@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Terminal Orchestrator",
+  "description": "A web-based terminal orchestrator using Gemini Voice AI to manage multiple local terminal sessions with human-in-the-loop execution.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
