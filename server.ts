@@ -278,16 +278,18 @@ async function startServer() {
     if (pending) {
       if (approved) {
         const term = manager.terminals[pending.terminalId];
-        if (term) {
-          term.writeInput(pending.cmd);
-          pending.session.sendToolResponse({
-            functionResponses: [{
-              name: "propose_command",
-              id: pending.callId,
-              response: { output: `Command dispatched to ${pending.terminalId} successfully.` }
-            }]
-          });
-        }
+        const dispatched = term ? term.writeInput(pending.cmd) : false;
+        pending.session.sendToolResponse({
+          functionResponses: [{
+            name: "propose_command",
+            id: pending.callId,
+            response: {
+              output: dispatched
+                ? `Command dispatched to ${pending.terminalId} successfully.`
+                : `Execution failed: pane '${pending.terminalId}' is unavailable or has exited.`
+            }
+          }]
+        });
       } else {
         pending.session.sendToolResponse({
           functionResponses: [{
@@ -579,7 +581,12 @@ async function startServer() {
     }
 
     clientWs.on("message", (data) => {
-      const msg = JSON.parse(data.toString());
+      let msg: any;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
       if (msg.type === "audio" && msg.audio) {
         // Feed user mic to Gemini
         if (session) {
@@ -598,6 +605,16 @@ async function startServer() {
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
+      }
+      // Release the upstream Gemini session and drop approvals bound to it
+      // so connect/disconnect cycles don't leak live sessions.
+      for (const [id, pending] of Object.entries(pendingApprovals)) {
+        if (pending.session === session) delete pendingApprovals[id];
+      }
+      if (session) {
+        try {
+          session.close();
+        } catch {}
       }
       console.log("Client WS closed");
     });

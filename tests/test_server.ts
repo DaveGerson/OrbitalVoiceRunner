@@ -51,6 +51,23 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
       const output = term.getRecentOutput(20);
       assert.ok(output.includes("async_input_received"), `Output should contain 'async_input_received', got: ${output}`);
     });
+
+    it("should not throw and should report failure when writing to an exited process", async () => {
+      const isWin = process.platform === "win32";
+      const cmd = isWin ? "echo done" : "echo 'done'";
+      // Use a local handle so the shared `term` (and its after() cleanup) keeps
+      // pointing at the long-running shell from the previous test.
+      const exitedTerm = new UniversalTerminal("test-exited", process.cwd(), cmd);
+      exitedTerm.start();
+
+      // Wait for the short-lived process to exit.
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      assert.strictEqual(exitedTerm.status, "Exited");
+
+      const dispatched = exitedTerm.writeInput("echo should_not_run");
+      assert.strictEqual(dispatched, false);
+      exitedTerm.stop();
+    });
   });
 
   describe("OrchestratorManager", () => {

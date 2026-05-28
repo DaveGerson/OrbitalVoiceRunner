@@ -29,6 +29,13 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // Mirror mute state into a ref so the long-lived onaudioprocess callback
+  // reads the current value instead of the value captured when it was created.
+  const isMicMutedRef = useRef(false);
+
+  useEffect(() => {
+    isMicMutedRef.current = isMicMuted;
+  }, [isMicMuted]);
 
   const fetchTerminals = async () => {
     try {
@@ -199,7 +206,7 @@ export default function App() {
         processor.connect(audioCtx.destination);
 
         processor.onaudioprocess = (e) => {
-          if (ws.readyState === WebSocket.OPEN && !isMicMuted) {
+          if (ws.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
             const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
             ws.send(JSON.stringify({ type: "audio", audio: base64 }));
           }
@@ -207,7 +214,12 @@ export default function App() {
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        let msg: any;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
+        }
         if (msg.type === "audio" && msg.audio) {
           playAudioChunk(audioCtx, msg.audio);
         } else if (msg.type === "interrupted") {

@@ -170,8 +170,14 @@ export class UniversalTerminal {
       cwd: this.cwd,
       env: process.env,
     });
-    
+
     this.resetIdleTimer();
+
+    // Guard against unhandled EPIPE when writing to a stdin whose process
+    // has already exited; without this listener the error would crash the server.
+    if (this.process.stdin) {
+      this.process.stdin.on("error", () => {});
+    }
 
     if (this.process.stdout) {
       this.process.stdout.on("data", (data) => {
@@ -219,9 +225,20 @@ export class UniversalTerminal {
     });
   }
 
-  writeInput(command: string) {
-    if (this.process && this.process.stdin) {
+  writeInput(command: string): boolean {
+    if (
+      this.status === "Exited" ||
+      !this.process ||
+      !this.process.stdin ||
+      !this.process.stdin.writable
+    ) {
+      return false;
+    }
+    try {
       this.process.stdin.write(command + "\n");
+      return true;
+    } catch {
+      return false;
     }
   }
 
