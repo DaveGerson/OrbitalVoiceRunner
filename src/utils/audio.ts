@@ -65,3 +65,9 @@ export function resetAudioPlayback() {
   }
   activeSources.length = 0;
 }
+
+export function isAudioPlaying(audioCtx: AudioContext | null): boolean {
+  if (!audioCtx) return false;
+  const bufferGuardSeconds = 0.2; // 200ms guard to prevent echo bleed-through immediately after speech
+  return activeSources.length > 0 || nextStartTime > (audioCtx.currentTime - bufferGuardSeconds);
+}

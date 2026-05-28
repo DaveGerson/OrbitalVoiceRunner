@@ -76,13 +76,17 @@ interface SettingsDialogProps {
   settings: SystemSettings | null;
   onSave: (updated: SystemSettings) => Promise<void>;
   terminals?: any[];
+  isMockMode?: boolean;
+  onToggleMockMode?: () => void;
 }
 
 export function SettingsDialog({
   onClose,
   settings: initialSettings,
   onSave,
-  terminals = []
+  terminals = [],
+  isMockMode = false,
+  onToggleMockMode
 }: SettingsDialogProps) {
   const [activeTab, setActiveTab] = useState<"form" | "json" | "install">("form");
   const [formTab, setFormTab] = useState<"session" | "profiles" | "advanced" | "secrets">("session");
@@ -722,9 +726,9 @@ export function SettingsDialog({
                                       onChange={e => handleUpdatePreset(preset.id, { permissionsMode: e.target.value as any })}
                                       className="w-full bg-black border border-white/10 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500 cursor-pointer"
                                     >
-                                      <option value="Full Auto">Full Auto (Immediate Run)</option>
-                                      <option value="Human-in-the-Loop">Human-in-the-Loop (Approval)</option>
-                                      <option value="Read-Only">Read-Only</option>
+                                      <option value="Full Auto">Full Auto (Voice/AI Submits Commands Automatically)</option>
+                                      <option value="Human-in-the-Loop">Human-in-the-Loop (Require User Approval to Execute)</option>
+                                      <option value="Read-Only">Read-Only (Terminal output only, no submissions)</option>
                                     </select>
                                   </div>
                                   <div>
@@ -976,9 +980,9 @@ export function SettingsDialog({
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white cursor-pointer"
                         >
                           <option value="Inherit">Inherit Parent Node Settings</option>
-                          <option value="Full Auto">Full Auto (Immediate Run)</option>
-                          <option value="Human-in-the-Loop">Human-in-the-Loop (Always Ask)</option>
-                          <option value="Read-Only">Read-Only (Lock Execution Output)</option>
+                          <option value="Full Auto">Full Auto (Voice/AI Submits Commands Automatically)</option>
+                          <option value="Human-in-the-Loop">Human-in-the-Loop (Require User Approval to Execute)</option>
+                          <option value="Read-Only">Read-Only (Terminal output only, no submissions)</option>
                         </select>
                       </div>
 
@@ -1016,6 +1020,22 @@ export function SettingsDialog({
                         />
                       </div>
                     </div>
+
+                    {onToggleMockMode && (
+                      <div className="pt-4 border-t border-white/5 space-y-3">
+                        <label className="block text-zinc-400 mb-1">Testing & Simulation</label>
+                        <button 
+                          onClick={onToggleMockMode}
+                          className={`w-full text-center py-2 bg-transparent border border-dashed transition-colors focus:outline-none text-[10px] uppercase tracking-widest font-bold ${
+                            isMockMode 
+                              ? "border-amber-500 hover:border-amber-400 text-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.3)]" 
+                              : "border-white/20 hover:border-amber-500/50 hover:text-amber-400 text-white/60"
+                          }`}
+                        >
+                          {isMockMode ? "Mock Mode Active (Click to Disable)" : "Run UI Smoke Test (Enable Mock Mode)"}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1052,15 +1072,15 @@ export function SettingsDialog({
                       </div>
                     </div>
 
-                    <div className="bg-red-950/10 border border-red-900/30 rounded-lg p-4 flex gap-3 text-red-300">
-                      <AlertCircle className="w-5 h-5 shrink-0 text-red-400" />
+                    <div className="bg-amber-950/10 border border-amber-900/30 rounded-lg p-4 flex gap-3 text-amber-300">
+                      <AlertCircle className="w-5 h-5 shrink-0 text-amber-400" />
                       <div className="font-sans text-[11px] leading-relaxed space-y-1">
-                        <span className="font-mono text-xs font-bold block text-red-200 uppercase tracking-widest">Offline Python Integrity Guard</span>
+                        <span className="font-mono text-xs font-bold block text-amber-200 uppercase tracking-widest">API Key & Data Routing Disclaimer</span>
                         <p>
-                          Your CLI startup commands, folder trees, and local subshells run with raw subprocess Python execution. They are strictly local and **do not require any API keys or tokens**.
+                          This Gemini Key is stored in your configuration and is used to establish server-side WebSocket connections directly to public Gemini Web APIs.
                         </p>
-                        <p className="text-zinc-500">
-                          This Gemini Key is used **solely** to boot the real-time audio/voice stream interface directly in this iframe.
+                        <p className="text-zinc-400">
+                          Your local environment, command context, and pane activity details are processed in memory and routed directly to Google Gemini APIs to handle synthesis, grounding, and voice streaming.
                         </p>
                       </div>
                     </div>

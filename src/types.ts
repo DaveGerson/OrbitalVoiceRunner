@@ -14,6 +14,10 @@ export interface PendingCommand {
   messageId: string;
   cmd: string;
   terminalId: string;
+  rationale?: {
+    trigger?: string;
+    summary: string;
+  };
 }
 
 export interface PaneMeta {
@@ -37,6 +41,7 @@ export interface Workspace {
   summary: string;
   notes: string[];
   panes: Record<string, PaneMeta>;
+  keyTerms?: string[];
 }
 
 export interface CliPreset {

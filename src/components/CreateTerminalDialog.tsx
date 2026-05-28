@@ -100,9 +100,9 @@ export function CreateTerminalDialog({
                 onChange={e => setPermissionsMode(e.target.value as any)}
                 className="w-full bg-black border border-white/10 rounded px-2.5 py-1.5 text-white focus:outline-none focus:border-cyan-500 transition-colors cursor-pointer"
               >
-                <option value="Full Auto">Full Auto</option>
-                <option value="Human-in-the-Loop">Human-in-the-Loop</option>
-                <option value="Read-Only">Read-Only</option>
+                <option value="Full Auto">Full Auto (Voice/AI Submits Commands Automatically)</option>
+                <option value="Human-in-the-Loop">Human-in-the-Loop (Require User Approval to Execute)</option>
+                <option value="Read-Only">Read-Only (Terminal output only, no submissions)</option>
               </select>
             </div>
             <div>

@@ -21,6 +21,7 @@ export interface Workspace {
   summary: string;
   notes: string[];
   panes: Record<string, PaneMeta>;
+  keyTerms?: string[];
 }
 
 export class Ledger {
@@ -116,7 +117,7 @@ export class Ledger {
     }
   }
 
-  addProject(id: string, directory: string, summary: string = "") {
+  addProject(id: string, directory: string, summary: string = "", keyTerms: string[] = []) {
     if (!this.workspaces[id]) {
       this.workspaces[id] = {
         id,
@@ -124,7 +125,8 @@ export class Ledger {
         directory,
         summary,
         notes: [],
-        panes: {}
+        panes: {},
+        keyTerms
       };
       this.save(true);
     }
@@ -192,7 +194,8 @@ export class Ledger {
       summary: ws.summary,
       directory: ws.directory,
       panes: Object.values(ws.panes),
-      notes: ws.notes
+      notes: ws.notes,
+      key_codebase_terms: ws.keyTerms || []
     };
   }
 }

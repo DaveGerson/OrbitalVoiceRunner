@@ -1,11 +1,12 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "./utils/audio";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback, isAudioPlaying } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalView } from "./components/TerminalView";
+import { ProjectDialog } from "./components/ProjectDialog";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock } from "lucide-react";
 import { apiFetch } from "./utils/api";
 
@@ -14,18 +15,25 @@ function AppRaw() {
   const [ledger, setLedger] = useState<Record<string, Workspace>>({});
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
+  const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [recentlyIdled, setRecentlyIdled] = useState<Record<string, boolean>>({});
+  const prevTerminalsRef = useRef<Terminal[]>([]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showProjectModal, setShowProjectModal] = useState(false);
+  const [editingProject, setEditingProject] = useState<Workspace | null>(null);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [promptDialog, setPromptDialog] = useState<{title: string, placeholder: string, onSubmit: (val: string) => void} | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [newNoteInputs, setNewNoteInputs] = useState<Record<string, string>>({});
+  const [isMockMode, setIsMockMode] = useState<boolean>(false);
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
+  const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
@@ -88,7 +96,8 @@ function AppRaw() {
   };
 
   const wsRef = useRef<WebSocket | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
+  const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
+  const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -96,7 +105,10 @@ function AppRaw() {
   const desiredLiveRef = useRef(false);
   const reconnectTimeoutRef = useRef<any>(null);
 
+  const isMockModeRef = useRef(false);
+
   const fetchTerminals = async () => {
+    if (isMockModeRef.current) return;
     try {
       const res = await apiFetch("/api/terminals");
       if (!res.ok) return;
@@ -108,6 +120,7 @@ function AppRaw() {
   };
 
   const fetchLedger = async () => {
+    if (isMockModeRef.current) return;
     try {
       const res = await apiFetch("/api/ledger");
       if (!res.ok) return;
@@ -162,6 +175,7 @@ function AppRaw() {
   };
 
   const fetchPendingCommands = async () => {
+    if (isMockModeRef.current) return;
     try {
       const res = await apiFetch("/api/commands/pending");
       if (!res.ok) return;
@@ -205,7 +219,58 @@ function AppRaw() {
     };
   }, [showHistoryPanel, activeTerminalId]);
 
+  useEffect(() => {
+    const prev = prevTerminalsRef.current;
+    let hasChanges = false;
+    const nextRecentlyIdled = { ...recentlyIdled };
+
+    terminals.forEach((term) => {
+      const prevTerm = prev.find((p) => p.id === term.id);
+      if (prevTerm && prevTerm.status === "Running" && term.status === "Idle") {
+        nextRecentlyIdled[term.id] = true;
+        hasChanges = true;
+        
+        // Remove animation after 6 seconds (2 heartbeats)
+        setTimeout(() => {
+          setRecentlyIdled(current => {
+            if (!current[term.id]) return current;
+            const updated = { ...current };
+            delete updated[term.id];
+            return updated;
+          });
+        }, 6000);
+      } else if (term.status === "Running" && nextRecentlyIdled[term.id]) {
+        delete nextRecentlyIdled[term.id];
+        hasChanges = true;
+      }
+    });
+
+    if (hasChanges) {
+      setRecentlyIdled(nextRecentlyIdled);
+    }
+
+    prevTerminalsRef.current = terminals;
+  }, [terminals]);
+
   const handleApprove = async (messageId: string) => {
+    if (isMockModeRef.current) {
+      const pendingCmd = pendingCommands.find(p => p.messageId === messageId);
+      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
+      if (pendingCmd) {
+        setTerminals(prev => prev.map(t => {
+          if (t.id === pendingCmd.terminalId) {
+            return {
+              ...t,
+              status: "Running",
+              command: pendingCmd.cmd,
+              output: t.output + `\n\n> ${pendingCmd.cmd}\n` + (pendingCmd.cmd.includes("tailwindcss") ? "added 1 package, and audited 2 packages in 3s" : "Successfully installed pandas 2.1.0\nDONE"),
+            };
+          }
+          return t;
+        }));
+      }
+      return;
+    }
     try {
       await apiFetch("/api/commands/approve", {
         method: "POST",
@@ -218,6 +283,10 @@ function AppRaw() {
   };
 
   const handleReject = async (messageId: string) => {
+    if (isMockModeRef.current) {
+      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
+      return;
+    }
     try {
       await apiFetch("/api/commands/approve", {
         method: "POST",
@@ -235,6 +304,41 @@ function AppRaw() {
     toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only"
   ) => {
+    if (isMockModeRef.current) {
+      setTerminals(prev => [...prev, {
+        id,
+        cwd,
+        command: cmd,
+        output: "Mock Node Started...\n",
+        status: "Running",
+        tool_preset: toolPreset,
+        permissions_mode: permissionsMode,
+        context_size: 0
+      }]);
+      setLedger(prev => {
+        const next = { ...prev };
+        if (activeProjectId && next[activeProjectId]) {
+          next[activeProjectId].panes[id] = {
+            pane_id: id,
+            name: "Mock Node " + id,
+            runtime_type: "shell",
+            last_known_state: "Running",
+            is_busy: true,
+            alive: true,
+            notes: [],
+            permissions_mode: permissionsMode,
+            session_id: "mock_session_" + id,
+            tool_preset: toolPreset,
+            context_size: 0
+          };
+        }
+        return next;
+      });
+      setShowCreateModal(false);
+      setActiveTerminalId(id);
+      return;
+    }
+    
     try {
       await apiFetch("/api/terminals", {
         method: "POST",
@@ -244,7 +348,8 @@ function AppRaw() {
           cwd,
           command: cmd,
           toolPreset,
-          permissionsMode
+          permissionsMode,
+          projectId: activeProjectId
         })
       });
       setShowCreateModal(false);
@@ -301,11 +406,17 @@ function AppRaw() {
       } catch (e) {}
       streamRef.current = null;
     }
-    if (audioCtxRef.current) {
+    if (voiceCaptureCtxRef.current) {
       try {
-        audioCtxRef.current.close();
+        voiceCaptureCtxRef.current.close();
       } catch (e) {}
-      audioCtxRef.current = null;
+      voiceCaptureCtxRef.current = null;
+    }
+    if (voicePlaybackCtxRef.current) {
+      try {
+        voicePlaybackCtxRef.current.close();
+      } catch (e) {}
+      voicePlaybackCtxRef.current = null;
     }
   };
 
@@ -316,8 +427,10 @@ function AppRaw() {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      audioCtxRef.current = audioCtx;
+      const captureCtx = new AudioContext({ sampleRate: 16000 });
+      const playbackCtx = new AudioContext({ sampleRate: 24000 });
+      voiceCaptureCtxRef.current = captureCtx;
+      voicePlaybackCtxRef.current = playbackCtx;
       resetAudioPlayback();
 
       ws.onopen = async () => {
@@ -327,16 +440,20 @@ function AppRaw() {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           streamRef.current = stream;
           
-          const source = audioCtx.createMediaStreamSource(stream);
+          const source = captureCtx.createMediaStreamSource(stream);
           sourceRef.current = source;
-          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          const processor = captureCtx.createScriptProcessor(4096, 1, 1);
           processorRef.current = processor;
           
           source.connect(processor);
-          processor.connect(audioCtx.destination);
+          processor.connect(captureCtx.destination);
 
           processor.onaudioprocess = (e) => {
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
+              if (isAudioPlaying(voicePlaybackCtxRef.current)) {
+                // Half-duplex barge-in/echo prevention: drop capture frames while synthesized speech streams through speakers
+                return;
+              }
               const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
               wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
             }
@@ -349,7 +466,7 @@ function AppRaw() {
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === "audio" && msg.audio) {
-          playAudioChunk(audioCtx, msg.audio);
+          playAudioChunk(playbackCtx, msg.audio);
         } else if (msg.type === "interrupted") {
           resetAudioPlayback();
         } else if (msg.type === "approval_pending") {
@@ -385,6 +502,10 @@ function AppRaw() {
             ...prev,
             { sender: msg.sender, text: msg.text, timestamp: new Date() }
           ].slice(-50));
+        } else if (msg.type === "error") {
+          setWsErrorNotification({ message: msg.message || "An unexpected error occurred during raw liveness communication." });
+          setTimeout(() => setWsErrorNotification(null), 8000);
+          resetAudioPlayback();
         }
       };
 
@@ -445,6 +566,134 @@ function AppRaw() {
     cleanupSocketOnly();
   };
 
+  const generateMockData = () => {
+    isMockModeRef.current = !isMockMode;
+    setIsMockMode(!isMockMode);
+    
+    if (isMockMode) {
+      // Turn off mock mode
+      fetchTerminals();
+      fetchLedger();
+      fetchPendingCommands();
+      setTranscript([]);
+      return;
+    }
+
+    // Turn on mock mode and populate fake data
+    const mockTermId1 = "terminal_mock_1";
+    const mockTermId2 = "terminal_mock_2";
+    const mockTermId3 = "terminal_mock_3";
+    
+    setTerminals([
+      {
+        id: mockTermId1,
+        cwd: "/home/user/workspace/web-app",
+        command: "npm run dev",
+        output: "\\n> web-app@1.0.0 dev\\n> vite\\n\\n  VITE v5.0.0  ready in 150 ms\\n\\n  ➜  Local:   http://localhost:5173/\\n  ➜  Network: use --host to expose",
+        status: "Running",
+        tool_preset: "Claude Code",
+        permissions_mode: "Full Auto",
+        context_size: 450
+      },
+      {
+        id: mockTermId2,
+        cwd: "/home/user/workspace/backend-api",
+        command: "python main.py",
+        output: "Starting server on port 8000...\\nConnecting to db...\\nDatabase connected.",
+        status: "Idle",
+        tool_preset: "Custom",
+        permissions_mode: "Human-in-the-Loop",
+        context_size: 2300
+      },
+      {
+        id: mockTermId3,
+        cwd: "/home/user/workspace/data-pipeline",
+        command: "npm run build",
+        output: "[ERROR] Failed to compile data-pipeline.\\nModuleNotFoundError: No module named 'pandas'\\n\\nError: Command failed with exit code 1.\\nPlease verify your dependencies are installed.",
+        status: "Running",
+        tool_preset: "Claude Code",
+        permissions_mode: "Full Auto",
+        context_size: 1024
+      }
+    ]);
+
+    setLedger({
+      "mock_project_alpha": {
+        id: "mock_project_alpha",
+        name: "Alpha Project",
+        directory: "/home/user/workspace",
+        summary: "This is a mock project to test UI capability.",
+        notes: ["Remember to check API rate limits"],
+        keyTerms: ["react", "vite", "nodejs"],
+        panes: {
+          [mockTermId1]: {
+            pane_id: mockTermId1,
+            name: "React Frontend",
+            runtime_type: "shell",
+            last_known_state: "Running",
+            is_busy: true,
+            alive: true,
+            notes: ["Dev server running"],
+            permissions_mode: "Full Auto",
+            session_id: "mock-sess-1",
+            tool_preset: "Claude Code",
+            context_size: 450
+          },
+          [mockTermId2]: {
+            pane_id: mockTermId2,
+            name: "Python Backend",
+            runtime_type: "shell",
+            last_known_state: "Idle",
+            is_busy: false,
+            alive: true,
+            notes: ["DB Connected"],
+            permissions_mode: "Human-in-the-Loop",
+            session_id: "mock-sess-2",
+            tool_preset: "Custom",
+            context_size: 2300
+          },
+          [mockTermId3]: {
+            pane_id: mockTermId3,
+            name: "Data Pipeline",
+            runtime_type: "shell",
+            last_known_state: "Running",
+            is_busy: true,
+            alive: true,
+            notes: ["Needs to install pandas", "Troubleshoot build failure"],
+            permissions_mode: "Full Auto",
+            session_id: "mock-sess-3",
+            tool_preset: "Claude Code",
+            context_size: 1024
+          }
+        }
+      }
+    });
+
+    setActiveProjectId("mock_project_alpha");
+    
+    setPendingCommands([
+      {
+        messageId: "mock_msg_1",
+        cmd: "npm install tailwindcss",
+        terminalId: mockTermId2,
+        rationale: { trigger: "I need tailwind", summary: "To add styling support to the project." }
+      },
+      {
+        messageId: "mock_msg_2",
+        cmd: "pip install pandas",
+        terminalId: mockTermId3,
+        rationale: { trigger: "Missing module", summary: "To fix the build error shown in the terminal output." }
+      }
+    ]);
+
+    setTranscript([
+      { sender: "User", text: "Please start the development server and prepare the background worker.", timestamp: new Date(Date.now() - 60000) },
+      { sender: "Janus", text: "Understood. I will spin up the React frontend and initialize the Python backend.", timestamp: new Date(Date.now() - 55000) },
+      { sender: "User", text: "Great, also install tailwind on the backend for some reason.", timestamp: new Date(Date.now() - 10000) },
+      { sender: "Janus", text: "I noticed an error in the data pipeline build regarding a missing 'pandas' module. I have proposed a command to install it.", timestamp: new Date(Date.now() - 5000) }
+    ]);
+  };
+
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
   let activePaneMeta = null;
   let activeProjectMeta = null;
@@ -461,23 +710,89 @@ function AppRaw() {
   }
 
   const handleCreateProject = () => {
-    setPromptDialog({
-      title: "Create New Project Context Space", placeholder: "e.g. multi-agent-space",
-      onSubmit: async (val) => {
-        if (!val.trim()) return;
-        const normId = val.trim().toLowerCase().replace(/\s+/g, "_");
-        await apiFetch("/api/projects", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: normId, directory: ".", summary: "Custom Registered Context" })
-        });
-        setPromptDialog(null);
-        handleSwitchProject(normId);
+    setEditingProject(null);
+    setShowProjectModal(true);
+  };
+
+  const handleEditProject = (project: Workspace) => {
+    setEditingProject(project);
+    setShowProjectModal(true);
+  };
+
+  const handleSaveProject = async (data: {
+    id: string;
+    name: string;
+    directory: string;
+    summary: string;
+    keyTerms: string[];
+  }) => {
+    if (isMockModeRef.current) {
+      setLedger(prev => {
+        const next = { ...prev };
+        if (editingProject) {
+          next[editingProject.id] = {
+            ...next[editingProject.id],
+            name: data.name,
+            directory: data.directory,
+            summary: data.summary,
+            keyTerms: data.keyTerms,
+          };
+        } else {
+          next[data.id] = {
+            id: data.id,
+            name: data.name,
+            directory: data.directory,
+            summary: data.summary,
+            keyTerms: data.keyTerms,
+            notes: [],
+            panes: {}
+          };
+        }
+        return next;
+      });
+      if (!editingProject) {
+        setActiveProjectId(data.id);
       }
-    });
+      setShowProjectModal(false);
+      setEditingProject(null);
+      return;
+    }
+    if (editingProject) {
+      await apiFetch(`/api/projects/${editingProject.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: data.name,
+          directory: data.directory,
+          summary: data.summary,
+          keyTerms: data.keyTerms,
+        }),
+      });
+      fetchLedger();
+    } else {
+      await apiFetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: data.id,
+          name: data.name,
+          directory: data.directory,
+          summary: data.summary,
+          keyTerms: data.keyTerms,
+        }),
+      });
+      await handleSwitchProject(data.id);
+    }
+    setShowProjectModal(false);
+    setEditingProject(null);
   };
 
   const handleSwitchProject = async (id: string) => {
+    if (isMockModeRef.current) {
+      setActiveProjectId(id);
+      setActiveTerminalId(null);
+      return;
+    }
     await apiFetch(`/api/projects/${id}/switch`, { method: "POST" });
     setActiveProjectId(id);
     setActiveTerminalId(null);
@@ -614,6 +929,17 @@ function AppRaw() {
 
   return (
     <div className="flex flex-col h-screen w-full bg-[#050505] text-[#e0e0e0] font-sans overflow-hidden border-t-4 border-[#121212]">
+      {showProjectModal && (
+        <ProjectDialog 
+          onClose={() => {
+            setShowProjectModal(false);
+            setEditingProject(null);
+          }}
+          onSave={handleSaveProject}
+          project={editingProject}
+        />
+      )}
+
       {showCreateModal && (
         <CreateTerminalDialog 
           onClose={() => setShowCreateModal(false)}
@@ -627,18 +953,22 @@ function AppRaw() {
           settings={settings}
           onSave={handleSaveSettings}
           terminals={terminals}
+          isMockMode={isMockMode}
+          onToggleMockMode={generateMockData}
         />
       )}
       
-      {pendingCommands.length > 0 && (
+      {pendingCommands.map((pending) => (
         <ApprovalDialog 
-          messageId={pendingCommands[0].messageId}
-          terminalId={pendingCommands[0].terminalId}
-          cmd={pendingCommands[0].cmd}
+          key={pending.messageId}
+          messageId={pending.messageId}
+          terminalId={pending.terminalId}
+          cmd={pending.cmd}
+          rationale={pending.rationale}
           onApprove={handleApprove}
           onReject={handleReject}
         />
-      )}
+      ))}
       
       <GenericPromptModal />
 
@@ -657,6 +987,12 @@ function AppRaw() {
             <span className="text-[11px] font-mono text-white/90">Node ID: {blockedNotification.terminalId}</span>
             <span className="text-[10px] text-zinc-400">Policy: {blockedNotification.reason}</span>
             <pre className="text-[10px] bg-black/40 p-2 rounded text-zinc-500 border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{blockedNotification.cmd}</pre>
+          </div>
+        )}
+        {wsErrorNotification && (
+          <div className="bg-[#111] border border-red-500/50 text-red-500 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
+            <span className="text-[10px] font-mono uppercase tracking-widest text-red-500 font-bold">⛔ Connection / AI Error</span>
+            <span className="text-[11px] font-mono text-white/90">{wsErrorNotification.message}</span>
           </div>
         )}
       </div>
@@ -808,6 +1144,19 @@ function AppRaw() {
               <span className="text-[9px] opacity-40 px-1 bg-white/5 rounded">ALL</span>
             </button>
 
+            <div className="mb-5 flex items-center justify-between border border-white/5 bg-black/30 px-3 py-2 rounded">
+              <label className="text-[10px] font-mono uppercase opacity-60">Filter Panes:</label>
+              <select
+                value={termFilter}
+                onChange={(e) => setTermFilter(e.target.value as "All" | "Running" | "Idle")}
+                className="bg-[#111] text-[10px] font-mono text-zinc-300 border border-white/10 rounded px-1.5 py-1 focus:outline-none focus:border-cyan-500 cursor-pointer"
+              >
+                <option value="All">All Panes</option>
+                <option value="Running">Running</option>
+                <option value="Idle">Idle</option>
+              </select>
+            </div>
+
             <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-1 select-none">
               <h2 className="text-[10px] font-mono uppercase opacity-40 tracking-[0.2em]">Workspace Contexts</h2>
               <button
@@ -829,11 +1178,12 @@ function AppRaw() {
                     >
                       {(project.name || project.id).toUpperCase()}
                     </div>
-                    <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                       <button onClick={() => handleRenameProject(project.id, project.name)} className="text-[9px] uppercase hover:text-cyan-400" title="Rename space">Rename</button>
-                       <button onClick={() => handleAddProjectNote(project.id)} className="text-[9px] uppercase hover:text-cyan-400" title="Append note">Note</button>
+                    <div className="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                       <button onClick={() => handleEditProject(project)} className="text-[9px] uppercase hover:text-cyan-400 px-1 hover:bg-white/5 rounded" title="Edit workspace details">Edit</button>
+                       <button onClick={() => handleRenameProject(project.id, project.name)} className="text-[9px] uppercase hover:text-cyan-450 text-zinc-500 hover:bg-white/5 px-1 rounded animate-pulse" title="Quick rename space">Rename</button>
+                       <button onClick={() => handleAddProjectNote(project.id)} className="text-[9px] uppercase hover:text-cyan-450 text-zinc-400 hover:bg-white/5 px-1 rounded" title="Append note">Note</button>
                        {projectList.length > 1 && (
-                         <button onClick={() => handleDeleteProjectPrompt(project.id)} className="text-[9px] uppercase hover:text-red-400 text-zinc-650" title="Prune Project Memory">Prune</button>
+                         <button onClick={() => handleDeleteProjectPrompt(project.id)} className="text-[9px] uppercase hover:text-red-400 text-zinc-650 px-1 hover:bg-red-500/10 rounded" title="Prune Project Memory">Prune</button>
                        )}
                     </div>
                   </div>
@@ -846,10 +1196,34 @@ function AppRaw() {
                        ))}
                     </div>
                   )}
+
+                  {activeProjectId === project.id && (
+                    <div className="pl-3 ml-2 border-l-2 border-white/5 space-y-2 mt-1.5 py-1 select-none">
+                      {project.summary && (
+                        <p className="text-[10px] text-zinc-500 leading-relaxed font-mono italic max-w-[210px] break-all">
+                          {project.summary}
+                        </p>
+                      )}
+                      {project.keyTerms && project.keyTerms.length > 0 && (
+                        <div className="flex flex-wrap gap-1 max-w-[210px]">
+                          {project.keyTerms.map((term, idx) => (
+                            <span key={idx} className="bg-cyan-500/5 text-cyan-400/80 border border-cyan-500/10 px-1 py-0.5 rounded text-[8px] font-mono leading-none">
+                              {term}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   
                   {activeProjectId === project.id && project.panes && (
                     <div className="space-y-1 pl-2 mt-2">
-                      {Object.values(project.panes).map((pane) => {
+                      {Object.values(project.panes).filter(pane => {
+                        if (termFilter === "All") return true;
+                        const term = terminals.find(t => t.id === pane.pane_id);
+                        const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                        return status === termFilter;
+                      }).map((pane) => {
                         const isActive = activeTerminalId === pane.pane_id;
                         const term = terminals.find(t => t.id === pane.pane_id);
                         const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
@@ -861,13 +1235,13 @@ function AppRaw() {
                           if (term.status === "Running") {
                             statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
                           } else if (term.status === "Idle") {
-                            statusColor = "bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)]";
+                            statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
                           } else if (term.status === "Exited") {
                             statusColor = "bg-red-500";
                           }
                         } else {
                           if (pane.alive && pane.is_busy) statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
-                          else if (pane.alive && !pane.is_busy) statusColor = "bg-yellow-500";
+                          else if (pane.alive && !pane.is_busy) statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
                           else statusColor = "bg-red-500";
                         }
                         
@@ -888,7 +1262,7 @@ function AppRaw() {
                                 </span>
                                 {term && <span className="text-[9px] opacity-30 font-mono truncate">{term.cwd}</span>}
                               </div>
-                              <span className={`flex-shrink-0 w-1.5 h-1.5 rounded-full ${statusColor}`} title={isAlertActive ? "Status: Alert (Approval Required)" : `Status: ${pane.last_known_state}`}></span>
+                              <span className={`flex-shrink-0 w-1.5 h-1.5 rounded-full transition-all duration-1000 ${statusColor}`} title={isAlertActive ? "Status: Alert (Approval Required)" : `Status: ${pane.last_known_state}`}></span>
                             </div>
                             {isActive && (
                               <div className="flex px-3 mt-1 pb-1 gap-2 border-b border-white/5">
@@ -1037,6 +1411,13 @@ function AppRaw() {
                               $ {entry.command}
                             </div>
 
+                            {(entry as any).finalResponse && (
+                              <div className="mt-2 text-[10px] text-zinc-400 font-mono bg-cyan-950/10 border border-cyan-500/15 p-2 rounded flex gap-1.5 items-start">
+                                <span className="text-cyan-400 font-bold shrink-0">◇ Outcome Briefing:</span>
+                                <span className="leading-relaxed select-text">{(entry as any).finalResponse}</span>
+                              </div>
+                            )}
+
                             {entry.output && (
                               <div className="mt-2 flex items-center justify-between text-[8px] text-cyan-500/80 uppercase tracking-widest leading-none">
                                 <span>{selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp === entry.timestamp ? "▲ Hide stdout" : "▼ Read stdout context"}</span>
@@ -1078,17 +1459,25 @@ function AppRaw() {
               <div className="mb-8 select-none">
                 <h1 className="text-xl font-mono text-white tracking-widest uppercase mb-1 flex items-center gap-2">
                   <Cpu className="w-5 h-5 text-cyan-400 shrink-0" />
-                  Node Configuration Matrix
+                  Project Terminal Workspace
                 </h1>
                 <p className="text-xs text-zinc-500 font-mono">
-                  Active compilation channels tracking Claude Code, Codex, and Antigravity orchestrator engines.
+                  Active terminal sessions tracking Claude Code, Codex, and Antigravity orchestrator engines.
                 </p>
               </div>
 
-              {activeProject && activeProject.panes && Object.keys(activeProject.panes).length > 0 ? (
-                <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-                  {Object.values(activeProject.panes).map((pane) => {
-                    const term = terminals.find(t => t.id === pane.pane_id);
+              {(() => {
+                const filteredPanes = activeProject && activeProject.panes ? Object.values(activeProject.panes).filter(pane => {
+                  if (termFilter === "All") return true;
+                  const term = terminals.find(t => t.id === pane.pane_id);
+                  const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                  return status === termFilter;
+                }) : [];
+
+                return filteredPanes.length > 0 ? (
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                    {filteredPanes.map((pane) => {
+                      const term = terminals.find(t => t.id === pane.pane_id);
                     const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
                     const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
 
@@ -1125,9 +1514,9 @@ function AppRaw() {
                           <div className="flex items-start justify-between gap-2 mb-3">
                             <div>
                               <div className="flex items-center gap-2">
-                                <span className={`w-2 h-2 rounded-full ${
+                                <span className={`w-2 h-2 transition-all duration-1000 rounded-full ${
                                   isAlertActive ? "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.9)] animate-ping" :
-                                  status === "Running" ? "bg-green-500 animate-pulse" : status === "Idle" ? "bg-yellow-500" : "bg-red-500"
+                                  status === "Running" ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse" : status === "Idle" ? `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.2)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}` : "bg-red-500"
                                 }`}></span>
                                 <h3 className="text-xs font-mono font-bold text-white tracking-widest uppercase flex items-center gap-1.5">
                                   {pane.name}
@@ -1291,7 +1680,8 @@ function AppRaw() {
                     Launch Core Engine Note
                   </button>
                 </div>
-              )}
+              );
+            })()}
 
               {/* Artifacts & Memory Registry Panel */}
               <div className="mt-12 pt-8 border-t border-white/5 space-y-6">

@@ -71,6 +71,7 @@ export class UniversalTerminal {
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   public sessionId: string;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
+  public onIdle?: (terminalId: string) => void;
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
@@ -161,18 +162,27 @@ export class UniversalTerminal {
     // Prompts matching: ending in standard patterns
     const inputPromptPattern = /([\?$#>]|\[[yY]\/[nN]\]|\([yY]\/[nN]\)|password:|confirm\??)\s*$/i;
 
+    const wasRunning = this.status === "Running";
+
     if (inputPromptPattern.test(stripped) || inputPromptPattern.test(fullStripped)) {
       this.status = "Idle";
       if (this.idleTimer) {
         clearTimeout(this.idleTimer);
         this.idleTimer = null;
       }
+      if (wasRunning && this.onIdle) {
+        this.onIdle(this.terminalId);
+      }
     } else {
       this.status = "Running";
       if (this.idleTimer) clearTimeout(this.idleTimer);
       this.idleTimer = setTimeout(() => {
         if (this.status !== "Exited") {
+          const finishedRunning = this.status === "Running";
           this.status = "Idle";
+          if (finishedRunning && this.onIdle) {
+            this.onIdle(this.terminalId);
+          }
         }
       }, 1000);
     }
@@ -371,6 +381,7 @@ export class OrchestratorManager {
   public activeId: string | null = null;
   public ledger: Ledger;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
+  public onIdle?: (terminalId: string) => void;
   public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
   public settings!: SystemSettings;
   private settingsFilePath = ".janus_settings.json";
@@ -477,10 +488,34 @@ export class OrchestratorManager {
   constructor() {
     this.loadSettings();
     this.ledger = new Ledger();
-    const activeCtx = this.settings.projects?.activeContext || "default_project";
+    
+    // Set activeProjectId from ledger or settings
+    const activeCtx = this.ledger.activeProjectId || this.settings.projects?.activeContext || "default_project";
     const workspacePath = this.settings.projects?.localWorkspacePath || process.cwd();
+    
+    // Ensure the active project is registered on the ledger
     this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
     this.ledger.switchContext(activeCtx);
+
+    // Restore pane terminals based on ledger records
+    const project = this.ledger.getProject(activeCtx);
+    if (project && project.panes) {
+      for (const [paneId, pane] of Object.entries(project.panes)) {
+        let cmd = "bash";
+        if (pane.tool_preset === "Claude Code") cmd = "npx @anthropic-ai/claude-code";
+        else if (pane.tool_preset === "Codex") cmd = "npx codex";
+        else if (pane.tool_preset === "Antigravity") cmd = "npx antigravity";
+        this.addTerminal(
+          pane.pane_id,
+          project.directory || process.cwd(),
+          cmd,
+          pane.tool_preset,
+          pane.permissions_mode,
+          pane.session_id,
+          activeCtx
+         );
+      }
+    }
   }
 
   addTerminal(
@@ -499,6 +534,9 @@ export class OrchestratorManager {
     const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
+    };
+    term.onIdle = (tid) => {
+      if (this.onIdle) this.onIdle(tid);
     };
     term.start();
     this.terminals[terminalId] = term;
@@ -525,7 +563,11 @@ export class OrchestratorManager {
   private syncLedger() {
     for (const [id, term] of Object.entries(this.terminals)) {
       const pId = term.projectId || "default_project";
-      const project = this.ledger.getProject(pId);
+      let project = this.ledger.getProject(pId);
+      if (!project) {
+        this.ledger.addProject(pId, term.cwd, "Auto-created project");
+        project = this.ledger.getProject(pId);
+      }
       if (project) {
         const existingPane = project.panes[id];
         const meta: PaneMeta = {

@@ -8,6 +8,7 @@ export function ApprovalDialog({
   onApprove, 
   onReject 
 }: { 
+  key?: string;
   messageId: string; 
   terminalId: string; 
   cmd: string; 
@@ -20,10 +21,7 @@ export function ApprovalDialog({
 }) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        onApprove(messageId);
-      } else if (e.key === "Escape") {
+      if (e.key === "Escape") {
         e.preventDefault();
         onReject(messageId);
       }
@@ -31,7 +29,7 @@ export function ApprovalDialog({
     
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [messageId, onApprove, onReject]);
+  }, [messageId, onReject]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
@@ -42,7 +40,7 @@ export function ApprovalDialog({
           </div>
           <div className="flex-1">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-amber-500">Proposed Command Execution</h3>
+              <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-[#d97706]">Proposed Command Execution</h3>
               <span className="text-[10px] font-mono opacity-40">Target: {terminalId}</span>
             </div>
             
@@ -59,7 +57,7 @@ export function ApprovalDialog({
                 <div className="text-[10px] font-mono">
                   <span className="text-zinc-500 uppercase tracking-wider block font-bold">Proposed rationale / summary</span>
                   <pre className="text-[9.5px] bg-black/30 p-1.5 rounded border border-white/5 text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto">
-                    {rationale.summary}
+                     {rationale.summary}
                   </pre>
                 </div>
               </div>
@@ -70,11 +68,12 @@ export function ApprovalDialog({
                 onClick={() => onApprove(messageId)}
                 className="flex-1 py-2 bg-amber-600 hover:bg-amber-500 text-black text-xs font-bold uppercase tracking-widest transition-colors focus:outline-none focus:ring-2 focus:ring-amber-500"
               >
-                Confirm & Fire [Enter]
+                Confirm & Fire
               </button>
               <button 
                 onClick={() => onReject(messageId)}
-                className="px-6 py-2 border border-white/10 hover:bg-white/5 text-xs font-bold uppercase tracking-widest transition-colors focus:outline-none focus:ring-2 focus:ring-white/20"
+                autoFocus
+                className="px-6 py-2 border border-red-500/30 bg-red-950/10 hover:bg-red-900/20 text-red-400 text-xs font-bold uppercase tracking-widest transition-colors focus:outline-none focus:ring-2 focus:ring-red-500"
               >
                 Reject [Esc]
               </button>

@@ -35,6 +35,7 @@ export interface HistoryEntry {
   command: string;
   timestamp: string;
   output: string;
+  finalResponse?: string;
 }
 
 export class HistoryManager {
@@ -49,8 +50,8 @@ export class HistoryManager {
     return HistoryManager.instance;
   }
 
-  private getFilePath(cwd: string): string {
-    return path.join(cwd || ".", ".janus_history.json");
+  private getFilePath(): string {
+    return path.join(process.cwd(), ".janus_history.json");
   }
 
   private getLimits() {
@@ -59,15 +60,18 @@ export class HistoryManager {
     return { maxCmds, maxOutput };
   }
 
-  public loadHistory(cwd: string): HistoryEntry[] {
-    const filePath = this.getFilePath(cwd);
+  public loadHistory(terminalId: string): HistoryEntry[] {
+    const filePath = this.getFilePath();
     const { maxCmds } = this.getLimits();
     try {
       if (fs.existsSync(filePath)) {
         const data = fs.readFileSync(filePath, "utf-8");
         const parsed = JSON.parse(data);
-        if (Array.isArray(parsed)) {
-          return parsed.slice(-maxCmds);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const list = parsed[terminalId];
+          if (Array.isArray(list)) {
+            return list.slice(-maxCmds);
+          }
         }
       }
     } catch (e) {
@@ -76,45 +80,55 @@ export class HistoryManager {
     return [];
   }
 
-  public saveHistory(cwd: string, history: HistoryEntry[]): void {
-    const filePath = this.getFilePath(cwd);
+  public saveHistory(terminalId: string, history: HistoryEntry[]): void {
+    const filePath = this.getFilePath();
     const { maxCmds, maxOutput } = this.getLimits();
     try {
       const pruned = history.slice(-maxCmds).map(entry => ({
         ...entry,
         output: (entry.output || "").slice(-maxOutput)
       }));
-      fs.writeFileSync(filePath, JSON.stringify(pruned, null, 2), "utf-8");
+
+      let allHistory: Record<string, HistoryEntry[]> = {};
+      if (fs.existsSync(filePath)) {
+        try {
+          const data = fs.readFileSync(filePath, "utf-8");
+          const parsed = JSON.parse(data);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            allHistory = parsed;
+          }
+        } catch (e) {}
+      }
+      allHistory[terminalId] = pruned;
+      fs.writeFileSync(filePath, JSON.stringify(allHistory, null, 2), "utf-8");
     } catch (e) {
       console.warn(`[HistoryManager] Failed to save history to ${filePath}:`, e);
     }
   }
 
-  public addCommand(cwd: string, command: string) {
-    const history = this.loadHistory(cwd);
+  public addCommand(terminalId: string, command: string) {
+    const history = this.loadHistory(terminalId);
     const newEntry: HistoryEntry = {
       command,
       timestamp: new Date().toISOString(),
       output: ""
     };
     history.push(newEntry);
-    this.saveHistory(cwd, history);
+    this.saveHistory(terminalId, history);
   }
 
-  public appendOutputToLastCommand(cwd: string, chunk: string) {
-    const history = this.loadHistory(cwd);
+  public appendOutputToLastCommand(terminalId: string, chunk: string) {
+    const history = this.loadHistory(terminalId);
     if (history.length > 0) {
       const lastEntry = history[history.length - 1];
       const { maxOutput } = this.getLimits();
       lastEntry.output = ((lastEntry.output || "") + chunk).slice(-maxOutput);
-      this.saveHistory(cwd, history);
+      this.saveHistory(terminalId, history);
     }
   }
 }
 
 const manager = new OrchestratorManager();
-// Add default terminal
-manager.addTerminal("primary-cli", process.cwd(), process.platform === "win32" ? "cmd.exe" : "bash");
 
 async function startServer() {
   const app = express();
@@ -160,6 +174,67 @@ async function startServer() {
     }
   });
 
+  async function summarizeCommandOutcome(command: string, rawOutput: string): Promise<string> {
+    try {
+      const apiKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
+        ? manager.settings.secrets.geminiApiKey
+        : (process.env.GEMINI_API_KEY || "");
+
+      const summarizeAi = apiKey ? new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      }) : ai;
+
+      const prompt = `You are a strict, command-line terminal outcome synthesizer.
+Summarize the final response and outcome of the following command execution. Do NOT include raw or verbose stdout log sequences. Focus exclusively on the ultimate outcome, success/failure of the command, and any critical final lines of output (key numbers, final results, final generated file text, or compile error statements). Do not say who you are. Keep your summary to 1-2 small conversational sentences, highly professional and compact.
+
+Command: ${command}
+Verbose Output:
+${rawOutput.slice(-3000)}`;
+
+      const response = await summarizeAi.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+      });
+      return response.text?.trim() || "No outcomes summary available.";
+    } catch (err) {
+      console.error("[summarizeCommandOutcome] Error:", err);
+      return "Execution finished successfully.";
+    }
+  }
+
+  manager.onIdle = async (terminalId) => {
+    const term = manager.terminals[terminalId];
+    if (term) {
+      const history = HistoryManager.getInstance().loadHistory(terminalId);
+      if (history.length > 0) {
+        const lastEntry = history[history.length - 1];
+        if (lastEntry.output && !lastEntry.finalResponse) {
+          try {
+            const cleanOutput = stripAnsiSequences(lastEntry.output).trim();
+            if (cleanOutput.length > 5) {
+              const summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
+              lastEntry.finalResponse = summaryText;
+              HistoryManager.getInstance().saveHistory(terminalId, history);
+              
+              broadcast({
+                type: "history_updated",
+                terminalId,
+                history
+              });
+            }
+          } catch (err) {
+            console.error("Auto-summarization failed for command outcomes:", err);
+          }
+        }
+      }
+    }
+  };
+
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
 
@@ -183,7 +258,7 @@ async function startServer() {
     const term = manager.terminals[terminalId];
     if (term) {
       const cleanChunk = stripAnsiSequences(chunk);
-      HistoryManager.getInstance().appendOutputToLastCommand(term.cwd, cleanChunk);
+      HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
     }
 
     if (!outputBuffers[terminalId]) {
@@ -240,12 +315,20 @@ async function startServer() {
 
   // Web API to create a terminal manually
   app.post("/api/terminals", (req, res) => {
-    const { terminalId, cwd, command, toolPreset, permissionsMode, sessionId } = req.body;
+    const { terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId } = req.body;
     if (!terminalId || !cwd || !command) {
       res.status(400).json({ error: "Missing required fields" });
       return;
     }
-    const result = manager.addTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId);
+    // ensure the active projectId is synced with this new terminal if requested
+    if (projectId) {
+      manager.ledger.activeProjectId = projectId;
+      // also ensure the project exists, just in case
+      if (!manager.ledger.getProject(projectId)) {
+        manager.ledger.addProject(projectId, cwd, "", []);
+      }
+    }
+    const result = manager.addTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
     broadcastLedgerUpdate();
     broadcast({ type: "terminals_updated" });
     res.json({ success: true, result });
@@ -283,43 +366,44 @@ async function startServer() {
   // Web API to get terminal history
   app.get("/api/terminals/:id/history", (req, res) => {
     const { id } = req.params;
-    const term = manager.terminals[id];
-    let cwd = process.cwd();
-    if (term) {
-      cwd = term.cwd;
-    } else {
-      const activeProject = manager.ledger.getActiveProject();
-      if (activeProject) {
-        cwd = activeProject.directory || process.cwd();
-      }
-    }
-    const history = HistoryManager.getInstance().loadHistory(cwd);
+    const history = HistoryManager.getInstance().loadHistory(id);
     res.json(history);
   });
 
   // Web API to clear terminal history
   app.post("/api/terminals/:id/history/clear", (req, res) => {
     const { id } = req.params;
-    const term = manager.terminals[id];
-    let cwd = process.cwd();
-    if (term) {
-      cwd = term.cwd;
-    } else {
-      const activeProject = manager.ledger.getActiveProject();
-      if (activeProject) {
-        cwd = activeProject.directory || process.cwd();
-      }
-    }
-    HistoryManager.getInstance().saveHistory(cwd, []);
+    HistoryManager.getInstance().saveHistory(id, []);
     res.json({ success: true, history: [] });
   });
 
   // Project and Pane management endpoints
   app.post("/api/projects", (req, res) => {
-    const { id, directory, summary } = req.body;
-    manager.ledger.addProject(id, directory, summary);
+    const { id, directory, summary, keyTerms, name } = req.body;
+    const terms = Array.isArray(keyTerms) ? keyTerms : [];
+    manager.ledger.addProject(id, directory || ".", summary || "", terms);
+    if (name) {
+      manager.ledger.renameProject(id, name);
+    }
     broadcastLedgerUpdate();
     res.json({ success: true });
+  });
+
+  app.put("/api/projects/:id", (req, res) => {
+    const { id } = req.params;
+    const { directory, summary, keyTerms, name } = req.body;
+    const ws = manager.ledger.getProject(id);
+    if (ws) {
+      if (directory !== undefined) ws.directory = directory;
+      if (summary !== undefined) ws.summary = summary;
+      if (keyTerms !== undefined) ws.keyTerms = Array.isArray(keyTerms) ? keyTerms : [];
+      if (name !== undefined) ws.name = name;
+      manager.ledger["save"](true);
+      broadcastLedgerUpdate();
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Project context not found" });
+    }
   });
 
   app.put("/api/projects/:id/rename", (req, res) => {
@@ -467,7 +551,7 @@ async function startServer() {
       if (approved) {
         const term = manager.terminals[pending.terminalId];
         if (term) {
-          HistoryManager.getInstance().addCommand(term.cwd, pending.cmd);
+          HistoryManager.getInstance().addCommand(pending.terminalId, pending.cmd);
           term.writeInput(pending.cmd);
           try {
             pending.session.sendToolResponse({
@@ -611,6 +695,27 @@ async function startServer() {
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: list } }]
                 });
+              } else if (name === "get_pane_command_history") {
+                const targetId = args.pane_id;
+                const term = manager.terminals[targetId];
+                let cwd = process.cwd();
+                if (term) {
+                  cwd = term.cwd;
+                } else {
+                  const activeProject = manager.ledger.getActiveProject();
+                  if (activeProject) {
+                    cwd = activeProject.directory || process.cwd();
+                  }
+                }
+                const history = HistoryManager.getInstance().loadHistory(cwd);
+                const conciseHistory = history.map((entry: any) => ({
+                  command: entry.command,
+                  timestamp: entry.timestamp,
+                  finalResponse: entry.finalResponse || stripAnsiSequences(entry.output).slice(-300).trim() || "No output captured."
+                }));
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: conciseHistory } }]
+                });
               } else if (name === "get_pane_summary") {
                 const targetId = args.pane_id;
                 const out = manager.getPaneSummary(targetId);
@@ -620,6 +725,11 @@ async function startServer() {
               } else if (name === "switch_context") {
                 const projectId = args.project_id;
                 manager.ledger.switchContext(projectId);
+                manager.settings.projects.activeContext = projectId;
+                const wsPath = manager.ledger.workspaces[projectId]?.directory || process.cwd();
+                manager.settings.projects.localWorkspacePath = wsPath;
+                manager.saveSettings();
+                broadcastLedgerUpdate();
                 const briefing = manager.ledger.getProjectBriefing(projectId) || { error: "Project not found" };
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: briefing } }]
@@ -638,7 +748,7 @@ async function startServer() {
                 if (effectivePermissions === "Full Auto") {
                   const term = manager.terminals[targetId];
                   if (term) {
-                    HistoryManager.getInstance().addCommand(term.cwd, cmd);
+                    HistoryManager.getInstance().addCommand(targetId, cmd);
                     term.writeInput(cmd);
                     session.sendToolResponse({
                       functionResponses: [{
@@ -727,7 +837,7 @@ async function startServer() {
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: "You are Project Janus, a voice helper controlling active terminal panes. You can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the project briefing when starting.",
+        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n- Live Terminal Panes: ${Object.values(manager.terminals).map(t => t.terminalId + " (Status: " + t.status + ", CWD: " + t.cwd + ")").join(", ")}\n\nYou can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the full project briefing when starting.`,
         ...({
           sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
           contextWindowCompression: {
@@ -755,6 +865,17 @@ async function startServer() {
                   command: { type: Type.STRING, description: "The refined command string." }
                 },
                 required: ["pane_id", "command"]
+              }
+            },
+            {
+              name: "get_pane_command_history",
+              description: "Return the list of recently executed commands in this pane with their concise, high-level final responses/outcomes, rather than raw/messy terminal outputs. Highly token-light and preserves context.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  pane_id: { type: Type.STRING, description: "Pane ID." },
+                },
+                required: ["pane_id"]
               }
             },
             {
@@ -867,6 +988,13 @@ async function startServer() {
         activeFrontendWs = null;
       }
       if (session) {
+        // Clean up any pending approvals associated with this session to avoid leaks or hanging tool-calls
+        for (const [messageId, details] of Object.entries(pendingApprovals)) {
+          if (details.session === session) {
+            console.log(`[CLEANUP] Purging orphaned approval ${messageId} linked to closed session.`);
+            delete pendingApprovals[messageId];
+          }
+        }
         try {
           session.close();
         } catch (e) {
@@ -907,8 +1035,9 @@ async function startServer() {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const bindHost = process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1";
+  server.listen(PORT, bindHost, () => {
+    console.log(`Server running on http://${bindHost}:${PORT}`);
   });
 }
 

@@ -1,1 +1,18 @@
 @import "tailwindcss";
+
+@theme {
+  @keyframes heartbeat {
+    0%, 100% {
+      transform: scale(1);
+      opacity: 0.8;
+    }
+    50% {
+      transform: scale(1.1);
+      opacity: 1;
+    }
+  }
+}
+
+.heartbeat-animation {
+  animation: heartbeat 3s ease-in-out infinite;
+}

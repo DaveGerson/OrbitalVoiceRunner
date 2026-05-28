@@ -46,9 +46,9 @@ the pane's own mode applies (defaulting to `Human-in-the-Loop`).
 
 | Mode               | Effect on `propose_command`                          |
 | ------------------ | ---------------------------------------------------- |
-| `Full Auto`        | Runs immediately, no approval.                       |
-| `Human-in-the-Loop`| Requires explicit operator approval in the UI.       |
-| `Read-Only`        | Rejected; the pane accepts no writes.                |
+| `Full Auto`        | Voice/AI Submits Commands Automatically. The agent writes commands directly to the pane without confirmation. |
+| `Human-in-the-Loop`| Requires explicit operator approval in the UI for individual commands. |
+| `Read-Only`        | Terminal output only, no submissions. The pane accepts no writes from the agent. |
 | `Inherit` (global) | Falls back to the pane's own mode.                   |
 
 Tool presets (`Claude Code`, `Codex`, `Antigravity`, `Custom`) seed a pane's
