@@ -15,6 +15,77 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
 
 ---
 
+## Validation against `main` (as of commit `16c62da`, 2026-05-28)
+
+Main advanced one commit past this branch's base — `16c62da refactor(terminal): update history
+persistence and UI`. That commit landed several of the round-one dependencies these next-level items
+rest on, and partially laid groundwork for two of them. **Net: the trust-UI substrate improved
+materially; the observation/voice/policy spine is still untouched.** Line anchors below reference the
+pre-`16c62da` baseline unless a "main @16c62da" note gives the updated location (App.tsx grew ~484
+lines, so its anchors have all shifted down).
+
+**Landed on main — round-one dependencies now satisfied (de-risks the items that named them):**
+- **Approval dialog now renders *all* pending commands** — `pendingCommands.map(...)` (`App.tsx:961`),
+  was `pendingCommands[0]`. Satisfies the dependency called out by **item 5** (ROADMAP P0.2).
+- **Rationale is now passed into and rendered by the dialog** — `rationale={pending.rationale}`
+  (`App.tsx:967`) → `ApprovalDialog.tsx:51-60`. The end-to-end plumbing **item 11** wanted to ride is
+  now actually connected (previously computed server-side but dropped before the component).
+- **Enter-to-approve removed** — the dialog now only binds Escape (`ApprovalDialog.tsx:24`). Partially
+  satisfies **item 11**'s "never Enter-to-fire" for the *default* path; risk-*tiered* confirmation is
+  still net-new.
+- **Command history is now keyed by terminal ID** — `HistoryManager.loadHistory(terminalId)` /
+  `allHistory[terminalId]` (`server.ts:63-126`). Fixes round-one P2.1 (co-located agents no longer
+  clobber a shared per-cwd file) and gives **items 1 & 12** a clean per-pane substrate.
+
+**Partial groundwork on main (a foundation, not the feature):**
+- **A real `onIdle` status-transition hook now exists** — `term.onIdle` (`terminal.ts:74,173,184`) →
+  `manager.onIdle` (`server.ts:210`). On idle it auto-summarizes the last command's outcome and
+  broadcasts `history_updated`. This is a genuine building block for **item 2** (an event to hang
+  watch-rules on) and a partial down-payment on **item 1** (a per-pane "what just happened" summary).
+  **But it is UI-facing only** — it `broadcast`s to clients and never pushes to the live model session
+  — and it is idle-only (no error/exit/prompt-class signals). Item 1's core (push *to the model* +
+  real deltas) is unmet.
+- **A `ProjectDialog` + project-management UI landed** (`App.tsx:9,933`; new
+  `src/components/ProjectDialog.tsx`). Partial UI substrate for **item 7** (project CRUD now has a
+  dialog — still screen-only, no voice tools) and **item 10** (project switching UI — still a single
+  `activeProjectId` at `App.tsx:918`, `totalContextSize` still computed over the active project only at
+  `App.tsx:920-921`, so the flattened cross-project fleet view is *not* done).
+
+**Still open after main (items + their deps unaddressed):**
+- **Push observation / real deltas (item 1) — NOT done.** `get_pane_summary` still returns a tail
+  (`server.ts:721`) and is still falsely described as "markdown delta … Pull, not push"
+  (`server.ts:883`). No model-facing event push.
+- **Idle heuristic still hardcoded `1000`ms (`terminal.ts:268`), ignoring the configured
+  `idleTimeoutMs` (default 2000).** Round-one P2.2 stands; **item 1**'s heuristic note stands.
+- **False "Execute with voice 'Confirm'" copy still present** (`App.tsx:1548`) with no voice-confirm
+  handler — **item 5**'s honesty flag and **item 8** (no spoken confirm) both stand.
+- **Typed-"SURE" destructive gate still present** (`App.tsx:805-808`) — **item 8** unmet.
+- **Antigravity preset still ships Full Auto + `--dangerously-skip-permissions`** (`terminal.ts:51`) —
+  **item 4** / round-one P3 not addressed.
+- **No kill-switch / emergency-stop / arm latch** anywhere — **item 4** unmet.
+- **`rateLimitRequestsPerMin` still defined-but-unread** — **item 15** unmet.
+- **Items 2, 3, 9, 10 (fleet), 11 (classifier/tiering), 12, 13 remain net-new and unstarted.**
+
+| Item | Status after main `16c62da` | Evidence |
+|---|---|---|
+| 1 Push observation + deltas | ❌ Open (partial substrate via onIdle/per-pane history) | `server.ts:721,883`; onIdle `server.ts:210` is UI-only |
+| 2 Watch/trigger rules | ⚠️ Foundation (onIdle event now emitted) | `terminal.ts:173,184` → `server.ts:210` |
+| 3 Policy rule engine | ❌ Open | gate still binary `server.ts` mode branch |
+| 4 Kill-switch + blast-radius | ❌ Open | no emergency/arm route; Antigravity Full Auto `terminal.ts:51` |
+| 5 Attention queue + digest | ⚠️ Dependency met (all approvals render) | `App.tsx:961,967` |
+| 6 Multi-pane output tiles | ❌ Open | grid still metadata cards |
+| 7 Voice-driven creation | ⚠️ UI substrate only (ProjectDialog), no voice tools | `App.tsx:933`; tools unchanged |
+| 8 Spoken confirm protocol | ❌ Open | typed-"SURE" `App.tsx:805-808`; copy `App.tsx:1548` |
+| 9 Recipes/templates/handoff | ❌ Open | — |
+| 10 Cross-project fleet view | ❌ Open (project UI exists, no flatten) | single `activeProjectId` `App.tsx:918,920-921` |
+| 11 Risk classify + tiered approval | ⚠️ Plumbing met (rationale wired, Enter removed) | `App.tsx:967`; `ApprovalDialog.tsx:24,51-60` |
+| 12 Signed audit log | ❌ Open (history now per-id, not an audit log) | `server.ts:63-126` |
+| 13 RBAC + secrets broker | ❌ Open | single shared token |
+| 14 Voice ergonomics bundle | ❌ Open | LISTENING/MUTED pill unchanged |
+| 15 Polish grab-bag | ❌ Open | `rateLimitRequestsPerMin` still unread |
+
+---
+
 ## P0-aspirational — the spine
 
 ### 1. Push-based observation with deltas (the situational-awareness backbone)
@@ -32,6 +103,10 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   heuristic fix (`src/terminal.ts:155-179`), which currently flips Idle after a 1s timer and lies for
   redraw-heavy TUIs.
 - **Why first.** It is the data plane that items 2, 3, 5, and 8 all stand on. Build it once, well.
+- **Status (main `16c62da`): ❌ open, partial substrate.** History is now per-pane (`server.ts:63-126`)
+  and an `onIdle` hook exists (`server.ts:210`) that auto-summarizes on idle — but it only broadcasts
+  to the UI, never pushes to the model, and `get_pane_summary` is still a pull-only tail mislabeled
+  "delta" (`server.ts:721,883`). The idle heuristic is still hardcoded `1000`ms (`terminal.ts:268`).
 
 ### 2. Watch/trigger rules + sequenced resumable plans ("when X → do Z", chained)
 - **[Feature] · effort: M (rules) → L (DAG) · Maya #1+#2, partial Sam NL-1 — convergence on the trigger primitive**
@@ -47,6 +122,9 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   (atomic Workspace serialization, `src/ledger.ts`) so it resumes across a server restart or the
   auto-reconnect loop. Ship rules first; the DAG is a fast-follow on the same primitive.
 - **Depends on:** item 1.
+- **Status (main `16c62da`): ⚠️ foundation present.** The `onIdle` status-transition event is now
+  emitted (`terminal.ts:173,184` → `server.ts:210`) — exactly the primitive a watch rule binds to.
+  The rule engine, persistence, and `create_watch` tool are still net-new.
 
 ### 3. Policy rule engine — per-command / per-path allowlist + denylist
 - **[Feature] · effort: L · Devon A1 (keystone) — Maya/Sam benefit indirectly via safer unattended ops**
@@ -94,6 +172,10 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   `approval_pending`/`command_blocked`/pane-exited (events already fire, `App.tsx:355-380`) plus an
   optional webhook to reach a phone. Backed by `pendingApprovals` (`server.ts:684`) + `listPanes()`.
 - **Depends on:** the round-one fix to render all pending approvals (ROADMAP P0.2).
+- **Status (main `16c62da`): ⚠️ dependency now met.** The dialog renders all pending approvals
+  (`pendingCommands.map`, `App.tsx:961`) and shows rationale (`App.tsx:967`) — so the queue substrate
+  exists. Still missing: the cross-pane attention queue, the `get_attention_digest()` voice tool, and
+  push notifications. The false "Execute with voice 'Confirm'" copy persists at `App.tsx:1548`.
 
 ### 6. Live multi-pane output tiles (turn the config matrix into a video wall)
 - **[UI] · effort: M · Maya #8 — the single biggest legibility win for fleet monitoring**
@@ -116,6 +198,10 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   cwd, permissions_mode)`, `create_project`, `delete_project` (guarded by item 8),
   `set_pane_permissions`, `set_global_permissions`, `set_mic_muted` — wired into the tool dispatch
   (`server.ts:604-721`) reusing the manager/ledger methods the HTTP routes already call.
+- **Status (main `16c62da`): ⚠️ UI substrate only.** A `ProjectDialog` and project-management UI
+  landed (`App.tsx:933`; `src/components/ProjectDialog.tsx`), so project CRUD is no longer ad-hoc — but
+  it remains screen-only. No voice tools (`create_pane`, `create_project`, `set_pane_permissions`, …)
+  were added; hands-free session setup is still blocked.
 
 ### 8. Spoken confirm protocol for destructive / high-blast-radius actions
 - **[Feature] · effort: M · Sam NL-4 — converges with Devon's tiered-confirm intent (item 11)**
@@ -155,6 +241,10 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   (pending-approval → exited/errored → idle → running) with a subtle project tag per tile; keep
   single-project as a filter, not a wall. Make global context/token counters genuinely fleet-wide.
 - **Composes with:** items 5 (urgency data) and 6 (output tiles).
+- **Status (main `16c62da`): ❌ open (project UI exists, no flatten).** `ProjectDialog` and project
+  filtering state landed, but the dashboard still renders a single `activeProjectId` (`App.tsx:918`)
+  and `totalContextSize` is still computed over the active project only (`App.tsx:920-921`) — the
+  flattened, urgency-sorted cross-project grid is not built, and the fleet-wide counter still lies.
 
 ### 11. Command risk classification + tiered approval, with risk badge in the dialog
 - **[Feature+UI] · effort: M · Devon A2+B1 — converges with Sam NL-4 (item 8) on tiered confirmation**
@@ -169,6 +259,10 @@ lowest priority; cross-persona convergence is treated as the strongest priority 
   speak-to-confirm, never Enter-to-fire). Tier also feeds item 3's defaults and item 8's spoken
   confirm. Cheap because it rides existing plumbing.
 - **Builds on:** item 3 (rules) and round-one P0.2 (pass `rationale` into the dialog).
+- **Status (main `16c62da`): ⚠️ plumbing now in place.** `rationale` is wired end-to-end into the
+  dialog (`App.tsx:967` → `ApprovalDialog.tsx:51-60`) and Enter-to-fire was removed
+  (`ApprovalDialog.tsx:24`), so the risk badge has a home to render into. The `classifyRisk` function
+  and tier-driven confirmation strength are still net-new.
 
 ### 12. Append-only signed audit log + in-app timeline / replay
 - **[Feature+UI] · effort: M · Devon A3+B3 — single-persona but compliance-gating**
