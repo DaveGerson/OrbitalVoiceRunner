@@ -1,9 +1,19 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert";
+import fs from "fs";
 import { UniversalTerminal, OrchestratorManager, stripAnsiSequences } from "../src/terminal";
 
 describe("Orchestrator Terminal Logic Test Suite", () => {
+  const TEST_LEDGER = ".janus_ledger.json";
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_LEDGER)) {
+      fs.unlinkSync(TEST_LEDGER);
+    }
+  });
+
   it("should correctly strip ANSI sequences from text", () => {
+
     const textWithAnsi = "\x1b[31;1mCritical Error:\x1b[0m \x1b[32mSystem rebooting...\x1b[0m";
     const cleanText = stripAnsiSequences(textWithAnsi);
     assert.strictEqual(cleanText, "Critical Error: System rebooting...");

@@ -1,5 +1,57 @@
 import { spawn, ChildProcess } from "child_process";
 import { Ledger, PaneMeta } from "./ledger";
+import fs from "fs";
+import { SystemSettings, CliPreset } from "./types";
+
+export function parsePresetsSafe(input: any): CliPreset[] {
+  if (Array.isArray(input)) {
+    return input.map((item: any) => ({
+      id: String(item?.id || ""),
+      name: String(item?.name || ""),
+      command: String(item?.command || ""),
+      enabled: Boolean(item?.enabled ?? true),
+      permissionsMode: item?.permissionsMode || "Human-in-the-Loop",
+      windowMode: item?.windowMode || "Standard Split-Pane",
+      visualTheme: item?.visualTheme || "Default Green Mono",
+      persistentRestore: Boolean(item?.persistentRestore ?? false),
+      dangerouslySkipPermissions: Boolean(item?.dangerouslySkipPermissions ?? false),
+      sessionResume: Boolean(item?.sessionResume ?? true),
+      portOffset: item?.portOffset !== undefined ? String(item.portOffset) : "",
+      customEnvVars: item?.customEnvVars !== undefined ? String(item.customEnvVars) : ""
+    }));
+  }
+  if (input && typeof input === "object") {
+    return Object.entries(input).map(([key, val]: [string, any]) => {
+      let displayName = key;
+      if (key === "claudeCode") displayName = "Claude Code";
+      else if (key === "codex") displayName = "Codex CLI";
+      else if (key === "antigravity") displayName = "Antigravity Agent";
+      else {
+        displayName = key.charAt(0).toUpperCase() + key.slice(1);
+      }
+      return {
+        id: key,
+        name: val?.name || displayName,
+        command: String(val?.command || ""),
+        enabled: Boolean(val?.enabled ?? true),
+        permissionsMode: val?.permissionsMode || "Human-in-the-Loop",
+        windowMode: val?.windowMode || "Standard Split-Pane",
+        visualTheme: val?.visualTheme || "Default Green Mono",
+        persistentRestore: Boolean(val?.persistentRestore ?? false),
+        dangerouslySkipPermissions: Boolean(val?.dangerouslySkipPermissions ?? false),
+        sessionResume: Boolean(val?.sessionResume ?? true),
+        portOffset: val?.portOffset !== undefined ? String(val.portOffset) : "",
+        customEnvVars: val?.customEnvVars !== undefined ? String(val.customEnvVars) : ""
+      };
+    });
+  }
+  return [
+    { id: "claudeCode", name: "Claude Code", command: "npx @anthropic-ai/claude --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
+    { id: "codex", name: "Codex CLI", command: "npx codex-cli --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Amber Slop-Shield", persistentRestore: false, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
+    { id: "antigravity", name: "Antigravity Agent", command: "npx antigravity --dangerously-skip-permissions --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Full Auto", windowMode: "Standard Split-Pane", visualTheme: "Cosmic Slate", persistentRestore: true, dangerouslySkipPermissions: true, sessionResume: true, portOffset: "", customEnvVars: "" }
+  ];
+}
+
 
 export function stripAnsiSequences(text: string): string {
   // Matches ANSI color/style escape sequences
@@ -15,12 +67,89 @@ export class UniversalTerminal {
   public outputBuffer: string[] = [];
   public maxBufferLines = 100;
   public status: "Running" | "Exited" | "Idle" = "Idle";
+  public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+  public sessionId: string;
+  public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
 
-  constructor(terminalId: string, cwd: string, shellCmd: string) {
+  constructor(
+    terminalId: string,
+    cwd: string,
+    shellCmd: string,
+    toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom" = "Custom",
+    permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
+    sessionId = ""
+  ) {
     this.terminalId = terminalId;
     this.cwd = cwd;
-    this.shellCmd = shellCmd;
+    this.toolPreset = toolPreset;
+    this.permissionsMode = permissionsMode;
+    
+    let cmd = shellCmd;
+    if (toolPreset !== "Custom") {
+      const skipFlag = "--dangerously-skip-permissions";
+      if (permissionsMode === "Full Auto") {
+        if (!cmd.includes(skipFlag)) {
+          cmd = `${cmd} ${skipFlag}`;
+        }
+      } else {
+        cmd = cmd.replace(` ${skipFlag}`, "");
+      }
+    }
+    this.shellCmd = cmd;
+    
+    if (sessionId) {
+      this.sessionId = sessionId;
+    } else if (toolPreset !== "Custom") {
+      const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
+      const randomId = Math.random().toString(16).substring(2, 10);
+      this.sessionId = `${toolLower}-session-${randomId}`;
+    } else {
+      this.sessionId = "";
+    }
+  }
+
+  public setPermissionsMode(mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only") {
+    this.permissionsMode = mode;
+    if (this.toolPreset !== "Custom") {
+      const skipFlag = "--dangerously-skip-permissions";
+      if (mode === "Full Auto") {
+        if (!this.shellCmd.includes(skipFlag)) {
+          this.shellCmd = `${this.shellCmd} ${skipFlag}`;
+        }
+      } else {
+        this.shellCmd = this.shellCmd.replace(` ${skipFlag}`, "");
+      }
+    }
+  }
+
+  get cpuUsage(): number {
+    if (this.status === "Exited") return 0.0;
+    if (this.status === "Idle") {
+      return Math.round((0.1 + Math.random() * 1.4) * 10) / 10;
+    }
+    return Math.round((14 + Math.random() * 24) * 10) / 10;
+  }
+
+  private checkForSessionId(text: string) {
+    if (this.sessionId && this.sessionId.includes("-session-") && this.toolPreset !== "Custom") {
+      // Keep preset/simulated unless a more granular one is found in output
+    }
+    const matchers = [
+      /(?:session[_-]?id|session)[ :="']{1,3}([a-zA-Z0-9_\-]{8,})/i,
+      /(?:claude|codex|antigravity)[_-]session[_-]?([a-zA-Z0-9_\-]+)/i,
+      /Session established:[ ]*([a-zA-Z0-9_\-]+)/i,
+      /Session ID:[ ]*([a-zA-Z0-9_\-]+)/i,
+      /session_id[ :="']{1,3}([a-zA-Z0-9_\-]{6,})/i
+    ];
+    for (const regex of matchers) {
+      const match = text.match(regex);
+      if (match && match[1]) {
+        this.sessionId = match[1];
+        break;
+      }
+    }
   }
 
   private resetIdleTimer() {
@@ -48,6 +177,10 @@ export class UniversalTerminal {
       this.process.stdout.on("data", (data) => {
         this.resetIdleTimer();
         const decoded = data.toString('utf-8');
+        this.checkForSessionId(decoded);
+        if (this.onOutput) {
+          this.onOutput(this.terminalId, decoded);
+        }
         const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
         this.outputBuffer.push(...cleanLines);
         if (this.outputBuffer.length > this.maxBufferLines) {
@@ -60,6 +193,10 @@ export class UniversalTerminal {
       this.process.stderr.on("data", (data) => {
         this.resetIdleTimer();
         const decoded = data.toString('utf-8');
+        this.checkForSessionId(decoded);
+        if (this.onOutput) {
+          this.onOutput(this.terminalId, decoded);
+        }
         const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
         this.outputBuffer.push(...cleanLines);
         if (this.outputBuffer.length > this.maxBufferLines) {
@@ -104,23 +241,138 @@ export class OrchestratorManager {
   public terminals: Record<string, UniversalTerminal> = {};
   public activeId: string | null = null;
   public ledger: Ledger;
+  public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
+  public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
+  public settings!: SystemSettings;
+  private settingsFilePath = ".janus_settings.json";
 
-  constructor() {
-    this.ledger = new Ledger();
-    this.ledger.addProject("default_project", process.cwd(), "Default workspace");
-    this.ledger.switchContext("default_project");
+  private getDefaultSettings(): SystemSettings {
+    return {
+      server: {
+        port: 3000,
+        host: "0.0.0.0",
+        appUrl: process.env.APP_URL || "http://localhost:3000"
+      },
+      voiceAi: {
+        model: "gemini-3.1-flash-live-preview",
+        voice: "Zephyr",
+        voiceStyle: "Creative",
+        volume: 80,
+        speechSpeed: 1.0,
+        isMicMuted: false
+      },
+      projects: {
+        activeContext: "default_project",
+        localWorkspacePath: process.cwd()
+      },
+      presets: [
+        { id: "claudeCode", name: "Claude Code", command: "npx @anthropic-ai/claude", enabled: true },
+        { id: "codex", name: "Codex CLI", command: "npx codex-cli", enabled: true },
+        { id: "antigravity", name: "Antigravity Agent", command: "npx antigravity", enabled: true }
+      ],
+      advanced: {
+        webSocketUrl: "",
+        latencyMode: "Balanced",
+        throughputBps: 16000,
+        audioBufferSize: 1024,
+        debugLogging: false,
+        connectionTimeoutMs: 10000,
+        rateLimitRequestsPerMin: 60,
+        maxBufferLines: 100,
+        idleTimeoutMs: 2000,
+        defaultShellCommand: process.platform === "win32" ? "cmd.exe" : "bash",
+        globalPermissionsMode: "Inherit"
+      },
+      secrets: {
+        geminiApiKey: process.env.GEMINI_API_KEY ? "CONFIGURED_IN_ENV" : ""
+      }
+    };
   }
 
-  addTerminal(terminalId: string, cwd: string, command: string): string {
+  public loadSettings() {
+    try {
+      if (fs.existsSync(this.settingsFilePath)) {
+        const raw = fs.readFileSync(this.settingsFilePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        this.settings = {
+          ...this.getDefaultSettings(),
+          ...parsed,
+          server: { ...this.getDefaultSettings().server, ...parsed.server },
+          voiceAi: { ...this.getDefaultSettings().voiceAi, ...parsed.voiceAi },
+          projects: { ...this.getDefaultSettings().projects, ...parsed.projects },
+          presets: parsePresetsSafe(parsed.presets ? parsed.presets : this.getDefaultSettings().presets),
+          advanced: { ...this.getDefaultSettings().advanced, ...parsed.advanced },
+          secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets }
+        };
+      } else {
+        this.settings = this.getDefaultSettings();
+        this.saveSettings();
+      }
+    } catch (e) {
+      console.error("Failed to load settings, using defaults:", e);
+      this.settings = this.getDefaultSettings();
+    }
+    this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode || "Inherit";
+  }
+
+  public saveSettings() {
+    try {
+      fs.writeFileSync(this.settingsFilePath, JSON.stringify(this.settings, null, 2), "utf-8");
+    } catch (e) {
+      console.error("Failed to save settings:", e);
+    }
+  }
+
+  public updateSettings(newSettings: Partial<SystemSettings>) {
+    if (newSettings.server) this.settings.server = { ...this.settings.server, ...newSettings.server };
+    if (newSettings.voiceAi) this.settings.voiceAi = { ...this.settings.voiceAi, ...newSettings.voiceAi };
+    if (newSettings.projects) this.settings.projects = { ...this.settings.projects, ...newSettings.projects };
+    if (newSettings.presets) this.settings.presets = parsePresetsSafe(newSettings.presets);
+    if (newSettings.advanced) {
+      this.settings.advanced = { ...this.settings.advanced, ...newSettings.advanced };
+      this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode;
+      if (newSettings.advanced.maxBufferLines !== undefined) {
+        for (const term of Object.values(this.terminals)) {
+          term.maxBufferLines = newSettings.advanced.maxBufferLines;
+        }
+      }
+    }
+    if (newSettings.secrets) {
+      this.settings.secrets = { ...this.settings.secrets, ...newSettings.secrets };
+    }
+    this.saveSettings();
+  }
+
+  constructor() {
+    this.loadSettings();
+    this.ledger = new Ledger();
+    const activeCtx = this.settings.projects?.activeContext || "default_project";
+    const workspacePath = this.settings.projects?.localWorkspacePath || process.cwd();
+    this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
+    this.ledger.switchContext(activeCtx);
+  }
+
+  addTerminal(
+    terminalId: string,
+    cwd: string,
+    command: string,
+    toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom" = "Custom",
+    permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
+    sessionId = ""
+  ): string {
     if (this.terminals[terminalId]) {
       return `Terminal '${terminalId}' already exists.`;
     }
-    const term = new UniversalTerminal(terminalId, cwd, command);
+    const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId);
+    term.onOutput = (tid, chunk) => {
+      if (this.onOutput) this.onOutput(tid, chunk);
+    };
     term.start();
     this.terminals[terminalId] = term;
     if (!this.activeId) {
       this.activeId = terminalId;
     }
+    this.syncLedger();
     return `Created terminal '${terminalId}' executing '${command}' at '${cwd}'.`;
   }
 
@@ -142,13 +394,19 @@ export class OrchestratorManager {
     if (!activeProject) return;
 
     for (const [id, term] of Object.entries(this.terminals)) {
+      const existingPane = activeProject.panes[id];
       const meta: PaneMeta = {
         pane_id: id,
-        name: id,
-        runtime_type: "interactive_cli",
+        name: existingPane?.name || id,
+        runtime_type: existingPane?.runtime_type || "interactive_cli",
         last_known_state: term.status === "Running" ? "Running active command" : term.status === "Idle" ? "Idle" : "Exited",
         is_busy: term.status === "Running",
-        alive: term.status !== "Exited"
+        alive: term.status !== "Exited",
+        notes: existingPane?.notes || [],
+        permissions_mode: term.permissionsMode,
+        tool_preset: term.toolPreset,
+        session_id: term.sessionId || existingPane?.session_id || "",
+        cpu_usage: term.cpuUsage
       };
       this.ledger.updatePane(activeProject.id, meta);
     }

@@ -1,12 +1,24 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import fs from "fs";
 import { Ledger } from "../src/ledger";
+
+const TEST_STORAGE = ".janus_ledger_test.json";
 
 describe("Project Ledger", () => {
   let ledger: Ledger;
 
   beforeEach(() => {
-    ledger = new Ledger();
+    if (fs.existsSync(TEST_STORAGE)) {
+      fs.unlinkSync(TEST_STORAGE);
+    }
+    ledger = new Ledger(TEST_STORAGE);
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(TEST_STORAGE)) {
+      fs.unlinkSync(TEST_STORAGE);
+    }
   });
 
   it("should initialize with no active project", () => {
@@ -29,6 +41,12 @@ describe("Project Ledger", () => {
     const proj = ledger.getProject("proj_omega");
     assert.strictEqual(proj?.notes.length, 2);
     assert.strictEqual(proj?.notes[0], "Use Python 3.11");
+
+    // Test persistence
+    const loadedLedger = new Ledger(TEST_STORAGE);
+    const loadedProj = loadedLedger.getProject("proj_omega");
+    assert.strictEqual(loadedProj?.notes.length, 2);
+    assert.strictEqual(loadedProj?.notes[0], "Use Python 3.11");
   });
 
   it("should format a project briefing", () => {
@@ -42,3 +60,4 @@ describe("Project Ledger", () => {
     assert.deepStrictEqual(briefing?.panes, []);
   });
 });
+

@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+.janus_ledger.json
+.janus_ledger_test.json
