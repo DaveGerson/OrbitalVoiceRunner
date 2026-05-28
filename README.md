@@ -6,6 +6,10 @@ terminal panes, organizes them in a persistent ledger, and acts on shell
 commands according to a configurable permissions policy — from full manual
 approval to full autonomy.
 
+See [`docs/USER_JOURNEYS.md`](docs/USER_JOURNEYS.md) for the workflows this tool
+is designed to support today, and [`BACKLOG.md`](BACKLOG.md) for aspirational
+journeys awaiting new capability.
+
 ## How it works
 
 ```
@@ -60,6 +64,8 @@ startup command and, for non-custom presets, manage the
 ```
 server.ts                     Express + WebSocket server; Gemini Live bridge; REST API
 SETTINGS_SPEC.md              Specification for the configuration/settings system
+BACKLOG.md                    Aspirational user journeys awaiting new capability
+docs/USER_JOURNEYS.md         Workflows the tool is designed to support today
 index.html                    Vite entry point
 vite.config.ts                Vite + React + Tailwind config
 src/
