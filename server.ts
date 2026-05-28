@@ -1,15 +1,116 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
+import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences } from "./src/terminal";
 
 dotenv.config();
 
 const PORT = 3000;
+
+// Automatic session secret token loaded from env or generated cryptographically fresh on boot
+const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+console.log("-----------------------------------------------------------------");
+console.log(`[SECURITY] Session API Authentication Token generated.`);
+console.log("-----------------------------------------------------------------");
+
+function getCookie(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null;
+  const cookies = cookieHeader.split(";");
+  for (const cookie of cookies) {
+    const parts = cookie.trim().split("=");
+    if (parts[0] === name) {
+      return parts.slice(1).join("=");
+    }
+  }
+  return null;
+}
+
+export interface HistoryEntry {
+  command: string;
+  timestamp: string;
+  output: string;
+}
+
+export class HistoryManager {
+  private static instance: HistoryManager;
+
+  private constructor() {}
+
+  public static getInstance(): HistoryManager {
+    if (!HistoryManager.instance) {
+      HistoryManager.instance = new HistoryManager();
+    }
+    return HistoryManager.instance;
+  }
+
+  private getFilePath(cwd: string): string {
+    return path.join(cwd || ".", ".janus_history.json");
+  }
+
+  private getLimits() {
+    const maxCmds = manager.settings?.advanced?.historyMaxCommands ?? 50;
+    const maxOutput = manager.settings?.advanced?.historyMaxOutputLength ?? 5000;
+    return { maxCmds, maxOutput };
+  }
+
+  public loadHistory(cwd: string): HistoryEntry[] {
+    const filePath = this.getFilePath(cwd);
+    const { maxCmds } = this.getLimits();
+    try {
+      if (fs.existsSync(filePath)) {
+        const data = fs.readFileSync(filePath, "utf-8");
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed)) {
+          return parsed.slice(-maxCmds);
+        }
+      }
+    } catch (e) {
+      // Return empty if file not found or corrupted
+    }
+    return [];
+  }
+
+  public saveHistory(cwd: string, history: HistoryEntry[]): void {
+    const filePath = this.getFilePath(cwd);
+    const { maxCmds, maxOutput } = this.getLimits();
+    try {
+      const pruned = history.slice(-maxCmds).map(entry => ({
+        ...entry,
+        output: (entry.output || "").slice(-maxOutput)
+      }));
+      fs.writeFileSync(filePath, JSON.stringify(pruned, null, 2), "utf-8");
+    } catch (e) {
+      console.warn(`[HistoryManager] Failed to save history to ${filePath}:`, e);
+    }
+  }
+
+  public addCommand(cwd: string, command: string) {
+    const history = this.loadHistory(cwd);
+    const newEntry: HistoryEntry = {
+      command,
+      timestamp: new Date().toISOString(),
+      output: ""
+    };
+    history.push(newEntry);
+    this.saveHistory(cwd, history);
+  }
+
+  public appendOutputToLastCommand(cwd: string, chunk: string) {
+    const history = this.loadHistory(cwd);
+    if (history.length > 0) {
+      const lastEntry = history[history.length - 1];
+      const { maxOutput } = this.getLimits();
+      lastEntry.output = ((lastEntry.output || "") + chunk).slice(-maxOutput);
+      this.saveHistory(cwd, history);
+    }
+  }
+}
 
 const manager = new OrchestratorManager();
 // Add default terminal
@@ -18,6 +119,34 @@ manager.addTerminal("primary-cli", process.cwd(), process.platform === "win32" ?
 async function startServer() {
   const app = express();
   app.use(express.json());
+
+  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders
+  app.use((req, res, next) => {
+    if (!req.path.startsWith("/api") && !req.path.startsWith("/live")) {
+      const currentToken = getCookie(req.headers.cookie, "auth_token");
+      if (currentToken !== API_AUTH_TOKEN) {
+        res.cookie("auth_token", API_AUTH_TOKEN, {
+          httpOnly: true,
+          sameSite: "strict",
+          secure: process.env.NODE_ENV === "production"
+        });
+      }
+    }
+    next();
+  });
+
+  const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
+    const tokenFromHeader = req.headers["x-api-token"]?.toString() || req.headers["authorization"]?.toString().replace(/^Bearer\s+/, "");
+    
+    if (tokenFromCookie === API_AUTH_TOKEN || tokenFromHeader === API_AUTH_TOKEN) {
+      next();
+    } else {
+      res.status(401).json({ error: "Unauthorized: Invalid or missing API security token. Reload your interface." });
+    }
+  };
+
+  app.use("/api", authMiddleware);
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: "/live" });
@@ -47,12 +176,36 @@ async function startServer() {
     }
   }
 
+  const outputBuffers: Record<string, string[]> = {};
+  let flushTimeout: NodeJS.Timeout | null = null;
+
   manager.onOutput = (terminalId, chunk) => {
-    broadcast({
-      type: "stdout_chunk",
-      terminalId,
-      chunk
-    });
+    const term = manager.terminals[terminalId];
+    if (term) {
+      const cleanChunk = stripAnsiSequences(chunk);
+      HistoryManager.getInstance().appendOutputToLastCommand(term.cwd, cleanChunk);
+    }
+
+    if (!outputBuffers[terminalId]) {
+      outputBuffers[terminalId] = [];
+    }
+    outputBuffers[terminalId].push(chunk);
+
+    if (!flushTimeout) {
+      flushTimeout = setTimeout(() => {
+        flushTimeout = null;
+        for (const [tid, chunks] of Object.entries(outputBuffers)) {
+          if (chunks.length > 0) {
+            broadcast({
+              type: "stdout_chunk",
+              terminalId: tid,
+              chunk: chunks.join("")
+            });
+            outputBuffers[tid] = [];
+          }
+        }
+      }, 30);
+    }
   };
 
   function broadcastLedgerUpdate() {
@@ -75,7 +228,7 @@ async function startServer() {
         permissions_mode: term.permissionsMode,
         tool_preset: term.toolPreset,
         session_id: term.sessionId,
-        cpu_usage: term.cpuUsage
+        context_size: term.contextSize
       };
     });
     res.json(list);
@@ -125,6 +278,40 @@ async function startServer() {
         res.status(404).json({ error: "Terminal not found" });
       }
     }
+  });
+
+  // Web API to get terminal history
+  app.get("/api/terminals/:id/history", (req, res) => {
+    const { id } = req.params;
+    const term = manager.terminals[id];
+    let cwd = process.cwd();
+    if (term) {
+      cwd = term.cwd;
+    } else {
+      const activeProject = manager.ledger.getActiveProject();
+      if (activeProject) {
+        cwd = activeProject.directory || process.cwd();
+      }
+    }
+    const history = HistoryManager.getInstance().loadHistory(cwd);
+    res.json(history);
+  });
+
+  // Web API to clear terminal history
+  app.post("/api/terminals/:id/history/clear", (req, res) => {
+    const { id } = req.params;
+    const term = manager.terminals[id];
+    let cwd = process.cwd();
+    if (term) {
+      cwd = term.cwd;
+    } else {
+      const activeProject = manager.ledger.getActiveProject();
+      if (activeProject) {
+        cwd = activeProject.directory || process.cwd();
+      }
+    }
+    HistoryManager.getInstance().saveHistory(cwd, []);
+    res.json({ success: true, history: [] });
   });
 
   // Project and Pane management endpoints
@@ -262,13 +449,14 @@ async function startServer() {
 
   // Client pending commands mapping Map<messageId, Function(approved: boolean)>
   // To keep it simple, we store pending execution approvals here.
-  const pendingApprovals: Record<string, { cmd: string, terminalId: string, callId: string, session: any }> = {};
+  const pendingApprovals: Record<string, { cmd: string, terminalId: string, callId: string, session: any, rationale?: { trigger: string, summary: string } }> = {};
 
   app.get("/api/commands/pending", (req, res) => {
     res.json(Object.entries(pendingApprovals).map(([messageId, details]) => ({
       messageId,
       cmd: details.cmd,
-      terminalId: details.terminalId
+      terminalId: details.terminalId,
+      rationale: details.rationale
     })));
   });
 
@@ -279,23 +467,32 @@ async function startServer() {
       if (approved) {
         const term = manager.terminals[pending.terminalId];
         if (term) {
+          HistoryManager.getInstance().addCommand(term.cwd, pending.cmd);
           term.writeInput(pending.cmd);
+          try {
+            pending.session.sendToolResponse({
+              functionResponses: [{
+                name: "propose_command",
+                id: pending.callId,
+                response: { output: `Command dispatched to ${pending.terminalId} successfully.` }
+              }]
+            });
+          } catch (e) {
+            console.error("Failed to send tool response to dead/closed session on approve:", e);
+          }
+        }
+      } else {
+        try {
           pending.session.sendToolResponse({
             functionResponses: [{
               name: "propose_command",
               id: pending.callId,
-              response: { output: `Command dispatched to ${pending.terminalId} successfully.` }
+              response: { output: "Execution cancelled by operator." }
             }]
           });
+        } catch (e) {
+          console.error("Failed to send tool response to dead/closed session on reject:", e);
         }
-      } else {
-        pending.session.sendToolResponse({
-          functionResponses: [{
-            name: "propose_command",
-            id: pending.callId,
-            response: { output: "Execution cancelled by operator." }
-          }]
-        });
       }
       delete pendingApprovals[messageId];
       res.json({ success: true });
@@ -304,12 +501,24 @@ async function startServer() {
     }
   });
 
-  wss.on("connection", async (clientWs) => {
+  let lastSessionResumptionToken: any = null;
+
+  wss.on("connection", async (clientWs, req) => {
+    const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
+    if (tokenFromCookie !== API_AUTH_TOKEN) {
+      console.warn("[SECURITY] Blocked unauthorized WebSocket connection attempt.");
+      clientWs.send(JSON.stringify({ type: "error", message: "Unauthorized WebSocket access. Please reload the interface." }));
+      clientWs.close(4001, "Unauthorized");
+      return;
+    }
+
     activeFrontendWs = clientWs;
     clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
     let session: any = null;
+    let currentSessionUserUtterance = "";
+    let currentSessionModelUtterance = "";
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
 
     try {
@@ -333,8 +542,57 @@ async function startServer() {
         model: liveModel,
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
-          // Pass audio back to client
-          const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            // Check for sessionResumption update
+            if ((message as any).sessionResumptionUpdate) {
+              lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
+              console.log("[SESSION RESUMPTION] Captured token:", lastSessionResumptionToken);
+            }
+
+            // Extract user or model verbal transcripts
+            let userUtterance = "";
+            let modelUtterance = "";
+
+            if (message.serverContent?.modelTurn?.parts) {
+              for (const part of message.serverContent.modelTurn.parts) {
+                if (part.text) {
+                  modelUtterance += part.text;
+                }
+              }
+            }
+            if ((message.serverContent as any)?.turn?.parts) {
+              for (const part of (message.serverContent as any).turn.parts) {
+                if (part.text) {
+                  userUtterance += part.text;
+                }
+              }
+            }
+            if ((message.serverContent as any)?.userTurn?.parts) {
+              for (const part of (message.serverContent as any).userTurn.parts) {
+                if (part.text) {
+                  userUtterance += part.text;
+                }
+              }
+            }
+
+            if (userUtterance) {
+              currentSessionUserUtterance = userUtterance;
+              clientWs.send(JSON.stringify({
+                type: "transcript_text",
+                sender: "User",
+                text: userUtterance
+              }));
+            }
+            if (modelUtterance) {
+              currentSessionModelUtterance = modelUtterance;
+              clientWs.send(JSON.stringify({
+                type: "transcript_text",
+                sender: "Janus",
+                text: modelUtterance
+              }));
+            }
+
+            // Pass audio back to client
+            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
           if (audio) {
             clientWs.send(JSON.stringify({ type: "audio", audio }));
           }
@@ -380,6 +638,7 @@ async function startServer() {
                 if (effectivePermissions === "Full Auto") {
                   const term = manager.terminals[targetId];
                   if (term) {
+                    HistoryManager.getInstance().addCommand(term.cwd, cmd);
                     term.writeInput(cmd);
                     session.sendToolResponse({
                       functionResponses: [{
@@ -419,14 +678,18 @@ async function startServer() {
                 } else {
                   // Human-in-the-loop intercept
                   const messageId = call.id; // use call.id as unique ID
-                  pendingApprovals[messageId] = { cmd, terminalId: targetId, callId: call.id, session };
+                  const trigUtterance = currentSessionUserUtterance || "Spoken execute command";
+                  const pSummary = manager.getPaneSummary(targetId, 5);
+                  const rationale = { trigger: trigUtterance, summary: pSummary };
+                  pendingApprovals[messageId] = { cmd, terminalId: targetId, callId: call.id, session, rationale };
                   
                   // Notify frontend to ask for approval
                   clientWs.send(JSON.stringify({
                     type: "approval_pending",
                     messageId,
                     cmd,
-                    terminalId: targetId
+                    terminalId: targetId,
+                    rationale
                   }));
                   // We do NOT send tool response here. It will be sent via /api/commands/approve API.
                 }
@@ -466,7 +729,7 @@ async function startServer() {
         },
         systemInstruction: "You are Project Janus, a voice helper controlling active terminal panes. You can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the project briefing when starting.",
         ...({
-          sessionResumption: {},
+          sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
           contextWindowCompression: {
             triggerTokens: 25000,
             slidingWindow: { targetTokens: 16000 }
@@ -579,18 +842,22 @@ async function startServer() {
     }
 
     clientWs.on("message", (data) => {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === "audio" && msg.audio) {
-        // Feed user mic to Gemini
-        if (session) {
-          try {
-            session.sendRealtimeInput({
-              audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
-            });
-          } catch (e) {
-            console.error("Error feeding user mic:", e);
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "audio" && msg.audio) {
+          // Feed user mic to Gemini
+          if (session) {
+            try {
+              session.sendRealtimeInput({
+                audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
+              });
+            } catch (e) {
+              console.error("Error feeding user mic:", e);
+            }
           }
         }
+      } catch (err) {
+        console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);
       }
     });
 
@@ -598,6 +865,13 @@ async function startServer() {
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
+      }
+      if (session) {
+        try {
+          session.close();
+        } catch (e) {
+          console.error("Error closing Gemini session on socket close:", e);
+        }
       }
       console.log("Client WS closed");
     });
@@ -617,6 +891,21 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  const shutdown = async () => {
+    console.log("Shutting down cleanly, stopping all terminals...");
+    for (const term of Object.values(manager.terminals)) {
+      try {
+        await term.stop();
+      } catch (err) {
+        console.error(`Error stopping terminal ${term.terminalId}:`, err);
+      }
+    }
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

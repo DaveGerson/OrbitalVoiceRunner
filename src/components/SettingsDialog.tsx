@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from "react";
 import { SystemSettings, CliPreset } from "../types";
+import { apiFetch } from "../utils/api";
 import { 
   X, 
   Settings, 
   Volume2, 
   Cpu, 
+  Database,
   FileCode, 
   Download, 
   Upload, 
@@ -117,6 +119,8 @@ export function SettingsDialog({
   const [idleTimeoutMs, setIdleTimeoutMs] = useState<number>(2000);
   const [defaultShellCommand, setDefaultShellCommand] = useState<string>("bash");
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
+  const [historyMaxCommands, setHistoryMaxCommands] = useState<number>(50);
+  const [historyMaxOutputLength, setHistoryMaxOutputLength] = useState<number>(5000);
 
   // Local states - Secret Key Cabinet
   const [geminiApiKey, setGeminiApiKey] = useState<string>("");
@@ -134,7 +138,7 @@ export function SettingsDialog({
   const [pendingCommands, setPendingCommands] = useState<any[]>([]);
 
   useEffect(() => {
-    fetch("/api/commands/pending")
+    apiFetch("/api/commands/pending")
       .then(res => res.json())
       .then(data => setPendingCommands(Array.isArray(data) ? data : []))
       .catch(err => console.error("Error fetching pending approvals settings modal", err));
@@ -169,6 +173,8 @@ export function SettingsDialog({
       setIdleTimeoutMs(initialSettings.advanced?.idleTimeoutMs ?? 2000);
       setDefaultShellCommand(initialSettings.advanced?.defaultShellCommand ?? "bash");
       setGlobalPermissionsMode(initialSettings.advanced?.globalPermissionsMode ?? "Inherit");
+      setHistoryMaxCommands(initialSettings.advanced?.historyMaxCommands ?? 50);
+      setHistoryMaxOutputLength(initialSettings.advanced?.historyMaxOutputLength ?? 5000);
 
       setGeminiApiKey(initialSettings.secrets?.geminiApiKey ?? "");
 
@@ -209,7 +215,9 @@ export function SettingsDialog({
         maxBufferLines,
         idleTimeoutMs,
         defaultShellCommand,
-        globalPermissionsMode
+        globalPermissionsMode,
+        historyMaxCommands,
+        historyMaxOutputLength
       },
       secrets: {
         geminiApiKey
@@ -226,7 +234,7 @@ export function SettingsDialog({
     activeTab, port, host, appUrl, voice, voiceStyle, volume, speechSpeed, isMicMuted, model,
     activeContext, localWorkspacePath, presets, webSocketUrl, latencyMode, throughputBps,
     audioBufferSize, debugLogging, connectionTimeoutMs, rateLimitRequestsPerMin, maxBufferLines,
-    idleTimeoutMs, defaultShellCommand, globalPermissionsMode, geminiApiKey
+    idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey
   ]);
 
   // Handle Saving
@@ -281,6 +289,8 @@ export function SettingsDialog({
         if (parsed.advanced.idleTimeoutMs !== undefined) setIdleTimeoutMs(parsed.advanced.idleTimeoutMs);
         if (parsed.advanced.defaultShellCommand !== undefined) setDefaultShellCommand(parsed.advanced.defaultShellCommand);
         if (parsed.advanced.globalPermissionsMode !== undefined) setGlobalPermissionsMode(parsed.advanced.globalPermissionsMode);
+        if (parsed.advanced.historyMaxCommands !== undefined) setHistoryMaxCommands(parsed.advanced.historyMaxCommands);
+        if (parsed.advanced.historyMaxOutputLength !== undefined) setHistoryMaxOutputLength(parsed.advanced.historyMaxOutputLength);
       }
       if (parsed.secrets) {
         if (parsed.secrets.geminiApiKey !== undefined) setGeminiApiKey(parsed.secrets.geminiApiKey);
@@ -615,7 +625,7 @@ export function SettingsDialog({
 
                           const matched = getMatchingTerminals(preset);
                           const numActive = matched.length;
-                          const totalCpu = matched.reduce((sum, t) => sum + (t.cpu_usage || 0), 0);
+                          const totalContextSize = matched.reduce((sum, t) => sum + (t.context_size || 0), 0);
                           const hasAlert = matched.some(t => pendingCommands.some(pc => pc.terminalId === t.id));
 
                           let statusLabel = "No Live Processes";
@@ -668,9 +678,14 @@ export function SettingsDialog({
                                   </span>
 
                                   {numActive > 0 && (
-                                    <span className="text-[8px] px-2 py-0.5 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-400 font-mono font-bold flex items-center gap-1">
-                                      <Cpu className="w-2.5 h-2.5" />
-                                      {totalCpu.toFixed(1)}% CPU
+                                    <span className="text-[8px] px-2 py-0.5 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-400 font-mono font-bold flex items-center gap-1" title="Memory Context Footprint: Raw Characters (~Estimated Tokens)">
+                                      <Database className="w-2.5 h-2.5" />
+                                      {(() => {
+                                        const chars = totalContextSize < 1000 ? `${totalContextSize} ch` : `${(totalContextSize / 1000).toFixed(1)}k ch`;
+                                        const estimatedTokens = Math.ceil(totalContextSize / 4);
+                                        const tokens = estimatedTokens < 1000 ? `${estimatedTokens} t` : `${(estimatedTokens / 1000).toFixed(1)}k t`;
+                                        return `${chars} (~${tokens})`;
+                                      })()}
                                     </span>
                                   )}
 
@@ -980,6 +995,25 @@ export function SettingsDialog({
                             <span className="text-[9px] text-zinc-500">Log websocket payloads in console</span>
                           </div>
                         </label>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 border-t border-white/5 pt-4">
+                      <div>
+                        <label className="block text-zinc-400 mb-1">Max Commands Saved per Pane</label>
+                        <input 
+                          type="number"
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
+                          value={historyMaxCommands} onChange={e => setHistoryMaxCommands(Number(e.target.value))} placeholder="50"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-zinc-400 mb-1">Max Characters Capturing stdout</label>
+                        <input 
+                          type="number"
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
+                          value={historyMaxOutputLength} onChange={e => setHistoryMaxOutputLength(Number(e.target.value))} placeholder="5000"
+                        />
                       </div>
                     </div>
                   </div>

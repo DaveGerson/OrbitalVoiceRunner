@@ -4,12 +4,17 @@ export function ApprovalDialog({
   messageId, 
   terminalId, 
   cmd, 
+  rationale,
   onApprove, 
   onReject 
 }: { 
   messageId: string; 
   terminalId: string; 
   cmd: string; 
+  rationale?: {
+    trigger: string;
+    summary: string;
+  };
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
 }) {
@@ -29,8 +34,8 @@ export function ApprovalDialog({
   }, [messageId, onApprove, onReject]);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm">
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 w-[600px] bg-[#111] border-2 border-amber-500/50 rounded-xl p-6 shadow-2xl shadow-black/80 animate-in slide-in-from-bottom-10 fade-in duration-300">
+    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-[620px] bg-[#111] border-2 border-amber-500/50 rounded-xl p-6 shadow-2xl shadow-black/80 animate-in slide-in-from-bottom-10 fade-in duration-300">
         <div className="flex items-start gap-5">
           <div className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-500/20 border border-amber-500/50 flex items-center justify-center">
             <span className="text-amber-500 font-bold text-xl">!</span>
@@ -40,9 +45,26 @@ export function ApprovalDialog({
               <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-amber-500">Proposed Command Execution</h3>
               <span className="text-[10px] font-mono opacity-40">Target: {terminalId}</span>
             </div>
+            
             <p className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">
               {cmd}
             </p>
+
+            {rationale && (
+              <div className="mb-4 space-y-2 border-l-2 border-zinc-700 pl-3">
+                <div className="text-[10px] font-mono">
+                  <span className="text-zinc-500 uppercase tracking-wider block font-bold">Heard trigger / context</span>
+                  <span className="text-zinc-300 italic">"{rationale.trigger}"</span>
+                </div>
+                <div className="text-[10px] font-mono">
+                  <span className="text-zinc-500 uppercase tracking-wider block font-bold">Proposed rationale / summary</span>
+                  <pre className="text-[9.5px] bg-black/30 p-1.5 rounded border border-white/5 text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto">
+                    {rationale.summary}
+                  </pre>
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-3">
               <button 
                 onClick={() => onApprove(messageId)}

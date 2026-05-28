@@ -7,7 +7,7 @@ export interface Terminal {
   permissions_mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   tool_preset?: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   session_id?: string;
-  cpu_usage?: number;
+  context_size?: number;
 }
 
 export interface PendingCommand {
@@ -27,7 +27,7 @@ export interface PaneMeta {
   permissions_mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   session_id: string;
   tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
-  cpu_usage: number;
+  context_size: number;
 }
 
 export interface Workspace {
@@ -85,6 +85,8 @@ export interface SystemSettings {
     idleTimeoutMs: number;
     defaultShellCommand: string;
     globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
+    historyMaxCommands?: number;
+    historyMaxOutputLength?: number;
   };
   secrets: {
     geminiApiKey: string;

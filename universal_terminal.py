@@ -21,9 +21,16 @@ class UniversalTerminal:
         self.max_buffer_lines = 100
 
     async def start(self):
-        """Starts the process based on OS type."""
-        executable = "cmd.exe" if IS_WINDOWS else "/bin/sh"
-        args = ["/c", self.shell_cmd] if IS_WINDOWS else ["-c", self.shell_cmd]
+        """Starts the process based on OS type with real PTY capabilities."""
+        if IS_WINDOWS:
+            executable = "cmd.exe"
+            args = ["/c", self.shell_cmd]
+        else:
+            executable = "script"
+            if sys.platform == "darwin":
+                args = ["-q", "/dev/null", "/bin/sh", "-c", self.shell_cmd]
+            else:
+                args = ["-q", "-f", "-c", self.shell_cmd, "/dev/null"]
 
         self.process = await asyncio.create_subprocess_exec(
             executable,

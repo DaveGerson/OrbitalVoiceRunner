@@ -11,7 +11,7 @@ export interface PaneMeta {
   permissions_mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   session_id: string;
   tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
-  cpu_usage: number;
+  context_size: number;
 }
 
 export interface Workspace {
@@ -46,15 +46,73 @@ export class Ledger {
     }
   }
 
-  private save() {
+  private isSaving = false;
+  private isDirty = false;
+  private saveTimeout: NodeJS.Timeout | null = null;
+
+  public save(sync = false) {
+    this.isDirty = true;
+    if (sync) {
+      if (this.saveTimeout) {
+        clearTimeout(this.saveTimeout);
+        this.saveTimeout = null;
+      }
+      this.flushSaveSync();
+      return;
+    }
+
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+    }
+    this.saveTimeout = setTimeout(() => {
+      this.saveTimeout = null;
+      this.flushSave().catch((err) => {
+        console.error("Async flushSave failed:", err);
+      });
+    }, 100);
+  }
+
+  public async flushSave(): Promise<void> {
+    if (!this.isDirty) return;
+    if (this.isSaving) {
+      return;
+    }
+    this.isSaving = true;
+    this.isDirty = false;
+
+    const tempPath = `${this.storagePath}.tmp`;
     try {
       const data = JSON.stringify({
         activeProjectId: this.activeProjectId,
         workspaces: this.workspaces
       }, null, 2);
-      fs.writeFileSync(this.storagePath, data, "utf-8");
+      await fs.promises.writeFile(tempPath, data, "utf-8");
+      await fs.promises.rename(tempPath, this.storagePath);
     } catch (e) {
-      console.error(`Failed to save ledger to ${this.storagePath}:`, e);
+      console.error(`Failed to save ledger atomically to ${this.storagePath}:`, e);
+      this.isDirty = true;
+    } finally {
+      this.isSaving = false;
+      if (this.isDirty) {
+        this.save();
+      }
+    }
+  }
+
+  private flushSaveSync() {
+    if (!this.isDirty) return;
+    this.isDirty = false;
+    const tempPath = `${this.storagePath}.tmp`;
+    try {
+      const data = JSON.stringify({
+        activeProjectId: this.activeProjectId,
+        workspaces: this.workspaces
+      }, null, 2);
+      fs.writeFileSync(tempPath, data, "utf-8");
+      fs.renameSync(tempPath, this.storagePath);
+    } catch (e) {
+      console.error(`Failed to save ledger atomically sync to ${this.storagePath}:`, e);
+      this.isDirty = true;
     }
   }
 
@@ -68,28 +126,28 @@ export class Ledger {
         notes: [],
         panes: {}
       };
-      this.save();
+      this.save(true);
     }
   }
 
   renameProject(id: string, name: string) {
     if (this.workspaces[id]) {
       this.workspaces[id].name = name;
-      this.save();
+      this.save(true);
     }
   }
 
   renamePane(projectId: string, paneId: string, name: string) {
     if (this.workspaces[projectId] && this.workspaces[projectId].panes[paneId]) {
       this.workspaces[projectId].panes[paneId].name = name;
-      this.save();
+      this.save(true);
     }
   }
 
   addPaneNote(projectId: string, paneId: string, note: string) {
     if (this.workspaces[projectId] && this.workspaces[projectId].panes[paneId]) {
       this.workspaces[projectId].panes[paneId].notes.push(note);
-      this.save();
+      this.save(true);
     }
   }
 
@@ -105,21 +163,23 @@ export class Ledger {
   switchContext(id: string) {
     if (this.workspaces[id]) {
       this.activeProjectId = id;
-      this.save();
+      this.save(true);
     }
   }
 
   addNote(projectId: string, note: string) {
     if (this.workspaces[projectId]) {
       this.workspaces[projectId].notes.push(note);
-      this.save();
+      this.save(true);
     }
   }
 
-  updatePane(projectId: string, paneMeta: PaneMeta) {
+  updatePane(projectId: string, paneMeta: PaneMeta, shouldSave = true) {
     if (this.workspaces[projectId]) {
       this.workspaces[projectId].panes[paneMeta.pane_id] = paneMeta;
-      this.save();
+      if (shouldSave) {
+        this.save(false);
+      }
     }
   }
 

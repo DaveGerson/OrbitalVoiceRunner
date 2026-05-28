@@ -71,7 +71,9 @@ export class UniversalTerminal {
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   public sessionId: string;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
+  public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
+  private cachedCpu = 0.0;
 
   constructor(
     terminalId: string,
@@ -79,12 +81,14 @@ export class UniversalTerminal {
     shellCmd: string,
     toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom" = "Custom",
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
-    sessionId = ""
+    sessionId = "",
+    projectId = "default_project"
   ) {
     this.terminalId = terminalId;
     this.cwd = cwd;
     this.toolPreset = toolPreset;
     this.permissionsMode = permissionsMode;
+    this.projectId = projectId;
     
     let cmd = shellCmd;
     if (toolPreset !== "Custom") {
@@ -124,12 +128,8 @@ export class UniversalTerminal {
     }
   }
 
-  get cpuUsage(): number {
-    if (this.status === "Exited") return 0.0;
-    if (this.status === "Idle") {
-      return Math.round((0.1 + Math.random() * 1.4) * 10) / 10;
-    }
-    return Math.round((14 + Math.random() * 24) * 10) / 10;
+  get contextSize(): number {
+    return this.outputBuffer.join('\n').length;
   }
 
   private checkForSessionId(text: string) {
@@ -152,31 +152,116 @@ export class UniversalTerminal {
     }
   }
 
-  private resetIdleTimer() {
+  private updateStatusOnOutput(decoded: string) {
     if (this.status === "Exited") return;
-    this.status = "Running";
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => {
-      if (this.status !== "Exited") this.status = "Idle";
-    }, 2000);
+
+    const stripped = stripAnsiSequences(decoded).trim();
+    const fullStripped = stripAnsiSequences(this.getRecentOutput(5)).trim();
+
+    // Prompts matching: ending in standard patterns
+    const inputPromptPattern = /([\?$#>]|\[[yY]\/[nN]\]|\([yY]\/[nN]\)|password:|confirm\??)\s*$/i;
+
+    if (inputPromptPattern.test(stripped) || inputPromptPattern.test(fullStripped)) {
+      this.status = "Idle";
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+    } else {
+      this.status = "Running";
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      this.idleTimer = setTimeout(() => {
+        if (this.status !== "Exited") {
+          this.status = "Idle";
+        }
+      }, 1000);
+    }
+  }
+
+  private loadScrollback() {
+    const file = `.janus_scrollback_${this.terminalId}.log`;
+    try {
+      if (fs.existsSync(file)) {
+        const data = fs.readFileSync(file, "utf-8");
+        const lines = data.split(/\r?\n/).filter(l => l.trim() !== "");
+        this.outputBuffer = lines.slice(-this.maxBufferLines);
+      }
+    } catch (e) {
+      console.warn("Failed to load scrollback:", e);
+    }
+  }
+
+  private appendScrollback(chunk: string) {
+    const file = `.janus_scrollback_${this.terminalId}.log`;
+    try {
+      fs.appendFileSync(file, chunk);
+      const stat = fs.statSync(file);
+      if (stat.size > 1024 * 512) { // 512KB limit
+        const data = fs.readFileSync(file, "utf-8");
+        const lines = data.split(/\r?\n/).filter(l => l.trim() !== "");
+        const pruned = lines.slice(-this.maxBufferLines).join("\n") + "\n";
+        fs.writeFileSync(file, pruned, "utf-8");
+      }
+    } catch (e) {
+      // ignore
+    }
   }
 
   start() {
     const isWindows = process.platform === "win32";
-    const executable = isWindows ? "cmd.exe" : "/bin/sh";
-    const args = isWindows ? ["/c", this.shellCmd] : ["-c", this.shellCmd];
+    const isDarwin = process.platform === "darwin";
+    
+    let executable: string;
+    let args: string[];
+
+    // Ensure session ID is mapped back into resume flag for actual agent/agent sessions
+    let finalCommand = this.shellCmd;
+    if (this.toolPreset !== "Custom" && this.sessionId) {
+      const resumePattern = /--resume|--session/;
+      if (!resumePattern.test(finalCommand)) {
+        finalCommand = `${finalCommand} --resume=${this.sessionId}`;
+      }
+    }
+
+    if (isWindows) {
+      executable = "cmd.exe";
+      args = ["/c", finalCommand];
+    } else {
+      // Allocate a real pseudo-terminal (PTY) using standard UNIX 'script'.
+      // Enables prompt rendering, terminal colors, and disables block output buffering.
+      executable = "script";
+      if (isDarwin) {
+        // macOS script usage: script -q /dev/null <command>
+        args = ["-q", "/dev/null", "/bin/sh", "-c", finalCommand];
+      } else {
+        // Linux script usage: script -q -f -c <command> /dev/null
+        args = ["-q", "-f", "-c", finalCommand, "/dev/null"];
+      }
+    }
+
+    // Populate historical output buffer from persistent scrollback log
+    this.loadScrollback();
 
     this.process = spawn(executable, args, {
       cwd: this.cwd,
       env: process.env,
+      detached: true,
     });
     
-    this.resetIdleTimer();
+    // Set running state and watch for idle state
+    if (this.status !== "Exited") {
+      this.status = "Running";
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      this.idleTimer = setTimeout(() => {
+        if (this.status !== "Exited") this.status = "Idle";
+      }, 1000);
+    }
 
     if (this.process.stdout) {
       this.process.stdout.on("data", (data) => {
-        this.resetIdleTimer();
         const decoded = data.toString('utf-8');
+        this.appendScrollback(decoded);
+        this.updateStatusOnOutput(decoded);
         this.checkForSessionId(decoded);
         if (this.onOutput) {
           this.onOutput(this.terminalId, decoded);
@@ -191,8 +276,9 @@ export class UniversalTerminal {
 
     if (this.process.stderr) {
       this.process.stderr.on("data", (data) => {
-        this.resetIdleTimer();
         const decoded = data.toString('utf-8');
+        this.appendScrollback(decoded);
+        this.updateStatusOnOutput(decoded);
         this.checkForSessionId(decoded);
         if (this.onOutput) {
           this.onOutput(this.terminalId, decoded);
@@ -229,10 +315,53 @@ export class UniversalTerminal {
     return this.outputBuffer.slice(-linesCount).join('\n');
   }
 
-  stop() {
-    if (this.process) {
-      this.process.kill();
+  public async stop(): Promise<void> {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    if (this.process && this.process.pid) {
+      const pid = this.process.pid;
+      const proc = this.process;
       this.process = null;
+
+      return new Promise<void>((resolve) => {
+        let resolved = false;
+        const cleanupAndResolve = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve();
+          }
+        };
+
+        proc.on("exit", cleanupAndResolve);
+        proc.on("close", cleanupAndResolve);
+
+        try {
+          // Teardown the process group cleanly
+          process.kill(-pid, "SIGTERM");
+        } catch (e) {
+          try {
+            proc.kill("SIGTERM");
+          } catch (err) {}
+          cleanupAndResolve();
+          return;
+        }
+
+        const killTimeout = setTimeout(() => {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch (e) {
+            try {
+              proc.kill("SIGKILL");
+            } catch (err) {}
+          }
+          cleanupAndResolve();
+        }, 1000);
+
+        proc.on("exit", () => clearTimeout(killTimeout));
+        proc.on("close", () => clearTimeout(killTimeout));
+      });
     }
   }
 }
@@ -281,7 +410,9 @@ export class OrchestratorManager {
         maxBufferLines: 100,
         idleTimeoutMs: 2000,
         defaultShellCommand: process.platform === "win32" ? "cmd.exe" : "bash",
-        globalPermissionsMode: "Inherit"
+        globalPermissionsMode: "Inherit",
+        historyMaxCommands: 50,
+        historyMaxOutputLength: 5000
       },
       secrets: {
         geminiApiKey: process.env.GEMINI_API_KEY ? "CONFIGURED_IN_ENV" : ""
@@ -358,12 +489,14 @@ export class OrchestratorManager {
     command: string,
     toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom" = "Custom",
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
-    sessionId = ""
+    sessionId = "",
+    projectId = ""
   ): string {
     if (this.terminals[terminalId]) {
       return `Terminal '${terminalId}' already exists.`;
     }
-    const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId);
+    const realProjId = projectId || this.ledger.activeProjectId || "default_project";
+    const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
     };
@@ -390,26 +523,28 @@ export class OrchestratorManager {
 
   // Synchronize actual terminal state to ledger
   private syncLedger() {
-    const activeProject = this.ledger.getActiveProject();
-    if (!activeProject) return;
-
     for (const [id, term] of Object.entries(this.terminals)) {
-      const existingPane = activeProject.panes[id];
-      const meta: PaneMeta = {
-        pane_id: id,
-        name: existingPane?.name || id,
-        runtime_type: existingPane?.runtime_type || "interactive_cli",
-        last_known_state: term.status === "Running" ? "Running active command" : term.status === "Idle" ? "Idle" : "Exited",
-        is_busy: term.status === "Running",
-        alive: term.status !== "Exited",
-        notes: existingPane?.notes || [],
-        permissions_mode: term.permissionsMode,
-        tool_preset: term.toolPreset,
-        session_id: term.sessionId || existingPane?.session_id || "",
-        cpu_usage: term.cpuUsage
-      };
-      this.ledger.updatePane(activeProject.id, meta);
+      const pId = term.projectId || "default_project";
+      const project = this.ledger.getProject(pId);
+      if (project) {
+        const existingPane = project.panes[id];
+        const meta: PaneMeta = {
+          pane_id: id,
+          name: existingPane?.name || id,
+          runtime_type: existingPane?.runtime_type || "interactive_cli",
+          last_known_state: term.status === "Running" ? "Running active command" : term.status === "Idle" ? "Idle" : "Exited",
+          is_busy: term.status === "Running",
+          alive: term.status !== "Exited",
+          notes: existingPane?.notes || [],
+          permissions_mode: term.permissionsMode,
+          tool_preset: term.toolPreset,
+          session_id: term.sessionId || existingPane?.session_id || "",
+          context_size: term.contextSize
+        };
+        this.ledger.updatePane(pId, meta, false);
+      }
     }
+    this.ledger.save(false);
   }
 
   getPaneSummary(paneId: string, limit = 20) {
@@ -417,7 +552,6 @@ export class OrchestratorManager {
       return `Error: Pane ${paneId} does not exist.`;
     }
     const recentOut = this.terminals[paneId].getRecentOutput(limit);
-    // Stub SDF (Semantic Delta Filter): wraps in markdown
     return `\`\`\`\n${recentOut || "[No new output]"}\n\`\`\``;
   }
 }

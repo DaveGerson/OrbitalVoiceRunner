@@ -15,6 +15,7 @@ export function pcmToBase64(pcmData: Float32Array): string {
 }
 
 let nextStartTime = 0;
+const activeSources: AudioBufferSourceNode[] = [];
 
 export function playAudioChunk(audioCtx: AudioContext, base64: string) {
   const binary = atob(base64);
@@ -41,9 +42,26 @@ export function playAudioChunk(audioCtx: AudioContext, base64: string) {
     nextStartTime = currentTime;
   }
   source.start(nextStartTime);
+  activeSources.push(source);
+
+  source.onended = () => {
+    const idx = activeSources.indexOf(source);
+    if (idx !== -1) {
+      activeSources.splice(idx, 1);
+    }
+  };
+
   nextStartTime += buffer.duration;
 }
 
 export function resetAudioPlayback() {
   nextStartTime = 0;
+  for (const source of activeSources) {
+    try {
+      source.stop();
+    } catch (e) {
+      // Ignore if finished or not started
+    }
+  }
+  activeSources.length = 0;
 }

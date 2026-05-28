@@ -1,17 +1,20 @@
+import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings } from "./types";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { Mic, MicOff, RefreshCw, Cpu, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings } from "lucide-react";
+import { TerminalView } from "./components/TerminalView";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock } from "lucide-react";
+import { apiFetch } from "./utils/api";
 
-export default function App() {
+function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
   const [ledger, setLedger] = useState<Record<string, Workspace>>({});
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
-  const [pendingCommand, setPendingCommand] = useState<PendingCommand | null>(null);
+  const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
@@ -23,16 +26,79 @@ export default function App() {
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
+  const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
+  const [showHistoryPanel, setShowHistoryPanel] = useState<boolean>(false);
+  const [historyList, setHistoryList] = useState<{ command: string; timestamp: string; output: string }[]>([]);
+  const [selectedHistoryEntry, setSelectedHistoryEntry] = useState<{ command: string; timestamp: string; output: string } | null>(null);
+
+  const fetchActiveTerminalHistory = async (terminalId: string | null = activeTerminalId) => {
+    if (!terminalId) return;
+    try {
+      const res = await apiFetch(`/api/terminals/${terminalId}/history`);
+      if (res.ok) {
+        const data = await res.json();
+        setHistoryList(data);
+      }
+    } catch (e) {
+      console.error("Failed to load terminal history:", e);
+    }
+  };
+
+  const clearActiveTerminalHistory = async () => {
+    if (!activeTerminalId) return;
+    try {
+      const res = await apiFetch(`/api/terminals/${activeTerminalId}/history/clear`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        setHistoryList([]);
+        setSelectedHistoryEntry(null);
+      }
+    } catch (e) {
+      console.error("Failed to clear terminal history:", e);
+    }
+  };
+
+  const stdoutBufferRef = useRef<Record<string, string>>({});
+  const animationFrameRef = useRef<number | null>(null);
+
+  const queueStdoutChunk = (terminalId: string, chunk: string) => {
+    stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
+    
+    if (!animationFrameRef.current) {
+      animationFrameRef.current = requestAnimationFrame(() => {
+        animationFrameRef.current = null;
+        const currentBuffers = { ...stdoutBufferRef.current };
+        stdoutBufferRef.current = {};
+
+        setTerminals((prev) =>
+          prev.map((t) => {
+            const bufMatch = currentBuffers[t.id];
+            if (bufMatch) {
+              const lines = (t.output + bufMatch).split("\n").slice(-110);
+              return { ...t, output: lines.join("\n") };
+            }
+            return t;
+          })
+        );
+      });
+    }
+  };
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const isMicMutedRef = useRef(false);
+  const desiredLiveRef = useRef(false);
+  const reconnectTimeoutRef = useRef<any>(null);
 
   const fetchTerminals = async () => {
     try {
-      const res = await fetch("/api/terminals");
+      const res = await apiFetch("/api/terminals");
       if (!res.ok) return;
       const data = await res.json();
       setTerminals(data);
@@ -43,7 +109,7 @@ export default function App() {
 
   const fetchLedger = async () => {
     try {
-      const res = await fetch("/api/ledger");
+      const res = await apiFetch("/api/ledger");
       if (!res.ok) return;
       const data = await res.json();
       setLedger(data);
@@ -52,7 +118,7 @@ export default function App() {
 
   const fetchSettings = async () => {
     try {
-      const res = await fetch("/api/settings");
+      const res = await apiFetch("/api/settings");
       if (!res.ok) return;
       const data = await res.json();
       setSettings(data);
@@ -69,7 +135,7 @@ export default function App() {
         advanced: { ...settings.advanced, globalPermissionsMode: val }
       } : { advanced: { globalPermissionsMode: val } };
 
-      const res = await fetch("/api/settings", {
+      const res = await apiFetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updatedSettings)
@@ -83,7 +149,7 @@ export default function App() {
 
   const handleSaveSettings = async (updatedSettings: SystemSettings) => {
     try {
-      const res = await fetch("/api/settings", {
+      const res = await apiFetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updatedSettings)
@@ -95,34 +161,70 @@ export default function App() {
     } catch (e) {}
   };
 
+  const fetchPendingCommands = async () => {
+    try {
+      const res = await apiFetch("/api/commands/pending");
+      if (!res.ok) return;
+      const data = await res.json();
+      setPendingCommands(data);
+    } catch (e) {}
+  };
+
   useEffect(() => {
     fetchTerminals();
     fetchLedger();
     fetchSettings();
-    const interval = setInterval(fetchTerminals, 3000);
+    fetchPendingCommands();
+    const interval = setInterval(() => {
+      fetchTerminals();
+      fetchPendingCommands();
+    }, 3000);
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    isMicMutedRef.current = isMicMuted;
+  }, [isMicMuted]);
+
+  useEffect(() => {
+    if (activeTerminalId) {
+      fetchActiveTerminalHistory(activeTerminalId);
+    }
+  }, [activeTerminalId]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+    if (showHistoryPanel && activeTerminalId) {
+      fetchActiveTerminalHistory(activeTerminalId);
+      interval = setInterval(() => {
+        fetchActiveTerminalHistory(activeTerminalId);
+      }, 5000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [showHistoryPanel, activeTerminalId]);
+
   const handleApprove = async (messageId: string) => {
     try {
-      await fetch("/api/commands/approve", {
+      await apiFetch("/api/commands/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messageId, approved: true })
       });
-      setPendingCommand(null);
+      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
       setTimeout(fetchTerminals, 500);
     } catch (e) {}
   };
 
   const handleReject = async (messageId: string) => {
     try {
-      await fetch("/api/commands/approve", {
+      await apiFetch("/api/commands/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messageId, approved: false })
       });
-      setPendingCommand(null);
+      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
     } catch (e) {}
   };
 
@@ -134,7 +236,7 @@ export default function App() {
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only"
   ) => {
     try {
-      await fetch("/api/terminals", {
+      await apiFetch("/api/terminals", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -154,7 +256,7 @@ export default function App() {
 
   const handleRestartTerminal = async (id: string) => {
     try {
-      await fetch(`/api/terminals/${id}/restart`, {
+      await apiFetch(`/api/terminals/${id}/restart`, {
         method: "POST"
       });
       fetchTerminals();
@@ -164,7 +266,7 @@ export default function App() {
 
   const handleUpdatePermissions = async (paneId: string, val: string) => {
     try {
-      await fetch(`/api/projects/${activeProjectId}/panes/${paneId}/permissions`, {
+      await apiFetch(`/api/projects/${activeProjectId}/panes/${paneId}/permissions`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ permissions: val })
@@ -174,7 +276,40 @@ export default function App() {
     } catch (e) {}
   };
 
-  const startLive = async () => {
+  const cleanupSocketOnly = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {}
+      wsRef.current = null;
+    }
+    if (processorRef.current) {
+      try {
+        processorRef.current.disconnect();
+      } catch (e) {}
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      try {
+        sourceRef.current.disconnect();
+      } catch (e) {}
+      sourceRef.current = null;
+    }
+    if (streamRef.current) {
+      try {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch (e) {}
+      audioCtxRef.current = null;
+    }
+  };
+
+  const connectLive = async () => {
     try {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${protocol}//${window.location.host}/live`;
@@ -187,23 +322,28 @@ export default function App() {
 
       ws.onopen = async () => {
         setIsLive(true);
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        streamRef.current = stream;
-        
-        const source = audioCtx.createMediaStreamSource(stream);
-        sourceRef.current = source;
-        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-        
-        source.connect(processor);
-        processor.connect(audioCtx.destination);
+        setIsReconnecting(false);
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          streamRef.current = stream;
+          
+          const source = audioCtx.createMediaStreamSource(stream);
+          sourceRef.current = source;
+          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
+          
+          source.connect(processor);
+          processor.connect(audioCtx.destination);
 
-        processor.onaudioprocess = (e) => {
-          if (ws.readyState === WebSocket.OPEN && !isMicMuted) {
-            const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
-            ws.send(JSON.stringify({ type: "audio", audio: base64 }));
-          }
-        };
+          processor.onaudioprocess = (e) => {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
+              const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
+              wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
+            }
+          };
+        } catch (mediaErr) {
+          console.error("Microphone streaming failed to start:", mediaErr);
+        }
       };
 
       ws.onmessage = (event) => {
@@ -213,10 +353,14 @@ export default function App() {
         } else if (msg.type === "interrupted") {
           resetAudioPlayback();
         } else if (msg.type === "approval_pending") {
-          setPendingCommand({
-            messageId: msg.messageId,
-            cmd: msg.cmd,
-            terminalId: msg.terminalId
+          setPendingCommands(prev => {
+            if (prev.some(pc => pc.messageId === msg.messageId)) return prev;
+            return [...prev, {
+              messageId: msg.messageId,
+              cmd: msg.cmd,
+              terminalId: msg.terminalId,
+              rationale: msg.rationale
+            }];
           });
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
@@ -235,50 +379,70 @@ export default function App() {
           setBlockedNotification({ terminalId: msg.terminalId, cmd: msg.cmd, reason: msg.reason });
           setTimeout(() => setBlockedNotification(null), 4000);
         } else if (msg.type === "stdout_chunk") {
-          // Live, latency-free updates! Feed chunks directly to the UI
-          setTerminals((prev) =>
-            prev.map((t) => {
-              if (t.id === msg.terminalId) {
-                const lines = (t.output + msg.chunk).split("\n").slice(-40);
-                return { ...t, output: lines.join("\n") };
-              }
-              return t;
-            })
-          );
+          queueStdoutChunk(msg.terminalId, msg.chunk);
+        } else if (msg.type === "transcript_text") {
+          setTranscript((prev) => [
+            ...prev,
+            { sender: msg.sender, text: msg.text, timestamp: new Date() }
+          ].slice(-50));
         }
       };
 
-      ws.onclose = () => {
-        stopLive();
+      ws.onclose = (event) => {
+        cleanupSocketOnly();
+        
+        // Adaptive auto-reconnection if closure was unexpected from server-side or connection drops
+        if (desiredLiveRef.current) {
+          setIsLive(true);
+          setIsReconnecting(true);
+          
+          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (desiredLiveRef.current) {
+              connectLive();
+            }
+          }, 3000);
+        } else {
+          setIsLive(false);
+          setIsReconnecting(false);
+        }
       };
     } catch (e) {
-      console.error(e);
-      stopLive();
+      console.error("Connection establish failed:", e);
+      cleanupSocketOnly();
+      if (desiredLiveRef.current) {
+        setIsLive(true);
+        setIsReconnecting(true);
+        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (desiredLiveRef.current) connectLive();
+        }, 3000);
+      } else {
+        setIsLive(false);
+        setIsReconnecting(false);
+      }
     }
   };
 
+  const startLive = async () => {
+    desiredLiveRef.current = true;
+    setIsReconnecting(false);
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    await connectLive();
+  };
+
   const stopLive = () => {
+    desiredLiveRef.current = false;
     setIsLive(false);
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+    setIsReconnecting(false);
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
-    }
+    cleanupSocketOnly();
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
@@ -302,10 +466,10 @@ export default function App() {
       onSubmit: async (val) => {
         if (!val.trim()) return;
         const normId = val.trim().toLowerCase().replace(/\s+/g, "_");
-        await fetch("/api/projects", {
+        await apiFetch("/api/projects", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: normId, directory: process.cwd(), summary: "Custom Registered Context" })
+          body: JSON.stringify({ id: normId, directory: ".", summary: "Custom Registered Context" })
         });
         setPromptDialog(null);
         handleSwitchProject(normId);
@@ -314,7 +478,7 @@ export default function App() {
   };
 
   const handleSwitchProject = async (id: string) => {
-    await fetch(`/api/projects/${id}/switch`, { method: "POST" });
+    await apiFetch(`/api/projects/${id}/switch`, { method: "POST" });
     setActiveProjectId(id);
     setActiveTerminalId(null);
     fetchLedger();
@@ -327,7 +491,7 @@ export default function App() {
       placeholder: "SURE",
       onSubmit: async (val) => {
         if (val.trim() !== "SURE") return;
-        await fetch(`/api/projects/${id}`, { method: "DELETE" });
+        await apiFetch(`/api/projects/${id}`, { method: "DELETE" });
         setPromptDialog(null);
         fetchLedger();
         setActiveTerminalId(null);
@@ -337,7 +501,7 @@ export default function App() {
   };
 
   const handleDeletePanePrompt = async (projId: string, paneId: string) => {
-    await fetch(`/api/projects/${projId}/panes/${paneId}`, { method: "DELETE" });
+    await apiFetch(`/api/projects/${projId}/panes/${paneId}`, { method: "DELETE" });
     fetchLedger();
     if (activeTerminalId === paneId) {
       setActiveTerminalId(null);
@@ -350,7 +514,7 @@ export default function App() {
       title: "Rename Project", placeholder: current,
       onSubmit: async (val) => {
         if (!val.trim()) return;
-        await fetch(`/api/projects/${id}/rename`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: val}) });
+        await apiFetch(`/api/projects/${id}/rename`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: val}) });
         setPromptDialog(null);
         fetchLedger();
       }
@@ -362,7 +526,7 @@ export default function App() {
       title: "Add Project Note", placeholder: "Note...",
       onSubmit: async (val) => {
         if (!val.trim()) return;
-        await fetch(`/api/projects/${id}/notes`, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: val}) });
+        await apiFetch(`/api/projects/${id}/notes`, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: val}) });
         setPromptDialog(null);
         fetchLedger();
       }
@@ -374,7 +538,7 @@ export default function App() {
       title: "Rename Pane", placeholder: current,
       onSubmit: async (val) => {
         if (!val.trim()) return;
-        await fetch(`/api/projects/${projId}/panes/${paneId}/rename`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: val}) });
+        await apiFetch(`/api/projects/${projId}/panes/${paneId}/rename`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: val}) });
         setPromptDialog(null);
         fetchLedger();
       }
@@ -386,7 +550,7 @@ export default function App() {
       title: "Add Pane Note", placeholder: "Note...",
       onSubmit: async (val) => {
         if (!val.trim()) return;
-        await fetch(`/api/projects/${projId}/panes/${paneId}/notes`, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: val}) });
+        await apiFetch(`/api/projects/${projId}/panes/${paneId}/notes`, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({note: val}) });
         setPromptDialog(null);
         fetchLedger();
       }
@@ -396,7 +560,7 @@ export default function App() {
   const handleAddPaneNoteInline = async (projId: string, paneId: string) => {
     const rawNote = newNoteInputs[paneId];
     if (!rawNote || !rawNote.trim()) return;
-    await fetch(`/api/projects/${projId}/panes/${paneId}/notes`, {
+    await apiFetch(`/api/projects/${projId}/panes/${paneId}/notes`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note: rawNote.trim() })
@@ -438,6 +602,16 @@ export default function App() {
 
   const activeProject = projectList.find(p => p.id === activeProjectId);
 
+  const totalContextSize = activeProject && activeProject.panes
+    ? Object.values(activeProject.panes).reduce((sum, pane) => {
+        const term = terminals.find(t => t.id === pane.pane_id);
+        const size = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+        return sum + size;
+      }, 0)
+    : 0;
+
+  const totalTokensEstimated = Math.ceil(totalContextSize / 4);
+
   return (
     <div className="flex flex-col h-screen w-full bg-[#050505] text-[#e0e0e0] font-sans overflow-hidden border-t-4 border-[#121212]">
       {showCreateModal && (
@@ -456,11 +630,11 @@ export default function App() {
         />
       )}
       
-      {pendingCommand && (
+      {pendingCommands.length > 0 && (
         <ApprovalDialog 
-          messageId={pendingCommand.messageId}
-          terminalId={pendingCommand.terminalId}
-          cmd={pendingCommand.cmd}
+          messageId={pendingCommands[0].messageId}
+          terminalId={pendingCommands[0].terminalId}
+          cmd={pendingCommands[0].cmd}
           onApprove={handleApprove}
           onReject={handleReject}
         />
@@ -490,7 +664,11 @@ export default function App() {
       {/* Header */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-black/40 backdrop-blur-md">
         <div className="flex items-center gap-4">
-          <div className={`w-3 h-3 rounded-full ${isLive ? 'bg-cyan-400 animate-pulse' : 'bg-zinc-600'}`}></div>
+          <div className={`w-3 h-3 rounded-full ${
+            isLive 
+              ? (isReconnecting ? 'bg-amber-500 animate-pulse' : 'bg-cyan-400 animate-pulse') 
+              : 'bg-zinc-600'
+          }`}></div>
           <h1 className="font-serif italic text-xl tracking-wide text-white flex items-center gap-2">
             Orbital Harness <span className="text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
           </h1>
@@ -542,10 +720,62 @@ export default function App() {
           <div className="w-px h-8 bg-white/10"></div>
           <div className="flex flex-col">
             <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest">Gemini Voice</span>
-            <span className={`text-xs font-mono ${isLive ? (isMicMuted ? 'text-amber-400' : 'text-green-400') : 'text-zinc-600'}`}>
-              {isLive ? (isMicMuted ? 'MUTED' : 'LISTENING...') : 'OFFLINE'}
+            <span className={`text-xs font-mono ${
+              isLive 
+                ? (isReconnecting 
+                    ? 'text-amber-500 animate-pulse' 
+                    : (isMicMuted ? 'text-amber-400' : 'text-green-400')) 
+                : 'text-zinc-600'
+            }`}>
+              {isLive 
+                ? (isReconnecting 
+                    ? 'RECONNECTING...' 
+                    : (isMicMuted ? 'MUTED' : 'LISTENING...')) 
+                : 'OFFLINE'}
             </span>
           </div>
+          <div className="w-px h-8 bg-white/10"></div>
+          <div className="flex flex-col items-end">
+            <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest flex items-center gap-1 leading-none select-none">
+              <Database className="w-2.5 h-2.5 text-cyan-400" />
+              Rigorous Context Memory
+            </span>
+            <div className="flex items-center gap-2 mt-1 leading-none select-none">
+              <span className={`text-xs font-mono font-black ${
+                totalContextSize > 80000 ? 'text-red-400 animate-pulse font-extrabold' : totalContextSize > 40000 ? 'text-amber-400 font-bold' : 'text-cyan-400'
+              }`}>
+                {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`}
+              </span>
+              <span className="text-[9px] font-mono opacity-40">
+                (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+              </span>
+            </div>
+            {/* Context overload bar */}
+            <div className="w-24 h-1 bg-zinc-950 rounded-full overflow-hidden mt-1.5" title="Aggregated Sandbox Overload Threshold Indicator">
+              <div 
+                className={`h-full transition-all duration-500 ${
+                  totalContextSize > 80000 ? 'bg-red-500 shadow-[0_0_8px_#ef4444]' : totalContextSize > 40000 ? 'bg-amber-500' : 'bg-cyan-500'
+                }`}
+                style={{ width: `${Math.min((totalContextSize / 100000) * 100, 100)}%` }}
+              ></div>
+            </div>
+          </div>
+          <div className="w-px h-8 bg-white/10"></div>
+          <button 
+            onClick={() => setShowTranscriptPanel(!showTranscriptPanel)}
+            className={`p-1.5 px-3 hover:bg-cyan-500/10 border transition-all rounded hover:text-cyan-400 focus:outline-none flex items-center justify-center cursor-pointer gap-1.5 shrink-0 ${
+              showTranscriptPanel 
+                ? "bg-cyan-500/15 border-cyan-500/40 text-cyan-400" 
+                : "bg-white/5 border-white/10 text-zinc-400"
+            }`}
+            title="Toggle Operator Conversation Transcript Log"
+          >
+            <span className="relative flex h-2.5 w-2.5">
+              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${transcript.length > 0 ? "bg-cyan-400" : "bg-zinc-400"}`}></span>
+              <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${transcript.length > 0 ? "bg-cyan-500" : "bg-zinc-600"}`}></span>
+            </span>
+            <span className="text-[10px] font-mono uppercase tracking-[0.1em] font-bold">Transcripts ({transcript.length})</span>
+          </button>
           <div className="w-px h-8 bg-white/10"></div>
           <button 
             onClick={() => setShowSettingsModal(true)}
@@ -622,7 +852,7 @@ export default function App() {
                       {Object.values(project.panes).map((pane) => {
                         const isActive = activeTerminalId === pane.pane_id;
                         const term = terminals.find(t => t.id === pane.pane_id);
-                        const isAlertActive = pendingCommand && pendingCommand.terminalId === pane.pane_id;
+                        const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
                         let statusColor = "bg-zinc-600";
                         
                         if (isAlertActive) {
@@ -697,33 +927,150 @@ export default function App() {
         <section className="flex-1 flex flex-col bg-[#0b0b0b] min-w-0">
           {activeTerminalId && activeTerminal ? (
             /* Terminal View */
-            <div className="flex flex-1 flex-col overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
-                <div className="flex gap-2 items-center overflow-hidden">
-                  <span className="text-[10px] font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
-                    {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
-                  </span>
-                  <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate" title={activeTerminal.command}>
-                    $ {activeTerminal.command}
-                  </span>
+            <div className="flex flex-1 flex-row overflow-hidden">
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
+                  <div className="flex gap-2 items-center overflow-hidden">
+                    <span className="text-[10px] font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
+                      {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
+                    </span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate" title={activeTerminal.command}>
+                      $ {activeTerminal.command}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-[10px] font-mono opacity-40 truncate" title={activeTerminal.cwd}>
+                      {activeTerminal.cwd}
+                    </span>
+                    <button
+                      onClick={() => {
+                        const nextState = !showHistoryPanel;
+                        setShowHistoryPanel(nextState);
+                        if (nextState) {
+                          fetchActiveTerminalHistory();
+                        }
+                      }}
+                      className={`p-1.5 hover:bg-white/5 rounded transition-colors ${showHistoryPanel ? "text-cyan-400 bg-white/5" : "text-zinc-400 hover:text-white"}`}
+                      title="Toggle Command History Pane"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={() => handleRestartTerminal(activeTerminal.id)}
+                      className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                      title="Restart Node Engine"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
-                <div className="flex items-center gap-4">
-                  <span className="text-[10px] font-mono opacity-40 truncate" title={activeTerminal.cwd}>
-                    {activeTerminal.cwd}
-                  </span>
-                  <button
-                    onClick={() => handleRestartTerminal(activeTerminal.id)}
-                    className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
-                    title="Restart Node Engine"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  </button>
+                <div className="flex-1 p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
+                  <TerminalView key={activeTerminal.id} output={activeTerminal.output} />
                 </div>
               </div>
-              <div className="flex-1 p-6 font-mono text-xs overflow-y-auto text-[#b4b4b4] leading-relaxed bg-[#060606]">
-                <pre className="whitespace-pre-wrap break-all break-words">{activeTerminal.output}</pre>
-                <div className="mt-2 text-cyan-400 animate-pulse">_</div>
-              </div>
+
+              {/* Collapsible History Sidebar Panel */}
+              {showHistoryPanel && (
+                <aside className="w-80 border-l border-white/5 bg-[#090909] flex flex-col shrink-0 overflow-hidden">
+                  <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
+                    <div className="flex items-center gap-2">
+                      <History className="w-4 h-4 text-cyan-400 shrink-0" />
+                      <span className="text-[11px] font-mono tracking-wider text-white uppercase font-bold">Local Pane History</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => fetchActiveTerminalHistory()}
+                        className="p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                        title="Reload History"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                      </button>
+                      <button 
+                        onClick={clearActiveTerminalHistory} 
+                        className="text-[9px] uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none flex items-center gap-1"
+                        title="Clear command history"
+                      >
+                        <Trash2 className="w-2.5 h-2.5" /> Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 flex flex-col overflow-hidden">
+                    {/* Commands List Area */}
+                    <div className="flex-1 overflow-y-auto p-4 space-y-2.5 scrollbar-thin border-b border-white/5">
+                      {historyList.length === 0 ? (
+                        <div className="h-full flex flex-col items-center justify-center text-center p-4">
+                          <History className="w-6 h-6 text-zinc-700 mb-2" />
+                          <p className="text-[10px] font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
+                            No commands recorded in .janus_history.json
+                          </p>
+                        </div>
+                      ) : (
+                        [...historyList].reverse().map((entry, idx) => (
+                          <div 
+                            key={idx}
+                            onClick={() => setSelectedHistoryEntry(selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp === entry.timestamp ? null : entry)}
+                            className={`group border rounded p-2.5 font-mono cursor-pointer transition-all duration-200 text-left ${
+                              selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp === entry.timestamp
+                                ? "border-cyan-500/40 bg-cyan-950/[0.08]" 
+                                : "border-white/5 bg-[#121212] hover:border-white/10"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <span className="text-[9px] text-zinc-500 flex items-center gap-1 shrink-0">
+                                <Clock className="w-3 h-3 opacity-60" />
+                                {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                              </span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigator.clipboard.writeText(entry.command);
+                                }}
+                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-opacity duration-200"
+                                title="Copy command"
+                              >
+                                <Clipboard className="w-3 h-3" />
+                              </button>
+                            </div>
+                            
+                            <div className="text-[11px] text-zinc-200 break-all font-semibold mt-1 bg-black/40 px-2 py-1.5 rounded border border-white/5 select-text">
+                              $ {entry.command}
+                            </div>
+
+                            {entry.output && (
+                              <div className="mt-2 flex items-center justify-between text-[8px] text-cyan-500/80 uppercase tracking-widest leading-none">
+                                <span>{selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp === entry.timestamp ? "▲ Hide stdout" : "▼ Read stdout context"}</span>
+                                <span className="opacity-40">{entry.output.length} Chars</span>
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+
+                    {/* Selected stdout reading pane */}
+                    {selectedHistoryEntry && (
+                      <div className="h-1/2 flex flex-col bg-black/60 border-t border-white/5 overflow-hidden shrink-0">
+                        <div className="px-3 py-1.5 border-b border-white/5 bg-[#141414] flex items-center justify-between">
+                          <span className="text-[9px] font-mono text-cyan-400 font-bold uppercase tracking-widest">Stdout capture context</span>
+                          <button
+                            onClick={() => {
+                              navigator.clipboard.writeText(selectedHistoryEntry.output);
+                            }}
+                            className="p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                            title="Copy captured context"
+                          >
+                            <Clipboard className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <div className="flex-1 overflow-auto p-3 font-mono text-[10px] text-zinc-400 leading-normal scrollbar-thin select-text whitespace-pre-wrap selection:bg-cyan-500/30 selection:text-white">
+                          {selectedHistoryEntry.output || "No output captured for this command."}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </aside>
+              )}
             </div>
           ) : (
             /* Dashboard High-Level View */
@@ -743,7 +1090,7 @@ export default function App() {
                   {Object.values(activeProject.panes).map((pane) => {
                     const term = terminals.find(t => t.id === pane.pane_id);
                     const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
-                    const cpu = term?.cpu_usage !== undefined ? term.cpu_usage : (pane.cpu_usage || 0);
+                    const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
 
                     // Badge colors
                     let primaryColorClass = "border-zinc-800 text-zinc-400";
@@ -761,11 +1108,12 @@ export default function App() {
                       bgHover = "hover:border-cyan-500/50";
                     }
 
-                    const isAlertActive = pendingCommand && pendingCommand.terminalId === pane.pane_id;
+                    const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
                     const finalStatus = isAlertActive ? "Alert (Awaiting Approval)" : status;
 
-                    // CPU health color
-                    const cpuColor = cpu > 70 ? "bg-red-500" : cpu > 30 ? "bg-amber-500" : "bg-cyan-500";
+                    // Context memory warnings/colors
+                    const contextPercent = Math.min((contextSize / 20000) * 100, 100);
+                    const contextColor = contextSize > 15000 ? "bg-red-500" : contextSize > 8000 ? "bg-amber-500" : "bg-cyan-500";
 
                     return (
                       <div 
@@ -805,7 +1153,7 @@ export default function App() {
                             <div className="mb-4 bg-amber-500/10 border border-amber-500/25 rounded p-2.5 font-mono text-[10px] text-amber-300 animate-pulse">
                               <span className="font-bold block text-amber-400">🚨 AGENT DISPATCHED WARNING:</span>
                               <span className="block mt-1 font-mono text-[9.5px] text-white break-all bg-black/50 p-1.5 rounded border border-white/5">
-                                {pendingCommand.cmd}
+                                {pendingCommands.find(cmd => cmd.terminalId === pane.pane_id)?.cmd}
                               </span>
                               <span className="block mt-1.5 text-[8.5px] opacity-75">
                                 Execute with voice "Confirm" or hit the approve trigger below.
@@ -813,14 +1161,16 @@ export default function App() {
                             </div>
                           )}
 
-                          {/* CPU Meter */}
+                          {/* Pane Context Size Meter */}
                           <div className="space-y-1 mb-4">
                             <div className="flex justify-between items-center text-[10px] font-mono text-zinc-400">
-                              <span className="flex items-center gap-1"><Cpu className="w-3 h-3" /> CPU Load</span>
-                              <span>{cpu.toFixed(1)}%</span>
+                              <span className="flex items-center gap-1 text-cyan-400"><Database className="w-3 h-3" /> Context Memory</span>
+                              <span>
+                                {contextSize < 1000 ? `${contextSize} Chars` : `${(contextSize / 1000).toFixed(1)}k Chars`} (~{Math.ceil(contextSize / 4)} Tokens)
+                              </span>
                             </div>
-                            <div className="w-full h-1 bg-zinc-950 rounded overflow-hidden">
-                              <div className={`h-full ${cpuColor} transition-all duration-500`} style={{ width: `${Math.min(cpu, 100)}%` }}></div>
+                            <div className="w-full h-1 bg-zinc-950 rounded overflow-hidden" title="Relative fill up to 20k characters memory threshold">
+                              <div className={`h-full ${contextColor} transition-all duration-500`} style={{ width: `${contextPercent}%` }}></div>
                             </div>
                           </div>
 
@@ -1047,8 +1397,8 @@ export default function App() {
                                   <span>Policy: <span className="text-zinc-400">{pane.permissions_mode}</span></span>
                                 </div>
                                 <div className="flex justify-between">
-                                  <span className="truncate max-w-[180px]">Session ID: <span className="text-zinc-400 text-[9px]">{pane.session_id || "None"}</span></span>
-                                  <span>Cpu: <span className="text-zinc-400">{pane.cpu_usage || 0}%</span></span>
+                                  <span className="truncate max-w-[140px]">Session ID: <span className="text-zinc-400 text-[9px]">{pane.session_id || "None"}</span></span>
+                                  <span>Context: <span className="text-cyan-400 text-[10px] font-bold">{pane.context_size < 1000 ? `${pane.context_size} Chars` : `${(pane.context_size / 1000).toFixed(1)}k Chars`}</span></span>
                                 </div>
                                 {!isLiveProcess && (
                                   <div className="pt-1.5 flex justify-end">
@@ -1076,13 +1426,68 @@ export default function App() {
             </div>
           )}
         </section>
+
+        {/* Right side Transcript Log Panel */}
+        {showTranscriptPanel && (
+          <aside className="w-80 border-l border-white/5 bg-[#090909] flex flex-col shrink-0">
+            <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
+              <div className="flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                <span className="text-[11px] font-mono tracking-wider text-white uppercase font-bold">Janus Voice Log</span>
+              </div>
+              <button 
+                onClick={() => setTranscript([])} 
+                className="text-[9px] uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none"
+                title="Clear transcript history"
+              >
+                Clear
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 space-y-3.5 scrollbar-thin">
+              {transcript.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center p-4">
+                  <div className="w-8 h-8 rounded-full border border-white/5 flex items-center justify-center text-zinc-600 mb-2 font-mono text-xs select-none">?</div>
+                  <p className="text-[10px] font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
+                    Speak to Janus or trigger a query to stream transcripts...
+                  </p>
+                </div>
+              ) : (
+                transcript.map((item, idx) => {
+                  const isUser = item.sender === "User";
+                  return (
+                    <div 
+                      key={idx} 
+                      className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
+                    >
+                      <span className="text-[9px] font-mono opacity-30 mb-0.5 select-none uppercase">
+                        {item.sender}
+                      </span>
+                      <div className={`p-2.5 rounded-lg text-xs leading-relaxed font-sans ${
+                        isUser 
+                          ? "bg-zinc-850 text-zinc-200 rounded-tr-none border border-white/5" 
+                          : "bg-cyan-950/25 border border-cyan-500/20 text-cyan-200 rounded-tl-none pr-3"
+                      }`}>
+                        {item.text}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+            <div className="p-3 border-t border-white/5 bg-black/40 text-[9px] font-mono text-zinc-500 leading-normal select-none">
+              Derived from client mic input PCM streaming mapping at 16,000 Hz.
+            </div>
+          </aside>
+        )}
       </main>
 
       {/* System Bar */}
       <div className="bg-black border-t border-white/5 px-6 py-2 flex justify-between items-center shrink-0">
         <div className="flex gap-6">
           <span className="text-[10px] font-mono opacity-30">UPTIME: ACTIVE DETECTED</span>
-          <span className="text-[10px] font-mono opacity-30">TOKEN USE: ADAPTIVE GRID</span>
+          <span className="text-[10px] font-mono text-cyan-400 font-bold tracking-wider">
+            CUMULATIVE CONTEXT SIZE: {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`} (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+          </span>
         </div>
         <div className="flex gap-4">
           <span className="text-[10px] font-mono text-cyan-400">[CORE CLOUD SYSTEMS ONLINE]</span>
@@ -1090,5 +1495,66 @@ export default function App() {
         </div>
       </div>
     </div>
+  );
+}
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState;
+  props: ErrorBoundaryProps;
+
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.props = props;
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("[CRITICAL FRONTEND FAULT]", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#060606] text-white flex flex-col items-center justify-center p-6 font-mono select-none">
+          <div className="w-full max-w-md bg-red-950/20 border border-red-500/30 rounded p-6 shadow-2xl relative animate-in zoom-in duration-250">
+            <div className="absolute top-3 right-3 text-[9px] bg-red-500 text-black px-1.5 rounded font-bold">FAULT</div>
+            <h1 className="text-sm font-bold uppercase tracking-wider text-red-400 mb-4 flex items-center gap-2">
+              ⚠️ Critical Sandbox Error
+            </h1>
+            <p className="text-xs text-zinc-400 leading-relaxed mb-4">
+              The Antigravity application engine encountered an unhandled execution exception. This sandbox remains active.
+            </p>
+            <div className="bg-black/60 p-3 rounded text-[10px] text-zinc-500 overflow-x-auto break-all border border-white/5 max-h-40 mb-6 font-mono leading-relaxed">
+              {this.state.error?.stack || this.state.error?.message || "Unknown Runtime Exception"}
+            </div>
+            <button
+              onClick={() => window.location.reload()}
+              className="w-full text-center py-2 bg-red-500 text-black hover:bg-red-400 text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer focus:outline-none"
+            >
+              Reboot Application View
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppRaw />
+    </ErrorBoundary>
   );
 }
