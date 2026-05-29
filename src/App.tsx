@@ -185,6 +185,9 @@ function AppRaw() {
   // Grid view display mode: detailed dashboard vs compact row list vs video wall layout
   const [gridDisplayMode, setGridDisplayMode] = useState<"detailed" | "compact" | "videowall">("compact");
 
+  // Simplicity Mode / Focus View toggler for a clean, non-overloaded experience
+  const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
+
   // Fetch Synchronous Prompt Buffer Initial State
   const fetchPromptBuffer = async () => {
     try {
@@ -2227,52 +2230,71 @@ function AppRaw() {
             <h1 className="font-serif italic text-lg lg:text-xl tracking-wide text-white flex items-center gap-2 select-none">
               Orbital Harness <span className="text-[10px] lg:text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
             </h1>
-          </div>
 
-          {/* Glowing Header Telemetry Strip */}
-          <div className="flex items-center gap-3 bg-black/60 px-3 py-1.5 rounded-lg border border-white/15 select-none font-mono">
-            {/* Active workers indicator */}
-            <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-              <span className="text-[10px] text-zinc-400 font-bold uppercase">
-                {terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes || {}).filter(p => p.alive).length} RUNNING
-              </span>
-            </div>
-
-            <div className="w-px h-3 bg-white/10"></div>
-
-            {/* Verification trigger alerts */}
-            <div 
-              className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
+            {/* Simplicity Toggle Switch */}
+            <button
               onClick={() => {
-                setActiveRightHelperTab("alerts");
+                setIsSimpleMode(!isSimpleMode);
                 playEarcon("chime");
               }}
-              title="Click to view pending verification commands in Alerts queue"
+              className={`px-2.5 py-1 text-[9.5px] uppercase font-mono rounded tracking-wider flex items-center gap-1.5 transition-all select-none border cursor-pointer font-bold ${
+                isSimpleMode 
+                  ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.1)]" 
+                  : "bg-white/5 border-white/5 text-zinc-500 hover:text-zinc-300 hover:border-white/10"
+              }`}
+              title="Toggle between Focus Mode (clean and simple UI) and Dev Mode (high density metrics analysis)"
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${pendingCommands.length > 0 ? "bg-amber-500 shadow-[0_0_6px_#f59e0b] animate-ping" : "bg-zinc-700"}`}></span>
-              <span className={`text-[10px] font-extrabold uppercase ${pendingCommands.length > 0 ? "text-amber-400" : "text-zinc-500"}`}>
-                {pendingCommands.length} VERIFY
-              </span>
-            </div>
-
-            <div className="w-px h-3 bg-white/10"></div>
-
-            {/* Unread Alerts count */}
-            <div 
-              className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
-              onClick={() => {
-                setActiveRightHelperTab("alerts");
-                playEarcon("chime");
-              }}
-              title="Click to view and triage live system attention alarms"
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "bg-red-500 shadow-[0_0_6px_#ef4444] animate-pulse" : "bg-zinc-700"}`}></span>
-              <span className={`text-[10px] font-extrabold uppercase ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "text-red-400 font-black animate-pulse" : "text-zinc-500"}`}>
-                {attentionQueue.filter(item => !item.dismissed).length} ALERTS
-              </span>
-            </div>
+              <div className={`w-1.5 h-1.5 rounded-full ${isSimpleMode ? "bg-cyan-400 animate-pulse" : "bg-zinc-650"}`} />
+              {isSimpleMode ? "Focus Mode" : "Dev Mode"}
+            </button>
           </div>
+
+          {/* Glowing Header Telemetry Strip - simplified in simple mode unless alarms are active */}
+          {(!isSimpleMode || pendingCommands.length > 0 || attentionQueue.filter(item => !item.dismissed).length > 0) && (
+            <div className="flex items-center gap-3 bg-black/60 px-3 py-1.5 rounded-lg border border-white/15 select-none font-mono">
+              {/* Active workers indicator */}
+              <div className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                <span className="text-[10px] text-zinc-400 font-bold uppercase">
+                  {terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes || {}).filter(p => p.alive).length} RUNNING
+                </span>
+              </div>
+
+              <div className="w-px h-3 bg-white/10"></div>
+
+              {/* Verification trigger alerts */}
+              <div 
+                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
+                onClick={() => {
+                  setActiveRightHelperTab("alerts");
+                  playEarcon("chime");
+                }}
+                title="Click to view pending verification commands in Alerts queue"
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${pendingCommands.length > 0 ? "bg-amber-500 shadow-[0_0_6px_#f59e0b] animate-ping" : "bg-zinc-700"}`}></span>
+                <span className={`text-[10px] font-extrabold uppercase ${pendingCommands.length > 0 ? "text-amber-400 font-black animate-pulse" : "text-zinc-500"}`}>
+                  {pendingCommands.length} VERIFY
+                </span>
+              </div>
+
+              <div className="w-px h-3 bg-white/10"></div>
+
+              {/* Unread Alerts count */}
+              <div 
+                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
+                onClick={() => {
+                  setActiveRightHelperTab("alerts");
+                  playEarcon("chime");
+                }}
+                title="Click to view and triage live system attention alarms"
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "bg-red-500 shadow-[0_0_6px_#ef4444] animate-pulse" : "bg-zinc-700"}`}></span>
+                <span className={`text-[10px] font-extrabold uppercase ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "text-red-400 font-black animate-pulse" : "text-zinc-500"}`}>
+                  {attentionQueue.filter(item => !item.dismissed).length} ALERTS
+                </span>
+              </div>
+            </div>
+          )}
         </div>
         
         <div className="flex items-center gap-4 lg:gap-6 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 shrink-0 hide-scrollbar">
@@ -2335,32 +2357,36 @@ function AppRaw() {
                 : 'OFFLINE'}
             </span>
           </div>
-          <div className="w-px h-8 bg-white/10"></div>
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest flex items-center gap-1 leading-none select-none">
-              <Database className="w-2.5 h-2.5 text-cyan-400" />
-              Rigorous Context Memory
-            </span>
-            <div className="flex items-center gap-2 mt-1 leading-none select-none">
-              <span className={`text-xs font-mono font-black ${
-                totalContextSize > 80000 ? 'text-red-400 animate-pulse font-extrabold' : totalContextSize > 40000 ? 'text-amber-400 font-bold' : 'text-cyan-400'
-              }`}>
-                {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`}
-              </span>
-              <span className="text-[9px] font-mono opacity-40">
-                (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
-              </span>
-            </div>
-            {/* Context overload bar */}
-            <div className="w-24 h-1 bg-zinc-950 rounded-full overflow-hidden mt-1.5" title="Aggregated Sandbox Overload Threshold Indicator">
-              <div 
-                className={`h-full transition-all duration-500 ${
-                  totalContextSize > 80000 ? 'bg-red-500 shadow-[0_0_8px_#ef4444]' : totalContextSize > 40000 ? 'bg-amber-500' : 'bg-cyan-500'
-                }`}
-                style={{ width: `${Math.min((totalContextSize / 100000) * 100, 100)}%` }}
-              ></div>
-            </div>
-          </div>
+          {!isSimpleMode && (
+            <>
+              <div className="w-px h-8 bg-white/10"></div>
+              <div className="flex flex-col items-end">
+                <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest flex items-center gap-1 leading-none select-none">
+                  <Database className="w-2.5 h-2.5 text-cyan-400" />
+                  Rigorous Context Memory
+                </span>
+                <div className="flex items-center gap-2 mt-1 leading-none select-none">
+                  <span className={`text-xs font-mono font-black ${
+                    totalContextSize > 80000 ? 'text-red-400 animate-pulse font-extrabold' : totalContextSize > 40000 ? 'text-amber-400 font-bold' : 'text-cyan-400'
+                  }`}>
+                    {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`}
+                  </span>
+                  <span className="text-[9px] font-mono opacity-40">
+                    (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+                  </span>
+                </div>
+                {/* Context overload bar */}
+                <div className="w-24 h-1 bg-zinc-950 rounded-full overflow-hidden mt-1.5" title="Aggregated Sandbox Overload Threshold Indicator">
+                  <div 
+                    className={`h-full transition-all duration-500 ${
+                      totalContextSize > 80000 ? 'bg-red-500 shadow-[0_0_8px_#ef4444]' : totalContextSize > 40000 ? 'bg-amber-500' : 'bg-cyan-500'
+                    }`}
+                    style={{ width: `${Math.min((totalContextSize / 100000) * 100, 100)}%` }}
+                  ></div>
+                </div>
+              </div>
+            </>
+          )}
           <div className="w-px h-8 bg-white/10"></div>
           <button 
             onClick={() => setShowTranscriptPanel(!showTranscriptPanel)}
@@ -2788,42 +2814,49 @@ function AppRaw() {
                   </p>
                 </div>
                 
-                {/* Responsive Touch-friendly View Switcher */}
-                <div className="flex items-center gap-1 bg-black/80 p-1.5 rounded-lg border border-white/10 shrink-0 select-none self-start md:self-auto shadow-inner">
-                  <button
-                    onClick={() => setGridDisplayMode("detailed")}
-                    className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                      gridDisplayMode === "detailed"
-                        ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                    }`}
-                  >
-                    <Laptop className="w-3.5 h-3.5" />
-                    Detailed
-                  </button>
-                  <button
-                    onClick={() => setGridDisplayMode("compact")}
-                    className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                      gridDisplayMode === "compact"
-                        ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                    }`}
-                  >
-                    <Smartphone className="w-3.5 h-3.5" />
-                    Compact List
-                  </button>
-                  <button
-                    onClick={() => setGridDisplayMode("videowall")}
-                    className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                      gridDisplayMode === "videowall"
-                        ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                    }`}
-                  >
-                    <Tv className="w-3.5 h-3.5" />
-                    Video Wall
-                  </button>
-                </div>
+                {/* View switcher or inline Focus mode notice */}
+                {!isSimpleMode ? (
+                  <div className="flex items-center gap-1 bg-black/80 p-1.5 rounded-lg border border-white/10 shrink-0 select-none self-start md:self-auto shadow-inner font-mono">
+                    <button
+                      onClick={() => setGridDisplayMode("detailed")}
+                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                        gridDisplayMode === "detailed"
+                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
+                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                      }`}
+                    >
+                      <Laptop className="w-3.5 h-3.5" />
+                      Detailed
+                    </button>
+                    <button
+                      onClick={() => setGridDisplayMode("compact")}
+                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                        gridDisplayMode === "compact"
+                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
+                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                      }`}
+                    >
+                      <Smartphone className="w-3.5 h-3.5" />
+                      Compact List
+                    </button>
+                    <button
+                      onClick={() => setGridDisplayMode("videowall")}
+                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                        gridDisplayMode === "videowall"
+                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
+                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                      }`}
+                    >
+                      <Tv className="w-3.5 h-3.5" />
+                      Video Wall
+                    </button>
+                  </div>
+                ) : (
+                  <div className="text-[10px] bg-cyan-950/10 border border-cyan-500/15 px-3 py-1.5 rounded-lg font-mono text-cyan-300 flex items-center gap-2 select-none">
+                    <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse" />
+                    <span>Focus View activated: click any terminal pane below to run commands.</span>
+                  </div>
+                )}
               </div>
 
               {/* Core Goal: Live Conversation & Synergy Matrix */}
@@ -3015,10 +3048,54 @@ function AppRaw() {
                     <AnimatePresence mode="popLayout">
                     {filteredPanes.map((pane) => {
                       const term = terminals.find(t => t.id === pane.pane_id);
-                    const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
-                    const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+                      const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                      const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
 
-                    // Badge colors
+                      // If Simplicity Focus Mode is active, render a super elegant, lightweight list item with zero clutter
+                      if (isSimpleMode) {
+                        const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
+                        return (
+                          <motion.div
+                            layout
+                            key={pane.pane_id}
+                            initial={{ opacity: 0, y: 8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -8 }}
+                            className={`bg-[#0c0c0c] border rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all ${
+                              isAlertActive ? 'border-amber-500 bg-amber-500/[0.04]' : 'border-white/5 hover:border-cyan-500/25 bg-black/50 hover:bg-black/80'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3">
+                              <span className={`w-2.5 h-2.5 rounded-full ${
+                                isAlertActive ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.9)] animate-ping" :
+                                status === "Running" ? "bg-green-500 shadow-[0_0_6px_#22c55e]" : "bg-zinc-650"
+                              }`} />
+                              <div>
+                                <h3 className="text-sm font-sans font-bold text-zinc-200 flex items-center gap-2">
+                                  {pane.name}
+                                  {isAlertActive && (
+                                    <span className="text-[8px] bg-amber-500 text-black px-1.5 py-0.5 rounded font-mono font-black uppercase">ACTION REQUIRED</span>
+                                  )}
+                                </h3>
+                                <p className="text-[10px] text-zinc-500 font-mono mt-0.5">Preset: {pane.tool_preset || "Standard Shell"} • ID: {pane.pane_id}</p>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-4 self-end md:self-auto select-none">
+                              <span className={`text-[11px] font-mono capitalize ${status === "Running" ? "text-green-400 font-black" : "text-zinc-500"}`}>{status.toLowerCase()}</span>
+                              <button
+                                onClick={() => setActiveTerminalId(pane.pane_id)}
+                                className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-black text-xs font-sans font-bold rounded-lg tracking-wider transition-all cursor-pointer active:scale-95 shadow-md flex items-center gap-1.5"
+                              >
+                                <TermIcon className="w-3.5 h-3.5" />
+                                CONNECT CONSOLE
+                              </button>
+                            </div>
+                          </motion.div>
+                        );
+                      }
+
+                      // Badge colors
                     let primaryColorClass = "border-zinc-800 text-zinc-400";
                     let bgHover = "hover:border-zinc-700";
                     let presetLabel = pane.tool_preset || "Custom";

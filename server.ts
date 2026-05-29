@@ -1114,14 +1114,76 @@ ${rawOutput.slice(-3000)}`;
                 text: userUtterance
               }));
 
-              // Auto-log dictation as bullet points inside synchronous prompt buffer
               const cleanUtter = userUtterance.trim();
               if (cleanUtter.length > 2) {
+                // Auto-log dictation as bullet points inside synchronous prompt buffer
                 promptBufferText += `\n* **User Dictation**: ${cleanUtter}`;
                 broadcast({
                   type: "prompt_buffer_updated",
                   text: promptBufferText
                 });
+
+                // Hands-free voice approvals parsing
+                const lowerUtter = cleanUtter.toLowerCase();
+                const isApprove = ["approve", "go ahead", "execute", "run it", "yes run", "approve command", "confirm execution"].some(word => lowerUtter.includes(word));
+                const isReject = ["reject", "cancel", "deny", "don't run", "reject command"].some(word => lowerUtter.includes(word));
+                
+                if (isApprove || isReject) {
+                  // Find any pending approval for this session
+                  const pendingEntries = Object.entries(pendingApprovals).filter(([mId, details]) => details.session === session);
+                  if (pendingEntries.length > 0) {
+                    // Sort to resolve the earliest/most relative first
+                    const [messageId, pending] = pendingEntries[0];
+                    console.log(`[VOICE INTERCEPT] Auto-resolving pending command "${pending.cmd}" on pane "${pending.terminalId}" via voice: approved=${isApprove}`);
+                    
+                    if (isApprove) {
+                      const term = manager.terminals[pending.terminalId];
+                      if (term) {
+                        HistoryManager.getInstance().addCommand(pending.terminalId, pending.cmd);
+                        term.writeInput(pending.cmd);
+                        try {
+                          pending.session.sendToolResponse({
+                            functionResponses: [{
+                              name: "propose_command",
+                              id: pending.callId,
+                              response: { output: `Command dispatched to ${pending.terminalId} successfully via voice.` }
+                            }]
+                          });
+                        } catch (e) {
+                          console.error("Failed to send tool response to session on voice approve:", e);
+                        }
+                        
+                        // Notify frontend
+                        clientWs.send(JSON.stringify({
+                          type: "command_auto_executed",
+                          terminalId: pending.terminalId,
+                          cmd: pending.cmd,
+                          vocal: true
+                        }));
+                      }
+                    } else {
+                      try {
+                        pending.session.sendToolResponse({
+                          functionResponses: [{
+                            name: "propose_command",
+                            id: pending.callId,
+                            response: { output: "Execution cancelled by operator via voice." }
+                          }]
+                        });
+                      } catch (e) {
+                        console.error("Failed to send tool response to session on voice reject:", e);
+                      }
+                      clientWs.send(JSON.stringify({
+                        type: "command_blocked",
+                        terminalId: pending.terminalId,
+                        cmd: pending.cmd,
+                        reason: "Execution cancelled by operator via voice."
+                      }));
+                    }
+                    delete pendingApprovals[messageId];
+                    broadcast({ type: "terminals_updated" }); // Refresh lists
+                  }
+                }
               }
             }
             if (modelUtterance) {
@@ -1175,7 +1237,7 @@ ${rawOutput.slice(-3000)}`;
                     cwd = activeProject.directory || process.cwd();
                   }
                 }
-                const history = HistoryManager.getInstance().loadHistory(cwd);
+                const history = HistoryManager.getInstance().loadHistory(targetId);
                 const conciseHistory = history.map((entry: any) => ({
                   command: entry.command,
                   timestamp: entry.timestamp,
@@ -1477,6 +1539,22 @@ ${rawOutput.slice(-3000)}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: resp } }]
                 });
+              } else if (name === "set_pane_permissions") {
+                const { project_id, pane_id, permissions_mode } = args;
+                const term = manager.terminals[pane_id];
+                if (term) {
+                  term.setPermissionsMode(permissions_mode);
+                }
+                const ws = manager.ledger.getProject(project_id);
+                if (ws && ws.panes[pane_id]) {
+                  ws.panes[pane_id].permissions_mode = permissions_mode;
+                  manager.ledger["save"]();
+                }
+                broadcastLedgerUpdate();
+                broadcast({ type: "terminals_updated" });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
+                });
               }
             }
           }
@@ -1738,6 +1816,19 @@ ${rawOutput.slice(-3000)}`;
                   context_notes: { type: Type.STRING, description: "Active guidance/handoff instructions summarizing context." }
                 },
                 required: ["source_pane_id", "target_pane_id", "context_notes"]
+              }
+            },
+            {
+              name: "set_pane_permissions",
+              description: "Set the safety permission policy mode for a specific terminal pane. Promotes or reverts autonomy (Full Auto, Human-in-the-Loop, Read-Only).",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  project_id: { type: Type.STRING, description: "The project workspace ID containing the pane." },
+                  pane_id: { type: Type.STRING, description: "The terminal pane ID to configure." },
+                  permissions_mode: { type: Type.STRING, description: "Safety mode: Full Auto, Human-in-the-Loop, or Read-Only." }
+                },
+                required: ["project_id", "pane_id", "permissions_mode"]
               }
             }
           ]
