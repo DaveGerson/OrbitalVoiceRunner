@@ -35,3 +35,14 @@ Perform a live walk-through of an arbitrary on-screen artifact (not terminal
 output) and capture every change that needs to be made.
 - **Blocked on:** the same screen/vision input modality as above.
 - **Status:** not started.
+
+## Deprioritized (supported today, parked)
+
+Journeys the tool can already do but that are not headline journeys for now.
+
+### Locked-down exploration
+Browse an unfamiliar or untrusted repository in Read-Only — observe and ask
+questions with zero write risk.
+- **Blocked on:** nothing; Read-Only mode already supports this. Parked to keep
+  the primary journey set focused.
+- **Status:** supported, deprioritized.
