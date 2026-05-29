@@ -206,12 +206,11 @@ Command: ${command}
 Verbose Output:
 ${rawOutput.slice(-3000)}`;
 
-      // NOTE (M0/WS-A): the summarizer model is intentionally left disabled until
-      // the redaction layer (docs/review/IMPLEMENTATION_PLAN.md WS-B) lands. The raw
-      // command output is sent to the model verbatim below, so re-enabling this with
-      // a valid model BEFORE redaction would open a secret-exfiltration path
-      // (final-review finding N-5). Flip the model name in WS-A* ONLY after WS-B.
-      // Until then this call throws and the honest fallback below is returned.
+      // NOTE: `rawOutput` is sent to the summarizer model here. This path is
+      // currently UNREDACTED, so secrets printed to a pane can reach the model
+      // (finding N-5). The redaction layer (docs/review/IMPLEMENTATION_PLAN.md WS-B)
+      // must wrap `rawOutput` before this call. The model ID is valid; the catch
+      // below returns an honest neutral fallback (never a false "success") on error.
       const response = await summarizeAi.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
