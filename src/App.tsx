@@ -6,8 +6,9 @@ import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalView } from "./components/TerminalView";
+import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen } from "lucide-react";
 import { apiFetch } from "./utils/api";
 
 function AppRaw() {
@@ -40,6 +41,61 @@ function AppRaw() {
   const [showHistoryPanel, setShowHistoryPanel] = useState<boolean>(false);
   const [historyList, setHistoryList] = useState<{ command: string; timestamp: string; output: string }[]>([]);
   const [selectedHistoryEntry, setSelectedHistoryEntry] = useState<{ command: string; timestamp: string; output: string } | null>(null);
+  const [hoveredTermId, setHoveredTermId] = useState<string | null>(null);
+
+  // --- Real-time Synchronous Markdown Prompt Buffer & Voice Agent Workspace States ---
+  const [promptBuffer, setPromptBuffer] = useState("");
+  const [isBufferFocused, setIsBufferFocused] = useState(false);
+  const [promptBufferEditMode, setPromptBufferEditMode] = useState<"edit" | "preview">("preview");
+
+  // Mobile layout switcher state: terminal | buffer | menu
+  const [mobileActiveView, setMobileActiveView] = useState<"terminal" | "buffer" | "menu">("terminal");
+
+  // Grid view display mode: detailed dashboard vs compact row list (useful for quick mobile operations)
+  const [gridDisplayMode, setGridDisplayMode] = useState<"detailed" | "compact">("compact");
+
+  // Fetch Synchronous Prompt Buffer Initial State
+  const fetchPromptBuffer = async () => {
+    try {
+      const res = await apiFetch("/api/prompt-buffer");
+      if (res.ok) {
+        const data = await res.json();
+        setPromptBuffer(data.text);
+      }
+    } catch (e) {
+      console.warn("REST prompt-buffer fetch failed: fallback to offline mode");
+    }
+  };
+
+  const handlePromptBufferChange = (val: string) => {
+    setPromptBuffer(val);
+    
+    // Send over WebSocket or save REST fallback
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: "prompt_buffer_edit",
+        text: val
+      }));
+    } else {
+      apiFetch("/api/prompt-buffer", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: val })
+      }).catch(() => {});
+    }
+  };
+
+  const handleSyncNoteToActiveNode = async () => {
+    if (!activeTerminalId || !activeProjectId) return;
+    try {
+      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: `Requirement Spec Captured: ${promptBuffer.slice(0, 100).replace(/\n/g, " ")}...` })
+      });
+      fetchLedger();
+    } catch (e) {}
+  };
 
   const fetchActiveTerminalHistory = async (terminalId: string | null = activeTerminalId) => {
     if (!terminalId) return;
@@ -189,6 +245,7 @@ function AppRaw() {
     fetchLedger();
     fetchSettings();
     fetchPendingCommands();
+    fetchPromptBuffer(); // Sync initial prompt buffer
     const interval = setInterval(() => {
       fetchTerminals();
       fetchPendingCommands();
@@ -478,6 +535,13 @@ function AppRaw() {
               terminalId: msg.terminalId,
               rationale: msg.rationale
             }];
+          });
+        } else if (msg.type === "prompt_buffer_updated") {
+          setIsBufferFocused(focused => {
+            if (!focused) {
+              setPromptBuffer(msg.text);
+            }
+            return focused;
           });
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
@@ -927,6 +991,312 @@ function AppRaw() {
 
   const totalTokensEstimated = Math.ceil(totalContextSize / 4);
 
+  const renderTerminalHealthHeatmap = () => {
+    return (
+      <div className="flex flex-col bg-[#090909] border border-white/5 rounded-lg p-4 select-none relative w-full">
+        {/* Title & Stats */}
+        <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-white/[0.04]">
+          <div className="flex items-center gap-1.5">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+            </span>
+            <h3 className="text-[11px] font-mono font-bold tracking-widest text-zinc-200 uppercase flex items-center gap-1.5">
+              Agent Telemetry Heatmap
+            </h3>
+          </div>
+          <span className="text-[9px] font-mono text-cyan-400/80 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/10">
+            {terminals.filter(t => t.status === "Running").length}/{terminals.length} Running
+          </span>
+        </div>
+
+        {/* Heatmap Grid */}
+        {terminals.length === 0 ? (
+          <div className="text-[10px] text-zinc-500 font-mono italic text-center py-4 bg-black/20 rounded border border-dashed border-white/5">
+            No active agents registered in ledger.
+          </div>
+        ) : (
+          <div>
+            <div className="grid grid-cols-5 sm:grid-cols-6 lg:grid-cols-5 xl:grid-cols-8 gap-2 mb-2">
+              {terminals.map((term, index) => {
+                const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === term.id);
+                const isActive = activeTerminalId === term.id;
+                
+                // Determine color classes for tiles
+                let bgClass = "bg-zinc-950";
+                let borderClass = "border-white/5";
+                let textClass = "text-zinc-400";
+                let animateDot = "";
+                let dotColor = "bg-zinc-600";
+
+                if (isAlertActive) {
+                  bgClass = "bg-amber-500/15";
+                  borderClass = "border-amber-500/70 shadow-[0_0_8px_rgba(245,158,11,0.2)]";
+                  textClass = "text-amber-300 font-extrabold";
+                  animateDot = "animate-ping";
+                  dotColor = "bg-amber-500";
+                } else if (term.status === "Running") {
+                  bgClass = "bg-emerald-500/10";
+                  borderClass = "border-emerald-500/30";
+                  textClass = "text-emerald-400 font-semibold";
+                  animateDot = "animate-pulse";
+                  dotColor = "bg-emerald-500";
+                } else if (term.status === "Idle") {
+                  bgClass = "bg-yellow-500/5";
+                  borderClass = "border-yellow-500/20";
+                  textClass = "text-yellow-500/80";
+                  dotColor = "bg-yellow-500";
+                } else {
+                  bgClass = "bg-red-500/5";
+                  borderClass = "border-red-500/20";
+                  textClass = "text-red-400/80";
+                  dotColor = "bg-red-500";
+                }
+
+                // If currently viewed connected terminal, add cyan glow/override
+                if (isActive) {
+                  borderClass = "border-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.3)]";
+                }
+
+                return (
+                  <div
+                    key={term.id}
+                    className={`h-11 rounded-md border flex flex-col items-center justify-center relative cursor-pointer group/tile transition-all duration-250 select-none ${bgClass} ${borderClass} hover:scale-105 active:scale-95`}
+                    onMouseEnter={() => setHoveredTermId(term.id)}
+                    onMouseLeave={() => setHoveredTermId(null)}
+                    onClick={() => {
+                      // Clicking on heatmap cell toggles tooltip or connects active terminal
+                      setHoveredTermId(hoveredTermId === term.id ? null : term.id);
+                    }}
+                  >
+                    <span className={`text-[10px] font-mono tracking-tight ${textClass}`}>
+                      T{index + 1}
+                    </span>
+                    
+                    {/* Tiny status indicator dot */}
+                    <span className="absolute top-1.5 right-1.5 flex h-1.5 w-1.5">
+                      {animateDot && (
+                        <span className={`absolute inline-flex h-full w-full rounded-full opacity-75 ${animateDot} ${dotColor}`}></span>
+                      )}
+                      <span className={`relative inline-flex rounded-full h-1.5 w-1.5 ${dotColor}`}></span>
+                    </span>
+
+                    {/* Badge showing truncated Name */}
+                    <span className="text-[7.5px] font-mono text-zinc-650 group-hover/tile:text-zinc-400 select-none uppercase truncate max-w-[90%] pointer-events-none mt-0.5 leading-none">
+                      {term.id.slice(-4)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            
+            {/* Visual Legend */}
+            <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[8.5px] font-mono text-zinc-500 pt-1.5 border-t border-white/[0.03]">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
+                Running
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-yellow-500 inline-block"></span>
+                Idle
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block"></span>
+                Exited
+              </span>
+              <span className="flex items-center gap-1 text-amber-500">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse inline-block"></span>
+                Alert Needed
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Floating popover/tooltip element when cell hovered, rendering rich diagnostics & last stdout snippet inside! */}
+        {(() => {
+          if (!hoveredTermId) return null;
+          const term = terminals.find(t => t.id === hoveredTermId);
+          if (!term) return null;
+
+          const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === term.id);
+          const currentOutputSnippetLines = term.output ? term.output.trim().split("\n").slice(-4) : [];
+          
+          let statusLabel = "Idle & Listening";
+          let statusBadgeClass = "bg-yellow-500/10 text-yellow-400 border border-yellow-500/10";
+          if (isAlertActive) {
+            statusLabel = "AWAITING APPROVAL";
+            statusBadgeClass = "bg-amber-500 text-black font-extrabold shadow-[0_0_8px_#f59e0b]";
+          } else if (term.status === "Running") {
+            statusLabel = "ACTIVE EXECUTING";
+            statusBadgeClass = "bg-emerald-500/10 text-emerald-400 border border-emerald-500/10";
+          } else if (term.status === "Exited") {
+            statusLabel = "TERMINATED";
+            statusBadgeClass = "bg-red-500/10 text-red-400 border border-red-500/10";
+          }
+
+          return (
+            <div className="absolute top-[102%] left-0 right-0 z-50 bg-[#0d0d0d] border border-cyan-500/30 shadow-[0_4px_24px_rgba(0,0,0,0.85)] rounded-lg p-3.5 text-left font-mono text-[10.5px] leading-relaxed animate-in fade-in slide-in-from-top-1 duration-150">
+              <div className="absolute top-3 right-3 flex gap-1.5">
+                <span className={`text-[8.5px] uppercase tracking-wider px-1.5 py-0.5 rounded font-black ${statusBadgeClass}`}>
+                  {statusLabel}
+                </span>
+                <button 
+                  onClick={() => setHoveredTermId(null)}
+                  className="text-zinc-500 hover:text-white px-1 font-sans font-bold hover:bg-white/5 rounded text-[11px] leading-none"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Title & Preset Identifier */}
+              <div className="mb-2">
+                <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+                  <span className={`w-1.5 h-1.5 rounded-full ${isAlertActive ? 'bg-amber-500' : term.status === 'Running' ? 'bg-emerald-500' : 'bg-yellow-500'}`}></span>
+                  NODE: {term.id.toUpperCase()}
+                </h4>
+                <p className="text-[9px] text-zinc-500 -mt-0.5 uppercase tracking-wide">
+                  Type: {term.tool_preset || "Custom Shell Engine"} • Mode: {term.permissions_mode || "Human-in-the-Loop"}
+                </p>
+              </div>
+
+              {/* Specs Bento List */}
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[9.5px] text-zinc-400 bg-black/40 border border-white/[0.03] p-2 rounded-md mb-2.5">
+                <div>
+                  <span className="text-zinc-650 uppercase text-[8.5px] block">Active Cwd</span>
+                  <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.cwd}>{term.cwd}</span>
+                </div>
+                <div>
+                  <span className="text-zinc-650 uppercase text-[8.5px] block">Context memory</span>
+                  <span className="text-cyan-400 block font-bold">
+                    {term.context_size < 1000 ? `${term.context_size} chars` : `${(term.context_size / 1000).toFixed(1)}k chars`}
+                  </span>
+                </div>
+                <div className="col-span-2">
+                  <span className="text-zinc-650 uppercase text-[8.5px] block">Active process thread</span>
+                  <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.command}>$ {term.command || "idle waiting"}</span>
+                </div>
+              </div>
+
+              {/* last stdout console output panel widget */}
+              <div className="bg-black/80 rounded border border-white/5 p-2 font-mono text-[9px] leading-relaxed text-zinc-500">
+                <div className="text-[8.5px] uppercase tracking-wider text-cyan-500/60 font-semibold mb-1 flex items-center justify-between border-b border-white/[0.04] pb-1 select-none">
+                  <span>🛰️ Live Stdout Capture</span>
+                  <span className="opacity-40">{term.output?.length || 0} bytes</span>
+                </div>
+                <div className="space-y-0.5 selection:bg-cyan-500/25 selection:text-white overflow-hidden max-h-24">
+                  {currentOutputSnippetLines.length > 0 ? (
+                    currentOutputSnippetLines.map((line, idx) => (
+                      <div key={idx} className="truncate text-emerald-400/80 leading-normal block whitespace-pre">
+                        {line || " "}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="italic text-zinc-600 py-1 font-mono">No live stream log. Waiting on execute triggers...</div>
+                  )}
+                </div>
+              </div>
+
+              {/* Action notice helper */}
+              <div className="mt-2 text-right">
+                <span className="text-[8.5px] text-zinc-650 italic">
+                  Tap to lock popup • Hover another tile to swap inspect
+                </span>
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+    );
+  };
+
+  const renderPromptSynchronizerPanel = () => {
+    return (
+      <div className="flex-1 flex flex-col bg-[#060606] border border-white/5 rounded-lg overflow-hidden h-full">
+        {/* Header toolbar */}
+        <div className="p-3 bg-white/[0.02] border-b border-white/5 flex items-center justify-between shrink-0 select-none">
+          <div className="flex items-center gap-2">
+            <CheckSquare className="w-4 h-4 text-cyan-400" />
+            <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase">Shared Prompt Buffer</h3>
+          </div>
+          <div className="flex items-center gap-1.5 bg-black/60 p-1 rounded border border-white/10">
+            <button
+              onClick={() => setPromptBufferEditMode("preview")}
+              className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "preview" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
+            >
+              Preview
+            </button>
+            <button
+              onClick={() => setPromptBufferEditMode("edit")}
+              className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
+            >
+              Edit
+            </button>
+          </div>
+        </div>
+
+        {/* Content Viewport */}
+        <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[300px]">
+          {promptBufferEditMode === "edit" ? (
+            <textarea
+              value={promptBuffer}
+              onChange={(e) => handlePromptBufferChange(e.target.value)}
+              onFocus={() => setIsBufferFocused(true)}
+              onBlur={() => setIsBufferFocused(false)}
+              className="w-full h-full min-h-[280px] bg-black text-xs text-zinc-200 p-3 rounded border border-white/10 focus:outline-none focus:border-cyan-500 font-mono resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30"
+              placeholder="Keep track of high-level specs as a list here. Operator typing & Live Voice Agent transcripts update this buffer in real-time..."
+            />
+          ) : (
+            <div className="prose prose-invert max-w-none text-zinc-300">
+              {promptBuffer ? (
+                <MiniMarkdown text={promptBuffer} />
+              ) : (
+                <p className="text-[10px] text-zinc-600 font-mono italic">No prompt notes captured. Switch to Edit or speak into the microphone to write specifications...</p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Quick Toolbar macros */}
+        <div className="p-3 bg-[#0d0d0d] border-t border-white/5 flex flex-wrap gap-2 items-center justify-between shrink-0 select-none">
+          <div className="flex gap-2">
+            <button
+              onClick={() => handlePromptBufferChange(promptBuffer + "\n- [ ] ")}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
+            >
+              + Task
+            </button>
+            <button
+              onClick={() => handlePromptBufferChange(
+                `# Requirements Specification Checklist\n\n- [ ] **Architecture**: Build production containers.\n- [ ] **Database Snapshots**: Configure sqlite snapshots in .env file.`
+              )}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
+            >
+              Template
+            </button>
+          </div>
+
+          <div className="flex gap-2">
+            {activeTerminalId && (
+              <button
+                onClick={handleSyncNoteToActiveNode}
+                className="px-2.5 py-1 text-[9px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded font-bold flex items-center gap-1"
+                title="Pushes prompt buffer specs directly to node chronicle notes registry"
+              >
+                Sync Note
+              </button>
+            )}
+            <button
+              onClick={() => handlePromptBufferChange("")}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="flex flex-col h-screen w-full bg-[#050505] text-[#e0e0e0] font-sans overflow-hidden border-t-4 border-[#121212]">
       {showProjectModal && (
@@ -998,19 +1368,19 @@ function AppRaw() {
       </div>
 
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-black/40 backdrop-blur-md">
-        <div className="flex items-center gap-4">
+      <header className="flex flex-col lg:flex-row items-start lg:items-center justify-between px-4 lg:px-6 py-4 border-b border-white/5 bg-black/40 backdrop-blur-md gap-4 shrink-0">
+        <div className="flex items-center gap-4 shrink-0">
           <div className={`w-3 h-3 rounded-full ${
             isLive 
               ? (isReconnecting ? 'bg-amber-500 animate-pulse' : 'bg-cyan-400 animate-pulse') 
               : 'bg-zinc-600'
           }`}></div>
-          <h1 className="font-serif italic text-xl tracking-wide text-white flex items-center gap-2">
-            Orbital Harness <span className="text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
+          <h1 className="font-serif italic text-lg lg:text-xl tracking-wide text-white flex items-center gap-2">
+            Orbital Harness <span className="text-[10px] lg:text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
           </h1>
         </div>
         
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-4 lg:gap-6 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 shrink-0 hide-scrollbar">
           <div className="flex flex-col">
             <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest">Global Voice Agent Permission</span>
             <select
@@ -1124,10 +1494,57 @@ function AppRaw() {
         </div>
       </header>
 
+      {/* Mobile Terminals Quick Swiper Bar */}
+      <div className="lg:hidden flex items-center gap-2 overflow-x-auto px-4 py-2 border-b border-white/5 bg-black/80 scrollbar-none shrink-0 select-none">
+        <button
+          onClick={() => {
+            setActiveTerminalId(null);
+            setMobileActiveView("terminal");
+          }}
+          className={`flex-shrink-0 px-3 py-1.5 rounded-full text-[10px] font-mono border transition-all ${
+            activeTerminalId === null
+              ? "bg-cyan-500/15 border-cyan-500 text-cyan-400 font-bold"
+              : "bg-white/5 border-white/10 text-zinc-500"
+          }`}
+        >
+          GRID VIEW
+        </button>
+        {terminals.map((term) => {
+          const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === term.id);
+          const isActive = activeTerminalId === term.id;
+          let colorClass = "border-zinc-850 text-zinc-500 bg-black/40";
+          if (isAlertActive) {
+            colorClass = "border-amber-500 text-amber-400 bg-amber-500/15 animate-pulse font-bold";
+          } else if (isActive) {
+            colorClass = "border-cyan-500 text-cyan-400 bg-cyan-500/10 font-bold";
+          } else if (term.status === "Running") {
+            colorClass = "border-green-500/50 text-green-400 bg-green-500/5";
+          } else if (term.status === "Idle") {
+            colorClass = "border-yellow-500/50 text-yellow-500 bg-yellow-500/5";
+          }
+          return (
+            <button
+              key={term.id}
+              onClick={() => {
+                setActiveTerminalId(term.id);
+                setMobileActiveView("terminal");
+              }}
+              className={`flex-shrink-0 px-3.5 py-1.5 rounded-full text-[10px] font-mono border flex items-center gap-1.5 transition-all ${colorClass}`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                isAlertActive ? "bg-amber-500 animate-ping2" :
+                term.status === "Running" ? "bg-green-500" : "bg-yellow-500"
+              }`}></span>
+              {(term.id).toUpperCase()}
+            </button>
+          )
+        })}
+      </div>
+
       {/* Main Content */}
-      <main className="flex flex-1 overflow-hidden">
+      <main className="flex flex-col lg:flex-row flex-1 overflow-hidden">
         {/* Sidebar */}
-        <nav className="w-72 border-r border-white/5 bg-black/20 flex flex-col overflow-y-auto">
+        <nav className={`w-full lg:w-72 border-b lg:border-b-0 lg:border-r border-white/5 bg-black/40 flex-col h-full lg:h-auto shrink-0 overflow-y-auto ${mobileActiveView === "menu" ? "flex" : "hidden lg:flex"}`}>
           <div className="p-4 flex-1">
             <button
               onClick={() => setActiveTerminalId(null)}
@@ -1218,39 +1635,47 @@ function AppRaw() {
                   
                   {activeProjectId === project.id && project.panes && (
                     <div className="space-y-1 pl-2 mt-2">
-                      {Object.values(project.panes).filter(pane => {
-                        if (termFilter === "All") return true;
-                        const term = terminals.find(t => t.id === pane.pane_id);
-                        const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
-                        return status === termFilter;
-                      }).map((pane) => {
-                        const isActive = activeTerminalId === pane.pane_id;
-                        const term = terminals.find(t => t.id === pane.pane_id);
-                        const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
-                        let statusColor = "bg-zinc-600";
-                        
-                        if (isAlertActive) {
-                          statusColor = "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.9)] animate-pulse";
-                        } else if (term) {
-                          if (term.status === "Running") {
-                            statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
-                          } else if (term.status === "Idle") {
-                            statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
-                          } else if (term.status === "Exited") {
-                            statusColor = "bg-red-500";
+                      <AnimatePresence initial={false}>
+                        {Object.values(project.panes).filter(pane => {
+                          if (termFilter === "All") return true;
+                          const term = terminals.find(t => t.id === pane.pane_id);
+                          const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                          return status === termFilter;
+                        }).map((pane) => {
+                          const isActive = activeTerminalId === pane.pane_id;
+                          const term = terminals.find(t => t.id === pane.pane_id);
+                          const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
+                          let statusColor = "bg-zinc-600";
+                          
+                          if (isAlertActive) {
+                            statusColor = "bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.9)] animate-pulse";
+                          } else if (term) {
+                            if (term.status === "Running") {
+                              statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
+                            } else if (term.status === "Idle") {
+                              statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
+                            } else if (term.status === "Exited") {
+                              statusColor = "bg-red-500";
+                            }
+                          } else {
+                            if (pane.alive && pane.is_busy) statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
+                            else if (pane.alive && !pane.is_busy) statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
+                            else statusColor = "bg-red-500";
                           }
-                        } else {
-                          if (pane.alive && pane.is_busy) statusColor = "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse";
-                          else if (pane.alive && !pane.is_busy) statusColor = `bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.6)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}`;
-                          else statusColor = "bg-red-500";
-                        }
-                        
-                        return (
-                          <div key={pane.pane_id} className="flex flex-col group">
-                            <div 
-                              onClick={() => { setActiveTerminalId(pane.pane_id); }}
-                              className={`group cursor-pointer p-2 rounded transition-colors flex items-center justify-between ${isAlertActive ? 'bg-amber-500/10 border border-amber-500/30' : isActive ? 'bg-white/5 border border-white/10' : 'border border-transparent hover:bg-white/5'}`}
+                          
+                          return (
+                            <motion.div
+                              key={pane.pane_id}
+                              initial={{ opacity: 0, height: 0, scale: 0.95 }}
+                              animate={{ opacity: 1, height: "auto", scale: 1 }}
+                              exit={{ opacity: 0, height: 0, scale: 0.95 }}
+                              transition={{ duration: 0.2 }}
+                              className="flex flex-col group overflow-hidden"
                             >
+                              <div 
+                                onClick={() => { setActiveTerminalId(pane.pane_id); }}
+                                className={`group cursor-pointer p-2 rounded transition-colors flex items-center justify-between ${isAlertActive ? 'bg-amber-500/10 border border-amber-500/30' : isActive ? 'bg-white/5 border border-white/10' : 'border border-transparent hover:bg-white/5'}`}
+                              >
                               <div className="flex flex-col overflow-hidden min-w-0 pr-2">
                                 <span className={`text-xs font-mono truncate flex items-center gap-1.5 ${isAlertActive ? 'text-amber-400 font-bold' : isActive ? 'font-bold text-cyan-400' : 'opacity-80'}`}>
                                   {pane.name}
@@ -1275,9 +1700,10 @@ function AppRaw() {
                                  {pane.notes.map((n, idx) => <div key={idx}>• {n}</div>)}
                               </div>
                             )}
-                          </div>
+                          </motion.div>
                         );
                       })}
+                      </AnimatePresence>
                     </div>
                   )}
                 </div>
@@ -1298,7 +1724,7 @@ function AppRaw() {
         </nav>
 
         {/* Center Content */}
-        <section className="flex-1 flex flex-col bg-[#0b0b0b] min-w-0">
+        <section className={`flex-1 flex flex-col bg-[#0b0b0b] min-w-0 ${mobileActiveView === "terminal" ? "flex" : "hidden lg:flex"}`}>
           {activeTerminalId && activeTerminal ? (
             /* Terminal View */
             <div className="flex flex-1 flex-row overflow-hidden">
@@ -1338,7 +1764,7 @@ function AppRaw() {
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
+                <div className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
                   <TerminalView key={activeTerminal.id} output={activeTerminal.output} />
                 </div>
               </div>
@@ -1455,15 +1881,43 @@ function AppRaw() {
             </div>
           ) : (
             /* Dashboard High-Level View */
-            <div className="flex-1 flex flex-col overflow-y-auto p-8">
-              <div className="mb-8 select-none">
-                <h1 className="text-xl font-mono text-white tracking-widest uppercase mb-1 flex items-center gap-2">
-                  <Cpu className="w-5 h-5 text-cyan-400 shrink-0" />
-                  Project Terminal Workspace
-                </h1>
-                <p className="text-xs text-zinc-500 font-mono">
-                  Active terminal sessions tracking Claude Code, Codex, and Antigravity orchestrator engines.
-                </p>
+            <div className="flex-1 flex flex-col overflow-y-auto p-4 lg:p-8">
+              <div className="mb-8 select-none flex flex-col md:flex-row md:items-center md:justify-between gap-4 border-b border-white/5 pb-6">
+                <div>
+                  <h1 className="text-xl font-mono text-white tracking-widest uppercase mb-1 flex items-center gap-2">
+                    <Cpu className="w-5 h-5 text-cyan-400 shrink-0" />
+                    Project Terminal Workspace
+                  </h1>
+                  <p className="text-xs text-zinc-500 font-mono">
+                    Active terminal sessions tracking Claude Code, Codex, and Antigravity orchestrator engines.
+                  </p>
+                </div>
+                
+                {/* Responsive Touch-friendly View Switcher */}
+                <div className="flex items-center gap-1 bg-black/80 p-1.5 rounded-lg border border-white/10 shrink-0 select-none self-start md:self-auto shadow-inner">
+                  <button
+                    onClick={() => setGridDisplayMode("detailed")}
+                    className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                      gridDisplayMode === "detailed"
+                        ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
+                        : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                    }`}
+                  >
+                    <Laptop className="w-3.5 h-3.5" />
+                    Detailed
+                  </button>
+                  <button
+                    onClick={() => setGridDisplayMode("compact")}
+                    className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                      gridDisplayMode === "compact"
+                        ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
+                        : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                    }`}
+                  >
+                    <Smartphone className="w-3.5 h-3.5" />
+                    Compact List
+                  </button>
+                </div>
               </div>
 
               {(() => {
@@ -1475,7 +1929,8 @@ function AppRaw() {
                 }) : [];
 
                 return filteredPanes.length > 0 ? (
-                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                  <motion.div layout className={gridDisplayMode === "compact" ? "flex flex-col gap-3" : "grid grid-cols-1 xl:grid-cols-2 gap-6"}>
+                    <AnimatePresence mode="popLayout">
                     {filteredPanes.map((pane) => {
                       const term = terminals.find(t => t.id === pane.pane_id);
                     const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
@@ -1504,10 +1959,106 @@ function AppRaw() {
                     const contextPercent = Math.min((contextSize / 20000) * 100, 100);
                     const contextColor = contextSize > 15000 ? "bg-red-500" : contextSize > 8000 ? "bg-amber-500" : "bg-cyan-500";
 
+                    if (gridDisplayMode === "compact") {
+                      return (
+                        <motion.div
+                          layout
+                          key={pane.pane_id}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -10 }}
+                          transition={{ duration: 0.15 }}
+                          className={`bg-[#0d0d0d] border rounded-lg p-3 lg:p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 transition-colors duration-200 ${
+                            isAlertActive ? 'border-amber-500 bg-amber-950/[0.04]' : 'border-white/5 bg-black/40'
+                          } ${bgHover}`}
+                        >
+                          {/* Inner element container */}
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 transition-all duration-1000 ${
+                              isAlertActive ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.9)] animate-ping" :
+                              status === "Running" ? "bg-green-500 shadow-[0_0_6px_rgba(34,197,94,0.6)] animate-pulse" : status === "Idle" ? `bg-yellow-500 shadow-[0_0_6px_rgba(234,179,8,0.2)] ${recentlyIdled[pane.pane_id] ? "heartbeat-animation" : ""}` : "bg-red-500"
+                            }`}></span>
+                            
+                            <div className="flex-1 min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5 md:gap-2">
+                                <h3 className="text-xs font-mono font-bold text-white uppercase truncate">
+                                  {pane.name}
+                                </h3>
+                                <span className={`text-[8px] font-mono px-1.5 py-0.2 rounded uppercase ${
+                                  pane.tool_preset === "Claude Code" ? "bg-purple-500/10 text-purple-400" :
+                                  pane.tool_preset === "Codex" ? "bg-orange-500/10 text-orange-400" :
+                                  pane.tool_preset === "Antigravity" ? "bg-cyan-500/10 text-cyan-400" : "bg-zinc-805 text-zinc-500"
+                                }`}>
+                                  {presetLabel}
+                                </span>
+                                {isAlertActive && (
+                                  <span className="text-[7.5px] bg-amber-500 text-black px-1.5 py-0.2 rounded font-sans font-black uppercase tracking-wider animate-bounce">
+                                    ALERT REQUIRED
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500 font-mono mt-0.5">
+                                <span>{pane.pane_id}</span>
+                                <span>•</span>
+                                <span className="truncate max-w-[180px]" title={term?.cwd || "/workspace"}>Cwd: {term?.cwd ? (term.cwd.length > 25 ? '...' + term.cwd.slice(-25) : term.cwd) : '/workspace'}</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Stats Metrics Badge */}
+                          <div className="flex items-center gap-4 shrink-0 justify-between md:justify-end border-t border-white/[0.04] md:border-0 pt-2.5 md:pt-0">
+                            <div className="flex items-center gap-3">
+                              <div className="flex flex-col items-end text-right">
+                                <span className="text-[10px] font-mono text-cyan-400 flex items-center gap-1 font-bold">
+                                  <Database className="w-2.5 h-2.5" />
+                                  {contextSize < 1000 ? `${contextSize} B` : `${(contextSize / 1000).toFixed(1)}k c`}
+                                </span>
+                                <span className="text-[8px] font-mono text-zinc-550">
+                                  ~{Math.ceil(contextSize / 4)} tkn
+                                </span>
+                              </div>
+                              <div className="h-6 w-px bg-white/5 hidden md:block"></div>
+                              <div className="flex flex-col items-start min-w-[64px]">
+                                <span className={`text-[8.5px] uppercase tracking-wider font-bold ${status === "Running" ? "text-green-400" : isAlertActive ? "text-amber-400" : "text-zinc-500"}`}>
+                                  {status === "Running" ? "Running" : isAlertActive ? "Awaiting" : "Idle"}
+                                </span>
+                                <span className="text-[8px] text-zinc-550 uppercase font-mono">Process</span>
+                              </div>
+                            </div>
+
+                            {/* Connectivity Activations */}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                onClick={() => handleRestartTerminal(pane.pane_id)}
+                                className="p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all text-[9px]"
+                                title="Restart Node Engine"
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setActiveTerminalId(pane.pane_id);
+                                }}
+                                className="px-3.5 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[9.5px] font-mono uppercase tracking-wider flex items-center gap-1 active:scale-95 transition-all font-bold select-none h-[34px]"
+                              >
+                                <TermIcon className="w-3.5 h-3.5" />
+                                CONNECT
+                              </button>
+                            </div>
+                          </div>
+                        </motion.div>
+                      );
+                    }
+
                     return (
-                      <div 
+                      <motion.div 
+                        layout
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.9 }}
+                        transition={{ duration: 0.2 }}
                         key={pane.pane_id} 
-                        className={`bg-[#111] border rounded-lg p-5 flex flex-col justify-between transition-all duration-300 ${isAlertActive ? 'border-amber-500 bg-amber-950/[0.02] shadow-[0_0_15px_rgba(245,158,11,0.05)]' : primaryColorClass} ${bgHover}`}
+                        className={`bg-[#111] border rounded-lg p-5 flex flex-col justify-between transition-colors transition-shadow duration-300 ${isAlertActive ? 'border-amber-500 bg-amber-950/[0.02] shadow-[0_0_15px_rgba(245,158,11,0.05)]' : primaryColorClass} ${bgHover}`}
                       >
                         {/* Card Header */}
                         <div>
@@ -1661,10 +2212,11 @@ function AppRaw() {
                             </button>
                           </div>
                         </div>
-                      </div>
+                      </motion.div>
                     );
                   })}
-                </div>
+                  </AnimatePresence>
+                </motion.div>
               ) : (
                 <div className="flex-1 flex flex-col items-center justify-center bg-[#090909] border border-dashed border-white/5 rounded-xl p-12">
                   <div className="w-10 h-10 rounded-full border border-dashed border-white/20 flex items-center justify-center text-zinc-500 mb-4 animate-pulse">
@@ -1817,6 +2369,24 @@ function AppRaw() {
           )}
         </section>
 
+        {/* Mobile Active Views */}
+        {mobileActiveView === "buffer" && (
+          <section className="flex-1 flex flex-col bg-[#080808] p-4 lg:hidden overflow-y-auto h-full gap-4">
+            {renderTerminalHealthHeatmap()}
+            {renderPromptSynchronizerPanel()}
+          </section>
+        )}
+
+        {/* Desktop Helper Panel: Shared Sync Buffer */}
+        <aside className="hidden lg:flex w-[400px] shrink-0 border-l border-white/5 bg-black/40 flex-col overflow-hidden max-h-full">
+          <div className="p-4 border-b border-white/5 bg-black/10 shrink-0">
+            {renderTerminalHealthHeatmap()}
+          </div>
+          <div className="flex-1 flex flex-col p-4 gap-4 overflow-y-auto h-full scrollbar-thin">
+            {renderPromptSynchronizerPanel()}
+          </div>
+        </aside>
+
         {/* Right side Transcript Log Panel */}
         {showTranscriptPanel && (
           <aside className="w-80 border-l border-white/5 bg-[#090909] flex flex-col shrink-0">
@@ -1870,6 +2440,34 @@ function AppRaw() {
           </aside>
         )}
       </main>
+
+      {/* Mobile Sticky Touch-friendly Navigation Bar */}
+      <div className="lg:hidden shrink-0 h-16 bg-black border-t border-white/10 flex items-center justify-around px-2 z-20 select-none">
+        <button
+          onClick={() => setMobileActiveView("terminal")}
+          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "terminal" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
+        >
+          <TermIcon className="w-4 h-4" />
+          <span className="text-[9px] font-mono uppercase tracking-wider">Terminal</span>
+        </button>
+        <button
+          onClick={() => setMobileActiveView("buffer")}
+          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 relative transition-colors focus:outline-none ${mobileActiveView === "buffer" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
+        >
+          <CheckSquare className="w-4 h-4" />
+          <span className="text-[9px] font-mono uppercase tracking-wider">Sync Buffer</span>
+          {promptBuffer.length > 0 && (
+            <span className="absolute top-2.5 right-8 w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse"></span>
+          )}
+        </button>
+        <button
+          onClick={() => setMobileActiveView("menu")}
+          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "menu" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
+        >
+          <Layers className="w-4 h-4" />
+          <span className="text-[9px] font-mono uppercase tracking-wider">Projects</span>
+        </button>
+      </div>
 
       {/* System Bar */}
       <div className="bg-black border-t border-white/5 px-6 py-2 flex justify-between items-center shrink-0">
@@ -1939,6 +2537,107 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
     }
     return this.props.children;
   }
+}
+
+function parseInlines(text: string): React.ReactNode[] {
+  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  const matches = text.split(regex);
+  return matches.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={i} className="font-bold text-white font-sans">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith("*") && part.endsWith("*")) {
+      return (
+        <span key={i} className="italic text-cyan-200">
+          {part.slice(1, -1)}
+        </span>
+      );
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code key={i} className="bg-black/80 px-1.5 py-0.5 rounded border border-white/10 font-mono text-[9px] text-cyan-400">
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return part;
+  }).filter(Boolean) as React.ReactNode[];
+}
+
+function MiniMarkdown({ text }: { text: string }) {
+  const lines = text.split("\n");
+  return (
+    <div className="space-y-1.5 select-text font-sans">
+      {lines.map((line, idx) => {
+        const trimmed = line.trim();
+        // Headers
+        if (trimmed.startsWith("### ")) {
+          return (
+            <h4 key={idx} className="text-[11px] font-mono font-bold text-cyan-400 uppercase tracking-widest mt-4 mb-2 border-b border-white/5 pb-1">
+              {trimmed.slice(4)}
+            </h4>
+          );
+        }
+        if (trimmed.startsWith("## ")) {
+          return (
+            <h3 key={idx} className="text-xs font-mono font-bold text-white uppercase tracking-wider mt-5 mb-2 border-b border-white/10 pb-1">
+              {trimmed.slice(3)}
+            </h3>
+          );
+        }
+        if (trimmed.startsWith("# ")) {
+          return (
+            <h2 key={idx} className="text-sm font-sans font-black text-white hover:text-cyan-400 uppercase tracking-widest mt-6 mb-3 border-b-2 border-cyan-400/20 pb-1">
+              {trimmed.slice(2)}
+            </h2>
+          );
+        }
+        // Horizontal separators
+        if (trimmed === "---") {
+          return <hr key={idx} className="border-white/5 my-4" />;
+        }
+        // Lists
+        if (trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") || trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+          const isChecklist = trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ");
+          const isChecked = trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ");
+          
+          let listText = trimmed;
+          if (isChecklist) {
+            listText = trimmed.slice(6);
+          } else if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+            listText = trimmed.slice(2);
+          }
+          
+          return (
+            <div key={idx} className="flex items-start gap-2.5 text-xs text-zinc-300 ml-4 py-0.5 font-sans leading-relaxed">
+              {isChecklist ? (
+                <span className={`w-3.5 h-3.5 border rounded flex-shrink-0 flex items-center justify-center text-[8px] tracking-tighter ${
+                  isChecked ? "bg-cyan-500/20 border-cyan-400 text-cyan-400 font-bold" : "border-white/20 text-transparent bg-black"
+                }`}>✓</span>
+              ) : (
+                <span className="text-cyan-500 select-none">•</span>
+              )}
+              <span className={isChecked ? "line-through text-zinc-650" : ""}>{parseInlines(listText)}</span>
+            </div>
+          );
+        }
+        // Empty space
+        if (!trimmed) {
+          return <div key={idx} className="h-1.5" />;
+        }
+        // Normal text
+        return (
+          <p key={idx} className="text-[11.5px] text-zinc-400 leading-relaxed py-0.5 font-sans">
+            {parseInlines(line)}
+          </p>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function App() {
