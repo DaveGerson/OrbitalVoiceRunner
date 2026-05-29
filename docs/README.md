@@ -12,6 +12,7 @@ independent final audit.
 > **Not hands-free-safe today.** 39 distinct defects, 8 P0.
 
 ## Start here
+- **[review/IMPLEMENTATION_PLAN.md](review/IMPLEMENTATION_PLAN.md)** — build-ready remediation plan: 12 workstreams across 4 milestones, dependency-aware sequencing, per-item file/function targets, data-model & tool-schema changes, tests, and the "hands-free-safe" definition of done.
 - **[review/final-review.md](review/final-review.md)** — independent audit, re-verification (8/8 confirmed), priority challenges, new findings, remediation roadmap, readiness sign-off.
 - **[review/BUG_LOG.md](review/BUG_LOG.md)** — consolidated, de-duplicated, prioritized bug log (P0→P3) + capability-coverage matrix + "what genuinely works". *(Stands in for the absent `BACKLOG.md` referenced by the design docs.)*
 
