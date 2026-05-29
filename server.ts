@@ -562,6 +562,25 @@ ${rawOutput.slice(-3000)}`;
     }
   });
 
+  // Web API to write input command directly to terminal node (for broadcast or target manipulation)
+  app.post("/api/terminals/:id/input", (req, res) => {
+    const { id } = req.params;
+    const { command } = req.body;
+    if (command === undefined) {
+      res.status(400).json({ error: "Missing command body parameter" });
+      return;
+    }
+    const term = manager.terminals[id];
+    if (term) {
+      HistoryManager.getInstance().addCommand(id, command);
+      term.writeInput(command);
+      broadcastLedgerUpdate();
+      res.json({ success: true, message: `Command successfully dispatched to terminal ${id}.` });
+    } else {
+      res.status(404).json({ error: "Terminal not found or offline" });
+    }
+  });
+
   // Web API to get terminal history
   app.get("/api/terminals/:id/history", (req, res) => {
     const { id } = req.params;

@@ -22,8 +22,29 @@
       opacity: 1;
     }
   }
+  @keyframes equalizer {
+    0%, 100% {
+      height: 30%;
+    }
+    50% {
+      height: 100%;
+    }
+  }
 }
 
 .heartbeat-animation {
   animation: heartbeat 3s ease-in-out infinite;
+}
+
+.equalizer-animation-1 {
+  animation: equalizer 1.2s ease-in-out infinite;
+}
+.equalizer-animation-2 {
+  animation: equalizer 0.8s ease-in-out infinite;
+}
+.equalizer-animation-3 {
+  animation: equalizer 1s ease-in-out infinite;
+}
+.equalizer-animation-4 {
+  animation: equalizer 1.5s ease-in-out infinite;
 }
