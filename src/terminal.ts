@@ -59,6 +59,69 @@ export function stripAnsiSequences(text: string): string {
   return text.replace(ansiEscape, '');
 }
 
+/**
+ * Redacts known secret patterns from terminal output before it is sent to any
+ * model-bound sink (Gemini Live session, summarizer, history fallback).
+ *
+ * Redaction is ADDITIVE and runs AFTER ANSI stripping. It is a pure function
+ * with no side-effects or state. Structured patterns (JWT, PEM, AKIA, AIza,
+ * GitHub/Slack tokens) are matched before the generic key=value catch-all so
+ * the more specific labels appear in the replacement token.
+ */
+export function redactSecrets(text: string): string {
+  // 1. PEM private-key blocks (multiline, dot-all). The optional algorithm prefix
+  //    (RSA/EC/OPENSSH/DSA…) means this also matches bare PKCS#8 "BEGIN PRIVATE KEY".
+  text = text.replace(
+    /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g,
+    "[REDACTED:private-key]"
+  );
+
+  // 2. JWTs: three base64url segments separated by dots
+  text = text.replace(
+    /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+    "[REDACTED:jwt]"
+  );
+
+  // 3. AWS access key IDs
+  text = text.replace(
+    /\bAKIA[0-9A-Z]{16}\b/g,
+    "[REDACTED:aws-key]"
+  );
+
+  // 4. AWS secret access key assignments
+  text = text.replace(
+    /\baws_secret_access_key\s*[=:]\s*["\']?([A-Za-z0-9/+]{40})["\']?/gi,
+    "aws_secret_access_key=[REDACTED:aws-key]"
+  );
+
+  // 5. Google API keys
+  text = text.replace(
+    /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    "[REDACTED:google-api-key]"
+  );
+
+  // 6. GitHub tokens (ghp_, gho_, ghs_, ghr_)
+  text = text.replace(
+    /\bgh[posr]_[A-Za-z0-9]{36,}\b/g,
+    "[REDACTED:github-token]"
+  );
+
+  // 7. Slack tokens
+  text = text.replace(
+    /\bxox[baprs]-[A-Za-z0-9-]+/g,
+    "[REDACTED:slack-token]"
+  );
+
+  // 8. Generic env/secret assignments — redact VALUE only, keep key name
+  //    Matches: api_key=secret, TOKEN: "abc123", password=\'hunter2\'
+  text = text.replace(
+    /\b(api[_-]?key|secret|token|password|passwd|bearer|access[_-]?key)\b(\s*[=:]\s*)["\']?([^\s"\']{6,})["\']?/gi,
+    (_match: string, key: string, sep: string, _val: string) => `${key}${sep}[REDACTED:secret]`
+  );
+
+  return text;
+}
+
 export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
@@ -604,6 +667,10 @@ export class OrchestratorManager {
       return `Error: Pane ${paneId} does not exist.`;
     }
     const recentOut = this.terminals[paneId].getRecentOutput(limit);
-    return `\`\`\`\n${recentOut || "[No new output]"}\n\`\`\``;
+    // WS-B: redactSecrets runs AFTER ANSI stripping (getRecentOutput already strips ANSI).
+    // This covers both the standard get_pane_summary tool response and the HiTL rationale
+    // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
+    const safeOut = redactSecrets(recentOut || "[No new output]");
+    return `\`\`\`\n${safeOut}\n\`\`\``;
   }
 }

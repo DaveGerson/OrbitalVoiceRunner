@@ -7,7 +7,7 @@ import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import { OrchestratorManager, UniversalTerminal, stripAnsiSequences } from "./src/terminal";
+import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
 
 dotenv.config();
 
@@ -199,18 +199,18 @@ async function startServer() {
         }
       }) : ai;
 
+      // WS-B: redactSecrets applied to raw output before it reaches the model (was UNREDACTED,
+      // finding N-5). Secrets printed to a pane are now scrubbed before this Gemini call.
       const prompt = `You are a strict, command-line terminal outcome synthesizer.
 Summarize the final response and outcome of the following command execution. Do NOT include raw or verbose stdout log sequences. Focus exclusively on the ultimate outcome, success/failure of the command, and any critical final lines of output (key numbers, final results, final generated file text, or compile error statements). Do not say who you are. Keep your summary to 1-2 small conversational sentences, highly professional and compact.
 
 Command: ${command}
 Verbose Output:
-${rawOutput.slice(-3000)}`;
+${redactSecrets(rawOutput.slice(-3000))}`;
 
-      // NOTE: `rawOutput` is sent to the summarizer model here. This path is
-      // currently UNREDACTED, so secrets printed to a pane can reach the model
-      // (finding N-5). The redaction layer (docs/review/IMPLEMENTATION_PLAN.md WS-B)
-      // must wrap `rawOutput` before this call. The model ID is valid; the catch
-      // below returns an honest neutral fallback (never a false "success") on error.
+      // NOTE: `rawOutput` is now sent to the summarizer model via redactSecrets(), which
+      // scrubs AWS keys, JWTs, PEM blocks, Google API keys, GitHub/Slack tokens, and
+      // generic key=value secret assignments before any content reaches the model.
       const response = await summarizeAi.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
@@ -1249,7 +1249,9 @@ ${rawOutput.slice(-3000)}`;
                 const conciseHistory = history.map((entry: any) => ({
                   command: entry.command,
                   timestamp: entry.timestamp,
-                  finalResponse: entry.finalResponse || stripAnsiSequences(entry.output).slice(-300).trim() || "No output captured."
+                  // WS-B: when no summarized finalResponse exists, the raw output fallback is
+                  // ANSI-stripped then secret-redacted before it reaches the Gemini model.
+                  finalResponse: entry.finalResponse || redactSecrets(stripAnsiSequences(entry.output).slice(-300).trim()) || "No output captured."
                 }));
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: conciseHistory } }]
@@ -1628,7 +1630,7 @@ ${rawOutput.slice(-3000)}`;
             },
             {
               name: "get_pane_summary",
-              description: "Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped). Primary observation path. Pull, not push. NOTE: output is raw — it is NOT redacted and NOT a delta; assume it may contain sensitive values.",
+              description: "Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted). Primary observation path. Pull, not push. NOTE: known secret patterns (AWS keys, JWTs, PEM blocks, GitHub/Slack tokens, Google API keys, generic key=value secrets) are scrubbed and replaced with [REDACTED:*] tokens before this response is sent. This is NOT a delta — it is a snapshot of the most recent lines only; incremental diffing is a later workstream.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
