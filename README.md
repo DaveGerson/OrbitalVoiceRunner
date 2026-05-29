@@ -44,6 +44,10 @@ Every pane has a `permissionsMode`; a `globalPermissionsMode` can override it.
 The effective mode is: use the global mode unless it is `Inherit`, in which case
 the pane's own mode applies (defaulting to `Human-in-the-Loop`).
 
+> **Note:** because the global mode takes precedence, changing a *pane's* mode
+> while `globalPermissionsMode` is anything other than `Inherit` has **no effect
+> on gating** until the global mode is set back to `Inherit`.
+
 | Mode               | Effect on `propose_command`                          |
 | ------------------ | ---------------------------------------------------- |
 | `Full Auto`        | Voice/AI Submits Commands Automatically. The agent writes commands directly to the pane without confirmation. |

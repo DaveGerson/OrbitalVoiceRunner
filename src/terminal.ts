@@ -75,6 +75,9 @@ export class UniversalTerminal {
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
+  // Silence-to-idle timeout (ms). Honors advanced.idleTimeoutMs; defaults to the
+  // documented 2000ms rather than the previously hardcoded 1000ms (BUG-034).
+  public idleTimeoutMs = 2000;
 
   constructor(
     terminalId: string,
@@ -184,7 +187,7 @@ export class UniversalTerminal {
             this.onIdle(this.terminalId);
           }
         }
-      }, 1000);
+      }, this.idleTimeoutMs);
     }
   }
 
@@ -264,7 +267,7 @@ export class UniversalTerminal {
       if (this.idleTimer) clearTimeout(this.idleTimer);
       this.idleTimer = setTimeout(() => {
         if (this.status !== "Exited") this.status = "Idle";
-      }, 1000);
+      }, this.idleTimeoutMs);
     }
 
     if (this.process.stdout) {
@@ -479,6 +482,11 @@ export class OrchestratorManager {
           term.maxBufferLines = newSettings.advanced.maxBufferLines;
         }
       }
+      if (newSettings.advanced.idleTimeoutMs !== undefined) {
+        for (const term of Object.values(this.terminals)) {
+          term.idleTimeoutMs = newSettings.advanced.idleTimeoutMs;
+        }
+      }
     }
     if (newSettings.secrets) {
       this.settings.secrets = { ...this.settings.secrets, ...newSettings.secrets };
@@ -533,6 +541,7 @@ export class OrchestratorManager {
     }
     const realProjId = projectId || this.ledger.activeProjectId || "default_project";
     const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
+    term.idleTimeoutMs = this.settings?.advanced?.idleTimeoutMs ?? term.idleTimeoutMs;
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
     };

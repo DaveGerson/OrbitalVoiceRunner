@@ -155,11 +155,13 @@ export class Ledger {
     }
   }
 
-  addPaneNote(projectId: string, paneId: string, note: string) {
+  addPaneNote(projectId: string, paneId: string, note: string): boolean {
     if (this.workspaces[projectId] && this.workspaces[projectId].panes[paneId]) {
       this.workspaces[projectId].panes[paneId].notes.push(note);
       this.save(true);
+      return true;
     }
+    return false;
   }
 
   getProject(id: string): Workspace | null {
@@ -178,11 +180,13 @@ export class Ledger {
     }
   }
 
-  addNote(projectId: string, note: string) {
+  addNote(projectId: string, note: string): boolean {
     if (this.workspaces[projectId]) {
       this.workspaces[projectId].notes.push(note);
       this.save(true);
+      return true;
     }
+    return false;
   }
 
   updatePane(projectId: string, paneMeta: PaneMeta, shouldSave = true) {
