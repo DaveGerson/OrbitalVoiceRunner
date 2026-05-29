@@ -70,8 +70,47 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
     });
     resizeObserver.observe(containerRef.current);
 
+    // Touch scrolling gesture handler for mobile/touch devices
+    let touchStartY = 0;
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        touchStartY = e.touches[0].clientY;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        const touchY = e.touches[0].clientY;
+        const deltaY = touchStartY - touchY;
+        
+        // Scroll 1 line per 8px delta distance
+        if (Math.abs(deltaY) > 8) {
+          const linesToScroll = Math.round(deltaY / 8);
+          if (linesToScroll !== 0) {
+            term.scrollLines(linesToScroll);
+            touchStartY = touchY;
+          }
+        }
+        
+        // Prevent background page bounce while dragging terminal logs
+        if (e.cancelable) {
+          e.preventDefault();
+        }
+      }
+    };
+
+    const containerEl = containerRef.current;
+    if (containerEl) {
+      containerEl.addEventListener("touchstart", handleTouchStart, { passive: true });
+      containerEl.addEventListener("touchmove", handleTouchMove, { passive: false });
+    }
+
     return () => {
       resizeObserver.disconnect();
+      if (containerEl) {
+        containerEl.removeEventListener("touchstart", handleTouchStart);
+        containerEl.removeEventListener("touchmove", handleTouchMove);
+      }
       term.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;

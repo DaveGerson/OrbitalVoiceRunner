@@ -130,6 +130,16 @@ export class HistoryManager {
 
 const manager = new OrchestratorManager();
 
+let promptBufferText = `# Requirements & Feedback Prompt Buffer
+
+- **Objective**: Review code updates, dictate requirements, and capture content fixes.
+- **Workflow**: Tap "Workspace Actions" below to test the core agentic workflows.
+- **Real-time Sync**: Updates made here instantly broadcast between all live operators and the voice agent.
+
+### ACTIVE CHRONICLE MEMORY LIST:
+* [System Status]: Orbital Harness and live voice workspace initialized.
+* [Task]: Review running nodes on mobile or initiate an agentic walkthrough session.`;
+
 async function startServer() {
   const app = express();
   app.use(express.json());
@@ -506,6 +516,25 @@ ${rawOutput.slice(-3000)}`;
     res.json({ success: true });
   });
 
+  // REST endpoints for the real-time synchronous markdown prompt buffer
+  app.get("/api/prompt-buffer", (req, res) => {
+    res.json({ text: promptBufferText });
+  });
+
+  app.put("/api/prompt-buffer", (req, res) => {
+    const { text } = req.body;
+    if (text !== undefined) {
+      promptBufferText = text;
+      broadcast({
+        type: "prompt_buffer_updated",
+        text: promptBufferText
+      });
+      res.json({ success: true, text: promptBufferText });
+    } else {
+      res.status(400).json({ error: "Missing text field" });
+    }
+  });
+
   app.get("/api/settings", (req, res) => {
     const sanitizedSettings = JSON.parse(JSON.stringify(manager.settings));
     if (sanitizedSettings.secrets && sanitizedSettings.secrets.geminiApiKey) {
@@ -600,6 +629,12 @@ ${rawOutput.slice(-3000)}`;
     clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
+    // Push initial prompt buffer synchronously to the newly connected client
+    clientWs.send(JSON.stringify({
+      type: "prompt_buffer_updated",
+      text: promptBufferText
+    }));
+
     let session: any = null;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
@@ -665,6 +700,16 @@ ${rawOutput.slice(-3000)}`;
                 sender: "User",
                 text: userUtterance
               }));
+
+              // Auto-log dictation as bullet points inside synchronous prompt buffer
+              const cleanUtter = userUtterance.trim();
+              if (cleanUtter.length > 2) {
+                promptBufferText += `\n* **User Dictation**: ${cleanUtter}`;
+                broadcast({
+                  type: "prompt_buffer_updated",
+                  text: promptBufferText
+                });
+              }
             }
             if (modelUtterance) {
               currentSessionModelUtterance = modelUtterance;
@@ -673,6 +718,16 @@ ${rawOutput.slice(-3000)}`;
                 sender: "Janus",
                 text: modelUtterance
               }));
+
+              // Auto-log agent comments as bullet points inside synchronous prompt buffer
+              const cleanUtter = modelUtterance.trim();
+              if (cleanUtter.length > 2) {
+                promptBufferText += `\n* **Agentic Thought**: *${cleanUtter}*`;
+                broadcast({
+                  type: "prompt_buffer_updated",
+                  text: promptBufferText
+                });
+              }
             }
 
             // Pass audio back to client
@@ -976,6 +1031,12 @@ ${rawOutput.slice(-3000)}`;
               console.error("Error feeding user mic:", e);
             }
           }
+        } else if (msg.type === "prompt_buffer_edit" && msg.text !== undefined) {
+          promptBufferText = msg.text;
+          broadcast({
+            type: "prompt_buffer_updated",
+            text: promptBufferText
+          });
         }
       } catch (err) {
         console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);
