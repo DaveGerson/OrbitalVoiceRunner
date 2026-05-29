@@ -59,5 +59,42 @@ describe("Project Ledger", () => {
     assert.strictEqual(briefing?.notes.length, 1);
     assert.deepStrictEqual(briefing?.panes, []);
   });
+
+  it("should persist and reload automation watch rules and plans correctly", () => {
+    const dummyRule = {
+      id: "rule_alpha",
+      triggerTerminalId: "pane_a",
+      triggerTransition: "idle" as const,
+      actionTerminalId: "pane_b",
+      actionCommand: "echo 'fired'",
+      enabled: true,
+      oneShot: true
+    };
+    ledger.watchRules.push(dummyRule);
+
+    const dummyPlan = {
+      id: "plan_beta",
+      name: "Upgrade and deploy pipeline",
+      steps: [
+        { id: "step_0", terminalId: "pane_a", command: "npm test", expectedTransition: "idle" as const, status: "pending" as const }
+      ],
+      currentStepIndex: 0,
+      status: "idle" as const
+    };
+    ledger.plans.push(dummyPlan);
+
+    ledger.save(true);
+
+    const secondLedger = new Ledger(TEST_STORAGE);
+    assert.strictEqual(secondLedger.watchRules.length, 1);
+    assert.strictEqual(secondLedger.watchRules[0].id, "rule_alpha");
+    assert.strictEqual(secondLedger.watchRules[0].actionCommand, "echo 'fired'");
+
+    assert.strictEqual(secondLedger.plans.length, 1);
+    assert.strictEqual(secondLedger.plans[0].id, "plan_beta");
+    assert.strictEqual(secondLedger.plans[0].name, "Upgrade and deploy pipeline");
+    assert.strictEqual(secondLedger.plans[0].steps.length, 1);
+    assert.strictEqual(secondLedger.plans[0].steps[0].command, "npm test");
+  });
 });
 

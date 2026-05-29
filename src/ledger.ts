@@ -1,4 +1,5 @@
 import fs from "fs";
+import { WatchRule, Plan } from "./types";
 
 export interface PaneMeta {
   pane_id: string;
@@ -27,6 +28,8 @@ export interface Workspace {
 export class Ledger {
   activeProjectId: string | null = null;
   workspaces: Record<string, Workspace> = {};
+  watchRules: WatchRule[] = [];
+  plans: Plan[] = [];
   private storagePath: string;
 
   constructor(storagePath: string = ".janus_ledger.json") {
@@ -41,6 +44,8 @@ export class Ledger {
         const parsed = JSON.parse(data);
         this.activeProjectId = parsed.activeProjectId || null;
         this.workspaces = parsed.workspaces || {};
+        this.watchRules = parsed.watchRules || [];
+        this.plans = parsed.plans || [];
       }
     } catch (e) {
       console.warn(`Failed to load ledger from ${this.storagePath}:`, e);
@@ -85,7 +90,9 @@ export class Ledger {
     try {
       const data = JSON.stringify({
         activeProjectId: this.activeProjectId,
-        workspaces: this.workspaces
+        workspaces: this.workspaces,
+        watchRules: this.watchRules,
+        plans: this.plans
       }, null, 2);
       await fs.promises.writeFile(tempPath, data, "utf-8");
       await fs.promises.rename(tempPath, this.storagePath);
@@ -100,14 +107,16 @@ export class Ledger {
     }
   }
 
-  private flushSaveSync() {
+  public flushSaveSync() {
     if (!this.isDirty) return;
     this.isDirty = false;
     const tempPath = `${this.storagePath}.tmp`;
     try {
       const data = JSON.stringify({
         activeProjectId: this.activeProjectId,
-        workspaces: this.workspaces
+        workspaces: this.workspaces,
+        watchRules: this.watchRules,
+        plans: this.plans
       }, null, 2);
       fs.writeFileSync(tempPath, data, "utf-8");
       fs.renameSync(tempPath, this.storagePath);

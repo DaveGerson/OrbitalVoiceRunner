@@ -261,6 +261,192 @@ ${rawOutput.slice(-3000)}`;
     }
   }
 
+  const lastStates: Record<string, string> = {};
+
+  function handleWatchRulesTrigger(terminalId: string, transition: "idle" | "prompt" | "error" | "build-failed" | "exited") {
+    const rules = manager.ledger.watchRules;
+    let changed = false;
+    for (const rule of rules) {
+      if (rule.enabled && rule.triggerTerminalId === terminalId && rule.triggerTransition === transition) {
+        const targetTerm = manager.terminals[rule.actionTerminalId];
+        if (targetTerm) {
+          console.log(`[WATCH RULE FIRED] Rule ${rule.id} triggered: Writing command to terminal ${rule.actionTerminalId}`);
+          HistoryManager.getInstance().addCommand(rule.actionTerminalId, rule.actionCommand);
+          targetTerm.writeInput(rule.actionCommand);
+          broadcast({
+            type: "watch_rule_fired",
+            ruleId: rule.id,
+            message: `Watch Rule matched! Fired '${rule.actionCommand}' on '${rule.actionTerminalId}' due to '${terminalId}' transition to '${transition}'.`
+          });
+          if (rule.oneShot) {
+            rule.enabled = false;
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed) {
+      manager.ledger["save"](true);
+      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+    }
+  }
+
+  function handlePlansTrigger(terminalId: string, transition: "idle" | "prompt" | "error" | "build-failed" | "exited") {
+    const plans = manager.ledger.plans;
+    let changed = false;
+    for (const plan of plans) {
+      if (plan.status === "running") {
+        const currentStep = plan.steps[plan.currentStepIndex];
+        if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
+          if (transition === currentStep.expectedTransition) {
+            currentStep.status = "completed";
+            console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
+            broadcast({
+              type: "plan_step_completed",
+              planId: plan.id,
+              stepId: currentStep.id,
+              message: `Plan step completed successfully on '${terminalId}'.`
+            });
+            const nextIndex = plan.currentStepIndex + 1;
+            if (nextIndex < plan.steps.length) {
+              plan.currentStepIndex = nextIndex;
+              const nextStep = plan.steps[nextIndex];
+              nextStep.status = "running";
+              const nextTerm = manager.terminals[nextStep.terminalId];
+              if (nextTerm) {
+                console.log(`[PLAN PROGRESS] Running next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
+                HistoryManager.getInstance().addCommand(nextStep.terminalId, nextStep.command);
+                nextTerm.writeInput(nextStep.command);
+                changed = true;
+              } else {
+                plan.status = "paused";
+                nextStep.status = "failed";
+                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+                manager.attentionQueue.push({
+                  id: itemID,
+                  type: "error",
+                  terminalId: nextStep.terminalId,
+                  projectId: manager.ledger.activeProjectId || "default_project",
+                  message: `Plan '${plan.name}' paused: pane '${nextStep.terminalId}' is not online.`,
+                  timestamp: new Date().toISOString(),
+                  dismissed: false
+                });
+                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+                changed = true;
+              }
+            } else {
+              plan.status = "completed";
+              console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
+              broadcast({
+                type: "plan_completed",
+                planId: plan.id,
+                message: `Plan '${plan.name}' completed all steps successfully!`
+              });
+              changed = true;
+            }
+          } else if (transition === "error" || transition === "build-failed" || transition === "exited") {
+            currentStep.status = "failed";
+            plan.status = "paused";
+            console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
+            
+            const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+            manager.attentionQueue.push({
+              id: itemID,
+              type: "build-failed",
+              terminalId,
+              projectId: manager.ledger.activeProjectId || "default_project",
+              message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+              timestamp: new Date().toISOString(),
+              dismissed: false
+            });
+            broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+            broadcast({
+              type: "plan_paused",
+              planId: plan.id,
+              message: `Plan '${plan.name}' paused due to execution error.`
+            });
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed) {
+      manager.ledger["save"](true);
+      broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+    }
+  }
+
+  function detectAndTriggerTransitions(terminalId: string, cleanChunk: string) {
+    const term = manager.terminals[terminalId];
+    if (!term) return;
+
+    let transition: "idle" | "prompt" | "error" | "build-failed" | "exited" | null = null;
+    if (term.status === "Exited") {
+      transition = "exited";
+    } else {
+      const lower = cleanChunk.toLowerCase();
+      if (
+        lower.includes("failed to compile") ||
+        lower.includes("build failed") ||
+        lower.includes("modulenotfounderror") ||
+        lower.includes("compile error") ||
+        lower.includes("npm err!") ||
+        lower.includes("failed to build") ||
+        lower.includes("error: command failed") ||
+        lower.includes("error: not found")
+      ) {
+        transition = "build-failed";
+      } else if (
+        cleanChunk.includes("Error:") ||
+        cleanChunk.includes("Exception:") ||
+        cleanChunk.includes("Stderr:") ||
+        lower.includes("traceback") ||
+        lower.includes("fatal: ")
+      ) {
+        transition = "error";
+      } else if (term.status === "Idle") {
+        const inputPromptPattern = /([\?$#>]|\[[yY]\/[nN]\]|\([yY]\/[nN]\)|password:|confirm\??)\s*$/i;
+        const stripped = cleanChunk.trim();
+        if (inputPromptPattern.test(stripped)) {
+          transition = "prompt";
+        } else {
+          transition = "idle";
+        }
+      }
+    }
+
+    const previousState = lastStates[terminalId];
+    if (transition && transition !== previousState) {
+      lastStates[terminalId] = transition;
+      console.log(`[TRANSITION] Terminal ${terminalId} transitioned: ${previousState || "none"} -> ${transition}`);
+      
+      broadcast({
+        type: "pane_transition",
+        terminalId,
+        transition,
+        message: `Pane ${terminalId} is now ${transition}.`
+      });
+
+      if (transition === "build-failed" || transition === "error" || transition === "exited") {
+        const activeProjectId = manager.ledger.activeProjectId || "default_project";
+        const id = "att_" + Math.random().toString(36).substring(2, 11);
+        manager.attentionQueue.push({
+          id,
+          type: transition,
+          terminalId,
+          projectId: activeProjectId,
+          message: `Pane '${terminalId}' transitioned to '${transition}' state.`,
+          timestamp: new Date().toISOString(),
+          dismissed: false
+        });
+        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+      }
+
+      handleWatchRulesTrigger(terminalId, transition);
+      handlePlansTrigger(terminalId, transition);
+    }
+  }
+
   const outputBuffers: Record<string, string[]> = {};
   let flushTimeout: NodeJS.Timeout | null = null;
 
@@ -269,6 +455,9 @@ ${rawOutput.slice(-3000)}`;
     if (term) {
       const cleanChunk = stripAnsiSequences(chunk);
       HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
+      
+      // Classify transitions and handle trigger rules
+      detectAndTriggerTransitions(terminalId, cleanChunk);
     }
 
     if (!outputBuffers[terminalId]) {
@@ -513,6 +702,211 @@ ${rawOutput.slice(-3000)}`;
     }
     broadcastLedgerUpdate();
     broadcast({ type: "terminals_updated" });
+    res.json({ success: true });
+  });
+
+  // --- ORCHESTRATION PIPELINES & AUTOMATIONS ENDPOINTS ---
+  const recipes = [
+    {
+      id: "full-stack-web",
+      name: "Full-Stack Web App Suite",
+      description: "Vite SPA client, Express backend router, and test watcher setup.",
+      panes: [
+        { id: "pane_frontend", name: "SPA Frontend (Vite)", command: "echo 'Frontend running' && npm run dev", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
+        { id: "pane_api", name: "Proxy Router (Express Server)", command: "echo 'API running' && node server.ts", preset: "Custom" as const, permissionsMode: "Full Auto" as const },
+        { id: "pane_tests", name: "Vitest Live Suite", command: "echo 'Tests idle' && npm run test", preset: "Custom" as const, permissionsMode: "Read-Only" as const }
+      ]
+    },
+    {
+      id: "python-worker",
+      name: "SQL Pipeline & background Queue",
+      description: "FastAPI Web Engine with an RQ asynchronous background worker.",
+      panes: [
+        { id: "pane_fastapi", name: "Microservice Host (Uvicorn)", command: "echo 'Uvicorn running' && uvicorn main:app --reload", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
+        { id: "pane_worker", name: "Asynchronous Poll Task Queue", command: "echo 'Queue worker poller running' && python -m rq worker tasks_queue", preset: "Custom" as const, permissionsMode: "Full Auto" as const }
+      ]
+    }
+  ];
+
+  // 1. Attention alerting queue
+  app.get("/api/attention", (req, res) => {
+    res.json(manager.attentionQueue);
+  });
+
+  app.post("/api/attention/:id/dismiss", (req, res) => {
+    const item = manager.attentionQueue.find(i => i.id === req.params.id);
+    if (item) {
+      item.dismissed = true;
+      broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Attention item not found" });
+    }
+  });
+
+  app.post("/api/attention/clear", (req, res) => {
+    manager.attentionQueue.forEach(i => i.dismissed = true);
+    broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+    res.json({ success: true });
+  });
+
+  // 2. Watch automation rules
+  app.get("/api/watch-rules", (req, res) => {
+    res.json(manager.ledger.watchRules);
+  });
+
+  app.post("/api/watch-rules", (req, res) => {
+    const { triggerTerminalId, triggerTransition, actionTerminalId, actionCommand, oneShot } = req.body;
+    if (!triggerTerminalId || !triggerTransition || !actionTerminalId || !actionCommand) {
+      res.status(400).json({ error: "Missing required rule parameters." });
+      return;
+    }
+    const newRule = {
+      id: "rule_" + Math.random().toString(36).substring(2, 11),
+      triggerTerminalId,
+      triggerTransition,
+      actionTerminalId,
+      actionCommand,
+      enabled: true,
+      oneShot: oneShot !== undefined ? oneShot : true
+    };
+    manager.ledger.watchRules.push(newRule);
+    manager.ledger["save"](true);
+    broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+    res.json({ success: true, rule: newRule });
+  });
+
+  app.delete("/api/watch-rules/:id", (req, res) => {
+    const idx = manager.ledger.watchRules.findIndex(r => r.id === req.params.id);
+    if (idx !== -1) {
+      manager.ledger.watchRules.splice(idx, 1);
+      manager.ledger["save"](true);
+      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Rule not found." });
+    }
+  });
+
+  // 3. Multi-step sequenced resumable plans
+  app.get("/api/plans", (req, res) => {
+    res.json(manager.ledger.plans);
+  });
+
+  app.post("/api/plans", (req, res) => {
+    const { name, steps } = req.body;
+    if (!name || !Array.isArray(steps)) {
+      res.status(400).json({ error: "Missing name or steps checklist." });
+      return;
+    }
+    const formattedSteps = steps.map((s: any, idx: number) => ({
+      id: "step_" + idx,
+      terminalId: s.terminalId,
+      command: s.command,
+      expectedTransition: s.expectedTransition || "idle",
+      status: "pending" as const
+    }));
+    const newPlan = {
+      id: "plan_" + Math.random().toString(36).substring(2, 11),
+      name,
+      steps: formattedSteps,
+      currentStepIndex: 0,
+      status: "idle" as const
+    };
+    manager.ledger.plans.push(newPlan);
+    manager.ledger["save"](true);
+    broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+    res.json({ success: true, plan: newPlan });
+  });
+
+  app.post("/api/plans/:id/execute", (req, res) => {
+    const plan = manager.ledger.plans.find(p => p.id === req.params.id);
+    if (plan) {
+      plan.status = "running";
+      plan.currentStepIndex = 0;
+      plan.steps.forEach((s, idx) => s.status = idx === 0 ? "running" : "pending");
+      const currentStep = plan.steps[0];
+      
+      const targetTerm = manager.terminals[currentStep.terminalId];
+      if (targetTerm) {
+        HistoryManager.getInstance().addCommand(currentStep.terminalId, currentStep.command);
+        targetTerm.writeInput(currentStep.command);
+        manager.ledger["save"](true);
+        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+        res.json({ success: true, message: `Running step 1 command on '${currentStep.terminalId}'.` });
+      } else {
+        plan.status = "paused";
+        currentStep.status = "failed";
+        manager.ledger["save"](true);
+        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+        res.status(400).json({ error: `Selected node '${currentStep.terminalId}' is currently offline.` });
+      }
+    } else {
+      res.status(404).json({ error: "Plan not found." });
+    }
+  });
+
+  app.delete("/api/plans/:id", (req, res) => {
+    const idx = manager.ledger.plans.findIndex(p => p.id === req.params.id);
+    if (idx !== -1) {
+      manager.ledger.plans.splice(idx, 1);
+      manager.ledger["save"](true);
+      broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Plan not found." });
+    }
+  });
+
+  // 4. Recipes and templates
+  app.get("/api/recipes", (req, res) => {
+    res.json(recipes);
+  });
+
+  app.post("/api/recipes/apply", (req, res) => {
+    const { recipeId } = req.body;
+    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+    const proj = manager.ledger.getProject(activeProjectId);
+    if (!proj) {
+      res.status(404).json({ error: "No active workspace is registered." });
+      return;
+    }
+    const recipe = recipes.find(r => r.id === recipeId);
+    if (recipe) {
+      for (const p of recipe.panes) {
+        if (!manager.terminals[p.id]) {
+          manager.addTerminal(p.id, proj.directory || process.cwd(), p.command, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+        }
+      }
+      broadcastLedgerUpdate();
+      broadcast({ type: "terminals_updated" });
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Recipe layout not found." });
+    }
+  });
+
+  // 5. Cross-pane context handoff
+  app.post("/api/handoff", (req, res) => {
+    const { sourcePaneId, targetPaneId, contextNotes } = req.body;
+    const sourceTerm = manager.terminals[sourcePaneId];
+    const targetTerm = manager.terminals[targetPaneId];
+    if (!sourceTerm || !targetTerm) {
+      res.status(400).json({ error: "Both source and target terminals must be active." });
+      return;
+    }
+    const sourceHistory = HistoryManager.getInstance().loadHistory(sourcePaneId);
+    const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
+    
+    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+    const handoffNote = `Handoff from [${sourcePaneId}] with notes: ${contextNotes}. Last events: ${lastFiveOutlines}`;
+    
+    manager.ledger.addPaneNote(activeProjectId, targetPaneId, handoffNote);
+    
+    const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${sourcePaneId} -> Target: ${targetPaneId}\n# Notes: ${contextNotes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
+    targetTerm.writeInput(commentCommand);
+    
+    broadcastLedgerUpdate();
     res.json({ success: true });
   });
 
@@ -882,6 +1276,188 @@ ${rawOutput.slice(-3000)}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Pane renamed to ${args.name}` } }]
                 });
+              } else if (name === "get_attention_digest") {
+                const unread = manager.attentionQueue.filter(item => !item.dismissed);
+                let text = "";
+                if (unread.length === 0) {
+                  text = "There are no pending alerts or actions requiring your attention right now.";
+                } else {
+                  text = `There are ${unread.length} items requiring attention. `;
+                  unread.forEach((item, index) => {
+                    text += `${index + 1}. Pane ${item.terminalId} in project ${item.projectId} transitioned to ${item.type}: ${item.message}. `;
+                  });
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: text } }]
+                });
+              } else if (name === "create_project") {
+                const { project_id, directory, summary, key_terms } = args;
+                manager.ledger.addProject(project_id, directory || ".", summary || "", key_terms || []);
+                broadcastLedgerUpdate();
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Project context ${project_id} created successfully.` } }]
+                });
+              } else if (name === "create_pane") {
+                const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
+                if (!manager.ledger.getProject(project_id)) {
+                  manager.ledger.addProject(project_id, ".", "Co-created with pane");
+                }
+                const result = manager.addTerminal(
+                  pane_id,
+                  manager.ledger.workspaces[project_id]?.directory || process.cwd(),
+                  command,
+                  tool_preset || "Custom",
+                  permissions_mode || "Human-in-the-Loop",
+                  "",
+                  project_id
+                );
+                broadcastLedgerUpdate();
+                broadcast({ type: "terminals_updated" });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Pane ${pane_id} created under project ${project_id}. Result: ${result}` } }]
+                });
+              } else if (name === "set_global_permissions") {
+                const { permissions_mode } = args;
+                manager.globalPermissionsMode = permissions_mode;
+                manager.settings.advanced.globalPermissionsMode = permissions_mode;
+                manager.saveSettings();
+                broadcast({ 
+                  type: "settings_updated", 
+                  globalPermissionsMode: permissions_mode,
+                  settings: manager.settings
+                });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Global permissions updated to ${permissions_mode}.` } }]
+                });
+              } else if (name === "set_voice_mute") {
+                const { muted } = args;
+                manager.settings.voiceAi.isMicMuted = muted;
+                manager.saveSettings();
+                broadcast({ 
+                  type: "settings_updated", 
+                  settings: manager.settings
+                });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Microphone now ${muted ? 'muted' : 'active-listening'}.` } }]
+                });
+              } else if (name === "add_watch_rule") {
+                const { trigger_terminal_id, trigger_transition, action_terminal_id, action_command, one_shot } = args;
+                const newRule = {
+                  id: "rule_" + Math.random().toString(36).substring(2, 11),
+                  triggerTerminalId: trigger_terminal_id,
+                  triggerTransition: trigger_transition,
+                  actionTerminalId: action_terminal_id,
+                  actionCommand: action_command,
+                  enabled: true,
+                  oneShot: one_shot !== undefined ? one_shot : true
+                };
+                manager.ledger.watchRules.push(newRule);
+                manager.ledger["save"](true);
+                broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Automation watch rule added: trigger ${trigger_terminal_id} on ${trigger_transition} -> run ${action_command} on ${action_terminal_id}` } }]
+                });
+              } else if (name === "create_orchestrator_plan") {
+                const { name: planName, steps } = args;
+                const formattedSteps = steps.map((s: any, idx: number) => ({
+                  id: "step_" + idx,
+                  terminalId: s.terminalId,
+                  command: s.command,
+                  expectedTransition: s.expectedTransition || "idle",
+                  status: "pending" as const
+                }));
+                const newPlan = {
+                  id: "plan_" + Math.random().toString(36).substring(2, 11),
+                  name: planName,
+                  steps: formattedSteps,
+                  currentStepIndex: 0,
+                  status: "idle" as const
+                };
+                manager.ledger.plans.push(newPlan);
+                manager.ledger["save"](true);
+                broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Multi-pane plan '${planName}' created. Contains ${steps.length} steps.` } }]
+                });
+              } else if (name === "execute_plan") {
+                const { plan_id } = args;
+                const plan = manager.ledger.plans.find(p => p.id === plan_id);
+                let resp = "";
+                if (plan) {
+                  plan.status = "running";
+                  plan.currentStepIndex = 0;
+                  plan.steps.forEach((s, idx) => s.status = idx === 0 ? "running" : "pending");
+                  const currentStep = plan.steps[0];
+                  
+                  const targetTerm = manager.terminals[currentStep.terminalId];
+                  if (targetTerm) {
+                    HistoryManager.getInstance().addCommand(currentStep.terminalId, currentStep.command);
+                    targetTerm.writeInput(currentStep.command);
+                    resp = `Started execution of plan '${plan.name}'! Running step 1: command '${currentStep.command}' on target '${currentStep.terminalId}'...`;
+                  } else {
+                    plan.status = "paused";
+                    currentStep.status = "failed";
+                    resp = `Error: Cannot start plan '${plan.name}' because node '${currentStep.terminalId}' is not online.`;
+                  }
+                  manager.ledger["save"](true);
+                  broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+                } else {
+                  resp = `Error: Plan '${plan_id}' not found.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "apply_orchestration_recipe") {
+                const { recipe_id } = args;
+                const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                const proj = manager.ledger.getProject(activeProjectId);
+                let resp = "";
+                if (!proj) {
+                  resp = "Error: There is no active project context synchronized to apply templates under.";
+                } else {
+                  const recipe = recipes.find(r => r.id === recipe_id);
+                  if (!recipe) {
+                    resp = `Error: Template recipe ${recipe_id} not found.`;
+                  } else {
+                    for (const p of recipe.panes) {
+                      if (!manager.terminals[p.id]) {
+                        manager.addTerminal(p.id, proj.directory || process.cwd(), p.command, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+                      }
+                    }
+                    broadcastLedgerUpdate();
+                    broadcast({ type: "terminals_updated" });
+                    resp = `Template recipe layout '${recipe.name}' successfully spawned in workspace.`;
+                  }
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "handoff_context_between_panes") {
+                const { source_pane_id, target_pane_id, context_notes } = args;
+                const sourceTerm = manager.terminals[source_pane_id];
+                const targetTerm = manager.terminals[target_pane_id];
+                
+                let resp = "";
+                if (!sourceTerm || !targetTerm) {
+                  resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
+                } else {
+                  const sourceHistory = HistoryManager.getInstance().loadHistory(source_pane_id);
+                  const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
+                  
+                  const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                  const handoffNote = `Handoff from [${source_pane_id}] with notes: ${context_notes}. Last events: ${lastFiveOutlines}`;
+                  
+                  manager.ledger.addPaneNote(activeProjectId, target_pane_id, handoffNote);
+                  
+                  const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${source_pane_id} -> Target: ${target_pane_id}\n# Notes: ${context_notes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
+                  targetTerm.writeInput(commentCommand);
+                  
+                  broadcastLedgerUpdate();
+                  resp = `Successful handoff orchestrated from [${source_pane_id}] to [${target_pane_id}]. Handoff packet injected into active process thread streams.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
               }
             }
           }
@@ -1003,6 +1579,146 @@ ${rawOutput.slice(-3000)}`;
                   name: { type: Type.STRING }
                 },
                 required: ["project_id", "pane_id", "name"]
+              }
+            },
+            {
+              name: "get_attention_digest",
+              description: "Speak a structured summary of active items in the attention queue requiring operator confirmation, approvals, or showing error states.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {}
+              }
+            },
+            {
+              name: "create_project",
+              description: "Create a new project workspace directory context block.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  project_id: { type: Type.STRING, description: "Unique project identifier." },
+                  directory: { type: Type.STRING, description: "Local workspace folder path." },
+                  summary: { type: Type.STRING, description: "A brief overview description of what this project does." }
+                },
+                required: ["project_id"]
+              }
+            },
+            {
+              name: "create_pane",
+              description: "Create a new terminal pane inside a project and live restore start its process environment.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  project_id: { type: Type.STRING, description: "Project ID context to create under." },
+                  pane_id: { type: Type.STRING, description: "Unique pane terminal identifier." },
+                  command: { type: Type.STRING, description: "The command line string to run." },
+                  tool_preset: { 
+                    type: Type.STRING, 
+                    description: "Tool preset environment to configure (Claude Code, Codex, Antigravity, Custom)."
+                  },
+                  permissions_mode: {
+                    type: Type.STRING,
+                    description: "Local permission safety policy mode (Full Auto, Human-in-the-Loop, Read-Only)."
+                  }
+                },
+                required: ["project_id", "pane_id", "command"]
+              }
+            },
+            {
+              name: "set_global_permissions",
+              description: "Set the system wide voice execution permission mode.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  permissions_mode: { 
+                    type: Type.STRING, 
+                    description: "Permissions Mode (Full Auto, Human-in-the-Loop, Read-Only, Inherit)"
+                  }
+                },
+                required: ["permissions_mode"]
+              }
+            },
+            {
+              name: "set_voice_mute",
+              description: "Set microphone muted status.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  muted: { type: Type.BOOLEAN, description: "True to mute, False to unmute." }
+                },
+                required: ["muted"]
+              }
+            },
+            {
+              name: "add_watch_rule",
+              description: "Add an automation rule that runs a command in an target pane when a trigger pane undergoes a state transition.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  trigger_terminal_id: { type: Type.STRING },
+                  trigger_transition: { type: Type.STRING, description: "Transition type (idle, prompt, error, build-failed, exited)" },
+                  action_terminal_id: { type: Type.STRING },
+                  action_command: { type: Type.STRING },
+                  one_shot: { type: Type.BOOLEAN, description: "If true, rule runs once and disables itself." }
+                },
+                required: ["trigger_terminal_id", "trigger_transition", "action_terminal_id", "action_command"]
+              }
+            },
+            {
+              name: "create_orchestrator_plan",
+              description: "Synthesize a multi-step sequence of chained commands spanning multiple panes that run sequentially with automatic state verification of previous outputs.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING, description: "Title designation of the recipe plan." },
+                  steps: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        terminalId: { type: Type.STRING },
+                        command: { type: Type.STRING },
+                        expectedTransition: { type: Type.STRING, description: "Expected transition (idle, prompt)" }
+                      },
+                      required: ["terminalId", "command", "expectedTransition"]
+                    }
+                  }
+                },
+                required: ["name", "steps"]
+              }
+            },
+            {
+              name: "execute_plan",
+              description: "Starts running a synthesized multi-step plan recipe.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  plan_id: { type: Type.STRING }
+                },
+                required: ["plan_id"]
+              }
+            },
+            {
+              name: "apply_orchestration_recipe",
+              description: "Apply a pre-configured template layout suite (such as full-stack-web or python-worker) to standard workspaces.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  recipe_id: { type: Type.STRING, description: "Recipe template ID (full-stack-web, python-worker)" }
+                },
+                required: ["recipe_id"]
+              }
+            },
+            {
+              name: "handoff_context_between_panes",
+              description: "Gather context from a source CLI pane and package summaries/learnings to prime a model agent in another target pane.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  source_pane_id: { type: Type.STRING },
+                  target_pane_id: { type: Type.STRING },
+                  context_notes: { type: Type.STRING, description: "Active guidance/handoff instructions summarizing context." }
+                },
+                required: ["source_pane_id", "target_pane_id", "context_notes"]
               }
             }
           ]

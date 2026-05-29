@@ -97,5 +97,56 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
 
       manager.terminals["pane_1"].stop();
     });
+
+    it("should manage and access attentionQueue and automation items layout structures", () => {
+      assert.strictEqual(manager.attentionQueue.length, 0);
+
+      // Add dummy attention item
+      manager.attentionQueue.push({
+        id: "att_foo",
+        type: "build-failed",
+        terminalId: "pane_x",
+        projectId: "default_project",
+        message: "Module build failed on Vite packager",
+        timestamp: new Date().toISOString(),
+        dismissed: false
+      });
+
+      assert.strictEqual(manager.attentionQueue.length, 1);
+      assert.strictEqual(manager.attentionQueue[0].type, "build-failed");
+      assert.strictEqual(manager.attentionQueue[0].dismissed, false);
+    });
+
+    it("should register plans and watch rules inside OrchestratorManager ledger storage block", () => {
+      assert.strictEqual(manager.ledger.watchRules.length, 0);
+      assert.strictEqual(manager.ledger.plans.length, 0);
+
+      // Create dummy structures
+      const rule = {
+        id: "rule_x",
+        triggerTerminalId: "pane_a",
+        triggerTransition: "exited" as const,
+        actionTerminalId: "pane_b",
+        actionCommand: "npm run dev",
+        enabled: true,
+        oneShot: false
+      };
+      manager.ledger.watchRules.push(rule);
+
+      const plan = {
+        id: "plan_y",
+        name: "CI pipeline",
+        steps: [
+          { id: "step_0", terminalId: "pane_a", command: "npm test", expectedTransition: "idle" as const, status: "pending" as const }
+        ],
+        currentStepIndex: 0,
+        status: "idle" as const
+      };
+      manager.ledger.plans.push(plan);
+
+      assert.strictEqual(manager.ledger.watchRules.length, 1);
+      assert.strictEqual(manager.ledger.plans.length, 1);
+      assert.strictEqual(manager.ledger.plans[0].name, "CI pipeline");
+    });
   });
 });

@@ -98,3 +98,54 @@ export interface SystemSettings {
   };
 }
 
+export interface AttentionItem {
+  id: string;
+  type: "approval" | "exited" | "error" | "build-failed" | "confirmation";
+  terminalId: string;
+  projectId: string;
+  message: string;
+  timestamp: string;
+  dismissed: boolean;
+  details?: any;
+}
+
+export interface WatchRule {
+  id: string;
+  triggerTerminalId: string;
+  triggerTransition: "idle" | "prompt" | "error" | "build-failed" | "exited";
+  actionTerminalId: string;
+  actionCommand: string;
+  enabled: boolean;
+  oneShot: boolean;
+}
+
+export interface PlanStep {
+  id: string;
+  terminalId: string;
+  command: string;
+  expectedTransition: "idle" | "prompt";
+  status: "pending" | "running" | "completed" | "failed";
+}
+
+export interface Plan {
+  id: string;
+  name: string;
+  steps: PlanStep[];
+  currentStepIndex: number;
+  status: "idle" | "running" | "paused" | "completed";
+}
+
+export interface TemplateRecipe {
+  id: string;
+  name: string;
+  description: string;
+  panes: {
+    id: string;
+    name: string;
+    command: string;
+    preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+    permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  }[];
+}
+
+

@@ -1,7 +1,7 @@
 import { spawn, ChildProcess } from "child_process";
 import { Ledger, PaneMeta } from "./ledger";
 import fs from "fs";
-import { SystemSettings, CliPreset } from "./types";
+import { SystemSettings, CliPreset, AttentionItem } from "./types";
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
@@ -380,6 +380,7 @@ export class OrchestratorManager {
   public terminals: Record<string, UniversalTerminal> = {};
   public activeId: string | null = null;
   public ledger: Ledger;
+  public attentionQueue: AttentionItem[] = [];
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
   public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
