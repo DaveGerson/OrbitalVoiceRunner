@@ -2,6 +2,7 @@
 import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
+import type { StoredPane, StoredPendingApproval } from "./types";
 
 export class JanusStore {
   readonly db: Database.Database;
@@ -122,4 +123,58 @@ export class JanusStore {
 
   /** Seam for deterministic IDs in tests. */
   protected rand(): number { return Math.random(); }
+
+  insertPendingApproval(a: StoredPendingApproval): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
+       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)`
+    ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null });
+  }
+  /** Atomic claim: flips 0->1 only if currently 0. True == this caller won. */
+  claimApproval(id: string): boolean {
+    return this.db.prepare("UPDATE pending_approvals SET claimed=1 WHERE id=? AND claimed=0").run(id).changes === 1;
+  }
+  deletePendingApproval(id: string): void {
+    this.db.prepare("DELETE FROM pending_approvals WHERE id=?").run(id);
+  }
+  getPendingApprovals(sessionId: string): StoredPendingApproval[] {
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as any[])
+      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+  }
+  getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
+      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+  }
+
+  upsertAttention(a: import("./types").StoredAttention): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO attention(id,type,terminal_id,project_id,message,timestamp,dismissed,details)
+       VALUES(@id,@type,@terminal_id,@project_id,@message,@timestamp,@dismissed,@details)`
+    ).run({ ...a, dismissed: a.dismissed?1:0, details: a.details ? JSON.stringify(a.details) : null });
+  }
+  dismissAttention(id: string): void { this.db.prepare("UPDATE attention SET dismissed=1 WHERE id=?").run(id); }
+  clearAttention(): void { this.db.prepare("DELETE FROM attention").run(); }
+  getAttention(opts: { includeDismissed?: boolean } = {}): import("./types").StoredAttention[] {
+    const clause = opts.includeDismissed ? "" : "WHERE dismissed=0";
+    return (this.db.prepare(`SELECT * FROM attention ${clause} ORDER BY timestamp DESC`).all() as any[])
+      .map(r => ({ ...r, dismissed: Boolean(r.dismissed), details: this.parseJSON(r.details, null) }));
+  }
+
+  getSettings(key: string): string | null {
+    const r = this.db.prepare("SELECT value FROM settings_kv WHERE key=?").get(key) as any;
+    return r?.value ?? null;
+  }
+  saveSettings(key: string, value: string): void {
+    this.db.prepare("INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .run(key, value, Date.now());
+  }
+  getKV(key: string): string | null {
+    const r = this.db.prepare("SELECT value FROM kv WHERE key=?").get(key) as any;
+    return r?.value ?? null;
+  }
+  setKV(key: string, value: string): void {
+    this.db.prepare("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .run(key, value, Date.now());
+  }
+  deleteKV(key: string): void { this.db.prepare("DELETE FROM kv WHERE key=?").run(key); }
 }
