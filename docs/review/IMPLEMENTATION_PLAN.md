@@ -215,10 +215,41 @@ assert no push fires on a false-idle input (regression guard for the WS-C coupli
 
 ---
 
-### WS-E — Spoken, targeted, safe approvals  *(M1, effort L)*
+### WS-E — Spoken, targeted, safe approvals  *(M1, effort L)*  ✅ COMPLETE
 **Closes:** BUG-001, BUG-007, BUG-008, BUG-009, BUG-016, BUG-019, BUG-020.
 **Root cause:** "block execution" is coupled to "block the model's voice"; the voice
 parser is a naive substring match; multi-pending resolves FIFO.
+
+> **STATUS: ✅ COMPLETE (`abf2508` + review-synthesis fixes).** All of E.1/E.2/E.3 landed.
+> The least-authority gate runs on EVERY pane write (propose_command, execute_plan steps, and
+> R4's plan-step ADVANCEMENT 2..N — the `activePlanGate` closes that bypass); `call.id` is
+> answered exactly ONCE (non-blocking `pending_approval`; outcomes via `pushApprovalNarration`,
+> never a 2nd `sendToolResponse`); the atomic `claim()` is the single mandatory gate inside one
+> `resolveDecision`/`applyResolution` choke-point shared by REST approve, voice approve/reject,
+> AND the TTL sweep (no path writes without winning the claim); the parser/targeting clarify
+> rather than over-approve (bare weak verbs and fragment-misses → none/clarify); all
+> spoken/stored/broadcast text is WS-B-redacted.
+> **Follow-up:** BUG-040 (`POST /api/plans/:id/execute` writes step 0 un-gated) remains **OPEN**
+> — it is the REST plan-execute endpoint, outside WS-E's voice scope; route it through the same
+> `dispatchProposal` gate in a follow-up.
+
+> **BINDING MAINTAINER DECISION (least authority + instruction-shaping) — reframes WS-E.**
+> 1. **Janus directs; agent panes do the heavy lifting (HARD constraint).** The agent
+>    terminals (Claude Code / Codex / Antigravity panes) are themselves capable agents that
+>    write the code and run the work. Janus's role is to **route the operator's request to the
+>    right agent pane and report back** — it must NOT author and execute raw *working* shell
+>    itself. The unit being proposed/approved is therefore primarily **"relay this instruction
+>    to pane Y"** (typed into the agent), not "Janus runs this shell command." Any direct
+>    shell Janus issues for its *own* needs is limited to a small read-only/observe set; the
+>    approval gate guards *both*, but the design must make "direct an agent" the primary,
+>    first-class path and treat Janus running raw heavy-lifting shell as out-of-bounds.
+> 2. **Collaborative instruction-shaping, not 1:1 relay.** Janus works *with* the operator to
+>    compress a long-winded dictation into a **focused, targeted action/instruction list**
+>    before directing it to an agent. It may decompose a stated goal into sub-instructions
+>    across one or more agent panes (fits `create_orchestrator_plan`/`execute_plan` and future
+>    WS-K fan-out) — bounded by what the operator asked for at the goal level. The spoken
+>    read-back/approval is over the **distilled instruction**, so the operator confirms the
+>    compressed version before it is sent.
 
 **Implementation — in two sub-steps (ordering matters):**
 

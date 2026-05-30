@@ -10,6 +10,19 @@ import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
 import { SHELL_PROMPT } from "./src/statusConstants";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
+import {
+  PendingApprovalStore,
+  decideProposal,
+  resolveDecision,
+  inferKind,
+  loadShellAllowlist,
+  serializePending,
+  type ApprovalKind,
+  type EffectiveMode,
+  type PendingApproval,
+  type ResolveMode,
+} from "./src/pendingApprovals";
+import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
 
 dotenv.config();
 
@@ -264,6 +277,33 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
 
+  // P0-3 (R4): minimal single-active-session registry used ONLY to gate plan-step ADVANCEMENT
+  // (steps 2..N). `handlePlansTrigger` runs at this outer scope and has no `session`/
+  // `dispatchProposal` in scope; the live connection installs a handle here (and clears it on
+  // close) so a step-completion can route the NEXT step's pane write through the SAME
+  // effective-mode + pending-approval gate as `dispatchProposal`. This is NOT the WS-D-declined
+  // proactive in-voice path — it is the same kind of handle the WS-E resolution push already
+  // needs. Single active session by design; if none is live we FALL BACK TO SAFE behavior
+  // (never an un-gated write).
+  //
+  // M11 (foot-gun): `activePlanGate` is module-scoped, single-slot, LAST-CONNECTION-WINS. A
+  // closing tab clears it (below) even if another session is still live, which PAUSES plan
+  // advancement (the SAFE direction — never an un-gated write) until a reconnect re-installs it.
+  // WS-F/WS-K should key this by sessionId so concurrent sessions don't clobber each other.
+  //
+  // H2: typed as the SAME outcome shape `dispatchProposal` returns (DispatchOutcome) so the union
+  // is single-sourced and can't drift from the real dispatch result.
+  type DispatchOutcome =
+    | { kind: "executed"; text: string }
+    | { kind: "blocked"; text: string }
+    | { kind: "error"; text: string }
+    | { kind: "clarify"; text: string }
+    | { kind: "pending"; text: string };
+
+  let activePlanGate:
+    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) => DispatchOutcome)
+    | null = null;
+
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
     for (const client of clients) {
@@ -343,12 +383,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               const nextStep = plan.steps[nextIndex];
               nextStep.status = "running";
               const nextTerm = manager.terminals[nextStep.terminalId];
-              if (nextTerm) {
-                console.log(`[PLAN PROGRESS] Running next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
-                HistoryManager.getInstance().addCommand(nextStep.terminalId, nextStep.command);
-                nextTerm.writeInput(nextStep.command);
-                changed = true;
-              } else {
+              if (!nextTerm) {
                 plan.status = "paused";
                 nextStep.status = "failed";
                 const itemID = "att_" + Math.random().toString(36).substring(2, 11);
@@ -368,6 +403,60 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   terminalId: nextStep.terminalId,
                   summary: `Plan '${plan.name}' paused — pane offline.`
                 });
+                changed = true;
+              } else if (!activePlanGate) {
+                // P0-3: no live session to gate through — FALL BACK TO SAFE. We MUST NOT write
+                // the next step un-gated (that is the least-authority hole). Pause and surface
+                // it for attention; the operator can resume once a session is live.
+                plan.status = "paused";
+                nextStep.status = "pending";
+                console.log(`[PLAN PROGRESS] Deferring step ${nextIndex + 1} of '${plan.name}': no active session to gate the write. NOT writing un-gated.`);
+                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+                manager.attentionQueue.push({
+                  id: itemID,
+                  type: "error",
+                  terminalId: nextStep.terminalId,
+                  projectId: manager.ledger.activeProjectId || "default_project",
+                  message: `Plan '${plan.name}' paused: step ${nextIndex + 1} needs the approval gate but no voice session is active.`,
+                  timestamp: new Date().toISOString(),
+                  dismissed: false
+                });
+                pruneAttention(); // BUG-035 cap/TTL
+                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+                announcementBus.enqueue({
+                  kind: "plan_paused",
+                  terminalId: nextStep.terminalId,
+                  summary: `Plan '${plan.name}' paused — no session to approve next step.`
+                });
+                changed = true;
+              } else {
+                // P0-3 (R4): route the next step's pane write through the SAME effective-mode +
+                // pending-approval gate as `dispatchProposal`. In HiTL the step becomes a spoken
+                // pending approval (it does NOT auto-execute), in Full Auto it runs, in Read-Only
+                // it is blocked. (WS-B redaction is applied inside the gate / narration.)
+                console.log(`[PLAN PROGRESS] Gating next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
+                const outcome = activePlanGate({
+                  pendingId: `plan__${plan.id}__step${nextIndex}`,
+                  targetId: nextStep.terminalId,
+                  instruction: nextStep.command,
+                  trigger: `Plan '${plan.name}' step ${nextIndex + 1}`,
+                });
+                if (outcome.kind === "executed") {
+                  // Full Auto: ran immediately; step stays "running" until its own transition.
+                } else if (outcome.kind === "pending") {
+                  // HiTL: now a spoken pending approval — do NOT auto-execute. Mark the step as
+                  // awaiting approval so the UI/plan state reflects that it has not run yet.
+                  nextStep.status = "pending";
+                } else {
+                  // blocked (Read-Only) / clarify / error: pause the plan, never silently write.
+                  plan.status = "paused";
+                  nextStep.status = "failed";
+                  announcementBus.enqueue({
+                    kind: "plan_paused",
+                    terminalId: nextStep.terminalId,
+                    summary: `Plan '${plan.name}' paused on step ${nextIndex + 1}: ${outcome.text}`,
+                  });
+                }
                 changed = true;
               }
             } else {
@@ -1033,59 +1122,144 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     res.json({ success: true, settings: manager.settings, globalPermissionsMode: manager.globalPermissionsMode });
   });
 
-  // Client pending commands mapping Map<messageId, Function(approved: boolean)>
-  // To keep it simple, we store pending execution approvals here.
-  const pendingApprovals: Record<string, { cmd: string, terminalId: string, callId: string, session: any, rationale?: { trigger: string, summary: string } }> = {};
+  // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
+  // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can
+  // add durability/atomicity without a rewrite (see src/pendingApprovals.ts §8).
+  const pendingApprovals = new PendingApprovalStore();
+  // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
+  const shellAllowlist = loadShellAllowlist();
+  // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
+  const APPROVAL_TTL_MS = 5 * 60 * 1000;
+  const APPROVAL_SWEEP_MS = 30 * 1000;
+
+  // R3: a fresh client-content push delivers the spoken read-back / resolution result. The
+  // original call.id is consumed once by the non-blocking pending_approval response, so the
+  // outcome cannot be a 2nd sendToolResponse — it is an ephemeral interactive turn.
+  // M3: single-source effective-mode resolution. `globalPermissionsMode === "Inherit"` defers to
+  // the pane's own mode (HiTL default when the pane is unknown); otherwise the global override
+  // wins. Used by EVERY write path (dispatchProposal + handoff_context) so "gate a new write" =
+  // resolve the mode here, never re-derive it inline.
+  function effectiveModeFor(targetId: string): EffectiveMode {
+    if (manager.globalPermissionsMode === "Inherit") {
+      const term = manager.terminals[targetId];
+      return (term ? term.permissionsMode : "Human-in-the-Loop") as EffectiveMode;
+    }
+    return manager.globalPermissionsMode as EffectiveMode;
+  }
+
+  function pushApprovalNarration(session: any, text: string) {
+    try {
+      session.sendClientContent({
+        turns: [{ role: "user", parts: [{ text: `SYSTEM EVENT (say this to the operator, then stop): ${text}` }] }],
+        turnComplete: true,
+      });
+    } catch (e) {
+      console.error("Failed to push approval narration to session:", e);
+    }
+  }
+
+  // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
+  // (ApprovalDialog.tsx) keys on these EXACT strings — do NOT rename the values without changing
+  // the client. The `command_auto_executed` payload has two boolean variants the UI relies on:
+  //   - `approved: true`  -> operator-APPROVED a HiTL command (REST or voice) — not auto-run.
+  //   - `vocal: true`     -> the approval/dispatch arrived via VOICE (vs the REST dialog).
+  //   - (neither flag)    -> a genuine Full-Auto auto-execution (no operator in the loop).
+  const WS_EVT = {
+    APPROVAL_PENDING: "approval_pending",
+    AUTO_EXECUTED: "command_auto_executed",
+    BLOCKED: "command_blocked",
+  } as const;
+
+  // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
+  // resolve path (REST approve, voice approve/reject, TTL sweep) renders the outcome of the pure
+  // `resolveDecision`. The MANDATORY atomic `claim()` lives INSIDE `resolveDecision`, so no path
+  // here can write without winning the claim (the sweep now goes through the SAME gate too).
+  // Returns the ResolveAction so a caller can branch on the reason for its own response shape.
+  // R3 (P0-1): `call.id` was already answered ONCE by the non-blocking `pending_approval`
+  // response at proposal time; resolution NEVER sends a 2nd `sendToolResponse` — the model-facing
+  // outcome is the `pushApprovalNarration` push only.
+  function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
+    const action = resolveDecision(
+      pendingApprovals,
+      messageId,
+      mode,
+      (terminalId) => !!manager.terminals[terminalId]
+    );
+    const { reason, record } = action;
+    if (!record) return action; // not_found: idempotent no-op
+    const session = pendingApprovals.sessionFor(messageId);
+    const safeInstr = redactSecrets(record.instruction);
+    const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
+
+    switch (reason) {
+      case "lost_race":
+        // Another resolver already won the claim — render nothing (exactly-once preserved).
+        break;
+      case "dead_pane":
+        if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+        break;
+      case "approved": {
+        // Claim already won inside resolveDecision — this is the single write path.
+        HistoryManager.getInstance().addCommand(record.terminalId, record.instruction);
+        manager.terminals[record.terminalId]!.writeInput(record.instruction);
+        if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+        // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
+        broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+        break;
+      }
+      case "rejected":
+        if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+        break;
+      case "expired":
+        if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
+        announcementBus.enqueue({ kind: "exited", terminalId: record.terminalId, summary: "Approval expired." });
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+        break;
+    }
+    if (reason !== "lost_race") broadcast({ type: "terminals_updated" });
+    return action;
+  }
 
   app.get("/api/commands/pending", (req, res) => {
-    res.json(Object.entries(pendingApprovals).map(([messageId, details]) => ({
-      messageId,
-      cmd: details.cmd,
-      terminalId: details.terminalId,
-      rationale: details.rationale
-    })));
+    res.json(pendingApprovals.all().map((p) => serializePending(p)));
   });
 
   app.post("/api/commands/approve", (req, res) => {
     const { messageId, approved } = req.body;
-    const pending = pendingApprovals[messageId];
-    if (pending) {
-      if (approved) {
-        const term = manager.terminals[pending.terminalId];
-        if (term) {
-          HistoryManager.getInstance().addCommand(pending.terminalId, pending.cmd);
-          term.writeInput(pending.cmd);
-          try {
-            pending.session.sendToolResponse({
-              functionResponses: [{
-                name: "propose_command",
-                id: pending.callId,
-                response: { output: `Command dispatched to ${pending.terminalId} successfully.` }
-              }]
-            });
-          } catch (e) {
-            console.error("Failed to send tool response to dead/closed session on approve:", e);
-          }
-        }
-      } else {
-        try {
-          pending.session.sendToolResponse({
-            functionResponses: [{
-              name: "propose_command",
-              id: pending.callId,
-              response: { output: "Execution cancelled by operator." }
-            }]
-          });
-        } catch (e) {
-          console.error("Failed to send tool response to dead/closed session on reject:", e);
-        }
-      }
-      delete pendingApprovals[messageId];
-      res.json({ success: true });
-    } else {
+    if (!pendingApprovals.has(messageId)) {
       res.status(404).json({ error: "Pending command not found" });
+      return;
+    }
+    const action = applyResolution(messageId, approved ? "approve" : "reject");
+    switch (action.reason) {
+      case "not_found":
+        res.status(404).json({ error: "Pending command not found" });
+        return;
+      case "dead_pane":
+        res.status(422).json({ success: false, error: "target pane missing" });
+        return;
+      case "lost_race":
+        res.json({ success: true, already: true });
+        return;
+      default:
+        res.json({ success: true });
     }
   });
+
+  // WS-E.3 (BUG-019): periodic sweep auto-rejects expired approvals so an unresolved vote
+  // never freezes a session indefinitely. The interval is unref'd so the test suite/process
+  // exits cleanly; it is also cleared on shutdown. The expiry routes through the SAME mandatory
+  // claim gate as approve (via applyResolution -> resolveDecision), closing the prior asymmetry
+  // where the sweep bypassed the claim by filtering `!p.claimed`.
+  function sweepExpiredApprovals(now: number = Date.now()) {
+    for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
+      applyResolution(pending.messageId, "expire");
+    }
+  }
+  const approvalSweepTimer = setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS);
+  if (typeof approvalSweepTimer.unref === "function") approvalSweepTimer.unref();
 
   let lastSessionResumptionToken: any = null;
 
@@ -1112,6 +1286,76 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
+
+    // WS-E.2/E.3: resolve a single targeted approval by voice. Speaks a pane+instruction
+    // read-back at resolution (R3 push), claims atomically (BUG-013/N-1 seam), and reports a
+    // spoken error on a dead pane (BUG-020) instead of unconditional success.
+    function resolveApprovalByVoice(_sess: any, messageId: string, approve: boolean) {
+      // The shared single choke-point renders narration + broadcast through the mandatory claim
+      // gate (exactly-once, dead-pane, redaction all inside). `vocal:true` tags the WS payloads.
+      applyResolution(messageId, approve ? "approve" : "reject", { vocal: true });
+    }
+
+    // WS-E.1 + R1/R2/R4: the SINGLE gated dispatch path. Used by both `propose_command` and
+    // `execute_plan` so plan steps respect the effective-mode gate (R4 closes the bypass).
+    // Returns the model-facing outcome text; the HiTL case stores a non-blocking pending entry
+    // (Janus is NOT muted — BUG-001) and the caller answers call.id with `pending_approval`.
+    function dispatchProposal(opts: {
+      sess: any;
+      callId: string;
+      /** Pending-entry key; defaults to callId. Plan steps use a synthetic id so they do
+       *  not collide with the execute_plan functionCall id. */
+      pendingId?: string;
+      targetId: string;
+      instruction: string;
+      explicitKind?: ApprovalKind;
+      trigger: string;
+    }): DispatchOutcome {
+      const { sess, callId, targetId, instruction } = opts;
+      const pendingId = opts.pendingId ?? callId;
+      const term = manager.terminals[targetId];
+      const wsProj = manager.ledger.getActiveProject();
+      const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+      const runtimeType = term?.runtimeType;
+      const kind = inferKind(opts.explicitKind, runtimeType);
+
+      // M3: single-source effective-mode resolver (global-first, then pane, then HiTL default).
+      const effectiveMode = effectiveModeFor(targetId);
+
+      const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist });
+      const safeInstr = redactSecrets(instruction);
+
+      switch (decision.type) {
+        case "error_no_pane":
+          return { kind: "error", text: `Error: pane ${targetId} not found.` };
+        case "error_kind_mismatch":
+          return { kind: "error", text: decision.reason };
+        case "clarify_shell":
+          // Non-blocking re-route (never a dead-end, never execution).
+          return { kind: "clarify", text: decision.reason };
+        case "blocked_read_only":
+          broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
+          return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
+        case "auto_execute":
+          HistoryManager.getInstance().addCommand(targetId, instruction);
+          term!.writeInput(instruction);
+          broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
+          return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
+        case "pending_approval": {
+          // WS-E.1 two-phase: store a serializable pending entry + the session in the side-map,
+          // mark it announced for targeting, and let the caller answer call.id NON-BLOCKINGLY.
+          const pSummary = redactSecrets(manager.getPaneSummary(targetId, 5));
+          const rationale = { trigger: redactSecrets(opts.trigger), summary: pSummary };
+          const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now() };
+          pendingApprovals.add(record, sess);
+          // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
+          announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
+          clientWs.send(JSON.stringify({ type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale }));
+          const verb = kind === "agent_instruction" ? "direct pane" : "run on pane";
+          return { kind: "pending", text: `Pending approval: ${verb} ${targetId} — "${safeInstr}". Read it back to the operator and ask them to approve or reject.` };
+        }
+      }
+    }
 
     try {
       const sessionKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
@@ -1183,67 +1427,29 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   text: promptBufferText
                 });
 
-                // Hands-free voice approvals parsing
-                const lowerUtter = cleanUtter.toLowerCase();
-                const isApprove = ["approve", "go ahead", "execute", "run it", "yes run", "approve command", "confirm execution"].some(word => lowerUtter.includes(word));
-                const isReject = ["reject", "cancel", "deny", "don't run", "reject command"].some(word => lowerUtter.includes(word));
-                
-                if (isApprove || isReject) {
-                  // Find any pending approval for this session
-                  const pendingEntries = Object.entries(pendingApprovals).filter(([mId, details]) => details.session === session);
-                  if (pendingEntries.length > 0) {
-                    // NOTE: resolves the OLDEST pending entry (insertion-order FIFO).
-                    // There is no targeting of the command the operator named — see
-                    // docs/review/BUG_LOG.md BUG-007 (fixed in IMPLEMENTATION_PLAN WS-E.2).
-                    const [messageId, pending] = pendingEntries[0];
-                    console.log(`[VOICE INTERCEPT] Auto-resolving pending command "${pending.cmd}" on pane "${pending.terminalId}" via voice: approved=${isApprove}`);
-                    
-                    if (isApprove) {
-                      const term = manager.terminals[pending.terminalId];
-                      if (term) {
-                        HistoryManager.getInstance().addCommand(pending.terminalId, pending.cmd);
-                        term.writeInput(pending.cmd);
-                        try {
-                          pending.session.sendToolResponse({
-                            functionResponses: [{
-                              name: "propose_command",
-                              id: pending.callId,
-                              response: { output: `Command dispatched to ${pending.terminalId} successfully via voice.` }
-                            }]
-                          });
-                        } catch (e) {
-                          console.error("Failed to send tool response to session on voice approve:", e);
-                        }
-                        
-                        // Notify frontend
-                        clientWs.send(JSON.stringify({
-                          type: "command_auto_executed",
-                          terminalId: pending.terminalId,
-                          cmd: pending.cmd,
-                          vocal: true
-                        }));
-                      }
+                // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser
+                // + most-recently-announced targeting (NOT FIFO, NOT substring matching).
+                const parsed = parseApprovalIntent(cleanUtter);
+                if (parsed.intent !== "none") {
+                  const entries = pendingApprovals.forSession(session);
+                  if (entries.length > 0) {
+                    // Collision/ambiguity in the utterance itself -> clarify, never approve.
+                    if (parsed.intent === "clarify") {
+                      pushApprovalNarration(session, `I heard both approve and reject — which did you mean for the ${entries.length} pending command${entries.length === 1 ? "" : "s"}?`);
                     } else {
-                      try {
-                        pending.session.sendToolResponse({
-                          functionResponses: [{
-                            name: "propose_command",
-                            id: pending.callId,
-                            response: { output: "Execution cancelled by operator via voice." }
-                          }]
-                        });
-                      } catch (e) {
-                        console.error("Failed to send tool response to session on voice reject:", e);
+                      const target = selectApprovalTarget(
+                        entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
+                        parsed.targetHint,
+                        pendingApprovals.lastAnnouncedFor(session)
+                      );
+                      if (target.ambiguous || !target.messageId) {
+                        // >1 pending and nothing disambiguates -> clarify, list them.
+                        const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
+                        pushApprovalNarration(session, `I have ${entries.length} pending: ${list}. Which one?`);
+                      } else {
+                        resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
                       }
-                      clientWs.send(JSON.stringify({
-                        type: "command_blocked",
-                        terminalId: pending.terminalId,
-                        cmd: pending.cmd,
-                        reason: "Execution cancelled by operator via voice."
-                      }));
                     }
-                    delete pendingApprovals[messageId];
-                    broadcast({ type: "terminals_updated" }); // Refresh lists
                   }
                 }
               }
@@ -1330,73 +1536,42 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "propose_command") {
                 const targetId = args.pane_id;
-                const cmd = args.command;
-                
-                // Determine effective permission mode: First check global, then local terminal
-                let effectivePermissions = manager.globalPermissionsMode;
-                if (effectivePermissions === "Inherit") {
-                  const term = manager.terminals[targetId];
-                  effectivePermissions = term ? term.permissionsMode : "Human-in-the-Loop";
-                }
-                
-                if (effectivePermissions === "Full Auto") {
-                  const term = manager.terminals[targetId];
-                  if (term) {
-                    HistoryManager.getInstance().addCommand(targetId, cmd);
-                    term.writeInput(cmd);
-                    session.sendToolResponse({
-                      functionResponses: [{
-                        name: "propose_command",
-                        id: call.id,
-                        response: { output: `Command executed automatically on node ${targetId}: "${cmd}"` }
-                      }]
-                    });
-                    clientWs.send(JSON.stringify({
-                      type: "command_auto_executed",
-                      terminalId: targetId,
-                      cmd
-                    }));
-                  } else {
-                    session.sendToolResponse({
-                      functionResponses: [{
-                        name: "propose_command",
-                        id: call.id,
-                        response: { output: `Error: Node ${targetId} not found.` }
-                      }]
-                    });
-                  }
-                } else if (effectivePermissions === "Read-Only") {
+                // R2 back-compat: accept the legacy `command` arg as an alias for `instruction`.
+                const instruction = args.instruction ?? args.command ?? "";
+                const explicitKind: ApprovalKind | undefined =
+                  args.kind === "shell" || args.kind === "agent_instruction" ? args.kind : undefined;
+                const trigger = currentSessionUserUtterance || "Spoken execute command";
+
+                const outcome = dispatchProposal({ sess: session, callId: call.id, targetId, instruction, explicitKind, trigger });
+                // WS-E.1 (BUG-001): ALWAYS answer call.id exactly once. Pending is answered
+                // NON-BLOCKINGLY (pending_approval) so Janus is not muted and can read it back.
+                if (outcome.kind === "pending") {
                   session.sendToolResponse({
-                    functionResponses: [{
-                      name: "propose_command",
-                      id: call.id,
-                      response: { output: `Error: Write execution block is active. Terminal ${targetId} is Read-Only.` }
-                    }]
+                    functionResponses: [{ name: "propose_command", id: call.id, response: { status: "pending_approval", messageId: call.id, pane_id: targetId, prompt: outcome.text } }]
                   });
-                  clientWs.send(JSON.stringify({
-                    type: "command_blocked",
-                    terminalId: targetId,
-                    cmd,
-                    reason: "Read-Only policy enforced."
-                  }));
+                } else if (outcome.kind === "clarify") {
+                  session.sendToolResponse({
+                    functionResponses: [{ name: "propose_command", id: call.id, response: { status: "clarify", output: outcome.text } }]
+                  });
                 } else {
-                  // Human-in-the-loop intercept
-                  const messageId = call.id; // use call.id as unique ID
-                  const trigUtterance = currentSessionUserUtterance || "Spoken execute command";
-                  const pSummary = manager.getPaneSummary(targetId, 5);
-                  const rationale = { trigger: trigUtterance, summary: pSummary };
-                  pendingApprovals[messageId] = { cmd, terminalId: targetId, callId: call.id, session, rationale };
-                  
-                  // Notify frontend to ask for approval
-                  clientWs.send(JSON.stringify({
-                    type: "approval_pending",
-                    messageId,
-                    cmd,
-                    terminalId: targetId,
-                    rationale
-                  }));
-                  // We do NOT send tool response here. It will be sent via /api/commands/approve API.
+                  session.sendToolResponse({
+                    functionResponses: [{ name: "propose_command", id: call.id, response: { output: outcome.text } }]
+                  });
                 }
+              } else if (name === "list_pending_approvals") {
+                // WS-E.1 (BUG-016): let the eyes-off operator ask "what's queued for approval?"
+                // Reads the SAME store the REST endpoint reads, redacted, scoped to this session.
+                const entries = pendingApprovals.forSession(session);
+                if (entries.length) pendingApprovals.setLastAnnounced(session, entries[entries.length - 1].messageId);
+                // M3: reuse serializePending (it already redacts + computes ageSeconds); add the
+                // voice-facing `index`/`pane_id` aliases on top so we don't hand-roll a 3rd shape.
+                const items = entries.map((p, i) => {
+                  const ser = serializePending(p);
+                  return { index: i + 1, pane_id: ser.terminalId, ...ser };
+                });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: { count: items.length, items } } }]
+                });
               } else if (name === "add_project_note") {
                 const ok = manager.ledger.addNote(args.project_id, args.note);
                 if (ok) broadcastLedgerUpdate();
@@ -1424,29 +1599,43 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               } else if (name === "get_attention_digest") {
                 pruneAttention(); // BUG-035: evict stale items before reading the digest
                 const unread = manager.attentionQueue.filter(item => !item.dismissed);
+                // BUG-009: MERGE pending approvals — the digest tool claims to cover approvals,
+                // so it must actually include them (one source of truth: the same store
+                // list_pending_approvals / GET /api/commands/pending read).
+                const pending = pendingApprovals.forSession(session);
                 let text = "";
-                if (unread.length === 0) {
+                if (unread.length === 0 && pending.length === 0) {
                   text = "There are no pending alerts or actions requiring your attention right now.";
                 } else {
-                  text = `There are ${unread.length} items requiring attention. `;
-                  unread.forEach((item, index) => {
-                    // BUG-025: enrich with live elapsed time + last command so Janus can
-                    // say e.g. "Pane build has been busy 4 minutes running npm run build."
-                    const term = manager.terminals[item.terminalId];
-                    let timing = "";
-                    if (term) {
-                      const elapsedMs = Date.now() - term.lastStatusChangeAt;
-                      const mins = Math.floor(elapsedMs / 60000);
-                      const secs = Math.floor((elapsedMs % 60000) / 1000);
-                      const dur = mins > 0 ? `${mins} minute${mins === 1 ? "" : "s"}` : `${secs} second${secs === 1 ? "" : "s"}`;
-                      timing = ` It has been ${term.status.toLowerCase()} for ${dur}`;
-                      // P2 (WS-B): redact secrets in the verbatim last command so a
-                      // token typed as a command is never surfaced/spoken unredacted.
-                      if (term.lastCommand) timing += `, last command was '${redactSecrets(term.lastCommand)}'`;
-                      timing += ".";
-                    }
-                    text += `${index + 1}. Pane ${item.terminalId} in project ${item.projectId} transitioned to ${item.type}: ${item.message}.${timing} `;
-                  });
+                  if (unread.length > 0) {
+                    text += `There are ${unread.length} items requiring attention. `;
+                    unread.forEach((item, index) => {
+                      // BUG-025: enrich with live elapsed time + last command so Janus can
+                      // say e.g. "Pane build has been busy 4 minutes running npm run build."
+                      const term = manager.terminals[item.terminalId];
+                      let timing = "";
+                      if (term) {
+                        const elapsedMs = Date.now() - term.lastStatusChangeAt;
+                        const mins = Math.floor(elapsedMs / 60000);
+                        const secs = Math.floor((elapsedMs % 60000) / 1000);
+                        const dur = mins > 0 ? `${mins} minute${mins === 1 ? "" : "s"}` : `${secs} second${secs === 1 ? "" : "s"}`;
+                        timing = ` It has been ${term.status.toLowerCase()} for ${dur}`;
+                        // P2 (WS-B): redact secrets in the verbatim last command so a
+                        // token typed as a command is never surfaced/spoken unredacted.
+                        if (term.lastCommand) timing += `, last command was '${redactSecrets(term.lastCommand)}'`;
+                        timing += ".";
+                      }
+                      text += `${index + 1}. Pane ${item.terminalId} in project ${item.projectId} transitioned to ${item.type}: ${item.message}.${timing} `;
+                    });
+                  }
+                  if (pending.length > 0) {
+                    pendingApprovals.setLastAnnounced(session, pending[pending.length - 1].messageId);
+                    text += `You also have ${pending.length} command${pending.length === 1 ? "" : "s"} awaiting approval: `;
+                    pending.forEach((p, i) => {
+                      const verb = p.kind === "agent_instruction" ? "direct pane" : "run on pane";
+                      text += `${i + 1}. ${verb} ${p.terminalId} — "${redactSecrets(p.instruction)}". `;
+                    });
+                  }
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: text } }]
@@ -1573,16 +1762,30 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   plan.currentStepIndex = 0;
                   plan.steps.forEach((s, idx) => s.status = idx === 0 ? "running" : "pending");
                   const currentStep = plan.steps[0];
-                  
-                  const targetTerm = manager.terminals[currentStep.terminalId];
-                  if (targetTerm) {
-                    HistoryManager.getInstance().addCommand(currentStep.terminalId, currentStep.command);
-                    targetTerm.writeInput(currentStep.command);
-                    resp = `Started execution of plan '${plan.name}'! Running step 1: command '${currentStep.command}' on target '${currentStep.terminalId}'...`;
+
+                  // R4: route the plan step's pane write through the SAME effective-mode gate +
+                  // pending-approval path. In HiTL the step becomes a spoken pending approval
+                  // (it does NOT auto-execute); Full Auto still runs immediately.
+                  const stepOutcome = dispatchProposal({
+                    sess: session,
+                    callId: call.id,
+                    pendingId: `${call.id}__${plan.id}__step0`,
+                    targetId: currentStep.terminalId,
+                    instruction: currentStep.command,
+                    trigger: `Plan '${plan.name}' step 1`,
+                  });
+                  if (stepOutcome.kind === "executed") {
+                    resp = `Started execution of plan '${plan.name}'! Running step 1 on '${currentStep.terminalId}'.`;
+                  } else if (stepOutcome.kind === "pending") {
+                    resp = `Plan '${plan.name}' step 1 needs approval: ${stepOutcome.text}`;
+                  } else if (stepOutcome.kind === "clarify") {
+                    plan.status = "paused";
+                    currentStep.status = "failed";
+                    resp = `Plan '${plan.name}' step 1 paused: ${stepOutcome.text}`;
                   } else {
                     plan.status = "paused";
                     currentStep.status = "failed";
-                    resp = `Error: Cannot start plan '${plan.name}' because node '${currentStep.terminalId}' is not online.`;
+                    resp = `Could not start plan '${plan.name}': ${stepOutcome.text}`;
                   }
                   manager.ledger["save"](true);
                   broadcast({ type: "plans_updated", plans: manager.ledger.plans });
@@ -1623,8 +1826,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const targetTerm = manager.terminals[target_pane_id];
                 
                 let resp = "";
+                // P2-1: this writes a comment block to the TARGET pane stdin — still a write, so
+                // respect Read-Only at minimum (least-authority). TODO(WS-G): route the full
+                // handoff write through the same effective-mode + pending-approval gate as
+                // `dispatchProposal` (HiTL should make it a spoken approval too).
+                const targetEffectiveMode = effectiveModeFor(target_pane_id);
                 if (!sourceTerm || !targetTerm) {
                   resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
+                } else if (targetEffectiveMode === "Read-Only") {
+                  broadcast({ type: "command_blocked", terminalId: target_pane_id, cmd: "(handoff context block)", reason: "Read-Only policy enforced." });
+                  resp = `Error: Target pane ${target_pane_id} is Read-Only; the handoff context block was not written.`;
                 } else {
                   const sourceHistory = HistoryManager.getInstance().loadHistory(source_pane_id);
                   const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
@@ -1681,7 +1892,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the full project briefing when starting.`,
+        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.`,
         ...({
           sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
           contextWindowCompression: {
@@ -1701,14 +1912,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "propose_command",
-              description: "Propose a command for a pane. Does NOT execute. Triggers human approval; returns the outcome (executed | edited | denied).",
+              description: "Direct work to the right pane. Does NOT execute directly — it passes the effective permission gate (auto-runs in Full Auto, becomes a spoken pending approval in Human-in-the-Loop, blocked in Read-Only). PREFER kind='agent_instruction' (the default): relay a SHORT, FOCUSED, DISTILLED instruction to the Claude Code / Codex / Antigravity agent in that pane and let the AGENT do the heavy lifting (write code, run builds/tests). Do NOT relay the operator's dictation verbatim — compress it to a targeted instruction first and confirm it by voice. kind='shell' is ONLY for your OWN small read-only/observe needs (status checks like git status, ls, cat, pwd); never author or run heavy/mutating shell yourself — delegate that to an agent pane via kind='agent_instruction'. A non-allowlisted shell command returns a clarification so you can re-route it to the agent.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
                   pane_id: { type: Type.STRING, description: "Target pane ID." },
-                  command: { type: Type.STRING, description: "The refined command string." }
+                  instruction: { type: Type.STRING, description: "The DISTILLED instruction to relay to the agent (kind='agent_instruction') or the shell command (kind='shell')." },
+                  kind: { type: Type.STRING, description: "'agent_instruction' (default, FIRST-CLASS — direct the agent in this pane) or 'shell' (your own small read-only command only).", enum: ["agent_instruction", "shell"] }
                 },
-                required: ["pane_id", "command"]
+                required: ["pane_id", "instruction"]
+              }
+            },
+            {
+              name: "list_pending_approvals",
+              description: "List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count). Use it when the operator asks 'what's queued for approval?' and to disambiguate which one they mean before approving/rejecting.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {}
               }
             },
             {
@@ -1796,7 +2016,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "get_attention_digest",
-              description: "Speak a structured summary of items in the attention queue (panes that transitioned to error/exit states). NOTE: this does NOT include pending command approvals — those are a separate queue.",
+              description: "Speak a structured summary of items needing the operator's attention: panes that transitioned to error/exit states AND any commands currently awaiting spoken approval (both are merged into one digest).",
               parameters: {
                 type: Type.OBJECT,
                 properties: {}
@@ -1962,6 +2182,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }]
       },
     });
+
+      // P0-3 (R4): install the single-active-session plan gate now that `session` is live, so
+      // `handlePlansTrigger` (outer scope) can route step ADVANCEMENT (steps 2..N) through the
+      // SAME `dispatchProposal` gate. Step-advancement is server-initiated (there is no live
+      // functionCall to answer), so the synthetic `pendingId` doubles as the record `callId`;
+      // resolution narrates via `pushApprovalNarration` only and never answers a tool call.
+      activePlanGate = (opts) =>
+        dispatchProposal({
+          sess: session,
+          callId: opts.pendingId,
+          pendingId: opts.pendingId,
+          targetId: opts.targetId,
+          instruction: opts.instruction,
+          trigger: opts.trigger,
+        });
     } catch (err: any) {
       console.error("Failed to establish Gemini Live session:", err);
       clientWs.send(JSON.stringify({ 
@@ -2001,14 +2236,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
       }
+      activePlanGate = null; // P0-3: drop the plan gate; advancement now falls back to SAFE.
       if (session) {
-        // Clean up any pending approvals associated with this session to avoid leaks or hanging tool-calls
-        for (const [messageId, details] of Object.entries(pendingApprovals)) {
-          if (details.session === session) {
-            console.log(`[CLEANUP] Purging orphaned approval ${messageId} linked to closed session.`);
-            delete pendingApprovals[messageId];
-          }
-        }
+        // Clean up any pending approvals associated with this session to avoid leaks or hanging
+        // tool-calls. TODO(WS-F): persist + re-announce these on reconnect instead of purging
+        // (the store's session side-map keeps the serializable record re-attachable).
+        const purged = pendingApprovals.purgeSession(session);
+        if (purged.length) console.log(`[CLEANUP] Purged ${purged.length} orphaned approval(s) for closed session.`);
         try {
           session.close();
         } catch (e) {
@@ -2037,6 +2271,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   const shutdown = async () => {
     console.log("Shutting down cleanly, stopping all terminals...");
     announcementBus.stop(); // WS-D: clear coalescing/rate-limit timers
+    clearInterval(approvalSweepTimer); // WS-E.3: clear the TTL sweep
     for (const term of Object.values(manager.terminals)) {
       try {
         await term.stop();
