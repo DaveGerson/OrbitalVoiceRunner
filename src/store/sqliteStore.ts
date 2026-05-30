@@ -1,8 +1,9 @@
-﻿// src/store/sqliteStore.ts
+// src/store/sqliteStore.ts
 import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
 import type { StoredPane, StoredPendingApproval } from "./types";
+import { pruneOnBoot, type PruneOpts } from "./retention";
 
 export class JanusStore {
   readonly db: Database.Database;
@@ -119,6 +120,26 @@ export class JanusStore {
     return this.db.prepare(
       `SELECT * FROM notes ${clause} ORDER BY created_at DESC`
     ).all(...args).map((r:any) => ({ ...r })) as any;
+  }
+
+  /** Full-text search across notes + events, ranked by bm25. */
+  search(query: string, opts: { limit?: number } = {}): Array<{ source:"note"|"event"; id:string; snippet:string; rank:number }> {
+    const limit = opts.limit ?? 25;
+    const notes = this.db.prepare(
+      `SELECT n.id AS id, n.text AS snippet, bm25(notes_fts) AS rank
+       FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
+       WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`
+    ).all(query, limit) as any[];
+    const events = this.db.prepare(
+      `SELECT e.id AS id, e.summary AS snippet, bm25(events_fts) AS rank
+       FROM events_fts JOIN events e ON e.id = events_fts.rowid
+       WHERE events_fts MATCH ? ORDER BY rank LIMIT ?`
+    ).all(query, limit) as any[];
+    const merged = [
+      ...notes.map(r => ({ source:"note" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
+      ...events.map(r => ({ source:"event" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
+    ].sort((a,b) => a.rank - b.rank);
+    return merged.slice(0, limit);
   }
 
   /** Seam for deterministic IDs in tests. */
@@ -258,5 +279,9 @@ export class JanusStore {
     return { ...r, is_busy: Boolean(r.is_busy), alive: Boolean(r.alive),
              last_status_change_at: r.last_status_change_at ?? null,
              last_command: r.last_command ?? null, scrollback_path: r.scrollback_path ?? null };
+  }
+
+  bootMaintenance(opts: PruneOpts): void {
+    pruneOnBoot(this.db, opts);
   }
 }
