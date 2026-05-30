@@ -10,6 +10,41 @@ state shape WS-F will harden; it does NOT implement durability/atomicity.
 
 ---
 
+## 0. MAINTAINER DECISIONS (BINDING — resolve the §11 escalations R1–R4)
+
+The maintainer reviewed the four escalations. Build to these:
+
+- **R1 — Tool surface: EXTEND, don't split.** Keep ONE gated tool **`propose_command`**, extended
+  with `kind: "agent_instruction" (default) | "shell"`. The default makes agent-direction
+  first-class; the model must explicitly opt into `kind:"shell"`, which is further constrained by
+  the read-only `JANUS_SHELL_ALLOWLIST` (non-allowlisted shell → non-blocking clarify/re-route,
+  never a dead-end). Do NOT introduce `direct_agent`/`run_shell`. Pane validation keys on
+  `runtimeType` (`interactive_cli` vs `shell`).
+- **R2 — Back-compat: KEEP the alias.** Accept the legacy `command` arg and infer `kind` from the
+  target pane's `runtimeType` when `kind` is absent, via a thin shim. No hard cutover; the 8
+  existing `propose_command` call sites keep working.
+- **R3 — Resolution read-back uses a fresh client-content push.** The non-blocking `pending_approval`
+  already consumed the original `call.id` (a functionCall is answerable once), so the spoken
+  pane+command read-back AND the final resolve/clarify are delivered via a fresh
+  `session.sendClientContent(...)` push. **This is NOT the WS-D-declined in-voice path:** WS-D
+  declined *unprompted proactive* speech; an approval is an inherently **interactive, operator-
+  initiated** voice exchange, so Janus speaking the read-back/result here is correct and in-scope.
+  (Earcon + notification for the *arrival* of a pending approval still go through WS-D's path.)
+- **R4 — Close the `execute_plan` HiTL bypass IN WS-E (scope expansion).** `execute_plan`
+  (`server.ts:~1580`) currently writes step commands to panes WITHOUT passing the effective-mode
+  gate — an un-gated execution route that violates the least-authority constraint. Route
+  `execute_plan`'s per-step writes through the SAME effective-mode gate + pending-approval path
+  WS-E builds, so plan execution also respects Full Auto / Human-in-the-Loop / Read-Only. In HiTL,
+  plan steps become spoken pending approvals (reuse the WS-E.1 machinery); keep plans usable in
+  Full Auto. Add a test that a HiTL plan step does NOT auto-execute. **Update the WS-E "Closes:"
+  set to note the execute_plan gate fix.**
+
+Everything else in this design (the two-phase non-blocking proposal, `parseApprovalIntent`,
+most-recently-announced targeting, TTL auto-reject, dead-pane error, WS-D integration, the
+WS-F-compatible state shape) stands as written.
+
+---
+
 ## 1. Executive summary
 
 The HiTL gate works (it correctly withholds execution), but it is coupled to the *model's
