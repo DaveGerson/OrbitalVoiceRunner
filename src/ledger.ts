@@ -5,11 +5,20 @@ import { WatchRule, Plan, PaneMeta, Workspace } from "./types";
 // re-exported here so existing `from "./ledger"` imports keep working (D7).
 export type { PaneMeta, Workspace };
 
+// An archived pane: the PaneMeta snapshot plus where it came from and when it was
+// archived, so it can be restored into its original project later (recoverable clear).
+export interface ArchivedPane {
+  pane: PaneMeta;
+  project_id: string;
+  archived_at: string; // ISO timestamp
+}
+
 export class Ledger {
   activeProjectId: string | null = null;
   workspaces: Record<string, Workspace> = {};
   watchRules: WatchRule[] = [];
   plans: Plan[] = [];
+  archivedPanes: ArchivedPane[] = [];
   private storagePath: string;
 
   constructor(storagePath: string = ".janus_ledger.json") {
@@ -26,6 +35,7 @@ export class Ledger {
         this.workspaces = parsed.workspaces || {};
         this.watchRules = parsed.watchRules || [];
         this.plans = parsed.plans || [];
+        this.archivedPanes = parsed.archivedPanes || [];
       }
     } catch (e) {
       console.warn(`Failed to load ledger from ${this.storagePath}:`, e);
@@ -72,7 +82,8 @@ export class Ledger {
         activeProjectId: this.activeProjectId,
         workspaces: this.workspaces,
         watchRules: this.watchRules,
-        plans: this.plans
+        plans: this.plans,
+        archivedPanes: this.archivedPanes
       }, null, 2);
       await fs.promises.writeFile(tempPath, data, "utf-8");
       await fs.promises.rename(tempPath, this.storagePath);
@@ -96,7 +107,8 @@ export class Ledger {
         activeProjectId: this.activeProjectId,
         workspaces: this.workspaces,
         watchRules: this.watchRules,
-        plans: this.plans
+        plans: this.plans,
+        archivedPanes: this.archivedPanes
       }, null, 2);
       fs.writeFileSync(tempPath, data, "utf-8");
       fs.renameSync(tempPath, this.storagePath);
@@ -176,6 +188,71 @@ export class Ledger {
         this.save(false);
       }
     }
+  }
+
+  // --- Pane archive (recoverable "clear exited") ---
+
+  /** Move a pane out of its project into the archive. Returns false if not found. */
+  archivePane(projectId: string, paneId: string): boolean {
+    const ws = this.workspaces[projectId];
+    if (!ws || !ws.panes[paneId]) return false;
+    const pane = ws.panes[paneId];
+    delete ws.panes[paneId];
+    this.archivedPanes.push({
+      pane,
+      project_id: projectId,
+      archived_at: new Date().toISOString()
+    });
+    this.save(true);
+    return true;
+  }
+
+  /** Archive every Exited (not alive) pane across all projects. Returns count archived. */
+  archiveExitedPanes(projectId?: string): number {
+    let count = 0;
+    const projectIds = projectId ? [projectId] : Object.keys(this.workspaces);
+    for (const pId of projectIds) {
+      const ws = this.workspaces[pId];
+      if (!ws) continue;
+      for (const paneId of Object.keys(ws.panes)) {
+        if (!ws.panes[paneId].alive) {
+          const pane = ws.panes[paneId];
+          delete ws.panes[paneId];
+          this.archivedPanes.push({ pane, project_id: pId, archived_at: new Date().toISOString() });
+          count++;
+        }
+      }
+    }
+    if (count > 0) this.save(true);
+    return count;
+  }
+
+  listArchived(): ArchivedPane[] {
+    return this.archivedPanes;
+  }
+
+  /** Restore an archived pane back into its original project. Returns the entry or null. */
+  restoreArchivedPane(paneId: string): ArchivedPane | null {
+    const idx = this.archivedPanes.findIndex(a => a.pane.pane_id === paneId);
+    if (idx === -1) return null;
+    const entry = this.archivedPanes[idx];
+    // Recreate the destination project if it has since been removed.
+    if (!this.workspaces[entry.project_id]) {
+      this.addProject(entry.project_id, entry.pane.last_command ? process.cwd() : process.cwd(), "Restored workspace");
+    }
+    this.workspaces[entry.project_id].panes[entry.pane.pane_id] = entry.pane;
+    this.archivedPanes.splice(idx, 1);
+    this.save(true);
+    return entry;
+  }
+
+  /** Permanently remove an archived pane. Returns true if it existed. */
+  deleteArchivedPane(paneId: string): boolean {
+    const idx = this.archivedPanes.findIndex(a => a.pane.pane_id === paneId);
+    if (idx === -1) return false;
+    this.archivedPanes.splice(idx, 1);
+    this.save(true);
+    return true;
   }
 
   getProjectBriefing(id: string) {

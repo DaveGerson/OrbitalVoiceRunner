@@ -700,8 +700,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         // WS-G quick win: Claude Code is installed globally here, so the bare
         // `claude` binary is correct; `npx @anthropic-ai/claude` is the wrong package.
         if (pane.tool_preset === "Claude Code") cmd = "claude";
-        else if (pane.tool_preset === "Codex") cmd = "npx codex-cli";
-         else if (pane.tool_preset === "Antigravity") cmd = "npx antigravity";
+        else if (pane.tool_preset === "Codex") cmd = "codex";
+        else if (pane.tool_preset === "Antigravity") cmd = "antigravity";
         
         manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, pane.tool_preset, pane.permissions_mode, pane.session_id);
         broadcastLedgerUpdate();
@@ -872,6 +872,62 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     broadcastLedgerUpdate();
     broadcast({ type: "terminals_updated" });
+    res.json({ success: true });
+  });
+
+  // --- Terminal archive (recoverable "clear exited") ---
+
+  // Archive all Exited panes in the active project (recoverable, not a hard delete).
+  app.post("/api/terminals/clear-exited", (req, res) => {
+    const activeId = manager.ledger.activeProjectId || undefined;
+    // Stop+drop any live terminal objects for panes about to be archived.
+    const ws = activeId ? manager.ledger.getProject(activeId) : null;
+    if (ws) {
+      for (const paneId of Object.keys(ws.panes)) {
+        if (!ws.panes[paneId].alive && manager.terminals[paneId]) {
+          manager.terminals[paneId].stop();
+          delete manager.terminals[paneId];
+        }
+      }
+    }
+    const archived = manager.ledger.archiveExitedPanes(activeId);
+    broadcastLedgerUpdate();
+    broadcast({ type: "terminals_updated" });
+    res.json({ success: true, archived });
+  });
+
+  app.get("/api/archive", (req, res) => {
+    const archived = manager.ledger.listArchived().map(a => ({
+      pane_id: a.pane.pane_id,
+      name: a.pane.name,
+      project_id: a.project_id,
+      tool_preset: a.pane.tool_preset,
+      last_command: a.pane.last_command || "",
+      archived_at: a.archived_at
+    }));
+    res.json({ archived });
+  });
+
+  app.post("/api/archive/:paneId/restore", (req, res) => {
+    const { paneId } = req.params;
+    const entry = manager.ledger.restoreArchivedPane(paneId);
+    if (!entry) {
+      res.status(404).json({ error: "Archived pane not found" });
+      return;
+    }
+    broadcastLedgerUpdate();
+    broadcast({ type: "terminals_updated" });
+    res.json({ success: true });
+  });
+
+  app.delete("/api/archive/:paneId", (req, res) => {
+    const { paneId } = req.params;
+    const ok = manager.ledger.deleteArchivedPane(paneId);
+    if (!ok) {
+      res.status(404).json({ error: "Archived pane not found" });
+      return;
+    }
+    broadcastLedgerUpdate();
     res.json({ success: true });
   });
 
@@ -1380,10 +1436,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         model: liveModel,
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
-            // Check for sessionResumption update
+            // Check for sessionResumption update. Gemini Live emits a fresh handle on
+            // (nearly) every turn; only log when it actually changes, else a single
+            // session floods the log with dozens of near-identical lines (bug E).
             if ((message as any).sessionResumptionUpdate) {
+              const prevHandle = lastSessionResumptionToken?.newHandle;
               lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
-              console.log("[SESSION RESUMPTION] Captured token:", lastSessionResumptionToken);
+              if (lastSessionResumptionToken?.newHandle !== prevHandle) {
+                console.log("[SESSION RESUMPTION] Token updated:", lastSessionResumptionToken?.newHandle);
+              }
             }
 
             // Extract user or model verbal transcripts

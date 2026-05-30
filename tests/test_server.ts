@@ -3,8 +3,20 @@ import assert from "node:assert";
 import fs from "fs";
 import { UniversalTerminal, OrchestratorManager, stripAnsiSequences } from "../src/terminal";
 
+// IDs of scrollback files created by this test suite
+const SUITE_SCROLLBACK_IDS = ["test-1", "test-input", "term-1", "pane_1"];
+
+function deleteScrollback(id: string): void {
+  const p = `.janus_scrollback_${id}.log`;
+  try { fs.unlinkSync(p); } catch { /* already gone */ }
+}
+
 describe("Orchestrator Terminal Logic Test Suite", () => {
   const TEST_LEDGER = ".janus_ledger.json";
+
+  after(() => {
+    SUITE_SCROLLBACK_IDS.forEach(deleteScrollback);
+  });
 
   beforeEach(() => {
     if (fs.existsSync(TEST_LEDGER)) {

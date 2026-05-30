@@ -75,6 +75,10 @@ function AppRaw() {
   const [broadcastTargetIds, setBroadcastTargetIds] = useState<string[]>([]);
   const [isBroadcastRunning, setIsBroadcastRunning] = useState(false);
 
+  // Archive panel states
+  const [archive, setArchive] = useState<any[]>([]);
+  const [showArchivePanel, setShowArchivePanel] = useState(false);
+
   // Web Audio Synth Chimes for Hands-Free Feedback
   const playEarcon = (type: EarconType) => {
     try {
@@ -448,6 +452,61 @@ function AppRaw() {
     } catch (e) {}
   };
 
+  const fetchArchive = async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/archive");
+      if (res.ok) {
+        const data = await res.json();
+        setArchive(data.archived || []);
+      }
+    } catch (e) {}
+  };
+
+  const handleClearExited = async () => {
+    const exitedCount = activeProject
+      ? Object.values(activeProject.panes || {}).filter(pane => {
+          const term = terminals.find(t => t.id === pane.pane_id);
+          const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+          return status === "Exited";
+        }).length
+      : 0;
+    if (exitedCount === 0) return;
+    setPromptDialog({
+      title: `Type "CLEAR" to archive ${exitedCount} exited pane(s) from this project:`,
+      placeholder: "CLEAR",
+      onSubmit: async (val) => {
+        if (val.trim() !== "CLEAR") return;
+        try {
+          await apiFetch("/api/terminals/clear-exited", { method: "POST" });
+          setPromptDialog(null);
+          fetchLedger();
+          fetchTerminals();
+          fetchArchive();
+          playEarcon("success");
+        } catch (e) {}
+      }
+    });
+  };
+
+  const handleRestoreArchived = async (paneId: string) => {
+    try {
+      await apiFetch(`/api/archive/${paneId}/restore`, { method: "POST" });
+      fetchArchive();
+      fetchLedger();
+      fetchTerminals();
+      playEarcon("success");
+    } catch (e) {}
+  };
+
+  const handleDeleteArchived = async (paneId: string) => {
+    try {
+      await apiFetch(`/api/archive/${paneId}`, { method: "DELETE" });
+      fetchArchive();
+      playEarcon("execute");
+    } catch (e) {}
+  };
+
   const handleDismissAttention = async (id: string) => {
     try {
       await apiFetch(`/api/attention/${id}/dismiss`, { method: "POST" });
@@ -611,6 +670,7 @@ function AppRaw() {
     fetchWatchRules();
     fetchPlans();
     fetchRecipes();
+    fetchArchive();
     fetchPromptBuffer(); // Sync initial prompt buffer
     
     // Auto-detect browser notification support configuration
@@ -2933,6 +2993,21 @@ function AppRaw() {
                     <span>Focus View activated: click any terminal pane below to run commands.</span>
                   </div>
                 )}
+                {/* Clear exited panes button — only shown when at least one pane is Exited */}
+                {activeProject && Object.values(activeProject.panes || {}).some(pane => {
+                  const term = terminals.find(t => t.id === pane.pane_id);
+                  const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                  return status === "Exited";
+                }) && (
+                  <button
+                    onClick={handleClearExited}
+                    className="text-[10px] font-mono uppercase tracking-wider px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded-lg transition-all flex items-center gap-1.5 shrink-0 select-none"
+                    title="Archive all exited panes for this project"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Clear Exited
+                  </button>
+                )}
               </div>
 
               {/* Core Goal: Live Conversation & Synergy Matrix */}
@@ -3654,6 +3729,82 @@ function AppRaw() {
                       )}
                     </div>
                   </div>
+                </div>
+
+                {/* Archive Panel */}
+                <div className="mt-6 bg-[#0b0b0b] border border-white/5 rounded-lg overflow-hidden">
+                  <button
+                    onClick={() => setShowArchivePanel(prev => !prev)}
+                    className="w-full flex items-center justify-between px-5 py-3 hover:bg-white/[0.02] transition-colors select-none"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-zinc-500" />
+                      <span className="text-[11px] font-mono uppercase text-zinc-400 font-bold tracking-wider">Pane Archive</span>
+                      {archive.length > 0 && (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded uppercase">{archive.length} archived</span>
+                      )}
+                    </div>
+                    <span className="text-zinc-600 text-[10px] font-mono">{showArchivePanel ? "▲ hide" : "▼ show"}</span>
+                  </button>
+
+                  {showArchivePanel && (
+                    <div className="border-t border-white/5 p-5 space-y-3">
+                      <p className="text-[10px] text-zinc-500 font-mono">
+                        Exited panes moved here via "Clear Exited". Restore to bring them back into the ledger, or permanently delete.
+                      </p>
+                      {archive.length === 0 ? (
+                        <div className="p-6 text-center text-zinc-600 text-[10px] italic border border-dashed border-white/5 rounded">
+                          Archive is empty. Clear exited panes to populate it.
+                        </div>
+                      ) : (
+                        <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                          {archive.map((item) => (
+                            <div key={item.pane_id} className="p-3 bg-black/30 border border-white/5 rounded font-mono text-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="font-bold text-zinc-300 truncate">{item.name}</span>
+                                  <span className="text-[8px] px-1 py-0.2 rounded bg-zinc-800 text-zinc-500 uppercase">{item.tool_preset || "Custom"}</span>
+                                </div>
+                                <div className="text-[9px] text-zinc-500 mt-0.5 space-x-2">
+                                  <span>Project: <span className="text-zinc-400">{item.project_id}</span></span>
+                                  {item.last_command && <span>Last cmd: <span className="text-zinc-400 truncate max-w-[140px] inline-block align-bottom">{item.last_command}</span></span>}
+                                </div>
+                                <div className="text-[9px] text-zinc-600 mt-0.5">
+                                  Archived: {new Date(item.archived_at).toLocaleString()}
+                                </div>
+                              </div>
+                              <div className="flex gap-2 shrink-0">
+                                <button
+                                  onClick={() => handleRestoreArchived(item.pane_id)}
+                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded cursor-pointer transition-colors"
+                                  title="Restore this pane back into the project ledger"
+                                >
+                                  Restore
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteArchived(item.pane_id)}
+                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded cursor-pointer transition-colors"
+                                  title="Permanently delete this archived pane"
+                                >
+                                  <Trash2 className="w-2.5 h-2.5 inline mr-0.5" />
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex justify-end pt-1">
+                        <button
+                          onClick={fetchArchive}
+                          className="text-[9px] font-mono uppercase text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                          title="Refresh archive"
+                        >
+                          <RefreshCw className="w-2.5 h-2.5" /> Refresh
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
