@@ -11,13 +11,18 @@
  * never re-derives text from raw pane content.
  */
 
+/**
+ * The single proactive-notification shape, shared by the server-side AnnouncementBus
+ * (which constructs it) and the client stack (which renders it). The earcon is delivered
+ * out-of-band by the separate `proactive_earcon` broadcast, so it is intentionally NOT a
+ * field here.
+ */
 export interface ProactiveNotification {
   id: string;
   kind: string;
   terminalId: string;
   severity: "high" | "normal";
   message: string;
-  earcon?: string;
   timestamp: string;
 }
 

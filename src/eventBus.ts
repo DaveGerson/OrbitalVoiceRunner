@@ -7,7 +7,10 @@
  * unit-tested without jsdom (the App.tsx `ws.onmessage` handler consumes it).
  */
 
-export type EarconType = "completion" | "alert" | "success" | "execute" | "chime" | null;
+import type { EarconTypeOrNull } from "./announcementKinds";
+
+/** The client event bus may also yield "no earcon", so it uses the null-augmented alias. */
+export type EarconType = EarconTypeOrNull;
 
 /** Which React setter a pushed event feeds (so the UI no longer depends on the poll). */
 export type SetterKey =
@@ -67,9 +70,10 @@ export function earconForTransition(transition: string | undefined): EarconType 
     case "build-failed":
     case "exited":
       return "alert";
-    case "idle":
-      return "completion";
+    // NOTE: "idle" deliberately yields NO earcon here. On a genuine Running->Idle edge the
+    // AnnouncementBus already fires the "completion" tone via its `proactive_earcon`
+    // broadcast; mapping idle->completion here too would double-play it (one event, two tones).
     default:
-      return null; // prompt / routine -> no earcon
+      return null; // idle / prompt / routine -> no earcon (bus owns completion)
   }
 }

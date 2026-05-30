@@ -229,35 +229,35 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const term = manager.terminals[terminalId];
     if (term) {
       const history = HistoryManager.getInstance().loadHistory(terminalId);
+      // WS-D summary for the proactive completion notification. Built ONLY from
+      // already-redacted/derived sources (never raw pane text): a fresh summarization when
+      // there is substantive output, else the existing redacted finalResponse, else a brief
+      // last-command-based fallback. Always set so the announcement below can fire.
+      let summaryText = "finished";
       if (history.length > 0) {
         const lastEntry = history[history.length - 1];
-        if (lastEntry.output && !lastEntry.finalResponse) {
-          try {
-            const cleanOutput = stripAnsiSequences(lastEntry.output).trim();
-            if (cleanOutput.length > 5) {
-              const summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
-              lastEntry.finalResponse = summaryText;
-              HistoryManager.getInstance().saveHistory(terminalId, history);
-
-              broadcast({
-                type: "history_updated",
-                terminalId,
-                history
-              });
-
-              // WS-D (BUG-024): announce ONLY on this genuine WS-C Running->Idle completion
-              // edge — no new idle inference. summaryText is already WS-B redacted.
-              announcementBus.enqueue({
-                kind: "completion",
-                terminalId,
-                summary: summaryText
-              });
-            }
-          } catch (err) {
-            console.error("Auto-summarization failed for command outcomes:", err);
+        try {
+          const cleanOutput = lastEntry.output ? stripAnsiSequences(lastEntry.output).trim() : "";
+          if (cleanOutput.length > 5 && !lastEntry.finalResponse) {
+            summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
+            lastEntry.finalResponse = summaryText;
+            HistoryManager.getInstance().saveHistory(terminalId, history);
+            broadcast({ type: "history_updated", terminalId, history });
+          } else if (lastEntry.finalResponse) {
+            summaryText = lastEntry.finalResponse; // already WS-B redacted
+          } else if (lastEntry.command) {
+            summaryText = `${lastEntry.command} finished`;
           }
+        } catch (err) {
+          console.error("Auto-summarization failed for command outcomes:", err);
         }
       }
+
+      // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
+      // idle inference. Fires regardless of whether there was substantive output / an existing
+      // finalResponse, with the redacted summary above as the message. The bus owns the
+      // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
+      announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
     }
   };
 

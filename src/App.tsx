@@ -10,6 +10,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
 import { NotificationStack } from "./components/NotificationStack";
 import { effectForEvent } from "./eventBus";
+import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
@@ -75,7 +76,7 @@ function AppRaw() {
   const [isBroadcastRunning, setIsBroadcastRunning] = useState(false);
 
   // Web Audio Synth Chimes for Hands-Free Feedback
-  const playEarcon = (type: "alert" | "success" | "execute" | "chime" | "completion") => {
+  const playEarcon = (type: EarconType) => {
     try {
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = ctx.createOscillator();
@@ -319,6 +320,9 @@ function AppRaw() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const isMicMutedRef = useRef(false);
   const desiredLiveRef = useRef(false);
+  // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
+  // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
+  const activeTerminalIdRef = useRef<string | null>(null);
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
@@ -634,6 +638,7 @@ function AppRaw() {
   }, [isMicMuted]);
 
   useEffect(() => {
+    activeTerminalIdRef.current = activeTerminalId;
     if (activeTerminalId) {
       fetchActiveTerminalHistory(activeTerminalId);
     }
@@ -960,7 +965,7 @@ function AppRaw() {
         } else if (msg.type === "history_updated") {
           // WS-D (BUG-010): refresh the open per-pane history view when the pushed
           // update concerns the active pane (avoids waiting on the safety-net poll).
-          if (msg.terminalId && msg.terminalId === activeTerminalId) {
+          if (msg.terminalId && msg.terminalId === activeTerminalIdRef.current) {
             fetchActiveTerminalHistory(msg.terminalId);
           }
         } else if (msg.type === "proactive_notification") {
@@ -971,7 +976,6 @@ function AppRaw() {
             terminalId: msg.terminalId,
             severity: msg.severity,
             message: msg.message,
-            earcon: msg.earcon,
             timestamp: msg.timestamp,
           }));
         } else {

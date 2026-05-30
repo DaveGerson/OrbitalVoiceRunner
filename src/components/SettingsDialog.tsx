@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { SystemSettings, CliPreset } from "../types";
+import {
+  type AnnouncementTemplates,
+  DEFAULT_ANNOUNCEMENT_TEMPLATES,
+  ANNOUNCEMENT_TEMPLATE_FIELDS,
+} from "../announcementKinds";
 import { apiFetch } from "../utils/api";
 import { 
   X, 
@@ -112,18 +117,10 @@ export function SettingsDialog({
   const [presets, setPresets] = useState<CliPreset[]>([]);
 
   // WS-D: Local state - operator-editable proactive-announcement message templates.
-  // {pane} and {summary} are interpolated; defaults are brief.
-  const [announcements, setAnnouncements] = useState<{
-    completion: string; error: string; buildFailed: string;
-    exited: string; planCompleted: string; planPaused: string;
-  }>({
-    completion: "Pane '{pane}' finished. {summary}",
-    error: "Pane '{pane}' reported an error. {summary}",
-    buildFailed: "Build failed on pane '{pane}'.",
-    exited: "Pane '{pane}' exited.",
-    planCompleted: "Plan completed. {summary}",
-    planPaused: "Plan paused. {summary}",
-  });
+  // {pane} and {summary} are interpolated. Type + defaults are sourced from the single
+  // announcementKinds module (never re-typed here).
+  const [announcements, setAnnouncements] =
+    useState<AnnouncementTemplates>(DEFAULT_ANNOUNCEMENT_TEMPLATES);
 
   // Local states - Advanced plumbing / Connection variables
   const [webSocketUrl, setWebSocketUrl] = useState<string>("");
@@ -589,14 +586,7 @@ export function SettingsDialog({
                         <span className="text-zinc-300 font-bold block">Proactive Announcement Messages</span>
                         <span className="text-[10px] text-zinc-500">Text shown on completion/error notifications. Use <code className="text-cyan-400">{"{pane}"}</code> and <code className="text-cyan-400">{"{summary}"}</code> placeholders.</span>
                       </div>
-                      {([
-                        ["completion", "Completion"],
-                        ["error", "Error"],
-                        ["buildFailed", "Build failed"],
-                        ["exited", "Exited"],
-                        ["planCompleted", "Plan completed"],
-                        ["planPaused", "Plan paused"],
-                      ] as const).map(([key, label]) => (
+                      {ANNOUNCEMENT_TEMPLATE_FIELDS.map(([key, label]) => (
                         <div key={key}>
                           <label className="block text-[10px] uppercase tracking-wider text-zinc-500 mb-0.5">{label}</label>
                           <input

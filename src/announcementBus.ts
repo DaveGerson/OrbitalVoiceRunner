@@ -15,6 +15,27 @@
  */
 
 import type { AttentionItem } from "./types";
+import type { ProactiveNotification } from "./notificationStack";
+import {
+  type AnnouncementKind,
+  type EarconType,
+  type AnnouncementTemplates,
+  DEFAULT_ANNOUNCEMENT_TEMPLATES,
+  EARCON_FOR,
+  PRIORITY,
+  severityOf,
+  isHighSeverity,
+  templateFor,
+} from "./announcementKinds";
+
+export type { AnnouncementKind, EarconType, AnnouncementTemplates };
+export { DEFAULT_ANNOUNCEMENT_TEMPLATES };
+
+/** Named magic numbers for the attention-queue prune (BUG-035). The bus `itemTtlMs`
+ *  default references ATTENTION_TTL_MS so "stale = 10 minutes" is one edit. */
+export const ATTENTION_QUEUE_CAP = 50;
+export const ATTENTION_TTL_MS = 10 * 60 * 1000;
+export const ATTENTION_DISMISSED_TTL_MS = 60 * 1000;
 
 /**
  * BUG-035: cap + TTL-evict the (previously unbounded) attentionQueue in place.
@@ -28,11 +49,17 @@ export function pruneAttentionQueue(
   now: number = Date.now(),
   opts: { cap?: number; ttlMs?: number; dismissedTtlMs?: number } = {}
 ): AttentionItem[] {
-  const cap = opts.cap ?? 50;
-  const ttlMs = opts.ttlMs ?? 10 * 60 * 1000;
-  const dismissedTtlMs = opts.dismissedTtlMs ?? 60 * 1000;
+  const cap = opts.cap ?? ATTENTION_QUEUE_CAP;
+  const ttlMs = opts.ttlMs ?? ATTENTION_TTL_MS;
+  const dismissedTtlMs = opts.dismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS;
 
-  const ageOf = (it: AttentionItem) => now - new Date(it.timestamp).getTime();
+  // An unparseable/NaN timestamp is treated as infinitely old (stale) so it always evicts
+  // — `new Date("x").getTime()` is NaN and `NaN > ttl` is false, which previously pinned
+  // such items forever.
+  const ageOf = (it: AttentionItem) => {
+    const t = new Date(it.timestamp).getTime();
+    return Number.isNaN(t) ? Infinity : now - t;
+  };
 
   // TTL eviction (in place).
   for (let i = queue.length - 1; i >= 0; i--) {
@@ -51,14 +78,6 @@ export function pruneAttentionQueue(
   return queue;
 }
 
-export type AnnouncementKind =
-  | "completion"   // genuine WS-C Running->Idle edge (real work finished)
-  | "error"        // error text detected
-  | "build-failed" // build failure
-  | "exited"       // process exited
-  | "plan_completed"
-  | "plan_paused";
-
 export interface AnnouncementItem {
   kind: AnnouncementKind;
   /** Pane/terminal the event concerns (used as the coalescing key together with the
@@ -69,64 +88,6 @@ export interface AnnouncementItem {
   /** Monotonic time the item was enqueued (filled in by the bus from its clock). */
   at?: number;
 }
-
-/** Earcon keyed to the event status. Reuses the existing client earcon vocabulary and
- *  adds the new "completion" tone (App.tsx). */
-export type EarconType = "completion" | "alert" | "success" | "execute" | "chime";
-
-export interface NotificationPayload {
-  /** Stable id keyed by pane + severity so the client stack coalesces to the latest. */
-  id: string;
-  kind: AnnouncementKind;
-  terminalId: string;
-  /** Severity bucket the stack groups by. */
-  severity: "high" | "normal";
-  message: string;
-  earcon: EarconType;
-  timestamp: string;
-}
-
-/** Operator-editable message templates (Settings surface). `{pane}` / `{summary}` are
- *  interpolated. Defaults are intentionally brief (maintainer Decision 2). */
-export interface AnnouncementTemplates {
-  completion: string;
-  error: string;
-  buildFailed: string;
-  exited: string;
-  planCompleted: string;
-  planPaused: string;
-}
-
-export const DEFAULT_ANNOUNCEMENT_TEMPLATES: AnnouncementTemplates = {
-  completion: "Pane '{pane}' finished. {summary}",
-  error: "Pane '{pane}' reported an error. {summary}",
-  buildFailed: "Build failed on pane '{pane}'.",
-  exited: "Pane '{pane}' exited.",
-  planCompleted: "Plan completed. {summary}",
-  planPaused: "Plan paused. {summary}",
-};
-
-/** Severity / priority ranking — highest fires first when a window is flushed.
- *  Errors are never starved by completions (§4). */
-const PRIORITY: Record<AnnouncementKind, number> = {
-  "build-failed": 5,
-  error: 4,
-  exited: 3,
-  plan_paused: 2,
-  completion: 1,
-  plan_completed: 0,
-};
-
-const HIGH_SEVERITY: AnnouncementKind[] = ["build-failed", "error", "plan_paused"];
-
-const EARCON_FOR: Record<AnnouncementKind, EarconType> = {
-  completion: "completion",
-  error: "alert",
-  "build-failed": "alert",
-  exited: "alert",
-  plan_completed: "success",
-  plan_paused: "alert",
-};
 
 export interface Clock {
   now(): number;
@@ -161,9 +122,12 @@ export interface AnnouncementBusOptions {
 }
 
 function applyTemplate(tpl: string, pane: string, summary: string): string {
+  // Use FUNCTION replacers: a plain replacement string makes `$&`, `` $` ``, `$'`, `$n`
+  // in the dynamic pane/summary value special, which corrupts/injects text when build
+  // output contains `$` (very common). A function replacer is verbatim.
   return tpl
-    .replace(/\{pane\}/g, pane)
-    .replace(/\{summary\}/g, summary || "")
+    .replace(/\{pane\}/g, () => pane)
+    .replace(/\{summary\}/g, () => summary || "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -191,7 +155,7 @@ export class AnnouncementBus {
     this.perPaneDebounceMs = opts.perPaneDebounceMs ?? 4000;
     this.rateLimitWindowMs = opts.rateLimitWindowMs ?? 3000;
     this.rateLimitBurst = opts.rateLimitBurst ?? 2;
-    this.itemTtlMs = opts.itemTtlMs ?? 10 * 60 * 1000;
+    this.itemTtlMs = opts.itemTtlMs ?? ATTENTION_TTL_MS;
     this.getTemplates = opts.getTemplates || (() => DEFAULT_ANNOUNCEMENT_TEMPLATES);
   }
 
@@ -208,8 +172,7 @@ export class AnnouncementBus {
     // (error/build-failed/plan_paused) are EXEMPT — they are already edge-deduped
     // server-side (lastStates) and must never be starved by a preceding completion on
     // the same pane (design §4: "errors are never starved by completions").
-    const isHighSeverity = HIGH_SEVERITY.includes(item.kind);
-    if (!isHighSeverity) {
+    if (!isHighSeverity(item.kind)) {
       const last = this.lastAnnouncedAt[paneKey];
       if (last !== undefined && now - last < this.perPaneDebounceMs) {
         return false;
@@ -270,12 +233,12 @@ export class AnnouncementBus {
     item: AnnouncementItem,
     templates: AnnouncementTemplates,
     now: number
-  ): { type: string } & NotificationPayload {
-    const severity: "high" | "normal" = HIGH_SEVERITY.includes(item.kind) ? "high" : "normal";
+  ): { type: string } & ProactiveNotification {
+    const severity = severityOf(item.kind);
     // Coalesce key: same pane + same severity bucket -> the client stack updates the
     // existing entry to the latest message instead of spawning a duplicate.
     const id = `notif_${item.terminalId}_${severity}`;
-    const tpl = this.templateFor(item.kind, templates);
+    const tpl = templateFor(item.kind, templates);
     const message = applyTemplate(tpl, item.terminalId, item.summary || "");
     return {
       type: "proactive_notification",
@@ -284,20 +247,8 @@ export class AnnouncementBus {
       terminalId: item.terminalId,
       severity,
       message,
-      earcon: EARCON_FOR[item.kind],
       timestamp: new Date(now).toISOString(),
     };
-  }
-
-  private templateFor(kind: AnnouncementKind, t: AnnouncementTemplates): string {
-    switch (kind) {
-      case "completion": return t.completion;
-      case "error": return t.error;
-      case "build-failed": return t.buildFailed;
-      case "exited": return t.exited;
-      case "plan_completed": return t.planCompleted;
-      case "plan_paused": return t.planPaused;
-    }
   }
 
   /** Tear down all timers so the process/test suite exits cleanly. */

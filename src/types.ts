@@ -1,3 +1,5 @@
+import type { AnnouncementTemplates } from "./announcementKinds";
+
 export interface Terminal {
   id: string;
   cwd: string;
@@ -89,14 +91,7 @@ export interface SystemSettings {
   presets: CliPreset[];
   // WS-D: operator-editable proactive-announcement message templates. `{pane}` and
   // `{summary}` are interpolated. Defaults are brief (see DEFAULT_ANNOUNCEMENT_TEMPLATES).
-  announcements?: {
-    completion: string;
-    error: string;
-    buildFailed: string;
-    exited: string;
-    planCompleted: string;
-    planPaused: string;
-  };
+  announcements?: AnnouncementTemplates;
   advanced: {
     webSocketUrl: string;
     latencyMode: "Low Latency" | "High Throughput" | "Balanced";

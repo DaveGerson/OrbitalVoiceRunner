@@ -331,6 +331,9 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add `else if` branches for each event type and drive the matching
   setters / earcons from the pushed payload.
 - **Source gaps:** J1-G5.
+- **Status:** ✅ **Resolved (WS-D, `dfb4eba`; review fixes `cb5b0a4` + synthesis round).**
+  The 9 push events are now dispatched via a data-driven event bus (`src/eventBus.ts`,
+  `effectForEvent`) wired into `App.tsx`'s `ws.onmessage`, each driving its setter + earcon.
 
 #### BUG-011 — `execute_plan` is strictly sequential — no parallel fan-out primitive
 - **Priority:** P1
@@ -402,6 +405,13 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** On `onIdle` after Running→Idle, and on new high-severity attention
   items, emit a typed WS event the client converts into a Janus TTS prompt / earcon.
 - **Source gaps:** J6-G5 (depends on BUG-010 for client wiring).
+- **Status:** ✅ **Resolved (WS-D, `dfb4eba`; review fixes `cb5b0a4` + synthesis round).**
+  Per the binding design (`wsd-proactive-audio-design.md` §0) the push is delivered as
+  **earcons + a coalescing on-screen notification stack** (NOT a Gemini in-voice path).
+  The `AnnouncementBus` (`src/announcementBus.ts`) fires on the genuine WS-C onIdle edge and
+  on high-severity transitions, with per-pane debounce, a 1.5s coalescing window, a
+  token-bucket rate limit, severity priority, and TTL. The completion now announces on the
+  genuine edge regardless of output volume (synthesis fix #3).
 
 #### BUG-021 — Notes are unstructured `string[]` with no timestamp / type / author / ID, and cannot be recalled in-session
 - **Priority:** P1
@@ -695,6 +705,11 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   `dismiss_attention` tool (dismiss is REST-only, `server.ts:755–770`).
 - **Suggested fix:** Cap/TTL-evict the queue; add a `dismiss_attention` voice tool.
 - **Source gaps:** J6-G12, J1-G14.
+- **Status:** ✅ **Resolved (WS-D, `dfb4eba`; synthesis round).** `pruneAttentionQueue`
+  (`src/announcementBus.ts`) caps the queue (50), TTL-evicts active items (10min) and
+  dismissed items (60s), dropping oldest-dismissed-first under cap; an unparseable timestamp
+  now evicts rather than pinning forever (synthesis fix #6). The `dismiss_attention` voice
+  tool is wired in `server.ts`. The cap/TTL consts are named + exported (synthesis fix #9).
 
 #### BUG-036 — `create_project` tool schema omits `key_terms`
 - **Priority:** P3

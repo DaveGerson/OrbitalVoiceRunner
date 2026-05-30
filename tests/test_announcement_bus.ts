@@ -174,6 +174,75 @@ describe("AnnouncementBus — coalescing / debounce / rate-limit", () => {
     bus.stop();
   });
 
+  it("applyTemplate: a summary with regex replacement specials ($&, $`, $', $1) passes through verbatim (no injection)", () => {
+    // BUG: a plain String.replace replacement string treats `$&`/`` $` ``/`$'`/`$n` as
+    // special. A summary from build output containing `$` would corrupt/inject text. The
+    // function-replacer fix must emit the dynamic value byte-for-byte.
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, {
+      getTemplates: () => ({ ...DEFAULT_ANNOUNCEMENT_TEMPLATES, completion: "{pane}: {summary}" }),
+    });
+    bus.enqueue({ kind: "completion", terminalId: "ci", summary: "result $` and $& done $1" });
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.strictEqual(out[0].message, "ci: result $` and $& done $1");
+    bus.stop();
+  });
+
+  it("a $ in the pane name is also passed through verbatim", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, {
+      getTemplates: () => ({ ...DEFAULT_ANNOUNCEMENT_TEMPLATES, completion: "[{pane}] {summary}" }),
+    });
+    bus.enqueue({ kind: "completion", terminalId: "pane$&x", summary: "ok" });
+    clock.advance(1500);
+    assert.strictEqual(notifs(sink)[0].message, "[pane$&x] ok");
+    bus.stop();
+  });
+
+  it("completion enqueues even with an empty/absent summary (genuine onIdle with trivial output)", () => {
+    // BUG: the completion was previously gated behind substantive output; a genuine
+    // Running->Idle with no/trivial output must still announce.
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    const ok = bus.enqueue({ kind: "completion", terminalId: "quiet" });
+    assert.strictEqual(ok, true, "trivial completion still enqueues");
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.strictEqual(out.length, 1);
+    assert.match(out[0].message, /quiet/);
+    bus.stop();
+  });
+
+  it("exited is HIGH severity: alert earcon, its own high coalescing bucket, debounce-exempt (never starved by a completion)", () => {
+    // BUG-002: `exited` was mis-bucketed as normal severity despite carrying an alert
+    // earcon -> it collided with completion's `notif_{pane}_normal` id and was starved by
+    // the per-pane debounce. As high severity it gets its own bucket and is debounce-exempt.
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    const first = bus.enqueue({ kind: "completion", terminalId: "p", summary: "done" });
+    const second = bus.enqueue({ kind: "exited", terminalId: "p", summary: "code 1" });
+    assert.strictEqual(first, true);
+    assert.strictEqual(second, true, "exited is debounce-exempt on the same pane");
+    // exited earcon is "alert".
+    const exitEarcon = earcons(sink).find((e) => e.kind === "exited");
+    assert.ok(exitEarcon);
+    assert.strictEqual(exitEarcon.earcon, "alert");
+    clock.advance(1500);
+    const out = notifs(sink);
+    // Two distinct notifications (different severity buckets), no coalescing collision.
+    assert.strictEqual(out.length, 2);
+    const exited = out.find((m) => m.kind === "exited");
+    assert.ok(exited);
+    assert.strictEqual(exited.severity, "high");
+    assert.notStrictEqual(out[0].id, out[1].id, "completion (normal) and exited (high) keep distinct ids");
+    bus.stop();
+  });
+
   it("stop() clears pending timers so nothing keeps the loop alive", () => {
     const sink: any[] = [];
     const clock = new FakeClock();
@@ -230,6 +299,19 @@ describe("pruneAttentionQueue — BUG-035 cap + TTL", () => {
     assert.strictEqual(old.length, 0);
   });
 
+  it("evicts an item with an unparseable/NaN timestamp (was pinned forever)", () => {
+    // BUG: `new Date(badTimestamp).getTime()` is NaN, and `NaN > ttl` is false, so such an
+    // item never aged out. It must now be treated as stale and evicted.
+    const now = Date.now();
+    const bad: AttentionItem = {
+      id: "bad", type: "error", terminalId: "t", projectId: "p", message: "m",
+      timestamp: "not-a-date", dismissed: false,
+    };
+    const q: AttentionItem[] = [bad, item("fresh", 1000)];
+    pruneAttentionQueue(q, now);
+    assert.deepStrictEqual(q.map((i) => i.id), ["fresh"]);
+  });
+
   it("caps length, dropping dismissed-then-oldest", () => {
     const now = Date.now();
     const q: AttentionItem[] = [];
@@ -249,7 +331,9 @@ describe("eventBus — BUG-010 dispatch mapping", () => {
       [{ type: "plans_updated", plans: [] }, "setPlans", null],
       [{ type: "watch_rules_updated", watchRules: [] }, "setWatchRules", null],
       [{ type: "pane_transition", transition: "error" }, "fetchTerminals", "alert"],
-      [{ type: "pane_transition", transition: "idle" }, "fetchTerminals", "completion"],
+      // idle yields NO earcon from the event bus: the AnnouncementBus owns the completion
+      // tone on the genuine onIdle edge, so mapping it here too would double-play it.
+      [{ type: "pane_transition", transition: "idle" }, "fetchTerminals", null],
       [{ type: "pane_transition", transition: "prompt" }, "fetchTerminals", null],
       [{ type: "plan_step_completed" }, "fetchPlans", "execute"],
       [{ type: "plan_completed" }, "fetchPlans", "success"],
@@ -275,7 +359,8 @@ describe("eventBus — BUG-010 dispatch mapping", () => {
     assert.strictEqual(earconForAttention([{ type: "approval", dismissed: false }]), "completion");
     assert.strictEqual(earconForAttention([{ type: "error", dismissed: true }]), null);
     assert.strictEqual(earconForTransition("exited"), "alert");
-    assert.strictEqual(earconForTransition("idle"), "completion");
+    // idle -> no earcon from the bus mapping (completion tone is owned by AnnouncementBus).
+    assert.strictEqual(earconForTransition("idle"), null);
     assert.strictEqual(earconForTransition("prompt"), null);
   });
 });
