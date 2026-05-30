@@ -28,8 +28,14 @@ unit of work with its own tests and acceptance criteria, then sequences the
 workstreams across **four milestones (M0–M3)** driven by the hard dependencies the
 audit identified:
 
-- **`redaction (WS-B) → summarizer-on (WS-A item)`** — turning the summarizer on
-  before redaction *worsens* secret exfiltration (finding N-5).
+> **Maintainer correction (supersedes the original BUG-005 finding):**
+> `gemini-3.5-flash` and the Live default `gemini-3.1-flash-live-preview` are
+> **valid current Google model IDs**. The review's "dead model" finding (BUG-005)
+> is therefore **retracted** — the command-outcome summarizer *works*. There is
+> **no model change** anywhere in this plan. The live consequence is that the
+> summarizer's raw-output path is an **active, unredacted leak** (finding N-5),
+> which makes WS-B (redaction) more urgent, not a gate for a deferred flip.
+
 - **`reliable status (WS-C) → proactive audio (WS-D)`** — pushing completions
   before status is trustworthy just announces false "done" confidently.
 - **`two-phase proposal (WS-E core) → targeting + parser (WS-E rest)`** — you must
@@ -49,20 +55,20 @@ Effort key: **S** ≈ <½ day · **M** ≈ 1–3 days · **L** ≈ multi-day / s
 | **M3 — Hardening & polish** | Security scoping, earcons, crash safety, docs/tests/a11y. | WS-L | Robustness, accessibility, test fidelity. |
 
 > **Critical-path note:** M1 is **not** parallelizable end-to-end. Within M1 the
-> hard ordering is `WS-B before WS-A's summarizer flip`, and `WS-C before WS-D`.
-> WS-E/F/G/H can proceed concurrently with WS-B/C once M0 lands, but the durable
-> queue (WS-F) and the two-phase proposal (WS-E) should land together because they
-> touch the same `pendingApprovals` lifecycle.
+> hard ordering is `WS-C before WS-D` (status must be trustworthy before it is
+> announced). WS-B/E/F/G/H can proceed once M0 lands, but the durable queue (WS-F)
+> and the two-phase proposal (WS-E) should land together because they touch the
+> same `pendingApprovals` lifecycle.
 
 ---
 
 ## 3. Dependency graph (hard edges only)
 
 ```
-M0 ─ WS-A (honesty/quick wins, minus summarizer flip)
+M0 ─ WS-A (honesty/quick wins)  ✅ DONE
         │
         ▼
-M1 ─ WS-B  redaction layer ───────────────► WS-A* (flip summarizer model on)
+M1 ─ WS-B  redaction layer (protects the live, unredacted summarizer + summary paths)
      WS-C  reliable status ───────────────► WS-D  proactive audio + event bus
      WS-E  two-phase proposal ───────────► WS-E' targeting + safer parser
      WS-F  durable + race-safe state ◄──── (co-lands with WS-E; shared pendingApprovals)
@@ -76,8 +82,8 @@ M2 ─ WS-I notes model · WS-J summary richness · WS-K parallel plans
 M3 ─ WS-L hardening/polish (REST scoping, earcons, crash handlers, docs, tests, a11y)
 ```
 
-`WS-A*` = the single line `server.ts:210` model-name change, deliberately deferred
-out of M0 into M1 *behind* WS-B.
+There is **no `WS-A*`** (the former "flip the summarizer model" step) — the model
+IDs are valid, so no model change is needed.
 
 ---
 
@@ -88,10 +94,11 @@ from the bug log/audit), new tool/data-model surface, acceptance criteria, and t
 
 ---
 
-### WS-A — Honesty & quick wins  *(M0, effort S)*
-**Closes:** BUG-005 *(comment/flag only in M0; model flip deferred)*, the doc half of
+### WS-A — Honesty & quick wins  *(M0, effort S)*  ✅ DONE
+**Closes:** the doc half of
 BUG-002/BUG-009/BUG-030/BUG-033/BUG-039, BUG-026 (validation), BUG-029 (surface
-failure), BUG-036.
+failure), BUG-036, and the honest-fallback half of the (now-retracted) BUG-005
+(neutral "summary unavailable" instead of a false "success" on summarizer error).
 **Goal:** stop the codebase and the model from asserting things that are not true.
 Nothing here is structurally risky; all of it is shippable in one PR.
 
@@ -114,8 +121,10 @@ to a bad id → failure surfaced, (c) idle timer reads the configured value.
 
 ---
 
-### WS-B — Output safety / redaction layer  *(M1, effort M)*  ⛔ gates WS-A* summarizer flip
-**Closes:** BUG-002, and finding **N-5** (the second, separate exfiltration path).
+### WS-B — Output safety / redaction layer  *(M1, effort M)*  🔴 closes a live, active leak
+**Closes:** BUG-002, and finding **N-5** (the second exfiltration path — via the
+*currently-live* `summarizeCommandOutcome`, which runs on a valid model and sends raw
+output to Gemini on every idle).
 **Root cause:** no secret-scrubbing exists anywhere; raw pane output reaches Gemini
 through *three* paths.
 
@@ -133,28 +142,16 @@ through *three* paths.
    - `summarizeCommandOutcome`'s `rawOutput.slice(-3000)` send — `server.ts:202–212`.
 3. Make redaction a defense-in-depth default-on; expose a settings flag only to
    *tighten*, never to disable silently.
-4. Re-introduce the honest "redacted" wording in the `get_pane_summary` description
-   (`server.ts:1611`) **now that it is true** (reverses the WS-A placeholder).
+4. Update the `get_pane_summary` description (`server.ts:1611`) to state it is now
+   redacted (reverses the WS-A "not redacted" placeholder); keep the "not a delta"
+   caveat until WS-J. Also tighten the M0 comment in `summarizeCommandOutcome` to
+   reflect that the raw send is now wrapped by `redactSecrets`.
 
 **Acceptance:** a pane printing an AWS key / JWT / `.env` line yields `[REDACTED:*]`
 in (a) the `get_pane_summary` tool response, (b) the approval rationale, (c) the
 summarizer input — verified by test. No raw secret string crosses the Gemini boundary.
 **Tests:** table-driven unit tests over each pattern at each of the three sinks; a
 negative test that ordinary output is untouched.
-
----
-
-### WS-A* — Re-enable the summarizer  *(M1, effort S; strictly after WS-B)*
-**Closes:** BUG-005 (the actual fix).
-**Change:** `server.ts:210` `model: "gemini-3.5-flash"` → a real model
-(`gemini-2.5-flash`). Keep the `catch` fallback but log the error (don't swallow it
-silently) so a future model break is visible.
-**Why gated:** turning the summarizer on routes `rawOutput.slice(-3000)` to Gemini;
-without WS-B this *opens* a new leak (N-5). Do not ship before WS-B.
-**Acceptance:** an integration smoke test asserts `summarizeCommandOutcome` returns a
-non-placeholder, non-empty, command-specific summary for a known command, and that a
-*failed* command summary is distinguishable from a success (no more universal
-"Execution finished successfully.").
 
 ---
 
@@ -444,19 +441,18 @@ agent CLIs; the approval dialog is screen-reader-legible.
 
 | Order | Workstream | Milestone | Effort | Hard dependency |
 |---|---|---|---|---|
-| 1 | WS-A (honesty/quick wins) | M0 | S | — |
-| 2 | WS-B (redaction) | M1 | M | — (gates 3) |
-| 3 | WS-A* (summarizer model flip) | M1 | S | **after WS-B** |
-| 4 | WS-C (reliable status) | M1 | L | — (gates 5) |
-| 5 | WS-D (proactive audio + event bus) | M1 | L | **after WS-C** |
-| 6 | WS-E (spoken/targeted/safe approvals) | M1 | L | E.2 after E.1 |
-| 7 | WS-F (durable + race-safe state) | M1 | L | co-land with WS-E |
-| 8 | WS-G (permission truth) | M1 | S→M | — |
-| 9 | WS-H (context propagation) | M1 | M | — |
-| 10 | WS-I (notes model) | M2 | M | — |
-| 11 | WS-J (summary richness) | M2 | M | — |
-| 12 | WS-K (parallel fan-out) | M2 | M | leans on WS-C |
-| 13 | WS-L (hardening/polish) | M3 | S×6 | — |
+| 1 | WS-A (honesty/quick wins) | M0 | S | — ✅ DONE |
+| 2 | WS-B (redaction) | M1 | M | — |
+| 3 | WS-C (reliable status) | M1 | L | — (gates 4) |
+| 4 | WS-D (proactive audio + event bus) | M1 | L | **after WS-C** |
+| 5 | WS-E (spoken/targeted/safe approvals) | M1 | L | E.2 after E.1 |
+| 6 | WS-F (durable + race-safe state) | M1 | L | co-land with WS-E |
+| 7 | WS-G (permission truth) | M1 | S→M | — |
+| 8 | WS-H (context propagation) | M1 | M | — |
+| 9 | WS-I (notes model) | M2 | M | — |
+| 10 | WS-J (summary richness) | M2 | M | — |
+| 11 | WS-K (parallel fan-out) | M2 | M | leans on WS-C |
+| 12 | WS-L (hardening/polish) | M3 | S×6 | — |
 
 **M1 is the bar for "hands-free-safe."** M0 can ship today; M2/M3 make the loop good
 and robust but are not gating for the safety claim.
@@ -492,8 +488,8 @@ Adapted directly from the final review's non-negotiables. The product may be cal
 **accessibility-first / hands-free-safe** only when **all seven** hold (each maps to a
 milestone-M1 workstream):
 
-1. **No secret reaches Gemini** — redaction across all three sinks (WS-B), and only
-   then the summarizer is on (WS-A*).
+1. **No secret reaches Gemini** — redaction across all three sinks (WS-B), including
+   the live command-outcome summarizer path.
 2. **No blind approvals** — every proposed command is spoken before approval (WS-E.1).
 3. **Right command, right pane** — multi-pane targeting + spoken read-back, and a
    parser that clarifies rather than silently approves on ambiguity/negation (WS-E.2).
@@ -515,7 +511,7 @@ milestone-M1 workstream):
 
 | Risk | Mitigation |
 |---|---|
-| **Shipping the summarizer flip (WS-A*) before redaction (WS-B)** opens a new exfiltration path (N-5). | Hard gate in the plan + sequencing table; keep the summarizer disabled/clamped until WS-B lands. |
+| **The summarizer is live and sends raw output to the model unredacted (N-5).** | Ship WS-B promptly; it wraps `summarizeCommandOutcome` plus the two other sinks. No model change is involved — the model IDs are valid. |
 | **Proactive push (WS-D) on a false idle (WS-C not done)** trains operators to distrust announcements. | WS-D strictly depends on WS-C; add a regression test that no push fires on a known false-idle input. |
 | **Status sentinel injection** may interfere with interactive agent CLIs (Claude Code, Codex). | Prefer `/proc`-based detection for raw agent panes; gate sentinel injection behind a per-preset capability flag; fall back to the narrowed regex. |
 | **Notes data-model migration** could drop existing string notes. | Migrate-on-load wrapping old strings as `type:'note'`; round-trip migration test; atomic ledger write (already solid) protects the swap. |
@@ -528,20 +524,60 @@ milestone-M1 workstream):
 
 One PR per workstream keeps reviews tractable and the dependency edges enforceable:
 
-1. `M0: honesty & quick wins` (WS-A)
-2. `M1: secret redaction layer` (WS-B) → 3. `M1: re-enable command summarizer` (WS-A*)
-4. `M1: reliable busy/idle signal + status tests` (WS-C) → 5. `M1: proactive audio + event bus` (WS-D)
-6. `M1: two-phase spoken approvals` (WS-E.1) → 7. `M1: approval targeting + safe parser` (WS-E.2) → 8. `M1: approval robustness (TTL, missing-pane)` (WS-E.3)
-9. `M1: durable + race-safe in-flight state` (WS-F)
-10. `M1: permission truth + restart_pane` (WS-G)
-11. `M1: context propagation` (WS-H)
-12. `M2: structured notes + recall + handoff artifacts` (WS-I)
-13. `M2: pane-summary delta/search/error-extraction` (WS-J)
-14. `M2: parallel fan-out plans` (WS-K)
-15. `M3: hardening, scoping, earcons, crash-safety, a11y, docs` (WS-L)
+1. `M0: honesty & quick wins` (WS-A) ✅ DONE
+2. `M1: secret redaction layer` (WS-B)
+3. `M1: reliable busy/idle signal + status tests` (WS-C) → 4. `M1: proactive audio + event bus` (WS-D)
+5. `M1: two-phase spoken approvals` (WS-E.1) → 6. `M1: approval targeting + safe parser` (WS-E.2) → 7. `M1: approval robustness (TTL, missing-pane)` (WS-E.3)
+8. `M1: durable + race-safe in-flight state` (WS-F)
+9. `M1: permission truth + restart_pane` (WS-G)
+10. `M1: context propagation` (WS-H)
+11. `M2: structured notes + recall + handoff artifacts` (WS-I)
+12. `M2: pane-summary delta/search/error-extraction` (WS-J)
+13. `M2: parallel fan-out plans` (WS-K)
+14. `M3: hardening, scoping, earcons, crash-safety, a11y, docs` (WS-L)
+
+---
+
+## 10. Execution model — subagent dispatch
+
+This plan is executed by **one subagent per workstream**, orchestrated from the
+`claude/orbital-journey-review-gSCPl` dev branch (no merge to `main`, no PR).
+
+**Why sequential, not parallel.** Almost every workstream edits `server.ts` and/or
+`src/terminal.ts` (the tool dispatcher, the Gemini Live wiring, the PTY manager).
+Parallel subagents editing the same files would produce irreconcilable conflicts —
+unlike the read-only analysis phase, which fanned out safely. So code workstreams run
+**one at a time**; the orchestrator verifies and commits between each so the build
+stays green and every step builds on the last.
+
+**Per-workstream subagent contract.** Each subagent is dispatched with:
+1. The full workstream spec from §4 (closes / root cause / implementation / acceptance
+   / tests) as its brief, plus the "Preserve, do not regress" list from the header.
+2. Hard rules: *implement only this workstream; cite `file:line`; do not touch other
+   workstreams' surfaces; run `npx tsc --noEmit` and `npm test` and report results;
+   **do not commit, push, or open a PR** — the orchestrator does that after verifying.*
+3. A requirement to add the workstream's tests (§6) and report any deviation from the
+   spec with its rationale.
+
+**Orchestrator loop (between every workstream):**
+```
+dispatch subagent(WS-x)  →  subagent implements + self-tests  →  returns summary
+   →  orchestrator runs tsc --noEmit + npm test  →  if green: commit + push
+   →  if red: dispatch a fix follow-up to the same subagent  →  repeat
+   →  advance to next WS in the §5 order
+```
+
+**Dispatch order** = §5 (WS-A ✅ done → **WS-B → WS-C → WS-D → WS-E → WS-F → WS-G →
+WS-H → WS-I → WS-J → WS-K → WS-L**), honoring the two hard edges (`WS-C → WS-D`;
+`WS-E.1 → WS-E.2`). The only safe parallelism is within M3/WS-L's purely
+frontend-isolated polish items (ARIA, earcons) via worktree isolation — optional.
+
+**Status:** WS-A ✅ complete (committed). **Next: WS-B (redaction).**
 
 ---
 
 *Plan derived from the consolidated [`BUG_LOG.md`](BUG_LOG.md) (39 defects) and the
-independent [`final-review.md`](final-review.md) (8/8 confirmed; +N-1/N-2/N-5). This is
-an analysis/plan artifact — no production code is modified by it.*
+independent [`final-review.md`](final-review.md) (8/8 confirmed; +N-1/N-2/N-5).
+Execution is underway on the dev branch via per-workstream subagents (§10); WS-A is
+committed. Note: the original BUG-005 "dead model" finding is **retracted** — the
+Gemini model IDs are valid, so no model change is part of this plan.*

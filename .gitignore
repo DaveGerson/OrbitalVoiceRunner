@@ -8,3 +8,6 @@ coverage/
 !.env.example
 .janus_ledger.json
 .janus_ledger_test.json
+.janus_settings.json
+.janus_history.json
+.janus_scrollback_*.log

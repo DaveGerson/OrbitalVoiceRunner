@@ -145,8 +145,18 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   system instruction so Janus can warn proactively.
 - **Source gaps:** J5-G1.
 
-#### BUG-005 — Dead summarizer model `gemini-3.5-flash` makes every command outcome a static placeholder
-- **Priority:** P0
+#### BUG-005 — ~~Dead summarizer model `gemini-3.5-flash`~~ — **RETRACTED (model ID is valid)**
+
+> **Correction (post-review, per maintainer):** `gemini-3.5-flash` is a **valid
+> current Google model ID**. This bug's premise is false, so BUG-005 is **retracted** —
+> the summarizer works and does not emit a static placeholder on the happy path. Two
+> real residuals remain, tracked elsewhere: (a) the error-path fallback used to falsely
+> claim "Execution finished successfully." — fixed in M0/WS-A (now a neutral "summary
+> unavailable"); (b) the summarizer is live, so it sends raw output to the model
+> **unredacted** — that is finding **N-5**, closed by **WS-B**. The superseded original
+> analysis is retained below for traceability.
+
+- **Priority:** ~~P0~~ → retracted
 - **Category:** Mocked (confidently false data)
 - **Journeys affected:** J4 (primary), J1, J6, J8 (all read the contaminated output).
 - **Evidence:** `summarizeCommandOutcome` calls **`server.ts:210` `model: "gemini-3.5-flash"`**
@@ -736,9 +746,10 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 A small number of root causes each break multiple journeys. Fixing these in roughly this
 order converts "eight journeys that work alone" into "one loop the operator can live in."
 
-1. **Dead command-outcome summarizer (BUG-005).** `gemini-3.5-flash` does not exist →
-   `"Execution finished successfully."` for every command. Poisons history, status read-back,
-   and handoffs (J1/J4/J6/J8). *One-line fix unblocks the entire continuity column.*
+1. **~~Dead command-outcome summarizer (BUG-005)~~ — RETRACTED.** `gemini-3.5-flash` is a
+   valid model (maintainer correction); the summarizer works. The real residual is that it
+   sends raw output to the model **unredacted** (finding N-5) — closed by WS-B, not by any
+   model change.
 2. **Unsynced `switch_context` + frozen system prompt + unhandled WS events
    (BUG-012, BUG-010, BUG-022).** Structural changes never propagate to the model context or
    the UI focus, and the server's push events are dropped by the client. Touches all 8

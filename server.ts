@@ -206,6 +206,11 @@ Command: ${command}
 Verbose Output:
 ${rawOutput.slice(-3000)}`;
 
+      // NOTE: `rawOutput` is sent to the summarizer model here. This path is
+      // currently UNREDACTED, so secrets printed to a pane can reach the model
+      // (finding N-5). The redaction layer (docs/review/IMPLEMENTATION_PLAN.md WS-B)
+      // must wrap `rawOutput` before this call. The model ID is valid; the catch
+      // below returns an honest neutral fallback (never a false "success") on error.
       const response = await summarizeAi.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
@@ -213,7 +218,8 @@ ${rawOutput.slice(-3000)}`;
       return response.text?.trim() || "No outcomes summary available.";
     } catch (err) {
       console.error("[summarizeCommandOutcome] Error:", err);
-      return "Execution finished successfully.";
+      // Honest neutral fallback — do NOT claim success; the outcome is unknown here.
+      return "Command outcome summary unavailable.";
     }
   }
 
@@ -1132,7 +1138,9 @@ ${rawOutput.slice(-3000)}`;
                   // Find any pending approval for this session
                   const pendingEntries = Object.entries(pendingApprovals).filter(([mId, details]) => details.session === session);
                   if (pendingEntries.length > 0) {
-                    // Sort to resolve the earliest/most relative first
+                    // NOTE: resolves the OLDEST pending entry (insertion-order FIFO).
+                    // There is no targeting of the command the operator named — see
+                    // docs/review/BUG_LOG.md BUG-007 (fixed in IMPLEMENTATION_PLAN WS-E.2).
                     const [messageId, pending] = pendingEntries[0];
                     console.log(`[VOICE INTERCEPT] Auto-resolving pending command "${pending.cmd}" on pane "${pending.terminalId}" via voice: approved=${isApprove}`);
                     
@@ -1334,16 +1342,16 @@ ${rawOutput.slice(-3000)}`;
                   // We do NOT send tool response here. It will be sent via /api/commands/approve API.
                 }
               } else if (name === "add_project_note") {
-                manager.ledger.addNote(args.project_id, args.note);
-                broadcastLedgerUpdate();
+                const ok = manager.ledger.addNote(args.project_id, args.note);
+                if (ok) broadcastLedgerUpdate();
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Note added to project ${args.project_id}` } }]
+                  functionResponses: [{ name, id: call.id, response: { output: ok ? `Note added to project ${args.project_id}` : `Could not add note: project ${args.project_id} not found.` } }]
                 });
               } else if (name === "add_pane_note") {
-                manager.ledger.addPaneNote(args.project_id, args.pane_id, args.note);
-                broadcastLedgerUpdate();
+                const ok = manager.ledger.addPaneNote(args.project_id, args.pane_id, args.note);
+                if (ok) broadcastLedgerUpdate();
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Note added to pane ${args.pane_id}` } }]
+                  functionResponses: [{ name, id: call.id, response: { output: ok ? `Note added to pane ${args.pane_id}` : `Could not add note: pane ${args.pane_id} not found in project ${args.project_id}.` } }]
                 });
               } else if (name === "rename_project") {
                 manager.ledger.renameProject(args.project_id, args.name);
@@ -1541,20 +1549,32 @@ ${rawOutput.slice(-3000)}`;
                 });
               } else if (name === "set_pane_permissions") {
                 const { project_id, pane_id, permissions_mode } = args;
+                const validModes = ["Full Auto", "Human-in-the-Loop", "Read-Only"];
                 const term = manager.terminals[pane_id];
-                if (term) {
-                  term.setPermissionsMode(permissions_mode);
-                }
                 const ws = manager.ledger.getProject(project_id);
-                if (ws && ws.panes[pane_id]) {
-                  ws.panes[pane_id].permissions_mode = permissions_mode;
-                  manager.ledger["save"]();
+                const paneExists = !!(ws && ws.panes[pane_id]);
+                if (!validModes.includes(permissions_mode)) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Invalid permissions mode "${permissions_mode}". Must be one of: ${validModes.join(", ")}.` } }]
+                  });
+                } else if (!term && !paneExists) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Pane ${pane_id} not found in project ${project_id}; no permission change applied.` } }]
+                  });
+                } else {
+                  if (term) {
+                    term.setPermissionsMode(permissions_mode);
+                  }
+                  if (paneExists) {
+                    ws!.panes[pane_id].permissions_mode = permissions_mode;
+                    manager.ledger["save"]();
+                  }
+                  broadcastLedgerUpdate();
+                  broadcast({ type: "terminals_updated" });
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
+                  });
                 }
-                broadcastLedgerUpdate();
-                broadcast({ type: "terminals_updated" });
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
-                });
               }
             }
           }
@@ -1608,7 +1628,7 @@ ${rawOutput.slice(-3000)}`;
             },
             {
               name: "get_pane_summary",
-              description: "Return the clean, redacted markdown delta of one pane's recent screen activity. Primary observation path. Pull, not push.",
+              description: "Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped). Primary observation path. Pull, not push. NOTE: output is raw — it is NOT redacted and NOT a delta; assume it may contain sensitive values.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
@@ -1680,7 +1700,7 @@ ${rawOutput.slice(-3000)}`;
             },
             {
               name: "get_attention_digest",
-              description: "Speak a structured summary of active items in the attention queue requiring operator confirmation, approvals, or showing error states.",
+              description: "Speak a structured summary of items in the attention queue (panes that transitioned to error/exit states). NOTE: this does NOT include pending command approvals — those are a separate queue.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {}
@@ -1694,7 +1714,8 @@ ${rawOutput.slice(-3000)}`;
                 properties: {
                   project_id: { type: Type.STRING, description: "Unique project identifier." },
                   directory: { type: Type.STRING, description: "Local workspace folder path." },
-                  summary: { type: Type.STRING, description: "A brief overview description of what this project does." }
+                  summary: { type: Type.STRING, description: "A brief overview description of what this project does." },
+                  key_terms: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Key codebase terms/keywords to anchor project context." }
                 },
                 required: ["project_id"]
               }

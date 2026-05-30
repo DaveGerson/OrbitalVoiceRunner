@@ -57,7 +57,14 @@ are at the margins, not the core.
 For each: the bug log's characterization, what the code actually says (file:line read
 this session), and an explicit **CONFIRM / REFUTE** with any fairness note.
 
-### 2.1 Dead `gemini-3.5-flash` summarizer + its fallback (BUG-005) — **CONFIRM**
+### 2.1 ~~Dead `gemini-3.5-flash` summarizer~~ (BUG-005) — ~~CONFIRM~~ **RETRACTED**
+
+> **Correction (post-review, per maintainer):** `gemini-3.5-flash` is a **valid**
+> current Google model ID. The premise below ("not a released model… will throw") is
+> wrong, so this confirmation and BUG-005 are **retracted**. Consequence: the summarizer
+> is *live*, so its raw-output send is an **active** unredacted leak (finding N-5, §4) —
+> making WS-B redaction more urgent, not less. Original reasoning kept below for the record.
+
 - `server.ts:210` — `model: "gemini-3.5-flash"`. That is not a released Google model
   ID, so `generateContent` will throw at runtime.
 - `server.ts:214–216` — the `catch` returns the literal `"Execution finished

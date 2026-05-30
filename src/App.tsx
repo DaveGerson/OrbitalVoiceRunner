@@ -1590,7 +1590,7 @@ function AppRaw() {
 
         {/* Helper Explanation strip */}
         <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-[8.5px] text-zinc-400 font-mono leading-relaxed">
-          <span className="text-cyan-400 font-extrabold uppercase">Shared Spec Sandbox:</span> Janus reads this buffer in real-time to orient its coding tools and maintain a robust state across your CLI surfaces.
+          <span className="text-cyan-400 font-extrabold uppercase">Shared Spec Sandbox:</span> Janus reads this buffer in real-time to orient its coding tools. <span className="text-amber-400/80">(Session only — not saved; the buffer is lost on restart.)</span>
         </div>
 
         {/* Content Viewport */}
