@@ -642,6 +642,11 @@ function AppRaw() {
     if (activeTerminalId) {
       fetchActiveTerminalHistory(activeTerminalId);
     }
+    // Step 5 (single active pane): the UI is the source of truth for where Janus may write.
+    // Tell the server which pane the operator has open (or null if none) on every change.
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalId }));
+    }
   }, [activeTerminalId]);
 
   useEffect(() => {
@@ -874,6 +879,9 @@ function AppRaw() {
       ws.onopen = async () => {
         setIsLive(true);
         setIsReconnecting(false);
+        // Step 5: re-assert the source of truth on (re)connect so the server knows which pane the
+        // operator has open before Janus can propose anything.
+        ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           streamRef.current = stream;
@@ -919,6 +927,10 @@ function AppRaw() {
               rationale: msg.rationale
             }];
           });
+        } else if (msg.type === "switch_active_pane") {
+          // Step 5: Janus switched the open pane at the operator's spoken direction. The UI obeys
+          // (it remains the source of truth); the activeTerminalId effect echoes set_active_pane back.
+          if (msg.paneId) setActiveTerminalId(msg.paneId);
         } else if (msg.type === "prompt_buffer_updated") {
           setIsBufferFocused(focused => {
             if (!focused) {

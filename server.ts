@@ -23,6 +23,7 @@ import {
   type ResolveMode,
 } from "./src/pendingApprovals";
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
+import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 
 dotenv.config();
 
@@ -289,6 +290,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
+
+  // Step 5 (single active pane): the pane the operator currently has open on screen, driven by the
+  // UI via `set_active_pane`. It is the SINGLE source of truth for where Janus may write — see
+  // `isPaneActiveForWrite`. Null when no pane is open / no UI is connected (no write permitted).
+  let activePaneId: string | null = null;
 
   // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
   // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
@@ -1281,6 +1287,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const term = manager.terminals[targetId];
       const wsProj = manager.ledger.getActiveProject();
       const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+
+      // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so
+      // the operator can SEE and improve the command before it lands (HiTL). A proposal for any
+      // other pane is refused here — never written, in ANY policy mode — and Janus is told to ask
+      // for a switch. This sits ABOVE the effective-mode gate on purpose. (architecture step 5.)
+      if (!isPaneActiveForWrite(activePaneId, targetId)) {
+        return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
+      }
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
 
@@ -1526,6 +1540,26 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     functionResponses: [{ name: "propose_command", id: call.id, response: { output: outcome.text } }]
                   });
                 }
+              } else if (name === "switch_active_pane") {
+                // Step 5: Janus may change which pane is open ONLY when the operator directs it
+                // ("switch to the build pane"). This moves the UI's source of truth: the server
+                // records the new active pane and tells the UI to open it; the UI echoes it back
+                // via set_active_pane. It does NOT write any command — it just changes focus.
+                const targetId = args.pane_id;
+                const term = manager.terminals[targetId];
+                const wsProj = manager.ledger.getActiveProject();
+                const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+                let output = "";
+                if (!paneExists) {
+                  output = `Cannot switch: pane '${targetId}' does not exist.`;
+                } else {
+                  activePaneId = targetId;
+                  broadcast({ type: "switch_active_pane", paneId: targetId });
+                  output = `Opened pane '${targetId}'. It is now the active pane; I can propose commands here for your approval.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
+                });
               } else if (name === "list_pending_approvals") {
                 // WS-E.1 (BUG-016): let the eyes-off operator ask "what's queued for approval?"
                 // Reads the SAME store the REST endpoint reads, redacted, scoped to this session.
@@ -1864,7 +1898,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "propose_command",
-              description: "Direct work to the right pane. Does NOT execute directly — it passes the effective permission gate (auto-runs in Full Auto, becomes a spoken pending approval in Human-in-the-Loop, blocked in Read-Only). PREFER kind='agent_instruction' (the default): relay a SHORT, FOCUSED, DISTILLED instruction to the Claude Code / Codex / Antigravity agent in that pane and let the AGENT do the heavy lifting (write code, run builds/tests). Do NOT relay the operator's dictation verbatim — compress it to a targeted instruction first and confirm it by voice. kind='shell' is ONLY for your OWN small read-only/observe needs (status checks like git status, ls, cat, pwd); never author or run heavy/mutating shell yourself — delegate that to an agent pane via kind='agent_instruction'. A non-allowlisted shell command returns a clarification so you can re-route it to the agent.",
+              description: "Direct work to the pane the operator currently has OPEN (the active pane). You can ONLY propose to that pane, so the operator can see and refine the command before it runs; to act on a different pane, call switch_active_pane first (with the operator's go-ahead). Does NOT execute directly — it passes the effective permission gate (auto-runs in Full Auto, becomes a spoken pending approval in Human-in-the-Loop, blocked in Read-Only). PREFER kind='agent_instruction' (the default): relay a SHORT, FOCUSED, DISTILLED instruction to the Claude Code / Codex / Antigravity agent in that pane and let the AGENT do the heavy lifting (write code, run builds/tests). Do NOT relay the operator's dictation verbatim — compress it to a targeted instruction first and confirm it by voice. kind='shell' is ONLY for your OWN small read-only/observe needs (status checks like git status, ls, cat, pwd); never author or run heavy/mutating shell yourself — delegate that to an agent pane via kind='agent_instruction'. A non-allowlisted shell command returns a clarification so you can re-route it to the agent.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
@@ -1873,6 +1907,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   kind: { type: Type.STRING, description: "'agent_instruction' (default, FIRST-CLASS — direct the agent in this pane) or 'shell' (your own small read-only command only).", enum: ["agent_instruction", "shell"] }
                 },
                 required: ["pane_id", "instruction"]
+              }
+            },
+            {
+              name: "switch_active_pane",
+              description: "Change which pane is open on the operator's screen. Call this ONLY when the operator directs you to ('switch to the build pane', 'open the test pane'). You can only propose commands to the pane the operator currently has OPEN — if you need to act on a different pane, switch to it first (with the operator's go-ahead). This changes focus only; it never runs a command.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  pane_id: { type: Type.STRING, description: "The pane to open / make active." }
+                },
+                required: ["pane_id"]
               }
             },
             {
@@ -2147,6 +2192,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             type: "prompt_buffer_updated",
             text: promptBufferText
           });
+        } else if (msg.type === "set_active_pane") {
+          // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
+          // open (or null if nothing is open) is recorded here and gates every Janus write.
+          activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
         }
       } catch (err) {
         console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);
@@ -2157,6 +2206,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
+        activePaneId = null; // Step 5: no UI connected -> no source of truth -> no write permitted.
       }
       if (session) {
         // Clean up any pending approvals associated with this session to avoid leaks or hanging

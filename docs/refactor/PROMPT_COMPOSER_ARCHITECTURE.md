@@ -117,7 +117,10 @@ Code locations are from `server.ts` / `src/` at branch point.
 4. **Demote plans** — strip auto-advance + `activePlanGate`; keep plan as outline.
    Advancement now pauses + surfaces the next step as a suggestion, never writes. ✅
 5. **Single active pane** — make "active pane" first-class; constrain Janus
-   writes to it. ⏳
+   writes to it. The pane the operator has OPEN in the UI is the single source of
+   truth (`set_active_pane`); `dispatchProposal` refuses any proposal not aimed
+   at it; Janus can move focus only via the operator-directed `switch_active_pane`
+   tool. ✅
 6. **Prompt-composer loop** — make conversation → proposed prompt → approve →
    send the explicit primary flow in the UI and the voice layer. ⏳
 
