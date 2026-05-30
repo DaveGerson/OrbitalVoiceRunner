@@ -9,6 +9,7 @@ import {
 import {
   PendingApprovalStore,
   decideProposal,
+  resolveDecision,
   inferKind,
   isShellAllowed,
   firstShellToken,
@@ -43,6 +44,21 @@ describe("parseApprovalIntent (BUG-008)", () => {
     // bare ambient speech (no explicit pairing) -> none
     ["we execute carefully here", "none"],
     ["let me think about cancelling later maybe", "none"],
+    // P0-A: bare weak ACTION verbs must NOT over-approve (require a nearby object token).
+    ["execute", "none"],
+    ["proceed", "none"],
+    ["send it", "none"],
+    ["go ahead", "none"],
+    ["run it", "none"],
+    ["dispatch", "none"],
+    ["lets go", "none"],
+    // P2: bare weak REJECT verbs must NOT over-reject either.
+    ["stop", "none"],
+    ["cancel", "none"],
+    // P2: "do not approve" (spelled) and "dont approve" (contracted) yield the SAME intent: none
+    // (conservative — never infer a reject from a negated approve).
+    ["do not approve", "none"],
+    ["dont approve", "none"],
     // explicit pairing -> approve / reject
     ["approve command", "approve"],
     ["approve the npm install one", "approve"],
@@ -124,6 +140,25 @@ describe("selectApprovalTarget (BUG-007)", () => {
     assert.strictEqual(r.messageId, "m1");
     assert.strictEqual(r.via, "only");
   });
+
+  it("P0-B: fragment present but matches ZERO with >1 pending -> ambiguous, NOT lastAnnounced over-approve", () => {
+    // entries [npm install (m1), rm -rf build (m2), docker build (m3)]; "kubernetes" matches none.
+    // Even with a lastAnnounced of m3 (deploy-like), a present-but-missed by-name fragment must
+    // CLARIFY, never silently approve the most-recently-announced entry.
+    const r = selectApprovalTarget(entries, { fragment: "kubernetes" }, "m3");
+    assert.ok(r.ambiguous, "fragment miss with >1 pending must be ambiguous");
+    assert.strictEqual(r.messageId, undefined, "must NOT resolve lastAnnounced on a fragment miss");
+  });
+
+  it("P0-B (spec example): [npm install, deploy], fragment 'docker', lastAnnounced=deploy -> ambiguous", () => {
+    const two = [
+      { messageId: "i", instruction: "npm install", terminalId: "pane_a" },
+      { messageId: "d", instruction: "deploy to prod", terminalId: "pane_b" },
+    ];
+    const r = selectApprovalTarget(two, { fragment: "docker" }, "d");
+    assert.ok(r.ambiguous);
+    assert.strictEqual(r.messageId, undefined, "must NOT approve deploy on a docker fragment miss");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -173,6 +208,68 @@ describe("decideProposal — kind / allowlist / mode gate (R1/R2)", () => {
   it("missing pane -> error_no_pane", () => {
     const d = decideProposal({ kind: "agent_instruction", instruction: "x", effectiveMode: "Human-in-the-Loop", runtimeType: undefined, paneExists: false, allowlist: allow });
     assert.strictEqual(d.type, "error_no_pane");
+  });
+
+  it("P2: empty/whitespace instruction never writes (clarify), even in Full Auto", () => {
+    for (const instruction of ["", "   ", "\n", "\t  "]) {
+      const d = decideProposal({ kind: "shell", instruction, effectiveMode: "Full Auto", runtimeType: "shell", paneExists: true, allowlist: allow });
+      assert.strictEqual(d.type, "clarify_shell", `"${JSON.stringify(instruction)}" must clarify, not auto_execute (no bare newline write)`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #6 — resolveDecision single choke-point: mandatory claim gate, dead-pane, expire-via-claim
+// ---------------------------------------------------------------------------
+describe("resolveDecision — single claim-gated choke-point (#6)", () => {
+  const alive = (_tid: string) => true;
+
+  it("approve writes once; a 2nd approve loses the claim (no double-write)", () => {
+    const store = new PendingApprovalStore();
+    store.add(mkRecord("a", "p1", "build"), {});
+    const first = resolveDecision(store, "a", "approve", alive);
+    assert.strictEqual(first.reason, "approved");
+    assert.strictEqual(first.doWrite, true);
+    // record was deleted by the winner; a 2nd resolve is a no-op (not_found).
+    const second = resolveDecision(store, "a", "approve", alive);
+    assert.strictEqual(second.reason, "not_found");
+    assert.strictEqual(second.doWrite, false);
+  });
+
+  it("dead pane -> dead_pane, no write, record removed", () => {
+    const store = new PendingApprovalStore();
+    store.add(mkRecord("a", "gone", "deploy"), {});
+    const r = resolveDecision(store, "a", "approve", () => false);
+    assert.strictEqual(r.reason, "dead_pane");
+    assert.strictEqual(r.doWrite, false);
+    assert.strictEqual(store.has("a"), false);
+  });
+
+  it("reject -> rejected, no write", () => {
+    const store = new PendingApprovalStore();
+    store.add(mkRecord("a", "p1", "x"), {});
+    const r = resolveDecision(store, "a", "reject", alive);
+    assert.strictEqual(r.reason, "rejected");
+    assert.strictEqual(r.doWrite, false);
+    assert.strictEqual(store.has("a"), false);
+  });
+
+  it("expire routes through the SAME claim gate (closes the sweep bypass)", () => {
+    const store = new PendingApprovalStore();
+    store.add(mkRecord("a", "p1", "x"), {});
+    const r = resolveDecision(store, "a", "expire", alive);
+    assert.strictEqual(r.reason, "expired");
+    assert.strictEqual(r.doWrite, false);
+    assert.strictEqual(store.has("a"), false);
+  });
+
+  it("expire LOSES to an in-flight approve that already claimed (no stomp)", () => {
+    const store = new PendingApprovalStore();
+    store.add(mkRecord("a", "p1", "x"), {});
+    assert.strictEqual(store.claim("a"), true); // a winning approve is mid-flight
+    const r = resolveDecision(store, "a", "expire", alive);
+    assert.strictEqual(r.reason, "lost_race");
+    assert.strictEqual(r.doWrite, false);
   });
 });
 
@@ -283,27 +380,31 @@ function makeHarness() {
     return d.type;
   }
 
-  // P0-1/R3: resolution mirrors production — `call.id` was already answered ONCE by the
-  // non-blocking `pending_approval` response at proposal time, so resolution NEVER sends a
-  // second `sendToolResponse`. The model-facing outcome is delivered ONLY via the
-  // `sendClientContent` push (the read-back/narration).
+  // L9 + #6: resolution drives the EXTRACTED `resolveDecision` choke-point (same logic the
+  // server's `applyResolution` thin caller renders), rather than a hand-copy that can drift.
+  // The mandatory atomic claim + dead-pane branch + record deletion all live INSIDE
+  // resolveDecision; the harness only renders the narration push, mirroring production.
+  // P0-1/R3: `call.id` was already answered ONCE by the non-blocking `pending_approval`
+  // response at proposal time, so resolution NEVER sends a second `sendToolResponse`. The
+  // model-facing outcome is delivered ONLY via the `sendClientContent` push.
   function resolve(session: FakeSession, messageId: string, approve: boolean) {
-    const p = store.get(messageId);
-    if (!p) return;
-    if (approve) {
-      const term = terms[p.terminalId];
-      if (!term) { // BUG-020 dead pane -> error via push, no write, no 2nd tool response
-        store.delete(messageId);
+    const action = resolveDecision(store, messageId, approve ? "approve" : "reject", (tid) => !!terms[tid]);
+    const rec = action.record;
+    if (!rec) return; // not_found
+    switch (action.reason) {
+      case "lost_race":
+        return; // claim lost -> render nothing (exactly-once)
+      case "approved":
+        terms[rec.terminalId]!.writeInput(rec.instruction);
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator approved; dispatched to ${rec.terminalId}.` }] }], turnComplete: true });
+        return;
+      case "dead_pane":
         session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "Error: pane gone" }] }], turnComplete: true });
         return;
-      }
-      if (!store.claim(messageId)) return;
-      term.writeInput(p.instruction);
-      session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator approved; dispatched to ${p.terminalId}.` }] }], turnComplete: true });
-    } else {
-      session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator rejected on ${p.terminalId}.` }] }], turnComplete: true });
+      case "rejected":
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator rejected on ${rec.terminalId}.` }] }], turnComplete: true });
+        return;
     }
-    store.delete(messageId);
   }
 
   // P0-3: a trimmed model of `handlePlansTrigger` advancement — step completion routes the

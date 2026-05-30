@@ -107,6 +107,13 @@ export function decideProposal(input: DecideProposalInput): ProposalDecision {
 
   if (!paneExists) return { type: "error_no_pane" };
 
+  // An empty/whitespace-only instruction is never a write (P2): in Full Auto it would otherwise
+  // type a bare newline into the pane. Treat it as a soft clarify so the model re-states what it
+  // actually wants to run, in EVERY mode (before the auto_execute branch can fire).
+  if (instruction.trim() === "") {
+    return { type: "clarify_shell", reason: "I didn't catch a command to run — what should I send to that pane?" };
+  }
+
   // Kind/runtimeType validation (design §2.1): an agent instruction only makes sense on an
   // interactive_cli pane; a shell command on a shell pane. A mismatch is a soft error so the
   // model re-routes rather than typing prose into a bare shell.
@@ -129,6 +136,71 @@ export function decideProposal(input: DecideProposalInput): ProposalDecision {
   if (effectiveMode === "Read-Only") return { type: "blocked_read_only" };
   if (effectiveMode === "Full Auto") return { type: "auto_execute" };
   return { type: "pending_approval" };
+}
+
+/**
+ * WS-E single-choke-point resolution (simplicity H1 / maintainability H1/H2/L9): the ONE place
+ * every resolve path (REST approve, voice approve/reject, TTL sweep) decides what to do. The
+ * atomic `claim()` is the MANDATORY gate INSIDE here, so NO path can write without winning the
+ * claim — including the TTL sweep, which previously bypassed by filtering `!p.claimed`.
+ *
+ * It is PURE over the store + a `paneExists` predicate (no PTY, no Gemini), and returns a small
+ * serializable ACTION the thin caller renders (writeInput + narration + broadcast). The record
+ * is ALWAYS deleted on a terminal outcome (write/reject/dead-pane/expire) — never on a lost race.
+ *
+ * Reasons:
+ *   - "not_found"      : no such record (idempotent no-op for a double resolve).
+ *   - "lost_race"      : another resolver already claimed it (no write, no narration).
+ *   - "dead_pane"      : approve but the target pane is gone -> error, no write.
+ *   - "approved"       : claimed + write the instruction.
+ *   - "rejected"       : operator/explicit reject -> no write.
+ *   - "expired"        : TTL sweep -> no write.
+ */
+export type ResolveReason = "not_found" | "lost_race" | "dead_pane" | "approved" | "rejected" | "expired";
+
+export interface ResolveAction {
+  reason: ResolveReason;
+  /** The record (for narration/broadcast). Absent only for "not_found". */
+  record?: PendingApproval;
+  /** True only for "approved": the caller MUST writeInput(record.instruction). */
+  doWrite: boolean;
+}
+
+export type ResolveMode = "approve" | "reject" | "expire";
+
+/**
+ * Resolve a pending approval through the single mandatory claim gate.
+ * `paneExists` is the caller's live check for the target terminal (dead-pane => error on approve).
+ * On any TERMINAL outcome the record is deleted from the store here; the thin caller only renders.
+ */
+export function resolveDecision(
+  store: PendingApprovalStore,
+  messageId: string,
+  mode: ResolveMode,
+  paneExists: (terminalId: string) => boolean
+): ResolveAction {
+  const record = store.get(messageId);
+  if (!record) return { reason: "not_found", doWrite: false };
+
+  // Reject / expire never write — but they STILL claim, so a concurrent approve cannot then win
+  // the claim and write after we have torn the entry down (closes the sweep/approve asymmetry).
+  if (mode === "reject" || mode === "expire") {
+    // If someone already claimed (a winning approve mid-flight), don't stomp it.
+    if (record.claimed) return { reason: "lost_race", record, doWrite: false };
+    store.claim(messageId);
+    store.delete(messageId);
+    return { reason: mode === "reject" ? "rejected" : "expired", record, doWrite: false };
+  }
+
+  // mode === "approve": dead-pane is an error (BUG-020) — delete, no write, no claimed write.
+  if (!paneExists(record.terminalId)) {
+    store.delete(messageId);
+    return { reason: "dead_pane", record, doWrite: false };
+  }
+  // The MANDATORY atomic gate: only the claim winner writes (BUG-013/N-1 REST+voice race).
+  if (!store.claim(messageId)) return { reason: "lost_race", record, doWrite: false };
+  store.delete(messageId);
+  return { reason: "approved", record, doWrite: true };
 }
 
 /** Serialize a record for the UI / persistence (keeps a `cmd` alias for back-compat). */

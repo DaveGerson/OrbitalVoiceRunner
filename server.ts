@@ -13,12 +13,14 @@ import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } 
 import {
   PendingApprovalStore,
   decideProposal,
+  resolveDecision,
   inferKind,
   loadShellAllowlist,
   serializePending,
   type ApprovalKind,
   type EffectiveMode,
   type PendingApproval,
+  type ResolveMode,
 } from "./src/pendingApprovals";
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
 
@@ -282,10 +284,24 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // effective-mode + pending-approval gate as `dispatchProposal`. This is NOT the WS-D-declined
   // proactive in-voice path — it is the same kind of handle the WS-E resolution push already
   // needs. Single active session by design; if none is live we FALL BACK TO SAFE behavior
-  // (never an un-gated write). The outcome mirrors `dispatchProposal`'s DispatchOutcome.
+  // (never an un-gated write).
+  //
+  // M11 (foot-gun): `activePlanGate` is module-scoped, single-slot, LAST-CONNECTION-WINS. A
+  // closing tab clears it (below) even if another session is still live, which PAUSES plan
+  // advancement (the SAFE direction — never an un-gated write) until a reconnect re-installs it.
+  // WS-F/WS-K should key this by sessionId so concurrent sessions don't clobber each other.
+  //
+  // H2: typed as the SAME outcome shape `dispatchProposal` returns (DispatchOutcome) so the union
+  // is single-sourced and can't drift from the real dispatch result.
+  type DispatchOutcome =
+    | { kind: "executed"; text: string }
+    | { kind: "blocked"; text: string }
+    | { kind: "error"; text: string }
+    | { kind: "clarify"; text: string }
+    | { kind: "pending"; text: string };
+
   let activePlanGate:
-    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) =>
-        { kind: "executed" | "blocked" | "error" | "clarify" | "pending"; text: string })
+    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) => DispatchOutcome)
     | null = null;
 
   function broadcast(msg: any) {
@@ -1119,6 +1135,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // R3: a fresh client-content push delivers the spoken read-back / resolution result. The
   // original call.id is consumed once by the non-blocking pending_approval response, so the
   // outcome cannot be a 2nd sendToolResponse — it is an ephemeral interactive turn.
+  // M3: single-source effective-mode resolution. `globalPermissionsMode === "Inherit"` defers to
+  // the pane's own mode (HiTL default when the pane is unknown); otherwise the global override
+  // wins. Used by EVERY write path (dispatchProposal + handoff_context) so "gate a new write" =
+  // resolve the mode here, never re-derive it inline.
+  function effectiveModeFor(targetId: string): EffectiveMode {
+    if (manager.globalPermissionsMode === "Inherit") {
+      const term = manager.terminals[targetId];
+      return (term ? term.permissionsMode : "Human-in-the-Loop") as EffectiveMode;
+    }
+    return manager.globalPermissionsMode as EffectiveMode;
+  }
+
   function pushApprovalNarration(session: any, text: string) {
     try {
       session.sendClientContent({
@@ -1130,67 +1158,104 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
   }
 
+  // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
+  // (ApprovalDialog.tsx) keys on these EXACT strings — do NOT rename the values without changing
+  // the client. The `command_auto_executed` payload has two boolean variants the UI relies on:
+  //   - `approved: true`  -> operator-APPROVED a HiTL command (REST or voice) — not auto-run.
+  //   - `vocal: true`     -> the approval/dispatch arrived via VOICE (vs the REST dialog).
+  //   - (neither flag)    -> a genuine Full-Auto auto-execution (no operator in the loop).
+  const WS_EVT = {
+    APPROVAL_PENDING: "approval_pending",
+    AUTO_EXECUTED: "command_auto_executed",
+    BLOCKED: "command_blocked",
+  } as const;
+
+  // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
+  // resolve path (REST approve, voice approve/reject, TTL sweep) renders the outcome of the pure
+  // `resolveDecision`. The MANDATORY atomic `claim()` lives INSIDE `resolveDecision`, so no path
+  // here can write without winning the claim (the sweep now goes through the SAME gate too).
+  // Returns the ResolveAction so a caller can branch on the reason for its own response shape.
+  // R3 (P0-1): `call.id` was already answered ONCE by the non-blocking `pending_approval`
+  // response at proposal time; resolution NEVER sends a 2nd `sendToolResponse` — the model-facing
+  // outcome is the `pushApprovalNarration` push only.
+  function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
+    const action = resolveDecision(
+      pendingApprovals,
+      messageId,
+      mode,
+      (terminalId) => !!manager.terminals[terminalId]
+    );
+    const { reason, record } = action;
+    if (!record) return action; // not_found: idempotent no-op
+    const session = pendingApprovals.sessionFor(messageId);
+    const safeInstr = redactSecrets(record.instruction);
+    const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
+
+    switch (reason) {
+      case "lost_race":
+        // Another resolver already won the claim — render nothing (exactly-once preserved).
+        break;
+      case "dead_pane":
+        if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+        break;
+      case "approved": {
+        // Claim already won inside resolveDecision — this is the single write path.
+        HistoryManager.getInstance().addCommand(record.terminalId, record.instruction);
+        manager.terminals[record.terminalId]!.writeInput(record.instruction);
+        if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+        // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
+        broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+        break;
+      }
+      case "rejected":
+        if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+        break;
+      case "expired":
+        if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
+        announcementBus.enqueue({ kind: "exited", terminalId: record.terminalId, summary: "Approval expired." });
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+        break;
+    }
+    if (reason !== "lost_race") broadcast({ type: "terminals_updated" });
+    return action;
+  }
+
   app.get("/api/commands/pending", (req, res) => {
     res.json(pendingApprovals.all().map((p) => serializePending(p)));
   });
 
   app.post("/api/commands/approve", (req, res) => {
     const { messageId, approved } = req.body;
-    const pending = pendingApprovals.get(messageId);
-    if (!pending) {
+    if (!pendingApprovals.has(messageId)) {
       res.status(404).json({ error: "Pending command not found" });
       return;
     }
-    const session = pendingApprovals.sessionFor(messageId);
-    // R3 (P0-1): `call.id` was already consumed exactly once by the non-blocking
-    // `pending_approval` response at proposal time. Resolution therefore NEVER sends a second
-    // `sendToolResponse` for that id (it would double-answer the functionCall). The model-facing
-    // outcome is delivered via the `pushApprovalNarration` push instead.
-    const safeInstr = redactSecrets(pending.instruction);
-    if (approved) {
-      const term = manager.terminals[pending.terminalId];
-      // WS-E.3 (BUG-020): dead target -> error, never false success.
-      if (!term) {
-        pendingApprovals.delete(messageId);
-        if (session) pushApprovalNarration(session, `That pane (${pending.terminalId}) is gone — I could not dispatch the command.`);
+    const action = applyResolution(messageId, approved ? "approve" : "reject");
+    switch (action.reason) {
+      case "not_found":
+        res.status(404).json({ error: "Pending command not found" });
+        return;
+      case "dead_pane":
         res.status(422).json({ success: false, error: "target pane missing" });
         return;
-      }
-      // WS-F seam: atomic claim guards against a near-simultaneous voice approve.
-      if (!pendingApprovals.claim(messageId)) {
+      case "lost_race":
         res.json({ success: true, already: true });
         return;
-      }
-      HistoryManager.getInstance().addCommand(pending.terminalId, pending.instruction);
-      term.writeInput(pending.instruction);
-      if (session) pushApprovalNarration(session, `Operator approved; dispatched "${safeInstr}" to pane ${pending.terminalId}.`);
-      // P1-2: this is an operator-APPROVED command, not an auto-execution — flag it so the UI
-      // does not mislabel it as auto-approved.
-      broadcast({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: safeInstr, approved: true });
-    } else {
-      if (session) pushApprovalNarration(session, `Operator rejected the command on pane ${pending.terminalId}: "${safeInstr}".`);
-      broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Execution cancelled by operator." });
+      default:
+        res.json({ success: true });
     }
-    pendingApprovals.delete(messageId);
-    broadcast({ type: "terminals_updated" });
-    res.json({ success: true });
   });
 
   // WS-E.3 (BUG-019): periodic sweep auto-rejects expired approvals so an unresolved vote
   // never freezes a session indefinitely. The interval is unref'd so the test suite/process
-  // exits cleanly; it is also cleared on shutdown.
+  // exits cleanly; it is also cleared on shutdown. The expiry routes through the SAME mandatory
+  // claim gate as approve (via applyResolution -> resolveDecision), closing the prior asymmetry
+  // where the sweep bypassed the claim by filtering `!p.claimed`.
   function sweepExpiredApprovals(now: number = Date.now()) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
-      const session = pendingApprovals.sessionFor(pending.messageId);
-      pendingApprovals.delete(pending.messageId);
-      // R3 (P0-1): `call.id` was already answered once by the non-blocking `pending_approval`
-      // response; TTL expiry narrates the cancellation via the push, never a 2nd tool response.
-      if (session) {
-        pushApprovalNarration(session, `The command on pane ${pending.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
-      }
-      announcementBus.enqueue({ kind: "exited", terminalId: pending.terminalId, summary: "Approval expired." });
-      broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: redactSecrets(pending.instruction), reason: "Approval expired (timeout)." });
-      broadcast({ type: "terminals_updated" });
+      applyResolution(pending.messageId, "expire");
     }
   }
   const approvalSweepTimer = setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS);
@@ -1225,46 +1290,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // WS-E.2/E.3: resolve a single targeted approval by voice. Speaks a pane+instruction
     // read-back at resolution (R3 push), claims atomically (BUG-013/N-1 seam), and reports a
     // spoken error on a dead pane (BUG-020) instead of unconditional success.
-    function resolveApprovalByVoice(sess: any, messageId: string, approve: boolean) {
-      const pending = pendingApprovals.get(messageId);
-      if (!pending) return;
-      const safeInstr = redactSecrets(pending.instruction);
-      const verb = pending.kind === "agent_instruction" ? "direct pane" : "run on pane";
-      // R3 (P0-1): `call.id` was already consumed exactly once by the non-blocking
-      // `pending_approval` response. Resolution delivers the model-facing outcome ONLY via the
-      // `pushApprovalNarration` push — never a second `sendToolResponse` on `pending.callId`.
-      if (approve) {
-        const term = manager.terminals[pending.terminalId];
-        if (!term) {
-          pendingApprovals.delete(messageId);
-          pushApprovalNarration(sess, `That pane (${pending.terminalId}) is gone — I could not dispatch the command.`);
-          broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Target pane missing." });
-          return;
-        }
-        if (!pendingApprovals.claim(messageId)) return; // already dispatched (REST/voice race)
-        pushApprovalNarration(sess, `Approving: ${verb} ${pending.terminalId} — "${safeInstr}". Dispatching now.`);
-        HistoryManager.getInstance().addCommand(pending.terminalId, pending.instruction);
-        term.writeInput(pending.instruction);
-        clientWs.send(JSON.stringify({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: safeInstr, vocal: true, approved: true }));
-      } else {
-        pushApprovalNarration(sess, `Rejecting the command on pane ${pending.terminalId}: "${safeInstr}".`);
-        clientWs.send(JSON.stringify({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Execution cancelled by operator via voice." }));
-      }
-      pendingApprovals.delete(messageId);
-      broadcast({ type: "terminals_updated" });
+    function resolveApprovalByVoice(_sess: any, messageId: string, approve: boolean) {
+      // The shared single choke-point renders narration + broadcast through the mandatory claim
+      // gate (exactly-once, dead-pane, redaction all inside). `vocal:true` tags the WS payloads.
+      applyResolution(messageId, approve ? "approve" : "reject", { vocal: true });
     }
 
     // WS-E.1 + R1/R2/R4: the SINGLE gated dispatch path. Used by both `propose_command` and
     // `execute_plan` so plan steps respect the effective-mode gate (R4 closes the bypass).
     // Returns the model-facing outcome text; the HiTL case stores a non-blocking pending entry
     // (Janus is NOT muted — BUG-001) and the caller answers call.id with `pending_approval`.
-    type DispatchOutcome =
-      | { kind: "executed"; text: string }
-      | { kind: "blocked"; text: string }
-      | { kind: "error"; text: string }
-      | { kind: "clarify"; text: string }
-      | { kind: "pending"; text: string };
-
     function dispatchProposal(opts: {
       sess: any;
       callId: string;
@@ -1284,13 +1319,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
 
-      // Same effective-mode resolver as before (global-first, then pane, then HiTL default).
-      let effectiveMode: EffectiveMode;
-      if (manager.globalPermissionsMode === "Inherit") {
-        effectiveMode = (term ? term.permissionsMode : "Human-in-the-Loop") as EffectiveMode;
-      } else {
-        effectiveMode = manager.globalPermissionsMode as EffectiveMode;
-      }
+      // M3: single-source effective-mode resolver (global-first, then pane, then HiTL default).
+      const effectiveMode = effectiveModeFor(targetId);
 
       const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist });
       const safeInstr = redactSecrets(instruction);
@@ -1533,15 +1563,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 // Reads the SAME store the REST endpoint reads, redacted, scoped to this session.
                 const entries = pendingApprovals.forSession(session);
                 if (entries.length) pendingApprovals.setLastAnnounced(session, entries[entries.length - 1].messageId);
-                const items = entries.map((p, i) => ({
-                  index: i + 1,
-                  messageId: p.messageId,
-                  pane_id: p.terminalId,
-                  kind: p.kind,
-                  instruction: redactSecrets(p.instruction),
-                  rationale: p.rationale,
-                  ageSeconds: Math.max(0, Math.floor((Date.now() - p.timestamp) / 1000)),
-                }));
+                // M3: reuse serializePending (it already redacts + computes ageSeconds); add the
+                // voice-facing `index`/`pane_id` aliases on top so we don't hand-roll a 3rd shape.
+                const items = entries.map((p, i) => {
+                  const ser = serializePending(p);
+                  return { index: i + 1, pane_id: ser.terminalId, ...ser };
+                });
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: { count: items.length, items } } }]
                 });
@@ -1803,9 +1830,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 // respect Read-Only at minimum (least-authority). TODO(WS-G): route the full
                 // handoff write through the same effective-mode + pending-approval gate as
                 // `dispatchProposal` (HiTL should make it a spoken approval too).
-                const targetEffectiveMode = manager.globalPermissionsMode === "Inherit"
-                  ? (targetTerm ? targetTerm.permissionsMode : "Human-in-the-Loop")
-                  : manager.globalPermissionsMode;
+                const targetEffectiveMode = effectiveModeFor(target_pane_id);
                 if (!sourceTerm || !targetTerm) {
                   resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
                 } else if (targetEffectiveMode === "Read-Only") {

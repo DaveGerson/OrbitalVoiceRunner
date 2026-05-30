@@ -31,15 +31,15 @@ eyes-off) · **Mocked** (returns placeholder / simulated data, not real behavior
 | # | Journey / Capability | Verdict | One-line justification | Controlling bugs |
 |---|---|---|---|---|
 | J1 | Fan-out / Delegate in Parallel | **Partial** | PTY spawn is real & concurrent, but `execute_plan` is strictly sequential (no parallel primitive), model context freezes at connect, and UI focus diverges from voice focus. | BUG-006, BUG-010, BUG-011, BUG-012, BUG-022 |
-| J2 | Supervisor / Air-Traffic Control | **Partial** | The HiTL gate enforces correctly, but Janus goes mute while pending, has no voice tool to list approvals, and the digest tool falsely claims to cover them. | BUG-001, BUG-003, BUG-004, BUG-009, BUG-016, BUG-019 |
-| J3 | Review & Approve by Voice | **Broken** (eyes-off) | Commands are never spoken before approval (blind approval), multi-pane "approve" hits the wrong/oldest pane, and the substring parser misfires on negation/ASR drift. | BUG-001, BUG-002, BUG-007, BUG-008, BUG-017, BUG-020 |
+| J2 | Supervisor / Air-Traffic Control | **Partial** | WS-E fixed the HiTL voice loop: Janus now speaks the proposal (no longer mute, BUG-001), `list_pending_approvals` exists (BUG-016), the digest merges approvals (BUG-009), and a TTL sweep unblocks stale votes (BUG-019). Remaining: the global-override no-op (BUG-003) and the missing REST broadcast (BUG-004). | BUG-001 ✅, BUG-003, BUG-004, BUG-009 ✅, BUG-016 ✅, BUG-019 ✅ |
+| J3 | Review & Approve by Voice | **Partial** (eyes-off) | WS-E closed the blind-approval seam (spoken read-back, BUG-001), targeted multi-pane resolution (clarify-not-approve, BUG-007), the intent parser (negation/ASR/collision, BUG-008), and dead-pane errors (BUG-020). Remaining: pane-output secret redaction (BUG-002) and REST session-scoping (BUG-017). | BUG-001 ✅, BUG-002, BUG-007 ✅, BUG-008 ✅, BUG-017, BUG-020 ✅ |
 | J4 | Knowledge Capture & Continuity | **Partial / Mocked** | Note capture is solid and durable, but every command summary is a placeholder, handoffs produce no retrievable artifact, and session memory dies on restart. | BUG-005, BUG-009, BUG-013, BUG-014, BUG-021, BUG-023 |
 | J5 | Adjust Autonomy Mid-Session | **Broken** (silently) | A non-`Inherit` global silently nullifies per-pane changes while Janus says "successfully"; Full Auto needs a restart with no voice tool. | BUG-003, BUG-015, BUG-018, BUG-026 |
 | J6 | On-Demand Status Check | **Partial** | `alive` is trustworthy but `is_busy` reads false on any non-trivial workload; no elapsed time; no proactive completion/error push. | BUG-006, BUG-010, BUG-024, BUG-025 |
 | J7 | Dictate a Specification | **Partial** | Deliberate notes persist atomically, but the ambient prompt buffer is volatile and the only commit path is keyboard-only + 100-char truncated; no voice recall/search/delete. | BUG-013, BUG-021, BUG-027, BUG-028, BUG-029 |
 | J8 | Narrate a Terminal Walk-through | **Partial / Unsafe** | ANSI stripping and note capture work, but output is raw (no semantic extraction), only the last 20 lines, no delta, and **no secret redaction** despite a tool description claiming "redacted." | BUG-002, BUG-005, BUG-030, BUG-031, BUG-032 |
 | C1 | Graduated permissions (cross-cutting) | **Partial** | Three-branch resolver is correct in principle, but global-first resolution makes per-pane changes silent no-ops and the Full Auto flag never reaches the live PTY. | BUG-003, BUG-015, BUG-018 |
-| C2 | Hands-free / eyes-off operation | **Broken** | Multiple core steps (buffer commit, pane restart, note recall) have no voice tool; voice approval is blind; the parser misfires. | BUG-001, BUG-007, BUG-008, BUG-018, BUG-027, BUG-028 |
+| C2 | Hands-free / eyes-off operation | **Partial** | WS-E made voice approval safe and eyes-off: spoken read-back (BUG-001), targeted resolution (BUG-007), and a robust intent parser (BUG-008). Remaining gaps are non-approval: Full Auto restart (BUG-018) and the volatile/keyboard-only prompt buffer (BUG-027, BUG-028). | BUG-001 ✅, BUG-007 ✅, BUG-008 ✅, BUG-018, BUG-027, BUG-028 |
 | C3 | Persistence / continuity | **Partial** | Ledger + notes persist atomically, but pending approvals, prompt buffer, and the session resumption token are all in-memory and lost on restart. | BUG-013, BUG-014, BUG-023 |
 | C4 | Proactive awareness | **Missing** | Completions and errors are detected server-side but never pushed to Janus as audio; the model only learns state when explicitly asked. | BUG-024, BUG-022 |
 | C5 | Output safety / redaction | **Missing** | No secret/credential redaction before pane output reaches Gemini; the tool contract falsely claims redaction. | BUG-002 |
@@ -103,6 +103,10 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   `pending_approval` tool response (so Janus speaks "I want to run X on pane Y — approve?"),
   track the open vote on a side channel, and resolve it via the voice intercept / REST path.
 - **Source gaps:** J2-G1, J3-G1.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** Two-phase proposal: the HiTL branch
+  answers `call.id` exactly once with a NON-BLOCKING `pending_approval` response, so Janus is
+  not muted and speaks the distilled read-back; resolution narrates the outcome via
+  `pushApprovalNarration` (`sendClientContent`), never a 2nd `sendToolResponse`.
 
 #### BUG-002 — No secret redaction before pane output reaches Gemini, and the tool contract falsely claims "redacted"
 - **Priority:** P0
@@ -213,6 +217,11 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   recently announced pending ID); support fragment/ordinal targeting ("approve the docker
   command"); speak the pane + command back before/at resolution.
 - **Source gaps:** J3-G3, J2-G7, J1-G7.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** `selectApprovalTarget`
+  (`src/approvalIntent.ts`) binds resolution to a fragment/ordinal hint then the
+  most-recently-announced id (never blind FIFO); a present-but-missed fragment with >1 pending
+  → ambiguous/clarify (P0-B), and ambiguity always clarifies rather than resolving the wrong
+  pane. The pane + redacted command are spoken back at resolution.
 
 #### BUG-008 — Naive substring voice parser misfires: no negation window, ASR apostrophe drop, and `isApprove` silently wins collisions
 - **Priority:** P0
@@ -234,6 +243,11 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   the primary trigger, and on `isApprove && isReject` send a clarification tool response
   instead of executing.
 - **Source gaps:** J3-G2, J3-G4, J3-G5, J2-G12.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** Replaced by the pure
+  `parseApprovalIntent` (`src/approvalIntent.ts`): 3-token negation window, apostrophe
+  normalization, explicit verb+object pairing (weak/ambient verbs ALWAYS require a nearby
+  object — bare "execute"/"send it"/"proceed"/"go ahead" → none, P0-A), and approve+reject
+  collision → clarify (never approve-wins). "do not approve"/"dont approve" both → none.
 
 #### BUG-013 — In-memory-only volatile state lost on restart / session drop (`pendingApprovals`, `promptBufferText`, `lastSessionResumptionToken`, `attentionQueue`)
 - **Priority:** P0
@@ -282,6 +296,10 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
   dedicated `list_pending_approvals` voice tool (see BUG-016) and correct this description to
   describe only the attention queue.
 - **Source gaps:** J2-G3, J3-G8, J3-G13, J6-G8.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** `get_attention_digest` now MERGES
+  `pendingApprovals.forSession` with the attention queue (one source of truth shared with
+  `list_pending_approvals` and `GET /api/commands/pending`), so the digest no longer falsely
+  reports "nothing pending" while approvals wait.
 
 #### BUG-016 — No voice tool to list pending approvals
 - **Priority:** P1
@@ -297,6 +315,9 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add a `list_pending_approvals` voice tool reading all queued entries
   (pane, command, rationale, count). Pairs with BUG-001's two-phase proposal.
 - **Source gaps:** J2-G2.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** Added the `list_pending_approvals`
+  voice tool, reading the same redacted store (via `serializePending`) as the REST view, scoped
+  to the session and marking the last-announced id for targeting.
 
 #### BUG-014 — Session resumption token is in-memory only — live model memory resets on restart
 - **Priority:** P1
@@ -532,6 +553,11 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add a `timestamp` per entry and a periodic cleanup that auto-rejects
   expired entries via `sendToolResponse` and speaks a timeout announcement.
 - **Source gaps:** J2-G9, J3-G7.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** Each entry carries a `timestamp`; an
+  unref'd periodic sweep (`sweepExpiredApprovals`) auto-rejects entries older than the TTL and
+  speaks a timeout narration. Expiry routes through the SAME mandatory `claim()` gate as approve
+  (`resolveDecision`, mode `expire`), so a concurrent approve can't stomp an expiry and vice
+  versa. The interval is cleared on shutdown (suite self-exits).
 
 #### BUG-020 — REST/voice approval no-ops when the target terminal is missing but reports success
 - **Priority:** P2
@@ -546,6 +572,10 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Detect the missing terminal; send an error tool response and HTTP 422 /
   spoken error.
 - **Source gaps:** J2-G10.
+- **Status:** ✅ **Resolved (WS-E, `abf2508` + fixes).** `resolveDecision` checks a `paneExists`
+  predicate on approve: a dead target returns `dead_pane` (no write, record deleted); the shared
+  `applyResolution` thin caller then speaks "that pane is gone — I could not dispatch" and the
+  REST endpoint returns HTTP 422, never a false success.
 
 #### BUG-022 — Static system-instruction terminal snapshot becomes stale after session start
 - **Priority:** P2

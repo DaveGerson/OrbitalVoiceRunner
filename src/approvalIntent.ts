@@ -148,11 +148,23 @@ export function parseApprovalIntent(transcript: string): ParsedApproval {
   }
 
   // Leading-negator DIRECTIVE: an utterance that STARTS with a CONTRACTED negator immediately
-  // followed by an approve/run verb ("dont run", "dont approve") is an explicit REJECT
-  // directive — this is the ASR apostrophe-drop case (BUG-008: "dont run" must reject). The
-  // fully-spelled "do not run it" is deliberately NOT a directive (design §10 table: -> none),
-  // and a negated verb mid-sentence ("I dont want to cancel") is likewise suppressed below.
-  if ((tokens[0] === "dont" || tokens[0] === "never") && APPROVE_VERBS.has(tokens[1])) {
+  // followed by an ambient ACTION verb ("dont run", "dont go", "dont execute") is an explicit
+  // REJECT directive — this is the ASR apostrophe-drop case (BUG-008: "dont run" must reject).
+  // The fully-spelled "do not run it" is deliberately NOT a directive (design §10 table: -> none).
+  //
+  // P2 (do-not-approve symmetry): we DELIBERATELY exclude the approval-domain verbs (approve /
+  // accept / confirm / ...) from this directive. "Negating approve" is genuinely ambiguous
+  // ("dont approve yet" is not necessarily "reject"), and the spelled form "do not approve"
+  // already resolves to `none` (the approve verb is negated, suppressed below). To remove the
+  // spelled-vs-contracted asymmetry the spec calls out, BOTH "do not approve" and "dont approve"
+  // now yield the SAME intent: `none` (conservative — never infer a reject from a negated
+  // approve). Only ambient action verbs ("run"/"go"/"execute"/...) keep the reject-directive.
+  const NON_DIRECTIVE_AFTER_NEGATOR = new Set([...APPROVE_STRONG, "approve", "approved"]);
+  if (
+    (tokens[0] === "dont" || tokens[0] === "never") &&
+    APPROVE_VERBS.has(tokens[1]) &&
+    !NON_DIRECTIVE_AFTER_NEGATOR.has(tokens[1])
+  ) {
     return { intent: "reject", targetHint: extractTargetHint(tokens) };
   }
 
@@ -165,9 +177,21 @@ export function parseApprovalIntent(transcript: string): ParsedApproval {
     const isRejectVerb = REJECT_VERBS.has(tok);
     if (!isApproveVerb && !isRejectVerb) continue;
 
-    // STRONG approval-domain verbs trigger on their own; WEAK ambient verbs require explicit
-    // pairing with a nearby object token (so "we execute carefully" does not resolve a vote).
-    const paired = STRONG_VERBS.has(tok) || hasNearbyObject(tokens, i) || tokens.length <= 2;
+    // STRONG approval-domain verbs trigger on their own; WEAK ambient verbs ALWAYS require
+    // explicit pairing with a nearby object token (so "we execute carefully" — and a bare
+    // "execute" / "proceed" / "dispatch" — does NOT resolve a vote). Bare affirmations
+    // ("yes" / "ok" / "okay") are handled by the BARE_YES block above; we must NOT re-admit
+    // weak verbs here via a length heuristic (P0-A: that over-approved "execute").
+    //
+    // P0-A (cont.): a bare two-word command of the form `[weak verb, bare pronoun]` — "send it",
+    // "run it", "go ahead", "lets go" — is ambient/under-specified, NOT explicit by-name
+    // targeting. The lone pronoun ("it"/"that"/"this") is too weak a signal to resolve a SAFETY
+    // vote on its own, so a WEAK verb only pairs when the utterance carries MORE than that bare
+    // verb+pronoun pair (a real object like "command"/"the install", an ordinal, etc.). Strong
+    // verbs are unaffected ("approve it" stays approve). Result: bare "send it"/"run it"/"go
+    // ahead"/"lets go" -> none (clarify), never an over-approve.
+    const isStrong = STRONG_VERBS.has(tok);
+    const paired = isStrong || (hasNearbyObject(tokens, i) && tokens.length > 2);
     if (!paired) continue;
 
     // A NEGATED trigger verb is CONSERVATIVELY suppressed (no resolution) — per the design,
@@ -215,6 +239,11 @@ export function selectApprovalTarget(
   if (entries.length === 1) return { messageId: entries[0].messageId, via: "only" };
 
   // 1. Fragment match against instruction or pane id.
+  // A PRESENT fragment is an explicit by-name targeting signal. With >1 pending, if it matches
+  // exactly one we take it; if it matches MORE than one OR ZERO, we CLARIFY rather than fall
+  // through to the ordinal/lastAnnounced path (P0-B: a fragment that names "docker" but matches
+  // nothing must NOT silently approve `lastAnnounced=deploy` — a miss means "I don't know which",
+  // which is a clarify, never an over-approve). The single-entry case is handled above.
   if (hint?.fragment) {
     const needle = normalizeUtterance(hint.fragment);
     const needleTokens = needle.split(" ").filter(Boolean);
@@ -223,7 +252,8 @@ export function selectApprovalTarget(
       return needleTokens.every((t) => hay.includes(t));
     });
     if (matches.length === 1) return { messageId: matches[0].messageId, via: "fragment" };
-    if (matches.length > 1) return { ambiguous: true };
+    // 0 matches OR >1 matches, with >1 pending -> the explicit by-name signal is unresolvable.
+    return { ambiguous: true };
   }
 
   // 2. Ordinal ("the second one", "the last one").
