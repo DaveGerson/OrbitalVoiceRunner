@@ -8,6 +8,7 @@ import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
+import { SHELL_PROMPT } from "./src/statusMachine";
 
 dotenv.config();
 
@@ -411,9 +412,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       ) {
         transition = "error";
       } else if (term.status === "Idle") {
-        const inputPromptPattern = /([\?$#>]|\[[yY]\/[nN]\]|\([yY]\/[nN]\)|password:|confirm\??)\s*$/i;
-        const stripped = cleanChunk.trim();
-        if (inputPromptPattern.test(stripped)) {
+        // The busy/idle status is now owned by the authoritative state machine
+        // (src/statusMachine.ts). Here we only refine an already-Idle pane into a
+        // "prompt" attention if it looks like a shell prompt awaiting input —
+        // using the SAME narrowed, gated regex (I4: shell panes only, never an
+        // interactive_cli TUI). Otherwise we defer to the machine's "idle".
+        const isShell = term.runtimeType === "shell";
+        const tail = stripAnsiSequences(cleanChunk);
+        if (isShell && SHELL_PROMPT.test(tail)) {
           transition = "prompt";
         } else {
           transition = "idle";
@@ -1375,7 +1381,22 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 } else {
                   text = `There are ${unread.length} items requiring attention. `;
                   unread.forEach((item, index) => {
-                    text += `${index + 1}. Pane ${item.terminalId} in project ${item.projectId} transitioned to ${item.type}: ${item.message}. `;
+                    // BUG-025: enrich with live elapsed time + last command so Janus can
+                    // say e.g. "Pane build has been busy 4 minutes running npm run build."
+                    const term = manager.terminals[item.terminalId];
+                    let timing = "";
+                    if (term) {
+                      const elapsedMs = Date.now() - term.lastStatusChangeAt;
+                      const mins = Math.floor(elapsedMs / 60000);
+                      const secs = Math.floor((elapsedMs % 60000) / 1000);
+                      const dur = mins > 0 ? `${mins} minute${mins === 1 ? "" : "s"}` : `${secs} second${secs === 1 ? "" : "s"}`;
+                      timing = ` It has been ${term.status.toLowerCase()} for ${dur}`;
+                      // P2 (WS-B): redact secrets in the verbatim last command so a
+                      // token typed as a command is never surfaced/spoken unredacted.
+                      if (term.lastCommand) timing += `, last command was '${redactSecrets(term.lastCommand)}'`;
+                      timing += ".";
+                    }
+                    text += `${index + 1}. Pane ${item.terminalId} in project ${item.projectId} transitioned to ${item.type}: ${item.message}.${timing} `;
                   });
                 }
                 session.sendToolResponse({
@@ -1587,7 +1608,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n- Live Terminal Panes: ${Object.values(manager.terminals).map(t => t.terminalId + " (Status: " + t.status + ", CWD: " + t.cwd + ")").join(", ")}\n\nYou can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the full project briefing when starting.`,
+        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou can list panes, get pane summaries, switch project contexts, and propose commands for human approval. You can also add notes to projects/panes and rename them to help you organize. You MUST remain token-light: only query screen summaries when necessary. Always use switch_context to get the full project briefing when starting.`,
         ...({
           sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
           contextWindowCompression: {
@@ -1599,7 +1620,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           functionDeclarations: [
             {
               name: "list_panes",
-              description: "List all projects and their panes with runtime_type, is_busy, alive, and a one-line state. Cheap orientation call.",
+              description: "List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing: last_status_change_at (ISO), elapsed_ms (time in the current status), and last_command. Use elapsed_ms/last_command to say things like 'the build pane has been running 4 minutes'. This is the authoritative source of current pane status — always call it before reporting whether something is busy or done. Cheap orientation call.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {}
