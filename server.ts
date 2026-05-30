@@ -664,19 +664,31 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // Web API to create a terminal manually
   app.post("/api/terminals", (req, res) => {
     const { terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId } = req.body;
-    if (!terminalId || !cwd || !command) {
+    if (!terminalId || !command) {
       res.status(400).json({ error: "Missing required fields" });
       return;
+    }
+    // Resolve the working directory: an empty, "." , or non-existent cwd falls back
+    // to the active project's directory (or the server cwd). Passing a bad path to
+    // spawn() is what produced the cryptic "The system cannot find the path specified."
+    const activeProj = manager.ledger.getActiveProject();
+    let resolvedCwd = (cwd && cwd.trim() && cwd.trim() !== ".") ? cwd.trim() : (activeProj?.directory || process.cwd());
+    try {
+      if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
+        resolvedCwd = activeProj?.directory || process.cwd();
+      }
+    } catch {
+      resolvedCwd = process.cwd();
     }
     // ensure the active projectId is synced with this new terminal if requested
     if (projectId) {
       manager.ledger.activeProjectId = projectId;
       // also ensure the project exists, just in case
       if (!manager.ledger.getProject(projectId)) {
-        manager.ledger.addProject(projectId, cwd, "", []);
+        manager.ledger.addProject(projectId, resolvedCwd, "", []);
       }
     }
-    const result = manager.addTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
+    const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
     broadcastLedgerUpdate();
     broadcast({ type: "terminals_updated" });
     res.json({ success: true, result });
