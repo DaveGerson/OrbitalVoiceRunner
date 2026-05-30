@@ -1414,8 +1414,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
           return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
         case "auto_execute":
+          // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live
+          // process until it is restarted. `paneExists` is true for such a pane, so guard the
+          // immediate Full-Auto write: if there is no live terminal, refuse instead of crashing on
+          // `term!.writeInput`. (The pending-approval path re-checks liveness at resolve time.)
+          if (!term) {
+            return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+          }
           HistoryManager.getInstance().addCommand(targetId, instruction);
-          term!.writeInput(instruction);
+          term.writeInput(instruction);
           broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
           return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
         case "pending_approval": {

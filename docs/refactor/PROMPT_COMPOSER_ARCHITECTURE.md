@@ -145,3 +145,31 @@ Code locations are from `server.ts` / `src/` at branch point.
    removed.
 
 Each step keeps `npm run lint` and `npm test` green before moving on.
+
+## 7. Folded in from `feat/local-testing`
+
+To make the app actually runnable for local retesting, three commits from
+`feat/local-testing` were cherry-picked on top of the refactor (they share the
+WS-E merge-base, `ee72b17`):
+
+- **bare-binary launch** — restored panes launch via `claude` / `codex` /
+  `antigravity`, not the broken `npx @anthropic-ai/...` packages.
+- **inert boot** — the `OrchestratorManager` constructor no longer auto-spawns
+  every persisted pane (the "million terminals" runaway). Panes load as not-alive
+  metadata; the operator starts one explicitly via `POST /api/terminals/:id/restart`.
+- **`--resume` UUID guard** — only resume with a real session UUID, using the
+  valid `--resume <id>` syntax.
+- **session-resumption log dedupe** — log only on handle change.
+- **recoverable pane archive** — `ArchivedPane` model + archive/restore/delete
+  (ledger), REST endpoints, and the Archive UI panel ("Clear Exited" archives
+  rather than hard-deletes). Archived snapshots carry the whole `PaneMeta`, so a
+  pane's `draft`/`modelContext`/`humanContext` survive archive→restore.
+- **inert SQLite scaffold** (`src/store/`) — present but unwired.
+
+**Integration fix:** inert boot broke a prior invariant — a pane could exist in
+the ledger (`paneExists` true) without a live process. The Full-Auto
+`auto_execute` path did `term!.writeInput`, which would crash on an inert active
+pane. It now refuses with "pane not running, restart it first." Regression test:
+`tests/test_approvals_wse.ts` "inert boot: Full Auto proposal to a ledger pane …".
+Draft `Send` already guarded `!term`; the pending-approval path re-checks liveness
+at resolve time.

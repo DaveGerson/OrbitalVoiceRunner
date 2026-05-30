@@ -355,15 +355,25 @@ function makeHarness() {
   const allow = loadShellAllowlist("git,ls,cat,pwd");
   const terms: Record<string, FakeTerm> = {};
 
+  // `ledgerOnly` panes exist in the ledger (paneExists true) but have no live term — the
+  // inert-boot case (feat/local-testing): a persisted pane that hasn't been restarted yet.
+  const ledgerOnly = new Set<string>();
+
   function dispatch(session: FakeSession, callId: string, pendingId: string, paneId: string, instruction: string, kind: any, globalMode = "Inherit") {
     const term = terms[paneId];
-    const paneExists = !!term;
+    const paneExists = !!term || ledgerOnly.has(paneId);
     const runtimeType = term?.runtimeType as any;
     const effectiveMode = (globalMode === "Inherit" ? (term ? term.permissionsMode : "Human-in-the-Loop") : globalMode) as any;
     const k = inferKind(kind, runtimeType);
     const d = decideProposal({ kind: k, instruction, effectiveMode, runtimeType, paneExists, allowlist: allow });
     if (d.type === "auto_execute") {
-      term!.writeInput(instruction);
+      // Mirror server dispatchProposal: a ledger pane with no live process refuses instead of
+      // crashing on term!.writeInput (inert-boot guard).
+      if (!term) {
+        session.sendToolResponse({ functionResponses: [{ name: "propose_command", id: callId, response: { output: "not running" } }] });
+        return "error_not_running";
+      }
+      term.writeInput(instruction);
       session.sendToolResponse({ functionResponses: [{ name: "propose_command", id: callId, response: { output: "executed" } }] });
       return "executed";
     }
@@ -407,7 +417,7 @@ function makeHarness() {
     }
   }
 
-  return { store, terms, dispatch, resolve };
+  return { store, terms, dispatch, resolve, ledgerOnly };
 }
 
 describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
@@ -483,6 +493,20 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     const lastPush = sess.clientContents[sess.clientContents.length - 1].turns[0].parts[0].text;
     assert.ok(String(lastPush).includes("pane gone"));
     assert.strictEqual(h.store.has("call1"), false);
+  });
+
+  it("inert boot: Full Auto proposal to a ledger pane with no live process refuses, no crash", () => {
+    // feat/local-testing inert boot: a persisted pane exists in the ledger but is not running
+    // until restarted. A Full-Auto proposal must NOT crash on term!.writeInput — it refuses and
+    // tells the operator to start the pane first.
+    const h = makeHarness();
+    h.ledgerOnly.add("pane_inert"); // exists in ledger, no live term
+    const sess = new FakeSession();
+    // Use an allowlisted shell command so the decision reaches auto_execute (the crash path),
+    // rather than short-circuiting to clarify on a non-allowlisted command.
+    const r = h.dispatch(sess, "c1", "c1", "pane_inert", "ls", "shell", "Full Auto");
+    assert.strictEqual(r, "error_not_running");
+    assert.ok(!h.terms["pane_inert"], "no live term was created or written to");
   });
 
   it("targeting: 3 pending, 'approve the npm install' dispatches ONLY that, to its pane", () => {
