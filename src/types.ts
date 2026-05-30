@@ -20,6 +20,11 @@ export interface PendingCommand {
   };
 }
 
+// Single source of truth for the ledger pane/workspace shapes (D7). These live
+// here (frontend-safe, no `fs`) and are re-exported from ./ledger.ts so the
+// browser App and the server ledger share one definition. The WS-C
+// status-detection fields are OPTIONAL so existing persisted ledgers load
+// unchanged.
 export interface PaneMeta {
   pane_id: string;
   name: string;
@@ -32,6 +37,10 @@ export interface PaneMeta {
   session_id: string;
   tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   context_size: number;
+  // WS-C status-detection additions (design §4.1).
+  last_status_change_at?: string;   // ISO timestamp of last Running/Idle/Exited transition
+  last_command?: string;            // most recent command written via writeInput
+  elapsed_ms?: number;              // derived at read time: now - last_status_change_at
 }
 
 export interface Workspace {

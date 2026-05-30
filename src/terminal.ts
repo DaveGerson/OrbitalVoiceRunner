@@ -1,7 +1,13 @@
-import { spawn, ChildProcess } from "child_process";
 import { Ledger, PaneMeta } from "./ledger";
 import fs from "fs";
 import { SystemSettings, CliPreset, AttentionItem } from "./types";
+import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
+import { PtyTransport, createPtyTransport } from "./ptyTransport";
+import {
+  decideStatus,
+  Status as MachineStatus,
+  RuntimeType,
+} from "./statusMachine";
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
@@ -126,7 +132,8 @@ export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
   public shellCmd: string;
-  public process: ChildProcess | null = null;
+  // WS-C: the active PTY transport (node-pty preferred, legacy fallback).
+  private transport: PtyTransport | null = null;
   public outputBuffer: string[] = [];
   public maxBufferLines = 100;
   public status: "Running" | "Exited" | "Idle" = "Idle";
@@ -142,6 +149,29 @@ export class UniversalTerminal {
   // documented 2000ms rather than the previously hardcoded 1000ms (BUG-034).
   public idleTimeoutMs = 2000;
 
+  // WS-C status-detection state (design §5).
+  public statusProbe: StatusProbe;
+  private probeTimer: NodeJS.Timeout | null = null;
+  private probeIntervalMs = 500;
+  public lastStatusChangeAt: number = Date.now();
+  public lastCommand = "";
+  // runtime_type drives the prompt-regex gating (I4): Custom preset ⇒ "shell";
+  // agent CLIs (Claude Code/Codex/Antigravity) ⇒ "interactive_cli".
+  public runtimeType: RuntimeType;
+  // The PTY shell/agent root pid captured at start for the probe.
+  private shellPid: number | undefined;
+  // True if the active transport is node-pty (vs the legacy fallback). When this
+  // is false the authoritative process-tree probe is unvalidated (the legacy path
+  // roots the tree at `script`/`cmd.exe`, not a real shell-rooted PTY), so start()
+  // swaps in a FallbackProbe and quiescence drives idle instead (design §6, R1).
+  public usingNodePty = false;
+  // Confidence of the most recent probe (drives output→idle behavior).
+  private lastConfidence: "authoritative" | "fallback" = "fallback";
+  // Whether genuine work (input, output, or a running-child probe) has been seen
+  // since the last Idle. Gates onIdle so a freshly-spawned interactive shell
+  // settling to its prompt does not fire a spurious "done" (I1).
+  private sawWorkSinceIdle = false;
+
   constructor(
     terminalId: string,
     cwd: string,
@@ -149,14 +179,18 @@ export class UniversalTerminal {
     toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom" = "Custom",
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
     sessionId = "",
-    projectId = "default_project"
+    projectId = "default_project",
+    statusProbe?: StatusProbe
   ) {
     this.terminalId = terminalId;
     this.cwd = cwd;
     this.toolPreset = toolPreset;
     this.permissionsMode = permissionsMode;
     this.projectId = projectId;
-    
+    this.runtimeType = toolPreset === "Custom" ? "shell" : "interactive_cli";
+    // Injectable for tests; defaults to the platform-selected probe (design §2.0).
+    this.statusProbe = statusProbe ?? selectProbe();
+
     let cmd = shellCmd;
     if (toolPreset !== "Custom") {
       const skipFlag = "--dangerously-skip-permissions";
@@ -219,38 +253,131 @@ export class UniversalTerminal {
     }
   }
 
-  private updateStatusOnOutput(decoded: string) {
+  /**
+   * WS-C status state machine (design §3). The DECISION is the pure
+   * `decideStatus()`; this method owns the side effects (timers, status stamp,
+   * onIdle edge). Busy-biased (I2): a positive probe wins; Idle requires the
+   * authoritative probe to report no running child (debounced), or — in fallback
+   * mode — quiescence + a narrowed prompt for shell panes (I4/I5).
+   */
+  private applyStatusEvent(
+    event:
+      | { kind: "output"; text: string }
+      | { kind: "probe"; probe: ProbeResult }
+      | { kind: "input" }
+      | { kind: "idleTimer" }
+  ) {
     if (this.status === "Exited") return;
 
-    const stripped = stripAnsiSequences(decoded).trim();
-    const fullStripped = stripAnsiSequences(this.getRecentOutput(5)).trim();
+    // Track the confidence of the latest probe so output/idleTimer events know
+    // which mode (authoritative vs fallback) drives idle.
+    if (event.kind === "probe") {
+      this.lastConfidence = event.probe.confidence;
+    }
 
-    // Prompts matching: ending in standard patterns
-    const inputPromptPattern = /([\?$#>]|\[[yY]\/[nN]\]|\([yY]\/[nN]\)|password:|confirm\??)\s*$/i;
+    // Record whether genuine work occurred (gates the onIdle edge below). Raw
+    // output is deliberately EXCLUDED: a shell rendering its prompt at startup
+    // emits output but is not a running command, so counting it would fire a
+    // spurious "done". Work = an input was sent, or an authoritative probe saw a
+    // running child.
+    if (
+      event.kind === "input" ||
+      (event.kind === "probe" &&
+        event.probe.confidence === "authoritative" &&
+        event.probe.hasRunningChild)
+    ) {
+      this.sawWorkSinceIdle = true;
+    }
 
-    const wasRunning = this.status === "Running";
+    const recentTail = stripAnsiSequences(this.getRecentOutput(5));
+    const result = decideStatus({
+      event,
+      currentStatus: this.status as MachineStatus,
+      runtimeType: this.runtimeType,
+      recentTail,
+      confidence: this.lastConfidence,
+      idleTimerArmed: this.idleTimer !== null,
+    });
 
-    if (inputPromptPattern.test(stripped) || inputPromptPattern.test(fullStripped)) {
-      this.status = "Idle";
-      if (this.idleTimer) {
-        clearTimeout(this.idleTimer);
+    // P0-2: in fallback mode there is no authoritative busy probe, so genuine
+    // work driven purely by OUTPUT (the legacy script/cmd.exe transport, and every
+    // interactive_cli pane after the P0-1 gate whose turns are not all driven via
+    // writeInput) would otherwise reach the idleTimer with sawWorkSinceIdle=false
+    // and the onIdle edge would be suppressed — worse than today (violates I5).
+    // Count an output-driven Running transition (from a non-Running state) in
+    // fallback mode as real work so the eventual Running->Idle edge fires onIdle.
+    if (
+      event.kind === "output" &&
+      this.lastConfidence === "fallback" &&
+      result.status === "Running" &&
+      this.status !== "Running"
+    ) {
+      this.sawWorkSinceIdle = true;
+    }
+
+    if (result.clearIdleTimer && this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    if (result.armIdleTimer) {
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      // C4: in authoritative mode the idle debounce must outlast at least one
+      // probe interval, otherwise an idleTimeoutMs < probeIntervalMs can fire
+      // "done" before the next authoritative tick has a chance to re-confirm a
+      // reappearing child — a spurious onIdle. Floor the effective debounce at
+      // probeIntervalMs there. Fallback mode is pure quiescence, so it keeps the
+      // configured timeout verbatim.
+      const effectiveIdleMs =
+        this.lastConfidence === "authoritative"
+          ? Math.max(this.idleTimeoutMs, this.probeIntervalMs)
+          : this.idleTimeoutMs;
+      this.idleTimer = setTimeout(() => {
         this.idleTimer = null;
-      }
-      if (wasRunning && this.onIdle) {
+        this.applyStatusEvent({ kind: "idleTimer" });
+      }, effectiveIdleMs);
+    }
+
+    if (result.status !== this.status) {
+      this.status = result.status;
+      this.lastStatusChangeAt = Date.now();
+    }
+    if (result.fireOnIdle) {
+      // Only a Running→Idle edge that followed genuine work is a real "done".
+      const realDone = this.sawWorkSinceIdle;
+      this.sawWorkSinceIdle = false;
+      if (realDone && this.onIdle) {
         this.onIdle(this.terminalId);
       }
-    } else {
-      this.status = "Running";
-      if (this.idleTimer) clearTimeout(this.idleTimer);
-      this.idleTimer = setTimeout(() => {
-        if (this.status !== "Exited") {
-          const finishedRunning = this.status === "Running";
-          this.status = "Idle";
-          if (finishedRunning && this.onIdle) {
-            this.onIdle(this.terminalId);
-          }
-        }
-      }, this.idleTimeoutMs);
+    }
+  }
+
+  /** Run one probe tick and feed it through the state machine. */
+  private runProbeTick() {
+    if (this.status === "Exited") return;
+    if (this.shellPid === undefined) return;
+    // P0-1: interactive_cli (agent) panes have no resting-shell signal — an agent
+    // at its prompt is process-indistinguishable from an agent mid-turn (both are
+    // one blocked process with no foreground child-shell). The busy-biased
+    // authoritative probe would therefore report them "Running" forever and never
+    // fire onIdle. Never run the authoritative probe for them; downgrade to a
+    // fallback probe so output quiescence drives idle (decideStatus fallback path).
+    if (this.runtimeType === "interactive_cli") {
+      this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } });
+      return;
+    }
+    let probe: ProbeResult;
+    try {
+      probe = this.statusProbe.probe(this.shellPid);
+    } catch {
+      probe = { hasRunningChild: false, confidence: "fallback" };
+    }
+    this.applyStatusEvent({ kind: "probe", probe });
+  }
+
+  private clearProbeTimer() {
+    if (this.probeTimer) {
+      clearInterval(this.probeTimer);
+      this.probeTimer = null;
     }
   }
 
@@ -284,13 +411,7 @@ export class UniversalTerminal {
   }
 
   start() {
-    const isWindows = process.platform === "win32";
-    const isDarwin = process.platform === "darwin";
-    
-    let executable: string;
-    let args: string[];
-
-    // Ensure session ID is mapped back into resume flag for actual agent/agent sessions
+    // Ensure session ID is mapped back into resume flag for actual agent sessions
     let finalCommand = this.shellCmd;
     if (this.toolPreset !== "Custom" && this.sessionId) {
       const resumePattern = /--resume|--session/;
@@ -299,91 +420,72 @@ export class UniversalTerminal {
       }
     }
 
-    if (isWindows) {
-      executable = "cmd.exe";
-      args = ["/c", finalCommand];
-    } else {
-      // Allocate a real pseudo-terminal (PTY) using standard UNIX 'script'.
-      // Enables prompt rendering, terminal colors, and disables block output buffering.
-      executable = "script";
-      if (isDarwin) {
-        // macOS script usage: script -q /dev/null <command>
-        args = ["-q", "/dev/null", "/bin/sh", "-c", finalCommand];
-      } else {
-        // Linux script usage: script -q -f -c <command> /dev/null
-        args = ["-q", "-f", "-c", finalCommand, "/dev/null"];
-      }
-    }
-
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
 
-    this.process = spawn(executable, args, {
+    // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
+    const { transport, usingNodePty } = createPtyTransport(finalCommand, {
       cwd: this.cwd,
       env: process.env,
-      detached: true,
     });
-    
-    // Set running state and watch for idle state
+    this.transport = transport;
+    this.usingNodePty = usingNodePty;
+    // C2: the legacy (non-node-pty) transport roots the process tree at `script`
+    // (Linux/macOS) or a separate `cmd.exe` (Windows), whose tree shape is NOT what
+    // the authoritative probe was validated against. Degrade to quiescence-driven
+    // idle on that path rather than running an unvalidated authoritative probe.
+    if (!usingNodePty) {
+      this.statusProbe = new FallbackProbe();
+    }
+    // Capture the PTY root pid for the probe (design §5).
+    this.shellPid = transport.pid;
+
+    // Set initial running state and stamp the transition.
     if (this.status !== "Exited") {
       this.status = "Running";
-      if (this.idleTimer) clearTimeout(this.idleTimer);
-      this.idleTimer = setTimeout(() => {
-        if (this.status !== "Exited") this.status = "Idle";
-      }, this.idleTimeoutMs);
+      this.lastStatusChangeAt = Date.now();
     }
 
-    if (this.process.stdout) {
-      this.process.stdout.on("data", (data) => {
-        const decoded = data.toString('utf-8');
-        this.appendScrollback(decoded);
-        this.updateStatusOnOutput(decoded);
-        this.checkForSessionId(decoded);
-        if (this.onOutput) {
-          this.onOutput(this.terminalId, decoded);
-        }
-        const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
-        this.outputBuffer.push(...cleanLines);
-        if (this.outputBuffer.length > this.maxBufferLines) {
-          this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
-        }
-      });
-    }
+    // Merged stdout/stderr stream from the transport.
+    transport.onData((decoded: string) => {
+      this.appendScrollback(decoded);
+      this.applyStatusEvent({ kind: "output", text: decoded });
+      this.checkForSessionId(decoded);
+      if (this.onOutput) {
+        this.onOutput(this.terminalId, decoded);
+      }
+      const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
+      this.outputBuffer.push(...cleanLines);
+      if (this.outputBuffer.length > this.maxBufferLines) {
+        this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
+      }
+    });
 
-    if (this.process.stderr) {
-      this.process.stderr.on("data", (data) => {
-        const decoded = data.toString('utf-8');
-        this.appendScrollback(decoded);
-        this.updateStatusOnOutput(decoded);
-        this.checkForSessionId(decoded);
-        if (this.onOutput) {
-          this.onOutput(this.terminalId, decoded);
-        }
-        const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
-        this.outputBuffer.push(...cleanLines);
-        if (this.outputBuffer.length > this.maxBufferLines) {
-          this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
-        }
-      });
-    }
+    // Lifecycle (Tier 0, design §3) — kept verbatim in semantics: a real exit
+    // maps to status="Exited" and tears down the probe/idle timers.
+    transport.onExit(() => {
+      this.status = "Exited";
+      this.lastStatusChangeAt = Date.now();
+      this.clearProbeTimer();
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+    });
 
-    this.process.on('error', (err) => {
-      this.status = "Exited";
-      this.outputBuffer.push(`[Session error: ${err.message}]`);
-    });
-    
-    this.process.on('exit', () => {
-      this.status = "Exited";
-    });
-    
-    this.process.on('close', () => {
-      this.status = "Exited";
-    });
+    // Run the ~500ms process-state probe (Tier A, design §3).
+    this.clearProbeTimer();
+    this.probeTimer = setInterval(() => this.runProbeTick(), this.probeIntervalMs);
+    if (this.probeTimer.unref) this.probeTimer.unref();
   }
 
   writeInput(command: string) {
-    if (this.process && this.process.stdin) {
-      this.process.stdin.write(command + "\n");
+    // Record the most recent command and optimistically mark Running — an input
+    // means a turn is starting (Tier A kick, design §5).
+    this.lastCommand = command;
+    this.applyStatusEvent({ kind: "input" });
+    if (this.transport) {
+      this.transport.write(command + "\n");
     }
   }
 
@@ -392,53 +494,56 @@ export class UniversalTerminal {
   }
 
   public async stop(): Promise<void> {
+    // Clear both timers up front so a stopped pane never leaves work alive
+    // (prevents the runner from hanging on lingering intervals).
+    this.clearProbeTimer();
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
-    if (this.process && this.process.pid) {
-      const pid = this.process.pid;
-      const proc = this.process;
-      this.process = null;
 
-      return new Promise<void>((resolve) => {
-        let resolved = false;
-        const cleanupAndResolve = () => {
-          if (!resolved) {
-            resolved = true;
-            resolve();
-          }
-        };
-
-        proc.on("exit", cleanupAndResolve);
-        proc.on("close", cleanupAndResolve);
-
-        try {
-          // Teardown the process group cleanly
-          process.kill(-pid, "SIGTERM");
-        } catch (e) {
-          try {
-            proc.kill("SIGTERM");
-          } catch (err) {}
-          cleanupAndResolve();
-          return;
-        }
-
-        const killTimeout = setTimeout(() => {
-          try {
-            process.kill(-pid, "SIGKILL");
-          } catch (e) {
-            try {
-              proc.kill("SIGKILL");
-            } catch (err) {}
-          }
-          cleanupAndResolve();
-        }, 1000);
-
-        proc.on("exit", () => clearTimeout(killTimeout));
-        proc.on("close", () => clearTimeout(killTimeout));
-      });
+    const transport = this.transport;
+    if (!transport || transport.pid === undefined) {
+      this.transport = null;
+      return;
     }
+    this.transport = null;
+
+    return new Promise<void>((resolve) => {
+      let resolved = false;
+      // P2: declared BEFORE done() to avoid a temporal-dead-zone ReferenceError if
+      // onExit fires synchronously or transport.kill() throws (already-dead pid) —
+      // both paths call done() before the timer is assigned below.
+      let killTimeout: NodeJS.Timeout | undefined;
+      const done = () => {
+        if (!resolved) {
+          resolved = true;
+          if (killTimeout) clearTimeout(killTimeout);
+          resolve();
+        }
+      };
+
+      // Map a real exit/close to resolution; the transport multiplexes onExit.
+      transport.onExit(done);
+
+      // SIGTERM → SIGKILL escalation semantics, preserved from the legacy stop().
+      try {
+        transport.kill("SIGTERM");
+      } catch {
+        done();
+        return;
+      }
+
+      killTimeout = setTimeout(() => {
+        try {
+          transport.kill("SIGKILL");
+        } catch {
+          // already dead
+        }
+        done();
+      }, 1000);
+      if (killTimeout.unref) killTimeout.unref();
+    });
   }
 }
 
@@ -646,7 +751,7 @@ export class OrchestratorManager {
         const meta: PaneMeta = {
           pane_id: id,
           name: existingPane?.name || id,
-          runtime_type: existingPane?.runtime_type || "interactive_cli",
+          runtime_type: existingPane?.runtime_type || term.runtimeType,
           last_known_state: term.status === "Running" ? "Running active command" : term.status === "Idle" ? "Idle" : "Exited",
           is_busy: term.status === "Running",
           alive: term.status !== "Exited",
@@ -654,7 +759,11 @@ export class OrchestratorManager {
           permissions_mode: term.permissionsMode,
           tool_preset: term.toolPreset,
           session_id: term.sessionId || existingPane?.session_id || "",
-          context_size: term.contextSize
+          context_size: term.contextSize,
+          // WS-C status-detection fields (design §4.2).
+          last_status_change_at: new Date(term.lastStatusChangeAt).toISOString(),
+          last_command: term.lastCommand || existingPane?.last_command || "",
+          elapsed_ms: Date.now() - term.lastStatusChangeAt
         };
         this.ledger.updatePane(pId, meta, false);
       }
