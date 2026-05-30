@@ -355,15 +355,25 @@ function makeHarness() {
   const allow = loadShellAllowlist("git,ls,cat,pwd");
   const terms: Record<string, FakeTerm> = {};
 
+  // `ledgerOnly` panes exist in the ledger (paneExists true) but have no live term — the
+  // inert-boot case (feat/local-testing): a persisted pane that hasn't been restarted yet.
+  const ledgerOnly = new Set<string>();
+
   function dispatch(session: FakeSession, callId: string, pendingId: string, paneId: string, instruction: string, kind: any, globalMode = "Inherit") {
     const term = terms[paneId];
-    const paneExists = !!term;
+    const paneExists = !!term || ledgerOnly.has(paneId);
     const runtimeType = term?.runtimeType as any;
     const effectiveMode = (globalMode === "Inherit" ? (term ? term.permissionsMode : "Human-in-the-Loop") : globalMode) as any;
     const k = inferKind(kind, runtimeType);
     const d = decideProposal({ kind: k, instruction, effectiveMode, runtimeType, paneExists, allowlist: allow });
     if (d.type === "auto_execute") {
-      term!.writeInput(instruction);
+      // Mirror server dispatchProposal: a ledger pane with no live process refuses instead of
+      // crashing on term!.writeInput (inert-boot guard).
+      if (!term) {
+        session.sendToolResponse({ functionResponses: [{ name: "propose_command", id: callId, response: { output: "not running" } }] });
+        return "error_not_running";
+      }
+      term.writeInput(instruction);
       session.sendToolResponse({ functionResponses: [{ name: "propose_command", id: callId, response: { output: "executed" } }] });
       return "executed";
     }
@@ -407,13 +417,7 @@ function makeHarness() {
     }
   }
 
-  // P0-3: a trimmed model of `handlePlansTrigger` advancement — step completion routes the
-  // NEXT step's write through the SAME gated `dispatch` (never an un-gated writeInput).
-  function advancePlan(session: FakeSession, planId: string, nextIndex: number, paneId: string, command: string, kind: any) {
-    return dispatch(session, `plan__${planId}__step${nextIndex}`, `plan__${planId}__step${nextIndex}`, paneId, command, kind);
-  }
-
-  return { store, terms, dispatch, resolve, advancePlan };
+  return { store, terms, dispatch, resolve, ledgerOnly };
 }
 
 describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
@@ -491,6 +495,20 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     assert.strictEqual(h.store.has("call1"), false);
   });
 
+  it("inert boot: Full Auto proposal to a ledger pane with no live process refuses, no crash", () => {
+    // feat/local-testing inert boot: a persisted pane exists in the ledger but is not running
+    // until restarted. A Full-Auto proposal must NOT crash on term!.writeInput — it refuses and
+    // tells the operator to start the pane first.
+    const h = makeHarness();
+    h.ledgerOnly.add("pane_inert"); // exists in ledger, no live term
+    const sess = new FakeSession();
+    // Use an allowlisted shell command so the decision reaches auto_execute (the crash path),
+    // rather than short-circuiting to clarify on a non-allowlisted command.
+    const r = h.dispatch(sess, "c1", "c1", "pane_inert", "ls", "shell", "Full Auto");
+    assert.strictEqual(r, "error_not_running");
+    assert.ok(!h.terms["pane_inert"], "no live term was created or written to");
+  });
+
   it("targeting: 3 pending, 'approve the npm install' dispatches ONLY that, to its pane", () => {
     const h = makeHarness();
     h.terms["pane_a"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
@@ -534,42 +552,10 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     assert.deepStrictEqual(h.terms["build"].writes, ["npm run build"]);
   });
 
-  it("P0-3: a HiTL multi-step plan does NOT auto-execute steps 2..N (advancement is gated)", () => {
-    // Step 1 ran; step 1 completes -> the orchestrator advances to step 2. That advancement
-    // MUST route the NEXT step's write through the gate (a pending approval in HiTL), NOT a
-    // bare un-gated writeInput. This is the least-authority hole P0-3 closes.
-    const h = makeHarness();
-    h.terms["s1"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
-    h.terms["s2"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
-    const sess = new FakeSession();
-
-    // step 0 proposed (HiTL pending), then operator approves it -> it runs on s1.
-    h.dispatch(sess, "planCall", "plan__plan1__step0", "s1", "build", undefined);
-    h.resolve(sess, "plan__plan1__step0", true);
-    assert.deepStrictEqual(h.terms["s1"].writes, ["build"], "step 1 ran after approval");
-
-    // step 1 completes -> advancement to step 2 (index 1) must be GATED, not auto-written.
-    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
-    assert.strictEqual(adv, "pending", "step 2 must become a pending approval, not auto-run");
-    assert.strictEqual(h.terms["s2"].writes.length, 0, "step 2 must NOT auto-execute");
-    assert.ok(h.store.has("plan__plan1__step1"), "step 2 held as a pending approval");
-  });
-
-  it("P0-3: Full Auto plan advancement runs the next step immediately (still through the gate)", () => {
-    const h = makeHarness();
-    h.terms["s2"] = new FakeTerm("interactive_cli", "Full Auto");
-    const sess = new FakeSession();
-    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
-    assert.strictEqual(adv, "executed");
-    assert.deepStrictEqual(h.terms["s2"].writes, ["deploy"]);
-  });
-
-  it("P0-3: Read-Only plan advancement is blocked (no write)", () => {
-    const h = makeHarness();
-    h.terms["s2"] = new FakeTerm("interactive_cli", "Read-Only");
-    const sess = new FakeSession();
-    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
-    assert.strictEqual(adv, "blocked_read_only");
-    assert.strictEqual(h.terms["s2"].writes.length, 0);
-  });
+  // Prompt-composer refactor: plan ADVANCEMENT (steps 2..N) no longer writes through any gate.
+  // A plan is an outline (architecture §5); when a running step completes, `handlePlansTrigger`
+  // pauses the plan and SURFACES the next step as a co-pilot suggestion — it never dispatches a
+  // write in the background, in ANY policy mode. The only write door remains the live, operator-
+  // engaged `dispatch` path exercised by the gate tests above (and by `execute_plan`'s step 0).
+  // The former "P0-3 gated auto-advance" tests modelled removed behavior and were dropped.
 });

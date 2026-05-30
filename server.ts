@@ -23,6 +23,7 @@ import {
   type ResolveMode,
 } from "./src/pendingApprovals";
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
+import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 
 dotenv.config();
 
@@ -44,6 +45,19 @@ function getCookie(cookieHeader: string | undefined, name: string): string | nul
     }
   }
   return null;
+}
+
+// Returns a deep copy of `settings` with the Gemini API key masked, safe to send to
+// any client (REST response or WS broadcast). The masking matches GET /api/settings so
+// the key is never shipped in plaintext over the `settings_updated` broadcast. PUT
+// restores the real key server-side when it sees a masked/blank value coming back.
+function sanitizeSettingsForClient<T extends { secrets?: { geminiApiKey?: string } }>(settings: T): T {
+  const sanitized = JSON.parse(JSON.stringify(settings)) as T;
+  const key = sanitized.secrets?.geminiApiKey;
+  if (key && key !== "CONFIGURED_IN_ENV" && key.length > 8) {
+    sanitized.secrets!.geminiApiKey = key.substring(0, 6) + "••••••••" + key.substring(key.length - 4);
+  }
+  return sanitized;
 }
 
 export interface HistoryEntry {
@@ -145,15 +159,8 @@ export class HistoryManager {
 
 const manager = new OrchestratorManager();
 
-let promptBufferText = `# Requirements & Feedback Prompt Buffer
-
-- **Objective**: Review code updates, dictate requirements, and capture content fixes.
-- **Workflow**: Tap "Workspace Actions" below to test the core agentic workflows.
-- **Real-time Sync**: Updates made here instantly broadcast between all live operators and the voice agent.
-
-### ACTIVE CHRONICLE MEMORY LIST:
-* [System Status]: Orbital Harness and live voice workspace initialized.
-* [Task]: Review running nodes on mobile or initiate an agentic walkthrough session.`;
+// Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
+// its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
 
 async function startServer() {
   const app = express();
@@ -277,32 +284,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
 
-  // P0-3 (R4): minimal single-active-session registry used ONLY to gate plan-step ADVANCEMENT
-  // (steps 2..N). `handlePlansTrigger` runs at this outer scope and has no `session`/
-  // `dispatchProposal` in scope; the live connection installs a handle here (and clears it on
-  // close) so a step-completion can route the NEXT step's pane write through the SAME
-  // effective-mode + pending-approval gate as `dispatchProposal`. This is NOT the WS-D-declined
-  // proactive in-voice path — it is the same kind of handle the WS-E resolution push already
-  // needs. Single active session by design; if none is live we FALL BACK TO SAFE behavior
-  // (never an un-gated write).
-  //
-  // M11 (foot-gun): `activePlanGate` is module-scoped, single-slot, LAST-CONNECTION-WINS. A
-  // closing tab clears it (below) even if another session is still live, which PAUSES plan
-  // advancement (the SAFE direction — never an un-gated write) until a reconnect re-installs it.
-  // WS-F/WS-K should key this by sessionId so concurrent sessions don't clobber each other.
-  //
-  // H2: typed as the SAME outcome shape `dispatchProposal` returns (DispatchOutcome) so the union
-  // is single-sourced and can't drift from the real dispatch result.
+  // Step 5 (single active pane): the pane the operator currently has open on screen, driven by the
+  // UI via `set_active_pane`. It is the SINGLE source of truth for where Janus may write — see
+  // `isPaneActiveForWrite`. Null when no pane is open / no UI is connected (no write permitted).
+  let activePaneId: string | null = null;
+
+  // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
+  // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
+  // writing into a pane (architecture §5), so the outer-scope step engine no longer needs a handle
+  // back into the live session's dispatch path.
   type DispatchOutcome =
     | { kind: "executed"; text: string }
     | { kind: "blocked"; text: string }
     | { kind: "error"; text: string }
     | { kind: "clarify"; text: string }
     | { kind: "pending"; text: string };
-
-  let activePlanGate:
-    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) => DispatchOutcome)
-    | null = null;
 
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
@@ -315,6 +311,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }
       }
     }
+  }
+
+  // Step 6 (the Workbench): per-pane WIP draft helpers. The draft is composed against the ACTIVE
+  // pane (single source of truth, step 5); composing/editing it is not a CLI write and is ungated.
+  function activeDraftTarget(): { projectId: string; paneId: string } | null {
+    if (!activePaneId) return null;
+    return { projectId: manager.ledger.activeProjectId || "default_project", paneId: activePaneId };
+  }
+  function broadcastDraft(projectId: string, paneId: string) {
+    const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
+    broadcast({ type: "draft_updated", projectId, paneId, draft });
+  }
+  function appendActiveDraft(line: string, updatedBy: "janus" | "operator") {
+    const t = activeDraftTarget();
+    if (!t) return; // no active pane -> nowhere to compose (step 5)
+    manager.ledger.appendDraft(t.projectId, t.paneId, line, updatedBy);
+    broadcastDraft(t.projectId, t.paneId);
   }
 
   // WS-D (BUG-024): proactive feedback controller. Per the maintainer decision this drives
@@ -338,20 +351,39 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     let changed = false;
     for (const rule of rules) {
       if (rule.enabled && rule.triggerTerminalId === terminalId && rule.triggerTransition === transition) {
-        const targetTerm = manager.terminals[rule.actionTerminalId];
-        if (targetTerm) {
-          console.log(`[WATCH RULE FIRED] Rule ${rule.id} triggered: Writing command to terminal ${rule.actionTerminalId}`);
-          HistoryManager.getInstance().addCommand(rule.actionTerminalId, rule.actionCommand);
-          targetTerm.writeInput(rule.actionCommand);
-          broadcast({
-            type: "watch_rule_fired",
+        // Prompt-composer refactor: watch rules NEVER write to a CLI pane. They are co-pilot
+        // nudges — when the trigger matches, we SURFACE the suggested command for the operator
+        // (who can act on it, gated, on the active pane). No autonomous, background, or
+        // cross-pane write happens here. (architecture §5: Remove watch-rule autonomous writes.)
+        console.log(`[WATCH RULE NUDGE] Rule ${rule.id} matched: suggesting '${rule.actionCommand}' for '${rule.actionTerminalId}' (not writing).`);
+        const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+        manager.attentionQueue.push({
+          id: itemID,
+          type: "confirmation",
+          terminalId: rule.actionTerminalId,
+          projectId: manager.ledger.activeProjectId || "default_project",
+          message: `Suggestion: run '${rule.actionCommand}' on '${rule.actionTerminalId}' (trigger: '${terminalId}' → '${transition}').`,
+          timestamp: new Date().toISOString(),
+          dismissed: false,
+          details: {
+            kind: "watch_rule_suggestion",
             ruleId: rule.id,
-            message: `Watch Rule matched! Fired '${rule.actionCommand}' on '${rule.actionTerminalId}' due to '${terminalId}' transition to '${transition}'.`
-          });
-          if (rule.oneShot) {
-            rule.enabled = false;
-            changed = true;
-          }
+            suggestedCommand: rule.actionCommand,
+            targetTerminalId: rule.actionTerminalId,
+          },
+        });
+        pruneAttention(); // BUG-035 cap/TTL
+        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+        broadcast({
+          type: "watch_rule_suggested",
+          ruleId: rule.id,
+          suggestedCommand: rule.actionCommand,
+          targetTerminalId: rule.actionTerminalId,
+          message: `Watch rule matched — suggested '${rule.actionCommand}' on '${rule.actionTerminalId}'. Not executed; awaiting the operator.`
+        });
+        if (rule.oneShot) {
+          rule.enabled = false;
+          changed = true;
         }
       }
     }
@@ -379,86 +411,39 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             });
             const nextIndex = plan.currentStepIndex + 1;
             if (nextIndex < plan.steps.length) {
+              // Prompt-composer refactor: a plan is an OUTLINE, not an execution engine. We do
+              // NOT auto-advance by writing the next step into a pane. Mark the next step pending,
+              // pause the plan awaiting the operator, and SURFACE it as a co-pilot suggestion the
+              // operator can act on (gated, on the active pane). (architecture §5: Demote plans.)
               plan.currentStepIndex = nextIndex;
               const nextStep = plan.steps[nextIndex];
-              nextStep.status = "running";
-              const nextTerm = manager.terminals[nextStep.terminalId];
-              if (!nextTerm) {
-                plan.status = "paused";
-                nextStep.status = "failed";
-                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-                manager.attentionQueue.push({
-                  id: itemID,
-                  type: "error",
-                  terminalId: nextStep.terminalId,
-                  projectId: manager.ledger.activeProjectId || "default_project",
-                  message: `Plan '${plan.name}' paused: pane '${nextStep.terminalId}' is not online.`,
-                  timestamp: new Date().toISOString(),
-                  dismissed: false
-                });
-                pruneAttention(); // BUG-035 cap/TTL
-                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-                announcementBus.enqueue({
-                  kind: "plan_paused",
-                  terminalId: nextStep.terminalId,
-                  summary: `Plan '${plan.name}' paused — pane offline.`
-                });
-                changed = true;
-              } else if (!activePlanGate) {
-                // P0-3: no live session to gate through — FALL BACK TO SAFE. We MUST NOT write
-                // the next step un-gated (that is the least-authority hole). Pause and surface
-                // it for attention; the operator can resume once a session is live.
-                plan.status = "paused";
-                nextStep.status = "pending";
-                console.log(`[PLAN PROGRESS] Deferring step ${nextIndex + 1} of '${plan.name}': no active session to gate the write. NOT writing un-gated.`);
-                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-                manager.attentionQueue.push({
-                  id: itemID,
-                  type: "error",
-                  terminalId: nextStep.terminalId,
-                  projectId: manager.ledger.activeProjectId || "default_project",
-                  message: `Plan '${plan.name}' paused: step ${nextIndex + 1} needs the approval gate but no voice session is active.`,
-                  timestamp: new Date().toISOString(),
-                  dismissed: false
-                });
-                pruneAttention(); // BUG-035 cap/TTL
-                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-                announcementBus.enqueue({
-                  kind: "plan_paused",
-                  terminalId: nextStep.terminalId,
-                  summary: `Plan '${plan.name}' paused — no session to approve next step.`
-                });
-                changed = true;
-              } else {
-                // P0-3 (R4): route the next step's pane write through the SAME effective-mode +
-                // pending-approval gate as `dispatchProposal`. In HiTL the step becomes a spoken
-                // pending approval (it does NOT auto-execute), in Full Auto it runs, in Read-Only
-                // it is blocked. (WS-B redaction is applied inside the gate / narration.)
-                console.log(`[PLAN PROGRESS] Gating next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
-                const outcome = activePlanGate({
-                  pendingId: `plan__${plan.id}__step${nextIndex}`,
-                  targetId: nextStep.terminalId,
-                  instruction: nextStep.command,
-                  trigger: `Plan '${plan.name}' step ${nextIndex + 1}`,
-                });
-                if (outcome.kind === "executed") {
-                  // Full Auto: ran immediately; step stays "running" until its own transition.
-                } else if (outcome.kind === "pending") {
-                  // HiTL: now a spoken pending approval — do NOT auto-execute. Mark the step as
-                  // awaiting approval so the UI/plan state reflects that it has not run yet.
-                  nextStep.status = "pending";
-                } else {
-                  // blocked (Read-Only) / clarify / error: pause the plan, never silently write.
-                  plan.status = "paused";
-                  nextStep.status = "failed";
-                  announcementBus.enqueue({
-                    kind: "plan_paused",
-                    terminalId: nextStep.terminalId,
-                    summary: `Plan '${plan.name}' paused on step ${nextIndex + 1}: ${outcome.text}`,
-                  });
-                }
-                changed = true;
-              }
+              nextStep.status = "pending";
+              plan.status = "paused";
+              const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+              manager.attentionQueue.push({
+                id: itemID,
+                type: "confirmation",
+                terminalId: nextStep.terminalId,
+                projectId: manager.ledger.activeProjectId || "default_project",
+                message: `Plan '${plan.name}': step ${nextIndex + 1} ready — suggest '${nextStep.command}' on '${nextStep.terminalId}'.`,
+                timestamp: new Date().toISOString(),
+                dismissed: false,
+                details: {
+                  kind: "plan_step_suggestion",
+                  planId: plan.id,
+                  stepId: nextStep.id,
+                  suggestedCommand: nextStep.command,
+                  targetTerminalId: nextStep.terminalId,
+                },
+              });
+              pruneAttention(); // BUG-035 cap/TTL
+              broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+              announcementBus.enqueue({
+                kind: "plan_paused",
+                terminalId: nextStep.terminalId,
+                summary: `Plan '${plan.name}' — step ${nextIndex + 1} ready for your approval.`
+              });
+              changed = true;
             } else {
               plan.status = "completed";
               console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
@@ -695,11 +680,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   });
 
   // Web API to restart terminal node
-  app.post("/api/terminals/:id/restart", (req, res) => {
+  app.post("/api/terminals/:id/restart", async (req, res) => {
     const { id } = req.params;
     const term = manager.terminals[id];
     if (term) {
-      term.stop();
+      // stop() is async (SIGTERM→SIGKILL escalation); await it so the dying PTY's onExit
+      // fires BEFORE start() spawns the replacement, otherwise the late exit flips the
+      // freshly-restarted pane to Exited and tears down its probe timer (zombie pane).
+      await term.stop();
       term.start();
       broadcastLedgerUpdate();
       broadcast({ type: "terminals_updated" });
@@ -811,6 +799,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   app.post("/api/projects/:projectId/panes/:paneId/notes", (req, res) => {
     const { note } = req.body;
     manager.ledger.addPaneNote(req.params.projectId, req.params.paneId, note);
+    broadcastLedgerUpdate();
+    res.json({ success: true });
+  });
+
+  // Step 6 / §4: add a layered context entry to a pane. Operator-typed entries land in the human
+  // layer (authoritative steering); this is not a CLI write and is never gated.
+  app.post("/api/projects/:projectId/panes/:paneId/context", (req, res) => {
+    const { text, layer } = req.body;
+    if (!text || typeof text !== "string") { res.status(400).json({ error: "Missing text" }); return; }
+    const ok = layer === "model"
+      ? manager.ledger.addModelContext(req.params.projectId, req.params.paneId, text, "operator-ui")
+      : manager.ledger.addHumanContext(req.params.projectId, req.params.paneId, text);
+    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
     broadcastLedgerUpdate();
     res.json({ success: true });
   });
@@ -1148,44 +1149,57 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     
     const activeProjectId = manager.ledger.activeProjectId || "default_project";
     const handoffNote = `Handoff from [${sourcePaneId}] with notes: ${contextNotes}. Last events: ${lastFiveOutlines}`;
-    
-    manager.ledger.addPaneNote(activeProjectId, targetPaneId, handoffNote);
-    
-    const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${sourcePaneId} -> Target: ${targetPaneId}\n# Notes: ${contextNotes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
-    targetTerm.writeInput(commentCommand);
-    
+
+    // Prompt-composer refactor: handoff carries CONTEXT, not commands. It writes to the target
+    // pane's model-context layer (ungated, not a CLI write) and never injects into the target
+    // pane's stdin. (architecture §5: Remove handoff stdin injection.)
+    manager.ledger.addModelContext(activeProjectId, targetPaneId, handoffNote, "handoff");
+
     broadcastLedgerUpdate();
     res.json({ success: true });
   });
 
-  // REST endpoints for the real-time synchronous markdown prompt buffer
-  app.get("/api/prompt-buffer", (req, res) => {
-    res.json({ text: promptBufferText });
+  // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
+  app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
+    const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
+      ?? { text: "", updatedAt: new Date().toISOString() };
+    res.json({ draft });
   });
 
-  app.put("/api/prompt-buffer", (req, res) => {
+  app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
     const { text } = req.body;
-    if (text !== undefined) {
-      promptBufferText = text;
-      broadcast({
-        type: "prompt_buffer_updated",
-        text: promptBufferText
-      });
-      res.json({ success: true, text: promptBufferText });
-    } else {
-      res.status(400).json({ error: "Missing text field" });
-    }
+    if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
+    const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
+    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    broadcastDraft(req.params.projectId, req.params.paneId);
+    res.json({ success: true });
+  });
+
+  // The WIP register (the scalable part of "B"): every pane in a project with a non-empty draft,
+  // so work composed for one pane is never lost when the operator switches to another.
+  app.get("/api/projects/:projectId/drafts", (req, res) => {
+    res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
+  });
+
+  // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
+  // architecture §2): clicking Send IS the approval, so it writes immediately. The draft is then
+  // cleared. Janus never calls this — it only fills the draft for the operator to send.
+  app.post("/api/panes/:projectId/:paneId/draft/send", (req, res) => {
+    const { projectId, paneId } = req.params;
+    const text = (manager.ledger.getDraft(projectId, paneId)?.text ?? "").trim();
+    if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
+    const term = manager.terminals[paneId];
+    if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
+    HistoryManager.getInstance().addCommand(paneId, text);
+    term.writeInput(text);
+    broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
+    manager.ledger.setDraft(projectId, paneId, "", "operator");
+    broadcastDraft(projectId, paneId);
+    res.json({ success: true });
   });
 
   app.get("/api/settings", (req, res) => {
-    const sanitizedSettings = JSON.parse(JSON.stringify(manager.settings));
-    if (sanitizedSettings.secrets && sanitizedSettings.secrets.geminiApiKey) {
-      const key = sanitizedSettings.secrets.geminiApiKey;
-      if (key && key !== "CONFIGURED_IN_ENV" && key.length > 8) {
-        sanitizedSettings.secrets.geminiApiKey = key.substring(0, 6) + "••••••••" + key.substring(key.length - 4);
-      }
-    }
-    res.json(sanitizedSettings);
+    res.json(sanitizeSettingsForClient(manager.settings));
   });
 
   app.put("/api/settings", (req, res) => {
@@ -1194,12 +1208,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
     manager.updateSettings(newSettings);
-    broadcast({ 
-      type: "settings_updated", 
+    broadcast({
+      type: "settings_updated",
       globalPermissionsMode: manager.globalPermissionsMode,
-      settings: manager.settings
+      settings: sanitizeSettingsForClient(manager.settings)
     });
-    res.json({ success: true, settings: manager.settings, globalPermissionsMode: manager.globalPermissionsMode });
+    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
   });
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
@@ -1356,11 +1370,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
-    // Push initial prompt buffer synchronously to the newly connected client
-    clientWs.send(JSON.stringify({
-      type: "prompt_buffer_updated",
-      text: promptBufferText
-    }));
+    // Step 6: drafts are per-pane now; the client fetches the active pane's draft once it has told
+    // us which pane is open (set_active_pane). No global buffer to push on connect.
 
     let session: any = null;
     let wsClosed = false;
@@ -1397,6 +1408,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const term = manager.terminals[targetId];
       const wsProj = manager.ledger.getActiveProject();
       const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+
+      // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so
+      // the operator can SEE and improve the command before it lands (HiTL). A proposal for any
+      // other pane is refused here — never written, in ANY policy mode — and Janus is told to ask
+      // for a switch. This sits ABOVE the effective-mode gate on purpose. (architecture step 5.)
+      if (!isPaneActiveForWrite(activePaneId, targetId)) {
+        return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
+      }
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
 
@@ -1418,8 +1437,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
           return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
         case "auto_execute":
+          // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live
+          // process until it is restarted. `paneExists` is true for such a pane, so guard the
+          // immediate Full-Auto write: if there is no live terminal, refuse instead of crashing on
+          // `term!.writeInput`. (The pending-approval path re-checks liveness at resolve time.)
+          if (!term) {
+            return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+          }
           HistoryManager.getInstance().addCommand(targetId, instruction);
-          term!.writeInput(instruction);
+          term.writeInput(instruction);
           broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
           return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
         case "pending_approval": {
@@ -1466,7 +1492,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             // overwrite the live handle with a stale one from a dead session and
             // poison the next reconnect's resume attempt.
             if ((message as any).sessionResumptionUpdate && !wsClosed) {
+              const prevHandle = lastSessionResumptionToken?.newHandle;
               lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
+              if (lastSessionResumptionToken?.newHandle !== prevHandle) {
+                console.log("[SESSION RESUMPTION] Token updated:", lastSessionResumptionToken?.newHandle);
+              }
             }
 
             // Extract user or model verbal transcripts
@@ -1505,12 +1535,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
               const cleanUtter = userUtterance.trim();
               if (cleanUtter.length > 2) {
-                // Auto-log dictation as bullet points inside synchronous prompt buffer
-                promptBufferText += `\n* **User Dictation**: ${cleanUtter}`;
-                broadcast({
-                  type: "prompt_buffer_updated",
-                  text: promptBufferText
-                });
+                // Step 6: capture dictation into the ACTIVE pane's WIP draft (raw material the
+                // operator refines before sending). No-op if no pane is open.
+                appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
 
                 // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser
                 // + most-recently-announced targeting (NOT FIFO, NOT substring matching).
@@ -1547,14 +1574,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 text: modelUtterance
               }));
 
-              // Auto-log agent comments as bullet points inside synchronous prompt buffer
+              // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
               const cleanUtter = modelUtterance.trim();
               if (cleanUtter.length > 2) {
-                promptBufferText += `\n* **Agentic Thought**: *${cleanUtter}*`;
-                broadcast({
-                  type: "prompt_buffer_updated",
-                  text: promptBufferText
-                });
+                appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
               }
             }
 
@@ -1572,7 +1595,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             for (const call of message.toolCall.functionCalls || []) {
               const name = call.name;
               const args = call.args as Record<string, any>;
-              
+
+              // Guard every tool handler: an uncaught throw here would escape the Gemini SDK
+              // onmessage callback, leave this call.id unanswered, and stall the conversation.
+              try {
               if (name === "list_panes") {
                 const list = manager.listPanes();
                 session.sendToolResponse({
@@ -1643,6 +1669,44 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     functionResponses: [{ name: "propose_command", id: call.id, response: { output: outcome.text } }]
                   });
                 }
+              } else if (name === "switch_active_pane") {
+                // Step 5: Janus may change which pane is open ONLY when the operator directs it
+                // ("switch to the build pane"). This moves the UI's source of truth: the server
+                // records the new active pane and tells the UI to open it; the UI echoes it back
+                // via set_active_pane. It does NOT write any command — it just changes focus.
+                const targetId = args.pane_id;
+                const term = manager.terminals[targetId];
+                const wsProj = manager.ledger.getActiveProject();
+                const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+                let output = "";
+                if (!paneExists) {
+                  output = `Cannot switch: pane '${targetId}' does not exist.`;
+                } else {
+                  activePaneId = targetId;
+                  broadcast({ type: "switch_active_pane", paneId: targetId });
+                  output = `Opened pane '${targetId}'. It is now the active pane; I can propose commands here for your approval.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
+                });
+              } else if (name === "update_draft_prompt") {
+                // Step 6: Janus composes/refines the WIP draft for the OPERATOR to review and send.
+                // It does NOT send (sending is operator-direct). Targets the active pane.
+                const t = activeDraftTarget();
+                let output = "";
+                if (!t) {
+                  output = "No pane is open, so there is no draft to write. Ask the operator to open a pane first.";
+                } else {
+                  const mode = args.mode === "append" ? "append" : "replace";
+                  const text = String(args.text ?? "");
+                  if (mode === "append") manager.ledger.appendDraft(t.projectId, t.paneId, text, "janus");
+                  else manager.ledger.setDraft(t.projectId, t.paneId, text, "janus");
+                  broadcastDraft(t.projectId, t.paneId);
+                  output = `Draft for pane '${t.paneId}' updated (${mode}). The operator can review and send it.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
+                });
               } else if (name === "list_pending_approvals") {
                 // WS-E.1 (BUG-016): let the eyes-off operator ask "what's queued for approval?"
                 // Reads the SAME store the REST endpoint reads, redacted, scoped to this session.
@@ -1780,10 +1844,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 manager.globalPermissionsMode = permissions_mode;
                 manager.settings.advanced.globalPermissionsMode = permissions_mode;
                 manager.saveSettings();
-                broadcast({ 
-                  type: "settings_updated", 
+                broadcast({
+                  type: "settings_updated",
                   globalPermissionsMode: permissions_mode,
-                  settings: manager.settings
+                  settings: sanitizeSettingsForClient(manager.settings)
                 });
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Global permissions updated to ${permissions_mode}.` } }]
@@ -1792,29 +1856,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const { muted } = args;
                 manager.settings.voiceAi.isMicMuted = muted;
                 manager.saveSettings();
-                broadcast({ 
-                  type: "settings_updated", 
-                  settings: manager.settings
+                broadcast({
+                  type: "settings_updated",
+                  settings: sanitizeSettingsForClient(manager.settings)
                 });
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Microphone now ${muted ? 'muted' : 'active-listening'}.` } }]
-                });
-              } else if (name === "add_watch_rule") {
-                const { trigger_terminal_id, trigger_transition, action_terminal_id, action_command, one_shot } = args;
-                const newRule = {
-                  id: "rule_" + Math.random().toString(36).substring(2, 11),
-                  triggerTerminalId: trigger_terminal_id,
-                  triggerTransition: trigger_transition,
-                  actionTerminalId: action_terminal_id,
-                  actionCommand: action_command,
-                  enabled: true,
-                  oneShot: one_shot !== undefined ? one_shot : true
-                };
-                manager.ledger.watchRules.push(newRule);
-                manager.ledger["save"](true);
-                broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Automation watch rule added: trigger ${trigger_terminal_id} on ${trigger_transition} -> run ${action_command} on ${action_terminal_id}` } }]
                 });
               } else if (name === "create_orchestrator_plan") {
                 const { name: planName, steps } = args;
@@ -1916,30 +1963,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const targetTerm = manager.terminals[target_pane_id];
                 
                 let resp = "";
-                // P2-1: this writes a comment block to the TARGET pane stdin — still a write, so
-                // respect Read-Only at minimum (least-authority). TODO(WS-G): route the full
-                // handoff write through the same effective-mode + pending-approval gate as
-                // `dispatchProposal` (HiTL should make it a spoken approval too).
-                const targetEffectiveMode = effectiveModeFor(target_pane_id);
+                // Prompt-composer refactor: handoff carries CONTEXT, not commands. It writes to
+                // the target pane's model-context layer (ungated, not a CLI write) and never
+                // injects into the target pane's stdin — so there is no effective-mode gate here.
+                // (architecture §5: Remove handoff stdin injection.)
                 if (!sourceTerm || !targetTerm) {
                   resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
-                } else if (targetEffectiveMode === "Read-Only") {
-                  broadcast({ type: "command_blocked", terminalId: target_pane_id, cmd: "(handoff context block)", reason: "Read-Only policy enforced." });
-                  resp = `Error: Target pane ${target_pane_id} is Read-Only; the handoff context block was not written.`;
                 } else {
                   const sourceHistory = HistoryManager.getInstance().loadHistory(source_pane_id);
                   const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
-                  
+
                   const activeProjectId = manager.ledger.activeProjectId || "default_project";
                   const handoffNote = `Handoff from [${source_pane_id}] with notes: ${context_notes}. Last events: ${lastFiveOutlines}`;
-                  
-                  manager.ledger.addPaneNote(activeProjectId, target_pane_id, handoffNote);
-                  
-                  const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${source_pane_id} -> Target: ${target_pane_id}\n# Notes: ${context_notes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
-                  targetTerm.writeInput(commentCommand);
-                  
+
+                  manager.ledger.addModelContext(activeProjectId, target_pane_id, handoffNote, "handoff");
+
                   broadcastLedgerUpdate();
-                  resp = `Successful handoff orchestrated from [${source_pane_id}] to [${target_pane_id}]. Handoff packet injected into active process thread streams.`;
+                  resp = `Handoff context from [${source_pane_id}] recorded into [${target_pane_id}]'s orientation context. No command was written to the pane.`;
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: resp } }]
@@ -1973,6 +2013,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   });
                 }
               }
+              } catch (toolErr) {
+                console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
+                try {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
+                  });
+                } catch { /* session already torn down; nothing more we can do */ }
+              }
             }
           }
         },
@@ -2002,7 +2050,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "propose_command",
-              description: "Direct work to the right pane. Does NOT execute directly — it passes the effective permission gate (auto-runs in Full Auto, becomes a spoken pending approval in Human-in-the-Loop, blocked in Read-Only). PREFER kind='agent_instruction' (the default): relay a SHORT, FOCUSED, DISTILLED instruction to the Claude Code / Codex / Antigravity agent in that pane and let the AGENT do the heavy lifting (write code, run builds/tests). Do NOT relay the operator's dictation verbatim — compress it to a targeted instruction first and confirm it by voice. kind='shell' is ONLY for your OWN small read-only/observe needs (status checks like git status, ls, cat, pwd); never author or run heavy/mutating shell yourself — delegate that to an agent pane via kind='agent_instruction'. A non-allowlisted shell command returns a clarification so you can re-route it to the agent.",
+              description: "Direct work to the pane the operator currently has OPEN (the active pane). You can ONLY propose to that pane, so the operator can see and refine the command before it runs; to act on a different pane, call switch_active_pane first (with the operator's go-ahead). Does NOT execute directly — it passes the effective permission gate (auto-runs in Full Auto, becomes a spoken pending approval in Human-in-the-Loop, blocked in Read-Only). PREFER kind='agent_instruction' (the default): relay a SHORT, FOCUSED, DISTILLED instruction to the Claude Code / Codex / Antigravity agent in that pane and let the AGENT do the heavy lifting (write code, run builds/tests). Do NOT relay the operator's dictation verbatim — compress it to a targeted instruction first and confirm it by voice. kind='shell' is ONLY for your OWN small read-only/observe needs (status checks like git status, ls, cat, pwd); never author or run heavy/mutating shell yourself — delegate that to an agent pane via kind='agent_instruction'. A non-allowlisted shell command returns a clarification so you can re-route it to the agent.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
@@ -2011,6 +2059,29 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   kind: { type: Type.STRING, description: "'agent_instruction' (default, FIRST-CLASS — direct the agent in this pane) or 'shell' (your own small read-only command only).", enum: ["agent_instruction", "shell"] }
                 },
                 required: ["pane_id", "instruction"]
+              }
+            },
+            {
+              name: "switch_active_pane",
+              description: "Change which pane is open on the operator's screen. Call this ONLY when the operator directs you to ('switch to the build pane', 'open the test pane'). You can only propose commands to the pane the operator currently has OPEN — if you need to act on a different pane, switch to it first (with the operator's go-ahead). This changes focus only; it never runs a command.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  pane_id: { type: Type.STRING, description: "The pane to open / make active." }
+                },
+                required: ["pane_id"]
+              }
+            },
+            {
+              name: "update_draft_prompt",
+              description: "Compose or refine the WIP draft prompt for the pane the operator currently has open, so they can review/edit and send it. This does NOT send anything — sending is the operator's action. Use it to distill the conversation into a clean, focused prompt for the agent in that pane. Defaults to replacing the draft; use mode='append' to add to it.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING, description: "The draft prompt text (markdown allowed)." },
+                  mode: { type: Type.STRING, description: "'replace' (default) or 'append'.", enum: ["replace", "append"] }
+                },
+                required: ["text"]
               }
             },
             {
@@ -2183,21 +2254,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }
             },
             {
-              name: "add_watch_rule",
-              description: "Add an automation rule that runs a command in an target pane when a trigger pane undergoes a state transition.",
-              parameters: {
-                type: Type.OBJECT,
-                properties: {
-                  trigger_terminal_id: { type: Type.STRING },
-                  trigger_transition: { type: Type.STRING, description: "Transition type (idle, prompt, error, build-failed, exited)" },
-                  action_terminal_id: { type: Type.STRING },
-                  action_command: { type: Type.STRING },
-                  one_shot: { type: Type.BOOLEAN, description: "If true, rule runs once and disables itself." }
-                },
-                required: ["trigger_terminal_id", "trigger_transition", "action_terminal_id", "action_command"]
-              }
-            },
-            {
               name: "create_orchestrator_plan",
               description: "Synthesize a multi-step sequence of chained commands spanning multiple panes that run sequentially with automatic state verification of previous outputs.",
               parameters: {
@@ -2272,21 +2328,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }]
       },
     });
-
-      // P0-3 (R4): install the single-active-session plan gate now that `session` is live, so
-      // `handlePlansTrigger` (outer scope) can route step ADVANCEMENT (steps 2..N) through the
-      // SAME `dispatchProposal` gate. Step-advancement is server-initiated (there is no live
-      // functionCall to answer), so the synthetic `pendingId` doubles as the record `callId`;
-      // resolution narrates via `pushApprovalNarration` only and never answers a tool call.
-      activePlanGate = (opts) =>
-        dispatchProposal({
-          sess: session,
-          callId: opts.pendingId,
-          pendingId: opts.pendingId,
-          targetId: opts.targetId,
-          instruction: opts.instruction,
-          trigger: opts.trigger,
-        });
     } catch (err: any) {
       console.error("Failed to establish Gemini Live session:", err);
       clientWs.send(JSON.stringify({ 
@@ -2309,12 +2350,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               console.error("Error feeding user mic:", e);
             }
           }
-        } else if (msg.type === "prompt_buffer_edit" && msg.text !== undefined) {
-          promptBufferText = msg.text;
-          broadcast({
-            type: "prompt_buffer_updated",
-            text: promptBufferText
-          });
+        } else if (msg.type === "draft_edit" && msg.text !== undefined) {
+          // Step 6: operator editing a pane's WIP draft. Defaults to the active pane when the
+          // client doesn't name one. Not a CLI write — ungated.
+          const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
+          const paneId = msg.paneId || activePaneId;
+          if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
+            broadcastDraft(projectId, paneId);
+          }
+        } else if (msg.type === "set_active_pane") {
+          // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
+          // open (or null if nothing is open) is recorded here and gates every Janus write.
+          activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
         }
       } catch (err) {
         console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);
@@ -2326,8 +2373,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
+        activePaneId = null; // Step 5: no UI connected -> no source of truth -> no write permitted.
       }
-      activePlanGate = null; // P0-3: drop the plan gate; advancement now falls back to SAFE.
       if (session) {
         // Clean up any pending approvals associated with this session to avoid leaks or hanging
         // tool-calls. TODO(WS-F): persist + re-announce these on reconnect instead of purging
