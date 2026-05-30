@@ -53,9 +53,9 @@ export function parsePresetsSafe(input: any): CliPreset[] {
     });
   }
   return [
-    { id: "claudeCode", name: "Claude Code", command: "npx @anthropic-ai/claude --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
-    { id: "codex", name: "Codex CLI", command: "npx codex-cli --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Amber Slop-Shield", persistentRestore: false, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
-    { id: "antigravity", name: "Antigravity Agent", command: "npx antigravity --dangerously-skip-permissions --resume-previous-session --with-open-textbox", enabled: true, permissionsMode: "Full Auto", windowMode: "Standard Split-Pane", visualTheme: "Cosmic Slate", persistentRestore: true, dangerouslySkipPermissions: true, sessionResume: true, portOffset: "", customEnvVars: "" }
+    { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
+    { id: "codex", name: "Codex CLI", command: "codex", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Amber Slop-Shield", persistentRestore: false, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
+    { id: "antigravity", name: "Antigravity Agent", command: "antigravity", enabled: true, permissionsMode: "Full Auto", windowMode: "Standard Split-Pane", visualTheme: "Cosmic Slate", persistentRestore: true, dangerouslySkipPermissions: true, sessionResume: true, portOffset: "", customEnvVars: "" }
   ];
 }
 
@@ -208,6 +208,10 @@ export class UniversalTerminal {
     if (sessionId) {
       this.sessionId = sessionId;
     } else if (toolPreset !== "Custom") {
+      // Synthetic "<tool>-session-<hex>" id is for internal tracking/display ONLY.
+      // It is intentionally never passed to the CLI --resume flag, which requires a
+      // real UUID. Real session UUIDs are captured later by checkForSessionId() once
+      // the CLI prints them. start() guards on UUID format before appending --resume.
       const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
       const randomId = Math.random().toString(16).substring(2, 10);
       this.sessionId = `${toolLower}-session-${randomId}`;
@@ -412,12 +416,14 @@ export class UniversalTerminal {
   }
 
   start() {
-    // Ensure session ID is mapped back into resume flag for actual agent sessions
     let finalCommand = this.shellCmd;
     if (this.toolPreset !== "Custom" && this.sessionId) {
-      const resumePattern = /--resume|--session/;
-      if (!resumePattern.test(finalCommand)) {
-        finalCommand = `${finalCommand} --resume=${this.sessionId}`;
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
+      // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
+      // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
+      if (!alreadyHasResume && UUID_RE.test(this.sessionId)) {
+        finalCommand = `${finalCommand} --resume ${this.sessionId}`;
       }
     }
 
@@ -579,9 +585,9 @@ export class OrchestratorManager {
         localWorkspacePath: process.cwd()
       },
       presets: [
-        { id: "claudeCode", name: "Claude Code", command: "npx @anthropic-ai/claude", enabled: true },
-        { id: "codex", name: "Codex CLI", command: "npx codex-cli", enabled: true },
-        { id: "antigravity", name: "Antigravity Agent", command: "npx antigravity", enabled: true }
+        { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true },
+        { id: "codex", name: "Codex CLI", command: "codex", enabled: true },
+        { id: "antigravity", name: "Antigravity Agent", command: "antigravity", enabled: true }
       ],
       announcements: { ...DEFAULT_ANNOUNCEMENT_TEMPLATES },
       advanced: {
@@ -683,27 +689,20 @@ export class OrchestratorManager {
     this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
     this.ledger.switchContext(activeCtx);
 
-    // Restore pane terminals based on ledger records
+    // Restore pane records as INERT metadata only — do NOT auto-spawn on boot.
+    // Auto-spawning every persisted pane launched N real agent processes (and, on the
+    // legacy non-node-pty transport, N visible console windows) on every boot/reconnect,
+    // compounding into a runaway ("a million terminals"). Panes are now reconciled to a
+    // not-running state on load; the operator starts one explicitly via
+    // POST /api/terminals/:id/restart (which creates + starts it on demand).
     const project = this.ledger.getProject(activeCtx);
     if (project && project.panes) {
-      for (const [paneId, pane] of Object.entries(project.panes)) {
-        let cmd = "bash";
-        // WS-G quick win: Claude Code is installed globally here as the bare `claude`
-        // binary; `npx @anthropic-ai/claude-code` is the wrong package and errors on
-        // spawn, which is what produced the boot `none -> error` transition spam.
-        if (pane.tool_preset === "Claude Code") cmd = "claude";
-        else if (pane.tool_preset === "Codex") cmd = "npx codex";
-        else if (pane.tool_preset === "Antigravity") cmd = "npx antigravity";
-        this.addTerminal(
-          pane.pane_id,
-          project.directory || process.cwd(),
-          cmd,
-          pane.tool_preset,
-          pane.permissions_mode,
-          pane.session_id,
-          activeCtx
-         );
+      for (const pane of Object.values(project.panes)) {
+        pane.alive = false;
+        pane.is_busy = false;
+        pane.last_known_state = "Exited";
       }
+      this.ledger.save(true);
     }
   }
 

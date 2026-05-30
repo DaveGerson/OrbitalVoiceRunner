@@ -80,6 +80,9 @@ M2 ─ WS-I notes model · WS-J summary richness · WS-K parallel plans
         │
         ▼
 M3 ─ WS-L hardening/polish (REST scoping, earcons, crash handlers, docs, tests, a11y)
+        │
+        ▼
+M2/M3 ─ WS-M SQLite durable store (schema design collaborative — gates on maintainer sign-off)
 ```
 
 There is **no `WS-A*`** (the former "flip the summarizer model" step) — the model
@@ -484,6 +487,7 @@ agent CLIs; the approval dialog is screen-reader-legible.
 | 10 | WS-J (summary richness) | M2 | M | — |
 | 11 | WS-K (parallel fan-out) | M2 | M | leans on WS-C |
 | 12 | WS-L (hardening/polish) | M3 | S×6 | — |
+| 13 | WS-M (SQLite durable store) | M2/M3 | L | schema sign-off by maintainer |
 
 **M1 is the bar for "hands-free-safe."** M0 can ship today; M2/M3 make the loop good
 and robust but are not gating for the safety claim.
@@ -551,6 +555,194 @@ milestone-M1 workstream):
 
 ---
 
+### WS-M — SQLite durable store  *(M2/M3, effort L)*  🟡 SCHEMA DESIGN COLLABORATIVE
+
+> **Schema is not finalised — nothing is wired until the maintainer signs off.**
+> The scaffold lives in `src/store/sqliteStore.ts` (inert; `better-sqlite3` not yet a dependency).
+
+#### Motivation
+
+Three independent problems converge on the same root: state is scattered across JSON flat-files
+and raw in-memory variables, with no retention, no archive, and no durability across restarts.
+
+| Problem | Evidence |
+|---|---|
+| **JSON-file clutter** | `.janus_ledger.json`, `.janus_settings.json`, `.janus_history.json`, plus one `.janus_scrollback_<id>.log` per pane. Every settings change rewrites the entire blob; the history file grows unboundedly; the scrollback files accumulate with no TTL. |
+| **No retention / archive** | Panes that are killed vanish from the ledger with no recoverable snapshot. History has no query interface — the only access path is loading the full file. |
+| **Volatile in-memory state lost on restart** | `pendingApprovals` (`server.ts:978`), `promptBufferText` (`server.ts:133`), `lastSessionResumptionToken` (`server.ts:1030`), and `attentionQueue` are all pure in-memory. A server crash or network blip destroys every pending approval, every dictated spec fragment, and the Gemini session resumption token — root cause of **BUG-013** and **BUG-014**. |
+| **Scrollback sprawl** | Scrollback files (`src/terminal.ts:204–218`) are written but never cleaned up, and are never read back (WS-J BUG-030). |
+
+#### Scope — what moves into SQLite vs what stays on disk
+
+**Moves into SQLite:**
+
+| Current location | SQLite table |
+|---|---|
+| `workspaces` object in `.janus_ledger.json` | `projects` |
+| `panes` sub-object per workspace | `panes` (live) + `panes_archive` (soft-delete) |
+| `watchRules`, `plans` arrays in ledger | `settings_kv` (as JSON blobs, until they grow large enough for dedicated tables) |
+| `.janus_settings.json` (SystemSettings fields) | `settings_kv` (flat key-value by dot-path) |
+| `.janus_history.json` (command outcomes) | `history` (append-only rows) |
+| `pendingApprovals` in-memory map | `pending_approvals` (durable; atomic claim column for N-1 race gate) |
+| `promptBufferText`, `lastSessionResumptionToken`, `activeProjectId`, `attentionQueue` cap | `kv` (generic key-value; schema-free escape hatch for scalar volatile state) |
+
+**Stays on disk (files):**
+
+| Artifact | Reason |
+|---|---|
+| Raw PTY scrollback (`.janus_scrollback_<id>.log`) | Binary/text bulk data; file I/O is already optimal. SQLite stores the **path** in `panes.scrollback_path` so WS-J's `search_pane_output` can find it. Storing as a DB BLOB is an open question (see Q3 below). |
+
+#### Schema — DRAFT for collaborative review
+
+All tables are `CREATE TABLE IF NOT EXISTS` inside `JanusStore.init()` and tagged
+`/* PROPOSED — pending maintainer review (WS-M) */`.
+
+**`projects`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT PK | workspace id (existing string key) |
+| `name` | TEXT | |
+| `directory` | TEXT | |
+| `summary` | TEXT | |
+| `key_terms` | TEXT | JSON array of strings |
+| `notes` | TEXT | JSON array of strings — **see open Q1** |
+| `created_at` | INTEGER | epoch ms |
+| `updated_at` | INTEGER | epoch ms |
+
+**`panes`** (live) / **`panes_archive`** (same columns + `archived_at`, `archive_reason`)
+
+| Column | Type | Notes |
+|---|---|---|
+| `pane_id` | TEXT | composite PK with `workspace_id` |
+| `workspace_id` | TEXT FK→projects | CASCADE DELETE |
+| `name`, `runtime_type`, `tool_preset`, `permissions_mode`, `session_id` | TEXT | |
+| `last_known_state` | TEXT | `Running`/`Idle`/`Exited` |
+| `is_busy`, `alive` | INTEGER | SQLite BOOLEAN 0/1 |
+| `notes` | TEXT | JSON array — **see open Q1** |
+| `context_size` | INTEGER | |
+| `last_status_change_at` | TEXT | ISO timestamp (WS-C addition) |
+| `last_command` | TEXT | |
+| `scrollback_path` | TEXT | absolute path on disk — **see open Q3** |
+| `created_at`, `updated_at` | INTEGER | epoch ms |
+
+**`history`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTOINCREMENT | |
+| `workspace_id`, `pane_id` | TEXT | not FK — history should survive pane deletion |
+| `command`, `summary` | TEXT | |
+| `exit_code` | INTEGER | NULL = unknown |
+| `timestamp` | INTEGER | epoch ms |
+
+**`settings_kv`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `key` | TEXT PK | dot-path convention, e.g. `"voiceAi.voice"`, `"advanced.idleTimeoutMs"` |
+| `value` | TEXT | scalar or JSON-encoded |
+| `updated_at` | INTEGER | epoch ms |
+
+**`pending_approvals`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | TEXT PK | = messageId / call.id |
+| `session_id`, `workspace_id`, `pane_id` | TEXT | |
+| `command` | TEXT | |
+| `rationale` | TEXT | JSON blob `{ trigger?, summary }` or NULL |
+| `claimed` | INTEGER | 0=open, 1=claimed — **atomic-claim gate (N-1 race fix)** |
+| `timestamp`, `expires_at` | INTEGER | epoch ms |
+
+**`kv`** (generic escape hatch)
+
+| Column | Type | Notes |
+|---|---|---|
+| `key` | TEXT PK | e.g. `"activeProjectId"`, `"promptBufferText"`, `"lastSessionResumptionToken"` |
+| `value` | TEXT | scalar or JSON-encoded |
+| `updated_at` | INTEGER | epoch ms |
+
+---
+
+#### Open schema questions for the maintainer
+
+These must be decided before the migration script is written.
+
+1. **Notes: JSON blob vs normalised rows?**
+   `notes` is currently a flat `string[]` on both `projects` and `panes`. WS-I plans to
+   upgrade these to typed `NoteEntry[]` (`{ id, text, timestamp, type, author, paneId? }`).
+   Two options:
+   - **Keep as JSON-in-TEXT** on the existing columns — simple, no schema change, but no
+     SQL-level filtering (must load and parse in TypeScript).
+   - **Normalise to a `notes` table** — enables `WHERE type = 'decision'` queries, search,
+     and delete-by-id without loading all notes; required for WS-I recall tools.
+   *Recommendation: normalise (a `notes` table), so WS-I doesn't need a second migration.*
+
+2. **Archive retention policy / TTL for `panes_archive`?**
+   The archive table currently has no automatic pruning. Options:
+   - Prune on startup (delete rows older than N days).
+   - Prune on explicit operator action (`archive_pane --delete-history`).
+   - Never prune (keep forever; disk is cheap for text rows).
+   *Need a number: how many days of archived pane history should be retained?*
+
+3. **Scrollback: BLOB in DB or keep files + path reference?**
+   Raw scrollback is currently up to 512 KB per pane (`src/terminal.ts:204–218`).
+   Options:
+   - **Path reference only** (current proposal): `panes.scrollback_path` stores the
+     `.log` file path. Simple; file I/O for search. Requires a separate cleanup sweep.
+   - **BLOB in DB**: single file to backup, atomic with other pane data, easy TTL via
+     `WHERE updated_at < ?`. Drawback: SQLite BLOBs are not streamed — full BLOB loaded
+     into memory for each read.
+   *Recommendation: path reference for now; revisit if scrollback search (WS-J) becomes
+   a bottleneck.*
+
+4. **Single DB file — where does it live?**
+   Options: same directory as the JSON files (CWD / project root), `~/.janus/janus.db`, or
+   configurable via `JANUS_DB_PATH` env var.
+   *Recommendation: default to `.janus.db` in CWD (matches existing JSON file convention);
+   allow override via env var.*
+
+5. **Migration: one-shot import → keep JSON as `.bak`?**
+   The proposed migration plan (below) writes `.bak` files before deleting the originals.
+   Should the app:
+   - Auto-delete the `.bak` files after N successful starts?
+   - Keep them indefinitely and let the operator delete them manually?
+   *Recommendation: keep indefinitely; they are small and serve as a human-readable audit trail.*
+
+---
+
+#### Migration plan
+
+1. **Read** existing `.janus_ledger.json`, `.janus_settings.json`, `.janus_history.json`.
+2. **Populate** SQLite tables in a single transaction (all-or-nothing).
+3. **Rename** the originals to `.janus_ledger.json.bak`, etc. (atomic OS rename — no window
+   where both old and new are absent).
+4. **Switch** `server.ts` to instantiate `JanusStore` instead of `Ledger` (thin adapter; the
+   `Ledger` public API is preserved by `JanusStore`'s method signatures).
+5. On the **next `N` successful clean shutdowns**, optionally log a reminder that the `.bak`
+   files can be removed.
+
+Rollback: rename `.bak` files back. The adapter layer keeps the old `Ledger` class intact until
+the migration is confirmed green.
+
+---
+
+#### Acceptance criteria
+
+- `src/store/sqliteStore.ts` compiles cleanly under `tsc --noEmit` (nothing imports it yet, so
+  the missing `better-sqlite3` does not affect the main build).
+- `better-sqlite3` added to `package.json` only after the maintainer approves the schema.
+- Migration script reads all three JSON files and populates tables in a single transaction with
+  no data loss (verified by a round-trip test: JSON → SQLite → JSON-export must diff clean).
+- After migration, a server restart restores `pendingApprovals` from `pending_approvals` and
+  re-announces open approvals (BUG-013 acceptance criterion from WS-F).
+- After migration, `lastSessionResumptionToken` is read from `kv` on connect and replayed to
+  Gemini (BUG-014 acceptance criterion from WS-F).
+- **Nothing is wired until the maintainer signs off on all five open schema questions above.**
+
+---
+
 ## 9. Suggested PR breakdown
 
 One PR per workstream keeps reviews tractable and the dependency edges enforceable:
@@ -566,6 +758,7 @@ One PR per workstream keeps reviews tractable and the dependency edges enforceab
 12. `M2: pane-summary delta/search/error-extraction` (WS-J)
 13. `M2: parallel fan-out plans` (WS-K)
 14. `M3: hardening, scoping, earcons, crash-safety, a11y, docs` (WS-L)
+15. `M2/M3: SQLite durable store — schema sign-off + migration` (WS-M) — **after maintainer approves schema**
 
 ---
 
