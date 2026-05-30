@@ -1,5 +1,5 @@
 import fs from "fs";
-import { WatchRule, Plan, PaneMeta, Workspace } from "./types";
+import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry } from "./types";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
 // re-exported here so existing `from "./ledger"` imports keep working (D7).
@@ -142,6 +142,50 @@ export class Ledger {
       return true;
     }
     return false;
+  }
+
+  // Layered per-terminal context (prompt-composer refactor §4). Writing context is
+  // NOT a CLI write and is never gated. `addModelContext` is for machine-maintained
+  // orientation (Janus / synthesizer / handoff); `addHumanContext` is for operator
+  // steering. Both append a timestamped entry and persist.
+  private appendContext(
+    layer: "modelContext" | "humanContext",
+    projectId: string,
+    paneId: string,
+    text: string,
+    source?: string
+  ): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    const entry: ContextEntry = { text, at: new Date().toISOString() };
+    if (source) entry.source = source;
+    (pane[layer] ??= []).push(entry);
+    this.save(true);
+    return true;
+  }
+
+  addModelContext(projectId: string, paneId: string, text: string, source?: string): boolean {
+    return this.appendContext("modelContext", projectId, paneId, text, source);
+  }
+
+  addHumanContext(projectId: string, paneId: string, text: string): boolean {
+    return this.appendContext("humanContext", projectId, paneId, text);
+  }
+
+  // Unified read of a pane's orientation context across all layers, newest-last.
+  // `legacy` surfaces pre-refactor flat notes so nothing is lost on migration.
+  getPaneContext(projectId: string, paneId: string): {
+    model: ContextEntry[];
+    human: ContextEntry[];
+    legacy: string[];
+  } | null {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return null;
+    return {
+      model: pane.modelContext ?? [],
+      human: pane.humanContext ?? [],
+      legacy: pane.notes ?? [],
+    };
   }
 
   getProject(id: string): Workspace | null {

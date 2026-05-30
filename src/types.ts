@@ -27,6 +27,15 @@ export interface PendingCommand {
 // browser App and the server ledger share one definition. The WS-C
 // status-detection fields are OPTIONAL so existing persisted ledgers load
 // unchanged.
+// A single orientation-context entry. Context is the substrate the conversational
+// composer reads to understand a pane; writing it is never gated (it is not a CLI
+// write). See docs/refactor/PROMPT_COMPOSER_ARCHITECTURE.md §4.
+export interface ContextEntry {
+  text: string;
+  at: string;       // ISO timestamp
+  source?: string;  // optional free-form origin tag (e.g. "handoff", "synthesizer")
+}
+
 export interface PaneMeta {
   pane_id: string;
   name: string;
@@ -34,7 +43,13 @@ export interface PaneMeta {
   last_known_state: string;
   is_busy: boolean;
   alive: boolean;
+  // Legacy flat note bucket. Retained for back-compat with persisted ledgers and
+  // existing readers; new writes go to the layered context below.
   notes: string[];
+  // Layered per-terminal context (prompt-composer refactor §4). Optional so older
+  // persisted ledgers load unchanged.
+  modelContext?: ContextEntry[];  // machine-maintained orientation (Janus / synthesizer)
+  humanContext?: ContextEntry[];  // operator-typed steering; authoritative when present
   permissions_mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   session_id: string;
   tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";

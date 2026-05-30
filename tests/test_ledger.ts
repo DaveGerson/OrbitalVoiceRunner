@@ -60,6 +60,46 @@ describe("Project Ledger", () => {
     assert.deepStrictEqual(briefing?.panes, []);
   });
 
+  it("should layer model/human context per pane and surface legacy notes (prompt-composer §4)", () => {
+    ledger.addProject("proj_omega", "/home/omega");
+    ledger.updatePane("proj_omega", {
+      pane_id: "pane_dev",
+      name: "dev",
+      runtime_type: "shell",
+      last_known_state: "Idle",
+      is_busy: false,
+      alive: true,
+      notes: ["legacy flat note"],
+      permissions_mode: "Human-in-the-Loop",
+      session_id: "sess_1",
+      tool_preset: "Claude Code",
+      context_size: 0,
+    });
+
+    // A pre-existing flat note must remain readable after the refactor.
+    assert.strictEqual(ledger.addModelContext("proj_omega", "pane_dev", "build is a Vite + esbuild split", "synthesizer"), true);
+    assert.strictEqual(ledger.addHumanContext("proj_omega", "pane_dev", "focus on the auth module"), true);
+
+    // Writing to a non-existent pane is a no-op that reports failure.
+    assert.strictEqual(ledger.addModelContext("proj_omega", "ghost", "nope"), false);
+
+    const ctx = ledger.getPaneContext("proj_omega", "pane_dev");
+    assert.strictEqual(ctx?.model.length, 1);
+    assert.strictEqual(ctx?.model[0].text, "build is a Vite + esbuild split");
+    assert.strictEqual(ctx?.model[0].source, "synthesizer");
+    assert.ok(ctx?.model[0].at, "model context entry should carry an ISO timestamp");
+    assert.strictEqual(ctx?.human.length, 1);
+    assert.strictEqual(ctx?.human[0].text, "focus on the auth module");
+    assert.deepStrictEqual(ctx?.legacy, ["legacy flat note"]);
+
+    // Layers persist and reload independently.
+    const reloaded = new Ledger(TEST_STORAGE);
+    const rctx = reloaded.getPaneContext("proj_omega", "pane_dev");
+    assert.strictEqual(rctx?.model[0].text, "build is a Vite + esbuild split");
+    assert.strictEqual(rctx?.human[0].text, "focus on the auth module");
+    assert.deepStrictEqual(rctx?.legacy, ["legacy flat note"]);
+  });
+
   it("should persist and reload automation watch rules and plans correctly", () => {
     const dummyRule = {
       id: "rule_alpha",
