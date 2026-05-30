@@ -115,12 +115,21 @@ export class LegacyChildProcessTransport implements PtyTransport {
   private proc: ChildProcess | null;
   private dataCbs: ((data: string) => void)[] = [];
   private exitCbs: ((info: { exitCode: number; signal?: number }) => void)[] = [];
+  private isWindows: boolean;
 
   constructor(file: string, args: string[], opts: PtySpawnOptions) {
+    // On Windows, detached:true gives the child its own console window (the
+    // floating popup the operator sees on the desktop) AND orphans the stdio
+    // pipes so stdout/stderr capture and stdin writes silently break.
+    // attached + windowsHide keeps the child headless with working pipes.
+    // On POSIX, detached:true is kept so process.kill(-pid) in kill() can
+    // tear down the entire process group.
+    this.isWindows = process.platform === "win32";
     this.proc = spawn(file, args, {
       cwd: opts.cwd,
       env: opts.env,
-      detached: true,
+      detached: !this.isWindows,
+      windowsHide: true,
     });
 
     if (this.proc.stdout) {
@@ -168,14 +177,28 @@ export class LegacyChildProcessTransport implements PtyTransport {
     if (!this.proc || !this.proc.pid) return;
     const pid = this.proc.pid;
     const sig = (signal as NodeJS.Signals) || "SIGTERM";
-    try {
-      // Teardown the process group cleanly (matches legacy stop()).
-      process.kill(-pid, sig);
-    } catch {
+    if (this.isWindows) {
+      // taskkill /t tears down the full child tree; /f forces termination.
+      // Ignore errors (process may already be gone).
       try {
-        this.proc.kill(sig);
+        spawn("taskkill", ["/pid", String(pid), "/t", "/f"]);
       } catch {
-        // already dead
+        try {
+          this.proc.kill(sig);
+        } catch {
+          // already dead
+        }
+      }
+    } else {
+      try {
+        // Teardown the process group cleanly (matches legacy stop()).
+        process.kill(-pid, sig);
+      } catch {
+        try {
+          this.proc.kill(sig);
+        } catch {
+          // already dead
+        }
       }
     }
   }

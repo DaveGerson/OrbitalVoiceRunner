@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, isAudioPlaying } from "./utils/audio";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -935,7 +935,7 @@ function AppRaw() {
         setIsLive(true);
         setIsReconnecting(false);
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
           streamRef.current = stream;
           
           const source = captureCtx.createMediaStreamSource(stream);
@@ -948,10 +948,6 @@ function AppRaw() {
 
           processor.onaudioprocess = (e) => {
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              if (isAudioPlaying(voicePlaybackCtxRef.current)) {
-                // Half-duplex barge-in/echo prevention: drop capture frames while synthesized speech streams through speakers
-                return;
-              }
               const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
               wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
             }
