@@ -15,6 +15,11 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     // Initialize standard manager targeting custom test ledger storage
     manager = new OrchestratorManager();
     manager.ledger = new Ledger(TEST_LEDGER_PATH);
+    // Hermetic precondition: the constructor seeds globalPermissionsMode from the
+    // developer's live .janus_settings.json, which makes Journey 2's Inherit→pane
+    // fallback depend on machine state. Pin it to "Inherit" so the suite is
+    // self-contained (matches the pattern in test_status_gating.ts:36).
+    manager.globalPermissionsMode = "Inherit";
   });
 
   afterEach(() => {
