@@ -8,6 +8,39 @@ debounced `onIdle` edge so proactive announcements never fire on a false idle.
 
 ---
 
+## 0. MAINTAINER DECISION (BINDING — overrides §2 and the in-voice parts of §1/§3)
+
+The maintainer reviewed the §2 mechanism options and **declined the in-voice
+`sendClientContent` spoken-announcement layer.** The implementer MUST follow the decision
+below; the in-voice analysis in §1/§2/§3 is retained for rationale only and is NOT to be built.
+
+**Decision 1 — feedback mechanism: earcons + a stacking on-screen notification stack (NO
+Gemini in-voice turns).** Proactive feedback is delivered as:
+  - an **earcon** keyed to the event's status (distinct tones for done / error / exit / etc.), and
+  - an **on-screen notification stack** that **stacks by status and coalesces**: when multiple
+    updates concern the same pane/status, the stack does NOT spawn a new toast — it updates the
+    existing entry to the **latest status message**. The attentionQueue (already coalesced per
+    pane) is the natural backing model for this stack.
+  - **Do NOT** build the module-scoped `activeVoiceSession` registry / `session.sendClientContent`
+    speech path (Seam A). Only **Seam B (`broadcast()`)** remains: it drives the earcons, the
+    notification stack, and the BUG-010 client branches. This removes the per-announcement token
+    cost and most barge-in complexity (earcons are short tones, not spoken turns).
+
+**Decision 2 — verbosity: brief summary by default, configurable.** Notification/earcon text
+defaults to the **brief summary** (e.g. "Tests pane finished — all passing", sourced from the
+WS-B command summary; numeric exit codes remain out of scope per the §1 finding). The message
+templates MUST be **editable by the operator via Settings, with direct access to the message/
+prompt strings** (same Settings surface the user edits prompts in today — implementer to locate
+and extend it). Keep brief as the default.
+
+**Still in scope, unchanged by this decision:** BUG-010 event-bus wiring (§5), the genuine
+WS-C `onIdle` trigger gating + de-spam/coalescing/rate-limit (§4 — now applied to earcons +
+the notification stack rather than spoken turns), `dismiss_attention` + attentionQueue cap/TTL
+(§6, BUG-035), demoting the 3 s poll to a safety net, and all "what to preserve" items (§7:
+WS-C status, WS-B redaction of any displayed pane content/`last_command`, existing earcons/barge-in).
+
+---
+
 ## 1. Executive Summary (~10 lines)
 
 - **Problem.** Completions/errors are detected server-side (`manager.onIdle`,
