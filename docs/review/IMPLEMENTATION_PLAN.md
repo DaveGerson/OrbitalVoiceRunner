@@ -442,7 +442,7 @@ agent CLIs; the approval dialog is screen-reader-legible.
 | Order | Workstream | Milestone | Effort | Hard dependency |
 |---|---|---|---|---|
 | 1 | WS-A (honesty/quick wins) | M0 | S | — ✅ DONE |
-| 2 | WS-B (redaction) | M1 | M | — |
+| 2 | WS-B (redaction) | M1 | M | — ✅ DONE |
 | 3 | WS-C (reliable status) | M1 | L | — (gates 4) |
 | 4 | WS-D (proactive audio + event bus) | M1 | L | **after WS-C** |
 | 5 | WS-E (spoken/targeted/safe approvals) | M1 | L | E.2 after E.1 |
@@ -572,7 +572,7 @@ WS-H → WS-I → WS-J → WS-K → WS-L**), honoring the two hard edges (`WS-C 
 `WS-E.1 → WS-E.2`). The only safe parallelism is within M3/WS-L's purely
 frontend-isolated polish items (ARIA, earcons) via worktree isolation — optional.
 
-**Status:** WS-A ✅ complete (committed). **Next: WS-B (redaction).**
+**Status:** WS-A ✅ and WS-B ✅ complete (committed & pushed). **Next: WS-C (reliable status).**
 
 ---
 
