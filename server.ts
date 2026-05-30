@@ -351,20 +351,39 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     let changed = false;
     for (const rule of rules) {
       if (rule.enabled && rule.triggerTerminalId === terminalId && rule.triggerTransition === transition) {
-        const targetTerm = manager.terminals[rule.actionTerminalId];
-        if (targetTerm) {
-          console.log(`[WATCH RULE FIRED] Rule ${rule.id} triggered: Writing command to terminal ${rule.actionTerminalId}`);
-          HistoryManager.getInstance().addCommand(rule.actionTerminalId, rule.actionCommand);
-          targetTerm.writeInput(rule.actionCommand);
-          broadcast({
-            type: "watch_rule_fired",
+        // Prompt-composer refactor: watch rules NEVER write to a CLI pane. They are co-pilot
+        // nudges — when the trigger matches, we SURFACE the suggested command for the operator
+        // (who can act on it, gated, on the active pane). No autonomous, background, or
+        // cross-pane write happens here. (architecture §5: Remove watch-rule autonomous writes.)
+        console.log(`[WATCH RULE NUDGE] Rule ${rule.id} matched: suggesting '${rule.actionCommand}' for '${rule.actionTerminalId}' (not writing).`);
+        const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+        manager.attentionQueue.push({
+          id: itemID,
+          type: "confirmation",
+          terminalId: rule.actionTerminalId,
+          projectId: manager.ledger.activeProjectId || "default_project",
+          message: `Suggestion: run '${rule.actionCommand}' on '${rule.actionTerminalId}' (trigger: '${terminalId}' → '${transition}').`,
+          timestamp: new Date().toISOString(),
+          dismissed: false,
+          details: {
+            kind: "watch_rule_suggestion",
             ruleId: rule.id,
-            message: `Watch Rule matched! Fired '${rule.actionCommand}' on '${rule.actionTerminalId}' due to '${terminalId}' transition to '${transition}'.`
-          });
-          if (rule.oneShot) {
-            rule.enabled = false;
-            changed = true;
-          }
+            suggestedCommand: rule.actionCommand,
+            targetTerminalId: rule.actionTerminalId,
+          },
+        });
+        pruneAttention(); // BUG-035 cap/TTL
+        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+        broadcast({
+          type: "watch_rule_suggested",
+          ruleId: rule.id,
+          suggestedCommand: rule.actionCommand,
+          targetTerminalId: rule.actionTerminalId,
+          message: `Watch rule matched — suggested '${rule.actionCommand}' on '${rule.actionTerminalId}'. Not executed; awaiting the operator.`
+        });
+        if (rule.oneShot) {
+          rule.enabled = false;
+          changed = true;
         }
       }
     }
@@ -1084,12 +1103,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     
     const activeProjectId = manager.ledger.activeProjectId || "default_project";
     const handoffNote = `Handoff from [${sourcePaneId}] with notes: ${contextNotes}. Last events: ${lastFiveOutlines}`;
-    
-    manager.ledger.addPaneNote(activeProjectId, targetPaneId, handoffNote);
-    
-    const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${sourcePaneId} -> Target: ${targetPaneId}\n# Notes: ${contextNotes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
-    targetTerm.writeInput(commentCommand);
-    
+
+    // Prompt-composer refactor: handoff carries CONTEXT, not commands. It writes to the target
+    // pane's model-context layer (ungated, not a CLI write) and never injects into the target
+    // pane's stdin. (architecture §5: Remove handoff stdin injection.)
+    manager.ledger.addModelContext(activeProjectId, targetPaneId, handoffNote, "handoff");
+
     broadcastLedgerUpdate();
     res.json({ success: true });
   });
@@ -1726,23 +1745,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Microphone now ${muted ? 'muted' : 'active-listening'}.` } }]
                 });
-              } else if (name === "add_watch_rule") {
-                const { trigger_terminal_id, trigger_transition, action_terminal_id, action_command, one_shot } = args;
-                const newRule = {
-                  id: "rule_" + Math.random().toString(36).substring(2, 11),
-                  triggerTerminalId: trigger_terminal_id,
-                  triggerTransition: trigger_transition,
-                  actionTerminalId: action_terminal_id,
-                  actionCommand: action_command,
-                  enabled: true,
-                  oneShot: one_shot !== undefined ? one_shot : true
-                };
-                manager.ledger.watchRules.push(newRule);
-                manager.ledger["save"](true);
-                broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Automation watch rule added: trigger ${trigger_terminal_id} on ${trigger_transition} -> run ${action_command} on ${action_terminal_id}` } }]
-                });
               } else if (name === "create_orchestrator_plan") {
                 const { name: planName, steps } = args;
                 const formattedSteps = steps.map((s: any, idx: number) => ({
@@ -1838,30 +1840,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const targetTerm = manager.terminals[target_pane_id];
                 
                 let resp = "";
-                // P2-1: this writes a comment block to the TARGET pane stdin — still a write, so
-                // respect Read-Only at minimum (least-authority). TODO(WS-G): route the full
-                // handoff write through the same effective-mode + pending-approval gate as
-                // `dispatchProposal` (HiTL should make it a spoken approval too).
-                const targetEffectiveMode = effectiveModeFor(target_pane_id);
+                // Prompt-composer refactor: handoff carries CONTEXT, not commands. It writes to
+                // the target pane's model-context layer (ungated, not a CLI write) and never
+                // injects into the target pane's stdin — so there is no effective-mode gate here.
+                // (architecture §5: Remove handoff stdin injection.)
                 if (!sourceTerm || !targetTerm) {
                   resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
-                } else if (targetEffectiveMode === "Read-Only") {
-                  broadcast({ type: "command_blocked", terminalId: target_pane_id, cmd: "(handoff context block)", reason: "Read-Only policy enforced." });
-                  resp = `Error: Target pane ${target_pane_id} is Read-Only; the handoff context block was not written.`;
                 } else {
                   const sourceHistory = HistoryManager.getInstance().loadHistory(source_pane_id);
                   const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
-                  
+
                   const activeProjectId = manager.ledger.activeProjectId || "default_project";
                   const handoffNote = `Handoff from [${source_pane_id}] with notes: ${context_notes}. Last events: ${lastFiveOutlines}`;
-                  
-                  manager.ledger.addPaneNote(activeProjectId, target_pane_id, handoffNote);
-                  
-                  const commentCommand = `# === HANDOFF CONTEXT INTERCEPT ===\n# Source: ${source_pane_id} -> Target: ${target_pane_id}\n# Notes: ${context_notes.replace(/\r?\n/g, ' ')}\n# State indicators: ${lastFiveOutlines.replace(/\r?\n/g, ' ')}\n# ==================================`;
-                  targetTerm.writeInput(commentCommand);
-                  
+
+                  manager.ledger.addModelContext(activeProjectId, target_pane_id, handoffNote, "handoff");
+
                   broadcastLedgerUpdate();
-                  resp = `Successful handoff orchestrated from [${source_pane_id}] to [${target_pane_id}]. Handoff packet injected into active process thread streams.`;
+                  resp = `Handoff context from [${source_pane_id}] recorded into [${target_pane_id}]'s orientation context. No command was written to the pane.`;
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: resp } }]
@@ -2110,21 +2105,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   muted: { type: Type.BOOLEAN, description: "True to mute, False to unmute." }
                 },
                 required: ["muted"]
-              }
-            },
-            {
-              name: "add_watch_rule",
-              description: "Add an automation rule that runs a command in an target pane when a trigger pane undergoes a state transition.",
-              parameters: {
-                type: Type.OBJECT,
-                properties: {
-                  trigger_terminal_id: { type: Type.STRING },
-                  trigger_transition: { type: Type.STRING, description: "Transition type (idle, prompt, error, build-failed, exited)" },
-                  action_terminal_id: { type: Type.STRING },
-                  action_command: { type: Type.STRING },
-                  one_shot: { type: Type.BOOLEAN, description: "If true, rule runs once and disables itself." }
-                },
-                required: ["trigger_terminal_id", "trigger_transition", "action_terminal_id", "action_command"]
               }
             },
             {

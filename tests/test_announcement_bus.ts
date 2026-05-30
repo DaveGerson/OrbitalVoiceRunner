@@ -339,7 +339,9 @@ describe("eventBus — BUG-010 dispatch mapping", () => {
       [{ type: "plan_completed" }, "fetchPlans", "success"],
       [{ type: "plan_paused" }, "fetchPlans", "alert"],
       [{ type: "history_updated" }, "noop", null],
-      [{ type: "watch_rule_fired" }, "fetchTerminals", "chime"],
+      // Prompt-composer refactor: a matched watch rule is a co-pilot suggestion (queued via a
+      // paired attention_updated event), so the event itself only chimes — it never writes.
+      [{ type: "watch_rule_suggested" }, "noop", "chime"],
     ];
     for (const [msg, setter, earcon] of cases) {
       const eff = effectForEvent(msg);

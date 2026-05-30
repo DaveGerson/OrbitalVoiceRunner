@@ -45,8 +45,11 @@ export function effectForEvent(msg: any): EventEffect | null {
       return { setter: "fetchPlans", earcon: "alert" };
     case "history_updated":
       return { setter: "noop", earcon: null };
-    case "watch_rule_fired":
-      return { setter: "fetchTerminals", earcon: "chime" };
+    case "watch_rule_suggested":
+      // Prompt-composer refactor: a matched watch rule is a co-pilot SUGGESTION, never an
+      // autonomous write. The suggestion is queued via a paired `attention_updated` event
+      // (which feeds setAttentionQueue), so here we only sound the chime.
+      return { setter: "noop", earcon: "chime" };
     default:
       return null;
   }
