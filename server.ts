@@ -290,32 +290,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
 
-  // P0-3 (R4): minimal single-active-session registry used ONLY to gate plan-step ADVANCEMENT
-  // (steps 2..N). `handlePlansTrigger` runs at this outer scope and has no `session`/
-  // `dispatchProposal` in scope; the live connection installs a handle here (and clears it on
-  // close) so a step-completion can route the NEXT step's pane write through the SAME
-  // effective-mode + pending-approval gate as `dispatchProposal`. This is NOT the WS-D-declined
-  // proactive in-voice path — it is the same kind of handle the WS-E resolution push already
-  // needs. Single active session by design; if none is live we FALL BACK TO SAFE behavior
-  // (never an un-gated write).
-  //
-  // M11 (foot-gun): `activePlanGate` is module-scoped, single-slot, LAST-CONNECTION-WINS. A
-  // closing tab clears it (below) even if another session is still live, which PAUSES plan
-  // advancement (the SAFE direction — never an un-gated write) until a reconnect re-installs it.
-  // WS-F/WS-K should key this by sessionId so concurrent sessions don't clobber each other.
-  //
-  // H2: typed as the SAME outcome shape `dispatchProposal` returns (DispatchOutcome) so the union
-  // is single-sourced and can't drift from the real dispatch result.
+  // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
+  // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
+  // writing into a pane (architecture §5), so the outer-scope step engine no longer needs a handle
+  // back into the live session's dispatch path.
   type DispatchOutcome =
     | { kind: "executed"; text: string }
     | { kind: "blocked"; text: string }
     | { kind: "error"; text: string }
     | { kind: "clarify"; text: string }
     | { kind: "pending"; text: string };
-
-  let activePlanGate:
-    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) => DispatchOutcome)
-    | null = null;
 
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
@@ -411,86 +395,39 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             });
             const nextIndex = plan.currentStepIndex + 1;
             if (nextIndex < plan.steps.length) {
+              // Prompt-composer refactor: a plan is an OUTLINE, not an execution engine. We do
+              // NOT auto-advance by writing the next step into a pane. Mark the next step pending,
+              // pause the plan awaiting the operator, and SURFACE it as a co-pilot suggestion the
+              // operator can act on (gated, on the active pane). (architecture §5: Demote plans.)
               plan.currentStepIndex = nextIndex;
               const nextStep = plan.steps[nextIndex];
-              nextStep.status = "running";
-              const nextTerm = manager.terminals[nextStep.terminalId];
-              if (!nextTerm) {
-                plan.status = "paused";
-                nextStep.status = "failed";
-                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-                manager.attentionQueue.push({
-                  id: itemID,
-                  type: "error",
-                  terminalId: nextStep.terminalId,
-                  projectId: manager.ledger.activeProjectId || "default_project",
-                  message: `Plan '${plan.name}' paused: pane '${nextStep.terminalId}' is not online.`,
-                  timestamp: new Date().toISOString(),
-                  dismissed: false
-                });
-                pruneAttention(); // BUG-035 cap/TTL
-                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-                announcementBus.enqueue({
-                  kind: "plan_paused",
-                  terminalId: nextStep.terminalId,
-                  summary: `Plan '${plan.name}' paused — pane offline.`
-                });
-                changed = true;
-              } else if (!activePlanGate) {
-                // P0-3: no live session to gate through — FALL BACK TO SAFE. We MUST NOT write
-                // the next step un-gated (that is the least-authority hole). Pause and surface
-                // it for attention; the operator can resume once a session is live.
-                plan.status = "paused";
-                nextStep.status = "pending";
-                console.log(`[PLAN PROGRESS] Deferring step ${nextIndex + 1} of '${plan.name}': no active session to gate the write. NOT writing un-gated.`);
-                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-                manager.attentionQueue.push({
-                  id: itemID,
-                  type: "error",
-                  terminalId: nextStep.terminalId,
-                  projectId: manager.ledger.activeProjectId || "default_project",
-                  message: `Plan '${plan.name}' paused: step ${nextIndex + 1} needs the approval gate but no voice session is active.`,
-                  timestamp: new Date().toISOString(),
-                  dismissed: false
-                });
-                pruneAttention(); // BUG-035 cap/TTL
-                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-                announcementBus.enqueue({
-                  kind: "plan_paused",
-                  terminalId: nextStep.terminalId,
-                  summary: `Plan '${plan.name}' paused — no session to approve next step.`
-                });
-                changed = true;
-              } else {
-                // P0-3 (R4): route the next step's pane write through the SAME effective-mode +
-                // pending-approval gate as `dispatchProposal`. In HiTL the step becomes a spoken
-                // pending approval (it does NOT auto-execute), in Full Auto it runs, in Read-Only
-                // it is blocked. (WS-B redaction is applied inside the gate / narration.)
-                console.log(`[PLAN PROGRESS] Gating next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
-                const outcome = activePlanGate({
-                  pendingId: `plan__${plan.id}__step${nextIndex}`,
-                  targetId: nextStep.terminalId,
-                  instruction: nextStep.command,
-                  trigger: `Plan '${plan.name}' step ${nextIndex + 1}`,
-                });
-                if (outcome.kind === "executed") {
-                  // Full Auto: ran immediately; step stays "running" until its own transition.
-                } else if (outcome.kind === "pending") {
-                  // HiTL: now a spoken pending approval — do NOT auto-execute. Mark the step as
-                  // awaiting approval so the UI/plan state reflects that it has not run yet.
-                  nextStep.status = "pending";
-                } else {
-                  // blocked (Read-Only) / clarify / error: pause the plan, never silently write.
-                  plan.status = "paused";
-                  nextStep.status = "failed";
-                  announcementBus.enqueue({
-                    kind: "plan_paused",
-                    terminalId: nextStep.terminalId,
-                    summary: `Plan '${plan.name}' paused on step ${nextIndex + 1}: ${outcome.text}`,
-                  });
-                }
-                changed = true;
-              }
+              nextStep.status = "pending";
+              plan.status = "paused";
+              const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+              manager.attentionQueue.push({
+                id: itemID,
+                type: "confirmation",
+                terminalId: nextStep.terminalId,
+                projectId: manager.ledger.activeProjectId || "default_project",
+                message: `Plan '${plan.name}': step ${nextIndex + 1} ready — suggest '${nextStep.command}' on '${nextStep.terminalId}'.`,
+                timestamp: new Date().toISOString(),
+                dismissed: false,
+                details: {
+                  kind: "plan_step_suggestion",
+                  planId: plan.id,
+                  stepId: nextStep.id,
+                  suggestedCommand: nextStep.command,
+                  targetTerminalId: nextStep.terminalId,
+                },
+              });
+              pruneAttention(); // BUG-035 cap/TTL
+              broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+              announcementBus.enqueue({
+                kind: "plan_paused",
+                terminalId: nextStep.terminalId,
+                summary: `Plan '${plan.name}' — step ${nextIndex + 1} ready for your approval.`
+              });
+              changed = true;
             } else {
               plan.status = "completed";
               console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
@@ -2182,21 +2119,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }]
       },
     });
-
-      // P0-3 (R4): install the single-active-session plan gate now that `session` is live, so
-      // `handlePlansTrigger` (outer scope) can route step ADVANCEMENT (steps 2..N) through the
-      // SAME `dispatchProposal` gate. Step-advancement is server-initiated (there is no live
-      // functionCall to answer), so the synthetic `pendingId` doubles as the record `callId`;
-      // resolution narrates via `pushApprovalNarration` only and never answers a tool call.
-      activePlanGate = (opts) =>
-        dispatchProposal({
-          sess: session,
-          callId: opts.pendingId,
-          pendingId: opts.pendingId,
-          targetId: opts.targetId,
-          instruction: opts.instruction,
-          trigger: opts.trigger,
-        });
     } catch (err: any) {
       console.error("Failed to establish Gemini Live session:", err);
       clientWs.send(JSON.stringify({ 
@@ -2236,7 +2158,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
       }
-      activePlanGate = null; // P0-3: drop the plan gate; advancement now falls back to SAFE.
       if (session) {
         // Clean up any pending approvals associated with this session to avoid leaks or hanging
         // tool-calls. TODO(WS-F): persist + re-announce these on reconnect instead of purging

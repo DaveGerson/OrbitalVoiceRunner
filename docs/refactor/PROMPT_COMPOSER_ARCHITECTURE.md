@@ -111,13 +111,14 @@ Code locations are from `server.ts` / `src/` at branch point.
 
 1. **Anchor** — this document. ✅
 2. **Context substrate** — layered `modelContext` / `humanContext` on `PaneMeta`,
-   ledger accessors, back-compat load of existing flat `notes`.
+   ledger accessors, back-compat load of existing flat `notes`. ✅
 3. **Remove autonomous writes** — watch-rule write + `add_watch_rule`; convert
-   handoff to a context write.
+   handoff to a context write. ✅
 4. **Demote plans** — strip auto-advance + `activePlanGate`; keep plan as outline.
+   Advancement now pauses + surfaces the next step as a suggestion, never writes. ✅
 5. **Single active pane** — make "active pane" first-class; constrain Janus
-   writes to it.
+   writes to it. ⏳
 6. **Prompt-composer loop** — make conversation → proposed prompt → approve →
-   send the explicit primary flow in the UI and the voice layer.
+   send the explicit primary flow in the UI and the voice layer. ⏳
 
 Each step keeps `npm run lint` and `npm test` green before moving on.
