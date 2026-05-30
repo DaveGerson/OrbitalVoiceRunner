@@ -202,6 +202,9 @@ export function SettingsDialog({
         voice,
         voiceStyle,
         volume,
+        // speechSpeed control was removed (Gemini Live has no speaking-rate knob);
+        // kept as a constant so the persisted SystemSettings shape still type-checks.
+        speechSpeed: 1.0,
         isMicMuted,
         model
       },
