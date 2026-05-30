@@ -121,7 +121,17 @@ Code locations are from `server.ts` / `src/` at branch point.
    truth (`set_active_pane`); `dispatchProposal` refuses any proposal not aimed
    at it; Janus can move focus only via the operator-directed `switch_active_pane`
    tool. ✅
-6. **Prompt-composer loop** — make conversation → proposed prompt → approve →
-   send the explicit primary flow in the UI and the voice layer. ⏳
+6. **Prompt-composer loop** — the Workbench. Design decided with the operator:
+   **A (one live draft per pane) is primary, C (that pane's context) is a side
+   component, and B becomes a per-pane persistent WIP register** so work composed
+   for one pane is never lost when switching to another. The draft is per-pane and
+   persisted (it joins the durable per-terminal record of §4). "Send" is an
+   operator-direct, ungated write to the active pane; Janus fills the draft (it
+   does not auto-send). Sub-steps:
+   - 6a — per-pane `draft` on `PaneMeta` + ledger accessors (get/set/append/list). ✅
+   - 6b — migrate server plumbing: Janus appends to the ACTIVE pane's draft;
+     per-pane REST/WS; `draft_updated { paneId, ... }` broadcast. ⏳
+   - 6c — Workbench UI bound to the active pane + a Send action. ⏳
+   - 6d — WIP register across panes + the context (C) side panel. ⏳
 
 Each step keeps `npm run lint` and `npm test` green before moving on.

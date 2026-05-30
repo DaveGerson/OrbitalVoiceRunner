@@ -1,5 +1,5 @@
 import fs from "fs";
-import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry } from "./types";
+import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft } from "./types";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
 // re-exported here so existing `from "./ledger"` imports keep working (D7).
@@ -186,6 +186,41 @@ export class Ledger {
       human: pane.humanContext ?? [],
       legacy: pane.notes ?? [],
     };
+  }
+
+  // Per-pane WIP draft prompt (step 6 — the Workbench). A draft is a proposed prompt that has not
+  // yet been sent to the pane; composing/editing it is not a CLI write and is never gated. Each
+  // pane keeps its own, persisted, so switching panes preserves the work in progress.
+  getDraft(projectId: string, paneId: string): PaneDraft | null {
+    return this.workspaces[projectId]?.panes[paneId]?.draft ?? null;
+  }
+
+  setDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    pane.draft = { text, updatedAt: new Date().toISOString(), ...(updatedBy ? { updatedBy } : {}) };
+    this.save(true);
+    return true;
+  }
+
+  appendDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    const prev = pane.draft?.text ?? "";
+    const next = prev ? `${prev}\n${text}` : text;
+    pane.draft = { text: next, updatedAt: new Date().toISOString(), ...(updatedBy ? { updatedBy } : {}) };
+    this.save(true);
+    return true;
+  }
+
+  // The WIP register (step 6, the scalable part of "B"): every pane in a project that has a
+  // non-empty draft, so the operator never loses work composed for a pane they switched away from.
+  listDrafts(projectId: string): { paneId: string; draft: PaneDraft }[] {
+    const ws = this.workspaces[projectId];
+    if (!ws) return [];
+    return Object.values(ws.panes)
+      .filter((p) => p.draft && p.draft.text.trim().length > 0)
+      .map((p) => ({ paneId: p.pane_id, draft: p.draft! }));
   }
 
   getProject(id: string): Workspace | null {
