@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
 import { SHELL_PROMPT } from "./src/statusConstants";
+import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 
 dotenv.config();
 
@@ -228,27 +229,35 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const term = manager.terminals[terminalId];
     if (term) {
       const history = HistoryManager.getInstance().loadHistory(terminalId);
+      // WS-D summary for the proactive completion notification. Built ONLY from
+      // already-redacted/derived sources (never raw pane text): a fresh summarization when
+      // there is substantive output, else the existing redacted finalResponse, else a brief
+      // last-command-based fallback. Always set so the announcement below can fire.
+      let summaryText = "finished";
       if (history.length > 0) {
         const lastEntry = history[history.length - 1];
-        if (lastEntry.output && !lastEntry.finalResponse) {
-          try {
-            const cleanOutput = stripAnsiSequences(lastEntry.output).trim();
-            if (cleanOutput.length > 5) {
-              const summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
-              lastEntry.finalResponse = summaryText;
-              HistoryManager.getInstance().saveHistory(terminalId, history);
-              
-              broadcast({
-                type: "history_updated",
-                terminalId,
-                history
-              });
-            }
-          } catch (err) {
-            console.error("Auto-summarization failed for command outcomes:", err);
+        try {
+          const cleanOutput = lastEntry.output ? stripAnsiSequences(lastEntry.output).trim() : "";
+          if (cleanOutput.length > 5 && !lastEntry.finalResponse) {
+            summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
+            lastEntry.finalResponse = summaryText;
+            HistoryManager.getInstance().saveHistory(terminalId, history);
+            broadcast({ type: "history_updated", terminalId, history });
+          } else if (lastEntry.finalResponse) {
+            summaryText = lastEntry.finalResponse; // already WS-B redacted
+          } else if (lastEntry.command) {
+            summaryText = `${lastEntry.command} finished`;
           }
+        } catch (err) {
+          console.error("Auto-summarization failed for command outcomes:", err);
         }
       }
+
+      // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
+      // idle inference. Fires regardless of whether there was substantive output / an existing
+      // finalResponse, with the redacted summary above as the message. The bus owns the
+      // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
+      announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
     }
   };
 
@@ -266,6 +275,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }
       }
     }
+  }
+
+  // WS-D (BUG-024): proactive feedback controller. Per the maintainer decision this drives
+  // earcons + a coalescing on-screen notification stack (Seam B / broadcast) — NOT in-voice
+  // spoken turns. It owns the per-pane debounce, coalescing window, and token-bucket rate
+  // limit so the event path below stays thin (just enqueue).
+  const announcementBus = new AnnouncementBus({
+    broadcast,
+    getTemplates: () => manager.settings.announcements || DEFAULT_ANNOUNCEMENT_TEMPLATES,
+  });
+
+  // BUG-035: keep the attentionQueue bounded + TTL-evicted wherever it is mutated.
+  function pruneAttention() {
+    pruneAttentionQueue(manager.attentionQueue);
   }
 
   const lastStates: Record<string, string> = {};
@@ -338,7 +361,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   timestamp: new Date().toISOString(),
                   dismissed: false
                 });
+                pruneAttention(); // BUG-035 cap/TTL
                 broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+                announcementBus.enqueue({
+                  kind: "plan_paused",
+                  terminalId: nextStep.terminalId,
+                  summary: `Plan '${plan.name}' paused — pane offline.`
+                });
                 changed = true;
               }
             } else {
@@ -348,6 +377,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 type: "plan_completed",
                 planId: plan.id,
                 message: `Plan '${plan.name}' completed all steps successfully!`
+              });
+              announcementBus.enqueue({
+                kind: "plan_completed",
+                terminalId: plan.id,
+                summary: `Plan '${plan.name}' completed.`
               });
               changed = true;
             }
@@ -366,11 +400,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               timestamp: new Date().toISOString(),
               dismissed: false
             });
+            pruneAttention(); // BUG-035 cap/TTL
             broadcast({ type: "attention_updated", queue: manager.attentionQueue });
             broadcast({
               type: "plan_paused",
               planId: plan.id,
               message: `Plan '${plan.name}' paused due to execution error.`
+            });
+            announcementBus.enqueue({
+              kind: "plan_paused",
+              terminalId,
+              summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
             });
             changed = true;
           }
@@ -443,6 +483,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (transition === "build-failed" || transition === "error" || transition === "exited") {
         const activeProjectId = manager.ledger.activeProjectId || "default_project";
         const id = "att_" + Math.random().toString(36).substring(2, 11);
+        // WS-B: scrub the chunk before it becomes a displayed/announced hint.
+        const hint = redactSecrets(cleanChunk.trim()).slice(-160);
         manager.attentionQueue.push({
           id,
           type: transition,
@@ -452,7 +494,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           timestamp: new Date().toISOString(),
           dismissed: false
         });
+        pruneAttention(); // BUG-035 cap/TTL
         broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+
+        // WS-D (BUG-024): high-severity proactive announcement (reuses the existing
+        // lastStates edge-dedup, so this fires once per genuine transition edge).
+        announcementBus.enqueue({ kind: transition, terminalId, summary: hint });
       }
 
       handleWatchRulesTrigger(terminalId, transition);
@@ -1375,6 +1422,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   functionResponses: [{ name, id: call.id, response: { output: `Pane renamed to ${args.name}` } }]
                 });
               } else if (name === "get_attention_digest") {
+                pruneAttention(); // BUG-035: evict stale items before reading the digest
                 const unread = manager.attentionQueue.filter(item => !item.dismissed);
                 let text = "";
                 if (unread.length === 0) {
@@ -1402,6 +1450,30 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: text } }]
+                });
+              } else if (name === "dismiss_attention") {
+                // BUG-035: let the eyes-off operator clear an attention item by voice.
+                // Mirrors the REST dismiss path (/api/attention/:id/dismiss) so REST and
+                // voice share one queue. `id` omitted -> dismiss all.
+                const targetId = args.id;
+                let output: string;
+                if (targetId) {
+                  const item = manager.attentionQueue.find(i => i.id === targetId);
+                  if (item) {
+                    item.dismissed = true;
+                    output = `Dismissed attention item ${targetId}.`;
+                  } else {
+                    output = `No attention item found with id ${targetId}.`;
+                  }
+                } else {
+                  const count = manager.attentionQueue.filter(i => !i.dismissed).length;
+                  manager.attentionQueue.forEach(i => i.dismissed = true);
+                  output = `Dismissed all ${count} pending attention item${count === 1 ? "" : "s"}.`;
+                }
+                pruneAttention();
+                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
                 });
               } else if (name === "create_project") {
                 const { project_id, directory, summary, key_terms } = args;
@@ -1731,6 +1803,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }
             },
             {
+              name: "dismiss_attention",
+              description: "Dismiss one attention item by its id (or all items if id is omitted) once the operator has acknowledged it, so it stops appearing in the digest and proactive notifications.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING, description: "The attention item id to dismiss; omit to dismiss all." }
+                }
+              }
+            },
+            {
               name: "create_project",
               description: "Create a new project workspace directory context block.",
               parameters: {
@@ -1954,6 +2036,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   const shutdown = async () => {
     console.log("Shutting down cleanly, stopping all terminals...");
+    announcementBus.stop(); // WS-D: clear coalescing/rate-limit timers
     for (const term of Object.values(manager.terminals)) {
       try {
         await term.stop();

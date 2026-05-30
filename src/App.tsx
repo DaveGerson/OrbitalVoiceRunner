@@ -8,6 +8,10 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalView } from "./components/TerminalView";
 import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
+import { NotificationStack } from "./components/NotificationStack";
+import { effectForEvent } from "./eventBus";
+import type { EarconType } from "./announcementKinds";
+import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
 
@@ -35,6 +39,8 @@ function AppRaw() {
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
+  // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
+  const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
@@ -70,7 +76,7 @@ function AppRaw() {
   const [isBroadcastRunning, setIsBroadcastRunning] = useState(false);
 
   // Web Audio Synth Chimes for Hands-Free Feedback
-  const playEarcon = (type: "alert" | "success" | "execute" | "chime") => {
+  const playEarcon = (type: EarconType) => {
     try {
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = ctx.createOscillator();
@@ -78,7 +84,28 @@ function AppRaw() {
       osc.connect(gain);
       gain.connect(ctx.destination);
 
-      if (type === "alert") {
+      if (type === "completion") {
+        // WS-D (BUG-024): a distinct, short rising two-note so a genuine completion is
+        // audibly distinct from alert/success/execute/chime.
+        const now = ctx.currentTime;
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(587.33, now); // D5
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+        osc.start(now);
+        osc.stop(now + 0.2);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.type = "triangle";
+        osc2.frequency.setValueAtTime(880, now + 0.12); // A5
+        gain2.gain.setValueAtTime(0.05, now + 0.12);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.12 + 0.24);
+      } else if (type === "alert") {
         osc.type = "sawtooth";
         osc.frequency.setValueAtTime(440, ctx.currentTime);
         gain.gain.setValueAtTime(0.04, ctx.currentTime);
@@ -293,6 +320,9 @@ function AppRaw() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const isMicMutedRef = useRef(false);
   const desiredLiveRef = useRef(false);
+  // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
+  // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
+  const activeTerminalIdRef = useRef<string | null>(null);
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
@@ -590,13 +620,16 @@ function AppRaw() {
       }
     }
 
+    // WS-D (BUG-010): the push branches in ws.onmessage now drive these setters in real
+    // time, so the poll is demoted to a slow safety-net (reconciles if a broadcast is
+    // missed on a flaky socket) rather than the primary refresh path.
     const interval = setInterval(() => {
       fetchTerminals();
       fetchPendingCommands();
       fetchAttentionQueue();
       fetchWatchRules();
       fetchPlans();
-    }, 3000);
+    }, 20000);
     return () => clearInterval(interval);
   }, []);
 
@@ -605,6 +638,7 @@ function AppRaw() {
   }, [isMicMuted]);
 
   useEffect(() => {
+    activeTerminalIdRef.current = activeTerminalId;
     if (activeTerminalId) {
       fetchActiveTerminalHistory(activeTerminalId);
     }
@@ -924,6 +958,42 @@ function AppRaw() {
           setWsErrorNotification({ message: msg.message || "An unexpected error occurred during raw liveness communication." });
           setTimeout(() => setWsErrorNotification(null), 8000);
           resetAudioPlayback();
+        } else if (msg.type === "proactive_earcon") {
+          // WS-D: immediate non-verbal feedback for a proactive event (fires before the
+          // coalesced notification arrives).
+          if (msg.earcon) playEarcon(msg.earcon);
+        } else if (msg.type === "history_updated") {
+          // WS-D (BUG-010): refresh the open per-pane history view when the pushed
+          // update concerns the active pane (avoids waiting on the safety-net poll).
+          if (msg.terminalId && msg.terminalId === activeTerminalIdRef.current) {
+            fetchActiveTerminalHistory(msg.terminalId);
+          }
+        } else if (msg.type === "proactive_notification") {
+          // WS-D: stack-by-status, coalesce-to-latest on-screen notification (BUG-024).
+          setProactiveNotifications(prev => upsertNotification(prev, {
+            id: msg.id,
+            kind: msg.kind,
+            terminalId: msg.terminalId,
+            severity: msg.severity,
+            message: msg.message,
+            timestamp: msg.timestamp,
+          }));
+        } else {
+          // WS-D (BUG-010): event-bus wiring for the orchestration broadcasts that
+          // previously had NO client handler — drive the matching setter + earcon from
+          // the pushed payload so the UI no longer depends on the 3s poll.
+          const effect = effectForEvent(msg);
+          if (effect) {
+            switch (effect.setter) {
+              case "setAttentionQueue": setAttentionQueue(msg.queue); break;
+              case "setPlans": setPlans(msg.plans); break;
+              case "setWatchRules": setWatchRules(msg.watchRules); break;
+              case "fetchTerminals": fetchTerminals(); break;
+              case "fetchPlans": fetchPlans(); break;
+              case "noop": break;
+            }
+            if (effect.earcon) playEarcon(effect.earcon);
+          }
         }
       };
 
@@ -2217,6 +2287,12 @@ function AppRaw() {
           </div>
         )}
       </div>
+
+      {/* WS-D (BUG-024): proactive completion/error notification stack */}
+      <NotificationStack
+        notifications={proactiveNotifications}
+        onDismiss={(id) => setProactiveNotifications(prev => dismissNotification(prev, id))}
+      />
 
       {/* Header */}
       <header className="flex flex-col lg:flex-row items-start lg:items-center justify-between px-4 lg:px-6 py-4 border-b border-white/5 bg-black/40 backdrop-blur-md gap-4 shrink-0">

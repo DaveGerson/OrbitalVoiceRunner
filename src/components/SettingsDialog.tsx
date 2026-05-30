@@ -1,5 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { SystemSettings, CliPreset } from "../types";
+import {
+  type AnnouncementTemplates,
+  DEFAULT_ANNOUNCEMENT_TEMPLATES,
+  ANNOUNCEMENT_TEMPLATE_FIELDS,
+} from "../announcementKinds";
 import { apiFetch } from "../utils/api";
 import { 
   X, 
@@ -111,6 +116,12 @@ export function SettingsDialog({
   // Local states - Customizable CLIs Startup presets
   const [presets, setPresets] = useState<CliPreset[]>([]);
 
+  // WS-D: Local state - operator-editable proactive-announcement message templates.
+  // {pane} and {summary} are interpolated. Type + defaults are sourced from the single
+  // announcementKinds module (never re-typed here).
+  const [announcements, setAnnouncements] =
+    useState<AnnouncementTemplates>(DEFAULT_ANNOUNCEMENT_TEMPLATES);
+
   // Local states - Advanced plumbing / Connection variables
   const [webSocketUrl, setWebSocketUrl] = useState<string>("");
   const [latencyMode, setLatencyMode] = useState<"Low Latency" | "High Throughput" | "Balanced">("Balanced");
@@ -166,6 +177,10 @@ export function SettingsDialog({
 
       setPresets(parsePresetsSafe(initialSettings.presets));
 
+      if (initialSettings.announcements) {
+        setAnnouncements(prev => ({ ...prev, ...initialSettings.announcements }));
+      }
+
       setWebSocketUrl(initialSettings.advanced?.webSocketUrl ?? "");
       setLatencyMode(initialSettings.advanced?.latencyMode ?? "Balanced");
       setThroughputBps(initialSettings.advanced?.throughputBps ?? 16000);
@@ -208,6 +223,7 @@ export function SettingsDialog({
         localWorkspacePath
       },
       presets,
+      announcements,
       advanced: {
         webSocketUrl,
         latencyMode,
@@ -238,7 +254,8 @@ export function SettingsDialog({
     activeTab, port, host, appUrl, voice, voiceStyle, volume, speechSpeed, isMicMuted, model,
     activeContext, localWorkspacePath, presets, webSocketUrl, latencyMode, throughputBps,
     audioBufferSize, debugLogging, connectionTimeoutMs, rateLimitRequestsPerMin, maxBufferLines,
-    idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey
+    idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
+    announcements
   ]);
 
   // Handle Saving
@@ -280,6 +297,9 @@ export function SettingsDialog({
       }
       if (parsed.presets !== undefined) {
         setPresets(parsePresetsSafe(parsed.presets));
+      }
+      if (parsed.announcements) {
+        setAnnouncements(prev => ({ ...prev, ...parsed.announcements }));
       }
       if (parsed.advanced) {
         if (parsed.advanced.webSocketUrl !== undefined) setWebSocketUrl(parsed.advanced.webSocketUrl);
@@ -557,6 +577,26 @@ export function SettingsDialog({
                       >
                         {isMicMuted ? "● MUTED (LIVE SILENCE)" : "● TRANSMITTING VOICE"}
                       </button>
+                    </div>
+
+                    {/* WS-D: Proactive announcement message templates (earcon + on-screen
+                        notification text). Brief by default; {pane}/{summary} interpolated. */}
+                    <div className="p-3 bg-zinc-950/50 border border-white/5 rounded-lg flex flex-col gap-2">
+                      <div>
+                        <span className="text-zinc-300 font-bold block">Proactive Announcement Messages</span>
+                        <span className="text-[10px] text-zinc-500">Text shown on completion/error notifications. Use <code className="text-cyan-400">{"{pane}"}</code> and <code className="text-cyan-400">{"{summary}"}</code> placeholders.</span>
+                      </div>
+                      {ANNOUNCEMENT_TEMPLATE_FIELDS.map(([key, label]) => (
+                        <div key={key}>
+                          <label className="block text-[10px] uppercase tracking-wider text-zinc-500 mb-0.5">{label}</label>
+                          <input
+                            type="text"
+                            value={announcements[key]}
+                            onChange={e => setAnnouncements(prev => ({ ...prev, [key]: e.target.value }))}
+                            className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white text-xs font-mono focus:outline-none focus:border-cyan-500"
+                          />
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}

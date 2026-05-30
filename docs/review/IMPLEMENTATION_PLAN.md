@@ -572,7 +572,7 @@ WS-H → WS-I → WS-J → WS-K → WS-L**), honoring the two hard edges (`WS-C 
 `WS-E.1 → WS-E.2`). The only safe parallelism is within M3/WS-L's purely
 frontend-isolated polish items (ARIA, earcons) via worktree isolation — optional.
 
-**Status:** WS-A ✅, WS-B ✅, WS-C ✅ complete (committed & pushed; WS-C built by the design→implement→review→fix team pipeline + 3 lensed reviews). **Next: WS-D (proactive audio).**
+**Status:** WS-A ✅, WS-B ✅, WS-C ✅, WS-D ✅ complete (committed & pushed; WS-C/WS-D built by the design→implement→review→fix team pipeline + 3 lensed reviews). WS-D (`dfb4eba`, review fixes `cb5b0a4` + synthesis round) closes BUG-010, BUG-024, BUG-035 — proactive feedback delivered as earcons + a coalescing on-screen notification stack (no in-voice path), fired on the genuine WS-C onIdle edge + high-severity transitions, with full de-spam (per-pane debounce, 1.5s coalescing window, token-bucket rate limit, severity priority, TTL). **Next: WS-E (permission truth).**
 
 ---
 

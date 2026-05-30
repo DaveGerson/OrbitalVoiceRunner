@@ -1,6 +1,7 @@
 import { Ledger, PaneMeta } from "./ledger";
 import fs from "fs";
 import { SystemSettings, CliPreset, AttentionItem } from "./types";
+import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
 import { PtyTransport, createPtyTransport } from "./ptyTransport";
 import {
@@ -582,6 +583,7 @@ export class OrchestratorManager {
         { id: "codex", name: "Codex CLI", command: "npx codex-cli", enabled: true },
         { id: "antigravity", name: "Antigravity Agent", command: "npx antigravity", enabled: true }
       ],
+      announcements: { ...DEFAULT_ANNOUNCEMENT_TEMPLATES },
       advanced: {
         webSocketUrl: "",
         latencyMode: "Balanced",
@@ -615,6 +617,7 @@ export class OrchestratorManager {
           voiceAi: { ...this.getDefaultSettings().voiceAi, ...parsed.voiceAi },
           projects: { ...this.getDefaultSettings().projects, ...parsed.projects },
           presets: parsePresetsSafe(parsed.presets ? parsed.presets : this.getDefaultSettings().presets),
+          announcements: { ...this.getDefaultSettings().announcements!, ...parsed.announcements },
           advanced: { ...this.getDefaultSettings().advanced, ...parsed.advanced },
           secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets }
         };
@@ -642,6 +645,12 @@ export class OrchestratorManager {
     if (newSettings.voiceAi) this.settings.voiceAi = { ...this.settings.voiceAi, ...newSettings.voiceAi };
     if (newSettings.projects) this.settings.projects = { ...this.settings.projects, ...newSettings.projects };
     if (newSettings.presets) this.settings.presets = parsePresetsSafe(newSettings.presets);
+    if (newSettings.announcements) {
+      this.settings.announcements = {
+        ...(this.settings.announcements || DEFAULT_ANNOUNCEMENT_TEMPLATES),
+        ...newSettings.announcements
+      };
+    }
     if (newSettings.advanced) {
       this.settings.advanced = { ...this.settings.advanced, ...newSettings.advanced };
       this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode;
