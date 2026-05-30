@@ -46,6 +46,19 @@ function getCookie(cookieHeader: string | undefined, name: string): string | nul
   return null;
 }
 
+// Returns a deep copy of `settings` with the Gemini API key masked, safe to send to
+// any client (REST response or WS broadcast). The masking matches GET /api/settings so
+// the key is never shipped in plaintext over the `settings_updated` broadcast. PUT
+// restores the real key server-side when it sees a masked/blank value coming back.
+function sanitizeSettingsForClient<T extends { secrets?: { geminiApiKey?: string } }>(settings: T): T {
+  const sanitized = JSON.parse(JSON.stringify(settings)) as T;
+  const key = sanitized.secrets?.geminiApiKey;
+  if (key && key !== "CONFIGURED_IN_ENV" && key.length > 8) {
+    sanitized.secrets!.geminiApiKey = key.substring(0, 6) + "••••••••" + key.substring(key.length - 4);
+  }
+  return sanitized;
+}
+
 export interface HistoryEntry {
   command: string;
   timestamp: string;
@@ -683,11 +696,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   });
 
   // Web API to restart terminal node
-  app.post("/api/terminals/:id/restart", (req, res) => {
+  app.post("/api/terminals/:id/restart", async (req, res) => {
     const { id } = req.params;
     const term = manager.terminals[id];
     if (term) {
-      term.stop();
+      // stop() is async (SIGTERM→SIGKILL escalation); await it so the dying PTY's onExit
+      // fires BEFORE start() spawns the replacement, otherwise the late exit flips the
+      // freshly-restarted pane to Exited and tears down its probe timer (zombie pane).
+      await term.stop();
       term.start();
       broadcastLedgerUpdate();
       broadcast({ type: "terminals_updated" });
@@ -1098,14 +1114,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   });
 
   app.get("/api/settings", (req, res) => {
-    const sanitizedSettings = JSON.parse(JSON.stringify(manager.settings));
-    if (sanitizedSettings.secrets && sanitizedSettings.secrets.geminiApiKey) {
-      const key = sanitizedSettings.secrets.geminiApiKey;
-      if (key && key !== "CONFIGURED_IN_ENV" && key.length > 8) {
-        sanitizedSettings.secrets.geminiApiKey = key.substring(0, 6) + "••••••••" + key.substring(key.length - 4);
-      }
-    }
-    res.json(sanitizedSettings);
+    res.json(sanitizeSettingsForClient(manager.settings));
   });
 
   app.put("/api/settings", (req, res) => {
@@ -1114,12 +1123,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
     manager.updateSettings(newSettings);
-    broadcast({ 
-      type: "settings_updated", 
+    broadcast({
+      type: "settings_updated",
       globalPermissionsMode: manager.globalPermissionsMode,
-      settings: manager.settings
+      settings: sanitizeSettingsForClient(manager.settings)
     });
-    res.json({ success: true, settings: manager.settings, globalPermissionsMode: manager.globalPermissionsMode });
+    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
   });
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
@@ -1487,7 +1496,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             for (const call of message.toolCall.functionCalls || []) {
               const name = call.name;
               const args = call.args as Record<string, any>;
-              
+
+              // Guard every tool handler: an uncaught throw here would escape the Gemini SDK
+              // onmessage callback, leave this call.id unanswered, and stall the conversation.
+              try {
               if (name === "list_panes") {
                 const list = manager.listPanes();
                 session.sendToolResponse({
@@ -1695,10 +1707,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 manager.globalPermissionsMode = permissions_mode;
                 manager.settings.advanced.globalPermissionsMode = permissions_mode;
                 manager.saveSettings();
-                broadcast({ 
-                  type: "settings_updated", 
+                broadcast({
+                  type: "settings_updated",
                   globalPermissionsMode: permissions_mode,
-                  settings: manager.settings
+                  settings: sanitizeSettingsForClient(manager.settings)
                 });
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Global permissions updated to ${permissions_mode}.` } }]
@@ -1707,9 +1719,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const { muted } = args;
                 manager.settings.voiceAi.isMicMuted = muted;
                 manager.saveSettings();
-                broadcast({ 
-                  type: "settings_updated", 
-                  settings: manager.settings
+                broadcast({
+                  type: "settings_updated",
+                  settings: sanitizeSettingsForClient(manager.settings)
                 });
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Microphone now ${muted ? 'muted' : 'active-listening'}.` } }]
@@ -1882,6 +1894,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
                   });
                 }
+              }
+              } catch (toolErr) {
+                console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
+                try {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
+                  });
+                } catch { /* session already torn down; nothing more we can do */ }
               }
             }
           }

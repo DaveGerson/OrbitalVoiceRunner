@@ -931,9 +931,19 @@ function AppRaw() {
         } else if (msg.type === "ledger_updated") {
           setLedger(msg.ledger);
         } else if (msg.type === "settings_updated") {
-          setGlobalPermissionsMode(msg.globalPermissionsMode);
+          // Some settings_updated broadcasts (e.g. set_voice_mute) omit globalPermissionsMode;
+          // only apply it when present so a mute toggle can't clobber the permissions display.
+          if (msg.globalPermissionsMode !== undefined) {
+            setGlobalPermissionsMode(msg.globalPermissionsMode);
+          }
           if (msg.settings) {
             setSettings(msg.settings);
+            // Propagate the authoritative mute state so a model-driven set_voice_mute actually
+            // gates mic capture (the processor reads isMicMutedRef). Without this the model is
+            // told "muted" while audio keeps streaming.
+            if (typeof msg.settings.voiceAi?.isMicMuted === "boolean") {
+              setIsMicMuted(msg.settings.voiceAi.isMicMuted);
+            }
           }
         } else if (msg.type === "command_auto_executed") {
           playEarcon("execute");
