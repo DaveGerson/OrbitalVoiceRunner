@@ -123,7 +123,7 @@ const EARCON_FOR: Record<AnnouncementKind, EarconType> = {
   completion: "completion",
   error: "alert",
   "build-failed": "alert",
-  exited: "completion",
+  exited: "alert",
   plan_completed: "success",
   plan_paused: "alert",
 };
@@ -203,10 +203,17 @@ export class AnnouncementBus {
     const now = this.clock.now();
     const paneKey = item.terminalId;
 
-    // Per-pane debounce: suppress a repeat for the same pane inside the window.
-    const last = this.lastAnnouncedAt[paneKey];
-    if (last !== undefined && now - last < this.perPaneDebounceMs) {
-      return false;
+    // Per-pane debounce: suppress a repeat for the same pane inside the window so a
+    // flapping build cannot machine-gun the operator. High-severity events
+    // (error/build-failed/plan_paused) are EXEMPT — they are already edge-deduped
+    // server-side (lastStates) and must never be starved by a preceding completion on
+    // the same pane (design §4: "errors are never starved by completions").
+    const isHighSeverity = HIGH_SEVERITY.includes(item.kind);
+    if (!isHighSeverity) {
+      const last = this.lastAnnouncedAt[paneKey];
+      if (last !== undefined && now - last < this.perPaneDebounceMs) {
+        return false;
+      }
     }
     this.lastAnnouncedAt[paneKey] = now;
 
