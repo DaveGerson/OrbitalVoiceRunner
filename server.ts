@@ -697,7 +697,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const pane = activeProject?.panes[id];
       if (pane) {
         let cmd = "bash";
-        if (pane.tool_preset === "Claude Code") cmd = "npx @anthropic-ai/claude";
+        // WS-G quick win: Claude Code is installed globally here, so the bare
+        // `claude` binary is correct; `npx @anthropic-ai/claude` is the wrong package.
+        if (pane.tool_preset === "Claude Code") cmd = "claude";
         else if (pane.tool_preset === "Codex") cmd = "npx codex-cli";
          else if (pane.tool_preset === "Antigravity") cmd = "npx antigravity";
         
