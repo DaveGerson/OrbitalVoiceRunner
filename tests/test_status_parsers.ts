@@ -181,16 +181,68 @@ describe("statusProbe pure parsers", () => {
       assert.strictEqual(parseProcessList(orphan, 100), false, "orphan ParentProcessId-only record is not a child");
     });
 
-    it("agent-at-rest under cmd.exe reads BUSY (any-descendant rule) — justifies P0-1 on Windows", () => {
-      // A live agent CLI is a descendant of the shell root at all times, so the
-      // Windows any-descendant probe reads a resting agent as busy forever — the
-      // same defect the P0-1 gate fixes on Windows.
+    it("agent-at-rest under cmd.exe reads BUSY (non-shell descendant) — justifies P0-1 on Windows", () => {
+      // A live agent CLI (claude.exe — NOT a known shell) is a descendant of the
+      // shell root at all times, so the shell-aware Windows probe reads a resting
+      // agent as busy forever — the same defect the P0-1 gate fixes on Windows.
       const csvAgent = [
         "Node,Name,ParentProcessId,ProcessId",
         "HOST,cmd.exe,50,100",
         "HOST,claude.exe,100,200",
       ].join("\n");
       assert.strictEqual(parseProcessList(csvAgent, 100), true);
+    });
+
+    it("C1: resting `cmd.exe -> cmd.exe` (the `cmd /c cmd` spawn shape) reads IDLE", () => {
+      // The #1-platform "busy forever" defect: a Custom shell pane is spawned
+      // `cmd.exe /c cmd.exe`, so the inner interactive cmd.exe is a PERMANENT
+      // descendant of the PTY root. The shell-aware rule treats a descendant whose
+      // Name is a known shell (SHELL_COMMS) as inert, so a resting tree is IDLE.
+      const csvRestingShell = [
+        "Node,Name,ParentProcessId,ProcessId",
+        "HOST,cmd.exe,50,100",   // outer /c cmd (PTY root)
+        "HOST,cmd.exe,100,200",  // inner interactive cmd at its prompt
+      ].join("\n");
+      assert.strictEqual(parseProcessList(csvRestingShell, 100), false, "resting cmd-under-cmd ⇒ idle");
+    });
+
+    it("C1: `cmd.exe -> node.exe` (a real command under the shell) reads BUSY", () => {
+      const csvRunning = [
+        "Node,Name,ParentProcessId,ProcessId",
+        "HOST,cmd.exe,50,100",
+        "HOST,cmd.exe,100,200",  // inner resting shell
+        "HOST,node.exe,200,300", // a real command launched from the inner shell
+      ].join("\n");
+      assert.strictEqual(parseProcessList(csvRunning, 100), true, "non-shell descendant ⇒ busy");
+    });
+
+    it("C1: powershell/pwsh descendants are also treated as resting shells (idle)", () => {
+      const csvPwsh = [
+        "Node,Name,ParentProcessId,ProcessId",
+        "HOST,powershell.exe,50,100",
+        "HOST,pwsh.exe,100,200",
+      ].join("\n");
+      assert.strictEqual(parseProcessList(csvPwsh, 100), false, "shell-only tree ⇒ idle");
+    });
+
+    it("C3: a process Name containing a comma (quoted CSV field) does not drop the row", () => {
+      // RFC-4180: the Name `"weird,name.exe"` contains a comma. A naive split(',')
+      // would shift the columns and silently drop the child ⇒ false idle. The
+      // quote-aware splitter must keep it as one non-shell descendant ⇒ busy.
+      const csvQuoted = [
+        "Node,Name,ParentProcessId,ProcessId",
+        "HOST,cmd.exe,50,100",
+        'HOST,"weird,name.exe",100,200',
+      ].join("\n");
+      assert.strictEqual(parseProcessList(csvQuoted, 100), true, "comma-in-Name child still detected ⇒ busy");
+      // And a quoted shell Name with a comma elsewhere still parses the numeric IDs
+      // correctly (here the only descendant is a shell ⇒ idle).
+      const csvQuotedShell = [
+        "Node,Name,ParentProcessId,ProcessId",
+        'HOST,"cmd.exe",50,100',
+        'HOST,"cmd.exe",100,200',
+      ].join("\n");
+      assert.strictEqual(parseProcessList(csvQuotedShell, 100), false);
     });
 
     it("walks a multi-level descendant chain", () => {

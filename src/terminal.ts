@@ -1,9 +1,8 @@
-import { spawn, ChildProcess } from "child_process";
 import { Ledger, PaneMeta } from "./ledger";
 import fs from "fs";
 import { SystemSettings, CliPreset, AttentionItem } from "./types";
-import { StatusProbe, ProbeResult, selectProbe } from "./statusProbe";
-import { PtyTransport, createPtyTransport, nodePtyAvailable } from "./ptyTransport";
+import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
+import { PtyTransport, createPtyTransport } from "./ptyTransport";
 import {
   decideStatus,
   Status as MachineStatus,
@@ -133,7 +132,6 @@ export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
   public shellCmd: string;
-  public process: ChildProcess | null = null;
   // WS-C: the active PTY transport (node-pty preferred, legacy fallback).
   private transport: PtyTransport | null = null;
   public outputBuffer: string[] = [];
@@ -162,8 +160,10 @@ export class UniversalTerminal {
   public runtimeType: RuntimeType;
   // The PTY shell/agent root pid captured at start for the probe.
   private shellPid: number | undefined;
-  // True if the active transport is node-pty (vs the legacy fallback). Panes
-  // advertise confidence:"fallback" when this is false (design §6, R1).
+  // True if the active transport is node-pty (vs the legacy fallback). When this
+  // is false the authoritative process-tree probe is unvalidated (the legacy path
+  // roots the tree at `script`/`cmd.exe`, not a real shell-rooted PTY), so start()
+  // swaps in a FallbackProbe and quiescence drives idle instead (design §6, R1).
   public usingNodePty = false;
   // Confidence of the most recent probe (drives output→idle behavior).
   private lastConfidence: "authoritative" | "fallback" = "fallback";
@@ -321,10 +321,20 @@ export class UniversalTerminal {
     }
     if (result.armIdleTimer) {
       if (this.idleTimer) clearTimeout(this.idleTimer);
+      // C4: in authoritative mode the idle debounce must outlast at least one
+      // probe interval, otherwise an idleTimeoutMs < probeIntervalMs can fire
+      // "done" before the next authoritative tick has a chance to re-confirm a
+      // reappearing child — a spurious onIdle. Floor the effective debounce at
+      // probeIntervalMs there. Fallback mode is pure quiescence, so it keeps the
+      // configured timeout verbatim.
+      const effectiveIdleMs =
+        this.lastConfidence === "authoritative"
+          ? Math.max(this.idleTimeoutMs, this.probeIntervalMs)
+          : this.idleTimeoutMs;
       this.idleTimer = setTimeout(() => {
         this.idleTimer = null;
         this.applyStatusEvent({ kind: "idleTimer" });
-      }, this.idleTimeoutMs);
+      }, effectiveIdleMs);
     }
 
     if (result.status !== this.status) {
@@ -420,6 +430,13 @@ export class UniversalTerminal {
     });
     this.transport = transport;
     this.usingNodePty = usingNodePty;
+    // C2: the legacy (non-node-pty) transport roots the process tree at `script`
+    // (Linux/macOS) or a separate `cmd.exe` (Windows), whose tree shape is NOT what
+    // the authoritative probe was validated against. Degrade to quiescence-driven
+    // idle on that path rather than running an unvalidated authoritative probe.
+    if (!usingNodePty) {
+      this.statusProbe = new FallbackProbe();
+    }
     // Capture the PTY root pid for the probe (design §5).
     this.shellPid = transport.pid;
 

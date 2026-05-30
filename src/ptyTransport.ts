@@ -11,8 +11,9 @@ import { spawn, ChildProcess } from "child_process";
  *    spawn("script" | "cmd.exe", …) path, lifted verbatim from the old terminal.ts.
  *
  * Selection is a single try{require(node-pty)}catch{legacy} at startup
- * (createPtyTransport). `nodePtyAvailable()` lets panes advertise
- * confidence:"fallback" when the legacy path is active (design §6, R1).
+ * (createPtyTransport), which returns `usingNodePty`. When that is false the
+ * caller (terminal.start) swaps the authoritative probe for a FallbackProbe so a
+ * pane on the legacy transport degrades to quiescence-driven idle (design §6, R1).
  */
 
 export interface PtyTransport {

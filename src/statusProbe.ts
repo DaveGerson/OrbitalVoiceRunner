@@ -1,4 +1,5 @@
 import { execSync } from "child_process";
+import { SHELL_COMMS } from "./statusConstants";
 
 /**
  * StatusProbe — the authoritative busy/idle signal source (WS-C design §2.0).
@@ -32,12 +33,6 @@ export interface StatusProbe {
 // Pure parsers (unit-tested against text fixtures — design §7.2/§7.3)
 // ---------------------------------------------------------------------------
 
-/** Process-table comm names treated as interactive shells (for the prompt-at-rest test). */
-const SHELL_COMMS = new Set([
-  "sh", "bash", "zsh", "dash", "ash", "fish", "ksh", "tcsh", "csh",
-  "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
-]);
-
 interface ProcRec {
   pid: number;
   ppid: number;
@@ -70,16 +65,14 @@ function parseProcRecords(entries: string[]): ProcRec[] {
   return out;
 }
 
-/** Set of shellPid plus all its descendants. */
-function treeMembers(recs: ProcRec[], shellPid: number): Set<number> {
-  const childrenOf = new Map<number, number[]>();
-  for (const r of recs) {
-    const arr = childrenOf.get(r.ppid) || [];
-    arr.push(r.pid);
-    childrenOf.set(r.ppid, arr);
-  }
-  const members = new Set<number>([shellPid]);
-  const stack = [shellPid];
+/**
+ * Set of `root` plus all its transitive descendants, given a parent→children map.
+ * The single shared tree-walk used by every platform parser (Linux /proc, macOS
+ * ps, and the Windows process list) so the descendant logic cannot drift.
+ */
+function buildDescendantSet(childrenOf: Map<number, number[]>, root: number): Set<number> {
+  const members = new Set<number>([root]);
+  const stack = [root];
   while (stack.length) {
     const cur = stack.pop()!;
     for (const c of childrenOf.get(cur) || []) {
@@ -90,6 +83,17 @@ function treeMembers(recs: ProcRec[], shellPid: number): Set<number> {
     }
   }
   return members;
+}
+
+/** Build a parent→children adjacency map from {pid, ppid} records. */
+function childrenMap(recs: { pid: number; ppid: number }[]): Map<number, number[]> {
+  const childrenOf = new Map<number, number[]>();
+  for (const r of recs) {
+    const arr = childrenOf.get(r.ppid) || [];
+    arr.push(r.pid);
+    childrenOf.set(r.ppid, arr);
+  }
+  return childrenOf;
 }
 
 /**
@@ -113,7 +117,7 @@ function treeMembers(recs: ProcRec[], shellPid: number): Set<number> {
 export function parseProcTree(entries: string[], shellPid: number): boolean {
   const recs = parseProcRecords(entries);
   if (recs.length === 0) return false;
-  const members = treeMembers(recs, shellPid);
+  const members = buildDescendantSet(childrenMap(recs), shellPid);
   for (const r of recs) {
     if (!members.has(r.pid)) continue;
     const isShell = SHELL_COMMS.has(r.comm.toLowerCase());
@@ -158,20 +162,7 @@ export function parsePsTree(rawText: string, shellPid: number): boolean {
   if (recs.length === 0) return false;
 
   // Build descendant set rooted at shellPid (inclusive).
-  const childrenOf = new Map<number, number[]>();
-  for (const r of recs) {
-    const arr = childrenOf.get(r.ppid) || [];
-    arr.push(r.pid);
-    childrenOf.set(r.ppid, arr);
-  }
-  const members = new Set<number>([shellPid]);
-  const stack = [shellPid];
-  while (stack.length) {
-    const cur = stack.pop()!;
-    for (const c of childrenOf.get(cur) || []) {
-      if (!members.has(c)) { members.add(c); stack.push(c); }
-    }
-  }
+  const members = buildDescendantSet(childrenMap(recs), shellPid);
 
   const haveComm = recs.some(r => r.comm.length > 0);
   for (const r of recs) {
@@ -191,45 +182,92 @@ export function parsePsTree(rawText: string, shellPid: number): boolean {
   return haveComm ? true : false;
 }
 
+interface WinProcRec { pid: number; ppid: number; name: string; }
+
+/**
+ * Split one CSV line into fields, honoring RFC-4180 double-quoted fields so a
+ * value that itself contains a comma (e.g. a process Name `"weird,name.exe"`)
+ * does not shift the column count and drop a row (C3). A doubled `""` inside a
+ * quoted field is an escaped quote.
+ */
+function splitCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      out.push(field);
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  out.push(field);
+  return out.map(f => f.trim());
+}
+
 /**
  * Windows: parse `Get-CimInstance Win32_Process | ConvertTo-Csv` / `wmic process`
- * CSV output (or legacy "Key : Value" CIM blocks) into a ParentProcessId->ProcessId
- * tree and return true if shellPid has any descendant. Validated WITHOUT a Windows
- * runtime against synthetic CIM/wmic fixtures (design §2.1/§7.2).
+ * CSV output (or legacy "Key : Value" CIM blocks) into a process tree and decide
+ * busy/idle by the SAME philosophy as Linux/macOS: a pane is IDLE iff the only
+ * live descendants under the PTY root are known shells (SHELL_COMMS), and BUSY iff
+ * any non-shell command process is alive in the tree.
+ *
+ * This fixes the "busy forever" defect (C1): a Custom shell pane is spawned
+ * `cmd.exe /c cmd.exe`, so the inner interactive `cmd.exe` is a PERMANENT
+ * descendant of the PTY root. The old "any descendant ⇒ busy" rule therefore read
+ * such a resting pane as Running forever. By treating shell descendants as inert,
+ * a resting `cmd.exe → cmd.exe` reads IDLE while `cmd.exe → node.exe` reads BUSY.
+ *
+ * Validated WITHOUT a Windows runtime against synthetic CIM/wmic fixtures
+ * (design §2.1/§7.2). Busy-biased (I2): on parse failure / no usable records we
+ * return false (fallback) at the probe layer, but a tree we cannot resolve a Name
+ * for is treated as a non-shell process ⇒ busy.
  *
  * Accepts two shapes:
- *  - CSV (PREFERRED, deterministic): a header line containing both ProcessId and
- *    ParentProcessId columns, then one row per process. This is what both
- *    `ConvertTo-Csv -NoTypeInformation` and `wmic ... /format:csv` emit, so the
- *    probe always hits this branch in practice.
+ *  - CSV (PREFERRED, deterministic): a header line containing ProcessId and
+ *    ParentProcessId (and, for the shell check, Name) columns, then one row per
+ *    process. This is what both `ConvertTo-Csv -NoTypeInformation` and
+ *    `wmic ... /format:csv` emit, so the probe always hits this branch in practice.
  *  - Legacy CIM Format-List "Key : Value" blocks separated by blank lines. The
  *    blank line is the AUTHORITATIVE record boundary (P2 hardening): the previous
  *    record is flushed at each blank line, so a record missing one of the two keys
- *    no longer mis-pairs with the next record's fields.
+ *    no longer mis-pairs with the next record's fields. (CIM blocks carry no Name
+ *    in the committed fixtures, so a descendant with unknown Name reads busy.)
  */
 export function parseProcessList(rawText: string, shellPid: number): boolean {
-  const childrenOf = new Map<number, number[]>();
+  const recs: WinProcRec[] = [];
   const rawLines = rawText.split(/\r?\n/);
   const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
 
   // PREFERRED: CSV header containing both ProcessId and ParentProcessId columns.
   const header = lines.find(l => /ProcessId/i.test(l) && /ParentProcessId/i.test(l) && l.includes(","));
   if (header) {
-    const cols = header.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
+    const cols = splitCsvLine(header).map(c => c.replace(/^"|"$/g, ""));
     const pidIdx = cols.findIndex(c => /^ProcessId$/i.test(c));
     const ppidIdx = cols.findIndex(c => /^ParentProcessId$/i.test(c));
+    const nameIdx = cols.findIndex(c => /^Name$/i.test(c));
     for (const line of lines) {
       if (line === header) continue;
-      const cells = line.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
+      const cells = splitCsvLine(line);
       if (cells.length <= Math.max(pidIdx, ppidIdx)) continue;
       const pid = parseInt(cells[pidIdx], 10);
       const ppid = parseInt(cells[ppidIdx], 10);
       if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
-      const arr = childrenOf.get(ppid) || [];
-      arr.push(pid);
-      childrenOf.set(ppid, arr);
+      const name = nameIdx >= 0 && nameIdx < cells.length ? cells[nameIdx] : "";
+      recs.push({ pid, ppid, name });
     }
-    return hasDescendant(childrenOf, shellPid);
+    return treeHasNonShellDescendant(recs, shellPid);
   }
 
   // Legacy CIM "Key : Value" Format-List blocks. Use the BLANK LINE as the
@@ -237,14 +275,14 @@ export function parseProcessList(rawText: string, shellPid: number): boolean {
   // which mis-pairs when a record lacks one of the two fields.
   let curPid: number | null = null;
   let curPpid: number | null = null;
+  let curName = "";
   const flush = () => {
     if (curPid !== null && curPpid !== null) {
-      const arr = childrenOf.get(curPpid) || [];
-      arr.push(curPid);
-      childrenOf.set(curPpid, arr);
+      recs.push({ pid: curPid, ppid: curPpid, name: curName });
     }
     curPid = null;
     curPpid = null;
+    curName = "";
   };
   for (const raw of rawLines) {
     const line = raw.trim();
@@ -255,23 +293,30 @@ export function parseProcessList(rawText: string, shellPid: number): boolean {
     }
     const ppidMatch = line.match(/ParentProcessId\s*[=:]\s*(\d+)/i);
     const pidMatch = line.match(/(?<!Parent)ProcessId\s*[=:]\s*(\d+)/i);
+    const nameMatch = line.match(/^Name\s*[=:]\s*(.+)$/i);
     if (ppidMatch) curPpid = parseInt(ppidMatch[1], 10);
     if (pidMatch) curPid = parseInt(pidMatch[1], 10);
+    if (nameMatch) curName = nameMatch[1].trim();
   }
   flush();
-  return hasDescendant(childrenOf, shellPid);
+  return treeHasNonShellDescendant(recs, shellPid);
 }
 
-function hasDescendant(childrenOf: Map<number, number[]>, root: number): boolean {
-  const stack = [...(childrenOf.get(root) || [])];
-  const seen = new Set<number>();
-  while (stack.length > 0) {
-    const pid = stack.pop()!;
-    if (pid === root || seen.has(pid)) continue;
-    seen.add(pid);
-    return true; // any descendant at all means a child command is running
+/**
+ * Shell-aware Windows busy rule (mirrors the Linux/macOS resting-shell philosophy):
+ * BUSY iff the PTY root's descendant tree contains a process whose Name is NOT a
+ * known shell. A descendant with an empty/unknown Name is treated as non-shell
+ * (busy-biased, I2) so we never falsely report idle when the Name column is absent.
+ */
+function treeHasNonShellDescendant(recs: WinProcRec[], root: number): boolean {
+  const members = buildDescendantSet(childrenMap(recs), root);
+  for (const r of recs) {
+    if (r.pid === root || !members.has(r.pid)) continue; // skip the root itself
+    if (!SHELL_COMMS.has(r.name.toLowerCase())) {
+      return true; // a non-shell descendant command is running ⇒ busy
+    }
   }
-  return false;
+  return false; // only shell descendants (or none) ⇒ idle
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +362,7 @@ export class WindowsProbe implements StatusProbe {
     // CSV shape the parseProcessList CSV branch already handles. wmic CSV stays as
     // a SECONDARY fallback for older hosts where PowerShell is unavailable.
     try {
+      // Name is REQUIRED for the shell-aware busy rule (resting cmd.exe ⇒ idle).
       const psCmd =
         "Get-CimInstance Win32_Process | " +
         "Select-Object Name,ProcessId,ParentProcessId | " +

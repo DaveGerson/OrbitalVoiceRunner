@@ -8,7 +8,7 @@ import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
-import { SHELL_PROMPT } from "./src/statusMachine";
+import { SHELL_PROMPT } from "./src/statusConstants";
 
 dotenv.config();
 
@@ -415,8 +415,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         // The busy/idle status is now owned by the authoritative state machine
         // (src/statusMachine.ts). Here we only refine an already-Idle pane into a
         // "prompt" attention if it looks like a shell prompt awaiting input —
-        // using the SAME narrowed, gated regex (I4: shell panes only, never an
-        // interactive_cli TUI). Otherwise we defer to the machine's "idle".
+        // using the shared SHELL_PROMPT regex from statusConstants.ts (I4: shell
+        // panes only, never an interactive_cli TUI). This is an attention-label
+        // concern independent of the idle decision. Otherwise we defer to "idle".
         const isShell = term.runtimeType === "shell";
         const tail = stripAnsiSequences(cleanChunk);
         if (isShell && SHELL_PROMPT.test(tail)) {

@@ -6,8 +6,10 @@ import type { ProbeResult } from "./statusProbe";
  *
  * The decision is busy-biased (I2): any positive "still running" signal wins.
  * Idle is only declared when the authoritative probe says no running child
- * (after debounce), or — in fallback mode — when quiescence + a narrowed prompt
- * (shell panes) hold.
+ * (after debounce), or — in fallback mode — when output quiescence holds (the
+ * debounced idle timer fires). Idle is quiescence-only and runtime-type
+ * independent; there is no prompt gate here (that refinement lives in server.ts
+ * as a separate attention-label concern).
  *
  * This function makes NO side effects and arms NO timers; the caller
  * (UniversalTerminal) owns the timers and fires onIdle on the Running->Idle edge.
@@ -15,9 +17,6 @@ import type { ProbeResult } from "./statusProbe";
 
 export type Status = "Running" | "Idle" | "Exited";
 export type RuntimeType = "shell" | "interactive_cli";
-
-/** Narrowed shell prompt: the ENTIRE last line is a prompt (otherwise empty). */
-export const SHELL_PROMPT = /(^|\n)[^\n]{0,80}?[\$#%>]\s?$/;
 
 export type StatusEvent =
   | { kind: "output"; text: string }   // an output chunk arrived (ANSI-stripped recent tail)
@@ -28,13 +27,21 @@ export type StatusEvent =
 export interface DecideInputs {
   event: StatusEvent;
   currentStatus: Status;
+  /**
+   * Pane runtime type. Retained on the input contract (callers/replay harness
+   * pass it) for clarity and future gating; the idle decision itself is currently
+   * runtime-type independent.
+   */
   runtimeType: RuntimeType;
-  /** Recent ANSI-stripped tail used for fallback prompt detection. */
+  /**
+   * Recent ANSI-stripped tail. Retained on the contract for callers; no longer
+   * consumed by the idle decision (the prompt gate was removed — see file header).
+   */
   recentTail: string;
   /**
    * Confidence of the most recent probe. "authoritative" => the process-state
    * probe drives idle (output never claims idle on its own). "fallback" =>
-   * quiescence + prompt drive idle (no-worse-than-today).
+   * output quiescence drives idle (no-worse-than-today).
    */
   confidence: "authoritative" | "fallback";
   /**
@@ -56,10 +63,6 @@ export interface DecideResult {
   fireOnIdle: boolean;
 }
 
-function lastLineIsPrompt(tail: string): boolean {
-  return SHELL_PROMPT.test(tail);
-}
-
 const NO_CHANGE = (status: Status): DecideResult => ({
   status,
   armIdleTimer: false,
@@ -68,7 +71,7 @@ const NO_CHANGE = (status: Status): DecideResult => ({
 });
 
 export function decideStatus(inp: DecideInputs): DecideResult {
-  const { event, currentStatus, runtimeType, recentTail, confidence, idleTimerArmed } = inp;
+  const { event, currentStatus, confidence, idleTimerArmed } = inp;
 
   // Tier 0 — Exited is terminal and immune to all lower tiers.
   if (currentStatus === "Exited") {
@@ -141,25 +144,15 @@ export function decideStatus(inp: DecideInputs): DecideResult {
     }
 
     case "idleTimer": {
-      // The debounced timer fired.
-      if (confidence === "authoritative") {
-        // The timer is only armed in authoritative mode after a "no running
-        // child" probe; any reappearing child would have fired a probe tick that
-        // called setRunning() and cleared this timer. So if it survives to fire,
-        // no child is running ⇒ safe to declare Idle.
-        return setIdle();
-      }
-      // Fallback mode: gate by runtime_type (I4). Shell panes idle on
-      // quiescence + a narrowed prompt; interactive_cli idles on quiescence only
-      // and NEVER on a prompt-looking line.
-      if (runtimeType === "shell") {
-        if (lastLineIsPrompt(recentTail)) {
-          return setIdle();
-        }
-        // No prompt visible — quiescence alone (no worse than today).
-        return setIdle();
-      }
-      // interactive_cli in fallback: idle purely on quiescence, never prompt regex.
+      // The debounced timer fired ⇒ declare Idle, identically in both modes.
+      //  - Authoritative: the timer is only armed after a "no running child"
+      //    probe; any reappearing child fires a probe tick that calls setRunning()
+      //    and clears this timer, so surviving to fire means no child is running.
+      //  - Fallback: idle is quiescence-only and runtime-type independent. The
+      //    earlier "shell panes gate on a prompt regex" design never shipped — both
+      //    the shell and interactive_cli arms returned setIdle() unconditionally —
+      //    so this is collapsed to one honest path (the SHELL_PROMPT refinement
+      //    lives only in server.ts as a separate attention-label concern).
       return setIdle();
     }
 

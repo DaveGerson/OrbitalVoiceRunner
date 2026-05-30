@@ -1,34 +1,9 @@
 import fs from "fs";
-import { WatchRule, Plan } from "./types";
+import { WatchRule, Plan, PaneMeta, Workspace } from "./types";
 
-export interface PaneMeta {
-  pane_id: string;
-  name: string;
-  runtime_type: string;
-  last_known_state: string;
-  is_busy: boolean;
-  alive: boolean;
-  notes: string[];
-  permissions_mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
-  session_id: string;
-  tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
-  context_size: number;
-  // WS-C status-detection additions (design §4.1). All optional so existing
-  // persisted ledgers load unchanged.
-  last_status_change_at?: string;   // ISO timestamp of last Running/Idle/Exited transition
-  last_command?: string;            // most recent command written via writeInput
-  elapsed_ms?: number;              // derived at read time: now - last_status_change_at
-}
-
-export interface Workspace {
-  id: string;
-  name: string;
-  directory: string;
-  summary: string;
-  notes: string[];
-  panes: Record<string, PaneMeta>;
-  keyTerms?: string[];
-}
+// PaneMeta and Workspace are defined once in ./types (frontend-safe) and
+// re-exported here so existing `from "./ledger"` imports keep working (D7).
+export type { PaneMeta, Workspace };
 
 export class Ledger {
   activeProjectId: string | null = null;
