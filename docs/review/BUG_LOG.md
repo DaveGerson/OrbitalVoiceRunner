@@ -672,6 +672,25 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 
 ---
 
+#### BUG-040 — `POST /api/plans/:id/execute` REST endpoint writes plan step 0 to a pane un-gated
+- **Found by:** WS-E fix-round review (least-authority pane-write audit).
+- **Category:** Permission / least-authority bypass (REST surface).
+- **Priority:** P2 (un-gated execution route, but UI/REST-initiated by the operator, not model-initiated).
+- **Description:** The manual REST plan-start endpoint (`server.ts:~985`) writes the plan's first
+  step to the target pane WITHOUT passing the effective-mode gate (Full Auto / Human-in-the-Loop /
+  Read-Only). WS-E (R4) gated the *voice* `execute_plan` tool path and plan-step *advancement*
+  (steps 2..N now route through `activePlanGate`, including for plans started via this endpoint),
+  but step 0 of a REST-initiated plan still bypasses the gate. So a plan launched from the UI while
+  a pane is Human-in-the-Loop / Read-Only executes its first step without approval.
+- **Operator impact:** A UI-launched plan can run its first command on a pane that should require
+  approval (or be read-only), inconsistent with the voice path and the least-authority promise.
+- **Suggested fix:** Route the REST endpoint's step-0 write through the same effective-mode +
+  pending-approval path as `dispatchProposal` / `activePlanGate`. Relates to WS-G (permission truth)
+  and the REST-scoping work in WS-L.
+- **Status:** OPEN (logged during WS-E; deferred — outside WS-E's voice scope).
+
+---
+
 #### BUG-033 — Doc discrepancies: README/JOURNEYS_DESIGN claims not matched by code
 - **Priority:** P3
 - **Category:** Inaccurate-doc

@@ -275,6 +275,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   let activeFrontendWs: any = null;
   const clients = new Set<any>();
 
+  // P0-3 (R4): minimal single-active-session registry used ONLY to gate plan-step ADVANCEMENT
+  // (steps 2..N). `handlePlansTrigger` runs at this outer scope and has no `session`/
+  // `dispatchProposal` in scope; the live connection installs a handle here (and clears it on
+  // close) so a step-completion can route the NEXT step's pane write through the SAME
+  // effective-mode + pending-approval gate as `dispatchProposal`. This is NOT the WS-D-declined
+  // proactive in-voice path — it is the same kind of handle the WS-E resolution push already
+  // needs. Single active session by design; if none is live we FALL BACK TO SAFE behavior
+  // (never an un-gated write). The outcome mirrors `dispatchProposal`'s DispatchOutcome.
+  let activePlanGate:
+    | ((opts: { pendingId: string; targetId: string; instruction: string; trigger: string }) =>
+        { kind: "executed" | "blocked" | "error" | "clarify" | "pending"; text: string })
+    | null = null;
+
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
     for (const client of clients) {
@@ -354,12 +367,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               const nextStep = plan.steps[nextIndex];
               nextStep.status = "running";
               const nextTerm = manager.terminals[nextStep.terminalId];
-              if (nextTerm) {
-                console.log(`[PLAN PROGRESS] Running next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
-                HistoryManager.getInstance().addCommand(nextStep.terminalId, nextStep.command);
-                nextTerm.writeInput(nextStep.command);
-                changed = true;
-              } else {
+              if (!nextTerm) {
                 plan.status = "paused";
                 nextStep.status = "failed";
                 const itemID = "att_" + Math.random().toString(36).substring(2, 11);
@@ -379,6 +387,60 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   terminalId: nextStep.terminalId,
                   summary: `Plan '${plan.name}' paused — pane offline.`
                 });
+                changed = true;
+              } else if (!activePlanGate) {
+                // P0-3: no live session to gate through — FALL BACK TO SAFE. We MUST NOT write
+                // the next step un-gated (that is the least-authority hole). Pause and surface
+                // it for attention; the operator can resume once a session is live.
+                plan.status = "paused";
+                nextStep.status = "pending";
+                console.log(`[PLAN PROGRESS] Deferring step ${nextIndex + 1} of '${plan.name}': no active session to gate the write. NOT writing un-gated.`);
+                const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+                manager.attentionQueue.push({
+                  id: itemID,
+                  type: "error",
+                  terminalId: nextStep.terminalId,
+                  projectId: manager.ledger.activeProjectId || "default_project",
+                  message: `Plan '${plan.name}' paused: step ${nextIndex + 1} needs the approval gate but no voice session is active.`,
+                  timestamp: new Date().toISOString(),
+                  dismissed: false
+                });
+                pruneAttention(); // BUG-035 cap/TTL
+                broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+                announcementBus.enqueue({
+                  kind: "plan_paused",
+                  terminalId: nextStep.terminalId,
+                  summary: `Plan '${plan.name}' paused — no session to approve next step.`
+                });
+                changed = true;
+              } else {
+                // P0-3 (R4): route the next step's pane write through the SAME effective-mode +
+                // pending-approval gate as `dispatchProposal`. In HiTL the step becomes a spoken
+                // pending approval (it does NOT auto-execute), in Full Auto it runs, in Read-Only
+                // it is blocked. (WS-B redaction is applied inside the gate / narration.)
+                console.log(`[PLAN PROGRESS] Gating next step command: '${nextStep.command}' on '${nextStep.terminalId}'`);
+                const outcome = activePlanGate({
+                  pendingId: `plan__${plan.id}__step${nextIndex}`,
+                  targetId: nextStep.terminalId,
+                  instruction: nextStep.command,
+                  trigger: `Plan '${plan.name}' step ${nextIndex + 1}`,
+                });
+                if (outcome.kind === "executed") {
+                  // Full Auto: ran immediately; step stays "running" until its own transition.
+                } else if (outcome.kind === "pending") {
+                  // HiTL: now a spoken pending approval — do NOT auto-execute. Mark the step as
+                  // awaiting approval so the UI/plan state reflects that it has not run yet.
+                  nextStep.status = "pending";
+                } else {
+                  // blocked (Read-Only) / clarify / error: pause the plan, never silently write.
+                  plan.status = "paused";
+                  nextStep.status = "failed";
+                  announcementBus.enqueue({
+                    kind: "plan_paused",
+                    terminalId: nextStep.terminalId,
+                    summary: `Plan '${plan.name}' paused on step ${nextIndex + 1}: ${outcome.text}`,
+                  });
+                }
                 changed = true;
               }
             } else {
@@ -1080,16 +1142,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       return;
     }
     const session = pendingApprovals.sessionFor(messageId);
+    // R3 (P0-1): `call.id` was already consumed exactly once by the non-blocking
+    // `pending_approval` response at proposal time. Resolution therefore NEVER sends a second
+    // `sendToolResponse` for that id (it would double-answer the functionCall). The model-facing
+    // outcome is delivered via the `pushApprovalNarration` push instead.
+    const safeInstr = redactSecrets(pending.instruction);
     if (approved) {
       const term = manager.terminals[pending.terminalId];
       // WS-E.3 (BUG-020): dead target -> error, never false success.
       if (!term) {
-        try {
-          session?.sendToolResponse({
-            functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: `Error: pane ${pending.terminalId} is gone; could not dispatch.` } }]
-          });
-        } catch (e) { console.error("Failed tool response on dead-pane REST approve:", e); }
         pendingApprovals.delete(messageId);
+        if (session) pushApprovalNarration(session, `That pane (${pending.terminalId}) is gone — I could not dispatch the command.`);
         res.status(422).json({ success: false, error: "target pane missing" });
         return;
       }
@@ -1100,23 +1163,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       }
       HistoryManager.getInstance().addCommand(pending.terminalId, pending.instruction);
       term.writeInput(pending.instruction);
-      try {
-        session?.sendToolResponse({
-          functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: `Command dispatched to ${pending.terminalId} successfully.` } }]
-        });
-      } catch (e) {
-        console.error("Failed to send tool response to dead/closed session on approve:", e);
-      }
-      broadcast({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: redactSecrets(pending.instruction) });
+      if (session) pushApprovalNarration(session, `Operator approved; dispatched "${safeInstr}" to pane ${pending.terminalId}.`);
+      // P1-2: this is an operator-APPROVED command, not an auto-execution — flag it so the UI
+      // does not mislabel it as auto-approved.
+      broadcast({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: safeInstr, approved: true });
     } else {
-      try {
-        session?.sendToolResponse({
-          functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: "Execution cancelled by operator." } }]
-        });
-      } catch (e) {
-        console.error("Failed to send tool response to dead/closed session on reject:", e);
-      }
-      broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: redactSecrets(pending.instruction), reason: "Execution cancelled by operator." });
+      if (session) pushApprovalNarration(session, `Operator rejected the command on pane ${pending.terminalId}: "${safeInstr}".`);
+      broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Execution cancelled by operator." });
     }
     pendingApprovals.delete(messageId);
     broadcast({ type: "terminals_updated" });
@@ -1130,11 +1183,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
       const session = pendingApprovals.sessionFor(pending.messageId);
       pendingApprovals.delete(pending.messageId);
-      try {
-        session?.sendToolResponse({
-          functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: `Approval for "${redactSecrets(pending.instruction)}" on pane ${pending.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes and was cancelled.` } }]
-        });
-      } catch (e) { console.error("Failed tool response on TTL auto-reject:", e); }
+      // R3 (P0-1): `call.id` was already answered once by the non-blocking `pending_approval`
+      // response; TTL expiry narrates the cancellation via the push, never a 2nd tool response.
       if (session) {
         pushApprovalNarration(session, `The command on pane ${pending.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
       }
@@ -1180,13 +1230,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (!pending) return;
       const safeInstr = redactSecrets(pending.instruction);
       const verb = pending.kind === "agent_instruction" ? "direct pane" : "run on pane";
+      // R3 (P0-1): `call.id` was already consumed exactly once by the non-blocking
+      // `pending_approval` response. Resolution delivers the model-facing outcome ONLY via the
+      // `pushApprovalNarration` push — never a second `sendToolResponse` on `pending.callId`.
       if (approve) {
         const term = manager.terminals[pending.terminalId];
         if (!term) {
           pendingApprovals.delete(messageId);
-          try {
-            sess?.sendToolResponse({ functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: `Error: pane ${pending.terminalId} is gone; could not dispatch "${safeInstr}".` } }] });
-          } catch (e) { console.error("Failed tool response on dead-pane voice approve:", e); }
           pushApprovalNarration(sess, `That pane (${pending.terminalId}) is gone — I could not dispatch the command.`);
           broadcast({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Target pane missing." });
           return;
@@ -1195,15 +1245,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         pushApprovalNarration(sess, `Approving: ${verb} ${pending.terminalId} — "${safeInstr}". Dispatching now.`);
         HistoryManager.getInstance().addCommand(pending.terminalId, pending.instruction);
         term.writeInput(pending.instruction);
-        try {
-          sess?.sendToolResponse({ functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: `Command dispatched to ${pending.terminalId} successfully via voice.` } }] });
-        } catch (e) { console.error("Failed tool response on voice approve:", e); }
-        clientWs.send(JSON.stringify({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: safeInstr, vocal: true }));
+        clientWs.send(JSON.stringify({ type: "command_auto_executed", terminalId: pending.terminalId, cmd: safeInstr, vocal: true, approved: true }));
       } else {
         pushApprovalNarration(sess, `Rejecting the command on pane ${pending.terminalId}: "${safeInstr}".`);
-        try {
-          sess?.sendToolResponse({ functionResponses: [{ name: "propose_command", id: pending.callId, response: { output: "Execution cancelled by operator via voice." } }] });
-        } catch (e) { console.error("Failed tool response on voice reject:", e); }
         clientWs.send(JSON.stringify({ type: "command_blocked", terminalId: pending.terminalId, cmd: safeInstr, reason: "Execution cancelled by operator via voice." }));
       }
       pendingApprovals.delete(messageId);
@@ -1755,8 +1799,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const targetTerm = manager.terminals[target_pane_id];
                 
                 let resp = "";
+                // P2-1: this writes a comment block to the TARGET pane stdin — still a write, so
+                // respect Read-Only at minimum (least-authority). TODO(WS-G): route the full
+                // handoff write through the same effective-mode + pending-approval gate as
+                // `dispatchProposal` (HiTL should make it a spoken approval too).
+                const targetEffectiveMode = manager.globalPermissionsMode === "Inherit"
+                  ? (targetTerm ? targetTerm.permissionsMode : "Human-in-the-Loop")
+                  : manager.globalPermissionsMode;
                 if (!sourceTerm || !targetTerm) {
                   resp = `Error: Both source and target terminal panes must be active. (Source: ${sourceTerm ? 'OK':'Not found'}, Target: ${targetTerm ? 'OK':'Not found'})`;
+                } else if (targetEffectiveMode === "Read-Only") {
+                  broadcast({ type: "command_blocked", terminalId: target_pane_id, cmd: "(handoff context block)", reason: "Read-Only policy enforced." });
+                  resp = `Error: Target pane ${target_pane_id} is Read-Only; the handoff context block was not written.`;
                 } else {
                   const sourceHistory = HistoryManager.getInstance().loadHistory(source_pane_id);
                   const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
@@ -2103,6 +2157,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }]
       },
     });
+
+      // P0-3 (R4): install the single-active-session plan gate now that `session` is live, so
+      // `handlePlansTrigger` (outer scope) can route step ADVANCEMENT (steps 2..N) through the
+      // SAME `dispatchProposal` gate. Step-advancement is server-initiated (there is no live
+      // functionCall to answer), so the synthetic `pendingId` doubles as the record `callId`;
+      // resolution narrates via `pushApprovalNarration` only and never answers a tool call.
+      activePlanGate = (opts) =>
+        dispatchProposal({
+          sess: session,
+          callId: opts.pendingId,
+          pendingId: opts.pendingId,
+          targetId: opts.targetId,
+          instruction: opts.instruction,
+          trigger: opts.trigger,
+        });
     } catch (err: any) {
       console.error("Failed to establish Gemini Live session:", err);
       clientWs.send(JSON.stringify({ 
@@ -2142,6 +2211,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
       }
+      activePlanGate = null; // P0-3: drop the plan gate; advancement now falls back to SAFE.
       if (session) {
         // Clean up any pending approvals associated with this session to avoid leaks or hanging
         // tool-calls. TODO(WS-F): persist + re-announce these on reconnect instead of purging

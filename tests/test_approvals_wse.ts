@@ -283,23 +283,36 @@ function makeHarness() {
     return d.type;
   }
 
+  // P0-1/R3: resolution mirrors production — `call.id` was already answered ONCE by the
+  // non-blocking `pending_approval` response at proposal time, so resolution NEVER sends a
+  // second `sendToolResponse`. The model-facing outcome is delivered ONLY via the
+  // `sendClientContent` push (the read-back/narration).
   function resolve(session: FakeSession, messageId: string, approve: boolean) {
     const p = store.get(messageId);
     if (!p) return;
     if (approve) {
       const term = terms[p.terminalId];
-      if (!term) { // BUG-020 dead pane -> error, no write
+      if (!term) { // BUG-020 dead pane -> error via push, no write, no 2nd tool response
         store.delete(messageId);
-        session.sendToolResponse({ functionResponses: [{ name: "propose_command", id: p.callId, response: { output: "Error: pane gone" } }] });
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: "Error: pane gone" }] }], turnComplete: true });
         return;
       }
       if (!store.claim(messageId)) return;
       term.writeInput(p.instruction);
+      session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator approved; dispatched to ${p.terminalId}.` }] }], turnComplete: true });
+    } else {
+      session.sendClientContent({ turns: [{ role: "user", parts: [{ text: `Operator rejected on ${p.terminalId}.` }] }], turnComplete: true });
     }
     store.delete(messageId);
   }
 
-  return { store, terms, dispatch, resolve };
+  // P0-3: a trimmed model of `handlePlansTrigger` advancement — step completion routes the
+  // NEXT step's write through the SAME gated `dispatch` (never an un-gated writeInput).
+  function advancePlan(session: FakeSession, planId: string, nextIndex: number, paneId: string, command: string, kind: any) {
+    return dispatch(session, `plan__${planId}__step${nextIndex}`, `plan__${planId}__step${nextIndex}`, paneId, command, kind);
+  }
+
+  return { store, terms, dispatch, resolve, advancePlan };
 }
 
 describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
@@ -325,6 +338,34 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     assert.deepStrictEqual(h.terms["pane_a"].writes, ["run the tests"]);
   });
 
+  it("P0-1: approve answers call.id EXACTLY ONCE (the pending response); outcome via push", () => {
+    const h = makeHarness();
+    h.terms["pane_a"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
+    const sess = new FakeSession();
+    h.dispatch(sess, "call1", "call1", "pane_a", "run the tests", undefined);
+    h.resolve(sess, "call1", true);
+    // The functionCall id was answered ONCE (the non-blocking pending_approval); resolution
+    // must NOT add a second tool response — it narrates via sendClientContent.
+    const answersForCall = sess.toolResponses.filter(
+      (tr) => tr.functionResponses?.[0]?.id === "call1"
+    );
+    assert.strictEqual(answersForCall.length, 1, "call.id answered exactly once");
+    assert.strictEqual(answersForCall[0].functionResponses[0].response.status, "pending_approval");
+    assert.ok(sess.clientContents.length >= 1, "outcome delivered via sendClientContent push");
+  });
+
+  it("P0-1: reject also answers call.id exactly once and narrates via push", () => {
+    const h = makeHarness();
+    h.terms["pane_a"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
+    const sess = new FakeSession();
+    h.dispatch(sess, "callR", "callR", "pane_a", "deploy", undefined);
+    h.resolve(sess, "callR", false);
+    const answers = sess.toolResponses.filter((tr) => tr.functionResponses?.[0]?.id === "callR");
+    assert.strictEqual(answers.length, 1, "call.id answered exactly once on reject");
+    assert.strictEqual(h.terms["pane_a"].writes.length, 0, "reject writes nothing");
+    assert.ok(sess.clientContents.length >= 1, "reject narrated via push");
+  });
+
   it("kind:'shell' non-allowlisted -> clarify, no dispatch (even Full Auto)", () => {
     const h = makeHarness();
     h.terms["sh"] = new FakeTerm("shell", "Full Auto");
@@ -334,15 +375,18 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     assert.strictEqual(h.terms["sh"].writes.length, 0);
   });
 
-  it("BUG-020: approving a dead pane -> error tool response, no write", () => {
+  it("BUG-020: approving a dead pane -> spoken error via push, no write, no 2nd tool response", () => {
     const h = makeHarness();
     h.terms["pane_a"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
     const sess = new FakeSession();
     h.dispatch(sess, "call1", "call1", "pane_a", "deploy", undefined);
     delete h.terms["pane_a"]; // pane killed before approval
     h.resolve(sess, "call1", true);
-    const last = sess.toolResponses[sess.toolResponses.length - 1].functionResponses[0].response.output;
-    assert.ok(String(last).startsWith("Error"));
+    // call.id still answered exactly once (the pending response); the dead-pane error is a push.
+    const answers = sess.toolResponses.filter((tr) => tr.functionResponses?.[0]?.id === "call1");
+    assert.strictEqual(answers.length, 1, "no second tool response on dead-pane approve");
+    const lastPush = sess.clientContents[sess.clientContents.length - 1].turns[0].parts[0].text;
+    assert.ok(String(lastPush).includes("pane gone"));
     assert.strictEqual(h.store.has("call1"), false);
   });
 
@@ -387,5 +431,44 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
     const r = h.dispatch(sess, "planCall", "planCall__plan1__step0", "build", "npm run build", undefined, "Full Auto");
     assert.strictEqual(r, "executed");
     assert.deepStrictEqual(h.terms["build"].writes, ["npm run build"]);
+  });
+
+  it("P0-3: a HiTL multi-step plan does NOT auto-execute steps 2..N (advancement is gated)", () => {
+    // Step 1 ran; step 1 completes -> the orchestrator advances to step 2. That advancement
+    // MUST route the NEXT step's write through the gate (a pending approval in HiTL), NOT a
+    // bare un-gated writeInput. This is the least-authority hole P0-3 closes.
+    const h = makeHarness();
+    h.terms["s1"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
+    h.terms["s2"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
+    const sess = new FakeSession();
+
+    // step 0 proposed (HiTL pending), then operator approves it -> it runs on s1.
+    h.dispatch(sess, "planCall", "plan__plan1__step0", "s1", "build", undefined);
+    h.resolve(sess, "plan__plan1__step0", true);
+    assert.deepStrictEqual(h.terms["s1"].writes, ["build"], "step 1 ran after approval");
+
+    // step 1 completes -> advancement to step 2 (index 1) must be GATED, not auto-written.
+    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
+    assert.strictEqual(adv, "pending", "step 2 must become a pending approval, not auto-run");
+    assert.strictEqual(h.terms["s2"].writes.length, 0, "step 2 must NOT auto-execute");
+    assert.ok(h.store.has("plan__plan1__step1"), "step 2 held as a pending approval");
+  });
+
+  it("P0-3: Full Auto plan advancement runs the next step immediately (still through the gate)", () => {
+    const h = makeHarness();
+    h.terms["s2"] = new FakeTerm("interactive_cli", "Full Auto");
+    const sess = new FakeSession();
+    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
+    assert.strictEqual(adv, "executed");
+    assert.deepStrictEqual(h.terms["s2"].writes, ["deploy"]);
+  });
+
+  it("P0-3: Read-Only plan advancement is blocked (no write)", () => {
+    const h = makeHarness();
+    h.terms["s2"] = new FakeTerm("interactive_cli", "Read-Only");
+    const sess = new FakeSession();
+    const adv = h.advancePlan(sess, "plan1", 1, "s2", "deploy", undefined);
+    assert.strictEqual(adv, "blocked_read_only");
+    assert.strictEqual(h.terms["s2"].writes.length, 0);
   });
 });
