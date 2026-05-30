@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert";
 import { EVENT_TYPES } from "../src/store/eventTypes";
 import { JanusStore } from "../src/store/sqliteStore";
+import type { StoredWorkspace } from "../src/store/types";
 
 test("recordActivity appends an event and applies state mutation atomically", () => {
   const s = new JanusStore(":memory:"); s.init();
@@ -37,4 +38,30 @@ test("event vocabulary is frozen and complete", () => {
                    "pane_created","pane_archived","pane_restored","project_created","plan_step"]) {
     assert.ok(Object.values(EVENT_TYPES).includes(t as any), `missing event type ${t}`);
   }
+});
+
+test("saveWorkspace upserts; addNote writes a normalized row + note_added event", () => {
+  const s = new JanusStore(":memory:"); s.init();
+  const ws: StoredWorkspace = { id:"p1", name:"P1", directory:"/tmp", summary:"s", key_terms:["a"], created_at:0, updated_at:0 };
+  s.saveWorkspace(ws);
+  assert.equal(s.getWorkspaces()["p1"].key_terms[0], "a");
+
+  const note = s.addNote("p1", "we chose CJS", { type: "decision", author: "user" });
+  const notes = s.getNotes({ projectId: "p1" });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].type, "decision");
+  assert.equal(notes[0].id, note.id);
+  assert.equal(s.getEvents({ type: "note_added" }).length, 1);
+  s.close();
+});
+
+test("amendNote and deleteNote keep FTS consistent", () => {
+  const s = new JanusStore(":memory:"); s.init();
+  s.saveWorkspace({ id:"p1", name:"P1", directory:"", summary:"", key_terms:[], created_at:0, updated_at:0 });
+  const n = s.addNote("p1", "rate limiting via token bucket", {});
+  s.amendNote(n.id, "rate limiting via leaky bucket");
+  assert.equal(s.getNotes({ projectId:"p1" })[0].text, "rate limiting via leaky bucket");
+  s.deleteNote(n.id);
+  assert.equal(s.getNotes({ projectId:"p1" }).length, 0);
+  s.close();
 });
