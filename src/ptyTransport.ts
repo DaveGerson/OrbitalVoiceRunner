@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from "child_process";
+import { createRequire } from "module";
 
 /**
  * PtyTransport — the spawn/IO seam (WS-C design §2.4 / §5).
@@ -44,35 +45,23 @@ function loadNodePty(): any {
   if (_nodePtyResolved) return _nodePtyModule;
   _nodePtyResolved = true;
   const PKG = "@homebridge/node-pty-prebuilt-multiarch";
-  // Resolve a working `require` regardless of runtime. Under tsx/ESM (the dev
-  // server's `tsx server.ts`), a bare global `require` is NOT defined, so the old
-  // `require(...)` threw and silently forced EVERY pane onto the legacy non-PTY
-  // transport — which gives the agent a piped (non-TTY) stdin, so Claude detects
-  // no terminal and exits after a few seconds. createRequire gives us a real
-  // CommonJS require in both ESM (tsx) and CJS (built dist/server.cjs) contexts.
+  // Resolve node-pty regardless of runtime. Under tsx/ESM (the dev server runs
+  // `tsx server.ts`) a bare global `require` is NOT defined, so the old
+  // `require(PKG)` threw and silently forced EVERY pane onto the legacy non-PTY
+  // transport — piped (non-TTY) stdin, so Claude detects no terminal and exits
+  // after a few seconds (the "panes never hold a live session" bug). We build a
+  // CommonJS require via createRequire (statically imported, so it works in both
+  // ESM/tsx and the built CJS bundle) bound to this module's location.
   try {
-    let req: NodeRequire | undefined =
-      typeof require === "function" ? require : undefined;
-    if (!req) {
-      // ESM/tsx path: synthesize a require bound to this module's location.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { createRequire } = require("module");
-      req = createRequire(import.meta.url);
-    }
-    _nodePtyModule = req!(PKG);
+    const req =
+      typeof require === "function"
+        ? require
+        : createRequire(import.meta.url);
+    _nodePtyModule = req(PKG);
     _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
-  } catch {
-    // Last-resort: try createRequire even if the first branch's `require` itself
-    // was the thing that was undefined (belt-and-suspenders for odd loaders).
-    try {
-      const { createRequire } = eval("require")("module");
-      const req2 = createRequire(import.meta.url);
-      _nodePtyModule = req2(PKG);
-      _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
-    } catch {
-      _nodePtyModule = null;
-      _nodePtyAvailable = false;
-    }
+  } catch (e) {
+    _nodePtyModule = null;
+    _nodePtyAvailable = false;
   }
   return _nodePtyModule;
 }
