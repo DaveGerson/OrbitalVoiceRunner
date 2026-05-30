@@ -121,6 +121,26 @@ export class JanusStore {
     ).all(...args).map((r:any) => ({ ...r })) as any;
   }
 
+  /** Full-text search across notes + events, ranked by bm25. */
+  search(query: string, opts: { limit?: number } = {}): Array<{ source:"note"|"event"; id:string; snippet:string; rank:number }> {
+    const limit = opts.limit ?? 25;
+    const notes = this.db.prepare(
+      `SELECT n.id AS id, n.text AS snippet, bm25(notes_fts) AS rank
+       FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
+       WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`
+    ).all(query, limit) as any[];
+    const events = this.db.prepare(
+      `SELECT e.id AS id, e.summary AS snippet, bm25(events_fts) AS rank
+       FROM events_fts JOIN events e ON e.id = events_fts.rowid
+       WHERE events_fts MATCH ? ORDER BY rank LIMIT ?`
+    ).all(query, limit) as any[];
+    const merged = [
+      ...notes.map(r => ({ source:"note" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
+      ...events.map(r => ({ source:"event" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
+    ].sort((a,b) => a.rank - b.rank);
+    return merged.slice(0, limit);
+  }
+
   /** Seam for deterministic IDs in tests. */
   protected rand(): number { return Math.random(); }
 

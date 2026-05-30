@@ -65,3 +65,16 @@ test("amendNote and deleteNote keep FTS consistent", () => {
   assert.equal(s.getNotes({ projectId:"p1" }).length, 0);
   s.close();
 });
+
+test("settings_kv and kv round-trip and upsert", () => {
+  const s = new JanusStore(":memory:"); s.init();
+  s.saveSettings("voiceAi.voice", "Charon");
+  assert.equal(s.getSettings("voiceAi.voice"), "Charon");
+  s.saveSettings("voiceAi.voice", "Puck");
+  assert.equal(s.getSettings("voiceAi.voice"), "Puck");
+  s.setKV("activeProjectId", "p1");
+  assert.equal(s.getKV("activeProjectId"), "p1");
+  s.deleteKV("activeProjectId");
+  assert.equal(s.getKV("activeProjectId"), null);
+  s.close();
+});
