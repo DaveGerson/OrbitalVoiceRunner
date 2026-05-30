@@ -287,4 +287,139 @@ export class JanusStore {
   bootMaintenance(opts: PruneOpts): void {
     pruneOnBoot(this.db, opts);
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Ledger API parity shims (WS-M Task 13, Part B).
+  //
+  // These reproduce the OLD `Ledger` return shapes against SQLite so server.ts
+  // call sites keep working when wired through this store. They are ADDITIVE —
+  // nothing above is changed. Where the Ledger exposed a `Workspace` with
+  // nested `panes: Record<string,PaneMeta>` and `notes: string[]`, these methods
+  // project the relational tables back into that legacy shape.
+  //
+  // NOT covered here (intentionally): `plans`, `watchRules`, `archivedPanes` as
+  // live mutable arrays, and `.save()`. There are no `plans`/`watch_rules`
+  // tables in the schema, and server.ts mutates those arrays in place
+  // (`.push`/`.splice`). Those must remain on the legacy Ledger. See the Part C
+  // analysis in the task report.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** Active project id, persisted in kv (Ledger.activeProjectId parity). */
+  get activeProjectId(): string | null {
+    return this.getKV("activeProjectId");
+  }
+  set activeProjectId(id: string | null) {
+    if (id == null) this.deleteKV("activeProjectId");
+    else this.setKV("activeProjectId", id);
+  }
+
+  /** Set the active project (Ledger.switchContext parity). Only switches if it exists. */
+  switchContext(id: string): void {
+    const exists = this.db.prepare("SELECT 1 FROM projects WHERE id=?").get(id);
+    if (exists) this.setKV("activeProjectId", id);
+  }
+
+  /** Project notes as a plain string[] (legacy Workspace.notes shape). */
+  private projectNoteStrings(projectId: string): string[] {
+    // Legacy notes were chronological; getNotes returns DESC, so reverse to ASC.
+    return this.getNotes({ projectId }).filter(n => !n.pane_id).map(n => n.text).reverse();
+  }
+
+  /** Pane notes as a plain string[] (legacy PaneMeta.notes shape). */
+  private paneNoteStrings(projectId: string, paneId: string): string[] {
+    return this.getNotes({ projectId, paneId }).map(n => n.text).reverse();
+  }
+
+  /** Project a StoredPane into the legacy PaneMeta shape (with notes[]). */
+  private toPaneMeta(p: StoredPane): import("../types").PaneMeta {
+    return {
+      pane_id: p.pane_id,
+      name: p.name,
+      alive: p.alive,
+      last_command: p.last_command ?? undefined,
+      last_known_state: p.last_known_state,
+      notes: this.paneNoteStrings(p.workspace_id, p.pane_id),
+      session_id: p.session_id,
+      context_size: p.context_size,
+      is_busy: p.is_busy,
+      tool_preset: p.tool_preset,
+      permissions_mode: p.permissions_mode,
+      runtime_type: p.runtime_type,
+    } as import("../types").PaneMeta;
+  }
+
+  /** A single project in the legacy Workspace shape, or null. */
+  getProject(id: string): import("../types").Workspace | null {
+    const r = this.db.prepare("SELECT * FROM projects WHERE id=?").get(id) as any;
+    if (!r) return null;
+    const panes: Record<string, import("../types").PaneMeta> = {};
+    for (const [pid, sp] of Object.entries(this.getPanes(id))) {
+      panes[pid] = this.toPaneMeta(sp);
+    }
+    return {
+      id: r.id,
+      name: r.name,
+      directory: r.directory,
+      summary: r.summary ?? "",
+      notes: this.projectNoteStrings(id),
+      panes,
+      keyTerms: this.parseJSON(r.key_terms, [] as string[]),
+    } as import("../types").Workspace;
+  }
+
+  /** The active project in legacy Workspace shape, or null. */
+  getActiveProject(): import("../types").Workspace | null {
+    const id = this.activeProjectId;
+    return id ? this.getProject(id) : null;
+  }
+
+  /** All projects keyed by id, in legacy Workspace shape (read snapshot). */
+  get workspaces(): Record<string, import("../types").Workspace> {
+    const out: Record<string, import("../types").Workspace> = {};
+    const ids = (this.db.prepare("SELECT id FROM projects ORDER BY created_at").all() as any[]).map(r => r.id);
+    for (const id of ids) {
+      const ws = this.getProject(id);
+      if (ws) out[id] = ws;
+    }
+    return out;
+  }
+
+  /** Create a project if absent (Ledger.addProject parity). */
+  addProject(id: string, directory: string, summary = "", keyTerms: string[] = []): void {
+    const exists = this.db.prepare("SELECT 1 FROM projects WHERE id=?").get(id);
+    if (exists) return;
+    const now = Date.now();
+    this.saveWorkspace({ id, name: id, directory, summary, key_terms: keyTerms, created_at: now, updated_at: now });
+  }
+
+  /** Rename a project (Ledger.renameProject parity). */
+  renameProject(id: string, name: string): void {
+    this.db.prepare("UPDATE projects SET name=?, updated_at=? WHERE id=?").run(name, Date.now(), id);
+  }
+
+  /** Rename a pane (Ledger.renamePane parity). */
+  renamePane(projectId: string, paneId: string, name: string): void {
+    this.db.prepare("UPDATE panes SET name=?, updated_at=? WHERE pane_id=? AND workspace_id=?")
+      .run(name, Date.now(), paneId, projectId);
+  }
+
+  /**
+   * Project briefing in the exact legacy Ledger.getProjectBriefing shape, or null.
+   * { project_id, summary, directory, panes: PaneMeta[], notes: string[], key_codebase_terms: string[] }
+   */
+  getProjectBriefing(id: string): {
+    project_id: string; summary: string; directory: string;
+    panes: import("../types").PaneMeta[]; notes: string[]; key_codebase_terms: string[];
+  } | null {
+    const ws = this.getProject(id);
+    if (!ws) return null;
+    return {
+      project_id: ws.id,
+      summary: ws.summary,
+      directory: ws.directory,
+      panes: Object.values(ws.panes),
+      notes: ws.notes,
+      key_codebase_terms: ws.keyTerms ?? [],
+    };
+  }
 }
