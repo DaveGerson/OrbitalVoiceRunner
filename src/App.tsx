@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, isAudioPlaying } from "./utils/audio";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -427,7 +427,19 @@ function AppRaw() {
       const data = await res.json();
       setSettings(data.settings);
       setGlobalPermissionsMode(data.globalPermissionsMode);
+      // Apply volume immediately (client-side gain) and sync the live mic gate.
+      if (typeof data.settings?.voiceAi?.volume === "number") setPlaybackVolume(data.settings.voiceAi.volume);
+      if (typeof data.settings?.voiceAi?.isMicMuted === "boolean") setIsMicMuted(data.settings.voiceAi.isMicMuted);
     } catch (e) {}
+  };
+
+  // Restart the live voice session so reconnect-only settings (voice, model, API
+  // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
+  const reconnectLive = async () => {
+    if (isLive) {
+      stopLive();
+      setTimeout(() => { startLive(); }, 400);
+    }
   };
 
   const fetchPendingCommands = async () => {
@@ -730,6 +742,14 @@ function AppRaw() {
     isMicMutedRef.current = isMicMuted;
   }, [isMicMuted]);
 
+  // Apply the persisted playback volume (Settings → Speaker Volume) to the audio
+  // layer whenever settings load or change. Gemini Live has no server volume knob,
+  // so this client-side gain is the real control.
+  useEffect(() => {
+    const vol = settings?.voiceAi?.volume;
+    if (typeof vol === "number") setPlaybackVolume(vol);
+  }, [settings?.voiceAi?.volume]);
+
   useEffect(() => {
     activeTerminalIdRef.current = activeTerminalId;
     if (activeTerminalId) {
@@ -979,7 +999,7 @@ function AppRaw() {
         // operator has open before Janus can propose anything.
         ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
           streamRef.current = stream;
           
           const source = captureCtx.createMediaStreamSource(stream);
@@ -992,10 +1012,6 @@ function AppRaw() {
 
           processor.onaudioprocess = (e) => {
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              if (isAudioPlaying(voicePlaybackCtxRef.current)) {
-                // Half-duplex barge-in/echo prevention: drop capture frames while synthesized speech streams through speakers
-                return;
-              }
               const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
               wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
             }
@@ -2414,13 +2430,15 @@ function AppRaw() {
       )}
       
       {showSettingsModal && (
-        <SettingsDialog 
+        <SettingsDialog
           onClose={() => setShowSettingsModal(false)}
           settings={settings}
           onSave={handleSaveSettings}
           terminals={terminals}
           isMockMode={isMockMode}
           onToggleMockMode={generateMockData}
+          isLive={isLive}
+          onReconnectLive={reconnectLive}
         />
       )}
       

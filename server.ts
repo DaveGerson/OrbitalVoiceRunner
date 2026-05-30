@@ -649,19 +649,31 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // Web API to create a terminal manually
   app.post("/api/terminals", (req, res) => {
     const { terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId } = req.body;
-    if (!terminalId || !cwd || !command) {
+    if (!terminalId || !command) {
       res.status(400).json({ error: "Missing required fields" });
       return;
+    }
+    // Resolve the working directory: an empty, "." , or non-existent cwd falls back
+    // to the active project's directory (or the server cwd). Passing a bad path to
+    // spawn() is what produced the cryptic "The system cannot find the path specified."
+    const activeProj = manager.ledger.getActiveProject();
+    let resolvedCwd = (cwd && cwd.trim() && cwd.trim() !== ".") ? cwd.trim() : (activeProj?.directory || process.cwd());
+    try {
+      if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
+        resolvedCwd = activeProj?.directory || process.cwd();
+      }
+    } catch {
+      resolvedCwd = process.cwd();
     }
     // ensure the active projectId is synced with this new terminal if requested
     if (projectId) {
       manager.ledger.activeProjectId = projectId;
       // also ensure the project exists, just in case
       if (!manager.ledger.getProject(projectId)) {
-        manager.ledger.addProject(projectId, cwd, "", []);
+        manager.ledger.addProject(projectId, resolvedCwd, "", []);
       }
     }
-    const result = manager.addTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
+    const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
     broadcastLedgerUpdate();
     broadcast({ type: "terminals_updated" });
     res.json({ success: true, result });
@@ -938,10 +950,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       id: "full-stack-web",
       name: "Full-Stack Web App Suite",
       description: "Vite SPA client, Express backend router, and test watcher setup.",
+      // startupCommand is SUGGESTED, not auto-run: panes always open a bare shell
+      // (see /api/recipes/apply). The operator runs the suggestion explicitly so a
+      // pane never starts doing work on its own ("always bare shell, never auto-run").
       panes: [
-        { id: "pane_frontend", name: "SPA Frontend (Vite)", command: "echo 'Frontend running' && npm run dev", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
-        { id: "pane_api", name: "Proxy Router (Express Server)", command: "echo 'API running' && node server.ts", preset: "Custom" as const, permissionsMode: "Full Auto" as const },
-        { id: "pane_tests", name: "Vitest Live Suite", command: "echo 'Tests idle' && npm run test", preset: "Custom" as const, permissionsMode: "Read-Only" as const }
+        { id: "pane_frontend", name: "SPA Frontend (Vite)", startupCommand: "npm run dev", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
+        { id: "pane_api", name: "Proxy Router (Express Server)", startupCommand: "node server.ts", preset: "Custom" as const, permissionsMode: "Full Auto" as const },
+        { id: "pane_tests", name: "Vitest Live Suite", startupCommand: "npm run test", preset: "Custom" as const, permissionsMode: "Read-Only" as const }
       ]
     },
     {
@@ -949,8 +964,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       name: "SQL Pipeline & background Queue",
       description: "FastAPI Web Engine with an RQ asynchronous background worker.",
       panes: [
-        { id: "pane_fastapi", name: "Microservice Host (Uvicorn)", command: "echo 'Uvicorn running' && uvicorn main:app --reload", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
-        { id: "pane_worker", name: "Asynchronous Poll Task Queue", command: "echo 'Queue worker poller running' && python -m rq worker tasks_queue", preset: "Custom" as const, permissionsMode: "Full Auto" as const }
+        { id: "pane_fastapi", name: "Microservice Host (Uvicorn)", startupCommand: "uvicorn main:app --reload", preset: "Custom" as const, permissionsMode: "Human-in-the-Loop" as const },
+        { id: "pane_worker", name: "Asynchronous Poll Task Queue", startupCommand: "python -m rq worker tasks_queue", preset: "Custom" as const, permissionsMode: "Full Auto" as const }
       ]
     }
   ];
@@ -1100,9 +1115,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     const recipe = recipes.find(r => r.id === recipeId);
     if (recipe) {
+      const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
       for (const p of recipe.panes) {
         if (!manager.terminals[p.id]) {
-          manager.addTerminal(p.id, proj.directory || process.cwd(), p.command, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+          // Always open a bare shell — never auto-run the recipe's startupCommand.
+          manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+          // Record the suggested startup command as a pane note so the operator can
+          // run it explicitly (auditable), rather than baking it into the spawn.
+          if (p.startupCommand) {
+            manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+          }
         }
       }
       broadcastLedgerUpdate();
@@ -1352,6 +1374,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // us which pane is open (set_active_pane). No global buffer to push on connect.
 
     let session: any = null;
+    let wsClosed = false;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
@@ -1465,7 +1488,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             // Check for sessionResumption update. Gemini Live emits a fresh handle on
             // (nearly) every turn; only log when it actually changes, else a single
             // session floods the log with dozens of near-identical lines (bug E).
-            if ((message as any).sessionResumptionUpdate) {
+            // Also ignore the SDK's final post-close token flush (wsClosed): writing it
+            // would overwrite the live handle with a stale one from a dead session and
+            // poison the next reconnect's resume attempt.
+            if ((message as any).sessionResumptionUpdate && !wsClosed) {
               const prevHandle = lastSessionResumptionToken?.newHandle;
               lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
               if (lastSessionResumptionToken?.newHandle !== prevHandle) {
@@ -1913,9 +1939,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   if (!recipe) {
                     resp = `Error: Template recipe ${recipe_id} not found.`;
                   } else {
+                    const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
                     for (const p of recipe.panes) {
                       if (!manager.terminals[p.id]) {
-                        manager.addTerminal(p.id, proj.directory || process.cwd(), p.command, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+                        // Always open a bare shell — never auto-run the startupCommand.
+                        manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+                        if (p.startupCommand) {
+                          manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+                        }
                       }
                     }
                     broadcastLedgerUpdate();
@@ -2338,6 +2369,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     });
 
     clientWs.on("close", () => {
+      wsClosed = true; // gate out the SDK's post-close resumption-token flush
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;

@@ -43,13 +43,36 @@ let _nodePtyAvailable = false;
 function loadNodePty(): any {
   if (_nodePtyResolved) return _nodePtyModule;
   _nodePtyResolved = true;
+  const PKG = "@homebridge/node-pty-prebuilt-multiarch";
+  // Resolve a working `require` regardless of runtime. Under tsx/ESM (the dev
+  // server's `tsx server.ts`), a bare global `require` is NOT defined, so the old
+  // `require(...)` threw and silently forced EVERY pane onto the legacy non-PTY
+  // transport — which gives the agent a piped (non-TTY) stdin, so Claude detects
+  // no terminal and exits after a few seconds. createRequire gives us a real
+  // CommonJS require in both ESM (tsx) and CJS (built dist/server.cjs) contexts.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    _nodePtyModule = require("@homebridge/node-pty-prebuilt-multiarch");
+    let req: NodeRequire | undefined =
+      typeof require === "function" ? require : undefined;
+    if (!req) {
+      // ESM/tsx path: synthesize a require bound to this module's location.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { createRequire } = require("module");
+      req = createRequire(import.meta.url);
+    }
+    _nodePtyModule = req!(PKG);
     _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
   } catch {
-    _nodePtyModule = null;
-    _nodePtyAvailable = false;
+    // Last-resort: try createRequire even if the first branch's `require` itself
+    // was the thing that was undefined (belt-and-suspenders for odd loaders).
+    try {
+      const { createRequire } = eval("require")("module");
+      const req2 = createRequire(import.meta.url);
+      _nodePtyModule = req2(PKG);
+      _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
+    } catch {
+      _nodePtyModule = null;
+      _nodePtyAvailable = false;
+    }
   }
   return _nodePtyModule;
 }
@@ -115,12 +138,21 @@ export class LegacyChildProcessTransport implements PtyTransport {
   private proc: ChildProcess | null;
   private dataCbs: ((data: string) => void)[] = [];
   private exitCbs: ((info: { exitCode: number; signal?: number }) => void)[] = [];
+  private isWindows: boolean;
 
   constructor(file: string, args: string[], opts: PtySpawnOptions) {
+    // On Windows, detached:true gives the child its own console window (the
+    // floating popup the operator sees on the desktop) AND orphans the stdio
+    // pipes so stdout/stderr capture and stdin writes silently break.
+    // attached + windowsHide keeps the child headless with working pipes.
+    // On POSIX, detached:true is kept so process.kill(-pid) in kill() can
+    // tear down the entire process group.
+    this.isWindows = process.platform === "win32";
     this.proc = spawn(file, args, {
       cwd: opts.cwd,
       env: opts.env,
-      detached: true,
+      detached: !this.isWindows,
+      windowsHide: true,
     });
 
     if (this.proc.stdout) {
@@ -168,14 +200,28 @@ export class LegacyChildProcessTransport implements PtyTransport {
     if (!this.proc || !this.proc.pid) return;
     const pid = this.proc.pid;
     const sig = (signal as NodeJS.Signals) || "SIGTERM";
-    try {
-      // Teardown the process group cleanly (matches legacy stop()).
-      process.kill(-pid, sig);
-    } catch {
+    if (this.isWindows) {
+      // taskkill /t tears down the full child tree; /f forces termination.
+      // Ignore errors (process may already be gone).
       try {
-        this.proc.kill(sig);
+        spawn("taskkill", ["/pid", String(pid), "/t", "/f"]);
       } catch {
-        // already dead
+        try {
+          this.proc.kill(sig);
+        } catch {
+          // already dead
+        }
+      }
+    } else {
+      try {
+        // Teardown the process group cleanly (matches legacy stop()).
+        process.kill(-pid, sig);
+      } catch {
+        try {
+          this.proc.kill(sig);
+        } catch {
+          // already dead
+        }
       }
     }
   }

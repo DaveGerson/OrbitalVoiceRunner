@@ -83,6 +83,8 @@ interface SettingsDialogProps {
   terminals?: any[];
   isMockMode?: boolean;
   onToggleMockMode?: () => void;
+  isLive?: boolean;
+  onReconnectLive?: () => void;
 }
 
 export function SettingsDialog({
@@ -91,7 +93,9 @@ export function SettingsDialog({
   onSave,
   terminals = [],
   isMockMode = false,
-  onToggleMockMode
+  onToggleMockMode,
+  isLive,
+  onReconnectLive
 }: SettingsDialogProps) {
   const [activeTab, setActiveTab] = useState<"form" | "json" | "install">("form");
   const [formTab, setFormTab] = useState<"session" | "profiles" | "advanced" | "secrets">("session");
@@ -105,7 +109,6 @@ export function SettingsDialog({
   const [voice, setVoice] = useState<string>("Zephyr");
   const [voiceStyle, setVoiceStyle] = useState<"Direct" | "Creative" | "Concise" | "Explanatory">("Creative");
   const [volume, setVolume] = useState<number>(80);
-  const [speechSpeed, setSpeechSpeed] = useState<number>(1.0);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [model, setModel] = useState<string>("gemini-3.1-flash-live-preview");
 
@@ -123,13 +126,6 @@ export function SettingsDialog({
     useState<AnnouncementTemplates>(DEFAULT_ANNOUNCEMENT_TEMPLATES);
 
   // Local states - Advanced plumbing / Connection variables
-  const [webSocketUrl, setWebSocketUrl] = useState<string>("");
-  const [latencyMode, setLatencyMode] = useState<"Low Latency" | "High Throughput" | "Balanced">("Balanced");
-  const [throughputBps, setThroughputBps] = useState<number>(16000);
-  const [audioBufferSize, setAudioBufferSize] = useState<number>(1024);
-  const [debugLogging, setDebugLogging] = useState<boolean>(false);
-  const [connectionTimeoutMs, setConnectionTimeoutMs] = useState<number>(10000);
-  const [rateLimitRequestsPerMin, setRateLimitRequestsPerMin] = useState<number>(60);
   const [maxBufferLines, setMaxBufferLines] = useState<number>(100);
   const [idleTimeoutMs, setIdleTimeoutMs] = useState<number>(2000);
   const [defaultShellCommand, setDefaultShellCommand] = useState<string>("bash");
@@ -168,7 +164,6 @@ export function SettingsDialog({
       setVoice(initialSettings.voiceAi?.voice ?? "Zephyr");
       setVoiceStyle(initialSettings.voiceAi?.voiceStyle ?? "Creative");
       setVolume(initialSettings.voiceAi?.volume ?? 80);
-      setSpeechSpeed(initialSettings.voiceAi?.speechSpeed ?? 1.0);
       setIsMicMuted(initialSettings.voiceAi?.isMicMuted ?? false);
       setModel(initialSettings.voiceAi?.model ?? "gemini-3.1-flash-live-preview");
 
@@ -181,13 +176,6 @@ export function SettingsDialog({
         setAnnouncements(prev => ({ ...prev, ...initialSettings.announcements }));
       }
 
-      setWebSocketUrl(initialSettings.advanced?.webSocketUrl ?? "");
-      setLatencyMode(initialSettings.advanced?.latencyMode ?? "Balanced");
-      setThroughputBps(initialSettings.advanced?.throughputBps ?? 16000);
-      setAudioBufferSize(initialSettings.advanced?.audioBufferSize ?? 1024);
-      setDebugLogging(initialSettings.advanced?.debugLogging ?? false);
-      setConnectionTimeoutMs(initialSettings.advanced?.connectionTimeoutMs ?? 10000);
-      setRateLimitRequestsPerMin(initialSettings.advanced?.rateLimitRequestsPerMin ?? 60);
       setMaxBufferLines(initialSettings.advanced?.maxBufferLines ?? 100);
       setIdleTimeoutMs(initialSettings.advanced?.idleTimeoutMs ?? 2000);
       setDefaultShellCommand(initialSettings.advanced?.defaultShellCommand ?? "bash");
@@ -214,7 +202,9 @@ export function SettingsDialog({
         voice,
         voiceStyle,
         volume,
-        speechSpeed,
+        // speechSpeed control was removed (Gemini Live has no speaking-rate knob);
+        // kept as a constant so the persisted SystemSettings shape still type-checks.
+        speechSpeed: 1.0,
         isMicMuted,
         model
       },
@@ -225,13 +215,13 @@ export function SettingsDialog({
       presets,
       announcements,
       advanced: {
-        webSocketUrl,
-        latencyMode,
-        throughputBps,
-        audioBufferSize,
-        debugLogging,
-        connectionTimeoutMs,
-        rateLimitRequestsPerMin,
+        webSocketUrl: "",
+        latencyMode: "Balanced",
+        throughputBps: 16000,
+        audioBufferSize: 1024,
+        debugLogging: false,
+        connectionTimeoutMs: 10000,
+        rateLimitRequestsPerMin: 60,
         maxBufferLines,
         idleTimeoutMs,
         defaultShellCommand,
@@ -251,9 +241,8 @@ export function SettingsDialog({
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, speechSpeed, isMicMuted, model,
-    activeContext, localWorkspacePath, presets, webSocketUrl, latencyMode, throughputBps,
-    audioBufferSize, debugLogging, connectionTimeoutMs, rateLimitRequestsPerMin, maxBufferLines,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model,
+    activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements
   ]);
@@ -287,7 +276,6 @@ export function SettingsDialog({
         if (parsed.voiceAi.voice !== undefined) setVoice(parsed.voiceAi.voice);
         if (parsed.voiceAi.voiceStyle !== undefined) setVoiceStyle(parsed.voiceAi.voiceStyle);
         if (parsed.voiceAi.volume !== undefined) setVolume(parsed.voiceAi.volume);
-        if (parsed.voiceAi.speechSpeed !== undefined) setSpeechSpeed(parsed.voiceAi.speechSpeed);
         if (parsed.voiceAi.isMicMuted !== undefined) setIsMicMuted(parsed.voiceAi.isMicMuted);
         if (parsed.voiceAi.model !== undefined) setModel(parsed.voiceAi.model);
       }
@@ -302,13 +290,6 @@ export function SettingsDialog({
         setAnnouncements(prev => ({ ...prev, ...parsed.announcements }));
       }
       if (parsed.advanced) {
-        if (parsed.advanced.webSocketUrl !== undefined) setWebSocketUrl(parsed.advanced.webSocketUrl);
-        if (parsed.advanced.latencyMode !== undefined) setLatencyMode(parsed.advanced.latencyMode);
-        if (parsed.advanced.throughputBps !== undefined) setThroughputBps(parsed.advanced.throughputBps);
-        if (parsed.advanced.audioBufferSize !== undefined) setAudioBufferSize(parsed.advanced.audioBufferSize);
-        if (parsed.advanced.debugLogging !== undefined) setDebugLogging(parsed.advanced.debugLogging);
-        if (parsed.advanced.connectionTimeoutMs !== undefined) setConnectionTimeoutMs(parsed.advanced.connectionTimeoutMs);
-        if (parsed.advanced.rateLimitRequestsPerMin !== undefined) setRateLimitRequestsPerMin(parsed.advanced.rateLimitRequestsPerMin);
         if (parsed.advanced.maxBufferLines !== undefined) setMaxBufferLines(parsed.advanced.maxBufferLines);
         if (parsed.advanced.idleTimeoutMs !== undefined) setIdleTimeoutMs(parsed.advanced.idleTimeoutMs);
         if (parsed.advanced.defaultShellCommand !== undefined) setDefaultShellCommand(parsed.advanced.defaultShellCommand);
@@ -503,6 +484,7 @@ export function SettingsDialog({
                           <option value="Kore">Kore (Clear Conversational Female)</option>
                           <option value="Fenrir">Fenrir (Crisp Assertive Male)</option>
                         </select>
+                        <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
                       </div>
 
                       <div>
@@ -526,28 +508,13 @@ export function SettingsDialog({
                           <label className="text-zinc-400">Speaker Volume ({volume}%)</label>
                           <Volume2 className="w-3.5 h-3.5 text-zinc-500" />
                         </div>
-                        <input 
+                        <input
                           type="range"
                           min="0"
                           max="100"
                           step="5"
                           className="w-full accent-cyan-500 bg-zinc-900 h-1.5 rounded-lg cursor-pointer"
                           value={volume} onChange={e => setVolume(Number(e.target.value))}
-                        />
-                      </div>
-
-                      <div className="pt-2">
-                        <div className="flex justify-between items-center mb-1">
-                          <label className="text-zinc-400">Dialogue Playback Rate ({speechSpeed}x)</label>
-                          <Sliders className="w-3.5 h-3.5 text-zinc-500" />
-                        </div>
-                        <input 
-                          type="range"
-                          min="0.5"
-                          max="2.0"
-                          step="0.1"
-                          className="w-full accent-cyan-500 bg-zinc-900 h-1.5 rounded-lg cursor-pointer"
-                          value={speechSpeed} onChange={e => setSpeechSpeed(Number(e.target.value))}
                         />
                       </div>
                     </div>
@@ -563,6 +530,24 @@ export function SettingsDialog({
                         <option value="gemini-2.0-flash-exp">gemini-2.0-flash-exp (Experimental Series)</option>
                         <option value="gemini-2.5-flash">gemini-2.5-flash (Standard Medium-Fast Model)</option>
                       </select>
+                      <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
+                    </div>
+
+                    {/* Reconnect button for voice/model/API key changes */}
+                    <div className="p-3 bg-cyan-950/20 border border-cyan-500/20 rounded-lg flex items-center justify-between gap-3">
+                      <div>
+                        <span className="text-zinc-300 font-bold block text-[11px]">Apply Voice Session Changes</span>
+                        <span className="text-[10px] text-zinc-500">Voice, model, and API key changes take effect after reconnecting.</span>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!isLive}
+                        onClick={() => onReconnectLive?.()}
+                        className="shrink-0 px-3 py-1.5 rounded text-[10px] tracking-wider font-bold transition-all bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:border-cyan-500/50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                        title={!isLive ? "Start a voice session first" : "Reconnect voice session now"}
+                      >
+                        {isLive ? "Apply & Reconnect" : "(start a voice session first)"}
+                      </button>
                     </div>
 
                     <div className="p-3 bg-zinc-950/50 border border-white/5 rounded-lg flex items-center justify-between">
@@ -919,99 +904,37 @@ export function SettingsDialog({
                   <div className="space-y-4">
                     <div className="border-b border-white/5 pb-2">
                       <h3 className="text-white uppercase text-[10px] tracking-widest font-bold">Advanced Subsystems plumbing</h3>
-                      <p className="text-[10px] text-zinc-500 mt-0.5">Control live transmission pipelines, timeouts, and buffers</p>
-                    </div>
-
-                    <div>
-                      <label className="block text-zinc-400 mb-1">Physical WebSocket Connection Override URL</label>
-                      <input 
-                        type="text"
-                        className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white placeholder:text-zinc-700"
-                        value={webSocketUrl} onChange={e => setWebSocketUrl(e.target.value)} placeholder="wss://api.gemini.direct/v1/live (Falls back to default SDK matrix)"
-                      />
-                      <span className="text-[9px] text-zinc-600 mt-1 block leading-relaxed">Let blank to trigger Google GenAI SDK standard pipe routers.</span>
+                      <p className="text-[10px] text-zinc-500 mt-0.5">Control timeouts, buffers, and runtime policies</p>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-zinc-400 mb-1">Latency Delivery Target</label>
-                        <select
-                          value={latencyMode}
-                          onChange={e => setLatencyMode(e.target.value as any)}
-                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white focus:outline-none cursor-pointer"
-                        >
-                          <option value="Balanced">Balanced (Standard Sync)</option>
-                          <option value="Low Latency">Low Latency (Micro-Buffer-Burst)</option>
-                          <option value="High Throughput">High Throughput (Stable Volumes)</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block text-zinc-400 mb-1">Audio PCM Frame Size (Bytes)</label>
-                        <select
-                          value={audioBufferSize}
-                          onChange={e => setAudioBufferSize(Number(e.target.value))}
-                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white focus:outline-none cursor-pointer"
-                        >
-                          <option value="512">512 Bytes (Fast Trigger)</option>
-                          <option value="1024">1024 Bytes (Standard Block)</option>
-                          <option value="2048">2048 Bytes (Large Delay)</option>
-                          <option value="4096">4096 Bytes (High Latency Audio)</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-zinc-400 mb-1">Rate Limit Cap (RPM)</label>
-                        <input 
-                          type="number"
-                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
-                          value={rateLimitRequestsPerMin} onChange={e => setRateLimitRequestsPerMin(Number(e.target.value))} placeholder="60"
-                        />
-                      </div>
                       <div>
                         <label className="block text-zinc-400 mb-1">Idle Terminal Timeout (ms)</label>
-                        <input 
+                        <input
                           type="number"
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={idleTimeoutMs} onChange={e => setIdleTimeoutMs(Number(e.target.value))} placeholder="2000"
                         />
                       </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-zinc-400 mb-1">Max Console Cache Buffer Lines</label>
-                        <input 
+                        <input
                           type="number"
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={maxBufferLines} onChange={e => setMaxBufferLines(Number(e.target.value))} placeholder="100"
                         />
                       </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-zinc-400 mb-1">Fallback Host Terminal Shell</label>
-                        <input 
+                        <input
                           type="text"
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={defaultShellCommand} onChange={e => setDefaultShellCommand(e.target.value)} placeholder="bash"
                         />
                       </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-zinc-400 mb-1">Live Feed Throughput volume ({throughputBps} Bps)</label>
-                      <input 
-                        type="range"
-                        min="8000"
-                        max="48000"
-                        step="8000"
-                        className="w-full accent-cyan-500 bg-zinc-900 h-1.5 rounded-lg cursor-pointer"
-                        value={throughputBps} onChange={e => setThroughputBps(Number(e.target.value))}
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-zinc-400 mb-1">Global Permissions Gate Policy</label>
                         <select
@@ -1024,21 +947,6 @@ export function SettingsDialog({
                           <option value="Human-in-the-Loop">Human-in-the-Loop (Require User Approval to Execute)</option>
                           <option value="Read-Only">Read-Only (Terminal output only, no submissions)</option>
                         </select>
-                      </div>
-
-                      <div className="flex flex-col justify-end">
-                        <label className="flex items-center gap-2 cursor-pointer p-2 bg-zinc-950/40 border border-white/5 rounded-lg">
-                          <input 
-                            type="checkbox"
-                            checked={debugLogging}
-                            onChange={e => setDebugLogging(e.target.checked)}
-                            className="rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-black"
-                          />
-                          <div>
-                            <span className="text-[11px] text-zinc-300 font-bold block">Console debug stream logging</span>
-                            <span className="text-[9px] text-zinc-500">Log websocket payloads in console</span>
-                          </div>
-                        </label>
                       </div>
                     </div>
 

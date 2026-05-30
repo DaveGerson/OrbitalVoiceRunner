@@ -430,10 +430,21 @@ export class UniversalTerminal {
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
 
+    // Build the child env, stripping nested-agent markers. If the SERVER itself was
+    // launched from inside a Claude Code session (CLAUDECODE=1 etc. inherited via
+    // process.env), a pane's `claude` would detect nesting and exit immediately —
+    // so a pane never becomes a live session. Remove those markers so every pane
+    // launches as a clean, top-level agent regardless of how the server was started.
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    delete childEnv.CLAUDECODE;
+    delete childEnv.CLAUDE_CODE_ENTRYPOINT;
+    delete childEnv.CLAUDE_CODE_SSE_PORT;
+    delete childEnv.CLAUDE_AGENT_SDK_VERSION;
+
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
     const { transport, usingNodePty } = createPtyTransport(finalCommand, {
       cwd: this.cwd,
-      env: process.env,
+      env: childEnv,
     });
     this.transport = transport;
     this.usingNodePty = usingNodePty;
