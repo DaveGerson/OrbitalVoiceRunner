@@ -129,9 +129,19 @@ Code locations are from `server.ts` / `src/` at branch point.
    operator-direct, ungated write to the active pane; Janus fills the draft (it
    does not auto-send). Sub-steps:
    - 6a — per-pane `draft` on `PaneMeta` + ledger accessors (get/set/append/list). ✅
-   - 6b — migrate server plumbing: Janus appends to the ACTIVE pane's draft;
-     per-pane REST/WS; `draft_updated { paneId, ... }` broadcast. ⏳
-   - 6c — Workbench UI bound to the active pane + a Send action. ⏳
-   - 6d — WIP register across panes + the context (C) side panel. ⏳
+   - 6b — migrated server plumbing: the global prompt buffer is gone; Janus
+     dictation/thought append to the ACTIVE pane's draft; per-pane draft REST
+     (`/api/panes/:proj/:pane/draft` GET/PUT, `/drafts` list, `/draft/send`),
+     `draft_edit` WS, `draft_updated { projectId, paneId, draft }` broadcast, and
+     an `update_draft_prompt` tool so Janus composes a clean draft. ✅
+   - 6c — Workbench UI bound to the active pane + a Send action (operator-direct
+     write that clears the draft). ✅
+   - 6d — WIP register across panes (chips that switch focus) + the context (C)
+     panel (model/human layers, with operator add). ✅
+
+   Notes: "Send" is operator-direct and writes immediately (operator is above the
+   gate). Janus fills the draft via dictation capture or `update_draft_prompt`; it
+   never sends. The legacy `/api/prompt-buffer` + `prompt_buffer_*` messages are
+   removed.
 
 Each step keeps `npm run lint` and `npm test` green before moving on.

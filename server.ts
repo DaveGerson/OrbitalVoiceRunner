@@ -159,15 +159,8 @@ export class HistoryManager {
 
 const manager = new OrchestratorManager();
 
-let promptBufferText = `# Requirements & Feedback Prompt Buffer
-
-- **Objective**: Review code updates, dictate requirements, and capture content fixes.
-- **Workflow**: Tap "Workspace Actions" below to test the core agentic workflows.
-- **Real-time Sync**: Updates made here instantly broadcast between all live operators and the voice agent.
-
-### ACTIVE CHRONICLE MEMORY LIST:
-* [System Status]: Orbital Harness and live voice workspace initialized.
-* [Task]: Review running nodes on mobile or initiate an agentic walkthrough session.`;
+// Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
+// its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
 
 async function startServer() {
   const app = express();
@@ -318,6 +311,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }
       }
     }
+  }
+
+  // Step 6 (the Workbench): per-pane WIP draft helpers. The draft is composed against the ACTIVE
+  // pane (single source of truth, step 5); composing/editing it is not a CLI write and is ungated.
+  function activeDraftTarget(): { projectId: string; paneId: string } | null {
+    if (!activePaneId) return null;
+    return { projectId: manager.ledger.activeProjectId || "default_project", paneId: activePaneId };
+  }
+  function broadcastDraft(projectId: string, paneId: string) {
+    const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
+    broadcast({ type: "draft_updated", projectId, paneId, draft });
+  }
+  function appendActiveDraft(line: string, updatedBy: "janus" | "operator") {
+    const t = activeDraftTarget();
+    if (!t) return; // no active pane -> nowhere to compose (step 5)
+    manager.ledger.appendDraft(t.projectId, t.paneId, line, updatedBy);
+    broadcastDraft(t.projectId, t.paneId);
   }
 
   // WS-D (BUG-024): proactive feedback controller. Per the maintainer decision this drives
@@ -779,6 +789,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     res.json({ success: true });
   });
 
+  // Step 6 / §4: add a layered context entry to a pane. Operator-typed entries land in the human
+  // layer (authoritative steering); this is not a CLI write and is never gated.
+  app.post("/api/projects/:projectId/panes/:paneId/context", (req, res) => {
+    const { text, layer } = req.body;
+    if (!text || typeof text !== "string") { res.status(400).json({ error: "Missing text" }); return; }
+    const ok = layer === "model"
+      ? manager.ledger.addModelContext(req.params.projectId, req.params.paneId, text, "operator-ui")
+      : manager.ledger.addHumanContext(req.params.projectId, req.params.paneId, text);
+    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    broadcastLedgerUpdate();
+    res.json({ success: true });
+  });
+
   app.put("/api/projects/:projectId/panes/:paneId/permissions", (req, res) => {
     const { permissions } = req.body;
     const { projectId, paneId } = req.params;
@@ -1056,23 +1079,43 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     res.json({ success: true });
   });
 
-  // REST endpoints for the real-time synchronous markdown prompt buffer
-  app.get("/api/prompt-buffer", (req, res) => {
-    res.json({ text: promptBufferText });
+  // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
+  app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
+    const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
+      ?? { text: "", updatedAt: new Date().toISOString() };
+    res.json({ draft });
   });
 
-  app.put("/api/prompt-buffer", (req, res) => {
+  app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
     const { text } = req.body;
-    if (text !== undefined) {
-      promptBufferText = text;
-      broadcast({
-        type: "prompt_buffer_updated",
-        text: promptBufferText
-      });
-      res.json({ success: true, text: promptBufferText });
-    } else {
-      res.status(400).json({ error: "Missing text field" });
-    }
+    if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
+    const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
+    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    broadcastDraft(req.params.projectId, req.params.paneId);
+    res.json({ success: true });
+  });
+
+  // The WIP register (the scalable part of "B"): every pane in a project with a non-empty draft,
+  // so work composed for one pane is never lost when the operator switches to another.
+  app.get("/api/projects/:projectId/drafts", (req, res) => {
+    res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
+  });
+
+  // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
+  // architecture §2): clicking Send IS the approval, so it writes immediately. The draft is then
+  // cleared. Janus never calls this — it only fills the draft for the operator to send.
+  app.post("/api/panes/:projectId/:paneId/draft/send", (req, res) => {
+    const { projectId, paneId } = req.params;
+    const text = (manager.ledger.getDraft(projectId, paneId)?.text ?? "").trim();
+    if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
+    const term = manager.terminals[paneId];
+    if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
+    HistoryManager.getInstance().addCommand(paneId, text);
+    term.writeInput(text);
+    broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
+    manager.ledger.setDraft(projectId, paneId, "", "operator");
+    broadcastDraft(projectId, paneId);
+    res.json({ success: true });
   });
 
   app.get("/api/settings", (req, res) => {
@@ -1247,11 +1290,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
-    // Push initial prompt buffer synchronously to the newly connected client
-    clientWs.send(JSON.stringify({
-      type: "prompt_buffer_updated",
-      text: promptBufferText
-    }));
+    // Step 6: drafts are per-pane now; the client fetches the active pane's draft once it has told
+    // us which pane is open (set_active_pane). No global buffer to push on connect.
 
     let session: any = null;
     let currentSessionUserUtterance = "";
@@ -1399,12 +1439,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
               const cleanUtter = userUtterance.trim();
               if (cleanUtter.length > 2) {
-                // Auto-log dictation as bullet points inside synchronous prompt buffer
-                promptBufferText += `\n* **User Dictation**: ${cleanUtter}`;
-                broadcast({
-                  type: "prompt_buffer_updated",
-                  text: promptBufferText
-                });
+                // Step 6: capture dictation into the ACTIVE pane's WIP draft (raw material the
+                // operator refines before sending). No-op if no pane is open.
+                appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
 
                 // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser
                 // + most-recently-announced targeting (NOT FIFO, NOT substring matching).
@@ -1441,14 +1478,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 text: modelUtterance
               }));
 
-              // Auto-log agent comments as bullet points inside synchronous prompt buffer
+              // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
               const cleanUtter = modelUtterance.trim();
               if (cleanUtter.length > 2) {
-                promptBufferText += `\n* **Agentic Thought**: *${cleanUtter}*`;
-                broadcast({
-                  type: "prompt_buffer_updated",
-                  text: promptBufferText
-                });
+                appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
               }
             }
 
@@ -1556,6 +1589,24 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   activePaneId = targetId;
                   broadcast({ type: "switch_active_pane", paneId: targetId });
                   output = `Opened pane '${targetId}'. It is now the active pane; I can propose commands here for your approval.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
+                });
+              } else if (name === "update_draft_prompt") {
+                // Step 6: Janus composes/refines the WIP draft for the OPERATOR to review and send.
+                // It does NOT send (sending is operator-direct). Targets the active pane.
+                const t = activeDraftTarget();
+                let output = "";
+                if (!t) {
+                  output = "No pane is open, so there is no draft to write. Ask the operator to open a pane first.";
+                } else {
+                  const mode = args.mode === "append" ? "append" : "replace";
+                  const text = String(args.text ?? "");
+                  if (mode === "append") manager.ledger.appendDraft(t.projectId, t.paneId, text, "janus");
+                  else manager.ledger.setDraft(t.projectId, t.paneId, text, "janus");
+                  broadcastDraft(t.projectId, t.paneId);
+                  output = `Draft for pane '${t.paneId}' updated (${mode}). The operator can review and send it.`;
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output } }]
@@ -1921,6 +1972,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }
             },
             {
+              name: "update_draft_prompt",
+              description: "Compose or refine the WIP draft prompt for the pane the operator currently has open, so they can review/edit and send it. This does NOT send anything — sending is the operator's action. Use it to distill the conversation into a clean, focused prompt for the agent in that pane. Defaults to replacing the draft; use mode='append' to add to it.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING, description: "The draft prompt text (markdown allowed)." },
+                  mode: { type: Type.STRING, description: "'replace' (default) or 'append'.", enum: ["replace", "append"] }
+                },
+                required: ["text"]
+              }
+            },
+            {
               name: "list_pending_approvals",
               description: "List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count). Use it when the operator asks 'what's queued for approval?' and to disambiguate which one they mean before approving/rejecting.",
               parameters: {
@@ -2186,12 +2249,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               console.error("Error feeding user mic:", e);
             }
           }
-        } else if (msg.type === "prompt_buffer_edit" && msg.text !== undefined) {
-          promptBufferText = msg.text;
-          broadcast({
-            type: "prompt_buffer_updated",
-            text: promptBufferText
-          });
+        } else if (msg.type === "draft_edit" && msg.text !== undefined) {
+          // Step 6: operator editing a pane's WIP draft. Defaults to the active pane when the
+          // client doesn't name one. Not a CLI write — ungated.
+          const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
+          const paneId = msg.paneId || activePaneId;
+          if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
+            broadcastDraft(projectId, paneId);
+          }
         } else if (msg.type === "set_active_pane") {
           // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
           // open (or null if nothing is open) is recorded here and gates every Janus write.

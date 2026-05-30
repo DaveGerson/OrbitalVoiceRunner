@@ -205,6 +205,10 @@ function AppRaw() {
   const [promptBuffer, setPromptBuffer] = useState("");
   const [isBufferFocused, setIsBufferFocused] = useState(false);
   const [promptBufferEditMode, setPromptBufferEditMode] = useState<"edit" | "preview">("preview");
+  // Step 6 (the Workbench): the cross-pane WIP draft register, so work composed for one pane is
+  // visible (and never lost) when the operator switches to another.
+  const [wipDrafts, setWipDrafts] = useState<{ paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[]>([]);
+  const [contextInput, setContextInput] = useState("");
 
   // Mobile layout switcher state: terminal | buffer | menu
   const [mobileActiveView, setMobileActiveView] = useState<"terminal" | "buffer" | "menu">("terminal");
@@ -215,30 +219,44 @@ function AppRaw() {
   // Simplicity Mode / Focus View toggler for a clean, non-overloaded experience
   const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
 
-  // Fetch Synchronous Prompt Buffer Initial State
-  const fetchPromptBuffer = async () => {
+  // Step 6 (the Workbench): the buffer is the ACTIVE pane's persistent WIP draft.
+  const fetchActiveDraft = async (projId = activeProjectId, paneId = activeTerminalId) => {
+    if (!paneId) { setPromptBuffer(""); return; }
     try {
-      const res = await apiFetch("/api/prompt-buffer");
+      const res = await apiFetch(`/api/panes/${projId}/${paneId}/draft`);
       if (res.ok) {
         const data = await res.json();
-        setPromptBuffer(data.text);
+        setPromptBuffer(data.draft?.text ?? "");
       }
     } catch (e) {
-      console.warn("REST prompt-buffer fetch failed: fallback to offline mode");
+      console.warn("REST draft fetch failed");
     }
+  };
+
+  // The cross-pane WIP register (the scalable part of "B").
+  const fetchWipDrafts = async (projId = activeProjectId) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/drafts`);
+      if (res.ok) {
+        const data = await res.json();
+        setWipDrafts(data.drafts || []);
+      }
+    } catch (e) {}
   };
 
   const handlePromptBufferChange = (val: string) => {
     setPromptBuffer(val);
-    
-    // Send over WebSocket or save REST fallback
+    if (!activeTerminalId) return;
+    // Edit the active pane's draft (not a CLI write — ungated).
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
-        type: "prompt_buffer_edit",
+        type: "draft_edit",
+        projectId: activeProjectId,
+        paneId: activeTerminalId,
         text: val
       }));
     } else {
-      apiFetch("/api/prompt-buffer", {
+      apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: val })
@@ -246,13 +264,27 @@ function AppRaw() {
     }
   };
 
-  const handleSyncNoteToActiveNode = async () => {
-    if (!activeTerminalId || !activeProjectId) return;
+  // Send the draft to the active pane. Operator-direct write (the operator is above the gate):
+  // clicking Send IS the approval, so it writes immediately and clears the draft.
+  const handleSendDraft = async () => {
+    if (!activeTerminalId || !promptBuffer.trim()) return;
     try {
-      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/notes`, {
+      const res = await apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft/send`, { method: "POST" });
+      if (res.ok) {
+        setPromptBuffer("");
+        playEarcon("execute");
+      }
+    } catch (e) {}
+  };
+
+  // Add an operator-typed context entry (the human layer) for the active pane.
+  const handleAddHumanContext = async (text: string) => {
+    if (!activeTerminalId || !text.trim()) return;
+    try {
+      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/context`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note: `Requirement Spec Captured: ${promptBuffer.slice(0, 100).replace(/\n/g, " ")}...` })
+        body: JSON.stringify({ text, layer: "human" })
       });
       fetchLedger();
     } catch (e) {}
@@ -611,7 +643,8 @@ function AppRaw() {
     fetchWatchRules();
     fetchPlans();
     fetchRecipes();
-    fetchPromptBuffer(); // Sync initial prompt buffer
+    fetchActiveDraft(); // Step 6: load the active pane's WIP draft (no-op until a pane is open)
+    fetchWipDrafts();
     
     // Auto-detect browser notification support configuration
     if (typeof window !== "undefined" && "Notification" in window) {
@@ -647,7 +680,10 @@ function AppRaw() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalId }));
     }
-  }, [activeTerminalId]);
+    // Step 6: load the newly-open pane's WIP draft into the Workbench, and refresh the register.
+    fetchActiveDraft(activeProjectId, activeTerminalId);
+    fetchWipDrafts(activeProjectId);
+  }, [activeTerminalId, activeProjectId]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
@@ -931,13 +967,19 @@ function AppRaw() {
           // Step 5: Janus switched the open pane at the operator's spoken direction. The UI obeys
           // (it remains the source of truth); the activeTerminalId effect echoes set_active_pane back.
           if (msg.paneId) setActiveTerminalId(msg.paneId);
-        } else if (msg.type === "prompt_buffer_updated") {
-          setIsBufferFocused(focused => {
-            if (!focused) {
-              setPromptBuffer(msg.text);
-            }
-            return focused;
-          });
+        } else if (msg.type === "draft_updated") {
+          // Step 6: a pane's WIP draft changed (Janus dictation/thought, or another view's edit).
+          // Mirror it into the Workbench only when it's the active pane and the operator isn't
+          // mid-edit; always refresh the cross-pane register.
+          if (msg.paneId === activeTerminalIdRef.current) {
+            setIsBufferFocused(focused => {
+              if (!focused) {
+                setPromptBuffer(msg.draft?.text ?? "");
+              }
+              return focused;
+            });
+          }
+          fetchWipDrafts(msg.projectId);
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
         } else if (msg.type === "ledger_updated") {
@@ -1656,13 +1698,21 @@ function AppRaw() {
   };
 
   const renderPromptSynchronizerPanel = () => {
+    const activePaneName = activePaneMeta?.name || activeTerminalId || "no pane open";
+    const modelCtx = activePaneMeta?.modelContext || [];
+    const humanCtx = activePaneMeta?.humanContext || [];
+    // The other panes (not the active one) that have WIP drafts — the scalable register.
+    const otherWip = wipDrafts.filter((d) => d.paneId !== activeTerminalId);
     return (
       <div className="flex-1 flex flex-col bg-[#060606] border border-white/5 rounded-lg overflow-hidden h-full">
         {/* Header toolbar */}
         <div className="p-3 bg-white/[0.02] border-b border-white/5 flex items-center justify-between shrink-0 select-none">
-          <div className="flex items-center gap-2">
-            <CheckSquare className="w-4 h-4 text-cyan-400" />
-            <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase">Shared Prompt Buffer</h3>
+          <div className="flex items-center gap-2 min-w-0">
+            <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
+            <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase truncate">Prompt Draft</h3>
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate" title="The pane this draft will be sent to">
+              → {activePaneName}
+            </span>
           </div>
           <div className="flex items-center gap-1.5 bg-black/60 p-1 rounded border border-white/10 font-bold select-none">
             <button
@@ -1682,67 +1732,110 @@ function AppRaw() {
 
         {/* Helper Explanation strip */}
         <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-[8.5px] text-zinc-400 font-mono leading-relaxed">
-          <span className="text-cyan-400 font-extrabold uppercase">Shared Spec Sandbox:</span> Janus reads this buffer in real-time to orient its coding tools. <span className="text-amber-400/80">(Session only — not saved; the buffer is lost on restart.)</span>
+          <span className="text-cyan-400 font-extrabold uppercase">Workbench:</span> compose the prompt for the open pane with Janus, then <span className="text-cyan-300 font-bold">Send</span> it. <span className="text-emerald-400/80">Saved per-pane — switching panes never loses your draft.</span>
         </div>
 
-        {/* Content Viewport */}
-        <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[300px]">
+        {/* WIP register (the scalable part of "B"): other panes with drafts in progress. */}
+        {otherWip.length > 0 && (
+          <div className="px-3 py-1.5 bg-black/40 border-b border-white/5 flex items-center gap-1.5 overflow-x-auto select-none">
+            <span className="text-[8px] font-mono uppercase text-zinc-500 shrink-0">WIP elsewhere:</span>
+            {otherWip.map((d) => (
+              <button
+                key={d.paneId}
+                onClick={() => setActiveTerminalId(d.paneId)}
+                title={d.draft.text.slice(0, 200)}
+                className="shrink-0 px-1.5 py-0.5 text-[9px] font-mono rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20"
+              >
+                {d.paneId} · {d.draft.text.split("\n").filter(Boolean).length}L
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Content Viewport — the draft */}
+        <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[200px]">
           {promptBufferEditMode === "edit" ? (
             <textarea
               value={promptBuffer}
               onChange={(e) => handlePromptBufferChange(e.target.value)}
               onFocus={() => setIsBufferFocused(true)}
               onBlur={() => setIsBufferFocused(false)}
-              className="w-full h-full min-h-[280px] bg-black text-xs text-zinc-200 p-3 rounded border border-white/10 focus:outline-none focus:border-cyan-500 font-mono resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30"
-              placeholder="Keep track of high-level specs as a list here. Operator typing & Live Voice Agent transcripts update this buffer in real-time..."
+              disabled={!activeTerminalId}
+              className="w-full h-full min-h-[180px] bg-black text-xs text-zinc-200 p-3 rounded border border-white/10 focus:outline-none focus:border-cyan-500 font-mono resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30 disabled:opacity-50"
+              placeholder={activeTerminalId ? "Compose the prompt to send to this pane. Your dictation and Janus's suggestions land here; refine, then Send." : "Open a pane to start composing a prompt for it."}
             />
           ) : (
             <div className="prose prose-invert max-w-none text-zinc-300">
               {promptBuffer ? (
                 <MiniMarkdown text={promptBuffer} />
               ) : (
-                <p className="text-[10px] text-zinc-600 font-mono italic">No prompt notes captured. Switch to Edit or speak into the microphone to write specifications...</p>
+                <p className="text-[10px] text-zinc-600 font-mono italic">{activeTerminalId ? "Empty draft. Switch to Edit, speak into the microphone, or ask Janus to draft a prompt for this pane." : "No pane open. Open a pane to compose a prompt for it."}</p>
               )}
             </div>
           )}
         </div>
 
-        {/* Quick Toolbar macros */}
+        {/* Context (C): the layered orientation that shapes this draft. */}
+        {activeTerminalId && (
+          <div className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
+            <div className="text-[8px] font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
+            {(modelCtx.length > 0 || humanCtx.length > 0) ? (
+              <div className="space-y-0.5 mb-1.5">
+                {modelCtx.slice(-4).map((c, i) => (
+                  <div key={`m${i}`} className="text-[9px] font-mono text-sky-300/80 leading-snug">· {c.text}</div>
+                ))}
+                {humanCtx.slice(-4).map((c, i) => (
+                  <div key={`h${i}`} className="text-[9px] font-mono text-emerald-300/90 leading-snug">✎ {c.text}</div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[9px] font-mono text-zinc-600 italic mb-1.5">No context yet. Add steering notes Janus will read.</div>
+            )}
+            <div className="flex gap-1">
+              <input
+                value={contextInput}
+                onChange={(e) => setContextInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") { handleAddHumanContext(contextInput); setContextInput(""); } }}
+                placeholder="Add context for this pane…"
+                className="flex-1 bg-black text-[9px] text-zinc-200 px-2 py-1 rounded border border-white/10 focus:outline-none focus:border-emerald-500 font-mono"
+              />
+              <button
+                onClick={() => { handleAddHumanContext(contextInput); setContextInput(""); }}
+                className="px-2 py-1 text-[9px] font-mono uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 rounded"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Action toolbar: Send is primary. */}
         <div className="p-3 bg-[#0d0d0d] border-t border-white/5 flex flex-wrap gap-2 items-center justify-between shrink-0 select-none">
           <div className="flex gap-2">
             <button
               onClick={() => handlePromptBufferChange(promptBuffer + "\n- [ ] ")}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
+              disabled={!activeTerminalId}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded disabled:opacity-40"
             >
               + Task
             </button>
             <button
-              onClick={() => handlePromptBufferChange(
-                `# Requirements Specification Checklist\n\n- [ ] **Architecture**: Build production containers.\n- [ ] **Database Snapshots**: Configure sqlite snapshots in .env file.`
-              )}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
-            >
-              Template
-            </button>
-          </div>
-
-          <div className="flex gap-2">
-            {activeTerminalId && (
-              <button
-                onClick={handleSyncNoteToActiveNode}
-                className="px-2.5 py-1 text-[9px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded font-bold flex items-center gap-1"
-                title="Pushes prompt buffer specs directly to node chronicle notes registry"
-              >
-                Sync Note
-              </button>
-            )}
-            <button
               onClick={() => handlePromptBufferChange("")}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded"
+              disabled={!activeTerminalId}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded disabled:opacity-40"
             >
               Clear
             </button>
           </div>
+
+          <button
+            onClick={handleSendDraft}
+            disabled={!activeTerminalId || !promptBuffer.trim()}
+            className="px-4 py-1.5 text-[10px] font-mono uppercase bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded font-bold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Send this prompt to the open pane (operator approval)"
+          >
+            Send → {activePaneName}
+          </button>
         </div>
       </div>
     );
