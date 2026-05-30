@@ -45,8 +45,13 @@ async function main() {
 
   log("starting pane (claude)...");
   term.start();
+  log(`spawned: usingNodePty=${(term as any).usingNodePty} pid=${(term as any).shellPid}`);
 
-  await new Promise((r) => setTimeout(r, STARTUP_MS));
+  // Instrument: report status each second through startup.
+  for (let i = 0; i < STARTUP_MS / 1000; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    log(`t+${i + 1}s status=${term.status} bytes=${bytesBefore}`);
+  }
 
   if (term.status === "Exited") {
     log("FAIL: pane exited during startup - not a live session.");
