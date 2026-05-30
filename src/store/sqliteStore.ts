@@ -1,4 +1,4 @@
-// src/store/sqliteStore.ts
+﻿// src/store/sqliteStore.ts
 import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
@@ -121,26 +121,6 @@ export class JanusStore {
     ).all(...args).map((r:any) => ({ ...r })) as any;
   }
 
-  /** Full-text search across notes + events, ranked by bm25. */
-  search(query: string, opts: { limit?: number } = {}): Array<{ source:"note"|"event"; id:string; snippet:string; rank:number }> {
-    const limit = opts.limit ?? 25;
-    const notes = this.db.prepare(
-      `SELECT n.id AS id, n.text AS snippet, bm25(notes_fts) AS rank
-       FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
-       WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`
-    ).all(query, limit) as any[];
-    const events = this.db.prepare(
-      `SELECT e.id AS id, e.summary AS snippet, bm25(events_fts) AS rank
-       FROM events_fts JOIN events e ON e.id = events_fts.rowid
-       WHERE events_fts MATCH ? ORDER BY rank LIMIT ?`
-    ).all(query, limit) as any[];
-    const merged = [
-      ...notes.map(r => ({ source:"note" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
-      ...events.map(r => ({ source:"event" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
-    ].sort((a,b) => a.rank - b.rank);
-    return merged.slice(0, limit);
-  }
-
   /** Seam for deterministic IDs in tests. */
   protected rand(): number { return Math.random(); }
 
@@ -197,4 +177,86 @@ export class JanusStore {
       .run(key, value, Date.now());
   }
   deleteKV(key: string): void { this.db.prepare("DELETE FROM kv WHERE key=?").run(key); }
+
+  savePane(pane: StoredPane): void {
+    const now = Date.now();
+    this.recordActivity(
+      { type: EVENT_TYPES.PANE_CREATED, project_id: pane.workspace_id, pane_id: pane.pane_id, summary: `pane ${pane.name}` },
+      (db) => db.prepare(
+        `INSERT INTO panes(pane_id,workspace_id,name,runtime_type,tool_preset,permissions_mode,
+           session_id,last_known_state,is_busy,alive,context_size,last_status_change_at,
+           last_command,scrollback_path,created_at,updated_at)
+         VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,
+           @session_id,@last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,
+           @last_command,@scrollback_path,@created_at,@updated_at)
+         ON CONFLICT(pane_id,workspace_id) DO UPDATE SET name=excluded.name,
+           runtime_type=excluded.runtime_type, tool_preset=excluded.tool_preset,
+           permissions_mode=excluded.permissions_mode, session_id=excluded.session_id,
+           last_known_state=excluded.last_known_state, is_busy=excluded.is_busy, alive=excluded.alive,
+           context_size=excluded.context_size, last_status_change_at=excluded.last_status_change_at,
+           last_command=excluded.last_command, scrollback_path=excluded.scrollback_path,
+           updated_at=excluded.updated_at`
+      ).run({ ...pane, is_busy: pane.is_busy?1:0, alive: pane.alive?1:0,
+              created_at: pane.created_at || now, updated_at: now })
+    );
+  }
+
+  getPanes(workspaceId: string): Record<string, StoredPane> {
+    const rows = this.db.prepare("SELECT * FROM panes WHERE workspace_id=? ORDER BY created_at").all(workspaceId) as any[];
+    const out: Record<string, StoredPane> = {};
+    for (const r of rows) out[r.pane_id] = this.hydratePane(r);
+    return out;
+  }
+
+  archivePane(paneId: string, workspaceId: string, reason?: string): void {
+    this.recordActivity(
+      { type: EVENT_TYPES.PANE_ARCHIVED, project_id: workspaceId, pane_id: paneId, summary: reason ?? "archived" },
+      (db) => {
+        const row = db.prepare("SELECT * FROM panes WHERE pane_id=? AND workspace_id=?").get(paneId, workspaceId) as any;
+        if (!row) return;
+        db.prepare(
+          `INSERT OR REPLACE INTO panes_archive(pane_id,workspace_id,name,runtime_type,tool_preset,
+             permissions_mode,session_id,last_known_state,is_busy,alive,context_size,last_status_change_at,
+             last_command,scrollback_path,created_at,updated_at,archived_at,archive_reason)
+           VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,@session_id,
+             @last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,@last_command,
+             @scrollback_path,@created_at,@updated_at,@archived_at,@archive_reason)`
+        ).run({ ...row, archived_at: Date.now(), archive_reason: reason ?? null });
+        db.prepare("DELETE FROM panes WHERE pane_id=? AND workspace_id=?").run(paneId, workspaceId);
+      }
+    );
+  }
+
+  restorePane(paneId: string, workspaceId: string): StoredPane | null {
+    const row = this.db.prepare(
+      "SELECT * FROM panes_archive WHERE pane_id=? AND workspace_id=? ORDER BY archived_at DESC LIMIT 1"
+    ).get(paneId, workspaceId) as any;
+    if (!row) return null;
+    const pane = { ...this.hydratePane(row), alive: false, last_known_state: "Exited" as const };
+    this.recordActivity(
+      { type: EVENT_TYPES.PANE_RESTORED, project_id: workspaceId, pane_id: paneId, summary: "restored" },
+      (db) => db.prepare(
+        `INSERT INTO panes(pane_id,workspace_id,name,runtime_type,tool_preset,permissions_mode,session_id,
+           last_known_state,is_busy,alive,context_size,last_status_change_at,last_command,scrollback_path,
+           created_at,updated_at)
+         VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,@session_id,
+           @last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,@last_command,
+           @scrollback_path,@created_at,@updated_at)
+         ON CONFLICT(pane_id,workspace_id) DO UPDATE SET alive=excluded.alive,
+           last_known_state=excluded.last_known_state, updated_at=excluded.updated_at`
+      ).run({ ...pane, is_busy: 0, alive: 0, updated_at: Date.now() })
+    );
+    return pane;
+  }
+
+  listArchived(workspaceId: string): import("./types").StoredArchivedPane[] {
+    const rows = this.db.prepare("SELECT * FROM panes_archive WHERE workspace_id=? ORDER BY archived_at DESC").all(workspaceId) as any[];
+    return rows.map(r => ({ ...this.hydratePane(r), archived_at: r.archived_at, archive_reason: r.archive_reason ?? null }));
+  }
+
+  private hydratePane(r: any): StoredPane {
+    return { ...r, is_busy: Boolean(r.is_busy), alive: Boolean(r.alive),
+             last_status_change_at: r.last_status_change_at ?? null,
+             last_command: r.last_command ?? null, scrollback_path: r.scrollback_path ?? null };
+  }
 }
