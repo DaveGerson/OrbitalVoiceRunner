@@ -48,9 +48,10 @@ export class JanusStore {
     if (filter.paneId) { where.push("pane_id = ?"); args.push(filter.paneId); }
     if (filter.type) { where.push("type = ?"); args.push(filter.type); }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    const limit = filter.limit && filter.limit > 0 ? `LIMIT ${filter.limit}` : "";
+    const hasLimit = filter.limit !== undefined && filter.limit > 0;
+    if (hasLimit) args.push(filter.limit);
     const rows = this.db.prepare(
-      `SELECT * FROM events ${clause} ORDER BY id ASC ${limit}`
+      `SELECT * FROM events ${clause} ORDER BY id ASC${hasLimit ? " LIMIT ?" : ""}`
     ).all(...args) as any[];
     return rows.map(r => ({ ...r, payload: this.parseJSON(r.payload, {}) }));
   }
@@ -176,8 +177,10 @@ export class JanusStore {
   dismissAttention(id: string): void { this.db.prepare("UPDATE attention SET dismissed=1 WHERE id=?").run(id); }
   clearAttention(): void { this.db.prepare("DELETE FROM attention").run(); }
   getAttention(opts: { includeDismissed?: boolean } = {}): import("./types").StoredAttention[] {
-    const clause = opts.includeDismissed ? "" : "WHERE dismissed=0";
-    return (this.db.prepare(`SELECT * FROM attention ${clause} ORDER BY timestamp DESC`).all() as any[])
+    const sql = opts.includeDismissed
+      ? "SELECT * FROM attention ORDER BY timestamp DESC"
+      : "SELECT * FROM attention WHERE dismissed=0 ORDER BY timestamp DESC";
+    return (this.db.prepare(sql).all() as any[])
       .map(r => ({ ...r, dismissed: Boolean(r.dismissed), details: this.parseJSON(r.details, null) }));
   }
 

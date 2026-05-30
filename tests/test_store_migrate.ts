@@ -4,6 +4,46 @@ import assert from "node:assert";
 import { JanusStore } from "../src/store/sqliteStore";
 import { migrateFromObjects } from "../src/store/migrate";
 
+test("migrateFromObjects is atomic: a mid-import failure leaves the DB empty", () => {
+  const s = new JanusStore(":memory:"); s.init();
+
+  // First workspace is valid. Second workspace has a pane with pane_id: null,
+  // which violates the NOT NULL constraint on panes.pane_id and throws mid-transaction.
+  const input = {
+    ledger: {
+      workspaces: {
+        ws1: {
+          id: "ws1", name: "WS1", directory: "/a", summary: "", keyTerms: [],
+          notes: [], panes: {},
+        },
+        ws2: {
+          id: "ws2", name: "WS2", directory: "/b", summary: "", keyTerms: [],
+          notes: [],
+          panes: {
+            badPane: {
+              pane_id: null,         // NOT NULL violation — forces the INSERT to throw
+              name: "bad", runtime_type: "shell", tool_preset: "Custom",
+              permissions_mode: "Human-in-the-Loop", session_id: "",
+              last_known_state: "Idle", is_busy: false, alive: false, context_size: 0,
+            },
+          },
+        },
+      },
+    },
+  };
+
+  // The transaction must throw (NOT NULL on pane_id)
+  assert.throws(() => migrateFromObjects(s, input), /NOT NULL|constraint/i);
+
+  // The outer transaction must have rolled back everything — even ws1 must be absent
+  assert.strictEqual(Object.keys(s.getWorkspaces()).length, 0,
+    "partial workspace import must be rolled back");
+  assert.strictEqual(s.getEvents({}).length, 0,
+    "partial event import must be rolled back");
+
+  s.close();
+});
+
 test("migrateFromObjects imports ledger + settings + history with no data loss", () => {
   const s = new JanusStore(":memory:"); s.init();
   const ledger = {
