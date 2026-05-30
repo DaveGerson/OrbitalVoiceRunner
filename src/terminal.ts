@@ -688,7 +688,10 @@ export class OrchestratorManager {
     if (project && project.panes) {
       for (const [paneId, pane] of Object.entries(project.panes)) {
         let cmd = "bash";
-        if (pane.tool_preset === "Claude Code") cmd = "npx @anthropic-ai/claude-code";
+        // WS-G quick win: Claude Code is installed globally here as the bare `claude`
+        // binary; `npx @anthropic-ai/claude-code` is the wrong package and errors on
+        // spawn, which is what produced the boot `none -> error` transition spam.
+        if (pane.tool_preset === "Claude Code") cmd = "claude";
         else if (pane.tool_preset === "Codex") cmd = "npx codex";
         else if (pane.tool_preset === "Antigravity") cmd = "npx antigravity";
         this.addTerminal(
