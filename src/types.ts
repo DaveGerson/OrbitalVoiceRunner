@@ -87,6 +87,16 @@ export interface SystemSettings {
     localWorkspacePath: string;
   };
   presets: CliPreset[];
+  // WS-D: operator-editable proactive-announcement message templates. `{pane}` and
+  // `{summary}` are interpolated. Defaults are brief (see DEFAULT_ANNOUNCEMENT_TEMPLATES).
+  announcements?: {
+    completion: string;
+    error: string;
+    buildFailed: string;
+    exited: string;
+    planCompleted: string;
+    planPaused: string;
+  };
   advanced: {
     webSocketUrl: string;
     latencyMode: "Low Latency" | "High Throughput" | "Balanced";
