@@ -330,7 +330,9 @@ function AppRaw() {
   const lastGridRef = useRef<Record<string, string>>({});
 
   const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
-    if (isMockModeRef.current) return;
+    // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
+    // where Playwright intercepts the POST to assert the grid-sync round-trip.
+    if (isMockModeRef.current && !e2eRef.current) return;
     if (!cols || !rows) return;
     const key = `${cols}x${rows}`;
     if (lastGridRef.current[terminalId] === key) return;
@@ -359,6 +361,52 @@ function AppRaw() {
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
+  // True only under the ?mock=1 e2e harness. Lets the resize POST still fire in
+  // mock mode (Playwright intercepts it) while keeping mock mode for real users
+  // a no-op.
+  const e2eRef = useRef(false);
+
+  // E2E harness: when loaded with ?mock=1, run fully client-side with deterministic
+  // mock data and expose injection hooks for Playwright. Gated entirely on the URL
+  // param — completely inert for real users (no effect without ?mock=1).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (new URLSearchParams(window.location.search).get("mock") !== "1") return;
+    e2eRef.current = true;
+    isMockModeRef.current = true;
+    setIsMockMode(true);
+    // Open the transcript panel so injected transcript lines are mounted/visible.
+    setShowTranscriptPanel(true);
+
+    const MOCK_ID = "mock_pane_1";
+    // Backfill carries an ANSI color sequence so the terminal spec can prove xterm
+    // renders RAW bytes (not ANSI-stripped). MOCKTERM_READY is the asserted token.
+    setTerminals([{
+      id: MOCK_ID,
+      cwd: ".",
+      command: "bash",
+      backfill: "[32mMOCKTERM_READY[0m web-app@1.0.0 dev server\r\n$ ",
+      output: "MOCKTERM_READY web-app@1.0.0 dev server\n$ ",
+      status: "Running",
+    }]);
+    setActiveTerminalId(MOCK_ID);
+
+    (window as any).__ORBITAL_E2E__ = {
+      injectStdoutChunk: (terminalId: string, chunk: string) => queueStdoutChunk(terminalId, chunk),
+      injectTranscript: (sender: "User" | "Janus", text: string) =>
+        setTranscript((prev) => [...prev, { sender, text, timestamp: new Date() }]),
+      injectPendingApproval: (cmd: string, terminalId: string = MOCK_ID) =>
+        setPendingCommands((prev) => [...prev, {
+          messageId: `mock_${prev.length + 1}`,
+          cmd,
+          terminalId,
+          rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
+        }]),
+    };
+    // Signal readiness so the Playwright fixture can wait deterministically.
+    document.documentElement.setAttribute("data-e2e-ready", "1");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
@@ -1759,6 +1807,7 @@ function AppRaw() {
               Preview
             </button>
             <button
+              data-testid="composer-edit-toggle"
               onClick={() => setPromptBufferEditMode("edit")}
               className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
             >
@@ -1776,6 +1825,7 @@ function AppRaw() {
         <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[300px]">
           {promptBufferEditMode === "edit" ? (
             <textarea
+              data-testid="composer-input"
               value={promptBuffer}
               onChange={(e) => handlePromptBufferChange(e.target.value)}
               onFocus={() => setIsBufferFocused(true)}
@@ -1816,6 +1866,7 @@ function AppRaw() {
           <div className="flex gap-2">
             {activeTerminalId && (
               <button
+                data-testid="composer-send"
                 onClick={handleSyncNoteToActiveNode}
                 className="px-2.5 py-1 text-[9px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded font-bold flex items-center gap-1"
                 title="Pushes prompt buffer specs directly to node chronicle notes registry"
@@ -2872,7 +2923,7 @@ function AppRaw() {
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
+                <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
                   <TerminalView
                     key={activeTerminal.id}
                     terminalId={activeTerminal.id}
@@ -3915,8 +3966,10 @@ function AppRaw() {
                 transcript.map((item, idx) => {
                   const isUser = item.sender === "User";
                   return (
-                    <div 
-                      key={idx} 
+                    <div
+                      key={idx}
+                      data-testid="transcript-message"
+                      data-sender={item.sender}
                       className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
                     >
                       <span className="text-[9px] font-mono opacity-30 mb-0.5 select-none uppercase">
