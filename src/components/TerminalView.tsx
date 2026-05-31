@@ -3,22 +3,34 @@ import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import "xterm/css/xterm.css";
 import { ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
+import { subscribeChunks } from "../terminalStream";
 
 interface TerminalViewProps {
-  output: string;
+  /** Pane id — keys the live raw-chunk subscription and resize callback. */
+  terminalId: string;
+  /** Raw bytes (escape sequences intact) to seed scrollback on (re)open. */
+  backfill?: string;
+  /** Report the xterm grid so the backend PTY can be resized to match. */
+  onResize?: (cols: number, rows: number) => void;
 }
 
-export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
+export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill, onResize }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  const writtenLengthRef = useRef<number>(0);
   const [fontSize, setFontSize] = useState<number>(12);
+  // Keep the latest onResize without re-running the mount effect on every render.
+  const onResizeRef = useRef<typeof onResize>(onResize);
+  onResizeRef.current = onResize;
 
+  // Re-create the terminal when the pane changes; the raw stream + backfill are
+  // pane-specific, so a key change must reset xterm cleanly.
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // Initialize xterm Terminal with custom theme matching Orbital Harness UI
+    // Initialize xterm Terminal with custom theme matching Orbital Harness UI.
+    // NOTE: no convertEol — a real PTY already emits \r\n, and forcing it would
+    // corrupt lone-\r in-place updates (spinners, progress bars).
     const term = new Terminal({
       cursorBlink: true,
       fontSize: fontSize,
@@ -44,7 +56,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
         brightCyan: "#22d3ee",
         brightWhite: "#ffffff",
       },
-      convertEol: true,
+      scrollback: 10000,
       rows: 24,
       cols: 80,
     });
@@ -58,9 +70,24 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    // Write initial output
-    term.write(output);
-    writtenLengthRef.current = output.length;
+    // Seed scrollback with the raw backfill (escape sequences intact), exactly
+    // once. After this, xterm owns the authoritative buffer.
+    if (backfill) term.write(backfill);
+
+    // Sync the backend PTY grid to the xterm grid. onResize fires after every
+    // fit() (initial + container changes), so the PTY always wraps to the
+    // operator's actual viewport.
+    const resizeDisposable = term.onResize(({ cols, rows }) => {
+      onResizeRef.current?.(cols, rows);
+    });
+    // Report the initial fitted grid.
+    onResizeRef.current?.(term.cols, term.rows);
+
+    // Live lane: raw chunks written DIRECTLY into xterm — no React state, no
+    // string accumulation, no line cap. xterm reconstructs the 2D grid itself.
+    const unsubscribe = subscribeChunks(terminalId, (chunk) => {
+      term.write(chunk);
+    });
 
     // Handle container resize
     const resizeObserver = new ResizeObserver(() => {
@@ -106,6 +133,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
     }
 
     return () => {
+      unsubscribe();
+      resizeDisposable.dispose();
       resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener("touchstart", handleTouchStart);
@@ -115,7 +144,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
-  }, []);
+    // Re-mount xterm when the pane changes so the new pane's backfill + stream
+    // bind cleanly. fontSize is handled in a separate effect (no re-mount).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [terminalId]);
 
   // Sync state changes back to active terminal instance
   useEffect(() => {
@@ -140,24 +172,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ output }) => {
       }
     }, 50);
   }, [fontSize]);
-
-  // Update output when it changes
-  useEffect(() => {
-    const term = terminalRef.current;
-    if (!term) return;
-
-    const lastLength = writtenLengthRef.current;
-    if (output.length < lastLength) {
-      // Re-initialize terminal buffer on contraction or restart
-      term.reset();
-      term.write(output);
-    } else if (output.length > lastLength) {
-      // Write only the new incremental slice
-      const chunk = output.slice(lastLength);
-      term.write(chunk);
-    }
-    writtenLengthRef.current = output.length;
-  }, [output]);
 
   const handleZoomIn = () => {
     setFontSize(prev => Math.min(prev + 1, 24));

@@ -26,6 +26,9 @@ export interface PtyTransport {
   onExit(cb: (info: { exitCode: number; signal?: number }) => void): void;
   /** Write raw bytes to the process stdin / PTY master. */
   write(data: string): void;
+  /** Resize the PTY grid so the program inside wraps to the operator's viewport.
+   *  No-op on transports without a real PTY (legacy fallback). */
+  resize(cols: number, rows: number): void;
   /** Terminate the process (and its group/tree where possible). */
   kill(signal?: string): void;
 }
@@ -110,6 +113,15 @@ export class NodePtyTransport implements PtyTransport {
     }
   }
 
+  resize(cols: number, rows: number): void {
+    try {
+      // node-pty rejects non-positive dims; clamp to a sane floor.
+      this.proc.resize(Math.max(1, Math.floor(cols)), Math.max(1, Math.floor(rows)));
+    } catch {
+      // process gone, or dims momentarily invalid mid-teardown
+    }
+  }
+
   kill(signal?: string): void {
     try {
       this.proc.kill(signal);
@@ -183,6 +195,12 @@ export class LegacyChildProcessTransport implements PtyTransport {
     if (this.proc && this.proc.stdin) {
       this.proc.stdin.write(data);
     }
+  }
+
+  resize(_cols: number, _rows: number): void {
+    // No real PTY behind a piped child process — nothing to resize. The pane is
+    // already degraded to quiescence-driven idle (design §6, R1); line wrapping
+    // is whatever the program assumes by default.
   }
 
   kill(signal?: string): void {

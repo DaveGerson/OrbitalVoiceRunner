@@ -14,6 +14,7 @@ import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
+import { publishChunk } from "./terminalStream";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -294,8 +295,15 @@ function AppRaw() {
   const animationFrameRef = useRef<number | null>(null);
 
   const queueStdoutChunk = (terminalId: string, chunk: string) => {
+    // Display lane: stream raw bytes straight into xterm (no React state, no line
+    // cap, no reset thrash). xterm owns the live buffer.
+    publishChunk(terminalId, chunk);
+
+    // Preview lane: keep a capped, ANSI-bearing tail in React state purely to feed
+    // the pane-card text snippets / byte count. This NO LONGER drives xterm, so the
+    // -110 line cap here is harmless (it once forced a full xterm.reset per frame).
     stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
-    
+
     if (!animationFrameRef.current) {
       animationFrameRef.current = requestAnimationFrame(() => {
         animationFrameRef.current = null;
@@ -314,6 +322,27 @@ function AppRaw() {
         );
       });
     }
+  };
+
+  // Per-pane debounce + last-sent-grid so a flurry of fit() events (drag-resize)
+  // collapses into one POST, and an unchanged grid never hits the server.
+  const resizeDebounceRef = useRef<Record<string, any>>({});
+  const lastGridRef = useRef<Record<string, string>>({});
+
+  const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
+    if (isMockModeRef.current) return;
+    if (!cols || !rows) return;
+    const key = `${cols}x${rows}`;
+    if (lastGridRef.current[terminalId] === key) return;
+    lastGridRef.current[terminalId] = key;
+    clearTimeout(resizeDebounceRef.current[terminalId]);
+    resizeDebounceRef.current[terminalId] = setTimeout(() => {
+      apiFetch(`/api/terminals/${terminalId}/resize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => { /* pane may have exited; resize is best-effort */ });
+    }, 120);
   };
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -2844,7 +2873,12 @@ function AppRaw() {
                   </div>
                 </div>
                 <div className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
-                  <TerminalView key={activeTerminal.id} output={activeTerminal.output} />
+                  <TerminalView
+                    key={activeTerminal.id}
+                    terminalId={activeTerminal.id}
+                    backfill={activeTerminal.backfill}
+                    onResize={(cols, rows) => handleTerminalResize(activeTerminal.id, cols, rows)}
+                  />
                 </div>
               </div>
 

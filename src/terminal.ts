@@ -60,6 +60,18 @@ export function parsePresetsSafe(input: any): CliPreset[] {
 }
 
 
+/**
+ * Append `chunk` to a raw display-backfill buffer, keeping at most the most
+ * recent `max` characters. Pure. Unlike the model-bound outputBuffer this keeps
+ * escape sequences INTACT (no ANSI stripping) — xterm needs the raw bytes to
+ * reconstruct colors/cursor on a freshly-opened pane. The cap is by length so
+ * the buffer cannot grow unbounded; xterm owns the authoritative live scrollback.
+ */
+export function appendRawCapped(existing: string, chunk: string, max: number): string {
+  const combined = existing + chunk;
+  return combined.length > max ? combined.slice(combined.length - max) : combined;
+}
+
 export function stripAnsiSequences(text: string): string {
   // Matches ANSI color/style escape sequences
   const ansiEscape = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
@@ -137,6 +149,16 @@ export class UniversalTerminal {
   private transport: PtyTransport | null = null;
   public outputBuffer: string[] = [];
   public maxBufferLines = 100;
+  // PTY grid, kept in sync with the operator's xterm viewport via resize(). The
+  // program inside wraps lines to THIS width, so it must match the display or
+  // wrapping looks wrong. Defaults match the node-pty spawn defaults (80x30).
+  public cols = 80;
+  public rows = 30;
+  // Raw display-backfill buffer (escape sequences intact). Distinct from the
+  // ANSI-stripped, line-capped `outputBuffer` (model lane). Seeds xterm when a
+  // pane is (re)opened so scrollback renders with correct colors/layout.
+  private rawBackfill = "";
+  public maxRawBackfillChars = 200_000;
   public status: "Running" | "Exited" | "Idle" = "Idle";
   public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
@@ -445,6 +467,8 @@ export class UniversalTerminal {
     const { transport, usingNodePty } = createPtyTransport(finalCommand, {
       cwd: this.cwd,
       env: childEnv,
+      cols: this.cols,
+      rows: this.rows,
     });
     this.transport = transport;
     this.usingNodePty = usingNodePty;
@@ -467,6 +491,8 @@ export class UniversalTerminal {
     // Merged stdout/stderr stream from the transport.
     transport.onData((decoded: string) => {
       this.appendScrollback(decoded);
+      // Display lane: keep raw bytes (escape sequences intact) for xterm backfill.
+      this.rawBackfill = appendRawCapped(this.rawBackfill, decoded, this.maxRawBackfillChars);
       this.applyStatusEvent({ kind: "output", text: decoded });
       this.checkForSessionId(decoded);
       if (this.onOutput) {
@@ -495,6 +521,25 @@ export class UniversalTerminal {
     this.clearProbeTimer();
     this.probeTimer = setInterval(() => this.runProbeTick(), this.probeIntervalMs);
     if (this.probeTimer.unref) this.probeTimer.unref();
+  }
+
+  /** Sync the PTY grid to the operator's xterm viewport. Idempotent; crash-safe
+   *  (transport.resize is guarded) so a resize after process exit is a harmless
+   *  no-op. Dims are stored even before/without a live transport so the next
+   *  start() spawns at the right size. */
+  resize(cols: number, rows: number) {
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return;
+    if (cols < 1 || rows < 1) return;
+    this.cols = Math.floor(cols);
+    this.rows = Math.floor(rows);
+    if (this.transport) {
+      this.transport.resize(this.cols, this.rows);
+    }
+  }
+
+  /** Raw display backfill (escape sequences intact) seeding xterm on (re)open. */
+  getRawBackfill(): string {
+    return this.rawBackfill;
   }
 
   writeInput(command: string) {
@@ -745,6 +790,14 @@ export class OrchestratorManager {
     }
     this.syncLedger();
     return `Created terminal '${terminalId}' executing '${command}' at '${cwd}'.`;
+  }
+
+  /** Resize a pane's PTY grid to match the operator's xterm viewport. Unknown
+   *  ids are a safe no-op (a stale client may resize a pane that just exited). */
+  resize(terminalId: string, cols: number, rows: number) {
+    const term = this.terminals[terminalId];
+    if (!term) return;
+    term.resize(cols, rows);
   }
 
   listPanes() {

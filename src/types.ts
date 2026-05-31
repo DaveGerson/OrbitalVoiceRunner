@@ -4,7 +4,10 @@ export interface Terminal {
   id: string;
   cwd: string;
   command: string;
+  /** ANSI-stripped recent output, used for the pane-card text previews. */
   output: string;
+  /** Raw bytes (escape sequences intact) seeding xterm on (re)open. */
+  backfill?: string;
   status: "Running" | "Exited" | "Idle";
   permissions_mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   tool_preset?: "Claude Code" | "Codex" | "Antigravity" | "Custom";
