@@ -17,6 +17,18 @@ import { createRequire } from "module";
  * pane on the legacy transport degrades to quiescence-driven idle (design §6, R1).
  */
 
+/**
+ * Choose the signal to hand node-pty's kill(). node-pty's Windows backend does
+ * NOT support POSIX signals — passing one throws "Signals not supported on
+ * windows" in a deferred context (an async uncaughtException that escapes a
+ * synchronous try/catch). On win32 we therefore drop the signal entirely (a bare
+ * kill() is an unconditional terminate); on POSIX the signal is preserved so the
+ * SIGTERM→SIGKILL escalation in UniversalTerminal.stop() still works.
+ */
+export function killSignalForPlatform(platform: string, signal?: string): string | undefined {
+  return platform === "win32" ? undefined : signal;
+}
+
 export interface PtyTransport {
   /** Root pid of the spawned shell/agent (for the StatusProbe). */
   readonly pid: number | undefined;
@@ -124,7 +136,7 @@ export class NodePtyTransport implements PtyTransport {
 
   kill(signal?: string): void {
     try {
-      this.proc.kill(signal);
+      this.proc.kill(killSignalForPlatform(process.platform, signal));
     } catch {
       // already dead
     }

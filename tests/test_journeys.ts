@@ -15,6 +15,10 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     // Initialize standard manager targeting custom test ledger storage
     manager = new OrchestratorManager();
     manager.ledger = new Ledger(TEST_LEDGER_PATH);
+    // Hermetic precondition: the constructor seeds globalPermissionsMode from the
+    // developer's live .janus_settings.json, which makes the Inherit->pane fallback
+    // depend on machine state. Pin it so the suite is self-contained.
+    manager.globalPermissionsMode = "Inherit";
   });
 
   afterEach(() => {
@@ -38,9 +42,13 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     manager.ledger.addProject("proj_alpha", "/cwd/alpha", "TypeScript backend migration");
     manager.ledger.addProject("proj_beta", "/cwd/beta", "Vite Frontend revamp");
 
-    // Add multiple concurrent terminal panes assigned to those projects
-    manager.addTerminal("pane_alpha_1", "/cwd/alpha", shellCmd, "Claude Code", "Human-in-the-Loop", "", "proj_alpha");
-    manager.addTerminal("pane_beta_1", "/cwd/beta", shellCmd, "Codex", "Human-in-the-Loop", "", "proj_beta");
+    // Add multiple concurrent terminal panes assigned to those projects.
+    // NOTE: cwd must be a real directory — node-pty validates it and throws
+    // (Windows ERROR_DIRECTORY / code 267) on a bogus path. The project-level
+    // dirs above are inert ledger metadata; only the pane cwd reaches the PTY, so
+    // use "." (the repo root). Project independence is keyed by projectId, not cwd.
+    manager.addTerminal("pane_alpha_1", ".", shellCmd, "Claude Code", "Human-in-the-Loop", "", "proj_alpha");
+    manager.addTerminal("pane_beta_1", ".", shellCmd, "Codex", "Human-in-the-Loop", "", "proj_beta");
 
     // Verify both exist, are tracked under their respective workspaces
     assert.ok(manager.terminals["pane_alpha_1"], "First client terminal should exist concurrently");
