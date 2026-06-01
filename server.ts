@@ -161,13 +161,11 @@ export class HistoryManager {
   }
 }
 
-const manager = new OrchestratorManager();
-
 // WS-M/Handoffs: the persistent JanusStore (SQLite). better-sqlite3 loads cleanly under tsx
 // (confirmed by the store unit tests + smoke), so a static import is fine here — unlike node-pty
-// which the transport layer loads via createRequire. v1 keeps the legacy Ledger live; only
-// handoff rows + capability-gate audit events flow through this store (design §5.3 two-store seam).
-// init() applies migrations (idempotent); bootMaintenance() prunes stale rows/scrollback.
+// which the transport layer loads via createRequire. init() applies migrations (idempotent);
+// bootMaintenance() prunes stale rows/scrollback. Created BEFORE the manager so it can serve as
+// the manager's ledger backend when the cutover flag is on.
 let store: JanusStore | null = null;
 try {
   store = new JanusStore(process.env.JANUS_DB || ".janus.db");
@@ -182,6 +180,17 @@ try {
 } catch (e) {
   console.error("[STORE] Failed to initialize JanusStore — handoff persistence disabled:", e);
   store = null;
+}
+
+// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it can BE the
+// manager's ledger — making drafts/context/approvals/etc. durable across restart.
+// GATED OFF by default: only when JANUS_LEDGER_BACKEND=sqlite (and the store booted)
+// does the manager run on SQLite; otherwise it keeps the legacy in-memory/JSON Ledger.
+// No JSON→SQLite data migration runs here yet — that is a separate, signed-off step.
+const useSqliteLedger = process.env.JANUS_LEDGER_BACKEND === "sqlite" && store !== null;
+const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
+if (useSqliteLedger) {
+  console.log("[STORE] OrchestratorManager is running on the SQLite ledger backend (JANUS_LEDGER_BACKEND=sqlite).");
 }
 
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps

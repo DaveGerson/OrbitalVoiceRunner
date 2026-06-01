@@ -16,6 +16,48 @@ export class JanusStore {
   init(): void { applyMigrations(this.db); }
   close(): void { this.db.close(); }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // watchRules / plans — live, self-persisting arrays (Ledger parity).
+  //
+  // server.ts treats these as mutable arrays and does `.push`/`.splice`/`.find`
+  // directly on the property. There is no relational table for them (they are
+  // small, document-shaped config), so we back each with a kv-JSON blob and wrap
+  // the in-memory array in a Proxy that re-serializes on any structural write.
+  // The array IDENTITY is stable across reads, so a captured reference the server
+  // mutates stays wired to persistence. In-place field edits on an *element*
+  // (e.g. `plan.status = "done"`) bypass the array proxy — callers flush those
+  // with persistPlans()/persistWatchRules(), mirroring how the legacy Ledger
+  // required an explicit `.save()`. ──────────────────────────────────────────
+
+  private _watchRules?: import("../types").WatchRule[];
+  private _plans?: import("../types").Plan[];
+
+  private loadJsonArray<T>(key: string): T[] {
+    return this.parseJSON<T[]>(this.getKV(key), []);
+  }
+
+  /** Wrap an array so structural mutations (set/delete length, push, splice, …) persist. */
+  private persistingArray<T>(key: string, backing: T[]): T[] {
+    const flush = () => this.setKV(key, JSON.stringify(backing));
+    return new Proxy(backing, {
+      set: (target, prop, value) => { (target as any)[prop] = value; flush(); return true; },
+      deleteProperty: (target, prop) => { delete (target as any)[prop]; flush(); return true; },
+    });
+  }
+
+  get watchRules(): import("../types").WatchRule[] {
+    if (!this._watchRules) this._watchRules = this.persistingArray("watchRules", this.loadJsonArray("watchRules"));
+    return this._watchRules;
+  }
+  get plans(): import("../types").Plan[] {
+    if (!this._plans) this._plans = this.persistingArray("plans", this.loadJsonArray("plans"));
+    return this._plans;
+  }
+
+  /** Flush in-place element edits that the array Proxy can't observe. */
+  persistWatchRules(): void { this.setKV("watchRules", JSON.stringify(this.watchRules)); }
+  persistPlans(): void { this.setKV("plans", JSON.stringify(this.plans)); }
+
   /** Append `event` AND run `mutations(db)` in ONE transaction (parallel-write). */
   recordActivity(event: NewEvent, mutations?: (db: Database.Database) => void): void {
     const tx = this.db.transaction(() => {
@@ -84,8 +126,24 @@ export class JanusStore {
     );
   }
 
+  /**
+   * Persist a note (a first-class, FTS-indexed `notes` row) and return it so
+   * callers can use its generated id. Returns null when the target project
+   * (or, for a pane-scoped note, the target pane) does not exist — so the
+   * server's `if (ok)` correctly reports "not found" rather than writing an
+   * orphan row. Mirrors the legacy Ledger's add{Note,PaneNote} success signal.
+   */
   addNote(projectId: string, text: string,
-          opts: { paneId?: string; type?: import("./types").NoteType; author?: "janus"|"user" } = {}): import("./types").StoredNote {
+          opts: { paneId?: string; type?: import("./types").NoteType; author?: "janus"|"user" } = {}): import("./types").StoredNote | null {
+    // Target must exist (no orphan notes). Pane-scoped notes need the pane;
+    // project-scoped notes need the project.
+    if (opts.paneId) {
+      const pane = this.db.prepare("SELECT 1 FROM panes WHERE pane_id=? AND workspace_id=?").get(opts.paneId, projectId);
+      if (!pane) return null;
+    } else {
+      const proj = this.db.prepare("SELECT 1 FROM projects WHERE id=?").get(projectId);
+      if (!proj) return null;
+    }
     const now = Date.now();
     const id = `note_${now}_${Math.floor(this.rand() * 1e6)}`;
     const note: import("./types").StoredNote = {
@@ -102,8 +160,8 @@ export class JanusStore {
     return note;
   }
 
-  /** Pane-scoped note (Ledger API parity). */
-  addPaneNote(projectId: string, paneId: string, text: string): import("./types").StoredNote {
+  /** Pane-scoped note (Ledger API parity). Null when the pane does not exist. */
+  addPaneNote(projectId: string, paneId: string, text: string): import("./types").StoredNote | null {
     return this.addNote(projectId, text, { paneId });
   }
 
@@ -274,9 +332,59 @@ export class JanusStore {
     return pane;
   }
 
-  listArchived(workspaceId: string): import("./types").StoredArchivedPane[] {
-    const rows = this.db.prepare("SELECT * FROM panes_archive WHERE workspace_id=? ORDER BY archived_at DESC").all(workspaceId) as any[];
-    return rows.map(r => ({ ...this.hydratePane(r), archived_at: r.archived_at, archive_reason: r.archive_reason ?? null }));
+  /**
+   * Archived panes in the legacy `ArchivedPane[]` shape ({pane, project_id,
+   * archived_at}) the server consumes. Pass a workspaceId to scope to one project,
+   * or omit for all projects (Ledger.listArchived() parity). `archived_at` is an
+   * ISO string to match the legacy shape.
+   */
+  listArchived(workspaceId?: string): import("../ledger").ArchivedPane[] {
+    const rows = workspaceId
+      ? this.db.prepare("SELECT * FROM panes_archive WHERE workspace_id=? ORDER BY archived_at DESC").all(workspaceId) as any[]
+      : this.db.prepare("SELECT * FROM panes_archive ORDER BY archived_at DESC").all() as any[];
+    return rows.map(r => ({
+      pane: this.toPaneMeta(this.hydratePane(r)),
+      project_id: r.workspace_id,
+      archived_at: new Date(r.archived_at).toISOString(),
+    }));
+  }
+
+  // ── Archive aliases matching the legacy Ledger signatures server.ts calls ───
+
+  /** Archive every non-alive pane (optionally in one project). Returns the count. */
+  archiveExitedPanes(projectId?: string): number {
+    const projectIds = projectId
+      ? [projectId]
+      : (this.db.prepare("SELECT id FROM projects").all() as any[]).map(r => r.id);
+    let count = 0;
+    for (const pId of projectIds) {
+      for (const [paneId, sp] of Object.entries(this.getPanes(pId))) {
+        if (!sp.alive) { this.archivePane(paneId, pId, "exited"); count++; }
+      }
+    }
+    return count;
+  }
+
+  /** Restore an archived pane by id alone (Ledger parity). Returns the legacy entry or null. */
+  restoreArchivedPane(paneId: string): import("../ledger").ArchivedPane | null {
+    const row = this.db.prepare(
+      "SELECT * FROM panes_archive WHERE pane_id=? ORDER BY archived_at DESC LIMIT 1"
+    ).get(paneId) as any;
+    if (!row) return null;
+    const entry: import("../ledger").ArchivedPane = {
+      pane: this.toPaneMeta(this.hydratePane(row)),
+      project_id: row.workspace_id,
+      archived_at: new Date(row.archived_at).toISOString(),
+    };
+    this.restorePane(paneId, row.workspace_id);
+    this.db.prepare("DELETE FROM panes_archive WHERE pane_id=? AND workspace_id=?").run(paneId, row.workspace_id);
+    return entry;
+  }
+
+  /** Permanently remove an archived pane by id. Returns true if it existed. */
+  deleteArchivedPane(paneId: string): boolean {
+    const res = this.db.prepare("DELETE FROM panes_archive WHERE pane_id=?").run(paneId);
+    return res.changes > 0;
   }
 
   private hydratePane(r: any): StoredPane {
@@ -287,6 +395,153 @@ export class JanusStore {
 
   bootMaintenance(opts: PruneOpts): void {
     pruneOnBoot(this.db, opts);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Per-pane Workbench draft (prompt-composer refactor step 6). The draft is a
+  // proposed-but-unsent prompt; composing it is never a CLI write. Stored as a
+  // JSON-encoded PaneDraft in panes.draft so it survives restart and pane switch.
+  // Semantics mirror src/ledger.ts exactly. ──────────────────────────────────
+
+  getDraft(projectId: string, paneId: string): import("../types").PaneDraft | null {
+    const r = this.db.prepare(
+      "SELECT draft FROM panes WHERE pane_id=? AND workspace_id=?"
+    ).get(paneId, projectId) as any;
+    if (!r) return null;
+    return this.parseJSON<import("../types").PaneDraft | null>(r.draft, null);
+  }
+
+  setDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const draft: import("../types").PaneDraft = {
+      text, updatedAt: new Date().toISOString(), ...(updatedBy ? { updatedBy } : {}),
+    };
+    const res = this.db.prepare(
+      "UPDATE panes SET draft=?, updated_at=? WHERE pane_id=? AND workspace_id=?"
+    ).run(JSON.stringify(draft), Date.now(), paneId, projectId);
+    return res.changes === 1;
+  }
+
+  appendDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const prev = this.getDraft(projectId, paneId);
+    if (prev === null) {
+      // Distinguish "no draft yet" (still a real pane) from "no such pane".
+      const exists = this.db.prepare(
+        "SELECT 1 FROM panes WHERE pane_id=? AND workspace_id=?"
+      ).get(paneId, projectId);
+      if (!exists) return false;
+    }
+    const prevText = prev?.text ?? "";
+    const next = prevText ? `${prevText}\n${text}` : text;
+    return this.setDraft(projectId, paneId, next, updatedBy);
+  }
+
+  /** Every pane in a project with a non-empty (trimmed) draft — the WIP register. */
+  listDrafts(projectId: string): { paneId: string; draft: import("../types").PaneDraft }[] {
+    const rows = this.db.prepare(
+      "SELECT pane_id, draft FROM panes WHERE workspace_id=? AND draft IS NOT NULL ORDER BY created_at"
+    ).all(projectId) as any[];
+    const out: { paneId: string; draft: import("../types").PaneDraft }[] = [];
+    for (const r of rows) {
+      const draft = this.parseJSON<import("../types").PaneDraft | null>(r.draft, null);
+      if (draft && draft.text.trim().length > 0) out.push({ paneId: r.pane_id, draft });
+    }
+    return out;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Layered per-pane context (prompt-composer refactor §4). `model_context` is
+  // machine-maintained orientation (Janus / synthesizer / handoff); `human_context`
+  // is operator steering. Both are JSON arrays of ContextEntry; writing context is
+  // never a CLI write. Semantics mirror src/ledger.ts. ────────────────────────
+
+  private appendContext(
+    column: "model_context" | "human_context",
+    projectId: string,
+    paneId: string,
+    text: string,
+    source?: string,
+  ): boolean {
+    const r = this.db.prepare(
+      `SELECT ${column} AS ctx FROM panes WHERE pane_id=? AND workspace_id=?`
+    ).get(paneId, projectId) as any;
+    if (!r) return false;
+    const entries = this.parseJSON<import("../types").ContextEntry[]>(r.ctx, []);
+    const entry: import("../types").ContextEntry = { text, at: new Date().toISOString(), ...(source ? { source } : {}) };
+    entries.push(entry);
+    this.db.prepare(
+      `UPDATE panes SET ${column}=?, updated_at=? WHERE pane_id=? AND workspace_id=?`
+    ).run(JSON.stringify(entries), Date.now(), paneId, projectId);
+    return true;
+  }
+
+  addModelContext(projectId: string, paneId: string, text: string, source?: string): boolean {
+    return this.appendContext("model_context", projectId, paneId, text, source);
+  }
+
+  addHumanContext(projectId: string, paneId: string, text: string): boolean {
+    return this.appendContext("human_context", projectId, paneId, text);
+  }
+
+  /** Unified read of a pane's orientation context across all layers. `legacy`
+   *  surfaces pre-refactor flat pane notes so nothing is lost on migration. */
+  getPaneContext(projectId: string, paneId: string): {
+    model: import("../types").ContextEntry[];
+    human: import("../types").ContextEntry[];
+    legacy: string[];
+  } | null {
+    const r = this.db.prepare(
+      "SELECT model_context, human_context FROM panes WHERE pane_id=? AND workspace_id=?"
+    ).get(paneId, projectId) as any;
+    if (!r) return null;
+    return {
+      model: this.parseJSON<import("../types").ContextEntry[]>(r.model_context, []),
+      human: this.parseJSON<import("../types").ContextEntry[]>(r.human_context, []),
+      legacy: this.paneNoteStrings(projectId, paneId),
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Manager-facing Ledger methods (OrchestratorManager calls these directly).
+
+  /** No-op: the store persists on every mutation (WAL), so there is no batched
+   *  flush to force. Present so manager code written against Ledger.save() works. */
+  save(_immediate?: boolean): void { /* auto-persisted per mutation */ }
+
+  /** Upsert a pane from the legacy PaneMeta shape into the panes table. The
+   *  `shouldSave` flag is accepted for Ledger parity but ignored (always durable). */
+  updatePane(projectId: string, paneMeta: import("../types").PaneMeta, _shouldSave = true): void {
+    this.savePane({
+      pane_id: paneMeta.pane_id,
+      workspace_id: projectId,
+      name: paneMeta.name ?? "",
+      runtime_type: paneMeta.runtime_type ?? "",
+      tool_preset: paneMeta.tool_preset ?? "Custom",
+      permissions_mode: paneMeta.permissions_mode ?? "Human-in-the-Loop",
+      session_id: paneMeta.session_id ?? "",
+      last_known_state: (paneMeta.last_known_state as any) ?? "Idle",
+      is_busy: !!paneMeta.is_busy,
+      alive: !!paneMeta.alive,
+      context_size: paneMeta.context_size ?? 0,
+      last_status_change_at: paneMeta.last_status_change_at ?? null,
+      last_command: paneMeta.last_command ?? null,
+      scrollback_path: null,
+      created_at: 0,
+      updated_at: Date.now(),
+    });
+    // Persist layered context / draft if the caller carried them on the meta,
+    // so a manager that mutates PaneMeta in place doesn't silently drop them.
+    if (paneMeta.draft) {
+      this.db.prepare("UPDATE panes SET draft=? WHERE pane_id=? AND workspace_id=?")
+        .run(JSON.stringify(paneMeta.draft), paneMeta.pane_id, projectId);
+    }
+    if (paneMeta.modelContext) {
+      this.db.prepare("UPDATE panes SET model_context=? WHERE pane_id=? AND workspace_id=?")
+        .run(JSON.stringify(paneMeta.modelContext), paneMeta.pane_id, projectId);
+    }
+    if (paneMeta.humanContext) {
+      this.db.prepare("UPDATE panes SET human_context=? WHERE pane_id=? AND workspace_id=?")
+        .run(JSON.stringify(paneMeta.humanContext), paneMeta.pane_id, projectId);
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
