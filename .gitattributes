@@ -1,0 +1,4 @@
+# Shell scripts and git hooks MUST use LF: a CRLF shebang breaks them under
+# /bin/sh on macOS/Linux. Scoped narrowly to avoid touching other files.
+*.sh text eol=lf
+.githooks/pre-commit text eol=lf
