@@ -33,5 +33,12 @@ export default defineConfig(() => {
         ],
       },
     },
+    build: {
+      // This app is served internally (the operator's own machine / a trusted
+      // host), so a single ~820 kB main bundle is acceptable — raise the advisory
+      // ceiling rather than hide it. Vendor manualChunks code-splitting is a
+      // deferred perf option, not a correctness issue.
+      chunkSizeWarningLimit: 1000,
+    },
   };
 });
