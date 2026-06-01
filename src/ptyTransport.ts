@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from "child_process";
+import { createRequire } from "module";
 
 /**
  * PtyTransport — the spawn/IO seam (WS-C design §2.4 / §5).
@@ -16,6 +17,18 @@ import { spawn, ChildProcess } from "child_process";
  * pane on the legacy transport degrades to quiescence-driven idle (design §6, R1).
  */
 
+/**
+ * Choose the signal to hand node-pty's kill(). node-pty's Windows backend does
+ * NOT support POSIX signals — passing one throws "Signals not supported on
+ * windows" in a deferred context (an async uncaughtException that escapes a
+ * synchronous try/catch). On win32 we therefore drop the signal entirely (a bare
+ * kill() is an unconditional terminate); on POSIX the signal is preserved so the
+ * SIGTERM→SIGKILL escalation in UniversalTerminal.stop() still works.
+ */
+export function killSignalForPlatform(platform: string, signal?: string): string | undefined {
+  return platform === "win32" ? undefined : signal;
+}
+
 export interface PtyTransport {
   /** Root pid of the spawned shell/agent (for the StatusProbe). */
   readonly pid: number | undefined;
@@ -25,6 +38,9 @@ export interface PtyTransport {
   onExit(cb: (info: { exitCode: number; signal?: number }) => void): void;
   /** Write raw bytes to the process stdin / PTY master. */
   write(data: string): void;
+  /** Resize the PTY grid so the program inside wraps to the operator's viewport.
+   *  No-op on transports without a real PTY (legacy fallback). */
+  resize(cols: number, rows: number): void;
   /** Terminate the process (and its group/tree where possible). */
   kill(signal?: string): void;
 }
@@ -44,35 +60,23 @@ function loadNodePty(): any {
   if (_nodePtyResolved) return _nodePtyModule;
   _nodePtyResolved = true;
   const PKG = "@homebridge/node-pty-prebuilt-multiarch";
-  // Resolve a working `require` regardless of runtime. Under tsx/ESM (the dev
-  // server's `tsx server.ts`), a bare global `require` is NOT defined, so the old
-  // `require(...)` threw and silently forced EVERY pane onto the legacy non-PTY
-  // transport — which gives the agent a piped (non-TTY) stdin, so Claude detects
-  // no terminal and exits after a few seconds. createRequire gives us a real
-  // CommonJS require in both ESM (tsx) and CJS (built dist/server.cjs) contexts.
+  // Resolve node-pty regardless of runtime. Under tsx/ESM (the dev server runs
+  // `tsx server.ts`) a bare global `require` is NOT defined, so the old
+  // `require(PKG)` threw and silently forced EVERY pane onto the legacy non-PTY
+  // transport — piped (non-TTY) stdin, so Claude detects no terminal and exits
+  // after a few seconds (the "panes never hold a live session" bug). We build a
+  // CommonJS require via createRequire (statically imported, so it works in both
+  // ESM/tsx and the built CJS bundle) bound to this module's location.
   try {
-    let req: NodeRequire | undefined =
-      typeof require === "function" ? require : undefined;
-    if (!req) {
-      // ESM/tsx path: synthesize a require bound to this module's location.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { createRequire } = require("module");
-      req = createRequire(import.meta.url);
-    }
-    _nodePtyModule = req!(PKG);
+    const req =
+      typeof require === "function"
+        ? require
+        : createRequire(import.meta.url);
+    _nodePtyModule = req(PKG);
     _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
-  } catch {
-    // Last-resort: try createRequire even if the first branch's `require` itself
-    // was the thing that was undefined (belt-and-suspenders for odd loaders).
-    try {
-      const { createRequire } = eval("require")("module");
-      const req2 = createRequire(import.meta.url);
-      _nodePtyModule = req2(PKG);
-      _nodePtyAvailable = !!_nodePtyModule && typeof _nodePtyModule.spawn === "function";
-    } catch {
-      _nodePtyModule = null;
-      _nodePtyAvailable = false;
-    }
+  } catch (e) {
+    _nodePtyModule = null;
+    _nodePtyAvailable = false;
   }
   return _nodePtyModule;
 }
@@ -121,9 +125,18 @@ export class NodePtyTransport implements PtyTransport {
     }
   }
 
+  resize(cols: number, rows: number): void {
+    try {
+      // node-pty rejects non-positive dims; clamp to a sane floor.
+      this.proc.resize(Math.max(1, Math.floor(cols)), Math.max(1, Math.floor(rows)));
+    } catch {
+      // process gone, or dims momentarily invalid mid-teardown
+    }
+  }
+
   kill(signal?: string): void {
     try {
-      this.proc.kill(signal);
+      this.proc.kill(killSignalForPlatform(process.platform, signal));
     } catch {
       // already dead
     }
@@ -194,6 +207,12 @@ export class LegacyChildProcessTransport implements PtyTransport {
     if (this.proc && this.proc.stdin) {
       this.proc.stdin.write(data);
     }
+  }
+
+  resize(_cols: number, _rows: number): void {
+    // No real PTY behind a piped child process — nothing to resize. The pane is
+    // already degraded to quiescence-driven idle (design §6, R1); line wrapping
+    // is whatever the program assumes by default.
   }
 
   kill(signal?: string): void {

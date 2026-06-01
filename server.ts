@@ -655,6 +655,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         id,
         cwd: term.cwd,
         command: term.shellCmd,
+        // Display lane: raw bytes (escape sequences intact) for xterm to render
+        // exactly. `output` stays ANSI-stripped for the pane-card text previews.
+        backfill: term.getRawBackfill(),
         output: term.getRecentOutput(20),
         status: term.status,
         permissions_mode: term.permissionsMode,
@@ -754,6 +757,26 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     } else {
       res.status(404).json({ error: "Terminal not found or offline" });
     }
+  });
+
+  // Web API to sync a pane's PTY grid to the operator's xterm viewport. The
+  // program inside wraps to the PTY's column count, so this MUST track the
+  // display or line wrapping diverges from a real terminal.
+  app.post("/api/terminals/:id/resize", (req, res) => {
+    const { id } = req.params;
+    const cols = Number(req.body?.cols);
+    const rows = Number(req.body?.rows);
+    if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 1 || rows < 1) {
+      res.status(400).json({ error: "cols and rows must be positive numbers" });
+      return;
+    }
+    const term = manager.terminals[id];
+    if (!term) {
+      res.status(404).json({ error: "Terminal not found or offline" });
+      return;
+    }
+    manager.resize(id, cols, rows);
+    res.json({ success: true });
   });
 
   // Web API to get terminal history

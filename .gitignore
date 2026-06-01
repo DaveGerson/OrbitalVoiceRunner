@@ -16,3 +16,9 @@ logs/
 .janus_scrollback_*.log
 _ptyprobe_test*.cjs
 dist-tmp/
+
+# Playwright e2e
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/

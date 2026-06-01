@@ -14,6 +14,7 @@ import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
+import { publishChunk } from "./terminalStream";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -326,8 +327,15 @@ function AppRaw() {
   const animationFrameRef = useRef<number | null>(null);
 
   const queueStdoutChunk = (terminalId: string, chunk: string) => {
+    // Display lane: stream raw bytes straight into xterm (no React state, no line
+    // cap, no reset thrash). xterm owns the live buffer.
+    publishChunk(terminalId, chunk);
+
+    // Preview lane: keep a capped, ANSI-bearing tail in React state purely to feed
+    // the pane-card text snippets / byte count. This NO LONGER drives xterm, so the
+    // -110 line cap here is harmless (it once forced a full xterm.reset per frame).
     stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
-    
+
     if (!animationFrameRef.current) {
       animationFrameRef.current = requestAnimationFrame(() => {
         animationFrameRef.current = null;
@@ -348,6 +356,29 @@ function AppRaw() {
     }
   };
 
+  // Per-pane debounce + last-sent-grid so a flurry of fit() events (drag-resize)
+  // collapses into one POST, and an unchanged grid never hits the server.
+  const resizeDebounceRef = useRef<Record<string, any>>({});
+  const lastGridRef = useRef<Record<string, string>>({});
+
+  const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
+    // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
+    // where Playwright intercepts the POST to assert the grid-sync round-trip.
+    if (isMockModeRef.current && !e2eRef.current) return;
+    if (!cols || !rows) return;
+    const key = `${cols}x${rows}`;
+    if (lastGridRef.current[terminalId] === key) return;
+    lastGridRef.current[terminalId] = key;
+    clearTimeout(resizeDebounceRef.current[terminalId]);
+    resizeDebounceRef.current[terminalId] = setTimeout(() => {
+      apiFetch(`/api/terminals/${terminalId}/resize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => { /* pane may have exited; resize is best-effort */ });
+    }, 120);
+  };
+
   const wsRef = useRef<WebSocket | null>(null);
   const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
   const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
@@ -362,6 +393,52 @@ function AppRaw() {
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
+  // True only under the ?mock=1 e2e harness. Lets the resize POST still fire in
+  // mock mode (Playwright intercepts it) while keeping mock mode for real users
+  // a no-op.
+  const e2eRef = useRef(false);
+
+  // E2E harness: when loaded with ?mock=1, run fully client-side with deterministic
+  // mock data and expose injection hooks for Playwright. Gated entirely on the URL
+  // param — completely inert for real users (no effect without ?mock=1).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (new URLSearchParams(window.location.search).get("mock") !== "1") return;
+    e2eRef.current = true;
+    isMockModeRef.current = true;
+    setIsMockMode(true);
+    // Open the transcript panel so injected transcript lines are mounted/visible.
+    setShowTranscriptPanel(true);
+
+    const MOCK_ID = "mock_pane_1";
+    // Backfill carries an ANSI color sequence so the terminal spec can prove xterm
+    // renders RAW bytes (not ANSI-stripped). MOCKTERM_READY is the asserted token.
+    setTerminals([{
+      id: MOCK_ID,
+      cwd: ".",
+      command: "bash",
+      backfill: "[32mMOCKTERM_READY[0m web-app@1.0.0 dev server\r\n$ ",
+      output: "MOCKTERM_READY web-app@1.0.0 dev server\n$ ",
+      status: "Running",
+    }]);
+    setActiveTerminalId(MOCK_ID);
+
+    (window as any).__ORBITAL_E2E__ = {
+      injectStdoutChunk: (terminalId: string, chunk: string) => queueStdoutChunk(terminalId, chunk),
+      injectTranscript: (sender: "User" | "Janus", text: string) =>
+        setTranscript((prev) => [...prev, { sender, text, timestamp: new Date() }]),
+      injectPendingApproval: (cmd: string, terminalId: string = MOCK_ID) =>
+        setPendingCommands((prev) => [...prev, {
+          messageId: `mock_${prev.length + 1}`,
+          cmd,
+          terminalId,
+          rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
+        }]),
+    };
+    // Signal readiness so the Playwright fixture can wait deterministically.
+    document.documentElement.setAttribute("data-e2e-ready", "1");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
@@ -1798,6 +1875,7 @@ function AppRaw() {
               Preview
             </button>
             <button
+              data-testid="composer-edit-toggle"
               onClick={() => setPromptBufferEditMode("edit")}
               className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
             >
@@ -1832,6 +1910,7 @@ function AppRaw() {
         <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[200px]">
           {promptBufferEditMode === "edit" ? (
             <textarea
+              data-testid="composer-input"
               value={promptBuffer}
               onChange={(e) => handlePromptBufferChange(e.target.value)}
               onFocus={() => setIsBufferFocused(true)}
@@ -1905,6 +1984,7 @@ function AppRaw() {
           </div>
 
           <button
+            data-testid="composer-send"
             onClick={handleSendDraft}
             disabled={!activeTerminalId || !promptBuffer.trim()}
             className="px-4 py-1.5 text-[10px] font-mono uppercase bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded font-bold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -2954,8 +3034,13 @@ function AppRaw() {
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
-                  <TerminalView key={activeTerminal.id} output={activeTerminal.output} />
+                <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
+                  <TerminalView
+                    key={activeTerminal.id}
+                    terminalId={activeTerminal.id}
+                    backfill={activeTerminal.backfill}
+                    onResize={(cols, rows) => handleTerminalResize(activeTerminal.id, cols, rows)}
+                  />
                 </div>
               </div>
 
@@ -3992,8 +4077,10 @@ function AppRaw() {
                 transcript.map((item, idx) => {
                   const isUser = item.sender === "User";
                   return (
-                    <div 
-                      key={idx} 
+                    <div
+                      key={idx}
+                      data-testid="transcript-message"
+                      data-sender={item.sender}
                       className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
                     >
                       <span className="text-[9px] font-mono opacity-30 mb-0.5 select-none uppercase">

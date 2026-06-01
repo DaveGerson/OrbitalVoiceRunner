@@ -32,7 +32,7 @@ export function ApprovalDialog({
   }, [messageId, onReject]);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
+    <div data-testid="approval-dialog" className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
       <div className="w-full max-w-[620px] bg-[#111] border-2 border-amber-500/50 rounded-xl p-6 shadow-2xl shadow-black/80 animate-in slide-in-from-bottom-10 fade-in duration-300">
         <div className="flex items-start gap-5">
           <div className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-500/20 border border-amber-500/50 flex items-center justify-center">
@@ -64,13 +64,15 @@ export function ApprovalDialog({
             )}
 
             <div className="flex gap-3">
-              <button 
+              <button
+                data-testid="approval-approve"
                 onClick={() => onApprove(messageId)}
                 className="flex-1 py-2 bg-amber-600 hover:bg-amber-500 text-black text-xs font-bold uppercase tracking-widest transition-colors focus:outline-none focus:ring-2 focus:ring-amber-500"
               >
                 Confirm & Fire
               </button>
-              <button 
+              <button
+                data-testid="approval-reject"
                 onClick={() => onReject(messageId)}
                 autoFocus
                 className="px-6 py-2 border border-red-500/30 bg-red-950/10 hover:bg-red-900/20 text-red-400 text-xs font-bold uppercase tracking-widest transition-colors focus:outline-none focus:ring-2 focus:ring-red-500"
