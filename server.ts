@@ -31,7 +31,7 @@ import {
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
-import { deliverOutcomeToHandoff, resolveReasonToHandoffState } from "./src/handoffFlow";
+import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate } from "./src/types";
@@ -1444,30 +1444,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // resolver choke-point — one added store call, no forked path. Approve => delivered (the write
   // already landed via the approved branch); reject => rejected; expire/dead-pane => expired.
   function flipHandoffOnResolve(messageId: string, reason: ResolveReason, opts?: { vocal?: boolean }) {
-    if (!store) return;
-    let handoff = store.getHandoff(messageId);
-    if (!handoff) {
-      const matches = store.listHandoffs().filter(h => h.gate_approval_id === messageId);
-      handoff = matches[0] ?? null;
-    }
-    if (!handoff) return;
-    // Pure mapping (src/handoffFlow): reason -> handoff state. One source of truth, unit-tested.
-    const nextState = resolveReasonToHandoffState(reason as any);
-    if (!nextState) return;
-    try {
-      if (nextState === "delivered") {
-        store.updateHandoffState(handoff.id, "delivered", {
-          approved_via: opts?.vocal ? "voice" : "rest",
-          delivered_at: Date.now(),
-        });
-      } else if (nextState === "rejected") {
-        store.updateHandoffState(handoff.id, "rejected", { approved_via: opts?.vocal ? "voice" : "rest" });
-      } else if (nextState === "expired") {
-        store.updateHandoffState(handoff.id, "expired", { approved_via: "ttl_expire" });
-      }
-    } catch (e) {
-      console.error("[HANDOFF] Failed to flip handoff state on resolve:", e);
-    }
+    // Delegate to the EXPORTED, unit-tested resolve-leg flip (src/handoffFlow) so the lookup +
+    // reason->state mapping + provenance live in ONE source of truth and are exercised end-to-end
+    // against a real JanusStore without a live session. `reason` is narrowed there to the handoff
+    // resolve reasons; lost_race/not_found never reach here (gated at the applyResolution call site).
+    applyHandoffFlipOnResolve(store, messageId, reason as HandoffResolveReason, { vocal: opts?.vocal });
   }
 
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
