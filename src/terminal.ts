@@ -1,6 +1,6 @@
 import { Ledger, PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
-import { SystemSettings, CliPreset, AttentionItem } from "./types";
+import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
 import { PtyTransport, createPtyTransport } from "./ptyTransport";
@@ -139,6 +139,47 @@ export function redactSecrets(text: string): string {
   );
 
   return text;
+}
+
+/**
+ * Secret classification for a COMPOSED PROMPT before it is delivered to a pane (director
+ * posture 2026-06-01: "prompts must never contain secrets"). Unlike redactSecrets (which
+ * scrubs OUTPUT bound for the model), this CLASSIFIES a candidate prompt by confidence so the
+ * delivery path can BLOCK high-confidence leaks and WARN on ambiguous ones — never silently
+ * mutate the verbatim prompt the PTY needs.
+ *
+ *   - high: recognized secret FORMATS (private key, JWT, AWS/Google/GitHub/Slack keys). These
+ *     are near-certain leaks -> the delivery path hard-blocks.
+ *   - low:  ambiguous "key = value" assignments (api_key=…, token:…). Could be a real secret or
+ *     an innocuous token-shaped string -> the delivery path delivers WITH A WARNING.
+ *
+ * Pure, no side effects. `labels` lists the matched detector names for operator-facing messages.
+ */
+export type SecretConfidence = "none" | "low" | "high";
+export interface SecretScan {
+  confidence: SecretConfidence;
+  labels: string[];
+}
+const HIGH_CONFIDENCE_SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/, "private-key"],
+  [/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "jwt"],
+  [/\bAKIA[0-9A-Z]{16}\b/, "aws-access-key-id"],
+  [/\baws_secret_access_key\s*[=:]\s*["']?([A-Za-z0-9/+]{40})["']?/i, "aws-secret-key"],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/, "google-api-key"],
+  [/\bgh[posr]_[A-Za-z0-9]{36,}\b/, "github-token"],
+  [/\bxox[baprs]-[A-Za-z0-9-]+/, "slack-token"],
+];
+const LOW_CONFIDENCE_SECRET_PATTERN =
+  /\b(api[_-]?key|secret|token|password|passwd|bearer|access[_-]?key)\b\s*[=:]\s*["']?([^\s"']{6,})["']?/i;
+
+export function classifySecrets(text: string): SecretScan {
+  const labels: string[] = [];
+  for (const [re, label] of HIGH_CONFIDENCE_SECRET_PATTERNS) {
+    if (re.test(text)) labels.push(label);
+  }
+  if (labels.length > 0) return { confidence: "high", labels };
+  if (LOW_CONFIDENCE_SECRET_PATTERN.test(text)) return { confidence: "low", labels: ["generic-assignment"] };
+  return { confidence: "none", labels: [] };
 }
 
 export class UniversalTerminal {
@@ -659,7 +700,8 @@ export class OrchestratorManager {
         defaultShellCommand: process.platform === "win32" ? "cmd.exe" : "bash",
         globalPermissionsMode: "Inherit",
         historyMaxCommands: 50,
-        historyMaxOutputLength: 5000
+        historyMaxOutputLength: 5000,
+        capabilityGates: { ...DEFAULT_CAPABILITY_GATES }
       },
       secrets: {
         geminiApiKey: process.env.GEMINI_API_KEY ? "CONFIGURED_IN_ENV" : ""
@@ -680,7 +722,17 @@ export class OrchestratorManager {
           projects: { ...this.getDefaultSettings().projects, ...parsed.projects },
           presets: parsePresetsSafe(parsed.presets ? parsed.presets : this.getDefaultSettings().presets),
           announcements: { ...this.getDefaultSettings().announcements!, ...parsed.announcements },
-          advanced: { ...this.getDefaultSettings().advanced, ...parsed.advanced },
+          advanced: {
+            ...this.getDefaultSettings().advanced,
+            ...parsed.advanced,
+            // Deep-merge the capability matrix so a settings file that overrides ONE gate does
+            // not silently drop the other sharp-edge defaults to "Auto" (fail-open). Director
+            // overrides layer ON TOP of the defaults.
+            capabilityGates: {
+              ...DEFAULT_CAPABILITY_GATES,
+              ...(parsed.advanced?.capabilityGates ?? {}),
+            },
+          },
           secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets }
         };
       } else {

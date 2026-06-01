@@ -13,6 +13,7 @@ declare global {
       injectStdoutChunk: (terminalId: string, chunk: string) => void;
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
       injectPendingApproval: (cmd: string, terminalId?: string) => void;
+      injectPendingAction: (capability: string, summary: string) => void;
     };
   }
 }
@@ -44,6 +45,13 @@ export async function injectPendingApproval(page: Page, cmd: string, terminalId 
   await page.evaluate(
     ([c, id]) => window.__ORBITAL_E2E__?.injectPendingApproval(c, id),
     [cmd, terminalId] as const,
+  );
+}
+
+export async function injectPendingAction(page: Page, capability: string, summary: string): Promise<void> {
+  await page.evaluate(
+    ([c, s]) => window.__ORBITAL_E2E__?.injectPendingAction(c, s),
+    [capability, summary] as const,
   );
 }
 

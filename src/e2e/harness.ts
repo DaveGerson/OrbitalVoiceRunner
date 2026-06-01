@@ -20,7 +20,10 @@ export interface OrbitalE2EHooks {
   injectStdoutChunk: (terminalId: string, chunk: string) => void;
   injectTranscript: (sender: "User" | "Janus", text: string) => void;
   injectPendingApproval: (cmd: string, terminalId?: string) => void;
+  injectPendingAction: (capability: string, summary: string) => void;
 }
+
+export type PendingActionEntry = { actionId: string; capability: string; summary: string };
 
 /** The application state/handlers the harness wires its injection hooks into. */
 export interface E2EHarnessDeps {
@@ -32,6 +35,7 @@ export interface E2EHarnessDeps {
   queueStdoutChunk: (terminalId: string, chunk: string) => void;
   setTranscript: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   setPendingCommands: (updater: (prev: PendingCommand[]) => PendingCommand[]) => void;
+  setPendingActions: (updater: (prev: PendingActionEntry[]) => PendingActionEntry[]) => void;
 }
 
 /**
@@ -82,6 +86,12 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
           cmd,
           terminalId,
           rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
+        }]),
+      injectPendingAction: (capability, summary) =>
+        deps.setPendingActions((prev) => [...prev, {
+          actionId: `mock_act_${prev.length + 1}`,
+          capability,
+          summary,
         }]),
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;

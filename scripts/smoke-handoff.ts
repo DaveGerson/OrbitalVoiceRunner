@@ -37,6 +37,7 @@ import * as fs from "fs";
 import { UniversalTerminal } from "../src/terminal";
 import { JanusStore } from "../src/store/sqliteStore";
 import { decideProposal } from "../src/pendingApprovals";
+import { deliverOutcomeToHandoff } from "../src/handoffFlow";
 
 // A distinctive sentinel embedded in the prompt. The PTY echoes typed input into the line
 // buffer, so this exact token MUST appear in the post-delivery stream if the composed prompt
@@ -118,11 +119,21 @@ async function main() {
   log(`gate decision (deliver_handoff, Full Auto, gate=Auto) -> ${decision.type}`);
   if (decision.type !== "auto_execute") { await term.stop(); fail(`expected auto_execute on the approved path, got ${decision.type}`); }
 
-  // approved path: land the composed prompt VERBATIM in the live PTY, then flip the row.
+  // (5b) Drive the SAME deliver-mapping the server uses (src/handoffFlow.deliverOutcomeToHandoff),
+  // mapping the auto_execute decision to the dispatch outcome kind the server would produce
+  // ("executed" for Full Auto). This closes G3 in the smoke: the row flip is governed by the real
+  // mapping function, not a hardcoded "delivered" literal.
+  const dispatchKind = decision.type === "auto_execute" ? "executed" : "pending";
+  const effect = deliverOutcomeToHandoff(dispatchKind);
+  log(`deliverOutcomeToHandoff(${dispatchKind}) -> ${effect.kind}`);
+  if (effect.kind !== "deliver_now") { await term.stop(); fail(`expected deliver_now effect on Full-Auto path, got ${effect.kind}`); }
+
+  // approved path: land the composed prompt VERBATIM in the live PTY, then flip the row via the
+  // effect the mapping prescribed (effect.state / effect.approvedVia — not a hardcoded value).
   phase = "post-deliver";
   log(`delivering composed_prompt into the live PTY via writeInput(): "${PROMPT}"`);
   term.writeInput(staged.composed_prompt);
-  const delivered = store.updateHandoffState(h.id, "delivered", { approved_via: "full_auto" });
+  const delivered = store.updateHandoffState(h.id, effect.state, { approved_via: effect.approvedVia });
   if (!delivered || delivered.state !== "delivered" || !delivered.delivered_at) { await term.stop(); fail(`delivered flip failed; state=${delivered?.state}`); }
   log(`updateHandoffState -> state=${delivered.state} delivered_at=${delivered.delivered_at} approved_via=${delivered.approved_via}`);
 

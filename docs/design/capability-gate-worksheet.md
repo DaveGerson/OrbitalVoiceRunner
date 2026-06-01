@@ -73,6 +73,79 @@ Reading the table — the safety invariants it encodes:
 3. Everything here is mechanical and proven by the test. The *policy* questions (what the
    DEFAULTS should be per capability) live in `janus-capability-gate-handoffs.md`.
 
+## The spotlight (context-aware resolution) — `resolveCapabilityGateWithContext`
+
+Resolution now has FOUR tiers (precedence, highest first). The director posture is
+"trust follows focus": Janus acts freely on the pane the director is looking at.
+
+1. **Explicit per-pane override** — always wins, both directions (the deliberate exception).
+2. **Spotlight** — if `paneId === activePane` AND the capability is *productive* (in
+   `SPOTLIGHT_CAPABILITIES` = `write_to_pane`, `deliver_handoff`), resolve to `Auto`. Only
+   fires when there is no per-pane override (tier 1).
+3. **Global default** — the matrix below (`DEFAULT_CAPABILITY_GATES`).
+4. **`Auto`** — absent everything (legacy).
+
+The spotlight NEVER loosens destructive (`close_pane`/`restart_pane`), meta
+(`set_*_permissions`/`set_capability_gate`), or spawn (`create_pane`/`apply_recipe`/
+`execute_plan`) capabilities — those always fall through to tier 3/4 even on the active pane.
+
+## Default global matrix (`DEFAULT_CAPABILITY_GATES`) — "friction is worse, gate by category"
+
+This is the OFF-CONTEXT baseline. `Ask` for the sharp edges; `Auto` for low-risk orientation.
+
+- **Ask:** `write_to_pane`, `deliver_handoff` (productive writes off-context), `create_pane`,
+  `execute_plan`, `apply_recipe`, `add_watch_rule` (spawn/cost), `close_pane`, `restart_pane`
+  (destructive), `set_pane_permissions`, `set_global_permissions`, `set_capability_gate` (meta).
+- **Auto:** `create_project`, `update_metadata`, `switch_context`, `set_voice_mute`,
+  `dismiss_attention` (low-risk orientation).
+
+On the ACTIVE pane, the spotlight loosens `write_to_pane`/`deliver_handoff` to `Auto`.
+
+## Meta-gate — voice may TIGHTEN, never LOOSEN (`isLoosening`)
+
+`set_capability_gate` by VOICE is allowed to make a gate MORE restrictive (Auto→Ask, Ask→Off)
+and applies immediately. A LOOSENING change (Off→Ask, Ask→Auto) is REFUSED by voice and must
+be done deliberately in the Settings UI — so a confused/misheard Janus cannot loosen its own
+restraints. Restriction rank: `Auto(0) < Ask(1) < Off(2)`.
+
+## Secret guard — prompts must never carry secrets (`classifySecrets`)
+
+A composed prompt is classified before staging/delivery:
+- **high** (recognized formats: private key, JWT, AWS/Google/GitHub/Slack keys) ⇒ **hard-block**
+  staging AND delivery; audited.
+- **low** (ambiguous `key=value` assignment) ⇒ deliver/stage **with a warning** (never silently
+  mutate the verbatim prompt the PTY needs).
+- **none** ⇒ proceed.
+
+## Staged staleness — flag, never delete (`isStagedStale`)
+
+A staged-but-undelivered handoff NEVER auto-expires. `list_handoffs` derives a `stale` flag +
+`staged_age_seconds` at read time (threshold `STAGED_STALE_MS` = 15 min) so the operator can
+notice; nothing is deleted.
+
+## Deferred execution for non-PTY mutators (G1 closed)
+
+The `Ask` tier now FUNCTIONS for the non-PTY mutators (`create_pane`, `set_pane_permissions`,
+`set_global_permissions`) — previously only the `Off` veto worked and `Ask` proceeded-and-audited.
+`gateOrDefer(capability, paneId, summary, run)` resolves the gate and:
+- **Auto** → runs the side effect now.
+- **Off** → forbids (no effect), audited.
+- **Ask** → stages the side-effect closure in `PendingActionStore` (separate from the pane-write
+  `PendingApprovalStore` so the two never entangle) and tells the model it awaits confirmation.
+  The operator confirms via `POST /api/actions/:id/confirm` (runs exactly once via a claim seam)
+  or `POST /api/actions/:id/cancel`. Stale actions expire on the same TTL sweep as approvals
+  (effect NOT run on expiry). `apply_orchestration_recipe` keeps the `Off`-veto-only guard
+  (loop-spawn; deferring each pane individually is out of scope).
+
+## Handoff deliver/flip mappings (G3 closed)
+
+The deliver-outcome→row and resolve-reason→state mappings are extracted to pure functions in
+`src/handoffFlow.ts` (`deliverOutcomeToHandoff`, `resolveReasonToHandoffState`) that the server
+calls directly — so the smoke test and unit tests exercise the REAL mapping, not a copy. The
+smoke now drives `deliverOutcomeToHandoff("executed") → deliver_now` and asserts the sentinel
+echoes back in the live PTY; `tests/test_handoff_flow.ts` drives approve/reject/expire flips
+against a real on-disk JanusStore.
+
 ## Test coverage map
 
 `tests/test_capability_gate.ts` asserts:
