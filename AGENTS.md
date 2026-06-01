@@ -47,6 +47,19 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Worktree Isolation (REQUIRED for commit-authorized agents)
+
+> Repository instruction. The managed Beads block below states that explicit repository instructions override it — this section governs **where** commit-authorized work happens.
+
+Every agent shares **one** git object store. Concurrent **team-maintainer** sessions working in the **same** tree stash, commit, and switch branches over each other — and over any human's uncommitted work. (2026-06-01: a team-maintainer session `git stash`-ed and branch-switched the shared main checkout, absorbing a developer's in-progress `.gitignore`/`server.ts` edits.)
+
+- **Isolate before you commit.** Any agent with commit/push authority MUST operate in its **own dedicated worktree**, never the shared main checkout. Start isolated: `dev <task>` (or `claude --worktree <task>` / `EnterWorktree`). Keep `worktree.bgIsolation: "worktree"` so background agents cannot edit the main checkout.
+- **Main is integration-only.** The primary checkout is for review, merges, and `git pull` — no feature edits, no autonomous commits.
+- **One committer per tree/branch.** Never `git stash`, `reset`, `checkout`, `add -A`, amend, or rebase against a working tree you do not exclusively own. If you find uncommitted changes you did not make, **STOP and report** — do not rescue, park, or stash them.
+- **Keep worktrees outside the shared tree.** Prefer a sibling dir (`../<repo>-wt/<task>`) over nested `.claude/worktrees/`, so non-git-aware tooling in the main checkout cannot reach into them.
+
+This binds **every** session — orchestrated, background, scheduled, and interactive alike.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 

@@ -58,6 +58,15 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
+## Worktree Isolation (REQUIRED for commit-authorized agents)
+
+Concurrent **team-maintainer** agents share one git store; in a shared working tree they stash/commit/switch over each other and over human WIP. (2026-06-01: a team-maintainer session stashed + branch-switched the shared main checkout, absorbing in-progress `.gitignore`/`server.ts` edits.)
+
+- **Isolate before committing** — any commit-authorized agent works in its **own worktree**, never the shared main checkout. Launch with `dev <task>` (or `claude --worktree`); keep `worktree.bgIsolation: "worktree"`.
+- **Main = integration-only** — review, merges, `git pull`; no autonomous commits there.
+- **One committer per tree** — never `git stash`/`reset`/`checkout`/`add -A`/rebase against a tree you don't exclusively own. Find foreign uncommitted changes? **STOP and report** — don't rescue/park/stash them.
+- Prefer sibling worktrees (`../<repo>-wt/<task>`) over nested `.claude/worktrees/`.
+
 ## Build & Test
 
 ```bash
