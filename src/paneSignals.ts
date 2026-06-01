@@ -1,11 +1,12 @@
 import { SHELL_PROMPT } from "./statusConstants";
+import { redactSecrets } from "./terminal";
 
 export type PaneSignalKind = "idle" | "error" | "prompt" | "exited";
 
 export interface PaneSignal {
   paneId: string;
   kind: PaneSignalKind;
-  detail?: string; // compact; MUST already be redacted before formatting
+  detail?: string; // compact and secret-redacted — safe to inject into the model
 }
 
 export interface OutputClass {
@@ -21,18 +22,20 @@ const ERROR_RE =
   /\b(error(?![-./])|build failed|exception|panic|traceback|FAILED|\d+\s+fail(?:ed|ing)|Tests?:\s*\d+\s+failed)\b/i;
 
 /** Classify a chunk of ALREADY-ANSI-STRIPPED pane output. Returns the strongest
- *  signal found, or null. Errors win over prompts. */
+ *  signal found, or null. Errors win over prompts. `detail` is secret-redacted here
+ *  (at the boundary) so the invariant holds regardless of caller — the signal may be
+ *  injected straight into the live model session. */
 export function classifyPaneOutput(cleanText: string): OutputClass | null {
   const lines = cleanText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return null;
   for (const line of lines) {
-    if (ERROR_RE.test(line)) return { kind: "error", detail: line.slice(0, 160) };
+    if (ERROR_RE.test(line)) return { kind: "error", detail: redactSecrets(line).slice(0, 160) };
   }
   // SHELL_PROMPT is shared with the status machine, so we don't tighten it here.
   // Known limitation: a last line ending in '>' (e.g. a JSX/HTML tag like "</Provider>")
   // can read as a prompt. Benign next to an error false-positive; tune during live testing.
   const last = lines[lines.length - 1];
-  if (SHELL_PROMPT.test(last)) return { kind: "prompt", detail: last.slice(0, 80) };
+  if (SHELL_PROMPT.test(last)) return { kind: "prompt", detail: redactSecrets(last).slice(0, 80) };
   return null;
 }
 
