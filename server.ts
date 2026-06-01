@@ -1309,7 +1309,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
   // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can
   // add durability/atomicity without a rewrite (see src/pendingApprovals.ts §8).
-  const pendingApprovals = new PendingApprovalStore();
+  // WS-M (bead wsm-e2e-pinned-nzt): inject the durable JanusStore so pending approvals SURVIVE a
+  // process restart, while the N-1 atomic-claim gate is backed by the durable SQL claim. When the
+  // store is null (JANUS_LEDGER_BACKEND=legacy or store init failed) the class is pure in-memory,
+  // byte-for-byte as before — no behavioral change on the legacy path.
+  const pendingApprovals = new PendingApprovalStore(store);
   // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions). On the
   // Ask tier these stage a side-effect here and run exactly once on operator confirm — separate
   // from the pane-write PendingApprovalStore so the two never entangle. (src/pendingActions.)
@@ -1695,7 +1699,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           const pSummary = redactSecrets(manager.getPaneSummary(targetId, 5));
           const rationale = { trigger: redactSecrets(opts.trigger), summary: pSummary };
           const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now(), capability };
-          pendingApprovals.add(record, sess);
+          pendingApprovals.add(record, sess, {
+            workspaceId: manager.ledger.activeProjectId || "default_project",
+            ttlMs: APPROVAL_TTL_MS,
+          });
           // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
           announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
           clientWs.send(JSON.stringify({ type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale }));
