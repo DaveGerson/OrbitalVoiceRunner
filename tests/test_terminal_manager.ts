@@ -2,6 +2,11 @@ import assert from "assert";
 import { OrchestratorManager } from "../src/terminal";
 import fs from "fs";
 
+function deleteScrollback(id: string): void {
+  const p = `.janus_scrollback_${id}.log`;
+  try { fs.unlinkSync(p); } catch { /* already gone */ }
+}
+
 async function runTests() {
   console.log("Running OrchestratorManager tests...");
   const manager = new OrchestratorManager();
@@ -39,7 +44,10 @@ async function runTests() {
     delete manager.terminals["test1"];
   }
   assert.ok(!manager.terminals["test1"], "Terminal test1 should have been removed");
-  
+
+  // Teardown: remove scrollback files spawned by this suite
+  deleteScrollback("test1");
+
   console.log("OrchestratorManager tests passed.");
 }
 

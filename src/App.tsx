@@ -1,15 +1,21 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, isAudioPlaying } from "./utils/audio";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalView } from "./components/TerminalView";
 import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
+import { NotificationStack } from "./components/NotificationStack";
+import { effectForEvent } from "./eventBus";
+import type { EarconType } from "./announcementKinds";
+import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
+import { publishChunk } from "./terminalStream";
+import { useE2EHarness } from "./e2e/harness";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -35,6 +41,8 @@ function AppRaw() {
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
+  // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
+  const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
@@ -69,8 +77,12 @@ function AppRaw() {
   const [broadcastTargetIds, setBroadcastTargetIds] = useState<string[]>([]);
   const [isBroadcastRunning, setIsBroadcastRunning] = useState(false);
 
+  // Archive panel states
+  const [archive, setArchive] = useState<any[]>([]);
+  const [showArchivePanel, setShowArchivePanel] = useState(false);
+
   // Web Audio Synth Chimes for Hands-Free Feedback
-  const playEarcon = (type: "alert" | "success" | "execute" | "chime") => {
+  const playEarcon = (type: EarconType) => {
     try {
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const osc = ctx.createOscillator();
@@ -78,7 +90,28 @@ function AppRaw() {
       osc.connect(gain);
       gain.connect(ctx.destination);
 
-      if (type === "alert") {
+      if (type === "completion") {
+        // WS-D (BUG-024): a distinct, short rising two-note so a genuine completion is
+        // audibly distinct from alert/success/execute/chime.
+        const now = ctx.currentTime;
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(587.33, now); // D5
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+        osc.start(now);
+        osc.stop(now + 0.2);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.type = "triangle";
+        osc2.frequency.setValueAtTime(880, now + 0.12); // A5
+        gain2.gain.setValueAtTime(0.05, now + 0.12);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.12 + 0.24);
+      } else if (type === "alert") {
         osc.type = "sawtooth";
         osc.frequency.setValueAtTime(440, ctx.currentTime);
         gain.gain.setValueAtTime(0.04, ctx.currentTime);
@@ -178,6 +211,10 @@ function AppRaw() {
   const [promptBuffer, setPromptBuffer] = useState("");
   const [isBufferFocused, setIsBufferFocused] = useState(false);
   const [promptBufferEditMode, setPromptBufferEditMode] = useState<"edit" | "preview">("preview");
+  // Step 6 (the Workbench): the cross-pane WIP draft register, so work composed for one pane is
+  // visible (and never lost) when the operator switches to another.
+  const [wipDrafts, setWipDrafts] = useState<{ paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[]>([]);
+  const [contextInput, setContextInput] = useState("");
 
   // Mobile layout switcher state: terminal | buffer | menu
   const [mobileActiveView, setMobileActiveView] = useState<"terminal" | "buffer" | "menu">("terminal");
@@ -188,30 +225,44 @@ function AppRaw() {
   // Simplicity Mode / Focus View toggler for a clean, non-overloaded experience
   const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
 
-  // Fetch Synchronous Prompt Buffer Initial State
-  const fetchPromptBuffer = async () => {
+  // Step 6 (the Workbench): the buffer is the ACTIVE pane's persistent WIP draft.
+  const fetchActiveDraft = async (projId = activeProjectId, paneId = activeTerminalId) => {
+    if (!paneId) { setPromptBuffer(""); return; }
     try {
-      const res = await apiFetch("/api/prompt-buffer");
+      const res = await apiFetch(`/api/panes/${projId}/${paneId}/draft`);
       if (res.ok) {
         const data = await res.json();
-        setPromptBuffer(data.text);
+        setPromptBuffer(data.draft?.text ?? "");
       }
     } catch (e) {
-      console.warn("REST prompt-buffer fetch failed: fallback to offline mode");
+      console.warn("REST draft fetch failed");
     }
+  };
+
+  // The cross-pane WIP register (the scalable part of "B").
+  const fetchWipDrafts = async (projId = activeProjectId) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/drafts`);
+      if (res.ok) {
+        const data = await res.json();
+        setWipDrafts(data.drafts || []);
+      }
+    } catch (e) {}
   };
 
   const handlePromptBufferChange = (val: string) => {
     setPromptBuffer(val);
-    
-    // Send over WebSocket or save REST fallback
+    if (!activeTerminalId) return;
+    // Edit the active pane's draft (not a CLI write — ungated).
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
-        type: "prompt_buffer_edit",
+        type: "draft_edit",
+        projectId: activeProjectId,
+        paneId: activeTerminalId,
         text: val
       }));
     } else {
-      apiFetch("/api/prompt-buffer", {
+      apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: val })
@@ -219,13 +270,27 @@ function AppRaw() {
     }
   };
 
-  const handleSyncNoteToActiveNode = async () => {
-    if (!activeTerminalId || !activeProjectId) return;
+  // Send the draft to the active pane. Operator-direct write (the operator is above the gate):
+  // clicking Send IS the approval, so it writes immediately and clears the draft.
+  const handleSendDraft = async () => {
+    if (!activeTerminalId || !promptBuffer.trim()) return;
     try {
-      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/notes`, {
+      const res = await apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft/send`, { method: "POST" });
+      if (res.ok) {
+        setPromptBuffer("");
+        playEarcon("execute");
+      }
+    } catch (e) {}
+  };
+
+  // Add an operator-typed context entry (the human layer) for the active pane.
+  const handleAddHumanContext = async (text: string) => {
+    if (!activeTerminalId || !text.trim()) return;
+    try {
+      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/context`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note: `Requirement Spec Captured: ${promptBuffer.slice(0, 100).replace(/\n/g, " ")}...` })
+        body: JSON.stringify({ text, layer: "human" })
       });
       fetchLedger();
     } catch (e) {}
@@ -263,8 +328,15 @@ function AppRaw() {
   const animationFrameRef = useRef<number | null>(null);
 
   const queueStdoutChunk = (terminalId: string, chunk: string) => {
+    // Display lane: stream raw bytes straight into xterm (no React state, no line
+    // cap, no reset thrash). xterm owns the live buffer.
+    publishChunk(terminalId, chunk);
+
+    // Preview lane: keep a capped, ANSI-bearing tail in React state purely to feed
+    // the pane-card text snippets / byte count. This NO LONGER drives xterm, so the
+    // -110 line cap here is harmless (it once forced a full xterm.reset per frame).
     stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
-    
+
     if (!animationFrameRef.current) {
       animationFrameRef.current = requestAnimationFrame(() => {
         animationFrameRef.current = null;
@@ -285,6 +357,29 @@ function AppRaw() {
     }
   };
 
+  // Per-pane debounce + last-sent-grid so a flurry of fit() events (drag-resize)
+  // collapses into one POST, and an unchanged grid never hits the server.
+  const resizeDebounceRef = useRef<Record<string, any>>({});
+  const lastGridRef = useRef<Record<string, string>>({});
+
+  const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
+    // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
+    // where Playwright intercepts the POST to assert the grid-sync round-trip.
+    if (isMockModeRef.current && !e2eActiveRef.current) return;
+    if (!cols || !rows) return;
+    const key = `${cols}x${rows}`;
+    if (lastGridRef.current[terminalId] === key) return;
+    lastGridRef.current[terminalId] = key;
+    clearTimeout(resizeDebounceRef.current[terminalId]);
+    resizeDebounceRef.current[terminalId] = setTimeout(() => {
+      apiFetch(`/api/terminals/${terminalId}/resize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => { /* pane may have exited; resize is best-effort */ });
+    }, 120);
+  };
+
   const wsRef = useRef<WebSocket | null>(null);
   const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
   const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
@@ -293,9 +388,24 @@ function AppRaw() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const isMicMutedRef = useRef(false);
   const desiredLiveRef = useRef(false);
+  // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
+  // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
+  const activeTerminalIdRef = useRef<string | null>(null);
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
+  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
+  // e2eActiveRef lets the mock-mode-gated resize POST still fire under e2e.
+  const { e2eActiveRef } = useE2EHarness({
+    isMockModeRef,
+    setIsMockMode,
+    setShowTranscriptPanel,
+    setTerminals,
+    setActiveTerminalId,
+    queueStdoutChunk,
+    setTranscript,
+    setPendingCommands,
+  });
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
@@ -361,7 +471,19 @@ function AppRaw() {
       const data = await res.json();
       setSettings(data.settings);
       setGlobalPermissionsMode(data.globalPermissionsMode);
+      // Apply volume immediately (client-side gain) and sync the live mic gate.
+      if (typeof data.settings?.voiceAi?.volume === "number") setPlaybackVolume(data.settings.voiceAi.volume);
+      if (typeof data.settings?.voiceAi?.isMicMuted === "boolean") setIsMicMuted(data.settings.voiceAi.isMicMuted);
     } catch (e) {}
+  };
+
+  // Restart the live voice session so reconnect-only settings (voice, model, API
+  // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
+  const reconnectLive = async () => {
+    if (isLive) {
+      stopLive();
+      setTimeout(() => { startLive(); }, 400);
+    }
   };
 
   const fetchPendingCommands = async () => {
@@ -415,6 +537,61 @@ function AppRaw() {
         const data = await res.json();
         setRecipes(data);
       }
+    } catch (e) {}
+  };
+
+  const fetchArchive = async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/archive");
+      if (res.ok) {
+        const data = await res.json();
+        setArchive(data.archived || []);
+      }
+    } catch (e) {}
+  };
+
+  const handleClearExited = async () => {
+    const exitedCount = activeProject
+      ? Object.values(activeProject.panes || {}).filter(pane => {
+          const term = terminals.find(t => t.id === pane.pane_id);
+          const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+          return status === "Exited";
+        }).length
+      : 0;
+    if (exitedCount === 0) return;
+    setPromptDialog({
+      title: `Type "CLEAR" to archive ${exitedCount} exited pane(s) from this project:`,
+      placeholder: "CLEAR",
+      onSubmit: async (val) => {
+        if (val.trim() !== "CLEAR") return;
+        try {
+          await apiFetch("/api/terminals/clear-exited", { method: "POST" });
+          setPromptDialog(null);
+          fetchLedger();
+          fetchTerminals();
+          fetchArchive();
+          playEarcon("success");
+        } catch (e) {}
+      }
+    });
+  };
+
+  const handleRestoreArchived = async (paneId: string) => {
+    try {
+      await apiFetch(`/api/archive/${paneId}/restore`, { method: "POST" });
+      fetchArchive();
+      fetchLedger();
+      fetchTerminals();
+      playEarcon("success");
+    } catch (e) {}
+  };
+
+  const handleDeleteArchived = async (paneId: string) => {
+    try {
+      await apiFetch(`/api/archive/${paneId}`, { method: "DELETE" });
+      fetchArchive();
+      playEarcon("execute");
     } catch (e) {}
   };
 
@@ -581,8 +758,10 @@ function AppRaw() {
     fetchWatchRules();
     fetchPlans();
     fetchRecipes();
-    fetchPromptBuffer(); // Sync initial prompt buffer
-    
+    fetchActiveDraft(); // Step 6: load the active pane's WIP draft (no-op until a pane is open)
+    fetchWipDrafts();
+    fetchArchive(); // feat/local-testing: load the recoverable pane archive
+
     // Auto-detect browser notification support configuration
     if (typeof window !== "undefined" && "Notification" in window) {
       if (Notification.permission === "granted") {
@@ -590,13 +769,16 @@ function AppRaw() {
       }
     }
 
+    // WS-D (BUG-010): the push branches in ws.onmessage now drive these setters in real
+    // time, so the poll is demoted to a slow safety-net (reconciles if a broadcast is
+    // missed on a flaky socket) rather than the primary refresh path.
     const interval = setInterval(() => {
       fetchTerminals();
       fetchPendingCommands();
       fetchAttentionQueue();
       fetchWatchRules();
       fetchPlans();
-    }, 3000);
+    }, 20000);
     return () => clearInterval(interval);
   }, []);
 
@@ -604,11 +786,28 @@ function AppRaw() {
     isMicMutedRef.current = isMicMuted;
   }, [isMicMuted]);
 
+  // Apply the persisted playback volume (Settings → Speaker Volume) to the audio
+  // layer whenever settings load or change. Gemini Live has no server volume knob,
+  // so this client-side gain is the real control.
   useEffect(() => {
+    const vol = settings?.voiceAi?.volume;
+    if (typeof vol === "number") setPlaybackVolume(vol);
+  }, [settings?.voiceAi?.volume]);
+
+  useEffect(() => {
+    activeTerminalIdRef.current = activeTerminalId;
     if (activeTerminalId) {
       fetchActiveTerminalHistory(activeTerminalId);
     }
-  }, [activeTerminalId]);
+    // Step 5 (single active pane): the UI is the source of truth for where Janus may write.
+    // Tell the server which pane the operator has open (or null if none) on every change.
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalId }));
+    }
+    // Step 6: load the newly-open pane's WIP draft into the Workbench, and refresh the register.
+    fetchActiveDraft(activeProjectId, activeTerminalId);
+    fetchWipDrafts(activeProjectId);
+  }, [activeTerminalId, activeProjectId]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
@@ -840,8 +1039,11 @@ function AppRaw() {
       ws.onopen = async () => {
         setIsLive(true);
         setIsReconnecting(false);
+        // Step 5: re-assert the source of truth on (re)connect so the server knows which pane the
+        // operator has open before Janus can propose anything.
+        ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
           streamRef.current = stream;
           
           const source = captureCtx.createMediaStreamSource(stream);
@@ -854,10 +1056,6 @@ function AppRaw() {
 
           processor.onaudioprocess = (e) => {
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              if (isAudioPlaying(voicePlaybackCtxRef.current)) {
-                // Half-duplex barge-in/echo prevention: drop capture frames while synthesized speech streams through speakers
-                return;
-              }
               const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
               wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
             }
@@ -885,21 +1083,41 @@ function AppRaw() {
               rationale: msg.rationale
             }];
           });
-        } else if (msg.type === "prompt_buffer_updated") {
-          setIsBufferFocused(focused => {
-            if (!focused) {
-              setPromptBuffer(msg.text);
-            }
-            return focused;
-          });
+        } else if (msg.type === "switch_active_pane") {
+          // Step 5: Janus switched the open pane at the operator's spoken direction. The UI obeys
+          // (it remains the source of truth); the activeTerminalId effect echoes set_active_pane back.
+          if (msg.paneId) setActiveTerminalId(msg.paneId);
+        } else if (msg.type === "draft_updated") {
+          // Step 6: a pane's WIP draft changed (Janus dictation/thought, or another view's edit).
+          // Mirror it into the Workbench only when it's the active pane and the operator isn't
+          // mid-edit; always refresh the cross-pane register.
+          if (msg.paneId === activeTerminalIdRef.current) {
+            setIsBufferFocused(focused => {
+              if (!focused) {
+                setPromptBuffer(msg.draft?.text ?? "");
+              }
+              return focused;
+            });
+          }
+          fetchWipDrafts(msg.projectId);
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
         } else if (msg.type === "ledger_updated") {
           setLedger(msg.ledger);
         } else if (msg.type === "settings_updated") {
-          setGlobalPermissionsMode(msg.globalPermissionsMode);
+          // Some settings_updated broadcasts (e.g. set_voice_mute) omit globalPermissionsMode;
+          // only apply it when present so a mute toggle can't clobber the permissions display.
+          if (msg.globalPermissionsMode !== undefined) {
+            setGlobalPermissionsMode(msg.globalPermissionsMode);
+          }
           if (msg.settings) {
             setSettings(msg.settings);
+            // Propagate the authoritative mute state so a model-driven set_voice_mute actually
+            // gates mic capture (the processor reads isMicMutedRef). Without this the model is
+            // told "muted" while audio keeps streaming.
+            if (typeof msg.settings.voiceAi?.isMicMuted === "boolean") {
+              setIsMicMuted(msg.settings.voiceAi.isMicMuted);
+            }
           }
         } else if (msg.type === "command_auto_executed") {
           playEarcon("execute");
@@ -924,6 +1142,42 @@ function AppRaw() {
           setWsErrorNotification({ message: msg.message || "An unexpected error occurred during raw liveness communication." });
           setTimeout(() => setWsErrorNotification(null), 8000);
           resetAudioPlayback();
+        } else if (msg.type === "proactive_earcon") {
+          // WS-D: immediate non-verbal feedback for a proactive event (fires before the
+          // coalesced notification arrives).
+          if (msg.earcon) playEarcon(msg.earcon);
+        } else if (msg.type === "history_updated") {
+          // WS-D (BUG-010): refresh the open per-pane history view when the pushed
+          // update concerns the active pane (avoids waiting on the safety-net poll).
+          if (msg.terminalId && msg.terminalId === activeTerminalIdRef.current) {
+            fetchActiveTerminalHistory(msg.terminalId);
+          }
+        } else if (msg.type === "proactive_notification") {
+          // WS-D: stack-by-status, coalesce-to-latest on-screen notification (BUG-024).
+          setProactiveNotifications(prev => upsertNotification(prev, {
+            id: msg.id,
+            kind: msg.kind,
+            terminalId: msg.terminalId,
+            severity: msg.severity,
+            message: msg.message,
+            timestamp: msg.timestamp,
+          }));
+        } else {
+          // WS-D (BUG-010): event-bus wiring for the orchestration broadcasts that
+          // previously had NO client handler — drive the matching setter + earcon from
+          // the pushed payload so the UI no longer depends on the 3s poll.
+          const effect = effectForEvent(msg);
+          if (effect) {
+            switch (effect.setter) {
+              case "setAttentionQueue": setAttentionQueue(msg.queue); break;
+              case "setPlans": setPlans(msg.plans); break;
+              case "setWatchRules": setWatchRules(msg.watchRules); break;
+              case "fetchTerminals": fetchTerminals(); break;
+              case "fetchPlans": fetchPlans(); break;
+              case "noop": break;
+            }
+            if (effect.earcon) playEarcon(effect.earcon);
+          }
         }
       };
 
@@ -1564,13 +1818,21 @@ function AppRaw() {
   };
 
   const renderPromptSynchronizerPanel = () => {
+    const activePaneName = activePaneMeta?.name || activeTerminalId || "no pane open";
+    const modelCtx = activePaneMeta?.modelContext || [];
+    const humanCtx = activePaneMeta?.humanContext || [];
+    // The other panes (not the active one) that have WIP drafts — the scalable register.
+    const otherWip = wipDrafts.filter((d) => d.paneId !== activeTerminalId);
     return (
       <div className="flex-1 flex flex-col bg-[#060606] border border-white/5 rounded-lg overflow-hidden h-full">
         {/* Header toolbar */}
         <div className="p-3 bg-white/[0.02] border-b border-white/5 flex items-center justify-between shrink-0 select-none">
-          <div className="flex items-center gap-2">
-            <CheckSquare className="w-4 h-4 text-cyan-400" />
-            <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase">Shared Prompt Buffer</h3>
+          <div className="flex items-center gap-2 min-w-0">
+            <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
+            <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase truncate">Prompt Draft</h3>
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate" title="The pane this draft will be sent to">
+              → {activePaneName}
+            </span>
           </div>
           <div className="flex items-center gap-1.5 bg-black/60 p-1 rounded border border-white/10 font-bold select-none">
             <button
@@ -1580,6 +1842,7 @@ function AppRaw() {
               Preview
             </button>
             <button
+              data-testid="composer-edit-toggle"
               onClick={() => setPromptBufferEditMode("edit")}
               className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
             >
@@ -1590,67 +1853,112 @@ function AppRaw() {
 
         {/* Helper Explanation strip */}
         <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-[8.5px] text-zinc-400 font-mono leading-relaxed">
-          <span className="text-cyan-400 font-extrabold uppercase">Shared Spec Sandbox:</span> Janus reads this buffer in real-time to orient its coding tools and maintain a robust state across your CLI surfaces.
+          <span className="text-cyan-400 font-extrabold uppercase">Workbench:</span> compose the prompt for the open pane with Janus, then <span className="text-cyan-300 font-bold">Send</span> it. <span className="text-emerald-400/80">Saved per-pane — switching panes never loses your draft.</span>
         </div>
 
-        {/* Content Viewport */}
-        <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[300px]">
+        {/* WIP register (the scalable part of "B"): other panes with drafts in progress. */}
+        {otherWip.length > 0 && (
+          <div className="px-3 py-1.5 bg-black/40 border-b border-white/5 flex items-center gap-1.5 overflow-x-auto select-none">
+            <span className="text-[8px] font-mono uppercase text-zinc-500 shrink-0">WIP elsewhere:</span>
+            {otherWip.map((d) => (
+              <button
+                key={d.paneId}
+                onClick={() => setActiveTerminalId(d.paneId)}
+                title={d.draft.text.slice(0, 200)}
+                className="shrink-0 px-1.5 py-0.5 text-[9px] font-mono rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20"
+              >
+                {d.paneId} · {d.draft.text.split("\n").filter(Boolean).length}L
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Content Viewport — the draft */}
+        <div className="flex-1 p-4 overflow-y-auto font-mono text-xs text-zinc-300 min-h-[200px]">
           {promptBufferEditMode === "edit" ? (
             <textarea
+              data-testid="composer-input"
               value={promptBuffer}
               onChange={(e) => handlePromptBufferChange(e.target.value)}
               onFocus={() => setIsBufferFocused(true)}
               onBlur={() => setIsBufferFocused(false)}
-              className="w-full h-full min-h-[280px] bg-black text-xs text-zinc-200 p-3 rounded border border-white/10 focus:outline-none focus:border-cyan-500 font-mono resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30"
-              placeholder="Keep track of high-level specs as a list here. Operator typing & Live Voice Agent transcripts update this buffer in real-time..."
+              disabled={!activeTerminalId}
+              className="w-full h-full min-h-[180px] bg-black text-xs text-zinc-200 p-3 rounded border border-white/10 focus:outline-none focus:border-cyan-500 font-mono resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30 disabled:opacity-50"
+              placeholder={activeTerminalId ? "Compose the prompt to send to this pane. Your dictation and Janus's suggestions land here; refine, then Send." : "Open a pane to start composing a prompt for it."}
             />
           ) : (
             <div className="prose prose-invert max-w-none text-zinc-300">
               {promptBuffer ? (
                 <MiniMarkdown text={promptBuffer} />
               ) : (
-                <p className="text-[10px] text-zinc-600 font-mono italic">No prompt notes captured. Switch to Edit or speak into the microphone to write specifications...</p>
+                <p className="text-[10px] text-zinc-600 font-mono italic">{activeTerminalId ? "Empty draft. Switch to Edit, speak into the microphone, or ask Janus to draft a prompt for this pane." : "No pane open. Open a pane to compose a prompt for it."}</p>
               )}
             </div>
           )}
         </div>
 
-        {/* Quick Toolbar macros */}
+        {/* Context (C): the layered orientation that shapes this draft. */}
+        {activeTerminalId && (
+          <div className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
+            <div className="text-[8px] font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
+            {(modelCtx.length > 0 || humanCtx.length > 0) ? (
+              <div className="space-y-0.5 mb-1.5">
+                {modelCtx.slice(-4).map((c, i) => (
+                  <div key={`m${i}`} className="text-[9px] font-mono text-sky-300/80 leading-snug">· {c.text}</div>
+                ))}
+                {humanCtx.slice(-4).map((c, i) => (
+                  <div key={`h${i}`} className="text-[9px] font-mono text-emerald-300/90 leading-snug">✎ {c.text}</div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[9px] font-mono text-zinc-600 italic mb-1.5">No context yet. Add steering notes Janus will read.</div>
+            )}
+            <div className="flex gap-1">
+              <input
+                value={contextInput}
+                onChange={(e) => setContextInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") { handleAddHumanContext(contextInput); setContextInput(""); } }}
+                placeholder="Add context for this pane…"
+                className="flex-1 bg-black text-[9px] text-zinc-200 px-2 py-1 rounded border border-white/10 focus:outline-none focus:border-emerald-500 font-mono"
+              />
+              <button
+                onClick={() => { handleAddHumanContext(contextInput); setContextInput(""); }}
+                className="px-2 py-1 text-[9px] font-mono uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 rounded"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Action toolbar: Send is primary. */}
         <div className="p-3 bg-[#0d0d0d] border-t border-white/5 flex flex-wrap gap-2 items-center justify-between shrink-0 select-none">
           <div className="flex gap-2">
             <button
               onClick={() => handlePromptBufferChange(promptBuffer + "\n- [ ] ")}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
+              disabled={!activeTerminalId}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded disabled:opacity-40"
             >
               + Task
             </button>
             <button
-              onClick={() => handlePromptBufferChange(
-                `# Requirements Specification Checklist\n\n- [ ] **Architecture**: Build production containers.\n- [ ] **Database Snapshots**: Configure sqlite snapshots in .env file.`
-              )}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded"
-            >
-              Template
-            </button>
-          </div>
-
-          <div className="flex gap-2">
-            {activeTerminalId && (
-              <button
-                onClick={handleSyncNoteToActiveNode}
-                className="px-2.5 py-1 text-[9px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded font-bold flex items-center gap-1"
-                title="Pushes prompt buffer specs directly to node chronicle notes registry"
-              >
-                Sync Note
-              </button>
-            )}
-            <button
               onClick={() => handlePromptBufferChange("")}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded"
+              disabled={!activeTerminalId}
+              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded disabled:opacity-40"
             >
               Clear
             </button>
           </div>
+
+          <button
+            data-testid="composer-send"
+            onClick={handleSendDraft}
+            disabled={!activeTerminalId || !promptBuffer.trim()}
+            className="px-4 py-1.5 text-[10px] font-mono uppercase bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded font-bold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Send this prompt to the open pane (operator approval)"
+          >
+            Send → {activePaneName}
+          </button>
         </div>
       </div>
     );
@@ -2169,13 +2477,15 @@ function AppRaw() {
       )}
       
       {showSettingsModal && (
-        <SettingsDialog 
+        <SettingsDialog
           onClose={() => setShowSettingsModal(false)}
           settings={settings}
           onSave={handleSaveSettings}
           terminals={terminals}
           isMockMode={isMockMode}
           onToggleMockMode={generateMockData}
+          isLive={isLive}
+          onReconnectLive={reconnectLive}
         />
       )}
       
@@ -2217,6 +2527,12 @@ function AppRaw() {
           </div>
         )}
       </div>
+
+      {/* WS-D (BUG-024): proactive completion/error notification stack */}
+      <NotificationStack
+        notifications={proactiveNotifications}
+        onDismiss={(id) => setProactiveNotifications(prev => dismissNotification(prev, id))}
+      />
 
       {/* Header */}
       <header className="flex flex-col lg:flex-row items-start lg:items-center justify-between px-4 lg:px-6 py-4 border-b border-white/5 bg-black/40 backdrop-blur-md gap-4 shrink-0">
@@ -2685,8 +3001,13 @@ function AppRaw() {
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
-                  <TerminalView key={activeTerminal.id} output={activeTerminal.output} />
+                <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
+                  <TerminalView
+                    key={activeTerminal.id}
+                    terminalId={activeTerminal.id}
+                    backfill={activeTerminal.backfill}
+                    onResize={(cols, rows) => handleTerminalResize(activeTerminal.id, cols, rows)}
+                  />
                 </div>
               </div>
 
@@ -2856,6 +3177,21 @@ function AppRaw() {
                     <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse" />
                     <span>Focus View activated: click any terminal pane below to run commands.</span>
                   </div>
+                )}
+                {/* Clear exited panes button — only shown when at least one pane is Exited */}
+                {activeProject && Object.values(activeProject.panes || {}).some(pane => {
+                  const term = terminals.find(t => t.id === pane.pane_id);
+                  const status = term?.status || (pane.alive ? (pane.is_busy ? "Running" : "Idle") : "Exited");
+                  return status === "Exited";
+                }) && (
+                  <button
+                    onClick={handleClearExited}
+                    className="text-[10px] font-mono uppercase tracking-wider px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded-lg transition-all flex items-center gap-1.5 shrink-0 select-none"
+                    title="Archive all exited panes for this project"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Clear Exited
+                  </button>
                 )}
               </div>
 
@@ -3579,6 +3915,82 @@ function AppRaw() {
                     </div>
                   </div>
                 </div>
+
+                {/* Archive Panel */}
+                <div className="mt-6 bg-[#0b0b0b] border border-white/5 rounded-lg overflow-hidden">
+                  <button
+                    onClick={() => setShowArchivePanel(prev => !prev)}
+                    className="w-full flex items-center justify-between px-5 py-3 hover:bg-white/[0.02] transition-colors select-none"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-zinc-500" />
+                      <span className="text-[11px] font-mono uppercase text-zinc-400 font-bold tracking-wider">Pane Archive</span>
+                      {archive.length > 0 && (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded uppercase">{archive.length} archived</span>
+                      )}
+                    </div>
+                    <span className="text-zinc-600 text-[10px] font-mono">{showArchivePanel ? "▲ hide" : "▼ show"}</span>
+                  </button>
+
+                  {showArchivePanel && (
+                    <div className="border-t border-white/5 p-5 space-y-3">
+                      <p className="text-[10px] text-zinc-500 font-mono">
+                        Exited panes moved here via "Clear Exited". Restore to bring them back into the ledger, or permanently delete.
+                      </p>
+                      {archive.length === 0 ? (
+                        <div className="p-6 text-center text-zinc-600 text-[10px] italic border border-dashed border-white/5 rounded">
+                          Archive is empty. Clear exited panes to populate it.
+                        </div>
+                      ) : (
+                        <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                          {archive.map((item) => (
+                            <div key={item.pane_id} className="p-3 bg-black/30 border border-white/5 rounded font-mono text-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="font-bold text-zinc-300 truncate">{item.name}</span>
+                                  <span className="text-[8px] px-1 py-0.2 rounded bg-zinc-800 text-zinc-500 uppercase">{item.tool_preset || "Custom"}</span>
+                                </div>
+                                <div className="text-[9px] text-zinc-500 mt-0.5 space-x-2">
+                                  <span>Project: <span className="text-zinc-400">{item.project_id}</span></span>
+                                  {item.last_command && <span>Last cmd: <span className="text-zinc-400 truncate max-w-[140px] inline-block align-bottom">{item.last_command}</span></span>}
+                                </div>
+                                <div className="text-[9px] text-zinc-600 mt-0.5">
+                                  Archived: {new Date(item.archived_at).toLocaleString()}
+                                </div>
+                              </div>
+                              <div className="flex gap-2 shrink-0">
+                                <button
+                                  onClick={() => handleRestoreArchived(item.pane_id)}
+                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded cursor-pointer transition-colors"
+                                  title="Restore this pane back into the project ledger"
+                                >
+                                  Restore
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteArchived(item.pane_id)}
+                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded cursor-pointer transition-colors"
+                                  title="Permanently delete this archived pane"
+                                >
+                                  <Trash2 className="w-2.5 h-2.5 inline mr-0.5" />
+                                  Delete
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex justify-end pt-1">
+                        <button
+                          onClick={fetchArchive}
+                          className="text-[9px] font-mono uppercase text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                          title="Refresh archive"
+                        >
+                          <RefreshCw className="w-2.5 h-2.5" /> Refresh
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -3632,8 +4044,10 @@ function AppRaw() {
                 transcript.map((item, idx) => {
                   const isUser = item.sender === "User";
                   return (
-                    <div 
-                      key={idx} 
+                    <div
+                      key={idx}
+                      data-testid="transcript-message"
+                      data-sender={item.sender}
                       className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
                     >
                       <span className="text-[9px] font-mono opacity-30 mb-0.5 select-none uppercase">

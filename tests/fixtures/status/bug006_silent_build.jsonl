@@ -1,0 +1,13 @@
+{"_comment":"BUG-006: a long-silent npm run build whose child holds the foreground the whole time MUST stay Running. Output then long silence with probe=busy, finally child exits + idleTimeout => exactly one Running->Idle."}
+{"t":0,"event":{"kind":"input"}}
+{"t":50,"event":{"kind":"output","text":"> build"}}
+{"t":500,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":1000,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":1500,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":2000,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":2500,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":3000,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":3500,"event":{"kind":"output","text":"Building project... done? $"}}
+{"t":3501,"event":{"kind":"probe","probe":{"hasRunningChild":true,"confidence":"authoritative"}}}
+{"t":4000,"event":{"kind":"probe","probe":{"hasRunningChild":false,"confidence":"authoritative"}}}
+{"t":4500,"event":{"kind":"probe","probe":{"hasRunningChild":false,"confidence":"authoritative"}}}

@@ -1,28 +1,16 @@
 import fs from "fs";
-import { WatchRule, Plan } from "./types";
+import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft } from "./types";
 
-export interface PaneMeta {
-  pane_id: string;
-  name: string;
-  runtime_type: string;
-  last_known_state: string;
-  is_busy: boolean;
-  alive: boolean;
-  notes: string[];
-  permissions_mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
-  session_id: string;
-  tool_preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
-  context_size: number;
-}
+// PaneMeta and Workspace are defined once in ./types (frontend-safe) and
+// re-exported here so existing `from "./ledger"` imports keep working (D7).
+export type { PaneMeta, Workspace };
 
-export interface Workspace {
-  id: string;
-  name: string;
-  directory: string;
-  summary: string;
-  notes: string[];
-  panes: Record<string, PaneMeta>;
-  keyTerms?: string[];
+// An archived pane: the PaneMeta snapshot plus where it came from and when it was
+// archived, so it can be restored into its original project later (recoverable clear).
+export interface ArchivedPane {
+  pane: PaneMeta;
+  project_id: string;
+  archived_at: string; // ISO timestamp
 }
 
 export class Ledger {
@@ -30,6 +18,7 @@ export class Ledger {
   workspaces: Record<string, Workspace> = {};
   watchRules: WatchRule[] = [];
   plans: Plan[] = [];
+  archivedPanes: ArchivedPane[] = [];
   private storagePath: string;
 
   constructor(storagePath: string = ".janus_ledger.json") {
@@ -46,6 +35,7 @@ export class Ledger {
         this.workspaces = parsed.workspaces || {};
         this.watchRules = parsed.watchRules || [];
         this.plans = parsed.plans || [];
+        this.archivedPanes = parsed.archivedPanes || [];
       }
     } catch (e) {
       console.warn(`Failed to load ledger from ${this.storagePath}:`, e);
@@ -92,7 +82,8 @@ export class Ledger {
         activeProjectId: this.activeProjectId,
         workspaces: this.workspaces,
         watchRules: this.watchRules,
-        plans: this.plans
+        plans: this.plans,
+        archivedPanes: this.archivedPanes
       }, null, 2);
       await fs.promises.writeFile(tempPath, data, "utf-8");
       await fs.promises.rename(tempPath, this.storagePath);
@@ -116,7 +107,8 @@ export class Ledger {
         activeProjectId: this.activeProjectId,
         workspaces: this.workspaces,
         watchRules: this.watchRules,
-        plans: this.plans
+        plans: this.plans,
+        archivedPanes: this.archivedPanes
       }, null, 2);
       fs.writeFileSync(tempPath, data, "utf-8");
       fs.renameSync(tempPath, this.storagePath);
@@ -155,11 +147,92 @@ export class Ledger {
     }
   }
 
-  addPaneNote(projectId: string, paneId: string, note: string) {
+  addPaneNote(projectId: string, paneId: string, note: string): boolean {
     if (this.workspaces[projectId] && this.workspaces[projectId].panes[paneId]) {
       this.workspaces[projectId].panes[paneId].notes.push(note);
       this.save(true);
+      return true;
     }
+    return false;
+  }
+
+  // Layered per-terminal context (prompt-composer refactor §4). Writing context is
+  // NOT a CLI write and is never gated. `addModelContext` is for machine-maintained
+  // orientation (Janus / synthesizer / handoff); `addHumanContext` is for operator
+  // steering. Both append a timestamped entry and persist.
+  private appendContext(
+    layer: "modelContext" | "humanContext",
+    projectId: string,
+    paneId: string,
+    text: string,
+    source?: string
+  ): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    const entry: ContextEntry = { text, at: new Date().toISOString() };
+    if (source) entry.source = source;
+    (pane[layer] ??= []).push(entry);
+    this.save(true);
+    return true;
+  }
+
+  addModelContext(projectId: string, paneId: string, text: string, source?: string): boolean {
+    return this.appendContext("modelContext", projectId, paneId, text, source);
+  }
+
+  addHumanContext(projectId: string, paneId: string, text: string): boolean {
+    return this.appendContext("humanContext", projectId, paneId, text);
+  }
+
+  // Unified read of a pane's orientation context across all layers, newest-last.
+  // `legacy` surfaces pre-refactor flat notes so nothing is lost on migration.
+  getPaneContext(projectId: string, paneId: string): {
+    model: ContextEntry[];
+    human: ContextEntry[];
+    legacy: string[];
+  } | null {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return null;
+    return {
+      model: pane.modelContext ?? [],
+      human: pane.humanContext ?? [],
+      legacy: pane.notes ?? [],
+    };
+  }
+
+  // Per-pane WIP draft prompt (step 6 — the Workbench). A draft is a proposed prompt that has not
+  // yet been sent to the pane; composing/editing it is not a CLI write and is never gated. Each
+  // pane keeps its own, persisted, so switching panes preserves the work in progress.
+  getDraft(projectId: string, paneId: string): PaneDraft | null {
+    return this.workspaces[projectId]?.panes[paneId]?.draft ?? null;
+  }
+
+  setDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    pane.draft = { text, updatedAt: new Date().toISOString(), ...(updatedBy ? { updatedBy } : {}) };
+    this.save(true);
+    return true;
+  }
+
+  appendDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean {
+    const pane = this.workspaces[projectId]?.panes[paneId];
+    if (!pane) return false;
+    const prev = pane.draft?.text ?? "";
+    const next = prev ? `${prev}\n${text}` : text;
+    pane.draft = { text: next, updatedAt: new Date().toISOString(), ...(updatedBy ? { updatedBy } : {}) };
+    this.save(true);
+    return true;
+  }
+
+  // The WIP register (step 6, the scalable part of "B"): every pane in a project that has a
+  // non-empty draft, so the operator never loses work composed for a pane they switched away from.
+  listDrafts(projectId: string): { paneId: string; draft: PaneDraft }[] {
+    const ws = this.workspaces[projectId];
+    if (!ws) return [];
+    return Object.values(ws.panes)
+      .filter((p) => p.draft && p.draft.text.trim().length > 0)
+      .map((p) => ({ paneId: p.pane_id, draft: p.draft! }));
   }
 
   getProject(id: string): Workspace | null {
@@ -178,11 +251,13 @@ export class Ledger {
     }
   }
 
-  addNote(projectId: string, note: string) {
+  addNote(projectId: string, note: string): boolean {
     if (this.workspaces[projectId]) {
       this.workspaces[projectId].notes.push(note);
       this.save(true);
+      return true;
     }
+    return false;
   }
 
   updatePane(projectId: string, paneMeta: PaneMeta, shouldSave = true) {
@@ -192,6 +267,71 @@ export class Ledger {
         this.save(false);
       }
     }
+  }
+
+  // --- Pane archive (recoverable "clear exited") ---
+
+  /** Move a pane out of its project into the archive. Returns false if not found. */
+  archivePane(projectId: string, paneId: string): boolean {
+    const ws = this.workspaces[projectId];
+    if (!ws || !ws.panes[paneId]) return false;
+    const pane = ws.panes[paneId];
+    delete ws.panes[paneId];
+    this.archivedPanes.push({
+      pane,
+      project_id: projectId,
+      archived_at: new Date().toISOString()
+    });
+    this.save(true);
+    return true;
+  }
+
+  /** Archive every Exited (not alive) pane across all projects. Returns count archived. */
+  archiveExitedPanes(projectId?: string): number {
+    let count = 0;
+    const projectIds = projectId ? [projectId] : Object.keys(this.workspaces);
+    for (const pId of projectIds) {
+      const ws = this.workspaces[pId];
+      if (!ws) continue;
+      for (const paneId of Object.keys(ws.panes)) {
+        if (!ws.panes[paneId].alive) {
+          const pane = ws.panes[paneId];
+          delete ws.panes[paneId];
+          this.archivedPanes.push({ pane, project_id: pId, archived_at: new Date().toISOString() });
+          count++;
+        }
+      }
+    }
+    if (count > 0) this.save(true);
+    return count;
+  }
+
+  listArchived(): ArchivedPane[] {
+    return this.archivedPanes;
+  }
+
+  /** Restore an archived pane back into its original project. Returns the entry or null. */
+  restoreArchivedPane(paneId: string): ArchivedPane | null {
+    const idx = this.archivedPanes.findIndex(a => a.pane.pane_id === paneId);
+    if (idx === -1) return null;
+    const entry = this.archivedPanes[idx];
+    // Recreate the destination project if it has since been removed.
+    if (!this.workspaces[entry.project_id]) {
+      this.addProject(entry.project_id, entry.pane.last_command ? process.cwd() : process.cwd(), "Restored workspace");
+    }
+    this.workspaces[entry.project_id].panes[entry.pane.pane_id] = entry.pane;
+    this.archivedPanes.splice(idx, 1);
+    this.save(true);
+    return entry;
+  }
+
+  /** Permanently remove an archived pane. Returns true if it existed. */
+  deleteArchivedPane(paneId: string): boolean {
+    const idx = this.archivedPanes.findIndex(a => a.pane.pane_id === paneId);
+    if (idx === -1) return false;
+    this.archivedPanes.splice(idx, 1);
+    this.save(true);
+    return true;
   }
 
   getProjectBriefing(id: string) {

@@ -79,7 +79,7 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 *   **History Simplification Engine (`get_pane_command_history` inside `/server.ts`):**
     Instead of passing large, messy and token-expensive stdout streams to the LLM context, it maintains a concise history log containing the precise command executed and its condensed high-level outcome.
 *   **Dynamic System Prompt Reconstruction:**
-    Each time Janus resumes a workspace session, the system instruction is reconstructed dynamically with available workspaces, file trees, notes, and the live status indicators of all terminals.
+    Each time Janus resumes a workspace session, the system instruction is reconstructed with the active project ID, the available workspaces (ID/name), and the live status and CWD of each terminal pane. (Note: project notes and file trees are *not* injected into the system instruction today; notes re-enter context via the `switch_context` briefing — see `docs/review/BUG_LOG.md` BUG-033.)
 
 ---
 
@@ -110,13 +110,13 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 | Secondary Journey | Core API Tool Hooks | Action Profile |
 | :--- | :--- | :--- |
 | **Dictate Specifications** | `add_project_note` & `add_pane_note` | Speech-to-text notes are written directly to ledger. |
-| **Narrate Terminal Walk-through** | `get_pane_summary` | Redacted terminal visual logs are analyzed and spoken back to notes. |
+| **Narrate Terminal Walk-through** | `get_pane_summary` | Recent terminal output (ANSI-stripped) is read back; the operator dictates notes for needed changes. *(Output is not yet redacted or semantically analyzed — see `docs/review/IMPLEMENTATION_PLAN.md` WS-B/WS-J.)* |
 
 ---
 
 ## 4. Maintenance and Validation Strategy
 
-To prevent functional regression, all 6 developer journeys are tested inside `/tests/test_journeys.ts`.
+To prevent functional regression, the primary developer journeys are tested inside `/tests/test_journeys.ts` (Journeys 1–6). *(The two secondary journeys, 7 and 8, are not yet covered — tracked in `docs/review/BUG_LOG.md` BUG-038.)*
 
 To verify and run all validation tests:
 ```bash

@@ -17,6 +17,15 @@ export function pcmToBase64(pcmData: Float32Array): string {
 let nextStartTime = 0;
 const activeSources: AudioBufferSourceNode[] = [];
 
+// Client-side playback volume (0..1). Gemini Live has no server volume control,
+// so the Settings "volume" slider is honored here by scaling the output samples.
+let playbackVolume = 1.0;
+export function setPlaybackVolume(v: number) {
+  // Accept either 0..1 or 0..100; clamp to a safe range.
+  const norm = v > 1 ? v / 100 : v;
+  playbackVolume = Math.max(0, Math.min(1, norm));
+}
+
 export function playAudioChunk(audioCtx: AudioContext, base64: string) {
   const binary = atob(base64);
   const len = binary.length;
@@ -35,7 +44,11 @@ export function playAudioChunk(audioCtx: AudioContext, base64: string) {
 
   const source = audioCtx.createBufferSource();
   source.buffer = buffer;
-  source.connect(audioCtx.destination);
+  // Route through a GainNode so the volume setting applies in real time.
+  const gain = audioCtx.createGain();
+  gain.gain.value = playbackVolume;
+  source.connect(gain);
+  gain.connect(audioCtx.destination);
 
   const currentTime = audioCtx.currentTime;
   if (nextStartTime < currentTime) {

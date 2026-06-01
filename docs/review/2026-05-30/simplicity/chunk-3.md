@@ -1,0 +1,19 @@
+# Chunk 3 — Command Proposal, Permissions & Approvals — Simplicity & Clarity
+
+**Score: 9/10** — This is the cleanest, most disciplined chunk in the codebase: pure decision functions (`decideProposal`, `resolveDecision`), one effective-mode resolver, one dispatch choke-point, one resolution choke-point. The control flow is genuinely easy to follow end-to-end. The only real drags are the inevitable mock-mode duplication in the React handlers and the unavoidable cost of these handlers living inside the giant App.tsx/server.ts files.
+
+## Findings
+
+- `src/pendingApprovals.ts` — Model code for this lens. `decideProposal` (L105-139) is a flat, single-return-per-branch switch over a closed `ProposalDecision` union; `resolveDecision` (L176-204) is the one place every resolve path (REST/voice/TTL) flows through the mandatory claim gate. Nothing to simplify — the structure IS the simplification.
+- `src/approvalIntent.ts` — Pure and well-organized, but it is the one place carrying heavy cognitive load in this chunk: `parseApprovalIntent` (L137-210) has many overlapping verb sets (`APPROVE_STRONG/WEAK`, `REJECT_STRONG/WEAK`, `STRONG_VERBS`, `OBJECT_TOKENS`, `NEGATORS`, `BARE_YES/NO`) and four special-case branches (bare-affirmation, leading-negator directive, paired-verb scan, collision). It is justified by the bug history in the docstrings, but ~50% of the file is prose comment. `extractTargetHint`'s "longest non-stopword run" fragment heuristic (L114-125) is the subtlest part and could use a worked example rather than restating the rule. No structural change needed; this is essential complexity, well-contained.
+- `server.ts:1303-1358` `dispatchProposal` — Exemplary: resolve paneExists/runtimeType/kind/effectiveMode, call the pure `decideProposal`, then a switch that does exactly one side-effect set per outcome. Easy to read top-to-bottom.
+- `server.ts:1181-1223` `applyResolution` — Likewise clean single choke-point. One nit: the four narration strings (dead_pane/approved/rejected/expired) each rebuild the `verb`/`safeInstr` phrasing inline; minor, and readability is fine.
+- `server.ts:1142-1149` `effectiveModeFor` — Tiny, single-source, exactly right. Good that both `dispatchProposal` and `handoff_context` (L1833) call it instead of re-deriving.
+- `src/App.tsx:693-736` `handleApprove`/`handleReject` — The real (non-mock) bodies are ~6 lines each and nearly identical (same endpoint, differ only in `approved: true/false` and the `setTimeout(fetchTerminals,500)`). They could share one `resolvePending(messageId, approved)` helper. The bulk of `handleApprove` (L694-711) is mock-mode simulation that hand-writes fake terminal output including a literal `tailwindcss`/`pandas` branch — that's demo scaffolding bloating a production handler; consider isolating all mock-mode behavior behind one `mockApprove()` rather than inlining it at the top of the real handler.
+- `src/components/ApprovalDialog.tsx` — Clean, single-purpose, Esc-to-reject. The `cmd`/`instruction` duality (server serializes both as a back-compat alias, dialog reads `cmd`) is a small smell but documented at `pendingApprovals.ts:211`. No change.
+- `server.ts:1162-1167` `WS_EVT` constant + comment block is a good single-source-of-truth move; the `approved`/`vocal` boolean-variant overloading of `command_auto_executed` is slightly tricky but documented.
+
+## Top fixes
+1. Extract a shared `resolvePending(messageId, approved)` in App.tsx to dedupe `handleApprove`/`handleReject` real-path bodies (`App.tsx:712-720` / `728-735`).
+2. Move the inline mock-mode simulation out of `handleApprove` (`App.tsx:694-711`) into a dedicated `mockApprove()` so the production handler reads in ~6 lines.
+3. (Optional) Add one or two worked examples to `extractTargetHint` (`approvalIntent.ts:96-128`) — the "longest non-stopword run" fragment logic is the only part that isn't self-evident.

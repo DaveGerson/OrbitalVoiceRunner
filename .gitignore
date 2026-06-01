@@ -4,7 +4,21 @@ dist/
 coverage/
 .DS_Store
 *.log
+logs/
+.idea/
 .env*
 !.env.example
 .janus_ledger.json
 .janus_ledger_test.json
+.janus_ledger_journeys_test.json
+.janus_settings.json
+.janus_history.json
+.janus_scrollback_*.log
+_ptyprobe_test*.cjs
+dist-tmp/
+
+# Playwright e2e
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/

@@ -14,10 +14,12 @@ export function CreateTerminalDialog({
   ) => Promise<void>;
 }) {
   const [id, setId] = useState("");
-  const [cwd, setCwd] = useState(".");
+  // Empty = use the active project's directory (server resolves it). Avoids "."
+  // which, combined with a bad command, produced cryptic spawn path errors.
+  const [cwd, setCwd] = useState("");
   const [toolPreset, setToolPreset] = useState<"Claude Code" | "Codex" | "Antigravity" | "Custom">("Claude Code");
   const [permissionsMode, setPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only">("Human-in-the-Loop");
-  const [cmd, setCmd] = useState("npx @anthropic-ai/claude");
+  const [cmd, setCmd] = useState("claude");
 
   // Modern Startup Config Modifiers state
   const [dangerouslySkipPermissions, setDangerouslySkipPermissions] = useState(false);
@@ -27,37 +29,32 @@ export function CreateTerminalDialog({
   const [showModifiers, setShowModifiers] = useState(true);
 
   useEffect(() => {
+    // Agent CLIs are installed globally as bare binaries; never `npx <pkg>`.
     let baseCmd = "";
     if (toolPreset === "Claude Code") {
-      baseCmd = "npx @anthropic-ai/claude";
+      baseCmd = "claude";
     } else if (toolPreset === "Codex") {
-      baseCmd = "npx codex-cli";
+      baseCmd = "codex";
     } else if (toolPreset === "Antigravity") {
-      baseCmd = "npx antigravity";
+      baseCmd = "antigravity";
     } else {
       baseCmd = process.platform === "win32" ? "cmd.exe" : "bash";
     }
 
+    // Only append flags the real CLIs actually accept. `--dangerously-skip-permissions`
+    // is valid for Claude Code; the old `--resume-previous-session` / `--with-open-textbox`
+    // were invented and made the CLI exit immediately, so they are removed. Session
+    // resume is handled server-side (real UUID only) and not via a launch flag here.
     const flags: string[] = [];
-    if (dangerouslySkipPermissions || (toolPreset !== "Custom" && permissionsMode === "Full Auto")) {
+    if (toolPreset === "Claude Code" && (dangerouslySkipPermissions || permissionsMode === "Full Auto")) {
       flags.push("--dangerously-skip-permissions");
-    }
-    if (sessionResume) {
-      flags.push("--resume-previous-session");
-      flags.push("--with-open-textbox");
-    }
-    if (portOffset) {
-      flags.push(`--port-offset=${portOffset}`);
-    }
-    if (customEnvVars) {
-      flags.push(`--env="${customEnvVars}"`);
     }
 
     if (flags.length > 0) {
       baseCmd = `${baseCmd} ${flags.join(" ")}`;
     }
     setCmd(baseCmd);
-  }, [toolPreset, permissionsMode, dangerouslySkipPermissions, sessionResume, portOffset, customEnvVars]);
+  }, [toolPreset, permissionsMode, dangerouslySkipPermissions]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
@@ -107,9 +104,9 @@ export function CreateTerminalDialog({
             </div>
             <div>
               <label className="block text-zinc-500 mb-1">Working Directory</label>
-              <input 
+              <input
                 className="w-full bg-black border border-white/10 rounded px-2.5 py-1.5 text-white focus:outline-none focus:border-cyan-500 transition-colors"
-                value={cwd} onChange={e => setCwd(e.target.value)} placeholder="./" 
+                value={cwd} onChange={e => setCwd(e.target.value)} placeholder="(active project dir)"
               />
             </div>
           </div>
@@ -194,9 +191,9 @@ export function CreateTerminalDialog({
           <button onClick={onClose} className="px-4 py-1.5 text-xs font-mono text-zinc-400 hover:text-white transition-colors focus:outline-none rounded">Cancel</button>
           <button 
             onClick={() => {
-              if (id && cwd && cmd) onCreate(id, cwd, cmd, toolPreset, permissionsMode);
+              if (id && cmd) onCreate(id, cwd, cmd, toolPreset, permissionsMode);
             }}
-            disabled={!id || !cwd || !cmd}
+            disabled={!id || !cmd}
             className="px-4 py-1.5 text-xs font-mono bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 border border-cyan-500/50 rounded transition-all disabled:opacity-40 focus:outline-none"
           >
             Deploy Node Unit
