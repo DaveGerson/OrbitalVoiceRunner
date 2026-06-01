@@ -60,6 +60,8 @@ Every agent shares **one** git object store. Concurrent **team-maintainer** sess
 
 This binds **every** session — orchestrated, background, scheduled, and interactive alike.
 
+**Enforcement — worktree-mutex lock (opt-in).** A committed `pre-commit` hook makes "one committer per tree/branch" a mechanism, not just a rule. It is **advisory by default** (warns on contention, never blocks) and **blocks only** when you opt in with `JANUS_WT_LOCK=strict`. Stale locks auto-expire and a dead session can never permanently block commits. Enable it per clone (it does **not** touch shared `core.hooksPath`): `sh scripts/install-wt-lock.sh` — or `pwsh scripts/install-wt-lock.ps1` on Windows. Clear a stale lock with `node scripts/wt-lock.mjs release --force`. Because it's a plain git hook it binds Claude, Codex, and humans alike. Full design + commands: [`docs/process/WORKTREE_LOCK.md`](docs/process/WORKTREE_LOCK.md).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 

@@ -66,6 +66,7 @@ Concurrent **team-maintainer** agents share one git store; in a shared working t
 - **Main = integration-only** — review, merges, `git pull`; no autonomous commits there.
 - **One committer per tree** — never `git stash`/`reset`/`checkout`/`add -A`/rebase against a tree you don't exclusively own. Find foreign uncommitted changes? **STOP and report** — don't rescue/park/stash them.
 - Prefer sibling worktrees (`../<repo>-wt/<task>`) over nested `.claude/worktrees/`.
+- **Enforcement (opt-in):** a `pre-commit` worktree-mutex lock backs this policy — advisory by default (warns), blocking via `JANUS_WT_LOCK=strict`. Enable per clone: `sh scripts/install-wt-lock.sh` (or `.ps1`). Clear a dead lock: `node scripts/wt-lock.mjs release --force`. Full details: `docs/process/WORKTREE_LOCK.md`.
 
 ## Build & Test
 

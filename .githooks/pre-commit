@@ -1,0 +1,38 @@
+#!/bin/sh
+# .githooks/pre-commit — Worktree Mutual-Exclusion Lock (advisory by default).
+#
+# Enforces "one committer per worktree/branch" (see AGENTS.md "Worktree
+# Isolation"). This hook is a thin launcher: all logic lives in
+# scripts/wt-lock.mjs + src/wtLock.ts.
+#
+# SAFETY: advisory by default (warns, never blocks). Strict/blocking mode is
+# opt-in via `export JANUS_WT_LOCK=strict`. If node is missing, or anything
+# goes wrong, this hook FAILS OPEN (exit 0) so it can never brick commits.
+#
+# This hook is NOT auto-active. Enable it per clone with:
+#   sh scripts/install-wt-lock.sh        (macOS/Linux/Git-Bash)
+#   pwsh scripts/install-wt-lock.ps1     (Windows PowerShell)
+# Disable entirely at runtime with: export JANUS_WT_LOCK=off
+
+# Locate the repo root (works in worktrees too).
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$ROOT" ]; then
+  exit 0   # not in a worktree we understand -> fail open
+fi
+
+HELPER="$ROOT/scripts/wt-lock.mjs"
+if [ ! -f "$HELPER" ]; then
+  exit 0   # helper absent (older checkout) -> fail open
+fi
+
+# Find a node binary; if none, fail open silently.
+if command -v node >/dev/null 2>&1; then
+  node "$HELPER" check
+  RC=$?
+else
+  echo "[wt-lock] node not found; skipping worktree lock check (fail open)." 1>&2
+  exit 0
+fi
+
+# Only a strict-mode contention returns non-zero. Everything else allowed.
+exit $RC
