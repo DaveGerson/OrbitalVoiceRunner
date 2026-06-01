@@ -29,6 +29,8 @@ import {
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
+import { deliverOutcomeToHandoff, resolveReasonToHandoffState } from "./src/handoffFlow";
+import { PendingActionStore } from "./src/pendingActions";
 import type { GateValue, CapabilityGate } from "./src/types";
 
 dotenv.config();
@@ -1270,6 +1272,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can
   // add durability/atomicity without a rewrite (see src/pendingApprovals.ts §8).
   const pendingApprovals = new PendingApprovalStore();
+  // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions). On the
+  // Ask tier these stage a side-effect here and run exactly once on operator confirm — separate
+  // from the pane-write PendingApprovalStore so the two never entangle. (src/pendingActions.)
+  const pendingActions = new PendingActionStore();
+  let pendingActionSeq = 0;
   // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
   const shellAllowlist = loadShellAllowlist();
   // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
@@ -1327,6 +1334,37 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     return { forbidden: gate === "Off", gate };
   }
 
+  // G1: gate a NON-PTY mutator with full Auto/Ask/Off semantics. Unlike gateCapability (which only
+  // enforced the Off veto and let Ask proceed), this DEFERS the side effect on Ask by staging
+  // `run` in pendingActions; the operator confirms via POST /api/actions/:id/confirm and the effect
+  // runs exactly once. Returns the disposition so the handler can answer the model appropriately.
+  //   { disposition: "run" }      -> Auto: caller invokes the effect now.
+  //   { disposition: "forbidden"} -> Off:  caller refuses.
+  //   { disposition: "deferred", actionId, summary } -> Ask: effect staged; caller tells the model
+  //                                it is awaiting operator confirmation (no side effect yet).
+  function gateOrDefer(
+    capability: CapabilityGate,
+    paneId: string | null,
+    summary: string,
+    run: () => string
+  ): { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string } {
+    const gate = effectiveCapabilityGateFor(paneId, capability);
+    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+    if (gate === "Off") {
+      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `FORBIDDEN ${capability}: ${summary}`, payload: { capability, gate, action: "forbidden" } }); } catch {} }
+      return { disposition: "forbidden" };
+    }
+    if (gate === "Ask") {
+      const actionId = `act_${Date.now()}_${pendingActionSeq++}`;
+      pendingActions.add({ id: actionId, capability, summary, timestamp: Date.now(), run });
+      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `DEFERRED ${capability} (await confirm): ${summary}`, payload: { capability, gate, action: "deferred", action_id: actionId } }); } catch {} }
+      broadcast({ type: "action_pending", actionId, capability, summary });
+      return { disposition: "deferred", actionId, summary };
+    }
+    // Auto
+    return { disposition: "run" };
+  }
+
   function pushApprovalNarration(session: any, text: string) {
     try {
       session.sendClientContent({
@@ -1371,15 +1409,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       handoff = matches[0] ?? null;
     }
     if (!handoff) return;
+    // Pure mapping (src/handoffFlow): reason -> handoff state. One source of truth, unit-tested.
+    const nextState = resolveReasonToHandoffState(reason as any);
+    if (!nextState) return;
     try {
-      if (reason === "approved") {
+      if (nextState === "delivered") {
         store.updateHandoffState(handoff.id, "delivered", {
           approved_via: opts?.vocal ? "voice" : "rest",
           delivered_at: Date.now(),
         });
-      } else if (reason === "rejected") {
+      } else if (nextState === "rejected") {
         store.updateHandoffState(handoff.id, "rejected", { approved_via: opts?.vocal ? "voice" : "rest" });
-      } else if (reason === "expired" || reason === "dead_pane") {
+      } else if (nextState === "expired") {
         store.updateHandoffState(handoff.id, "expired", { approved_via: "ttl_expire" });
       }
     } catch (e) {
@@ -1439,6 +1480,33 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     res.json(pendingApprovals.all().map((p) => serializePending(p)));
   });
 
+  // G1: pending NON-PTY deferred actions (gated Ask) — list / confirm / cancel.
+  app.get("/api/actions/pending", (_req, res) => {
+    res.json(pendingActions.all().map((a) => ({ id: a.id, capability: a.capability, summary: a.summary, ageSeconds: Math.max(0, Math.floor((Date.now() - a.timestamp) / 1000)) })));
+  });
+
+  app.post("/api/actions/:id/confirm", (req, res) => {
+    const { id } = req.params;
+    if (!pendingActions.has(id)) { res.status(404).json({ error: "Pending action not found" }); return; }
+    try {
+      const result = pendingActions.confirm(id);
+      if (result.reason === "lost_race") { res.json({ success: true, already: true }); return; }
+      if (result.reason === "not_found") { res.status(404).json({ error: "Pending action not found" }); return; }
+      broadcast({ type: "action_resolved", actionId: id, outcome: "confirmed" });
+      res.json({ success: true, output: result.output });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  app.post("/api/actions/:id/cancel", (req, res) => {
+    const { id } = req.params;
+    if (!pendingActions.has(id)) { res.status(404).json({ error: "Pending action not found" }); return; }
+    const result = pendingActions.cancel(id);
+    broadcast({ type: "action_resolved", actionId: id, outcome: "cancelled" });
+    res.json({ success: true, already: result.reason === "lost_race" });
+  });
+
   app.post("/api/commands/approve", (req, res) => {
     const { messageId, approved } = req.body;
     if (!pendingApprovals.has(messageId)) {
@@ -1469,6 +1537,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   function sweepExpiredApprovals(now: number = Date.now()) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
       applyResolution(pending.messageId, "expire");
+    }
+    // G1: expire stale deferred actions on the SAME cadence so a never-confirmed mutation does not
+    // linger forever (parity with approvals; the side effect is NOT run on expiry).
+    for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
+      pendingActions.expire(act.id);
+      broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
     }
   }
   const approvalSweepTimer = setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS);
@@ -1950,45 +2024,52 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "create_pane") {
                 const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
-                const cpGate = gateCapability("create_pane", pane_id ?? null);
-                if (cpGate.forbidden) {
+                const createPaneEffect = (): string => {
+                  if (!manager.ledger.getProject(project_id)) {
+                    manager.ledger.addProject(project_id, ".", "Co-created with pane");
+                  }
+                  const result = manager.addTerminal(
+                    pane_id,
+                    manager.ledger.workspaces[project_id]?.directory || process.cwd(),
+                    command,
+                    tool_preset || "Custom",
+                    permissions_mode || "Human-in-the-Loop",
+                    "",
+                    project_id
+                  );
+                  broadcastLedgerUpdate();
+                  broadcast({ type: "terminals_updated" });
+                  return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
+                };
+                const g = gateOrDefer("create_pane", pane_id ?? null, `Create pane ${pane_id} (${command}) in ${project_id}`, createPaneEffect);
+                if (g.disposition === "forbidden") {
                   session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.` } }] });
+                } else if (g.disposition === "deferred") {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to create the pane.` } }] });
                 } else {
-                if (!manager.ledger.getProject(project_id)) {
-                  manager.ledger.addProject(project_id, ".", "Co-created with pane");
-                }
-                const result = manager.addTerminal(
-                  pane_id,
-                  manager.ledger.workspaces[project_id]?.directory || process.cwd(),
-                  command,
-                  tool_preset || "Custom",
-                  permissions_mode || "Human-in-the-Loop",
-                  "",
-                  project_id
-                );
-                broadcastLedgerUpdate();
-                broadcast({ type: "terminals_updated" });
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Pane ${pane_id} created under project ${project_id}. Result: ${result}` } }]
-                });
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: createPaneEffect() } }] });
                 }
               } else if (name === "set_global_permissions") {
-                const sgpGate = gateCapability("set_global_permissions", null);
-                if (sgpGate.forbidden) {
-                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_global_permissions' capability is gated Off; this change is forbidden by policy.` } }] });
-                } else {
                 const { permissions_mode } = args;
-                manager.globalPermissionsMode = permissions_mode;
-                manager.settings.advanced.globalPermissionsMode = permissions_mode;
-                manager.saveSettings();
-                broadcast({
-                  type: "settings_updated",
-                  globalPermissionsMode: permissions_mode,
-                  settings: sanitizeSettingsForClient(manager.settings)
-                });
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Global permissions updated to ${permissions_mode}.` } }]
-                });
+                // The deferred side effect (runs now on Auto, or on operator confirm under Ask).
+                const applyGlobalPerms = (): string => {
+                  manager.globalPermissionsMode = permissions_mode;
+                  manager.settings.advanced.globalPermissionsMode = permissions_mode;
+                  manager.saveSettings();
+                  broadcast({
+                    type: "settings_updated",
+                    globalPermissionsMode: permissions_mode,
+                    settings: sanitizeSettingsForClient(manager.settings)
+                  });
+                  return `Global permissions updated to ${permissions_mode}.`;
+                };
+                const g = gateOrDefer("set_global_permissions", null, `Set global permissions to ${permissions_mode}`, applyGlobalPerms);
+                if (g.disposition === "forbidden") {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_global_permissions' capability is gated Off; this change is forbidden by policy.` } }] });
+                } else if (g.disposition === "deferred") {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.` } }] });
+                } else {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: applyGlobalPerms() } }] });
                 }
               } else if (name === "set_voice_mute") {
                 const { muted } = args;
@@ -2355,18 +2436,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                       trigger: "handoff delivery",
                       capability: "deliver_handoff",
                     });
-                    if (outcome.kind === "executed") {
+                    // Pure mapping (src/handoffFlow): dispatch outcome -> persisted-row effect.
+                    // One source of truth, unit- + smoke-tested against a real JanusStore (G3).
+                    const effect = deliverOutcomeToHandoff(outcome.kind as any);
+                    if (effect.kind === "deliver_now") {
                       // Full Auto: the write already landed; flip the row to delivered now.
-                      store.updateHandoffState(handoff_id, "delivered", { approved_via: "full_auto" });
+                      store.updateHandoffState(handoff_id, effect.state, { approved_via: effect.approvedVia });
                       broadcast({ type: "handoffs_updated" });
                       session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Delivered handoff ${handoff_id} to pane ${h.to_pane}.` } }] });
-                    } else if (outcome.kind === "pending") {
+                    } else if (effect.kind === "await_approval") {
                       // HiTL: persist the gate_approval_id; applyResolution flips to delivered on approve.
                       store.setGateApprovalId(handoff_id, handoff_id);
                       broadcast({ type: "handoffs_updated" });
                       session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { status: "pending_approval", messageId: handoff_id, pane_id: h.to_pane, prompt: outcome.text } }] });
-                    } else if (outcome.kind === "blocked") {
-                      store.updateHandoffState(handoff_id, "blocked_read_only");
+                    } else if (effect.kind === "block") {
+                      store.updateHandoffState(handoff_id, effect.state);
                       broadcast({ type: "handoffs_updated" });
                       session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: outcome.text } }] });
                     } else {
@@ -2444,10 +2528,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "set_pane_permissions") {
                 const { project_id, pane_id, permissions_mode } = args;
-                const sppGate = gateCapability("set_pane_permissions", pane_id ?? null);
-                if (sppGate.forbidden) {
-                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.` } }] });
-                } else {
+                // Ungated validation pre-checks (cheap reads, no side effect) BEFORE the gate.
                 const validModes = ["Full Auto", "Human-in-the-Loop", "Read-Only"];
                 const term = manager.terminals[pane_id];
                 const ws = manager.ledger.getProject(project_id);
@@ -2461,19 +2542,25 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     functionResponses: [{ name, id: call.id, response: { output: `Pane ${pane_id} not found in project ${project_id}; no permission change applied.` } }]
                   });
                 } else {
-                  if (term) {
-                    term.setPermissionsMode(permissions_mode);
+                  const applyPanePerms = (): string => {
+                    if (manager.terminals[pane_id]) manager.terminals[pane_id].setPermissionsMode(permissions_mode);
+                    const ws2 = manager.ledger.getProject(project_id);
+                    if (ws2 && ws2.panes[pane_id]) {
+                      ws2.panes[pane_id].permissions_mode = permissions_mode;
+                      manager.ledger["save"]();
+                    }
+                    broadcastLedgerUpdate();
+                    broadcast({ type: "terminals_updated" });
+                    return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
+                  };
+                  const g = gateOrDefer("set_pane_permissions", pane_id ?? null, `Set pane ${pane_id} permissions to ${permissions_mode}`, applyPanePerms);
+                  if (g.disposition === "forbidden") {
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.` } }] });
+                  } else if (g.disposition === "deferred") {
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.` } }] });
+                  } else {
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: applyPanePerms() } }] });
                   }
-                  if (paneExists) {
-                    ws!.panes[pane_id].permissions_mode = permissions_mode;
-                    manager.ledger["save"]();
-                  }
-                  broadcastLedgerUpdate();
-                  broadcast({ type: "terminals_updated" });
-                  session.sendToolResponse({
-                    functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
-                  });
-                }
                 }
               }
               } catch (toolErr) {

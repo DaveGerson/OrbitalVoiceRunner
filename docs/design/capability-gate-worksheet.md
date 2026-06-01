@@ -123,6 +123,29 @@ A staged-but-undelivered handoff NEVER auto-expires. `list_handoffs` derives a `
 `staged_age_seconds` at read time (threshold `STAGED_STALE_MS` = 15 min) so the operator can
 notice; nothing is deleted.
 
+## Deferred execution for non-PTY mutators (G1 closed)
+
+The `Ask` tier now FUNCTIONS for the non-PTY mutators (`create_pane`, `set_pane_permissions`,
+`set_global_permissions`) — previously only the `Off` veto worked and `Ask` proceeded-and-audited.
+`gateOrDefer(capability, paneId, summary, run)` resolves the gate and:
+- **Auto** → runs the side effect now.
+- **Off** → forbids (no effect), audited.
+- **Ask** → stages the side-effect closure in `PendingActionStore` (separate from the pane-write
+  `PendingApprovalStore` so the two never entangle) and tells the model it awaits confirmation.
+  The operator confirms via `POST /api/actions/:id/confirm` (runs exactly once via a claim seam)
+  or `POST /api/actions/:id/cancel`. Stale actions expire on the same TTL sweep as approvals
+  (effect NOT run on expiry). `apply_orchestration_recipe` keeps the `Off`-veto-only guard
+  (loop-spawn; deferring each pane individually is out of scope).
+
+## Handoff deliver/flip mappings (G3 closed)
+
+The deliver-outcome→row and resolve-reason→state mappings are extracted to pure functions in
+`src/handoffFlow.ts` (`deliverOutcomeToHandoff`, `resolveReasonToHandoffState`) that the server
+calls directly — so the smoke test and unit tests exercise the REAL mapping, not a copy. The
+smoke now drives `deliverOutcomeToHandoff("executed") → deliver_now` and asserts the sentinel
+echoes back in the live PTY; `tests/test_handoff_flow.ts` drives approve/reject/expire flips
+against a real on-disk JanusStore.
+
 ## Test coverage map
 
 `tests/test_capability_gate.ts` asserts:
