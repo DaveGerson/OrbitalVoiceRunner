@@ -1758,6 +1758,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: out } }]
                 });
+              } else if (name === "get_pane_delta") {
+                const targetId = args.pane_id;
+                const out = manager.getPaneDelta(targetId);
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: out } }],
+                });
               } else if (name === "switch_context") {
                 const projectId = args.project_id;
                 manager.ledger.switchContext(projectId);
@@ -2535,6 +2541,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 },
                 required: ["pane_id"]
               }
+            },
+            {
+              name: "get_pane_delta",
+              description:
+                "Return ONLY the pane output that is new since you last read this pane " +
+                "(true incremental delta; ANSI-stripped, secret-redacted). Advances a per-pane " +
+                "read cursor, so repeated calls won't re-show old lines. Prefer this over " +
+                "get_pane_summary when tracking progress.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { pane_id: { type: Type.STRING, description: "The pane id." } },
+                required: ["pane_id"],
+              },
             },
             {
               name: "switch_context",
