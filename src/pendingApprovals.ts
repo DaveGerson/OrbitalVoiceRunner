@@ -113,6 +113,20 @@ export interface DecideProposalInput {
 }
 
 /**
+ * Pure capability-gate RESOLUTION (design §3): which gate value applies for a (pane,
+ * capability). The per-pane override always WINS when present (in both directions — a pane
+ * set to "Auto" overrides a global "Off", because the override is a deliberate exception to
+ * the default); else the global default; else "Auto" (absent matrix == legacy mode-only).
+ * Extracted pure so the precedence is unit-testable without the server's `manager` state.
+ */
+export function resolveCapabilityGate(
+  paneGate: GateValue | undefined,
+  globalGate: GateValue | undefined
+): GateValue {
+  return paneGate ?? globalGate ?? "Auto";
+}
+
+/**
  * The single, pure gate decision. Both `kind`s pass through the SAME effective-mode gate;
  * `kind` does NOT bypass permissions. The allowlist check is IN ADDITION to the mode gate.
  */

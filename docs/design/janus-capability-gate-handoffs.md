@@ -110,6 +110,20 @@ prompt verbatim in the target pane's PTY.
   (PONG) nor drive the full server `deliver_handoff` → `flipHandoffOnResolve` handler
   (it exercises `decideProposal` + delivery inline). Hardening is a follow-up.
 
+## Director decisions (2026-06-01)
+
+1. **`deliver_handoff` default = GLOBAL AUTO + per-pane gating** (not always-Ask). Added
+   dimension to design: the gate dial is also about **context management of panes/projects**,
+   not only autonomy/trust — gating may key off context-scope, not just a trust flag. *(To be
+   designed when we implement the default flip.)*
+2. **Meta-gate = self-gate voice changes.** `set_capability_gate` by VOICE requires director
+   approval; the UI stays direct. Closes G5.
+3. **Secrets must never be in prompts at all.** Secrets exist only for Gemini auth (live +
+   synthesis APIs). `composed_prompt` must never store/index/surface secrets — stronger than
+   "don't FTS-index": guard on compose + never index + audit.
+4. **Next = clean branch + harden smoke tests** (done: G2/G4 closed on `feat/handoff-hardening`;
+   G3 server-path coverage still open). Two-store seam / WS-F deferral accepted.
+
 ## Open questions for the director
 
 1. `deliver_handoff` default gate is `Ask` (mirrors `write_to_pane`). Should trusted panes
