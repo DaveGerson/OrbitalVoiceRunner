@@ -1,4 +1,4 @@
-import { Ledger, PaneMeta } from "./ledger";
+import { Ledger, PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import { SystemSettings, CliPreset, AttentionItem } from "./types";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
@@ -613,7 +613,7 @@ export class UniversalTerminal {
 export class OrchestratorManager {
   public terminals: Record<string, UniversalTerminal> = {};
   public activeId: string | null = null;
-  public ledger: Ledger;
+  public ledger: LedgerLike;
   public attentionQueue: AttentionItem[] = [];
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
@@ -733,10 +733,13 @@ export class OrchestratorManager {
     this.saveSettings();
   }
 
-  constructor() {
+  constructor(opts?: { ledger?: LedgerLike }) {
     this.loadSettings();
-    this.ledger = new Ledger();
-    
+    // WS-M cutover seam: a LedgerLike backend may be injected (e.g. JanusStore for
+    // durable SQLite state). Default stays the legacy JSON Ledger so existing
+    // behavior is unchanged unless the caller opts in.
+    this.ledger = opts?.ledger ?? new Ledger();
+
     // Set activeProjectId from ledger or settings
     const activeCtx = this.ledger.activeProjectId || this.settings.projects?.activeContext || "default_project";
     const workspacePath = this.settings.projects?.localWorkspacePath || process.cwd();

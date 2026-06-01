@@ -13,6 +13,48 @@ export interface ArchivedPane {
   archived_at: string; // ISO timestamp
 }
 
+/**
+ * The ledger surface OrchestratorManager + server.ts depend on. Both the legacy
+ * JSON `Ledger` and the durable `JanusStore` satisfy it, so the running app can
+ * swap backends without touching call sites (WS-M cutover seam, design §5.3).
+ *
+ * Note methods are truthy-on-success: the legacy Ledger returns `boolean`, the
+ * store returns `StoredNote | null`. Both are accepted (callers use `if (ok)`),
+ * so the union return keeps either implementation assignable.
+ */
+export interface LedgerLike {
+  activeProjectId: string | null;
+  workspaces: Record<string, Workspace>;
+  addProject(id: string, directory: string, summary?: string, keyTerms?: string[]): unknown;
+  renameProject(id: string, name: string): unknown;
+  renamePane(projectId: string, paneId: string, name: string): unknown;
+  switchContext(id: string): unknown;
+  getProject(id: string): Workspace | null;
+  getActiveProject(): Workspace | null;
+  getProjectBriefing(id: string): {
+    project_id: string; summary: string; directory: string;
+    panes: PaneMeta[]; notes: string[]; key_codebase_terms: string[];
+  } | null;
+  updatePane(projectId: string, paneMeta: PaneMeta, shouldSave?: boolean): void;
+  save(immediate?: boolean): void;
+  // Truthy-on-success: legacy Ledger returns boolean, JanusStore returns StoredNote|null.
+  addNote(projectId: string, text: string): unknown;
+  addPaneNote(projectId: string, paneId: string, text: string): unknown;
+  getDraft(projectId: string, paneId: string): PaneDraft | null;
+  setDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean;
+  appendDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean;
+  listDrafts(projectId: string): { paneId: string; draft: PaneDraft }[];
+  addModelContext(projectId: string, paneId: string, text: string, source?: string): boolean;
+  addHumanContext(projectId: string, paneId: string, text: string): boolean;
+  getPaneContext(projectId: string, paneId: string): { model: ContextEntry[]; human: ContextEntry[]; legacy: string[] } | null;
+  plans: Plan[];
+  watchRules: WatchRule[];
+  archiveExitedPanes(projectId?: string): number;
+  listArchived(workspaceId?: string): ArchivedPane[];
+  restoreArchivedPane(paneId: string): ArchivedPane | null;
+  deleteArchivedPane(paneId: string): boolean;
+}
+
 export class Ledger {
   activeProjectId: string | null = null;
   workspaces: Record<string, Workspace> = {};

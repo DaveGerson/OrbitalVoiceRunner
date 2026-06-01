@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -179,6 +179,18 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       CREATE INDEX idx_handoffs_to_pane       ON handoffs(to_pane);
       ALTER TABLE events ADD COLUMN handoff_id TEXT;
       CREATE INDEX idx_events_handoff ON events(handoff_id);
+    `);
+  },
+  // v3: prompt-composer refactor parity (per-pane Workbench draft + layered context).
+  // `draft` is a JSON-encoded PaneDraft ({text,updatedAt,updatedBy?}) or NULL.
+  // model_context / human_context are JSON arrays of ContextEntry ({text,at,source?}),
+  // defaulting to '[]'. All three are additive and nullable/defaulted, so existing
+  // explicit-column pane INSERT/UPSERTs are unaffected.
+  (db) => {
+    db.exec(`
+      ALTER TABLE panes ADD COLUMN draft TEXT;
+      ALTER TABLE panes ADD COLUMN model_context TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE panes ADD COLUMN human_context TEXT NOT NULL DEFAULT '[]';
     `);
   },
 ];
