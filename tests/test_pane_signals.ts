@@ -22,6 +22,16 @@ describe("classifyPaneOutput", () => {
   it("returns null for benign output", () => {
     assert.strictEqual(classifyPaneOutput("building module 2 of 5\n"), null);
   });
+
+  it("errors win over a trailing prompt", () => {
+    const c = classifyPaneOutput("Error: not found\nuser@host:~/proj$ ");
+    assert.strictEqual(c?.kind, "error");
+  });
+
+  it("does not false-positive on kebab/dotted/path error filenames (HMR noise)", () => {
+    assert.strictEqual(classifyPaneOutput("error-handling.ts compiled in 14ms\n"), null);
+    assert.strictEqual(classifyPaneOutput("[vite] hmr update /src/error.ts\n"), null);
+  });
 });
 
 describe("formatPaneSignal", () => {
