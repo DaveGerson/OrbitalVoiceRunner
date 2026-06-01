@@ -930,4 +930,19 @@ export class OrchestratorManager {
     const safeOut = redactSecrets(recentOut || "[No new output]");
     return `\`\`\`\n${safeOut}\n\`\`\``;
   }
+
+  /** Push-observation pull side: only-new lines since the model last read this pane,
+   *  ANSI already stripped (model lane) and secret-redacted. */
+  getPaneDelta(paneId: string): string {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return `Error: Pane ${paneId} does not exist.`;
+    }
+    const { lines, dropped } = term.consumeDelta();
+    if (!lines) {
+      return "[No new output since last read]";
+    }
+    const note = dropped > 0 ? `[... ${dropped} earlier line(s) evicted from buffer ...]\n` : "";
+    return "```\n" + note + redactSecrets(lines) + "\n```";
+  }
 }
