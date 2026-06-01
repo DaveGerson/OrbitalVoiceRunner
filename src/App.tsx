@@ -15,6 +15,7 @@ import { upsertNotification, dismissNotification, ProactiveNotification } from "
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
+import { useE2EHarness } from "./e2e/harness";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -364,7 +365,7 @@ function AppRaw() {
   const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
     // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
     // where Playwright intercepts the POST to assert the grid-sync round-trip.
-    if (isMockModeRef.current && !e2eRef.current) return;
+    if (isMockModeRef.current && !e2eActiveRef.current) return;
     if (!cols || !rows) return;
     const key = `${cols}x${rows}`;
     if (lastGridRef.current[terminalId] === key) return;
@@ -393,52 +394,18 @@ function AppRaw() {
   const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
-  // True only under the ?mock=1 e2e harness. Lets the resize POST still fire in
-  // mock mode (Playwright intercepts it) while keeping mock mode for real users
-  // a no-op.
-  const e2eRef = useRef(false);
-
-  // E2E harness: when loaded with ?mock=1, run fully client-side with deterministic
-  // mock data and expose injection hooks for Playwright. Gated entirely on the URL
-  // param — completely inert for real users (no effect without ?mock=1).
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (new URLSearchParams(window.location.search).get("mock") !== "1") return;
-    e2eRef.current = true;
-    isMockModeRef.current = true;
-    setIsMockMode(true);
-    // Open the transcript panel so injected transcript lines are mounted/visible.
-    setShowTranscriptPanel(true);
-
-    const MOCK_ID = "mock_pane_1";
-    // Backfill carries an ANSI color sequence so the terminal spec can prove xterm
-    // renders RAW bytes (not ANSI-stripped). MOCKTERM_READY is the asserted token.
-    setTerminals([{
-      id: MOCK_ID,
-      cwd: ".",
-      command: "bash",
-      backfill: "[32mMOCKTERM_READY[0m web-app@1.0.0 dev server\r\n$ ",
-      output: "MOCKTERM_READY web-app@1.0.0 dev server\n$ ",
-      status: "Running",
-    }]);
-    setActiveTerminalId(MOCK_ID);
-
-    (window as any).__ORBITAL_E2E__ = {
-      injectStdoutChunk: (terminalId: string, chunk: string) => queueStdoutChunk(terminalId, chunk),
-      injectTranscript: (sender: "User" | "Janus", text: string) =>
-        setTranscript((prev) => [...prev, { sender, text, timestamp: new Date() }]),
-      injectPendingApproval: (cmd: string, terminalId: string = MOCK_ID) =>
-        setPendingCommands((prev) => [...prev, {
-          messageId: `mock_${prev.length + 1}`,
-          cmd,
-          terminalId,
-          rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
-        }]),
-    };
-    // Signal readiness so the Playwright fixture can wait deterministically.
-    document.documentElement.setAttribute("data-e2e-ready", "1");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
+  // e2eActiveRef lets the mock-mode-gated resize POST still fire under e2e.
+  const { e2eActiveRef } = useE2EHarness({
+    isMockModeRef,
+    setIsMockMode,
+    setShowTranscriptPanel,
+    setTerminals,
+    setActiveTerminalId,
+    queueStdoutChunk,
+    setTranscript,
+    setPendingCommands,
+  });
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
