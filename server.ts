@@ -38,7 +38,7 @@ import type { GateValue, CapabilityGate } from "./src/types";
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot
 const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
