@@ -6,6 +6,28 @@ import { EVENT_TYPES } from "./eventTypes";
 export interface MigrationInput { ledger?: any; settings?: any; history?: any; }
 export interface MigrationPaths { ledgerPath: string; settingsPath: string; historyPath: string; }
 
+/** kv marker recording that the one-shot JSON→SQLite ledger import has run.
+ *  Gating on this (not on .janus.db existence) keeps the migration idempotent —
+ *  the handoff store already creates .janus.db before the ledger is imported. */
+export const LEDGER_MIGRATED_KEY = "ledgerMigratedAt";
+
+/**
+ * Boot-time, gated, idempotent migration. Imports the legacy JSON ledger into
+ * `store` and renames the originals to `.bak` — but only once, and only if a
+ * legacy ledger file actually exists. Returns true iff it performed the import.
+ *
+ * The gate is the in-DB `LEDGER_MIGRATED_KEY` marker, so re-running the server
+ * (or a stray reappearance of the .json) never re-imports stale data over the
+ * now-authoritative SQLite store.
+ */
+export function migrateOnBootIfNeeded(store: JanusStore, paths: MigrationPaths): boolean {
+  if (store.getKV(LEDGER_MIGRATED_KEY)) return false;   // already migrated
+  if (!fs.existsSync(paths.ledgerPath)) return false;   // nothing to migrate
+  migrateFromJson(store, paths);                        // import + .bak the originals
+  store.setKV(LEDGER_MIGRATED_KEY, new Date().toISOString());
+  return true;
+}
+
 /** Pure, testable importer over already-parsed objects. Runs in one transaction. */
 export function migrateFromObjects(store: JanusStore, input: MigrationInput): void {
   const tx = store.db.transaction(() => {

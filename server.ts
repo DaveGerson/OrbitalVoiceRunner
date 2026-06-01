@@ -31,6 +31,7 @@ import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, resolveReasonToHandoffState } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
+import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate } from "./src/types";
 
 dotenv.config();
@@ -181,21 +182,37 @@ try {
     scrollbackDirs: [process.cwd()],
   });
   console.log("[STORE] JanusStore initialized (handoffs + capability-gate audit).");
+
+  // One-shot, gated, reversible JSON→SQLite ledger migration. Runs at most once
+  // (guarded by an in-DB marker), only if a legacy .janus_ledger.json exists, and
+  // renames the originals to .bak so the operator can verify/rollback. Idempotent
+  // across restarts even though .janus.db already exists for the handoff store.
+  try {
+    const migrated = migrateOnBootIfNeeded(store, {
+      ledgerPath: process.env.JANUS_LEDGER_PATH || ".janus_ledger.json",
+      settingsPath: ".janus_settings.json",
+      historyPath: ".janus_history.json",
+    });
+    if (migrated) console.log("[STORE] Migrated legacy JSON ledger → SQLite (originals renamed to .bak).");
+  } catch (e) {
+    console.error("[STORE] Ledger migration skipped (import failed; legacy JSON left intact):", e);
+  }
 } catch (e) {
   console.error("[STORE] Failed to initialize JanusStore — handoff persistence disabled:", e);
   store = null;
 }
 
-// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it can BE the
+// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the
 // manager's ledger — making drafts/context/approvals/etc. durable across restart.
-// GATED OFF by default: only when JANUS_LEDGER_BACKEND=sqlite (and the store booted)
-// does the manager run on SQLite; otherwise it keeps the legacy in-memory/JSON Ledger.
-// No JSON→SQLite data migration runs here yet — that is a separate, signed-off step.
-const useSqliteLedger = process.env.JANUS_LEDGER_BACKEND === "sqlite" && store !== null;
+// DEFAULT: SQLite (when the store booted). Escape hatch: JANUS_LEDGER_BACKEND=legacy
+// forces the in-memory/JSON Ledger. If the store failed to boot, we fall back to
+// legacy automatically so the app still runs.
+const forceLegacy = process.env.JANUS_LEDGER_BACKEND === "legacy";
+const useSqliteLedger = store !== null && !forceLegacy;
 const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
-if (useSqliteLedger) {
-  console.log("[STORE] OrchestratorManager is running on the SQLite ledger backend (JANUS_LEDGER_BACKEND=sqlite).");
-}
+console.log(useSqliteLedger
+  ? "[STORE] OrchestratorManager ledger backend: SQLite (durable). Set JANUS_LEDGER_BACKEND=legacy to opt out."
+  : `[STORE] OrchestratorManager ledger backend: legacy JSON Ledger${forceLegacy ? " (JANUS_LEDGER_BACKEND=legacy)" : " (store unavailable)"}.`);
 
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
 // its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
