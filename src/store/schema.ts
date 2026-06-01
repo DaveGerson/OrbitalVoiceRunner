@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -147,6 +147,38 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
         INSERT INTO notes_fts(notes_fts, rowid, text) VALUES('delete', old.rowid, old.text);
         INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
       END;
+    `);
+  },
+  // v2: first-class Handoff artifact (design §5.1). Dedicated mutable-state table +
+  // indexed observability queries; events stays the append-only audit spine.
+  (db) => {
+    db.exec(`
+      CREATE TABLE handoffs (
+        id            TEXT PRIMARY KEY NOT NULL,
+        workspace_id  TEXT NOT NULL,
+        from_pane     TEXT,
+        to_pane       TEXT NOT NULL,
+        kind          TEXT NOT NULL DEFAULT 'agent_instruction',
+        composed_prompt TEXT NOT NULL DEFAULT '',
+        source_context  TEXT NOT NULL DEFAULT '{}',
+        source_context_refs TEXT NOT NULL DEFAULT '[]',
+        state         TEXT NOT NULL DEFAULT 'composing',
+        gate_approval_id TEXT,
+        approved_by   TEXT,
+        approved_via  TEXT,
+        revision_count INTEGER NOT NULL DEFAULT 0,
+        created_at    INTEGER NOT NULL,
+        staged_at     INTEGER,
+        delivered_at  INTEGER,
+        consumed_at   INTEGER,
+        terminal_at   INTEGER,
+        expires_at    INTEGER
+      );
+      CREATE INDEX idx_handoffs_ws_state      ON handoffs(workspace_id, state);
+      CREATE INDEX idx_handoffs_state_expires ON handoffs(state, expires_at);
+      CREATE INDEX idx_handoffs_to_pane       ON handoffs(to_pane);
+      ALTER TABLE events ADD COLUMN handoff_id TEXT;
+      CREATE INDEX idx_events_handoff ON events(handoff_id);
     `);
   },
 ];

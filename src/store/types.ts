@@ -30,3 +30,30 @@ export interface StoredAttention {
   id: string; type: string; terminal_id: string; project_id: string;
   message: string; timestamp: number; dismissed: boolean; details: any;
 }
+
+export type HandoffState =
+  | "composing" | "revising" | "staged" | "delivered" | "consumed"
+  | "rejected" | "expired" | "blocked_read_only";
+
+/** Row shape for the handoffs table (schema v2, design §5.1). */
+export interface StoredHandoff {
+  id: string;
+  workspace_id: string;
+  from_pane: string | null;
+  to_pane: string;
+  kind: ApprovalKind;
+  composed_prompt: string;
+  source_context: string;          // JSON string (redactSecrets-applied), stored verbatim
+  source_context_refs: string;     // JSON string
+  state: HandoffState;
+  gate_approval_id: string | null;
+  approved_by: string | null;
+  approved_via: string | null;
+  revision_count: number;
+  created_at: number;
+  staged_at: number | null;
+  delivered_at: number | null;
+  consumed_at: number | null;
+  terminal_at: number | null;
+  expires_at: number | null;
+}

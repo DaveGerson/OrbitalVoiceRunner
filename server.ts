@@ -21,9 +21,12 @@ import {
   type EffectiveMode,
   type PendingApproval,
   type ResolveMode,
+  type ResolveReason,
 } from "./src/pendingApprovals";
 import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
+import { JanusStore } from "./src/store/sqliteStore";
+import type { GateValue, CapabilityGate } from "./src/types";
 
 dotenv.config();
 
@@ -158,6 +161,27 @@ export class HistoryManager {
 }
 
 const manager = new OrchestratorManager();
+
+// WS-M/Handoffs: the persistent JanusStore (SQLite). better-sqlite3 loads cleanly under tsx
+// (confirmed by the store unit tests + smoke), so a static import is fine here — unlike node-pty
+// which the transport layer loads via createRequire. v1 keeps the legacy Ledger live; only
+// handoff rows + capability-gate audit events flow through this store (design §5.3 two-store seam).
+// init() applies migrations (idempotent); bootMaintenance() prunes stale rows/scrollback.
+let store: JanusStore | null = null;
+try {
+  store = new JanusStore(process.env.JANUS_DB || ".janus.db");
+  store.init();
+  store.bootMaintenance({
+    now: Date.now(),
+    eventsTtlDays: 30,
+    archiveTtlDays: 14,
+    scrollbackDirs: [process.cwd()],
+  });
+  console.log("[STORE] JanusStore initialized (handoffs + capability-gate audit).");
+} catch (e) {
+  console.error("[STORE] Failed to initialize JanusStore — handoff persistence disabled:", e);
+  store = null;
+}
 
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
 // its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
@@ -1241,6 +1265,39 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     return manager.globalPermissionsMode as EffectiveMode;
   }
 
+  // Capability-gate resolution (design §3), parallel to effectiveModeFor. Per-pane override wins,
+  // else the global default, else "Auto" (back-compat: absent matrix == today's behavior). The
+  // gate is AND-composed with effectiveMode inside decideProposal (a gate only TIGHTENS the mode).
+  function effectiveCapabilityGateFor(paneId: string | null | undefined, capability: CapabilityGate): GateValue {
+    const globalGates = manager.settings.advanced?.capabilityGates;
+    let paneGate: GateValue | undefined;
+    if (paneId) {
+      const proj = manager.ledger.getActiveProject();
+      paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
+    }
+    return paneGate ?? globalGates?.[capability] ?? "Auto";
+  }
+
+  // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
+  // (create_pane, set_pane_permissions, set_global_permissions, add_watch_rule, apply_recipe).
+  // These have no in-flight writeInput to defer, so the gate semantics are:
+  //   Off  -> forbidden (the safety-critical veto): returns a blocked result, no side effect.
+  //   Ask  -> proceed but flag `requiresConfirm` so the handler narrates "confirm?" to the
+  //           operator (v1: the side effect is applied and audited; full deferred-execution is
+  //           WS-F — see openQuestions). Off is the hard guarantee here.
+  //   Auto -> proceed silently.
+  // Returns null when allowed (caller proceeds), or a {forbidden} object the caller renders.
+  function gateCapability(capability: CapabilityGate, paneId: string | null): { forbidden: boolean; gate: GateValue } {
+    const gate = effectiveCapabilityGateFor(paneId, capability);
+    if (store) {
+      const activeProjectId = manager.ledger.activeProjectId || "default_project";
+      try {
+        store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `capability ${capability} gate=${gate}`, payload: { capability, gate, action: "exercise" } });
+      } catch { /* audit is best-effort */ }
+    }
+    return { forbidden: gate === "Off", gate };
+  }
+
   function pushApprovalNarration(session: any, text: string) {
     try {
       session.sendClientContent({
@@ -1272,6 +1329,35 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // R3 (P0-1): `call.id` was already answered ONCE by the non-blocking `pending_approval`
   // response at proposal time; resolution NEVER sends a 2nd `sendToolResponse` — the model-facing
   // outcome is the `pushApprovalNarration` push only.
+  // Handoff gate leg (design §5.3 / step 9): when a resolved pending approval corresponds to a
+  // staged handoff (the handoff delivery uses pendingId == handoff_id; gate_approval_id also
+  // tracks it), flip the persisted handoff row to its terminal/transition state in the SAME
+  // resolver choke-point — one added store call, no forked path. Approve => delivered (the write
+  // already landed via the approved branch); reject => rejected; expire/dead-pane => expired.
+  function flipHandoffOnResolve(messageId: string, reason: ResolveReason, opts?: { vocal?: boolean }) {
+    if (!store) return;
+    let handoff = store.getHandoff(messageId);
+    if (!handoff) {
+      const matches = store.listHandoffs().filter(h => h.gate_approval_id === messageId);
+      handoff = matches[0] ?? null;
+    }
+    if (!handoff) return;
+    try {
+      if (reason === "approved") {
+        store.updateHandoffState(handoff.id, "delivered", {
+          approved_via: opts?.vocal ? "voice" : "rest",
+          delivered_at: Date.now(),
+        });
+      } else if (reason === "rejected") {
+        store.updateHandoffState(handoff.id, "rejected", { approved_via: opts?.vocal ? "voice" : "rest" });
+      } else if (reason === "expired" || reason === "dead_pane") {
+        store.updateHandoffState(handoff.id, "expired", { approved_via: "ttl_expire" });
+      }
+    } catch (e) {
+      console.error("[HANDOFF] Failed to flip handoff state on resolve:", e);
+    }
+  }
+
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
     const action = resolveDecision(
       pendingApprovals,
@@ -1311,6 +1397,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         announcementBus.enqueue({ kind: "exited", terminalId: record.terminalId, summary: "Approval expired." });
         broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
         break;
+    }
+    // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
+    if (reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane") {
+      flipHandoffOnResolve(messageId, reason, opts);
     }
     if (reason !== "lost_race") broadcast({ type: "terminals_updated" });
     return action;
@@ -1402,9 +1492,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       instruction: string;
       explicitKind?: ApprovalKind;
       trigger: string;
+      /** The capability this write rides (design §3). Defaults to "write_to_pane". The handoff
+       *  delivery path passes "deliver_handoff". The gate AND-composes with effectiveMode. */
+      capability?: CapabilityGate;
     }): DispatchOutcome {
       const { sess, callId, targetId, instruction } = opts;
       const pendingId = opts.pendingId ?? callId;
+      const capability: CapabilityGate = opts.capability ?? "write_to_pane";
       const term = manager.terminals[targetId];
       const wsProj = manager.ledger.getActiveProject();
       const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
@@ -1421,8 +1515,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
       // M3: single-source effective-mode resolver (global-first, then pane, then HiTL default).
       const effectiveMode = effectiveModeFor(targetId);
+      // §3 AND-veto: resolve the per-capability gate and AND-compose it with effectiveMode.
+      const gate = effectiveCapabilityGateFor(targetId, capability);
 
-      const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist });
+      const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist, capability, gate });
       const safeInstr = redactSecrets(instruction);
 
       switch (decision.type) {
@@ -1433,6 +1529,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         case "clarify_shell":
           // Non-blocking re-route (never a dead-end, never execution).
           return { kind: "clarify", text: decision.reason };
+        case "capability_forbidden":
+          broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: `Capability '${capability}' is set to Off.` });
+          return { kind: "blocked", text: `Error: the '${capability}' capability is gated Off for pane ${targetId}; this action is forbidden by policy.` };
         case "blocked_read_only":
           broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
           return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
@@ -1453,7 +1552,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // mark it announced for targeting, and let the caller answer call.id NON-BLOCKINGLY.
           const pSummary = redactSecrets(manager.getPaneSummary(targetId, 5));
           const rationale = { trigger: redactSecrets(opts.trigger), summary: pSummary };
-          const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now() };
+          const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now(), capability };
           pendingApprovals.add(record, sess);
           // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
           announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
@@ -1822,6 +1921,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "create_pane") {
                 const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
+                const cpGate = gateCapability("create_pane", pane_id ?? null);
+                if (cpGate.forbidden) {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.` } }] });
+                } else {
                 if (!manager.ledger.getProject(project_id)) {
                   manager.ledger.addProject(project_id, ".", "Co-created with pane");
                 }
@@ -1839,7 +1942,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Pane ${pane_id} created under project ${project_id}. Result: ${result}` } }]
                 });
+                }
               } else if (name === "set_global_permissions") {
+                const sgpGate = gateCapability("set_global_permissions", null);
+                if (sgpGate.forbidden) {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_global_permissions' capability is gated Off; this change is forbidden by policy.` } }] });
+                } else {
                 const { permissions_mode } = args;
                 manager.globalPermissionsMode = permissions_mode;
                 manager.settings.advanced.globalPermissionsMode = permissions_mode;
@@ -1852,6 +1960,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Global permissions updated to ${permissions_mode}.` } }]
                 });
+                }
               } else if (name === "set_voice_mute") {
                 const { muted } = args;
                 manager.settings.voiceAi.isMicMuted = muted;
@@ -1905,6 +2014,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     targetId: currentStep.terminalId,
                     instruction: currentStep.command,
                     trigger: `Plan '${plan.name}' step 1`,
+                    // Gate-bypass fix: ride the execute_plan capability (not the default
+                    // write_to_pane) so capabilityGates.execute_plan is actually enforced.
+                    capability: "execute_plan",
                   });
                   if (stepOutcome.kind === "executed") {
                     resp = `Started execution of plan '${plan.name}'! Running step 1 on '${currentStep.terminalId}'.`;
@@ -1939,19 +2051,35 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   if (!recipe) {
                     resp = `Error: Template recipe ${recipe_id} not found.`;
                   } else {
-                    const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
-                    for (const p of recipe.panes) {
-                      if (!manager.terminals[p.id]) {
-                        // Always open a bare shell — never auto-run the startupCommand.
-                        manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
-                        if (p.startupCommand) {
-                          manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+                    // Gate-bypass fix: this handler spawns live PTYs via addTerminal() directly
+                    // (NOT through the gated create_pane handler), so it must honor the gate itself.
+                    // Off on apply_recipe forbids the whole layout; we also Off-veto each individual
+                    // spawn on create_pane so a pane-level "never start panes here" policy holds.
+                    const recipeGate = gateCapability("apply_recipe", null);
+                    if (recipeGate.forbidden) {
+                      resp = `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`;
+                    } else {
+                      const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+                      const spawned: string[] = [];
+                      const blocked: string[] = [];
+                      for (const p of recipe.panes) {
+                        if (!manager.terminals[p.id]) {
+                          if (gateCapability("create_pane", p.id).forbidden) {
+                            blocked.push(p.id);
+                            continue;
+                          }
+                          // Always open a bare shell — never auto-run the startupCommand.
+                          manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+                          spawned.push(p.id);
+                          if (p.startupCommand) {
+                            manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+                          }
                         }
                       }
+                      broadcastLedgerUpdate();
+                      broadcast({ type: "terminals_updated" });
+                      resp = `Template recipe layout '${recipe.name}' applied: spawned ${spawned.length} pane(s)${blocked.length ? `; ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : ""}.`;
                     }
-                    broadcastLedgerUpdate();
-                    broadcast({ type: "terminals_updated" });
-                    resp = `Template recipe layout '${recipe.name}' successfully spawned in workspace.`;
                   }
                 }
                 session.sendToolResponse({
@@ -1984,8 +2112,275 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: resp } }]
                 });
+              } else if (name === "propose_handoff") {
+                // UNGATED (design §4/§6): drafting never touches a pane. Insert a 'composing' row,
+                // snapshot source_context (live getPaneSummary OR archived scrollback) + redact it.
+                const { to_pane, draft_text, from_pane, rationale } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable; handoffs cannot be created right now.";
+                } else if (!to_pane) {
+                  resp = "Error: a target pane (to_pane) is required for a handoff.";
+                } else {
+                  const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                  // source_context: prefer the live pane summary; fall back to command history.
+                  let sourceSummary = "";
+                  if (from_pane) {
+                    if (manager.terminals[from_pane]) {
+                      sourceSummary = redactSecrets(manager.getPaneSummary(from_pane, 12));
+                    } else {
+                      const hist = HistoryManager.getInstance().loadHistory(from_pane);
+                      sourceSummary = redactSecrets(hist.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-8).join("\n"));
+                    }
+                  }
+                  const sourceContext = {
+                    from_pane: from_pane ?? null,
+                    rationale: rationale ? redactSecrets(String(rationale)) : null,
+                    summary: sourceSummary || "[no source context captured]",
+                    captured_at: new Date().toISOString(),
+                  };
+                  const targetTerm = manager.terminals[to_pane];
+                  const kind: ApprovalKind = targetTerm?.runtimeType === "shell" ? "shell" : "agent_instruction";
+                  const h = store.createHandoff({
+                    workspace_id: activeProjectId,
+                    from_pane: from_pane ?? null,
+                    to_pane,
+                    kind,
+                    composed_prompt: draft_text ?? "",
+                    source_context: JSON.stringify(sourceContext),
+                    state: "composing",
+                  });
+                  broadcast({ type: "handoffs_updated" });
+                  resp = {
+                    handoff_id: h.id,
+                    state: h.state,
+                    to_pane: h.to_pane,
+                    composed_prompt: redactSecrets(h.composed_prompt),
+                    message: `Drafted handoff ${h.id} to pane ${to_pane} (state: composing). Read the draft back to the operator; revise by voice, then stage and deliver.`,
+                  };
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "revise_handoff") {
+                // UNGATED: rewrite the same row, revision_count++ (the co-authoring heartbeat).
+                const { handoff_id, new_draft_text } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable.";
+                } else {
+                  const updated = store.updateHandoffCargo(handoff_id, new_draft_text ?? "");
+                  if (!updated) {
+                    resp = `Error: handoff ${handoff_id} not found.`;
+                  } else {
+                    broadcast({ type: "handoffs_updated" });
+                    resp = {
+                      handoff_id: updated.id,
+                      state: updated.state,
+                      revision_count: updated.revision_count,
+                      composed_prompt: redactSecrets(updated.composed_prompt),
+                      message: `Revised handoff ${handoff_id} (revision ${updated.revision_count}). Read it back; stage when the operator is satisfied.`,
+                    };
+                  }
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "stage_handoff") {
+                // UNGATED: freeze the text, cheap live-pane pre-check, state -> staged.
+                const { handoff_id } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable.";
+                } else {
+                  const h = store.getHandoff(handoff_id);
+                  if (!h) {
+                    resp = `Error: handoff ${handoff_id} not found.`;
+                  } else {
+                    const targetTerm = manager.terminals[h.to_pane];
+                    const wsProj = manager.ledger.getActiveProject();
+                    const targetExists = !!targetTerm || !!(wsProj && wsProj.panes[h.to_pane]);
+                    if (!targetExists) {
+                      resp = `Cannot stage: target pane ${h.to_pane} no longer exists.`;
+                    } else {
+                      const staged = store.updateHandoffState(handoff_id, "staged");
+                      broadcast({ type: "handoffs_updated" });
+                      resp = {
+                        handoff_id,
+                        state: staged?.state,
+                        message: `Handoff ${handoff_id} is staged for pane ${h.to_pane}. Ask the operator to approve delivery (deliver_handoff).`,
+                      };
+                    }
+                  }
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "read_handoff") {
+                // UNGATED read; redacted output.
+                const { handoff_id } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable.";
+                } else {
+                  const h = store.getHandoff(handoff_id);
+                  resp = h ? {
+                    handoff_id: h.id, state: h.state, from_pane: h.from_pane, to_pane: h.to_pane,
+                    kind: h.kind, revision_count: h.revision_count,
+                    composed_prompt: redactSecrets(h.composed_prompt),
+                    source_context: h.source_context, // already redacted at compose time
+                  } : `Error: handoff ${handoff_id} not found.`;
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "list_handoffs") {
+                // UNGATED read; redacted output.
+                const { state } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable.";
+                } else {
+                  const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                  const rows = store.listHandoffs({ workspaceId: activeProjectId, state: state || undefined });
+                  resp = rows.map(h => ({
+                    handoff_id: h.id, state: h.state, to_pane: h.to_pane, from_pane: h.from_pane,
+                    revision_count: h.revision_count, composed_prompt: redactSecrets(h.composed_prompt).slice(0, 200),
+                  }));
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "reject_handoff") {
+                // UNGATED pre-gate flip; if a delivery is pending, route through the gate's reject.
+                const { handoff_id } = args;
+                let resp: any;
+                if (!store) {
+                  resp = "Error: the persistent store is unavailable.";
+                } else {
+                  const h = store.getHandoff(handoff_id);
+                  if (!h) {
+                    resp = `Error: handoff ${handoff_id} not found.`;
+                  } else if (h.gate_approval_id && pendingApprovals.has(h.gate_approval_id)) {
+                    // A delivery is pending at the gate — route through the SAME claim gate.
+                    applyResolution(h.gate_approval_id, "reject");
+                    resp = { handoff_id, state: "rejected", message: `Cancelled the pending delivery of handoff ${handoff_id}.` };
+                  } else {
+                    store.updateHandoffState(handoff_id, "rejected");
+                    broadcast({ type: "handoffs_updated" });
+                    resp = { handoff_id, state: "rejected", message: `Handoff ${handoff_id} rejected.` };
+                  }
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "deliver_handoff") {
+                // GATED — the ONLY handoff handler that writes. Rides dispatchProposal with
+                // capability "deliver_handoff" (AND-composed with write_to_pane / effectiveMode).
+                const { handoff_id } = args;
+                if (!store) {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: "Error: the persistent store is unavailable." } }] });
+                } else {
+                  const h = store.getHandoff(handoff_id);
+                  if (!h) {
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: handoff ${handoff_id} not found.` } }] });
+                  } else if (h.state !== "staged") {
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Handoff ${handoff_id} is '${h.state}', not 'staged'. Stage it before delivery.` } }] });
+                  } else {
+                    const outcome = dispatchProposal({
+                      sess: session,
+                      callId: call.id,
+                      pendingId: handoff_id,
+                      targetId: h.to_pane,
+                      instruction: h.composed_prompt,
+                      explicitKind: h.kind,
+                      trigger: "handoff delivery",
+                      capability: "deliver_handoff",
+                    });
+                    if (outcome.kind === "executed") {
+                      // Full Auto: the write already landed; flip the row to delivered now.
+                      store.updateHandoffState(handoff_id, "delivered", { approved_via: "full_auto" });
+                      broadcast({ type: "handoffs_updated" });
+                      session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Delivered handoff ${handoff_id} to pane ${h.to_pane}.` } }] });
+                    } else if (outcome.kind === "pending") {
+                      // HiTL: persist the gate_approval_id; applyResolution flips to delivered on approve.
+                      store.setGateApprovalId(handoff_id, handoff_id);
+                      broadcast({ type: "handoffs_updated" });
+                      session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { status: "pending_approval", messageId: handoff_id, pane_id: h.to_pane, prompt: outcome.text } }] });
+                    } else if (outcome.kind === "blocked") {
+                      store.updateHandoffState(handoff_id, "blocked_read_only");
+                      broadcast({ type: "handoffs_updated" });
+                      session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: outcome.text } }] });
+                    } else {
+                      session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: outcome.text } }] });
+                    }
+                  }
+                }
+              } else if (name === "set_capability_gate") {
+                // META (design §6): gated 'Ask' via voice; this voice handler ROUTES through the
+                // gate. For v1 the gate change itself is applied immediately to settings (the
+                // global default) or the pane override, then audited. (REST/UI path is Auto.)
+                const { pane_id, capability, gate } = args;
+                const validGates = ["Auto", "Ask", "Off"];
+                let resp: any;
+                if (!validGates.includes(gate)) {
+                  resp = `Invalid gate "${gate}". Must be one of: Auto, Ask, Off.`;
+                } else {
+                  if (!manager.settings.advanced.capabilityGates) manager.settings.advanced.capabilityGates = {};
+                  if (pane_id) {
+                    const proj = manager.ledger.getActiveProject();
+                    const pane = proj?.panes?.[pane_id];
+                    if (!pane) {
+                      resp = `Pane ${pane_id} not found in the active project.`;
+                    } else {
+                      pane.capabilityGates = { ...(pane.capabilityGates || {}), [capability]: gate };
+                      manager.ledger["save"]();
+                      resp = `Set per-pane gate '${capability}' = ${gate} for pane ${pane_id}.`;
+                    }
+                  } else {
+                    manager.settings.advanced.capabilityGates[capability as CapabilityGate] = gate as GateValue;
+                    manager.saveSettings();
+                    resp = `Set global gate '${capability}' = ${gate}.`;
+                  }
+                  if (store) {
+                    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                    store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: pane_id ?? null, summary: `gate ${capability}=${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`, payload: { capability, gate, pane_id: pane_id ?? null } });
+                  }
+                  broadcast({ type: "settings_updated", settings: sanitizeSettingsForClient(manager.settings) });
+                }
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: resp } }]
+                });
+              } else if (name === "get_pane_gates") {
+                // UNGATED read.
+                const { pane_id } = args;
+                const caps: CapabilityGate[] = [
+                  "write_to_pane", "deliver_handoff", "create_pane", "close_pane", "restart_pane",
+                  "set_pane_permissions", "set_global_permissions", "set_capability_gate",
+                  "add_watch_rule", "execute_plan", "apply_recipe", "create_project",
+                  "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention",
+                ];
+                const resolved: Record<string, GateValue> = {};
+                for (const c of caps) resolved[c] = effectiveCapabilityGateFor(pane_id || null, c);
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: { pane_id: pane_id ?? null, gates: resolved } } }]
+                });
+              } else if (name === "list_capabilities") {
+                // UNGATED read.
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: [
+                    "write_to_pane", "deliver_handoff", "create_pane", "close_pane", "restart_pane",
+                    "set_pane_permissions", "set_global_permissions", "set_capability_gate",
+                    "add_watch_rule", "execute_plan", "apply_recipe", "create_project",
+                    "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention",
+                  ] } }]
+                });
               } else if (name === "set_pane_permissions") {
                 const { project_id, pane_id, permissions_mode } = args;
+                const sppGate = gateCapability("set_pane_permissions", pane_id ?? null);
+                if (sppGate.forbidden) {
+                  session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.` } }] });
+                } else {
                 const validModes = ["Full Auto", "Human-in-the-Loop", "Read-Only"];
                 const term = manager.terminals[pane_id];
                 const ws = manager.ledger.getProject(project_id);
@@ -2011,6 +2406,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   session.sendToolResponse({
                     functionResponses: [{ name, id: call.id, response: { output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` } }]
                   });
+                }
                 }
               }
               } catch (toolErr) {
@@ -2323,6 +2719,104 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 },
                 required: ["project_id", "pane_id", "permissions_mode"]
               }
+            },
+            {
+              name: "propose_handoff",
+              description: "Draft a first-class handoff to a target pane (UNGATED — never touches the pane). Snapshots the source pane's context (redacted) and stores a 'composing' draft for the operator to revise by voice. Use this to begin co-authoring a prompt to delegate to a CLI agent pane.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  to_pane: { type: Type.STRING, description: "Target pane ID that will receive the prompt." },
+                  draft_text: { type: Type.STRING, description: "The initial composed prompt draft." },
+                  from_pane: { type: Type.STRING, description: "Optional source pane ID to snapshot context from (may be archived)." },
+                  rationale: { type: Type.STRING, description: "Optional rationale/notes for the handoff." }
+                },
+                required: ["to_pane", "draft_text"]
+              }
+            },
+            {
+              name: "revise_handoff",
+              description: "Rewrite a handoff's composed prompt (UNGATED co-authoring; increments revision_count). Read the revised draft back to the operator.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  handoff_id: { type: Type.STRING },
+                  new_draft_text: { type: Type.STRING, description: "The revised composed prompt." }
+                },
+                required: ["handoff_id", "new_draft_text"]
+              }
+            },
+            {
+              name: "stage_handoff",
+              description: "Freeze a handoff draft and mark it 'staged' (UNGATED; validates the target pane is live). After staging, ask the operator to approve delivery.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { handoff_id: { type: Type.STRING } },
+                required: ["handoff_id"]
+              }
+            },
+            {
+              name: "deliver_handoff",
+              description: "Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode). Full Auto writes immediately; Human-in-the-Loop creates a pending approval to read back; Read-Only/Off blocks.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { handoff_id: { type: Type.STRING } },
+                required: ["handoff_id"]
+              }
+            },
+            {
+              name: "read_handoff",
+              description: "Read a single handoff (UNGATED, redacted output).",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { handoff_id: { type: Type.STRING } },
+                required: ["handoff_id"]
+              }
+            },
+            {
+              name: "list_handoffs",
+              description: "List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output).",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { state: { type: Type.STRING, description: "Optional state filter: composing, revising, staged, delivered, consumed, rejected, expired." } },
+                required: []
+              }
+            },
+            {
+              name: "reject_handoff",
+              description: "Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path).",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { handoff_id: { type: Type.STRING } },
+                required: ["handoff_id"]
+              }
+            },
+            {
+              name: "set_capability_gate",
+              description: "Set a capability gate to Auto, Ask, or Off — globally or for one pane (meta capability). Auto=proceed, Ask=require human approval, Off=forbidden.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  pane_id: { type: Type.STRING, description: "Optional pane ID for a per-pane override; omit for the global default." },
+                  capability: { type: Type.STRING, description: "Capability name, e.g. write_to_pane, deliver_handoff, create_pane." },
+                  gate: { type: Type.STRING, description: "Gate value: Auto, Ask, or Off." }
+                },
+                required: ["capability", "gate"]
+              }
+            },
+            {
+              name: "get_pane_gates",
+              description: "Read the resolved capability-gate matrix for a pane (or global if pane_id omitted). UNGATED read.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: { pane_id: { type: Type.STRING, description: "Optional pane ID." } },
+                required: []
+              }
+            },
+            {
+              name: "list_capabilities",
+              description: "List every gateable capability name. UNGATED read.",
+              parameters: { type: Type.OBJECT, properties: {}, required: [] }
             }
           ]
         }]

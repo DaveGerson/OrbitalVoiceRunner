@@ -1,5 +1,54 @@
 import type { AnnouncementTemplates } from "./announcementKinds";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Capability Gate Matrix (design §3/§7). A capability can only TIGHTEN, never
+// loosen, the pane's effectiveMode (AND-veto). Absent matrix ⇒ all "Auto"
+// (back-compat: today's implicit behavior).
+// ─────────────────────────────────────────────────────────────────────────────
+export type CapabilityGate =
+  | "write_to_pane" | "deliver_handoff" | "create_pane" | "close_pane"
+  | "restart_pane" | "set_pane_permissions" | "set_global_permissions"
+  | "set_capability_gate" | "add_watch_rule" | "execute_plan"
+  | "apply_recipe" | "create_project" | "update_metadata"
+  | "switch_context" | "set_voice_mute" | "dismiss_attention";
+
+export type GateValue = "Auto" | "Ask" | "Off";
+
+export type CapabilityGateMap = Partial<Record<CapabilityGate, GateValue>>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Handoff artifact (design §4). A first-class, persisted artifact whose only
+// gated transition is staged → delivered (rides deliver_handoff → write_to_pane).
+// `composed_prompt` is delivered VERBATIM/unredacted; `source_context` IS redacted.
+// ─────────────────────────────────────────────────────────────────────────────
+export type HandoffState =
+  | "composing" | "revising" | "staged" | "delivered" | "consumed"
+  | "rejected" | "expired" | "blocked_read_only";
+
+export type HandoffKind = "agent_instruction" | "shell";
+
+export interface Handoff {
+  id: string;
+  workspace_id: string;
+  from_pane: string | null;        // NULLABLE: source may be archived/gone
+  to_pane: string;
+  kind: HandoffKind;
+  composed_prompt: string;         // cargo; NOT redacted
+  source_context: string;          // JSON snapshot, redactSecrets-applied
+  source_context_refs: string;     // JSON provenance pointers (advisory)
+  state: HandoffState;
+  gate_approval_id: string | null; // == PendingApproval.messageId while pending
+  approved_by: string | null;
+  approved_via: string | null;     // voice|rest|full_auto|ttl_expire
+  revision_count: number;
+  created_at: number;
+  staged_at: number | null;
+  delivered_at: number | null;
+  consumed_at: number | null;
+  terminal_at: number | null;
+  expires_at: number | null;
+}
+
 export interface Terminal {
   id: string;
   cwd: string;
@@ -69,6 +118,8 @@ export interface PaneMeta {
   last_status_change_at?: string;   // ISO timestamp of last Running/Idle/Exited transition
   last_command?: string;            // most recent command written via writeInput
   elapsed_ms?: number;              // derived at read time: now - last_status_change_at
+  // Per-pane capability-gate override (design §3). Absent ⇒ falls through to global ⇒ "Auto".
+  capabilityGates?: CapabilityGateMap;
 }
 
 export interface Workspace {
@@ -94,6 +145,8 @@ export interface CliPreset {
   sessionResume?: boolean;
   portOffset?: string;
   customEnvVars?: string;
+  // Template-level capability-gate defaults applied to panes spawned from this preset.
+  capabilityGates?: CapabilityGateMap;
 }
 
 export interface SystemSettings {
@@ -132,6 +185,8 @@ export interface SystemSettings {
     globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
     historyMaxCommands?: number;
     historyMaxOutputLength?: number;
+    // Global default capability-gate matrix (design §3/§7). Absent/empty ⇒ all "Auto".
+    capabilityGates?: CapabilityGateMap;
   };
   secrets: {
     geminiApiKey: string;

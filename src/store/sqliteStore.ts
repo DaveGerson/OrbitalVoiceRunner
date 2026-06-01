@@ -2,7 +2,7 @@
 import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
-import type { StoredPane, StoredPendingApproval } from "./types";
+import type { StoredPane, StoredPendingApproval, StoredHandoff, HandoffState } from "./types";
 import { pruneOnBoot, type PruneOpts } from "./retention";
 
 export class JanusStore {
@@ -29,8 +29,8 @@ export class JanusStore {
 
   private appendEventInTxn(event: NewEvent): void {
     this.db.prepare(
-      `INSERT INTO events(ts,type,project_id,pane_id,session_id,summary,payload)
-       VALUES(@ts,@type,@project_id,@pane_id,@session_id,@summary,@payload)`
+      `INSERT INTO events(ts,type,project_id,pane_id,session_id,summary,payload,handoff_id)
+       VALUES(@ts,@type,@project_id,@pane_id,@session_id,@summary,@payload,@handoff_id)`
     ).run({
       ts: event.ts ?? Date.now(),
       type: event.type,
@@ -39,6 +39,7 @@ export class JanusStore {
       session_id: event.session_id ?? null,
       summary: event.summary ?? "",
       payload: JSON.stringify(event.payload ?? {}),
+      handoff_id: event.handoff_id ?? null,
     });
   }
 
@@ -421,5 +422,178 @@ export class JanusStore {
       notes: ws.notes,
       key_codebase_terms: ws.keyTerms ?? [],
     };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Handoff artifact (design §4/§5). The row is the live projection; the events
+  // table is the immutable audit spine. Every state transition emits ONE HANDOFF
+  // event in the SAME transaction as the row-flip via recordActivity().
+  // ──────────────────────────────────────────────────────────────────────────
+
+  private hydrateHandoff(r: any): StoredHandoff {
+    return {
+      id: r.id,
+      workspace_id: r.workspace_id,
+      from_pane: r.from_pane ?? null,
+      to_pane: r.to_pane,
+      kind: r.kind,
+      composed_prompt: r.composed_prompt ?? "",
+      source_context: r.source_context ?? "{}",
+      source_context_refs: r.source_context_refs ?? "[]",
+      state: r.state,
+      gate_approval_id: r.gate_approval_id ?? null,
+      approved_by: r.approved_by ?? null,
+      approved_via: r.approved_via ?? null,
+      revision_count: r.revision_count ?? 0,
+      created_at: r.created_at,
+      staged_at: r.staged_at ?? null,
+      delivered_at: r.delivered_at ?? null,
+      consumed_at: r.consumed_at ?? null,
+      terminal_at: r.terminal_at ?? null,
+      expires_at: r.expires_at ?? null,
+    };
+  }
+
+  /** Insert a new handoff row (state defaults to 'composing'). Emits a HANDOFF event. */
+  createHandoff(h: {
+    id?: string;
+    workspace_id: string;
+    from_pane?: string | null;
+    to_pane: string;
+    kind?: import("./types").ApprovalKind;
+    composed_prompt?: string;
+    source_context?: string;
+    source_context_refs?: string;
+    state?: HandoffState;
+    expires_at?: number | null;
+  }): StoredHandoff {
+    const now = Date.now();
+    const id = h.id ?? `handoff_${now}_${Math.floor(this.rand() * 1e6)}`;
+    const row: StoredHandoff = {
+      id,
+      workspace_id: h.workspace_id,
+      from_pane: h.from_pane ?? null,
+      to_pane: h.to_pane,
+      kind: h.kind ?? "agent_instruction",
+      composed_prompt: h.composed_prompt ?? "",
+      source_context: h.source_context ?? "{}",
+      source_context_refs: h.source_context_refs ?? "[]",
+      state: h.state ?? "composing",
+      gate_approval_id: null,
+      approved_by: null,
+      approved_via: null,
+      revision_count: 0,
+      created_at: now,
+      staged_at: null,
+      delivered_at: null,
+      consumed_at: null,
+      terminal_at: null,
+      expires_at: h.expires_at ?? null,
+    };
+    this.recordActivity(
+      {
+        type: EVENT_TYPES.HANDOFF,
+        project_id: row.workspace_id,
+        pane_id: row.to_pane,
+        handoff_id: id,
+        summary: `handoff proposed -> ${row.state}`,
+        payload: { handoff_id: id, from: null, to: row.state, from_pane: row.from_pane, to_pane: row.to_pane },
+      },
+      (db) => db.prepare(
+        `INSERT INTO handoffs(id,workspace_id,from_pane,to_pane,kind,composed_prompt,source_context,
+           source_context_refs,state,gate_approval_id,approved_by,approved_via,revision_count,
+           created_at,staged_at,delivered_at,consumed_at,terminal_at,expires_at)
+         VALUES(@id,@workspace_id,@from_pane,@to_pane,@kind,@composed_prompt,@source_context,
+           @source_context_refs,@state,@gate_approval_id,@approved_by,@approved_via,@revision_count,
+           @created_at,@staged_at,@delivered_at,@consumed_at,@terminal_at,@expires_at)`
+      ).run(row)
+    );
+    return row;
+  }
+
+  getHandoff(id: string): StoredHandoff | null {
+    const r = this.db.prepare("SELECT * FROM handoffs WHERE id=?").get(id) as any;
+    return r ? this.hydrateHandoff(r) : null;
+  }
+
+  /** Ungated revise: rewrite the cargo + bump revision_count. Emits a composing->revising event. */
+  updateHandoffCargo(id: string, composedPrompt: string): StoredHandoff | null {
+    const existing = this.getHandoff(id);
+    if (!existing) return null;
+    this.recordActivity(
+      {
+        type: EVENT_TYPES.HANDOFF,
+        project_id: existing.workspace_id,
+        pane_id: existing.to_pane,
+        handoff_id: id,
+        summary: `handoff ${existing.state} -> revising`,
+        payload: { handoff_id: id, from: existing.state, to: "revising", revision: existing.revision_count + 1 },
+      },
+      (db) => db.prepare(
+        "UPDATE handoffs SET composed_prompt=?, state='revising', revision_count=revision_count+1 WHERE id=?"
+      ).run(composedPrompt, id)
+    );
+    return this.getHandoff(id);
+  }
+
+  /**
+   * Atomic state-flip + audit event. `patch` carries optional column updates (e.g.
+   * approved_by/approved_via/staged_at/delivered_at). Sets terminal_at for terminal states.
+   */
+  updateHandoffState(id: string, state: HandoffState, patch: Partial<StoredHandoff> = {}): StoredHandoff | null {
+    const existing = this.getHandoff(id);
+    if (!existing) return null;
+    const now = Date.now();
+    const terminalStates: HandoffState[] = ["consumed", "rejected", "expired", "blocked_read_only"];
+    const sets: string[] = ["state=@state"];
+    const params: Record<string, any> = { id, state };
+    if (state === "staged") { sets.push("staged_at=@staged_at"); params.staged_at = patch.staged_at ?? now; }
+    if (state === "delivered") { sets.push("delivered_at=@delivered_at"); params.delivered_at = patch.delivered_at ?? now; }
+    if (state === "consumed") { sets.push("consumed_at=@consumed_at"); params.consumed_at = patch.consumed_at ?? now; }
+    if (patch.approved_by !== undefined) { sets.push("approved_by=@approved_by"); params.approved_by = patch.approved_by; }
+    if (patch.approved_via !== undefined) { sets.push("approved_via=@approved_via"); params.approved_via = patch.approved_via; }
+    if (patch.gate_approval_id !== undefined) { sets.push("gate_approval_id=@gate_approval_id"); params.gate_approval_id = patch.gate_approval_id; }
+    if (terminalStates.includes(state)) { sets.push("terminal_at=@terminal_at"); params.terminal_at = patch.terminal_at ?? now; }
+    this.recordActivity(
+      {
+        type: EVENT_TYPES.HANDOFF,
+        project_id: existing.workspace_id,
+        pane_id: existing.to_pane,
+        handoff_id: id,
+        summary: `handoff ${existing.state} -> ${state}`,
+        payload: { handoff_id: id, from: existing.state, to: state },
+      },
+      (db) => db.prepare(`UPDATE handoffs SET ${sets.join(", ")} WHERE id=@id`).run(params)
+    );
+    return this.getHandoff(id);
+  }
+
+  /** Persist the in-memory PendingApproval messageId on the handoff (gate leg, design §5.3). */
+  setGateApprovalId(id: string, approvalId: string | null): void {
+    this.db.prepare("UPDATE handoffs SET gate_approval_id=? WHERE id=?").run(approvalId, id);
+  }
+
+  listHandoffs(filter: { workspaceId?: string; toPane?: string; state?: HandoffState } = {}): StoredHandoff[] {
+    const where: string[] = []; const args: any[] = [];
+    if (filter.workspaceId) { where.push("workspace_id=?"); args.push(filter.workspaceId); }
+    if (filter.toPane) { where.push("to_pane=?"); args.push(filter.toPane); }
+    if (filter.state) { where.push("state=?"); args.push(filter.state); }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    return (this.db.prepare(`SELECT * FROM handoffs ${clause} ORDER BY created_at DESC`).all(...args) as any[])
+      .map(r => this.hydrateHandoff(r));
+  }
+
+  /**
+   * Observability sweep (design §5/§5.3): staged/pending rows past their TTL, plus long-'delivered'
+   * rows (the fallback transport cannot authoritatively confirm consumption).
+   */
+  getStuckHandoffs(now = Date.now(), deliveredStaleMs = 10 * 60 * 1000): StoredHandoff[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM handoffs
+        WHERE (state IN ('staged','composing','revising') AND expires_at IS NOT NULL AND expires_at < ?)
+           OR (state='delivered' AND delivered_at IS NOT NULL AND delivered_at < ?)
+        ORDER BY created_at ASC`
+    ).all(now, now - deliveredStaleMs) as any[];
+    return rows.map(r => this.hydrateHandoff(r));
   }
 }

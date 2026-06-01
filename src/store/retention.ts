@@ -15,6 +15,8 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
   const tx = db.transaction(() => {
     db.prepare("DELETE FROM events WHERE ts < ?").run(evCutoff);          // triggers keep events_fts in sync
     db.prepare("DELETE FROM panes_archive WHERE archived_at < ?").run(arCutoff);
+    // Prune terminal handoffs past the archive cutoff (audit trail survives in events).
+    db.prepare("DELETE FROM handoffs WHERE terminal_at IS NOT NULL AND terminal_at < ?").run(arCutoff);
   });
   tx();
   // Orphaned scrollback sweep: delete .log files not referenced by any live or archived pane.

@@ -25,6 +25,7 @@ export interface NewEvent {
   session_id?: string | null;
   summary?: string;       // REDACTED by caller before passing in
   payload?: unknown;      // JSON-serializable, REDACTED by caller
+  handoff_id?: string | null; // correlation column for handoff timeline queries (schema v2)
 }
 
 export interface StoredEvent {
@@ -36,4 +37,5 @@ export interface StoredEvent {
   session_id: string | null;
   summary: string;
   payload: any;           // parsed JSON
+  handoff_id?: string | null;
 }

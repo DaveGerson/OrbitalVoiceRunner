@@ -21,6 +21,8 @@ import { redactSecrets } from "./terminal";
 export type ApprovalKind = "agent_instruction" | "shell";
 export type RuntimeType = "shell" | "interactive_cli";
 export type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+/** Per-capability gate value (design §3). Off > Ask > Auto (most-restrictive wins). */
+export type GateValue = "Auto" | "Ask" | "Off";
 
 /** The serializable record (WS-F primary key = `messageId`). NO live session handle here. */
 export interface PendingApproval {
@@ -38,6 +40,8 @@ export interface PendingApproval {
   timestamp: number;
   /** WS-F atomic-claim seam: set before writeInput so REST+voice can't double-dispatch. */
   claimed?: boolean;
+  /** The capability this approval rides (design §3). Defaults to "write_to_pane". */
+  capability?: string;
 }
 
 /**
@@ -84,6 +88,7 @@ export type ProposalDecision =
   | { type: "blocked_read_only" }                  // Read-Only: never write
   | { type: "pending_approval" }                   // HiTL: two-phase spoken proposal
   | { type: "clarify_shell"; reason: string }      // non-allowlisted shell -> re-route
+  | { type: "capability_forbidden"; capability: string } // gate Off: capability forbidden
   | { type: "error_no_pane" }                       // target pane missing
   | { type: "error_kind_mismatch"; reason: string };// agent_instruction on a shell pane, etc.
 
@@ -96,6 +101,15 @@ export interface DecideProposalInput {
   runtimeType?: RuntimeType;
   paneExists: boolean;
   allowlist: Set<string>;
+  /** The capability being exercised (design §3). Defaults to "write_to_pane" for back-compat. */
+  capability?: string;
+  /**
+   * The resolved per-capability gate (design §3 AND-veto). When omitted, defaults to "Auto"
+   * (back-compat: absent matrix = today's effectiveMode-only behavior). Composed decision is
+   * the MOST RESTRICTIVE of (effectiveMode, gate): Off ⇒ forbidden, Ask ⇒ pending, Auto ⇒
+   * defer to effectiveMode.
+   */
+  gate?: GateValue;
 }
 
 /**
@@ -104,6 +118,8 @@ export interface DecideProposalInput {
  */
 export function decideProposal(input: DecideProposalInput): ProposalDecision {
   const { kind, instruction, effectiveMode, runtimeType, paneExists, allowlist } = input;
+  const capability = input.capability ?? "write_to_pane";
+  const gate: GateValue = input.gate ?? "Auto";
 
   if (!paneExists) return { type: "error_no_pane" };
 
@@ -133,7 +149,21 @@ export function decideProposal(input: DecideProposalInput): ProposalDecision {
     };
   }
 
+  // AND-veto (design §3): the per-capability gate is evaluated AFTER the kind/allowlist checks
+  // and AND-composed with effectiveMode. A capability can only TIGHTEN, never loosen, the mode.
+  //   Off  ⇒ capability forbidden outright (most restrictive).
+  //   Ask  ⇒ force pending_approval (unless Read-Only, which is even more restrictive — handled
+  //          by the effectiveMode branch below since Read-Only > Ask).
+  //   Auto ⇒ defer to the existing effectiveMode branch (mode is the sole gate).
+  if (gate === "Off") return { type: "capability_forbidden", capability };
+
+  // Read-Only is the most restrictive mode and wins over any gate (you cannot Ask your way past
+  // a Read-Only pane). Evaluate it first so Ask cannot loosen Read-Only into a pending write.
   if (effectiveMode === "Read-Only") return { type: "blocked_read_only" };
+
+  // Ask gate forces human-in-the-loop even when the mode would auto-execute (gate tightens mode).
+  if (gate === "Ask") return { type: "pending_approval" };
+
   if (effectiveMode === "Full Auto") return { type: "auto_execute" };
   return { type: "pending_approval" };
 }
