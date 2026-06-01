@@ -190,6 +190,11 @@ export class UniversalTerminal {
   private transport: PtyTransport | null = null;
   public outputBuffer: string[] = [];
   public maxBufferLines = 100;
+  // Push-observation delta cursor. `totalLines` is monotonic (never decremented by
+  // the buffer cap splice); `modelCursor` is the absolute line index the model has
+  // consumed up to. Together they yield only-new-since-last-read deltas.
+  public totalLines = 0;
+  private modelCursor = 0;
   // PTY grid, kept in sync with the operator's xterm viewport via resize(). The
   // program inside wraps lines to THIS width, so it must match the display or
   // wrapping looks wrong. Defaults match the node-pty spawn defaults (80x30).
@@ -541,6 +546,7 @@ export class UniversalTerminal {
       }
       const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
       this.outputBuffer.push(...cleanLines);
+      this.totalLines += cleanLines.length;
       if (this.outputBuffer.length > this.maxBufferLines) {
         this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
       }
@@ -595,6 +601,18 @@ export class UniversalTerminal {
 
   getRecentOutput(linesCount = 10): string {
     return this.outputBuffer.slice(-linesCount).join('\n');
+  }
+
+  /** Only-new-since-last-read lines (model lane). Advances the model cursor.
+   *  `dropped` counts unread lines the buffer cap evicted before this read. */
+  consumeDelta(): { lines: string; dropped: number } {
+    const bufStart = this.totalLines - this.outputBuffer.length; // absolute idx of buffer[0]
+    let from = this.modelCursor;
+    let dropped = 0;
+    if (from < bufStart) { dropped = bufStart - from; from = bufStart; }
+    const lines = this.outputBuffer.slice(from - bufStart).join("\n");
+    this.modelCursor = this.totalLines;
+    return { lines, dropped };
   }
 
   public async stop(): Promise<void> {
@@ -911,5 +929,20 @@ export class OrchestratorManager {
     // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
     const safeOut = redactSecrets(recentOut || "[No new output]");
     return `\`\`\`\n${safeOut}\n\`\`\``;
+  }
+
+  /** Push-observation pull side: only-new lines since the model last read this pane,
+   *  ANSI already stripped (model lane) and secret-redacted. */
+  getPaneDelta(paneId: string): string {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return `Error: Pane ${paneId} does not exist.`;
+    }
+    const { lines, dropped } = term.consumeDelta();
+    if (!lines) {
+      return "[No new output since last read]";
+    }
+    const note = dropped > 0 ? `[... ${dropped} earlier line(s) evicted from buffer ...]\n` : "";
+    return "```\n" + note + redactSecrets(lines) + "\n```";
   }
 }

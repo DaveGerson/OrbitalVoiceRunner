@@ -9,6 +9,8 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets } from "./src/terminal";
 import { SHELL_PROMPT } from "./src/statusConstants";
+import { PaneSignalBus } from "./src/paneSignalBus";
+import { classifyPaneOutput, formatPaneSignal } from "./src/paneSignals";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
@@ -300,6 +302,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
   }
 
+  // Push-observation: one bus per server; each /live connection subscribes its session.
+  const paneSignalBus = new PaneSignalBus();
+
   manager.onIdle = async (terminalId) => {
     const term = manager.terminals[terminalId];
     if (term) {
@@ -333,6 +338,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // finalResponse, with the redacted summary above as the message. The bus owns the
       // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
       announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
+      paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
     }
   };
 
@@ -643,6 +649,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const term = manager.terminals[terminalId];
     if (term) {
       const cleanChunk = stripAnsiSequences(chunk);
+      // Push-observation: classify each chunk and publish error/prompt signals. The bus
+      // debounces per (pane,kind), so a chatty pane won't spam the model.
+      const cls = classifyPaneOutput(cleanChunk);
+      if (cls) {
+        paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
+      }
       HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
       
       // Classify transitions and handle trigger rules
@@ -1593,6 +1605,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // us which pane is open (set_active_pane). No global buffer to push on connect.
 
     let session: any = null;
+    let unsubscribePaneSignals: (() => void) | null = null;
     let wsClosed = false;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
@@ -1858,6 +1871,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               } else if (name === "get_pane_summary") {
                 const targetId = args.pane_id;
                 const out = manager.getPaneSummary(targetId);
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: out } }]
+                });
+              } else if (name === "get_pane_delta") {
+                const targetId = args.pane_id;
+                const out = manager.getPaneDelta(targetId);
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: out } }]
                 });
@@ -2691,6 +2710,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }
             },
             {
+              name: "get_pane_delta",
+              description: "Return ONLY the pane output that is new since you last read this pane (true incremental delta; ANSI-stripped, secret-redacted). Advances a per-pane read cursor, so repeated calls won't re-show old lines. Prefer this over get_pane_summary when tracking progress.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  pane_id: { type: Type.STRING, description: "The pane id." },
+                },
+                required: ["pane_id"]
+              }
+            },
+            {
               name: "switch_context",
               description: "Make a project the active focus. Returns a fresh project briefing (summary, directory, panes, notes) and backgrounds the previous project.",
               parameters: {
@@ -3002,6 +3032,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }]
       },
     });
+
+      // Push-observation: bridge global pane signals into THIS live session. The bus owns
+      // debounce; we forward each signal as a user-role nudge (same convention as approval
+      // narration the model already speaks). Unsubscribed on socket close.
+      unsubscribePaneSignals = paneSignalBus.subscribe((sig) => {
+        try {
+          session.sendClientContent({
+            turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
+            turnComplete: true,
+          });
+        } catch (e) {
+          console.error("Failed to push pane signal to session:", e);
+        }
+      });
     } catch (err: any) {
       console.error("Failed to establish Gemini Live session:", err);
       clientWs.send(JSON.stringify({ 
@@ -3044,6 +3088,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
     clientWs.on("close", () => {
       wsClosed = true; // gate out the SDK's post-close resumption-token flush
+      if (unsubscribePaneSignals) { unsubscribePaneSignals(); unsubscribePaneSignals = null; }
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
         activeFrontendWs = null;
