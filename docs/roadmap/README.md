@@ -5,7 +5,8 @@ developer personas (Maya — power user; Devon — security/platform; Sam — vo
 
 | File | What it is |
 |---|---|
-| `NEXT-LEVEL-ROADMAP.md` | **The headline roadmap** — net-new capability, velocity & usability focus, 10 prioritized items |
+| **`RECONCILIATION.md`** | **START HERE** — re-integrates this roadmap with the now-central capability-gate vision; proposed priority stack + decisions for the director |
+| `NEXT-LEVEL-ROADMAP.md` | The headline roadmap — net-new capability, velocity & usability focus, 10 prioritized items (velocity-lens; read through `RECONCILIATION.md`) |
 | `ROADMAP.md` | Round-one prioritized bug/UX roadmap (the foundation the next-level items assume is done) |
 | `01..03-*.md` | Per-persona codebase assessments (the evidence behind the synthesis) |
 | `next-level/{maya,devon,sam}.md` | Per-persona forward wishlists feeding the headline roadmap |
@@ -26,6 +27,8 @@ per-capability **Auto / Ask / Off** approval matrix as the safety dial). So the 
 priority ordering is stale with respect to the current vision: it parks the very layer the product
 now leads with.
 
-**Action pending:** a reconciliation pass that re-merges the capability-gate / governance items back
-into the priority stack and re-anchors line references to the current trunk. Until then, treat the
-ordering as velocity-lens input, not the authoritative plan.
+**Reconciled (2026-05-31):** see **`RECONCILIATION.md`** for the re-integrated view — the matrix is now
+the safety substrate the whole velocity roadmap rides on, several roadmap items (5, 7, 9) moved toward
+done via the matrix build, and the cut governance items are re-scored (some built, some now cheap and
+re-elevated, some correctly deferred). Until the director confirms the §6 decisions there, treat
+`NEXT-LEVEL-ROADMAP.md`'s ordering as velocity-lens input, not the authoritative plan.
