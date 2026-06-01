@@ -36,12 +36,20 @@ async function main() {
   let bytesAfter = 0;
   let sawAnyOutput = false;
   let phase: "startup" | "post-input" = "startup";
+  // Accumulate the post-input response as TEXT so we can assert on CONTENT (the
+  // model actually answered "PONG"), not merely that some bytes streamed back —
+  // a TUI redraw or an error banner also produces bytes. Strip ANSI escapes so
+  // the match isn't defeated by cursor-move / color control sequences.
+  let responseText = "";
 
   term.onOutput = (_id, chunk) => {
     sawAnyOutput = true;
     if (phase === "startup") bytesBefore += chunk.length;
-    else bytesAfter += chunk.length;
+    else { bytesAfter += chunk.length; responseText += chunk; }
   };
+
+  // eslint-disable-next-line no-control-regex
+  const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
 
   log("starting pane (claude)...");
   term.start();
@@ -78,7 +86,18 @@ async function main() {
     process.exit(1);
   }
 
-  log(`PASS: pane responded to submitted input - ${bytesAfter} bytes streamed back.`);
+  // Content assertion: the model was asked to reply with exactly "PONG". Proving
+  // the EXPECTED content (not just that *something* streamed back) is what makes
+  // this a real end-to-end check of a live, responding Claude session.
+  const cleaned = stripAnsi(responseText);
+  if (!/\bPONG\b/i.test(cleaned)) {
+    log(`FAIL: pane streamed ${bytesAfter} bytes but the response did not contain "PONG" `
+      + `(submitted but no valid answer — model error, auth prompt, or TUI noise).`);
+    log(`  last 200 chars seen: ${JSON.stringify(cleaned.slice(-200))}`);
+    process.exit(1);
+  }
+
+  log(`PASS: pane responded with the expected content "PONG" (${bytesAfter} bytes streamed back).`);
   process.exit(0);
 }
 
