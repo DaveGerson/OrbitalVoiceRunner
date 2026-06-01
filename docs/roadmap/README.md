@@ -5,7 +5,8 @@ developer personas (Maya — power user; Devon — security/platform; Sam — vo
 
 | File | What it is |
 |---|---|
-| `NEXT-LEVEL-ROADMAP.md` | **The headline roadmap** — net-new capability, velocity & usability focus, 10 prioritized items |
+| **`RECONCILIATION.md`** | **START HERE** — re-integrates this roadmap with the now-central capability-gate vision; proposed priority stack + decisions for the director |
+| `NEXT-LEVEL-ROADMAP.md` | The headline roadmap — net-new capability, velocity & usability focus, 10 prioritized items (velocity-lens; read through `RECONCILIATION.md`) |
 | `ROADMAP.md` | Round-one prioritized bug/UX roadmap (the foundation the next-level items assume is done) |
 | `01..03-*.md` | Per-persona codebase assessments (the evidence behind the synthesis) |
 | `next-level/{maya,devon,sam}.md` | Per-persona forward wishlists feeding the headline roadmap |
@@ -14,7 +15,7 @@ Provenance: salvaged from the retired `claude/relaxed-gates-LI27l` branch (archi
 `archive/relaxed-gates`). Line anchors validate against `main @16c62da` (2026-05-28) and predate the
 prompt-composer/WS work now on the trunk — re-anchor before acting on any single item.
 
-## ⚠️ Out of sync with the higher-level tool vision
+## ✅ Reconciled with the capability-gate vision
 
 This roadmap was **deliberately narrowed to developer velocity & usability**, and in doing so it
 **explicitly deprioritized the security/governance control-plane** — policy rule engine, command
@@ -26,6 +27,8 @@ per-capability **Auto / Ask / Off** approval matrix as the safety dial). So the 
 priority ordering is stale with respect to the current vision: it parks the very layer the product
 now leads with.
 
-**Action pending:** a reconciliation pass that re-merges the capability-gate / governance items back
-into the priority stack and re-anchors line references to the current trunk. Until then, treat the
-ordering as velocity-lens input, not the authoritative plan.
+**Reconciled — director decisions LOCKED 2026-06-01.** See **`RECONCILIATION.md`** for the authoritative
+view: the matrix is the safety substrate the whole velocity roadmap rides on, and the locked stack is
+`P0a harden → P0b push-observation + matrix surface → P1 velocity → P2 polish`, with RBAC, signed/replay
+audit, per-path policy, and per-command risk badges **out of scope** under the single-director thesis.
+`NEXT-LEVEL-ROADMAP.md` below is the velocity-lens source; read it through `RECONCILIATION.md`'s §4 stack.
