@@ -5,8 +5,7 @@
 > v1 built) became the central product thesis — and it *is* the tiered-approval layer the roadmap cut.
 > The matrix is not a resurrected backlog item; it's now the **safety substrate the whole velocity
 > roadmap sits on**, and building it already delivered partial/complete credit on roadmap items 5, 7, and 9.
-> This doc re-integrates the two. It does **not** rewrite the roadmap's priority order — that's the
-> director's call (§6 lists the decisions).
+> **Director decisions are LOCKED (2026-06-01, §6); the priority stack in §4 is now authoritative.**
 
 Anchored to the trunk as of the matrix v1 build on `claude/prompt-composer-refactor`. The roadmap's own
 line anchors (`main @16c62da`) predate this and are stale — see §5.
@@ -22,28 +21,30 @@ the tiered-approval engine, and the audit source — all at once — and every v
 a pane now routes through it via the `effectiveModeFor → dispatchProposal → decideProposal` choke-point.
 
 So the roadmap shouldn't carry "governance" as a deferred *section*. Governance is now **horizontal**:
-each velocity capability declares a gate and inherits the matrix's safety for free.
+each velocity capability declares a gate and inherits the matrix's safety for free. Per the director
+(§6.2), the matrix is a **mixed surface** — the human controls the gated (`Ask`/`Off`) capabilities
+*directly* (visible controls), while `Auto` capabilities run *indirectly* in the background.
 
 ## 2. Re-scoring the "Removed" governance items against the built matrix
 
-| Removed item (Devon ref) | Status now that the matrix exists | Recommendation |
+| Removed item (Devon ref) | Status now that the matrix exists | Disposition (locked) |
 |---|---|---|
-| **Policy rule engine**, per-cmd/path allow/ask/deny (A1) | **Superseded for v1.** The matrix (per-capability, global + per-pane) *is* the policy plane. Per-*path* granularity still deferred. | Keep deferred — matrix covers the 80%. |
-| **Command risk-classification + tiered approval + risk badge** (A2/B1) | **Reframed & BUILT.** Tiering is now per-**capability**, not per-command-risk. The matrix is the tiered-approval engine. | Close as built (different axis). Per-command risk badge → optional polish only. |
-| **Append-only signed audit log + replay** (A3/B3) | **Partially BUILT.** Atomic audit events exist (`events.handoff_id`, one `recordActivity` txn per state-flip; live row + audit spine can't diverge). Signing + replay still absent. | **Re-elevate** "signed + replay" as a scoped follow-up — the spine is already there. |
-| **Global kill-switch + blast-radius indicator** (A4/B4) | **Now cheap.** Global gate → `Off` is already a soft kill-all; a single "stop-all" affordance + blast-radius count is a thin UI layer over the matrix. | **Re-elevate** as a small item — the matrix made it a UI add, not a control plane. |
-| **Multi-operator RBAC + secrets brokering** (A5/A6) | **RBAC out of scope** by thesis (single *director*). **Secrets:** redaction already built (source context redacted; `composed_prompt` not FTS-indexed); full brokering deferred. | RBAC stays out. Note redaction covers the secret-surface for v1. |
-| **Rate-limit/anomaly, diff-preview, per-pane policy chips** (A7/B2/B5) | **Per-pane gate chip now trivial** (matrix already carries per-pane overrides — just surface them). Rate-limit/anomaly/diff-preview still deferred. | **Re-elevate** the per-pane gate chip as small UI; defer the rest. |
+| **Policy rule engine**, per-cmd/path allow/ask/deny (A1) | **Superseded.** The matrix (per-capability, global + per-pane) *is* the policy plane. Per-*path* granularity unneeded for a single-director tool. | **OUT** |
+| **Command risk-classification + tiered approval + risk badge** (A2/B1) | **Reframed & BUILT.** Tiering is now per-**capability**, not per-command-risk. The matrix is the tiered-approval engine. | **CLOSED as built** — per-capability is sufficient (§6.5); no risk badges. |
+| **Append-only signed audit log + replay** (A3/B3) | Atomic *unsigned* audit events already exist (`events.handoff_id`, one `recordActivity` txn per state-flip; live row + audit spine can't diverge). | **OUT** — a personal tool needs no multi-party tamper-evidence; the built unsigned trail suffices (§6.1). |
+| **Global kill-switch + blast-radius indicator** (A4/B4) | Global gate → `Off` is already a soft kill-all; a single "stop-all" affordance + blast-radius count is a thin UI layer over the matrix. | **IN — P0b** (part of the matrix surface; direct control). |
+| **Multi-operator RBAC + secrets brokering** (A5/A6) | RBAC is meaningless for a single director. Secrets: redaction already built (source context redacted; `composed_prompt` not FTS-indexed). | **OUT** (§6.1); redaction covers the secret-surface. |
+| **Rate-limit/anomaly, diff-preview, per-pane policy chips** (A7/B2/B5) | Per-pane gate **chip** is trivial (matrix already carries per-pane overrides — just surface them). Rate-limit/anomaly/diff-preview have no single-director rationale. | per-pane chip **IN — P0b**; rest **OUT**. |
 
-**Net:** of 6 cut groups, 1 is built (tiered approval), 2 are partially built (audit, secrets-via-redaction),
-2 became cheap and worth re-elevating (kill-switch, per-pane chip), and 2 stay correctly deferred (per-path
-policy engine, RBAC/rate-limit/diff-preview).
+**Net (locked):** of 6 cut groups — 1 closed-as-built (tiered approval), 2 surfaced into the **P0b matrix
+surface** (kill-switch, per-pane chip), and 3 fully **out of scope** under the single-director thesis
+(per-path policy engine, signed/replay audit, RBAC/rate-limit/diff-preview).
 
 ## 3. The velocity items now ride the matrix (and some are already partly built)
 
 | Roadmap item | Capability gate it rides | Status change from the matrix build |
 |---|---|---|
-| 1 Push observation | reads (ungated; redaction is the control) | **Unchanged** — still the data plane to build first. |
+| 1 Push observation | reads (ungated; redaction is the control) | **Unchanged feature** — the data plane; a P0b keystone (§4). |
 | 2 Attention queue + digest | `dismiss_attention` | Unchanged feature; gate already defined. |
 | 3 Multi-pane tiles | — (read-only UI) | Unchanged. |
 | 4 Watch rules + plans | `add_watch_rule`, `execute_plan` | Gates defined; rule/DAG engine still net-new. |
@@ -54,21 +55,20 @@ policy engine, RBAC/rate-limit/diff-preview).
 | 9 Hands-free confirmation | **the `Ask` tier itself** | **Reframed.** The mechanism *is* the matrix's `Ask` gate; item 9 collapses to the **voice read-back + distinct-confirm-phrase UX** layered on Ask-tier resolutions. No separate confirmation machinery needed. |
 | 10 Velocity polish | various | Unchanged. |
 
-## 4. Proposed re-integrated priority stack (recommendation — director confirms in §6)
+## 4. Re-integrated priority stack (LOCKED)
 
-- **Layer 0 — DONE:** capability-gate matrix + first-class handoffs (v1, backend-verified). Pending: live voice/UI test; WS-F (deferred-execution staging + full `PendingApproval` persistence).
-- **P0 — velocity spine (unchanged core):** **(1) push observation** → **(2) attention queue / (3) tiles** → **(4) watch rules**. Item 1 is still the keystone everything else stands on.
-- **P0.5 — NEW, matrix-enabled & cheap (closes the "safety dial" story the vision leads with):**
-  - **Surface the matrix in the UI** — per-pane gate chips + a global-gate control (was Devon B5; trivial now).
-  - **Global stop-all / kill-switch** affordance over `set_global_permissions → Off` (was Devon A4; thin UI).
-  - **Signed audit + replay** on the existing audit spine (was Devon A3; spine already built).
-- **P1 — hands-free & multi-project:** **(5)** finish voice tools on the already-gated handlers · **(6)** cross-project fleet view · **(7)** templates/recipes (handoff already done) · **(8)** voice ergonomics.
-- **P2 — polish:** **(9)** hands-free confirm *as the Ask-tier voice UX* · **(10)** velocity polish.
-- **Deferred (correctly out of scope):** per-path policy rule engine, multi-operator RBAC, secrets brokering beyond redaction, rate-limit/anomaly flags, diff/impact preview, per-command risk badges.
+| Tier | What | Rationale (decision) |
+|---|---|---|
+| **L0 — DONE** | Capability-gate matrix + first-class handoffs (v1, backend-verified). | Already built. |
+| **P0a — HARDEN (first)** | WS-F deferred-execution staging · full `PendingApproval` persistence · full `deliver_handoff → flipHandoffOnResolve` server path · smoke content-assertion (PONG, not just `bytesAfter>0`). | **§6.3** — pay down v1 debt before stacking, *for* velocity. |
+| **P0b — Two keystones (both full)** | ① **Push-observation w/ deltas** (the data plane). ② **Matrix surface**: per-pane gate chips + capability-matrix settings UI + global stop-all + item-5 voice tools on the already-gated handlers. | **§6.2 + §6.4** — direct control of the gated capabilities; both are full must-builds. |
+| **P1 — Velocity** | Attention queue (2) · multi-pane tiles (3) · watch rules (4) · cross-project fleet view (6) · templates/recipes (7; handoff done) · voice ergonomics (8). | Ride the hardened, surfaced matrix. |
+| **P2 — Polish** | Hands-free confirm as Ask-tier voice UX (9) · velocity polish (10). | — |
+| **OUT (not deferred — out)** | Per-path policy engine · multi-operator RBAC · secrets brokering beyond redaction · signed/replay audit · per-command risk badges · rate-limit/anomaly · diff/impact preview. | **§6.1 + §6.5** — single-director tool needs none. |
 
-The one substantive change vs. the original ordering: a small **P0.5** band that surfaces and rounds out
-the matrix (chips, stop-all, signed audit). It's cheap *because* the matrix exists, and it's what makes the
-"settings-controlled safety dial" thesis legible to the director — so it earns its place ahead of P1.
+**Sequencing:** `P0a → P0b → P1 → P2`. P0a (hardening) gates the rest. Within P0b the two keystones run in
+parallel; push-observation and the WS-F hardening are largely code-disjoint, so push-observation may begin
+alongside P0a if there's capacity — but the matrix surface waits on hardened gates.
 
 ## 5. Re-anchoring debt
 
@@ -77,14 +77,17 @@ terminal-fidelity coalesce, the e2e harness module, and the capability-gate + ha
 on any single item, re-anchor its `server.ts` / `App.tsx` / `terminal.ts` line refs against the current
 trunk, and re-check each "❌ open / ⚠️ partial" status — several (5, 7, 9) moved toward done via the matrix.
 
-## 6. Decisions for the director
+## 6. Decisions (LOCKED — 2026-06-01)
 
-1. **Tiered approval = matrix?** Confirm the per-capability matrix *closes* "command risk-classification /
-   tiered approval" (different axis: per-capability, not per-command-risk). Or do you still want per-command
-   risk badges as polish?
-2. **Adopt the P0.5 band?** Re-elevate the three now-cheap governance items (per-pane gate chips, global
-   stop-all, signed-audit + replay) ahead of P1 — they complete the safety-dial story the product leads with.
-3. **RBAC stays out?** Confirm multi-operator RBAC remains out of scope under the single-director thesis
-   (redaction already covers the v1 secret-surface).
-4. **Keystone unchanged?** Confirm **item 1 (push observation)** is still the first build — nothing in the
-   matrix work displaced it.
+1. **Horizon & audience → personal, single-director tool (permanent).** Therefore RBAC, signed/replay
+   audit, per-path policy engine, secrets brokering, rate-limit/anomaly, and diff-preview are **out of
+   scope** — not deferred.
+2. **Safety dial → mixed surface.** The director controls the gated (`Ask`/`Off`) capabilities **directly**
+   (visible per-pane chips + matrix settings UI + global stop-all); `Auto` capabilities run **indirectly**
+   in the background. This makes the matrix surface a P0b keystone.
+3. **Matrix completeness → harden first.** Build the WS-F/persistence/handler-path hardening *before*
+   stacking velocity features, explicitly *for* development velocity (don't compound v1 debt). → **P0a**.
+4. **Keystones → both full builds.** Push-observation **and** the matrix surface are both must-builds, not
+   either/or. → **P0b**.
+5. **Risk model → per-capability is enough.** No per-command/path risk dimension; the per-command
+   risk-classification item is closed-as-built.

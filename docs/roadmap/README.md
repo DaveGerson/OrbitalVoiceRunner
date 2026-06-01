@@ -15,7 +15,7 @@ Provenance: salvaged from the retired `claude/relaxed-gates-LI27l` branch (archi
 `archive/relaxed-gates`). Line anchors validate against `main @16c62da` (2026-05-28) and predate the
 prompt-composer/WS work now on the trunk — re-anchor before acting on any single item.
 
-## ⚠️ Out of sync with the higher-level tool vision
+## ✅ Reconciled with the capability-gate vision
 
 This roadmap was **deliberately narrowed to developer velocity & usability**, and in doing so it
 **explicitly deprioritized the security/governance control-plane** — policy rule engine, command
@@ -27,8 +27,8 @@ per-capability **Auto / Ask / Off** approval matrix as the safety dial). So the 
 priority ordering is stale with respect to the current vision: it parks the very layer the product
 now leads with.
 
-**Reconciled (2026-05-31):** see **`RECONCILIATION.md`** for the re-integrated view — the matrix is now
-the safety substrate the whole velocity roadmap rides on, several roadmap items (5, 7, 9) moved toward
-done via the matrix build, and the cut governance items are re-scored (some built, some now cheap and
-re-elevated, some correctly deferred). Until the director confirms the §6 decisions there, treat
-`NEXT-LEVEL-ROADMAP.md`'s ordering as velocity-lens input, not the authoritative plan.
+**Reconciled — director decisions LOCKED 2026-06-01.** See **`RECONCILIATION.md`** for the authoritative
+view: the matrix is the safety substrate the whole velocity roadmap rides on, and the locked stack is
+`P0a harden → P0b push-observation + matrix surface → P1 velocity → P2 polish`, with RBAC, signed/replay
+audit, per-path policy, and per-command risk badges **out of scope** under the single-director thesis.
+`NEXT-LEVEL-ROADMAP.md` below is the velocity-lens source; read it through `RECONCILIATION.md`'s §4 stack.
