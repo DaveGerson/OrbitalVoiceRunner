@@ -14,6 +14,7 @@ import {
   PendingApprovalStore,
   decideProposal,
   resolveDecision,
+  resolveCapabilityGate,
   inferKind,
   loadShellAllowlist,
   serializePending,
@@ -1298,7 +1299,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const proj = manager.ledger.getActiveProject();
       paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
     }
-    return paneGate ?? globalGates?.[capability] ?? "Auto";
+    // Precedence is the pure, unit-tested resolveCapabilityGate (design §3): pane override
+    // wins, else global default, else "Auto". Keep this in lockstep with that function.
+    return resolveCapabilityGate(paneGate, globalGates?.[capability]);
   }
 
   // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
