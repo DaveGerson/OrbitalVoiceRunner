@@ -9,11 +9,21 @@
  *      with matching payload.handoff_id.
  *
  *   2. DELIVERY: the staged->delivered transition actually lands the composed prompt VERBATIM
- *      in a REAL target pane's live PTY via term.writeInput() (the CR-vs-LF submit fix: \r
- *      submits, \n only edits the TUI buffer). We assert the pane streamed bytes back AFTER
- *      delivery — proof the prompt was submitted, not merely buffered.
+ *      in a REAL target pane's live PTY via term.writeInput(). We assert the DISTINCTIVE prompt
+ *      text is echoed back in the post-delivery PTY stream — deterministic proof the bytes that
+ *      came back were the composed prompt landing in the input line, NOT incidental TUI redraw
+ *      (cursor/status churn). This is stronger than a bare bytes>0 check (which redraw can
+ *      satisfy). NOTE: this branch's writeInput submits with "\n"; node-pty's line discipline
+ *      accepts LF as the submit. (There is no "\r" CR fix in this code path — earlier comments
+ *      claiming one were inaccurate.)
  *
  * The gate is SET TO ALLOW for the test (Full Auto), so delivery proceeds without a human.
+ *
+ * SCOPE CAVEAT (known gap G3): this test drives the DECISION spine (decideProposal) + the store
+ * state machine + a real PTY write directly. It does NOT yet invoke the server's WS-bound
+ * deliver_handoff handler / flipHandoffOnResolve choke-point (those close over the live WebSocket
+ * session). A regression isolated to that server handler would not be caught here — see the
+ * hardening note in docs/design/janus-capability-gate-handoffs.md.
  *
  * Run:  npm run smoke:handoff   (or: npx tsx scripts/smoke-handoff.ts)
  * Exit: 0 = PTY received bytes AND handoff persisted as 'delivered' with the right trail.
@@ -28,7 +38,11 @@ import { UniversalTerminal } from "../src/terminal";
 import { JanusStore } from "../src/store/sqliteStore";
 import { decideProposal } from "../src/pendingApprovals";
 
-const PROMPT = "Reply with exactly the word PONG and nothing else.";
+// A distinctive sentinel embedded in the prompt. The PTY echoes typed input into the line
+// buffer, so this exact token MUST appear in the post-delivery stream if the composed prompt
+// truly landed — deterministic regardless of model latency or response wording.
+const SENTINEL = "JANUS_SMOKE_XQ7";
+const PROMPT = `Reply with exactly the word PONG. Ignore this token: ${SENTINEL}`;
 const STARTUP_MS = 6000;
 const RESPONSE_MS = 25000;
 const WORKSPACE = "smoke-handoff-ws";
@@ -116,9 +130,17 @@ async function main() {
   await new Promise((r) => setTimeout(r, RESPONSE_MS));
   await term.stop();
 
-  // (7) ASSERT the prompt actually LANDED in the PTY (bytes streamed back after delivery).
-  if (bytesAfter === 0) { fail("composed_prompt was NOT submitted — zero PTY output after delivery (the LF-vs-CR bug)."); }
-  log(`PTY delivery OK — ${bytesAfter} bytes streamed back after delivery.`);
+  // (7) ASSERT the prompt actually LANDED in the PTY — by CONTENT, not just byte count.
+  // The PTY echoes typed input, so the distinctive sentinel must appear in the stream that came
+  // back after delivery. A bare bytes>0 check can be satisfied by TUI redraw churn (cursor/status
+  // bar); requiring the sentinel proves the composed prompt itself was submitted into the pane.
+  if (bytesAfter === 0) { fail("composed_prompt was NOT submitted — zero PTY output after delivery."); }
+  // Strip ANSI escape sequences before searching (the TUI interleaves cursor/color codes).
+  const cleaned = streamedAfter.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1B[()][AB0]/g, "");
+  if (!cleaned.includes(SENTINEL)) {
+    fail(`delivery NOT confirmed: sentinel "${SENTINEL}" never echoed back in ${bytesAfter} post-delivery bytes — the composed prompt did not land in the PTY input line (redraw churn alone cannot prove delivery).`);
+  }
+  log(`PTY delivery CONFIRMED — sentinel "${SENTINEL}" echoed back (${bytesAfter} bytes streamed after delivery).`);
 
   // (8) ASSERT persistence: row state + the ordered HANDOFF event trail.
   const finalRow = store.getHandoff(h.id);
