@@ -17,6 +17,32 @@
  */
 
 import { redactSecrets } from "./terminal";
+import type { JanusStore } from "./store/sqliteStore";
+import type { StoredPendingApproval } from "./store/types";
+
+/**
+ * Durable backend contract PendingApprovalStore depends on. JanusStore implements it; a null
+ * backend (legacy / store-init-failed) means pure in-memory behavior, byte-for-byte as before.
+ * Typed structurally (not as the whole JanusStore) so the dependency surface stays minimal.
+ */
+export interface ApprovalDurableStore {
+  insertPendingApproval(a: StoredPendingApproval): void;
+  claimApproval(id: string): boolean;
+  deletePendingApproval(id: string): void;
+  getPendingApprovals(sessionId: string): StoredPendingApproval[];
+  getExpiredApprovals(now?: number): StoredPendingApproval[];
+}
+
+/** Optional metadata the server supplies on add() so the durable row can be fully formed. */
+export interface AddApprovalMeta {
+  /** Active project id at proposal time -> StoredPendingApproval.workspace_id. */
+  workspaceId?: string;
+  /** TTL window -> expires_at = record.timestamp + ttlMs (defaults to APPROVAL_DEFAULT_TTL_MS). */
+  ttlMs?: number;
+}
+
+/** Fallback TTL when add() is called without an explicit ttlMs (mirrors server's APPROVAL_TTL_MS). */
+export const APPROVAL_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 export type ApprovalKind = "agent_instruction" | "shell";
 export type RuntimeType = "shell" | "interactive_cli";
@@ -333,11 +359,96 @@ export class PendingApprovalStore {
   /** Per-session most-recently-announced id (keyed by the live session handle). */
   private lastAnnounced = new Map<any, string>();
 
-  add(record: PendingApproval, session: any): void {
+  // ── WS-M durability wiring ──────────────────────────────────────────────────
+  // The optional JanusStore is the DURABILITY layer (survives a process reopen). The
+  // in-memory maps above remain the live, O(1), same-shape working set within a running
+  // process; the store is the source of truth ONLY across a reopen. Every mutating method
+  // dual-writes (store + in-memory mirror) so the live call sites never change shape and the
+  // N-1 claim gate is enforced by the durable atomic SQL when a store is present.
+  //
+  // When `store === null` (JANUS_LEDGER_BACKEND=legacy or store init failed) every method
+  // takes the EXACT original in-memory path — legacy behavior is byte-for-byte preserved.
+  private readonly store: ApprovalDurableStore | null;
+  /**
+   * The live WS `session` handle is NOT serializable and churns per turn; durable rows need a
+   * stable string session_id. We mint one lazily per handle and keep a bidirectional map. The
+   * WeakMap (handle->sid) is GC-safe; the reverse Map (sid->handle) holds a strong ref that is
+   * cleared on purgeSession so dead handles don't leak.
+   */
+  private handleToSid = new WeakMap<object, string>();
+  private sidToHandle = new Map<string, any>();
+  /** Per-messageId durable session_id, so delete/claim/purge can address durable rows. */
+  private sidForId: Record<string, string> = {};
+  private sidSeq = 0;
+
+  constructor(store: JanusStore | ApprovalDurableStore | null = null) {
+    this.store = (store as ApprovalDurableStore) ?? null;
+    if (this.store) this.hydrateFromStore();
+  }
+
+  /**
+   * On construct with a durable store, repopulate the in-memory working set from any unclaimed
+   * survivors so the synchronous call sites (has/all/get) see them immediately after a cold
+   * reopen — BEFORE any live session reconnects. Survivors have no live handle yet (re-attach is
+   * WS-F), so they go in with `session === undefined`; forSession(liveHandle) naturally returns
+   * [] for a fresh handle, which is correct. Ordered by durable timestamp (== insertion order).
+   */
+  private hydrateFromStore(): void {
+    if (!this.store) return;
+    const rows = this.store.getExpiredApprovals(Number.MAX_SAFE_INTEGER); // claimed=0, all rows, ASC by expiry
+    for (const row of rows) {
+      const rec = hydrateApproval(row);
+      if (this.records[rec.messageId]) continue;
+      this.records[rec.messageId] = rec;
+      this.sessions[rec.messageId] = undefined; // no live handle until WS-F re-attach
+      this.order.push(rec.messageId);
+      this.sidForId[rec.messageId] = row.session_id;
+      this.sidToHandle.set(row.session_id, undefined);
+    }
+  }
+
+  /** Translate a live handle to a stable durable session_id, minting on first use. */
+  private sidFor(session: any): string {
+    if (session && typeof session === "object") {
+      const existing = this.handleToSid.get(session);
+      if (existing) return existing;
+      const sid = `sess_${++this.sidSeq}_${Date.now()}`;
+      this.handleToSid.set(session, sid);
+      this.sidToHandle.set(sid, session);
+      return sid;
+    }
+    // Non-object handles (e.g. {} or undefined in tests) can't key a WeakMap; fall back to a
+    // synthetic sid keyed off identity via the reverse map only. These are not durable-critical
+    // (tests with `{}` handles), so a fresh sid per add is acceptable.
+    const sid = `sess_${++this.sidSeq}_${Date.now()}`;
+    this.sidToHandle.set(sid, session);
+    return sid;
+  }
+
+  add(record: PendingApproval, session: any, meta: AddApprovalMeta = {}): void {
+    // In-memory mirror (identical to legacy) — always maintained so live call sites stay O(1).
     this.records[record.messageId] = record;
     this.sessions[record.messageId] = session;
     this.order.push(record.messageId);
     this.lastAnnounced.set(session, record.messageId);
+
+    if (!this.store) return; // legacy path: nothing else to do.
+
+    const sid = this.sidFor(session);
+    this.sidForId[record.messageId] = sid;
+    const ttlMs = meta.ttlMs ?? APPROVAL_DEFAULT_TTL_MS;
+    this.store.insertPendingApproval({
+      id: record.messageId,
+      session_id: sid,
+      workspace_id: meta.workspaceId ?? "default_project",
+      pane_id: record.terminalId,
+      command: record.instruction, // RAW (not redacted) — the approved write replays verbatim.
+      kind: record.kind,
+      rationale: record.rationale ? JSON.stringify(record.rationale) : null,
+      claimed: record.claimed ?? false,
+      timestamp: record.timestamp,
+      expires_at: record.timestamp + ttlMs,
+    });
   }
 
   get(messageId: string): PendingApproval | undefined {
@@ -353,8 +464,10 @@ export class PendingApprovalStore {
   }
 
   delete(messageId: string): void {
+    if (this.store) this.store.deletePendingApproval(messageId);
     delete this.records[messageId];
     delete this.sessions[messageId];
+    delete this.sidForId[messageId];
     this.order = this.order.filter((id) => id !== messageId);
   }
 
@@ -378,8 +491,23 @@ export class PendingApprovalStore {
     return this.lastAnnounced.get(session) ?? null;
   }
 
-  /** WS-F seam: atomic claim. Returns true if THIS caller won the claim. */
+  /**
+   * The MANDATORY N-1 atomic claim. With a durable store the winner is selected by the atomic SQL
+   * `claimApproval` (UPDATE ... WHERE claimed=0 => exactly one caller sees changes===1) so the
+   * single-writer gate survives a reopen (a claimed-but-undeleted survivor stays claimed=1 and
+   * cannot be re-claimed). Without a store it is the original in-memory flip. The in-memory
+   * `rec.claimed` mirror is kept in sync so a same-process second resolve short-circuits and
+   * `expired()`'s `!claimed` filter still holds.
+   */
   claim(messageId: string): boolean {
+    if (this.store) {
+      const won = this.store.claimApproval(messageId);
+      if (won) {
+        const rec = this.records[messageId];
+        if (rec) rec.claimed = true; // mirror for in-process short-circuits / expired() filter
+      }
+      return won;
+    }
     const rec = this.records[messageId];
     if (!rec || rec.claimed) return false;
     rec.claimed = true;
@@ -389,13 +517,67 @@ export class PendingApprovalStore {
   /** Purge every entry for a closed session. (WS-F TODO: persist + re-announce, not purge.) */
   purgeSession(session: any): string[] {
     const purged = this.order.filter((id) => this.sessions[id] === session);
-    for (const id of purged) this.delete(id);
+    for (const id of purged) this.delete(id); // delete() handles durable row removal too
     this.lastAnnounced.delete(session);
+    // Drop the handle<->sid mapping for this closed handle so dead handles don't leak.
+    if (session && typeof session === "object") {
+      const sid = this.handleToSid.get(session);
+      if (sid) { this.sidToHandle.delete(sid); this.handleToSid.delete(session); }
+    }
     return purged;
   }
 
-  /** Entries older than `ttlMs` (for the TTL auto-reject sweep). */
+  /**
+   * Entries older than `ttlMs` (for the TTL auto-reject sweep). With a durable store the sweep
+   * reads DURABLE expiry (getExpiredApprovals, which filters claimed=0 AND expires_at<now) so a
+   * survivor that crossed its TTL while the process was down is swept on the first post-reopen
+   * tick. Rows are hydrated and the in-memory mirror is reconciled so the returned records are the
+   * same objects the resolver will claim+delete. Without a store it is the original in-memory
+   * filter (`now - timestamp > ttlMs && !claimed`).
+   */
   expired(ttlMs: number, now: number = Date.now()): PendingApproval[] {
-    return this.all().filter((p) => now - p.timestamp > ttlMs && !p.claimed);
+    if (!this.store) {
+      return this.all().filter((p) => now - p.timestamp > ttlMs && !p.claimed);
+    }
+    const out: PendingApproval[] = [];
+    for (const row of this.store.getExpiredApprovals(now)) {
+      let rec = this.records[row.id];
+      if (!rec) {
+        // A survivor not yet in the in-memory mirror (e.g. hydrated lazily): fold it in so the
+        // resolver can claim/delete it through the normal in-process path.
+        rec = hydrateApproval(row);
+        this.records[rec.messageId] = rec;
+        this.sessions[rec.messageId] = this.sidToHandle.get(row.session_id);
+        this.sidForId[rec.messageId] = row.session_id;
+        if (!this.order.includes(rec.messageId)) this.order.push(rec.messageId);
+      }
+      out.push(rec);
+    }
+    return out;
   }
+}
+
+/** Hydrate a durable row back into the in-memory PendingApproval shape (inverse of add()'s map). */
+function hydrateApproval(row: StoredPendingApproval): PendingApproval {
+  let rationale: { trigger: string; summary: string } | undefined;
+  if (row.rationale) {
+    try {
+      const parsed = JSON.parse(row.rationale);
+      if (parsed && typeof parsed === "object") rationale = parsed;
+    } catch { /* corrupt rationale -> undefined (non-load-bearing for resolve) */ }
+  }
+  return {
+    messageId: row.id,
+    instruction: row.command,
+    kind: row.kind,
+    terminalId: row.pane_id,
+    // callId is a live functionCall id consumed once at proposal time; on reopen there is no live
+    // call to answer (re-attach is WS-F) and resolveDecision never reads it — so it is dropped.
+    callId: row.id,
+    rationale,
+    timestamp: row.timestamp,
+    claimed: row.claimed,
+    // capability has no column (option A): survivors default it; not read by any resolve path.
+    capability: "write_to_pane",
+  };
 }
