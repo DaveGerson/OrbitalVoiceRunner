@@ -17,6 +17,10 @@ logs/
 _ptyprobe_test*.cjs
 dist-tmp/
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Playwright e2e
 /test-results/
 /playwright-report/
