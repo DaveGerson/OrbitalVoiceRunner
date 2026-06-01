@@ -15,6 +15,7 @@
     "setup": "npm install && npm run typecheck && npm run test:unit && npm run build && npm run e2e:install",
     "e2e:install": "playwright install chromium",
     "smoke:claude": "tsx scripts/smoke-claude-pane.ts",
+    "smoke:handoff": "tsx scripts/smoke-handoff.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
