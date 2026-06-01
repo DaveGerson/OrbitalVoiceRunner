@@ -3,6 +3,7 @@ import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
+import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TerminalView } from "./components/TerminalView";
@@ -24,6 +25,8 @@ function AppRaw() {
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
+  // G1: gated non-PTY deferred actions (create_pane / set_*_permissions on the Ask tier).
+  const [pendingActions, setPendingActions] = useState<{ actionId: string; capability: string; summary: string }[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [recentlyIdled, setRecentlyIdled] = useState<Record<string, boolean>>({});
   const prevTerminalsRef = useRef<Terminal[]>([]);
@@ -405,6 +408,7 @@ function AppRaw() {
     queueStdoutChunk,
     setTranscript,
     setPendingCommands,
+    setPendingActions,
   });
 
   const fetchTerminals = async () => {
@@ -900,6 +904,25 @@ function AppRaw() {
     } catch (e) {}
   };
 
+  // G1: confirm/cancel a gated non-PTY deferred action. Optimistically drop from the UI; the
+  // server runs the staged side effect exactly once on confirm (no-ops on a lost race).
+  const handleConfirmAction = async (actionId: string) => {
+    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
+      setTimeout(fetchTerminals, 500);
+    } catch (e) {}
+  };
+
+  const handleCancelAction = async (actionId: string) => {
+    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
+    } catch (e) {}
+  };
+
   const handleCreateTerminal = async (
     id: string,
     cwd: string,
@@ -1083,6 +1106,17 @@ function AppRaw() {
               rationale: msg.rationale
             }];
           });
+        } else if (msg.type === "action_pending") {
+          // G1: a gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier.
+          playEarcon("alert");
+          triggerDesktopNotification("⚙ Action Pending", `Confirm: ${msg.summary}`);
+          setPendingActions(prev => {
+            if (prev.some(a => a.actionId === msg.actionId)) return prev;
+            return [...prev, { actionId: msg.actionId, capability: msg.capability, summary: msg.summary }];
+          });
+        } else if (msg.type === "action_resolved") {
+          // Confirmed/cancelled/expired elsewhere (REST/voice/TTL) — drop it from the UI.
+          setPendingActions(prev => prev.filter(a => a.actionId !== msg.actionId));
         } else if (msg.type === "switch_active_pane") {
           // Step 5: Janus switched the open pane at the operator's spoken direction. The UI obeys
           // (it remains the source of truth); the activeTerminalId effect echoes set_active_pane back.
@@ -2490,7 +2524,7 @@ function AppRaw() {
       )}
       
       {pendingCommands.map((pending) => (
-        <ApprovalDialog 
+        <ApprovalDialog
           key={pending.messageId}
           messageId={pending.messageId}
           terminalId={pending.terminalId}
@@ -2498,6 +2532,17 @@ function AppRaw() {
           rationale={pending.rationale}
           onApprove={handleApprove}
           onReject={handleReject}
+        />
+      ))}
+
+      {pendingActions.map((action) => (
+        <ActionConfirmDialog
+          key={action.actionId}
+          actionId={action.actionId}
+          capability={action.capability}
+          summary={action.summary}
+          onConfirm={handleConfirmAction}
+          onCancel={handleCancelAction}
         />
       ))}
       
