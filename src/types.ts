@@ -16,6 +16,39 @@ export type GateValue = "Auto" | "Ask" | "Off";
 
 export type CapabilityGateMap = Partial<Record<CapabilityGate, GateValue>>;
 
+// The DEFAULT global matrix (design §7, director posture 2026-06-01: "friction is worse,
+// gate by category"). This is the OFF-CONTEXT baseline — the gate that applies to a pane the
+// director is NOT focused on. The context layer (effectiveCapabilityGateFor) loosens the
+// ACTIVE pane's productive capabilities to Auto (the "spotlight"). Categories:
+//   - Productive writes (write_to_pane, deliver_handoff): Ask off-context — a write the
+//     director hasn't seen lands only with approval unless it's the focused pane.
+//   - Destructive (close_pane, restart_pane): Ask — killing work deserves a checkpoint.
+//   - Meta / changing-the-locks (set_pane_permissions, set_global_permissions,
+//     set_capability_gate): Ask — the control surface never bends to in-the-moment looseness.
+//   - Pane creation / plan / recipe (create_pane, execute_plan, apply_recipe, add_watch_rule):
+//     Ask — spawning agents or autonomous rules costs compute/money.
+//   - Low-risk orientation (switch_context, create_project, update_metadata, set_voice_mute,
+//     dismiss_attention): Auto — pure velocity, no pane mutation of consequence.
+// Anything omitted resolves to "Auto" via resolveCapabilityGate (back-compat).
+export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
+  write_to_pane: "Ask",
+  deliver_handoff: "Ask",
+  create_pane: "Ask",
+  close_pane: "Ask",
+  restart_pane: "Ask",
+  set_pane_permissions: "Ask",
+  set_global_permissions: "Ask",
+  set_capability_gate: "Ask",
+  add_watch_rule: "Ask",
+  execute_plan: "Ask",
+  apply_recipe: "Ask",
+  create_project: "Auto",
+  update_metadata: "Auto",
+  switch_context: "Auto",
+  set_voice_mute: "Auto",
+  dismiss_attention: "Auto",
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handoff artifact (design §4). A first-class, persisted artifact whose only
 // gated transition is staged → delivered (rides deliver_handoff → write_to_pane).

@@ -127,6 +127,64 @@ export function resolveCapabilityGate(
 }
 
 /**
+ * Capabilities the SPOTLIGHT may loosen on the ACTIVE pane (director posture 2026-06-01:
+ * "trust follows focus" — Janus acts freely where the director is looking). Only PRODUCTIVE
+ * writes are spotlight-eligible. Destructive (close/restart), meta (set_*_gate/permissions),
+ * and spawn (create_pane/apply_recipe/execute_plan) capabilities are NEVER auto-loosened by
+ * focus — they always fall through to the explicit/global gate.
+ */
+export const SPOTLIGHT_CAPABILITIES: ReadonlySet<string> = new Set<string>([
+  "write_to_pane",
+  "deliver_handoff",
+]);
+
+/**
+ * Context-aware gate resolution (the "spotlight"). Precedence:
+ *   1. Explicit per-pane override always wins (deliberate exception, both directions).
+ *   2. SPOTLIGHT: if this is the active pane AND the capability is productive/spotlight-eligible,
+ *      loosen to "Auto" (act freely where the director is focused) — but only when there is no
+ *      explicit per-pane override (rule 1).
+ *   3. Else the global default.
+ *   4. Else "Auto".
+ * Pure + unit-testable; the server passes in whether paneId is the active pane.
+ */
+export function resolveCapabilityGateWithContext(
+  paneGate: GateValue | undefined,
+  globalGate: GateValue | undefined,
+  capability: string,
+  isActivePane: boolean
+): GateValue {
+  if (paneGate !== undefined) return paneGate; // explicit per-pane override wins
+  if (isActivePane && SPOTLIGHT_CAPABILITIES.has(capability)) return "Auto"; // spotlight
+  return globalGate ?? "Auto";
+}
+
+/**
+ * Staged-handoff staleness (director posture 2026-06-01: "friction is worse" — a staged draft
+ * NEVER auto-expires/deletes; it is merely FLAGGED stale so the operator can notice and act).
+ * Default threshold 15 min. Pure; the caller derives this at read time from staged_at.
+ */
+export const STAGED_STALE_MS = 15 * 60 * 1000;
+export function isStagedStale(stagedAt: number | null | undefined, now: number, thresholdMs: number = STAGED_STALE_MS): boolean {
+  if (!stagedAt) return false;
+  return now - stagedAt > thresholdMs;
+}
+
+/** Restriction rank of a gate: higher = more restrictive. Auto(0) < Ask(1) < Off(2). */
+export function gateRank(g: GateValue): number {
+  return g === "Off" ? 2 : g === "Ask" ? 1 : 0;
+}
+
+/**
+ * Is changing `from` -> `to` a LOOSENING (less restrictive)? Loosening is the dangerous
+ * direction for the meta-gate (design §6, director posture 2026-06-01): a confused/misheard
+ * Janus loosening its own restraints by voice. Tightening (or equal) is always safe.
+ */
+export function isLoosening(from: GateValue, to: GateValue): boolean {
+  return gateRank(to) < gateRank(from);
+}
+
+/**
  * The single, pure gate decision. Both `kind`s pass through the SAME effective-mode gate;
  * `kind` does NOT bypass permissions. The allowlist check is IN ADDITION to the mode gate.
  */

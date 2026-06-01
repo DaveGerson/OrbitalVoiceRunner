@@ -73,6 +73,56 @@ Reading the table — the safety invariants it encodes:
 3. Everything here is mechanical and proven by the test. The *policy* questions (what the
    DEFAULTS should be per capability) live in `janus-capability-gate-handoffs.md`.
 
+## The spotlight (context-aware resolution) — `resolveCapabilityGateWithContext`
+
+Resolution now has FOUR tiers (precedence, highest first). The director posture is
+"trust follows focus": Janus acts freely on the pane the director is looking at.
+
+1. **Explicit per-pane override** — always wins, both directions (the deliberate exception).
+2. **Spotlight** — if `paneId === activePane` AND the capability is *productive* (in
+   `SPOTLIGHT_CAPABILITIES` = `write_to_pane`, `deliver_handoff`), resolve to `Auto`. Only
+   fires when there is no per-pane override (tier 1).
+3. **Global default** — the matrix below (`DEFAULT_CAPABILITY_GATES`).
+4. **`Auto`** — absent everything (legacy).
+
+The spotlight NEVER loosens destructive (`close_pane`/`restart_pane`), meta
+(`set_*_permissions`/`set_capability_gate`), or spawn (`create_pane`/`apply_recipe`/
+`execute_plan`) capabilities — those always fall through to tier 3/4 even on the active pane.
+
+## Default global matrix (`DEFAULT_CAPABILITY_GATES`) — "friction is worse, gate by category"
+
+This is the OFF-CONTEXT baseline. `Ask` for the sharp edges; `Auto` for low-risk orientation.
+
+- **Ask:** `write_to_pane`, `deliver_handoff` (productive writes off-context), `create_pane`,
+  `execute_plan`, `apply_recipe`, `add_watch_rule` (spawn/cost), `close_pane`, `restart_pane`
+  (destructive), `set_pane_permissions`, `set_global_permissions`, `set_capability_gate` (meta).
+- **Auto:** `create_project`, `update_metadata`, `switch_context`, `set_voice_mute`,
+  `dismiss_attention` (low-risk orientation).
+
+On the ACTIVE pane, the spotlight loosens `write_to_pane`/`deliver_handoff` to `Auto`.
+
+## Meta-gate — voice may TIGHTEN, never LOOSEN (`isLoosening`)
+
+`set_capability_gate` by VOICE is allowed to make a gate MORE restrictive (Auto→Ask, Ask→Off)
+and applies immediately. A LOOSENING change (Off→Ask, Ask→Auto) is REFUSED by voice and must
+be done deliberately in the Settings UI — so a confused/misheard Janus cannot loosen its own
+restraints. Restriction rank: `Auto(0) < Ask(1) < Off(2)`.
+
+## Secret guard — prompts must never carry secrets (`classifySecrets`)
+
+A composed prompt is classified before staging/delivery:
+- **high** (recognized formats: private key, JWT, AWS/Google/GitHub/Slack keys) ⇒ **hard-block**
+  staging AND delivery; audited.
+- **low** (ambiguous `key=value` assignment) ⇒ deliver/stage **with a warning** (never silently
+  mutate the verbatim prompt the PTY needs).
+- **none** ⇒ proceed.
+
+## Staged staleness — flag, never delete (`isStagedStale`)
+
+A staged-but-undelivered handoff NEVER auto-expires. `list_handoffs` derives a `stale` flag +
+`staged_age_seconds` at read time (threshold `STAGED_STALE_MS` = 15 min) so the operator can
+notice; nothing is deleted.
+
 ## Test coverage map
 
 `tests/test_capability_gate.ts` asserts:

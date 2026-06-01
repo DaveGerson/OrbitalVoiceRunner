@@ -7,14 +7,16 @@ import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets } from "./src/terminal";
+import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets } from "./src/terminal";
 import { SHELL_PROMPT } from "./src/statusConstants";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
   decideProposal,
   resolveDecision,
-  resolveCapabilityGate,
+  resolveCapabilityGateWithContext,
+  isLoosening,
+  isStagedStale,
   inferKind,
   loadShellAllowlist,
   serializePending,
@@ -1289,9 +1291,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     return manager.globalPermissionsMode as EffectiveMode;
   }
 
-  // Capability-gate resolution (design §3), parallel to effectiveModeFor. Per-pane override wins,
-  // else the global default, else "Auto" (back-compat: absent matrix == today's behavior). The
-  // gate is AND-composed with effectiveMode inside decideProposal (a gate only TIGHTENS the mode).
+  // Capability-gate resolution (design §3) with the SPOTLIGHT (director posture 2026-06-01:
+  // "trust follows focus"). Precedence: explicit per-pane override > spotlight (active pane +
+  // productive capability => Auto) > global default > Auto. The gate is AND-composed with
+  // effectiveMode inside decideProposal (a gate only TIGHTENS the mode). Resolution itself is the
+  // pure, unit-tested resolveCapabilityGateWithContext — keep this in lockstep with that function.
   function effectiveCapabilityGateFor(paneId: string | null | undefined, capability: CapabilityGate): GateValue {
     const globalGates = manager.settings.advanced?.capabilityGates;
     let paneGate: GateValue | undefined;
@@ -1299,9 +1303,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const proj = manager.ledger.getActiveProject();
       paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
     }
-    // Precedence is the pure, unit-tested resolveCapabilityGate (design §3): pane override
-    // wins, else global default, else "Auto". Keep this in lockstep with that function.
-    return resolveCapabilityGate(paneGate, globalGates?.[capability]);
+    const isActivePane = !!paneId && activePaneId === paneId;
+    return resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
   }
 
   // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
@@ -2229,13 +2232,27 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     if (!targetExists) {
                       resp = `Cannot stage: target pane ${h.to_pane} no longer exists.`;
                     } else {
-                      const staged = store.updateHandoffState(handoff_id, "staged");
-                      broadcast({ type: "handoffs_updated" });
-                      resp = {
-                        handoff_id,
-                        state: staged?.state,
-                        message: `Handoff ${handoff_id} is staged for pane ${h.to_pane}. Ask the operator to approve delivery (deliver_handoff).`,
-                      };
+                      // Secret guard (director posture: prompts must never contain secrets).
+                      // High-confidence leak -> BLOCK staging; low-confidence -> stage WITH a warning.
+                      const scan = classifySecrets(h.composed_prompt);
+                      if (scan.confidence === "high") {
+                        if (store) {
+                          const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                          store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: h.to_pane, summary: `BLOCKED staging handoff ${handoff_id}: secret detected (${scan.labels.join(", ")})`, payload: { handoff_id, refused: true, secret_labels: scan.labels }, handoff_id });
+                        }
+                        resp = `Blocked: the composed prompt for handoff ${handoff_id} appears to contain a secret (${scan.labels.join(", ")}). Prompts must never carry secrets — revise it to remove the credential, then stage again.`;
+                      } else {
+                        const staged = store.updateHandoffState(handoff_id, "staged");
+                        broadcast({ type: "handoffs_updated" });
+                        const warn = scan.confidence === "low"
+                          ? ` WARNING: the prompt contains a possible credential assignment (${scan.labels.join(", ")}) — confirm it carries no real secret before approving delivery.`
+                          : "";
+                        resp = {
+                          handoff_id,
+                          state: staged?.state,
+                          message: `Handoff ${handoff_id} is staged for pane ${h.to_pane}. Ask the operator to approve delivery (deliver_handoff).${warn}`,
+                        };
+                      }
                     }
                   }
                 }
@@ -2269,10 +2286,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 } else {
                   const activeProjectId = manager.ledger.activeProjectId || "default_project";
                   const rows = store.listHandoffs({ workspaceId: activeProjectId, state: state || undefined });
-                  resp = rows.map(h => ({
-                    handoff_id: h.id, state: h.state, to_pane: h.to_pane, from_pane: h.from_pane,
-                    revision_count: h.revision_count, composed_prompt: redactSecrets(h.composed_prompt).slice(0, 200),
-                  }));
+                  const now = Date.now();
+                  resp = rows.map(h => {
+                    const stale = h.state === "staged" && isStagedStale(h.staged_at, now);
+                    return {
+                      handoff_id: h.id, state: h.state, to_pane: h.to_pane, from_pane: h.from_pane,
+                      revision_count: h.revision_count, composed_prompt: redactSecrets(h.composed_prompt).slice(0, 200),
+                      // Staged drafts never auto-expire; surface a stale flag so the operator notices.
+                      ...(h.state === "staged" ? { stale, staged_age_seconds: h.staged_at ? Math.floor((now - h.staged_at) / 1000) : null } : {}),
+                    };
+                  });
                 }
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: resp } }]
@@ -2312,6 +2335,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: handoff ${handoff_id} not found.` } }] });
                   } else if (h.state !== "staged") {
                     session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Handoff ${handoff_id} is '${h.state}', not 'staged'. Stage it before delivery.` } }] });
+                  } else if (classifySecrets(h.composed_prompt).confidence === "high") {
+                    // Deliver-time backstop: a prompt revised to a secret after staging is still
+                    // hard-blocked before it can reach the PTY (prompts must never carry secrets).
+                    const scan = classifySecrets(h.composed_prompt);
+                    if (store) {
+                      const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                      store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: h.to_pane, summary: `BLOCKED delivery of handoff ${handoff_id}: secret detected (${scan.labels.join(", ")})`, payload: { handoff_id, refused: true, secret_labels: scan.labels }, handoff_id });
+                    }
+                    session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Blocked: handoff ${handoff_id}'s prompt appears to contain a secret (${scan.labels.join(", ")}). Revise it to remove the credential before delivery.` } }] });
                   } else {
                     const outcome = dispatchProposal({
                       sess: session,
@@ -2343,14 +2375,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   }
                 }
               } else if (name === "set_capability_gate") {
-                // META (design §6): gated 'Ask' via voice; this voice handler ROUTES through the
-                // gate. For v1 the gate change itself is applied immediately to settings (the
-                // global default) or the pane override, then audited. (REST/UI path is Auto.)
+                // META self-gate (design §6, director posture 2026-06-01): "changing the locks"
+                // is the one deliberate exception to defaults-are-overridable. TIGHTENING a gate
+                // by voice (e.g. Auto->Ask, Ask->Off) is always safe and applies immediately.
+                // LOOSENING by voice (e.g. Off->Ask, Ask->Auto) is REFUSED — it must be a
+                // deliberate UI act, so a confused/misheard Janus cannot loosen its own restraints.
                 const { pane_id, capability, gate } = args;
                 const validGates = ["Auto", "Ask", "Off"];
                 let resp: any;
                 if (!validGates.includes(gate)) {
                   resp = `Invalid gate "${gate}". Must be one of: Auto, Ask, Off.`;
+                } else if (isLoosening(effectiveCapabilityGateFor(pane_id || null, capability as CapabilityGate), gate as GateValue)) {
+                  const current = effectiveCapabilityGateFor(pane_id || null, capability as CapabilityGate);
+                  resp = `For safety I can't LOOSEN a capability gate by voice (you asked to change '${capability}' from ${current} to ${gate}). Loosening must be done deliberately in the Settings UI. I can TIGHTEN gates by voice anytime.`;
+                  if (store) {
+                    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+                    store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: pane_id ?? null, summary: `REFUSED voice loosen ${capability} ${current}->${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`, payload: { capability, from: current, to: gate, pane_id: pane_id ?? null, refused: true } });
+                  }
                 } else {
                   if (!manager.settings.advanced.capabilityGates) manager.settings.advanced.capabilityGates = {};
                   if (pane_id) {
