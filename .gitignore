@@ -22,3 +22,6 @@ dist-tmp/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+
+# Claude Code machine-local settings (not committed)
+.claude/settings.local.json
