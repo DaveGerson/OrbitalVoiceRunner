@@ -191,3 +191,31 @@ test("updatePane writes a PaneMeta through to the panes table", () => {
   assert.equal(p.tool_preset, "Codex");
   s.close();
 });
+
+// bead 8sq (schema v4): per-pane capability-gate override round-trips through updatePane → getProject
+// (was SILENTLY DROPPED before — the panes table had no capability_gates column / hydrate path).
+test("updatePane persists per-pane capabilityGates and getProject hydrates it (durable across reopen)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-pg-"));
+  const dbPath = path.join(dir, "janus.db");
+  const s1 = new JanusStore(dbPath); s1.init();
+  s1.saveWorkspace({ id: "p1", name: "P1", directory: "", summary: "", key_terms: [], created_at: 0, updated_at: 0 });
+  const meta = {
+    pane_id: "t1", name: "t1", alive: true, last_known_state: "Idle", is_busy: false,
+    session_id: "", context_size: 0, tool_preset: "Custom", permissions_mode: "Full Auto",
+    runtime_type: "shell", notes: [], capabilityGates: { write_to_pane: "Off", close_pane: "Ask" },
+  } as any;
+  s1.updatePane("p1", meta, false);
+  s1.close();
+
+  // Reopen: the override must hydrate from the persisted column.
+  const s2 = new JanusStore(dbPath); s2.init();
+  const pane = s2.getProject("p1")?.panes["t1"];
+  assert.deepEqual(pane?.capabilityGates, { write_to_pane: "Off", close_pane: "Ask" }, "override hydrated after reopen");
+
+  // Clearing the override (undefined) erases the column rather than leaving a stale value.
+  s2.updatePane("p1", { ...meta, capabilityGates: undefined }, false);
+  const cleared = s2.getProject("p1")?.panes["t1"];
+  assert.strictEqual(cleared?.capabilityGates, undefined, "cleared override hydrates as undefined");
+  s2.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

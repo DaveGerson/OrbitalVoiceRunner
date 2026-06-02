@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -191,6 +191,18 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       ALTER TABLE panes ADD COLUMN draft TEXT;
       ALTER TABLE panes ADD COLUMN model_context TEXT NOT NULL DEFAULT '[]';
       ALTER TABLE panes ADD COLUMN human_context TEXT NOT NULL DEFAULT '[]';
+    `);
+  },
+  // v4 (bead 8sq): per-pane capability-gate OVERRIDE map. `capability_gates` is a JSON-encoded
+  // CapabilityGateMap (Partial<Record<CapabilityGate,GateValue>>) or NULL (no override → falls
+  // through to the global default). Until now per-pane gates set via the voice tool / matrix UI were
+  // SILENTLY DROPPED on the next getProject() reconstruction (the SQLite default backend never
+  // persisted the field) — this column closes that data-loss path. Additive + nullable, so existing
+  // explicit-column pane INSERT/UPSERTs are unaffected (the upsert sets it explicitly going forward).
+  (db) => {
+    db.exec(`
+      ALTER TABLE panes ADD COLUMN capability_gates TEXT;
+      ALTER TABLE panes_archive ADD COLUMN capability_gates TEXT;
     `);
   },
 ];

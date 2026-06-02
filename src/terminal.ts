@@ -1,6 +1,7 @@
 import { Ledger, PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
+import { preservePresetGates } from "./settingsGatesRoundTrip";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
 import { PtyTransport, createPtyTransport } from "./ptyTransport";
@@ -12,7 +13,10 @@ import {
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
-    return input.map((item: any) => ({
+    // bead 8sq: preservePresetGates carries per-preset capabilityGates through the field-by-field
+    // rebuild. This is the SERVER-SIDE persistence choke-point (updateSettings -> here); without it
+    // a saved preset's gate matrix was silently erased even when the client sent it.
+    return input.map((item: any) => preservePresetGates({
       id: String(item?.id || ""),
       name: String(item?.name || ""),
       command: String(item?.command || ""),
@@ -25,7 +29,7 @@ export function parsePresetsSafe(input: any): CliPreset[] {
       sessionResume: Boolean(item?.sessionResume ?? true),
       portOffset: item?.portOffset !== undefined ? String(item.portOffset) : "",
       customEnvVars: item?.customEnvVars !== undefined ? String(item.customEnvVars) : ""
-    }));
+    }, item));
   }
   if (input && typeof input === "object") {
     return Object.entries(input).map(([key, val]: [string, any]) => {
@@ -36,7 +40,7 @@ export function parsePresetsSafe(input: any): CliPreset[] {
       else {
         displayName = key.charAt(0).toUpperCase() + key.slice(1);
       }
-      return {
+      return preservePresetGates({
         id: key,
         name: val?.name || displayName,
         command: String(val?.command || ""),
@@ -49,7 +53,8 @@ export function parsePresetsSafe(input: any): CliPreset[] {
         sessionResume: Boolean(val?.sessionResume ?? true),
         portOffset: val?.portOffset !== undefined ? String(val.portOffset) : "",
         customEnvVars: val?.customEnvVars !== undefined ? String(val.customEnvVars) : ""
-      };
+      // bead 8sq: carry per-preset capabilityGates through (server-side persistence path).
+      }, val);
     });
   }
   return [

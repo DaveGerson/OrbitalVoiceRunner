@@ -1,0 +1,359 @@
+// Voice-tool backend suite (bead 8sq BACKEND slice).
+//
+// Boots the REAL server in-process via the ce7 harness (no Gemini API key, no
+// microphone): JANUS_NO_AUTOSTART=1, installMockLive() swaps the injectable
+// liveConnector for a fake session that records what the server sends it and lets
+// us push synthetic tool calls into the real onmessage dispatch, and
+// startServer({ port: 0, enableVite: false }) yields an ephemeral headless server.
+//
+// This suite OWNS its own boot scaffolding + WS client + message collector + api()
+// helper — ce7's tests/test_live_harness.ts keeps those LOCAL and does not export
+// shared fixtures, so we do not depend on them.
+//
+// Covers:
+//   (A) stop_all — the emergency kill switch (voice + REST + WS), including the
+//       safety-critical assertion that it BYPASSES the capability gate (an Off gate
+//       can never forbid an emergency halt).
+//   (B) voice tool surface PARITY guard — the set of onmessage dispatch handler
+//       names must equal the set of FunctionDeclaration names (both must now contain
+//       stop_all), so a future gated handler can't silently ship without a voice tool.
+//
+// FIXTURE NOTE: stop_all only reads `term.status` and calls `term.writeInput("\x03")`
+// (transport-null-safe). We register lightweight stub terminals directly into
+// manager.terminals rather than spawning real ConPTY shells: on Windows, repeatedly
+// spawn+kill of cmd.exe trips node-pty's "AttachConsole failed" agent crash, which
+// destabilizes the unit runner. The stub exercises the genuine stopAllPanes / REST /
+// WS / voice / broadcast / gate-bypass code paths deterministically, and lets us set
+// an "Exited" pane without killing an OS process. The real-PTY interrupt write is
+// already proven by the live smoke (npm run smoke:claude) + create_pane handler.
+
+import { describe, it, before, after } from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { fileURLToPath } from "url";
+import { WebSocket } from "ws";
+import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
+import type { RunningServer } from "../server";
+
+// Minimal stand-in for a UniversalTerminal, covering the surface stopAllPanes uses.
+class StubTerminal {
+  status: "Running" | "Exited" | "Idle";
+  lastCommand = "";
+  writeInputCount = 0;
+  stopCount = 0;
+  constructor(public terminalId: string, status: "Running" | "Exited" | "Idle" = "Running") {
+    this.status = status;
+  }
+  // Mirrors UniversalTerminal.writeInput's relevant side effects: record the command
+  // and optimistically mark the pane Running (an interrupt is still "alive", design §5).
+  writeInput(command: string) {
+    this.lastCommand = command;
+    this.writeInputCount++;
+    if (this.status !== "Exited") this.status = "Running";
+  }
+  async stop() { this.stopCount++; this.status = "Exited"; }
+}
+
+describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let session: MockLiveSession;
+  let client: WebSocket;
+  let clientMessages: any[];
+  let base: string;
+  let tmpDir: string;
+  let prevCwd: string;
+
+  // Authenticated REST helper against the ephemeral server.
+  const api = (pathname: string, init: RequestInit = {}): Promise<Response> =>
+    fetch(`${base}${pathname}`, {
+      ...init,
+      headers: { "x-api-token": apiToken, "content-type": "application/json", ...(init.headers || {}) },
+    });
+
+  // Register a live (or exited) stub pane directly into the manager. stop_all keys
+  // purely off term.status / term.writeInput, so this exercises the real code path.
+  function addPane(paneId: string, status: "Running" | "Exited" | "Idle" = "Running"): StubTerminal {
+    const t = new StubTerminal(paneId, status);
+    (running.manager.terminals as any)[paneId] = t;
+    return t;
+  }
+
+  // Drop every stub pane so each test starts from a known-empty terminal set.
+  function clearPanes() {
+    for (const id of Object.keys(running.manager.terminals)) {
+      delete (running.manager.terminals as any)[id];
+    }
+  }
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+
+    // Isolate the .janus_* ledger/scrollback files into a temp cwd BEFORE importing
+    // ../server (its boot-time store restore reads the cwd).
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-vt-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    running = await startServer({ port: 0, enableVite: false });
+    base = `http://127.0.0.1:${running.port}`;
+
+    clientMessages = [];
+    client = new WebSocket(`ws://127.0.0.1:${running.port}/live`, {
+      headers: { Cookie: `auth_token=${apiToken}` },
+    });
+    client.on("message", (data) => {
+      try { clientMessages.push(JSON.parse(data.toString())); } catch { /* non-JSON */ }
+    });
+    await new Promise<void>((resolve, reject) => {
+      client.on("open", () => resolve());
+      client.on("error", reject);
+    });
+
+    session = await waitFor(() => mock.latest());
+  });
+
+  after(async () => {
+    // Clear any leftover Stage-1 freeze so the persisted `frozen` kv flag never leaks across suites.
+    try { await api("/api/stop-all/release", { method: "POST" }); } catch {}
+    clearPanes();
+    // Drain the client socket BEFORE closing the server (Windows libuv double-close).
+    if (client && client.readyState !== WebSocket.CLOSED) {
+      await new Promise<void>((resolve) => {
+        client.once("close", () => resolve());
+        try { client.terminate(); } catch { resolve(); }
+      });
+    }
+    try { await running?.close(); } catch {}
+    // Let any in-flight libuv async-handle close (better-sqlite3) fully settle before
+    // the runner's --test-force-exit calls process.exit. With two in-process server
+    // suites sharing the singleton store, an unsettled CLOSING handle at exit aborts
+    // (Assertion: !(handle->flags & UV_HANDLE_CLOSING), src/win/async.c).
+    await new Promise((r) => setTimeout(r, 100));
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  });
+
+  // Release the freeze between tests so the two-stage state never leaks across cases.
+  async function releaseFreeze() {
+    await api("/api/stop-all/release", { method: "POST" });
+  }
+
+  // TWO-STAGE STOP-ALL (spec §2.C). This SUPERSEDES the interim one-stage Ctrl-C behavior:
+  //   stop_all          = Stage 1 (freeze + cancel in-flight; PANES KEEP RUNNING).
+  //   confirm_stop_all  = Stage 2 (kill running PTYs; only valid while frozen).
+  //   release_stop_all  = clear the freeze.
+  // The dedicated two-stage detail suite is tests/test_stop_all_two_stage.ts; here we keep the
+  // always-allowed gate-bypass + voice-surface-parity pins (still valid under the new design).
+  describe("stop_all emergency brake (two-stage)", () => {
+    it("voice stop_all freezes (Stage 1) and does NOT touch the panes", async () => {
+      clearPanes();
+      const a = addPane("vt-stop-a");
+      addPane("vt-stop-b");
+
+      const callId = session.emitToolCall("stop_all");
+      const out = String(await waitFor(() => mock.responseFor(callId)));
+
+      // Stage 1 is a freeze, not an interrupt: no Ctrl-C, no kill, panes survive.
+      assert.strictEqual(a.writeInputCount, 0, "no Ctrl-C written in Stage 1");
+      assert.notStrictEqual(running.manager.terminals["vt-stop-a"].status, "Exited", "pane survives Stage 1");
+      assert.ok(/froze|frozen|freeze/i.test(out), `read-back says it froze: ${out}`);
+      assert.ok(/kill|confirm|release/i.test(out), `read-back offers Stage-2 / release: ${out}`);
+      await releaseFreeze();
+    });
+
+    it("voice confirm_stop_all (Stage 2) kills running PTYs via term.stop()", async () => {
+      clearPanes();
+      const a = addPane("vt-kill-a");
+      const froze = session.emitToolCall("stop_all");
+      await waitFor(() => mock.responseFor(froze));
+
+      const kill = session.emitToolCall("confirm_stop_all");
+      const out = String(await waitFor(() => mock.responseFor(kill)));
+      assert.strictEqual(a.status, "Exited", "Stage 2 stopped the pane PTY");
+      assert.ok(out.includes("vt-kill-a"), "kill read-back names the pane");
+      await releaseFreeze();
+    });
+
+    it("voice confirm_stop_all with no panes still reports nothing-to-kill (Stage 2 no-op)", async () => {
+      clearPanes();
+      const froze = session.emitToolCall("stop_all");
+      await waitFor(() => mock.responseFor(froze));
+      const kill = session.emitToolCall("confirm_stop_all");
+      const out = String(await waitFor(() => mock.responseFor(kill)));
+      assert.ok(/no running panes|nothing/i.test(out), `nothing-to-kill read-back: ${out}`);
+      await releaseFreeze();
+    });
+
+    it("voice release_stop_all clears the freeze", async () => {
+      clearPanes();
+      const froze = session.emitToolCall("stop_all");
+      await waitFor(() => mock.responseFor(froze));
+      const rel = session.emitToolCall("release_stop_all");
+      const out = String(await waitFor(() => mock.responseFor(rel)));
+      assert.ok(/released|resume|un-?frozen/i.test(out), `release read-back: ${out}`);
+    });
+
+    it("GATE BYPASS: an Off global write_to_pane gate cannot forbid stop_all", async () => {
+      clearPanes();
+      addPane("vt-bypass-a");
+
+      // Tighten write_to_pane to Off by voice (tightening is allowed by set_capability_gate).
+      const gateCall = session.emitToolCall("set_capability_gate", { capability: "write_to_pane", gate: "Off" });
+      await waitFor(() => mock.responseFor(gateCall));
+
+      // stop_all MUST still freeze — it does not route through gateOrDefer.
+      const callId = session.emitToolCall("stop_all");
+      const out = String(await waitFor(() => mock.responseFor(callId)));
+      assert.ok(out.includes("vt-bypass-a"), "stop_all still names the still-running pane despite write_to_pane=Off");
+      assert.ok(!/forbidden|gated/i.test(out), `stop_all output never mentions a gate refusal: ${out}`);
+
+      await releaseFreeze();
+      // Reset the global gate so later tests/suites aren't polluted.
+      if (running.manager.settings.advanced.capabilityGates) {
+        delete (running.manager.settings.advanced.capabilityGates as any).write_to_pane;
+      }
+    });
+
+    it("GATE BYPASS 2: a per-pane Off gate cannot forbid stop_all for that pane", async () => {
+      clearPanes();
+      addPane("vt-bypass2-a");
+
+      // Set per-pane close_pane + write_to_pane = Off on the live pane. The pane must
+      // exist in the active project ledger for a per-pane gate to attach, so register it.
+      const proj = running.manager.ledger.getActiveProject();
+      if (proj) {
+        proj.panes["vt-bypass2-a"] = { ...(proj.panes["vt-bypass2-a"] || {}), id: "vt-bypass2-a", name: "vt-bypass2-a" } as any;
+      }
+      const g1 = session.emitToolCall("set_capability_gate", { pane_id: "vt-bypass2-a", capability: "write_to_pane", gate: "Off" });
+      await waitFor(() => mock.responseFor(g1));
+      const g2 = session.emitToolCall("set_capability_gate", { pane_id: "vt-bypass2-a", capability: "close_pane", gate: "Off" });
+      await waitFor(() => mock.responseFor(g2));
+
+      const callId = session.emitToolCall("stop_all");
+      const out = String(await waitFor(() => mock.responseFor(callId)));
+      assert.ok(out.includes("vt-bypass2-a"), "stop_all still includes the pane despite its per-pane Off gates");
+      assert.ok(!/forbidden/i.test(out), "no 'forbidden' response is ever produced for stop_all");
+
+      await releaseFreeze();
+      if (proj) delete proj.panes["vt-bypass2-a"];
+    });
+
+    it("REST: POST /api/stop-all (Stage 1) returns 200, frozen:true, and the still-running set", async () => {
+      clearPanes();
+      addPane("vt-rest-a");
+      addPane("vt-rest-b");
+
+      const res = await api("/api/stop-all", { method: "POST" });
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.success, true);
+      assert.strictEqual(body.frozen, true, "Stage 1 reports frozen:true");
+      assert.ok(Array.isArray(body.running), "running is an array");
+      assert.ok(body.running.includes("vt-rest-a"), "running includes vt-rest-a");
+      assert.ok(body.running.includes("vt-rest-b"), "running includes vt-rest-b");
+      await releaseFreeze();
+    });
+
+    it("REST: POST /api/stop-all without a token returns 401 and freezes nothing", async () => {
+      clearPanes();
+      const a = addPane("vt-auth-a");
+      const res = await fetch(`${base}/api/stop-all`, { method: "POST" });
+      assert.strictEqual(res.status, 401, "missing token -> 401");
+      // The unauthorized request never reached the handler, so the pane is untouched.
+      assert.strictEqual(a.writeInputCount, 0, "no interrupt written by the 401 request");
+      assert.strictEqual(a.stopCount, 0, "no kill from the 401 request");
+    });
+
+    it("WS control: {type:'stop_all'} (Stage 1) yields a stop_all_done ack with the running set", async () => {
+      clearPanes();
+      addPane("vt-ws-a");
+      const seen = clientMessages.length;
+
+      client.send(JSON.stringify({ type: "stop_all" }));
+      const ack = await waitFor(() =>
+        clientMessages.slice(seen).find((m) => m.type === "stop_all_done" && m.stage === 1)
+      );
+      assert.strictEqual(ack.frozen, true, "ack reports frozen:true");
+      assert.ok(Array.isArray(ack.running), "ack carries a running array");
+      assert.ok(ack.running.includes("vt-ws-a"), "ack running includes vt-ws-a");
+      await releaseFreeze();
+    });
+
+    it("BROADCAST: Stage 1 emits {type:'frozen', frozen:true} + {type:'terminals_updated'}", async () => {
+      clearPanes();
+      addPane("vt-bcast-a");
+      const seen = clientMessages.length;
+
+      await api("/api/stop-all", { method: "POST" });
+
+      const bcast = await waitFor(() =>
+        clientMessages.slice(seen).find((m) => m.type === "frozen" && m.frozen === true)
+      );
+      assert.ok(Array.isArray(bcast.running), "frozen broadcast carries the running list");
+      assert.ok(bcast.running.includes("vt-bcast-a"), "frozen broadcast names vt-bcast-a");
+      const updated = clientMessages.slice(seen).find((m) => m.type === "terminals_updated");
+      assert.ok(updated, "a terminals_updated frame was broadcast");
+      await releaseFreeze();
+    });
+
+    it("DECLARATION shape: stop_all is declared as an empty-params EMERGENCY tool", () => {
+      const decls = session.params?.config?.tools?.[0]?.functionDeclarations;
+      const decl = decls.find((d: any) => d.name === "stop_all");
+      assert.ok(decl, "stop_all is in the live FunctionDeclarations");
+      assert.deepStrictEqual(decl.parameters?.properties ?? {}, {}, "stop_all has an empty properties object");
+      assert.ok(
+        /EMERGENCY|always/i.test(decl.description),
+        `stop_all description flags it as emergency/always-allowed: ${decl.description}`
+      );
+    });
+  });
+
+  describe("voice tool surface parity guard", () => {
+    it("dispatch-handler names === FunctionDeclaration names (both include stop_all)", () => {
+      const here = path.dirname(fileURLToPath(import.meta.url));
+      const src = fs.readFileSync(path.join(here, "..", "server.ts"), "utf8");
+
+      // Declaration name set: scope strictly to the functionDeclarations array region
+      // (a whole-file name:"X" match would also catch the functionResponses:[{name:"X"}]
+      // objects in the dispatch handlers — false positives).
+      const declStart = src.indexOf("functionDeclarations: [");
+      assert.ok(declStart >= 0, "located the functionDeclarations array");
+      const declEnd = src.indexOf("\n          ]", declStart);
+      assert.ok(declEnd > declStart, "located the close of the functionDeclarations array");
+      const declRegion = src.slice(declStart, declEnd);
+      const declNames = new Set([...declRegion.matchAll(/name:\s*"([a-z_]+)"/g)].map((m) => m[1]));
+
+      // Handler name set: the onmessage dispatch switch uses `name === "X"`. Scope to
+      // everything before the live-session config block (responseModalities) so the
+      // declaration region's name:"X" entries are not picked up.
+      const dispEnd = src.indexOf("responseModalities");
+      assert.ok(dispEnd > 0, "located the live-session config block");
+      const dispRegion = src.slice(0, dispEnd);
+      const handlerNames = new Set([...dispRegion.matchAll(/name === "([a-z_]+)"/g)].map((m) => m[1]));
+
+      assert.ok(handlerNames.has("stop_all"), "stop_all has a dispatch handler");
+      assert.ok(declNames.has("stop_all"), "stop_all has a FunctionDeclaration");
+
+      const onlyHandlers = [...handlerNames].filter((n) => !declNames.has(n)).sort();
+      const onlyDecls = [...declNames].filter((n) => !handlerNames.has(n)).sort();
+      assert.deepStrictEqual(onlyHandlers, [], `handlers missing a voice declaration: ${onlyHandlers.join(", ")}`);
+      assert.deepStrictEqual(onlyDecls, [], `declarations missing a dispatch handler: ${onlyDecls.join(", ")}`);
+      assert.strictEqual(handlerNames.size, declNames.size, "handler set and declaration set are the same size");
+    });
+  });
+});

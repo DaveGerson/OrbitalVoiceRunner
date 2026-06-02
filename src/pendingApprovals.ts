@@ -154,6 +154,21 @@ export interface DecideProposalInput {
 }
 
 /**
+ * STOP-ALL Stage-1 freeze short-circuit (spec §2.C / §3). While the global `frozen` flag is set,
+ * EVERY capability resolves Off (capability_forbidden) at the SINGLE gate-resolution choke-point —
+ * Janus literally cannot act anywhere until Release. This is a PURE pass-through on the already-
+ * resolved gate value: it NEVER mutates the underlying matrix (Release is therefore a clean clear,
+ * no snapshot/restore). Kept here next to resolveCapabilityGate* so the server's choke-point
+ * (effectiveCapabilityGateFor) applies it in ONE place and never scatters the `frozen` check.
+ *
+ * Always-allowed actions (the stop_all emergency brake itself) DELIBERATELY do not route through
+ * gate resolution, so this short-circuit can never forbid the halt/release that clears it.
+ */
+export function applyFrozenShortCircuit(frozen: boolean, resolved: GateValue): GateValue {
+  return frozen ? "Off" : resolved;
+}
+
+/**
  * Pure capability-gate RESOLUTION (design §3): which gate value applies for a (pane,
  * capability). The per-pane override always WINS when present (in both directions — a pane
  * set to "Auto" overrides a global "Off", because the override is a deliberate exception to

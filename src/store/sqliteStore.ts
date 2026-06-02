@@ -14,7 +14,14 @@ export class JanusStore {
     this.db.pragma("synchronous = NORMAL");
   }
   init(): void { applyMigrations(this.db); }
-  close(): void { this.db.close(); }
+  // Idempotent: better-sqlite3's db.close() is a no-op at the JS level on a second
+  // call, but each call still schedules a libuv async-handle close. When TWO
+  // in-process servers share this singleton store (e.g. two test suites that each
+  // boot startServer() and call RunningServer.close()), the second close races the
+  // first mid-teardown and the runner's --test-force-exit process.exit then aborts
+  // (Assertion: !(handle->flags & UV_HANDLE_CLOSING), src/win/async.c). Guarding on
+  // db.open ensures the native handle is closed exactly once.
+  close(): void { if (this.db.open) this.db.close(); }
 
   // ──────────────────────────────────────────────────────────────────────────
   // watchRules / plans — live, self-persisting arrays (Ledger parity).
@@ -542,6 +549,16 @@ export class JanusStore {
       this.db.prepare("UPDATE panes SET human_context=? WHERE pane_id=? AND workspace_id=?")
         .run(JSON.stringify(paneMeta.humanContext), paneMeta.pane_id, projectId);
     }
+    // bead 8sq: persist the per-pane capability-gate override. ALWAYS written (even when undefined →
+    // NULL) so clearing an override actually erases it rather than leaving a stale row value. The
+    // savePane upsert above doesn't touch this column, so this is the single place it round-trips.
+    {
+      const gates = paneMeta.capabilityGates && Object.keys(paneMeta.capabilityGates).length
+        ? JSON.stringify(paneMeta.capabilityGates)
+        : null;
+      this.db.prepare("UPDATE panes SET capability_gates=? WHERE pane_id=? AND workspace_id=?")
+        .run(gates, paneMeta.pane_id, projectId);
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -601,6 +618,9 @@ export class JanusStore {
       tool_preset: p.tool_preset,
       permissions_mode: p.permissions_mode,
       runtime_type: p.runtime_type,
+      // bead 8sq: hydrate the per-pane capability-gate override (schema v4). NULL/absent → undefined
+      // (no override; the resolver falls through to the global default).
+      capabilityGates: this.parseJSON<import("../types").CapabilityGateMap | undefined>(p.capability_gates ?? null, undefined as any) || undefined,
     } as import("../types").PaneMeta;
   }
 

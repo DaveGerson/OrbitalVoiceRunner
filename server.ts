@@ -1,7 +1,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import { WebSocketServer } from "ws";
 import http from "http";
@@ -24,6 +23,7 @@ import {
   serializePending,
   decideSweepAction,
   renderResumptionLine,
+  applyFrozenShortCircuit,
   APPROVAL_GRACE_MS,
   type ApprovalKind,
   type EffectiveMode,
@@ -37,14 +37,25 @@ import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
-import type { GateValue, CapabilityGate } from "./src/types";
+import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
+import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// Automatic session secret token loaded from env or generated cryptographically fresh on boot
-const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+// Automatic session secret token loaded from env or generated cryptographically fresh on boot.
+// Exported so in-process integration tests can authenticate without guessing the token.
+export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+
+// The Gemini Live session is created through this seam so tests and the offline
+// simulator can swap in a fake session (no API key, no microphone) that still
+// drives the real tool-dispatch / approval code paths in this file.
+export type LiveConnector = (ai: GoogleGenAI, params: any) => Promise<any>;
+let liveConnector: LiveConnector = (ai, params) => ai.live.connect(params);
+export function setLiveConnector(fn: LiveConnector) {
+  liveConnector = fn;
+}
 console.log("-----------------------------------------------------------------");
 console.log(`[SECURITY] Session API Authentication Token generated.`);
 console.log("-----------------------------------------------------------------");
@@ -214,7 +225,7 @@ try {
 // legacy automatically so the app still runs.
 const forceLegacy = process.env.JANUS_LEDGER_BACKEND === "legacy";
 const useSqliteLedger = store !== null && !forceLegacy;
-const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
+export const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
 console.log(useSqliteLedger
   ? "[STORE] OrchestratorManager ledger backend: SQLite (durable). Set JANUS_LEDGER_BACKEND=legacy to opt out."
   : `[STORE] OrchestratorManager ledger backend: legacy JSON Ledger${forceLegacy ? " (JANUS_LEDGER_BACKEND=legacy)" : " (store unavailable)"}.`);
@@ -222,7 +233,32 @@ console.log(useSqliteLedger
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
 // its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
 
-async function startServer() {
+export interface StartServerOptions {
+  /** Port to bind. Use 0 for an ephemeral port (handy in tests). Defaults to PORT (3000). */
+  port?: number;
+  /** Host to bind. Defaults to 0.0.0.0 in production, 127.0.0.1 otherwise. */
+  bindHost?: string;
+  /** Mount the Vite dev middleware. Defaults to true outside production. Disable in tests. */
+  enableVite?: boolean;
+  /** Actually call server.listen(). Defaults to true. */
+  listen?: boolean;
+}
+
+export interface RunningServer {
+  app: express.Express;
+  server: http.Server;
+  wss: WebSocketServer;
+  manager: OrchestratorManager;
+  /** The actually-bound port (resolved even when port 0 was requested). */
+  port: number;
+  /** Stop the HTTP/WS servers and tear down all live terminals. */
+  close: () => Promise<void>;
+}
+
+async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
+  const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
+  const shouldListen = options.listen ?? true;
+
   const app = express();
   app.use(express.json());
 
@@ -357,6 +393,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // UI via `set_active_pane`. It is the SINGLE source of truth for where Janus may write — see
   // `isPaneActiveForWrite`. Null when no pane is open / no UI is connected (no write permitted).
   let activePaneId: string | null = null;
+
+  // STOP-ALL Stage-1 freeze (bead 8sq, spec §2.C / §3). When set, the gate resolver short-circuits
+  // EVERY capability to Off at the single choke-point (effectiveCapabilityGateFor) — Janus cannot
+  // act anywhere until Release. PERSISTED to the durable kv ("frozen"="1") so a froze-for-a-reason
+  // survives a process restart; the matrix itself is NEVER mutated, so Release is a clean clear.
+  // Restored from the store on boot (below). Module-level `store` is the durable backend.
+  let frozen: boolean = store?.getKV("frozen") === "1";
+  const FROZEN_KV = "frozen";
+  function persistFrozen(value: boolean): void {
+    frozen = value;
+    if (!store) return;
+    try { if (value) store.setKV(FROZEN_KV, "1"); else store.deleteKV(FROZEN_KV); }
+    catch (e) { console.error("[STOP-ALL] failed to persist frozen flag:", e); }
+  }
 
   // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
   // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
@@ -702,6 +752,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   app.get("/api/terminals", (req, res) => {
     const list = Object.keys(manager.terminals).map((id) => {
       const term = manager.terminals[id];
+      // bead 8sq: include the SERVER-resolved effective posture (16 gate values + posture word)
+      // so the per-pane chip renders from server truth — no client policy re-derivation (spec §5).
+      const posture = posturePayloadForPane(id);
       return {
         id,
         cwd: term.cwd,
@@ -714,7 +767,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         permissions_mode: term.permissionsMode,
         tool_preset: term.toolPreset,
         session_id: term.sessionId,
-        context_size: term.contextSize
+        context_size: term.contextSize,
+        effective_gates: posture.effective_gates,
+        posture: posture.posture,
       };
     });
     res.json(list);
@@ -753,7 +808,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
     broadcastLedgerUpdate();
-    broadcast({ type: "terminals_updated" });
+    broadcastTerminalsUpdated();
     res.json({ success: true, result });
   });
 
@@ -768,7 +823,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       await term.stop();
       term.start();
       broadcastLedgerUpdate();
-      broadcast({ type: "terminals_updated" });
+      broadcastTerminalsUpdated();
       res.json({ success: true, message: `Terminal ${id} restarted.` });
     } else {
       const activeProject = manager.ledger.getActiveProject();
@@ -783,12 +838,40 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         
         manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, pane.tool_preset, pane.permissions_mode, pane.session_id);
         broadcastLedgerUpdate();
-        broadcast({ type: "terminals_updated" });
+        broadcastTerminalsUpdated();
         res.json({ success: true, message: `Terminal ${id} restored and started.` });
       } else {
         res.status(404).json({ error: "Terminal not found" });
       }
     }
+  });
+
+  // TWO-STAGE EMERGENCY STOP-ALL (bead 8sq, spec §2.C). Auth is enforced by
+  // app.use("/api", authMiddleware) — the single shared director token. Always-allowed
+  // (see stopAll/releaseStopAll): an emergency brake is never gated.
+  //   POST /api/stop-all          -> Stage 1 (freeze + cancel in-flight; panes keep running).
+  //   POST /api/stop-all/confirm  -> Stage 2 (hold-to-fire kill of running PTYs; only when frozen).
+  //   POST /api/stop-all/release  -> clear the freeze (clean restore; matrix was never mutated).
+  // GET the current freeze state so the client can restore the FROZEN banner on a fresh page load
+  // (spec §2.C/§10.3 — "frozen survives a restart"; the flag is persisted in the durable kv).
+  app.get("/api/stop-all/status", (_req, res) => {
+    res.json({ frozen, running: frozen ? runningPaneIds() : [] });
+  });
+  app.post("/api/stop-all", (_req, res) => {
+    const running = stopAll(false);
+    res.json({ success: true, frozen: true, running });
+  });
+  app.post("/api/stop-all/confirm", (_req, res) => {
+    if (!frozen) {
+      res.status(409).json({ success: false, error: "Not frozen — Stage 2 kill requires a prior Stage 1 freeze (POST /api/stop-all)." });
+      return;
+    }
+    const killed = stopAll(true);
+    res.json({ success: true, killed });
+  });
+  app.post("/api/stop-all/release", (_req, res) => {
+    releaseStopAll();
+    res.json({ success: true, frozen: false });
   });
 
   // Web API to write input command directly to terminal node (for broadcast or target manipulation)
@@ -935,6 +1018,48 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     res.json({ success: true });
   });
 
+  // bead 8sq (spec §2.B / §5): set the per-pane capability-gate OVERRIDE map from the matrix editor's
+  // per-pane scope. This is the UI sibling of the voice `set_capability_gate` tool, but the UI is the
+  // deliberate place where LOOSENING is allowed (voice may only tighten — see the tool handler), so
+  // this endpoint writes the operator-chosen map verbatim. Body: { capabilityGates: CapabilityGateMap }
+  // (a full or partial override map; keys absent fall through to global). Persists to the ledger pane
+  // and re-broadcasts so chips repaint from the new server-resolved posture.
+  app.put("/api/projects/:projectId/panes/:paneId/capability-gates", (req, res) => {
+    const { projectId, paneId } = req.params;
+    const incoming = req.body?.capabilityGates;
+    const ws = manager.ledger.getProject(projectId);
+    const pane = ws?.panes?.[paneId];
+    if (!pane) { res.status(404).json({ error: "Pane not found" }); return; }
+    // Normalize: only valid {Auto|Ask|Off} entries survive; an empty map clears the override
+    // (so the pane falls back to the global default rather than persisting a masking `{}`).
+    const clean: CapabilityGateMap = {};
+    let any = false;
+    if (incoming && typeof incoming === "object") {
+      for (const [k, v] of Object.entries(incoming)) {
+        if (v === "Auto" || v === "Ask" || v === "Off") { (clean as any)[k] = v; any = true; }
+      }
+    }
+    pane.capabilityGates = any ? clean : undefined;
+    // Persist via updatePane (the durable path for BOTH backends): legacy Ledger keeps the full
+    // PaneMeta in its JSON-backed map; the SQLite store writes the capability_gates column (schema
+    // v4). A bare ledger.save() would be a SQLite no-op and silently drop the override.
+    manager.ledger.updatePane(projectId, pane, true);
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed",
+          project_id: projectId,
+          pane_id: paneId,
+          summary: `UI set per-pane gates for ${paneId} (${any ? Object.keys(clean).length : 0} override(s))`,
+          payload: { action: "set_pane_gates", capabilityGates: any ? clean : null },
+        });
+      } catch { /* store optional */ }
+    }
+    broadcastLedgerUpdate();
+    broadcastTerminalsUpdated();
+    res.json({ success: true, capabilityGates: pane.capabilityGates ?? null });
+  });
+
   app.post("/api/projects/:id/switch", (req, res) => {
     const { id } = req.params;
     manager.ledger.switchContext(id);
@@ -982,7 +1107,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       manager.ledger["save"]();
     }
     broadcastLedgerUpdate();
-    broadcast({ type: "terminals_updated" });
+    broadcastTerminalsUpdated();
     res.json({ success: true });
   });
 
@@ -1003,7 +1128,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     const archived = manager.ledger.archiveExitedPanes(activeId);
     broadcastLedgerUpdate();
-    broadcast({ type: "terminals_updated" });
+    broadcastTerminalsUpdated();
     res.json({ success: true, archived });
   });
 
@@ -1027,7 +1152,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       return;
     }
     broadcastLedgerUpdate();
-    broadcast({ type: "terminals_updated" });
+    broadcastTerminalsUpdated();
     res.json({ success: true });
   });
 
@@ -1226,7 +1351,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }
       }
       broadcastLedgerUpdate();
-      broadcast({ type: "terminals_updated" });
+      broadcastTerminalsUpdated();
       res.json({ success: true });
     } else {
       res.status(404).json({ error: "Recipe layout not found." });
@@ -1361,7 +1486,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
     }
     const isActivePane = !!paneId && activePaneId === paneId;
-    return resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
+    const resolved = resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
+    // STOP-ALL Stage-1: the ONE place the `frozen` short-circuit is applied. While frozen every
+    // capability resolves Off; the matrix above is untouched, so Release re-exposes it exactly.
+    return applyFrozenShortCircuit(frozen, resolved);
   }
 
   // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
@@ -1415,6 +1543,143 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     return { disposition: "run" };
   }
 
+  // ── EFFECTIVE-POSTURE SERVER TRUTH (bead 8sq, spec §3 item 1 / §5) ─────────────────────────────
+  // The chips + popover render from SERVER truth — never client policy re-derivation. We resolve
+  // the 16 effective gate values + the derived posture word per pane here (reusing the pure
+  // gateSurface) and expose them in /api/terminals AND the terminals_updated broadcast. The frozen
+  // short-circuit is reflected because effectiveCapabilityGateFor (which deriveEffectiveGates mirrors)
+  // already returns Off while frozen — but deriveEffectiveGates is pure (no `frozen` arg), so we
+  // overlay the same applyFrozenShortCircuit here to keep the surface in lockstep with the resolver.
+  function effectiveGatesForPane(paneId: string): Record<CapabilityGate, GateValue> {
+    const globalGates = manager.settings.advanced?.capabilityGates;
+    const proj = manager.ledger.getActiveProject();
+    const paneGates = proj?.panes?.[paneId]?.capabilityGates;
+    const isActivePane = activePaneId === paneId;
+    const base = deriveEffectiveGates(paneGates, globalGates, isActivePane);
+    if (!frozen) return base;
+    // Frozen overlay — mirror the resolver's single-choke-point short-circuit on the surface.
+    const out = {} as Record<CapabilityGate, GateValue>;
+    for (const cap of ALL_CAPABILITIES) out[cap] = applyFrozenShortCircuit(true, base[cap]);
+    return out;
+  }
+  function posturePayloadForPane(paneId: string): { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> } {
+    const effective = effectiveGatesForPane(paneId);
+    const mode = effectiveModeFor(paneId) as GateSurfaceMode;
+    return { id: paneId, effective_gates: effective, posture: derivePostureWord(effective, mode) };
+  }
+  function allPanePostures() {
+    return Object.keys(manager.terminals).map((id) => posturePayloadForPane(id));
+  }
+  // Single helper so every pane-state mutation broadcasts the SAME shape: a terminals_updated frame
+  // carrying the per-pane posture payload (chips repaint from this without a /api/terminals refetch).
+  function broadcastTerminalsUpdated() {
+    broadcast({ type: "terminals_updated", postures: allPanePostures() });
+  }
+
+  // ── TWO-STAGE EMERGENCY STOP-ALL (bead 8sq, spec §2.C / §3) ───────────────────────────────────
+  //
+  // DELIBERATELY UNGATED — these are the ONE set of paths that do NOT route through
+  // gateOrDefer/effectiveCapabilityGateFor, and that is correct, not a regression. Capability
+  // gates only ever TIGHTEN; the stop-all brake is the inverse (de-escalation / withdrawing
+  // autonomy). A gate set to Off must never be able to FORBID an emergency halt — that would
+  // defeat the gate's own safety purpose. So an always-allowed brake is consistent with the gate
+  // model, not a bypass of it. (Mirrors the directional precedent in set_capability_gate: voice may
+  // always TIGHTEN/de-escalate, never LOOSEN.) Single source of truth shared by REST, WS, voice.
+  function runningPaneIds(): string[] {
+    return Object.entries(manager.terminals)
+      .filter(([, term]) => term.status !== "Exited") // union: 'Running'|'Exited'|'Idle'
+      .map(([id]) => id);
+  }
+
+  /**
+   * STOP-ALL stage routine.
+   *   Stage 1 (kill=false): set+persist `frozen` (gate resolver now short-circuits every capability
+   *     to Off), then CANCEL EVERYTHING IN-FLIGHT — reject all pending approvals (expire), expire all
+   *     deferred actions, halt running plans (paused) + enabled watch-rules (disabled). PANES AND
+   *     THEIR PTYs KEEP RUNNING (spec §2.C) — the freeze is reversible; only Release clears it.
+   *   Stage 2 (kill=true): terminate each running pane PTY via the existing term.stop() primitive.
+   *     The deliberate, irreversible step; valid only after a Stage-1 freeze.
+   * Returns the still-running pane ids (Stage 1) or the killed pane ids (Stage 2).
+   */
+  function stopAll(kill: boolean): string[] {
+    if (!kill) {
+      persistFrozen(true);
+      // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
+      for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
+      // Expire every deferred non-PTY action (no side effect runs).
+      for (const a of [...pendingActions.all()]) pendingActions.expire(a.id);
+      // Halt running plans + enabled watch-rules (passive co-pilot state, no pane writes).
+      let ledgerChanged = false;
+      for (const plan of manager.ledger.plans) {
+        if (plan.status === "running") { plan.status = "paused"; ledgerChanged = true; }
+      }
+      for (const rule of manager.ledger.watchRules) {
+        if (rule.enabled) { rule.enabled = false; ledgerChanged = true; }
+      }
+      if (ledgerChanged) {
+        manager.ledger["save"]?.(true);
+        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+        broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+      }
+      const stillRunning = runningPaneIds();
+      if (store) {
+        try {
+          store.recordActivity({
+            type: "permission_changed",
+            project_id: manager.ledger.activeProjectId || "default_project",
+            pane_id: null,
+            summary: `STOP_ALL Stage 1: froze Janus + cancelled in-flight (${stillRunning.length} pane(s) still running)`,
+            payload: { action: "stop_all_freeze", running: stillRunning },
+          });
+        } catch { /* store optional */ }
+      }
+      broadcast({ type: "frozen", frozen: true, running: stillRunning });
+      broadcastTerminalsUpdated();
+      return stillRunning;
+    }
+    // Stage 2: kill the PTYs. Fire-and-forget term.stop() (async SIGTERM->SIGKILL); the onExit
+    // will flip status to Exited and re-broadcast. We collect the set we asked to kill.
+    const killed: string[] = [];
+    for (const [id, term] of Object.entries(manager.terminals)) {
+      if (term.status !== "Exited") {
+        killed.push(id);
+        Promise.resolve(term.stop()).catch((e) => console.error(`[STOP-ALL] kill ${id} failed:`, e));
+      }
+    }
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: null,
+          summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)`,
+          payload: { action: "stop_all_kill", panes: killed },
+        });
+      } catch { /* store optional */ }
+    }
+    broadcast({ type: "stop_all", killed });
+    broadcastTerminalsUpdated();
+    return killed;
+  }
+
+  /** Clear the freeze (Release). The matrix was never mutated, so this is a clean clear. */
+  function releaseStopAll(): void {
+    persistFrozen(false);
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: null,
+          summary: "STOP_ALL released: freeze cleared, matrix restored",
+          payload: { action: "stop_all_release" },
+        });
+      } catch { /* store optional */ }
+    }
+    broadcast({ type: "frozen", frozen: false });
+    broadcastTerminalsUpdated();
+  }
+
   function pushApprovalNarration(session: any, text: string) {
     try {
       session.sendClientContent({
@@ -1464,7 +1729,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     pushApprovalNarration(session, digest);
     // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
-    broadcast({ type: "terminals_updated" });
+    broadcastTerminalsUpdated();
   }
 
   // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
@@ -1544,7 +1809,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     if (reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane") {
       flipHandoffOnResolve(messageId, reason, opts);
     }
-    if (reason !== "lost_race") broadcast({ type: "terminals_updated" });
+    if (reason !== "lost_race") broadcastTerminalsUpdated();
     return action;
   }
 
@@ -1624,7 +1889,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         pending.lastCallAt = now;
         const session = pendingApprovals.sessionFor(pending.messageId);
         if (session) pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`);
-        broadcast({ type: "terminals_updated" });
+        broadcastTerminalsUpdated();
         continue;
       }
       // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
@@ -1796,8 +2061,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
       const liveModel = manager.settings.voiceAi?.model || "gemini-3.1-flash-live-preview";
 
-      // Initialize Gemini Live session
-      session = await sessionAi.live.connect({
+      // Initialize Gemini Live session (through the injectable seam so tests /
+      // the offline simulator can substitute a fake session).
+      session = await liveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
@@ -2158,7 +2424,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     project_id
                   );
                   broadcastLedgerUpdate();
-                  broadcast({ type: "terminals_updated" });
+                  broadcastTerminalsUpdated();
                   return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
                 };
                 const g = gateOrDefer("create_pane", pane_id ?? null, `Create pane ${pane_id} (${command}) in ${project_id}`, createPaneEffect);
@@ -2307,7 +2573,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                         }
                       }
                       broadcastLedgerUpdate();
-                      broadcast({ type: "terminals_updated" });
+                      broadcastTerminalsUpdated();
                       resp = `Template recipe layout '${recipe.name}' applied: spawned ${spawned.length} pane(s)${blocked.length ? `; ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : ""}.`;
                     }
                   }
@@ -2605,7 +2871,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                       resp = `Pane ${pane_id} not found in the active project.`;
                     } else {
                       pane.capabilityGates = { ...(pane.capabilityGates || {}), [capability]: gate };
-                      manager.ledger["save"]();
+                      // Persist via updatePane so the per-pane override survives in BOTH backends
+                      // (SQLite writes the capability_gates column; a bare save() would be a no-op
+                      // there — bead 8sq schema v4).
+                      manager.ledger.updatePane(manager.ledger.activeProjectId || "default_project", pane, true);
                       resp = `Set per-pane gate '${capability}' = ${gate} for pane ${pane_id}.`;
                     }
                   } else {
@@ -2646,6 +2915,49 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention",
                   ] } }]
                 });
+              } else if (name === "stop_all") {
+                // EMERGENCY BRAKE Stage 1 (bead 8sq, spec §2.C/§D). Always allowed — NOT routed
+                // through gateOrDefer (see stopAll). An Off gate must never forbid an emergency halt.
+                // Stage 1 is instant + reversible: freeze Janus + cancel everything in-flight; the
+                // panes KEEP RUNNING. We then ask for the spoken Stage-2 kill confirm (voice has no
+                // hold-to-fire, so the verbal "kill them" IS the deliberate second step).
+                const running = stopAll(false);
+                const output = running.length
+                  ? `I've frozen myself and cancelled everything in flight. ${running.length} pane(s) are still running (${running.join(", ")}). Should I also kill them? That can't be undone — say "kill them" to confirm, or "release" to resume.`
+                  : `I've frozen myself and cancelled everything in flight. No panes are running, so there's nothing to kill. Say "release" when you want to resume.`;
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output } }]
+                });
+              } else if (name === "confirm_stop_all") {
+                // EMERGENCY BRAKE Stage 2 (bead 8sq, spec §2.C/§D). Always allowed. The deliberate,
+                // irreversible kill — ONLY valid while frozen-awaiting-confirm (a stray "kill them"
+                // with no prior freeze does nothing). Terminates running PTYs via term.stop().
+                if (!frozen) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: "There's nothing to confirm — I'm not frozen. Say \"stop everything\" first if you want to halt." } }]
+                  });
+                } else {
+                  const killed = stopAll(true);
+                  const output = killed.length
+                    ? `Done — I killed ${killed.length} pane(s): ${killed.join(", ")}. They stay killed; I'm still frozen, say "release" to resume.`
+                    : `There were no running panes left to kill. I'm still frozen — say "release" to resume.`;
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output } }]
+                  });
+                }
+              } else if (name === "release_stop_all") {
+                // Clear the freeze (bead 8sq, spec §2.C/§D). Always allowed. The matrix was never
+                // mutated, so this is a clean restore — does NOT auto-restart any killed panes.
+                if (!frozen) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: "I wasn't frozen — nothing to release. Carrying on as normal." } }]
+                  });
+                } else {
+                  releaseStopAll();
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: "Released — I've un-frozen and your safety gates are back exactly as they were. Any panes you killed stay killed." } }]
+                  });
+                }
               } else if (name === "set_pane_permissions") {
                 const { project_id, pane_id, permissions_mode } = args;
                 // Ungated validation pre-checks (cheap reads, no side effect) BEFORE the gate.
@@ -2670,7 +2982,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                       manager.ledger["save"]();
                     }
                     broadcastLedgerUpdate();
-                    broadcast({ type: "terminals_updated" });
+                    broadcastTerminalsUpdated();
                     return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
                   };
                   const g = gateOrDefer("set_pane_permissions", pane_id ?? null, `Set pane ${pane_id} permissions to ${permissions_mode}`, applyPanePerms);
@@ -2700,7 +3012,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.`,
+        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.\n\nEMERGENCY BRAKE (two stages, always allowed): if the operator says "stop", "halt", "abort", "freeze", or "stop everything", call stop_all IMMEDIATELY — it freezes you (every capability becomes Off) and cancels everything in flight, but the panes KEEP RUNNING. After it freezes, tell the operator how many panes are still running and ASK whether to also kill them (that is irreversible). If they confirm the kill ("kill them", "yes"), call confirm_stop_all. When they say "release"/"resume", call release_stop_all to un-freeze (your gates restore exactly; killed panes stay killed).`,
         ...({
           sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
           contextWindowCompression: {
@@ -3102,6 +3414,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               name: "list_capabilities",
               description: "List every gateable capability name. UNGATED read.",
               parameters: { type: Type.OBJECT, properties: {}, required: [] }
+            },
+            {
+              name: "stop_all",
+              description: "EMERGENCY Stage 1: instantly freeze yourself (every capability becomes Off) and cancel everything in flight — pending approvals, deferred actions, running plans and rules. Panes KEEP RUNNING. Always allowed — never gated. Use when the operator says stop/halt/abort/freeze everything. After freezing, ASK whether to also kill the running panes (Stage 2, irreversible).",
+              parameters: { type: Type.OBJECT, properties: {}, required: [] }
+            },
+            {
+              name: "confirm_stop_all",
+              description: "EMERGENCY Stage 2 (irreversible): kill every running pane's process. Always allowed. ONLY call this after stop_all has frozen things and the operator verbally confirms the kill (e.g. says \"kill them\", \"yes kill\"). Does nothing if not currently frozen.",
+              parameters: { type: Type.OBJECT, properties: {}, required: [] }
+            },
+            {
+              name: "release_stop_all",
+              description: "Clear the emergency freeze and resume normal operation; restores the safety gates exactly as they were (the matrix was never changed). Always allowed. Use when the operator says release/resume/unfreeze. Does NOT restart any panes that were killed.",
+              parameters: { type: Type.OBJECT, properties: {}, required: [] }
             }
           ]
         }]
@@ -3163,6 +3490,27 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
           // open (or null if nothing is open) is recorded here and gates every Janus write.
           activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
+        } else if (msg.type === "stop_all") {
+          // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated.
+          // Stage 1 (default / kill=false): freeze + cancel in-flight; panes keep running.
+          // Stage 2 (kill=true): hold-to-fire kill of running PTYs, only when already frozen.
+          // stopAll broadcasts {type:'frozen'}/{type:'stop_all'} to ALL clients; this is the
+          // per-client ack so the requesting UI can confirm completion.
+          if (msg.kill === true) {
+            if (!frozen) {
+              clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
+            } else {
+              const killed = stopAll(true);
+              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed }));
+            }
+          } else {
+            const running = stopAll(false);
+            clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 1, frozen: true, running }));
+          }
+        } else if (msg.type === "release_stop_all") {
+          // Clear the freeze from the UI (bead 8sq). Always allowed.
+          releaseStopAll();
+          clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 0, frozen: false }));
         }
       } catch (err) {
         console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);
@@ -3199,14 +3547,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     });
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Vite middleware for development (dynamically imported so tests / production
+  // bundles that disable it don't need vite resolvable at module load).
+  if (enableVite) {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === "production") {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -3214,8 +3564,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     });
   }
 
-  const shutdown = async () => {
-    console.log("Shutting down cleanly, stopping all terminals...");
+  const close = async (): Promise<void> => {
     announcementBus.stop(); // WS-D: clear coalescing/rate-limit timers
     clearInterval(approvalSweepTimer); // WS-E.3: clear the TTL sweep
     for (const term of Object.values(manager.terminals)) {
@@ -3225,16 +3574,59 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         console.error(`Error stopping terminal ${term.terminalId}:`, err);
       }
     }
+    // Force every live WS client + lingering keep-alive socket to CLOSED before we
+    // resolve. Otherwise wss/server.close() leave half-closed libuv handles in the
+    // CLOSING state; a subsequent process.exit (e.g. the unit runner's
+    // --test-force-exit) then double-closes them and aborts (UV_HANDLE_CLOSING).
+    for (const ws of wss.clients) {
+      try { ws.terminate(); } catch { /* already gone */ }
+    }
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    // Release the better-sqlite3 native handle. Left open, its libuv async handle is
+    // still live when the unit runner's --test-force-exit calls process.exit, which
+    // double-closes it and aborts (UV_HANDLE_CLOSING). Guarded: store is null under
+    // JANUS_LEDGER_BACKEND=legacy / when the store failed to boot.
+    try { store?.close(); } catch (err) { console.error("Error closing JanusStore:", err); }
+  };
+
+  const shutdown = async () => {
+    console.log("Shutting down cleanly, stopping all terminals...");
+    await close();
     process.exit(0);
   };
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  const bindHost = process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1";
-  server.listen(PORT, bindHost, () => {
-    console.log(`Server running on http://${bindHost}:${PORT}`);
-  });
+  const bindHost = options.bindHost ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+  const requestedPort = options.port ?? PORT;
+
+  if (shouldListen) {
+    await new Promise<void>((resolve) => {
+      server.listen(requestedPort, bindHost, () => {
+        const addr = server.address();
+        const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
+        console.log(`Server running on http://${bindHost}:${boundPort}`);
+        resolve();
+      });
+    });
+  }
+
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : requestedPort;
+
+  return { app, server, wss, manager, port, close };
 }
 
-startServer().catch(console.error);
+export { startServer };
+
+// Auto-start when run as the entrypoint (`tsx server.ts` in dev or
+// `node dist/server.cjs` in prod). Tests and the offline simulator set
+// JANUS_NO_AUTOSTART=1 before importing so they can own the server lifecycle.
+// (An env flag rather than import.meta/require.main detection because esbuild
+// bundles this to CJS, where import.meta is empty.)
+if (process.env.JANUS_NO_AUTOSTART !== "1") {
+  startServer().catch(console.error);
+}

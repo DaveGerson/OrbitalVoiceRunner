@@ -10,6 +10,8 @@ import { TerminalView } from "./components/TerminalView";
 import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
 import { NotificationStack } from "./components/NotificationStack";
+import { GateChip } from "./components/GateChip";
+import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
@@ -46,6 +48,12 @@ function AppRaw() {
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
   // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
   const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
+  // bead 8sq (spec §2.C): two-stage emergency STOP-ALL state. `frozen` = Stage-1 freeze active (Janus
+  // short-circuited to Off + in-flight cancelled; panes still running). `frozenRunning` = the panes
+  // still alive while frozen (the Stage-2 hold-to-fire kill target count). Driven by the `frozen` WS
+  // event + restored from /api/stop-all/status on boot so the banner survives a page reload.
+  const [frozen, setFrozen] = useState(false);
+  const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
@@ -409,6 +417,8 @@ function AppRaw() {
     setTranscript,
     setPendingCommands,
     setPendingActions,
+    setFrozen,
+    setFrozenRunning,
   });
 
   const fetchTerminals = async () => {
@@ -433,6 +443,19 @@ function AppRaw() {
     } catch (e) {}
   };
 
+  // bead 8sq: restore the STOP-ALL freeze state on boot so the FROZEN banner survives a page reload
+  // (the flag is persisted server-side; spec §2.C/§10.3). No-op under mock mode (client-only harness).
+  const fetchFrozenStatus = async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/stop-all/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      setFrozen(!!data.frozen);
+      setFrozenRunning(Array.isArray(data.running) ? data.running : []);
+    } catch (e) {}
+  };
+
   const fetchSettings = async () => {
     try {
       const res = await apiFetch("/api/settings");
@@ -443,6 +466,36 @@ function AppRaw() {
         setGlobalPermissionsMode(data.advanced.globalPermissionsMode);
       }
     } catch (e) {}
+  };
+
+  // bead 8sq (spec §2.C): the two-stage emergency STOP-ALL. Stage 1 freezes Janus + cancels in-flight
+  // (reversible; panes keep running); Stage 2 (hold-to-fire) kills the running PTYs (irreversible);
+  // Release clears the freeze. All three hit the always-allowed REST routines; the `frozen` WS event
+  // drives the banner state, so these just fire-and-confirm.
+  const handleStopAllFreeze = async () => {
+    try {
+      const res = await apiFetch("/api/stop-all", { method: "POST" });
+      if (!res.ok) return;
+      const data = await res.json();
+      setFrozen(true);
+      setFrozenRunning(Array.isArray(data.running) ? data.running : []);
+    } catch (e) { console.error("stop-all freeze failed", e); }
+  };
+  const handleStopAllKill = async () => {
+    try {
+      const res = await apiFetch("/api/stop-all/confirm", { method: "POST" });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.killed)) setFrozenRunning(prev => prev.filter(id => !data.killed.includes(id)));
+    } catch (e) { console.error("stop-all kill failed", e); }
+  };
+  const handleStopAllRelease = async () => {
+    try {
+      const res = await apiFetch("/api/stop-all/release", { method: "POST" });
+      if (!res.ok) return;
+      setFrozen(false);
+      setFrozenRunning([]);
+    } catch (e) { console.error("stop-all release failed", e); }
   };
 
   const handleUpdateGlobalPermissions = async (val: string) => {
@@ -765,6 +818,7 @@ function AppRaw() {
     fetchActiveDraft(); // Step 6: load the active pane's WIP draft (no-op until a pane is open)
     fetchWipDrafts();
     fetchArchive(); // feat/local-testing: load the recoverable pane archive
+    fetchFrozenStatus(); // bead 8sq: restore the STOP-ALL freeze so the banner survives a reload
 
     // Auto-detect browser notification support configuration
     if (typeof window !== "undefined" && "Notification" in window) {
@@ -1135,6 +1189,17 @@ function AppRaw() {
           }
           fetchWipDrafts(msg.projectId);
         } else if (msg.type === "terminals_updated") {
+          fetchTerminals();
+        } else if (msg.type === "frozen") {
+          // bead 8sq Stage-1/Release: the server froze (or released) Janus. Drive the banner + refresh
+          // the chips (every gate now resolves Off while frozen; restores cleanly on release).
+          setFrozen(!!msg.frozen);
+          setFrozenRunning(Array.isArray(msg.running) ? msg.running : []);
+          if (msg.frozen) playEarcon("alert");
+          fetchTerminals();
+        } else if (msg.type === "stop_all") {
+          // bead 8sq Stage-2: PTYs were killed. Refresh so the panes flip to Exited; the freeze stays.
+          if (Array.isArray(msg.killed)) setFrozenRunning(prev => prev.filter(id => !msg.killed.includes(id)));
           fetchTerminals();
         } else if (msg.type === "ledger_updated") {
           setLedger(msg.ledger);
@@ -2520,6 +2585,8 @@ function AppRaw() {
           onToggleMockMode={generateMockData}
           isLive={isLive}
           onReconnectLive={reconnectLive}
+          activeProjectId={activeProjectId}
+          activePanes={activeProject?.panes}
         />
       )}
       
@@ -2765,7 +2832,19 @@ function AppRaw() {
             <span className="text-[10px] font-mono uppercase tracking-[0.1em] font-bold">Transcripts ({transcript.length})</span>
           </button>
           <div className="w-px h-8 bg-white/10"></div>
-          <button 
+          {/* bead 8sq: global two-stage emergency STOP-ALL. When frozen, the trigger is replaced by the
+              FROZEN banner below the header (kill / release live there). */}
+          {!frozen && (
+            <EmergencyStop
+              frozen={false}
+              runningCount={frozenRunning.length}
+              onFreeze={handleStopAllFreeze}
+              onKill={handleStopAllKill}
+              onRelease={handleStopAllRelease}
+            />
+          )}
+          <div className="w-px h-8 bg-white/10"></div>
+          <button
             onClick={() => setShowSettingsModal(true)}
             className="p-1.5 px-3 bg-white/5 hover:bg-cyan-500/10 border border-white/10 hover:border-cyan-500/30 transition-all rounded text-zinc-400 hover:text-cyan-400 focus:outline-none flex items-center justify-center cursor-pointer gap-1.5 shrink-0"
             title="System Parameters Settings"
@@ -2775,6 +2854,18 @@ function AppRaw() {
           </button>
         </div>
       </header>
+
+      {/* bead 8sq: FROZEN banner — Stage-2 hold-to-fire kill + Release (spec §2.C). Renders full-width
+          directly under the header when a Stage-1 freeze is active. */}
+      {frozen && (
+        <EmergencyStop
+          frozen={true}
+          runningCount={frozenRunning.length}
+          onFreeze={handleStopAllFreeze}
+          onKill={handleStopAllKill}
+          onRelease={handleStopAllRelease}
+        />
+      )}
 
       {/* Mobile Terminals Quick Swiper Bar */}
       <div className="lg:hidden flex items-center gap-2 overflow-x-auto px-4 py-2 border-b border-white/5 bg-black/80 scrollbar-none shrink-0 select-none">
@@ -2969,7 +3060,18 @@ function AppRaw() {
                                 </span>
                                 {term && <span className="text-[9px] opacity-30 font-mono truncate">{term.cwd}</span>}
                               </div>
-                              <span className={`flex-shrink-0 w-1.5 h-1.5 rounded-full transition-all duration-1000 ${statusColor}`} title={isAlertActive ? "Status: Alert (Approval Required)" : `Status: ${pane.last_known_state}`}></span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                {/* bead 8sq: per-pane effective-posture chip (server truth via terminals payload). */}
+                                {term?.posture && (
+                                  <GateChip
+                                    effectiveGates={term.effective_gates}
+                                    posture={term.posture}
+                                    isActivePane={isActive}
+                                    compact
+                                  />
+                                )}
+                                <span className={`flex-shrink-0 w-1.5 h-1.5 rounded-full transition-all duration-1000 ${statusColor}`} title={isAlertActive ? "Status: Alert (Approval Required)" : `Status: ${pane.last_known_state}`}></span>
+                              </div>
                             </div>
                             {isActive && (
                               <div className="flex px-3 mt-1 pb-1 gap-2 border-b border-white/5">
@@ -3019,6 +3121,15 @@ function AppRaw() {
                     <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate" title={activeTerminal.command}>
                       $ {activeTerminal.command}
                     </span>
+                    {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
+                        payload). Click for the full 16-capability breakdown in plain language. */}
+                    {activeTerminal.posture && (
+                      <GateChip
+                        effectiveGates={activeTerminal.effective_gates}
+                        posture={activeTerminal.posture}
+                        isActivePane
+                      />
+                    )}
                   </div>
                   <div className="flex items-center gap-4">
                     <span className="text-[10px] font-mono opacity-40 truncate" title={activeTerminal.cwd}>

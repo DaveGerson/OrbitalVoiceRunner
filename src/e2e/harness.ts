@@ -1,5 +1,5 @@
 import { useEffect, useRef, type MutableRefObject } from "react";
-import type { Terminal, PendingCommand } from "../types";
+import type { Terminal, PendingCommand, CapabilityGateMap } from "../types";
 
 /**
  * E2E test harness — fully isolated from the application internals.
@@ -38,6 +38,17 @@ export interface OrbitalE2EHooks {
    * string it pushed (or `null` when there were no survivors → silent, mirroring the server).
    */
   simulateReconnect: () => string | null;
+  /**
+   * bead 8sq (spec §2.A): set the mock pane's SERVER-resolved effective posture so the GateChip
+   * renders deterministically under ?mock=1 (the harness is client-only; there's no real server to
+   * resolve gates). Replaces the mock terminal's `effective_gates` + `posture` and re-seeds it.
+   */
+  setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: CapabilityGateMap) => void;
+  /**
+   * bead 8sq (spec §2.C): drive the two-stage STOP-ALL banner. `frozen` toggles the FROZEN banner;
+   * `running` sets the still-running pane count the Stage-2 hold-to-fire kill targets.
+   */
+  setFrozenMock: (frozen: boolean, running: string[]) => void;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -53,6 +64,9 @@ export interface E2EHarnessDeps {
   setTranscript: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   setPendingCommands: (updater: (prev: PendingCommand[]) => PendingCommand[]) => void;
   setPendingActions: (updater: (prev: PendingActionEntry[]) => PendingActionEntry[]) => void;
+  // bead 8sq: the two-stage STOP-ALL banner state (driven by the harness setFrozenMock hook).
+  setFrozen: (v: boolean) => void;
+  setFrozenRunning: (running: string[]) => void;
 }
 
 /**
@@ -97,7 +111,10 @@ function buildResumptionDigest(lines: string[]): string | null {
  * sequence so the terminal e2e can prove xterm renders RAW bytes (ANSI interpreted,
  * not shown literally and not stripped). MOCKTERM_READY is the asserted token.
  */
-function mockTerminal(): Terminal {
+function mockTerminal(
+  posture: "OPEN" | "GUARDED" | "LOCKED" = "GUARDED",
+  effectiveGates: CapabilityGateMap = DEFAULT_MOCK_GATES,
+): Terminal {
   return {
     id: MOCK_TERMINAL_ID,
     cwd: ".",
@@ -105,8 +122,35 @@ function mockTerminal(): Terminal {
     backfill: "\x1b[32mMOCKTERM_READY\x1b[0m web-app@1.0.0 dev server\r\n$ ",
     output: "MOCKTERM_READY web-app@1.0.0 dev server\n$ ",
     status: "Running",
+    // bead 8sq: seed a server-resolved posture so the GateChip renders deterministically under ?mock=1.
+    posture,
+    effective_gates: effectiveGates,
   };
 }
+
+/**
+ * The default mock effective-gate map — productive writes Auto (this IS the active/focused pane in the
+ * harness, so the spotlight loosens them), a couple of gates on Ask/Off → resolves to GUARDED, and the
+ * focus ★ shows. A deterministic fixture the chip e2e asserts against.
+ */
+const DEFAULT_MOCK_GATES: CapabilityGateMap = {
+  write_to_pane: "Auto",
+  deliver_handoff: "Auto",
+  create_pane: "Ask",
+  close_pane: "Ask",
+  restart_pane: "Ask",
+  set_pane_permissions: "Ask",
+  set_global_permissions: "Ask",
+  set_capability_gate: "Ask",
+  add_watch_rule: "Ask",
+  execute_plan: "Ask",
+  apply_recipe: "Ask",
+  create_project: "Auto",
+  update_metadata: "Auto",
+  switch_context: "Auto",
+  set_voice_mute: "Auto",
+  dismiss_attention: "Auto",
+};
 
 /**
  * Install the e2e harness. No-op unless the page is loaded with `?mock=1`. When
@@ -190,6 +234,19 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
         }
         disconnected = false; // re-attached: a fresh window is open.
         return digest;
+      },
+
+      // bead 8sq: re-seed the mock pane with a chosen server-resolved posture so the chip e2e can
+      // assert OPEN / GUARDED / LOCKED + the popover breakdown deterministically.
+      setPostureMock: (posture, effectiveGates) => {
+        deps.setTerminals([mockTerminal(posture, effectiveGates)]);
+        deps.setActiveTerminalId(MOCK_TERMINAL_ID);
+      },
+
+      // bead 8sq: drive the two-stage STOP-ALL banner (frozen flag + still-running pane count).
+      setFrozenMock: (frozen, running) => {
+        deps.setFrozen(frozen);
+        deps.setFrozenRunning(running);
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;

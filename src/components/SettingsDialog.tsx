@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from "react";
-import { SystemSettings, CliPreset } from "../types";
+import { SystemSettings, CliPreset, CapabilityGateMap, PaneMeta } from "../types";
+import { preservePresetGates, withAdvancedGates, normalizeGateMap } from "../settingsGatesRoundTrip";
+import { CapabilityMatrixTab } from "./CapabilityMatrixTab";
 import {
   type AnnouncementTemplates,
   DEFAULT_ANNOUNCEMENT_TEMPLATES,
@@ -28,12 +30,13 @@ import {
   Trash2,
   Plus,
   Eye,
-  EyeOff
+  EyeOff,
+  Shield
 } from "lucide-react";
 
 function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
-    return input.map((item: any) => ({
+    return input.map((item: any) => preservePresetGates({
       id: String(item?.id || ""),
       name: String(item?.name || ""),
       command: String(item?.command || ""),
@@ -46,7 +49,8 @@ function parsePresetsSafe(input: any): CliPreset[] {
       sessionResume: Boolean(item?.sessionResume ?? true),
       portOffset: item?.portOffset !== undefined ? String(item.portOffset) : "",
       customEnvVars: item?.customEnvVars !== undefined ? String(item.customEnvVars) : ""
-    }));
+    // bead 8sq: carry per-preset capabilityGates through the rebuild (was being dropped on save).
+    }, item));
   }
   if (input && typeof input === "object") {
     return Object.entries(input).map(([key, val]: [string, any]) => {
@@ -57,7 +61,7 @@ function parsePresetsSafe(input: any): CliPreset[] {
       else {
         displayName = key.charAt(0).toUpperCase() + key.slice(1);
       }
-      return {
+      return preservePresetGates({
         id: key,
         name: val?.name || displayName,
         command: String(val?.command || ""),
@@ -70,7 +74,8 @@ function parsePresetsSafe(input: any): CliPreset[] {
         sessionResume: Boolean(val?.sessionResume ?? true),
         portOffset: val?.portOffset !== undefined ? String(val.portOffset) : "",
         customEnvVars: val?.customEnvVars !== undefined ? String(val.customEnvVars) : ""
-      };
+      // bead 8sq: carry per-preset capabilityGates through the rebuild (was being dropped on save).
+      }, val);
     });
   }
   return [];
@@ -85,6 +90,10 @@ interface SettingsDialogProps {
   onToggleMockMode?: () => void;
   isLive?: boolean;
   onReconnectLive?: () => void;
+  // bead 8sq: the active project's panes (for the Capability Matrix's per-pane scope) + its id (for
+  // the per-pane gate REST path). Optional so non-project callers / tests can omit them.
+  activeProjectId?: string;
+  activePanes?: Record<string, PaneMeta>;
 }
 
 export function SettingsDialog({
@@ -95,10 +104,20 @@ export function SettingsDialog({
   isMockMode = false,
   onToggleMockMode,
   isLive,
-  onReconnectLive
+  onReconnectLive,
+  activeProjectId = "default_project",
+  activePanes = {}
 }: SettingsDialogProps) {
   const [activeTab, setActiveTab] = useState<"form" | "json" | "install">("form");
-  const [formTab, setFormTab] = useState<"session" | "profiles" | "advanced" | "secrets">("session");
+  const [formTab, setFormTab] = useState<"session" | "profiles" | "gates" | "advanced" | "secrets">("session");
+  // bead 8sq: a local mirror of per-pane override maps so the matrix tab reflects an immediate
+  // per-pane save (the REST round-trip) without waiting for a settings reload. Seeded from props.
+  const [paneGateOverrides, setPaneGateOverrides] = useState<Record<string, CapabilityGateMap | undefined>>({});
+  useEffect(() => {
+    const seed: Record<string, CapabilityGateMap | undefined> = {};
+    for (const [id, pane] of Object.entries(activePanes)) seed[id] = normalizeGateMap(pane?.capabilityGates);
+    setPaneGateOverrides(seed);
+  }, [activePanes]);
   
   // Local states for Form Inputs - Server
   const [port, setPort] = useState<number>(3000);
@@ -132,6 +151,9 @@ export function SettingsDialog({
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [historyMaxCommands, setHistoryMaxCommands] = useState<number>(50);
   const [historyMaxOutputLength, setHistoryMaxOutputLength] = useState<number>(5000);
+  // bead 8sq: the global default capability-gate matrix. Held in form state so save/load
+  // round-trips it (it was being DROPPED by getCompiledSettings's flat `advanced` rebuild).
+  const [capabilityGates, setCapabilityGates] = useState<CapabilityGateMap | undefined>(undefined);
 
   // Local states - Secret Key Cabinet
   const [geminiApiKey, setGeminiApiKey] = useState<string>("");
@@ -182,6 +204,7 @@ export function SettingsDialog({
       setGlobalPermissionsMode(initialSettings.advanced?.globalPermissionsMode ?? "Inherit");
       setHistoryMaxCommands(initialSettings.advanced?.historyMaxCommands ?? 50);
       setHistoryMaxOutputLength(initialSettings.advanced?.historyMaxOutputLength ?? 5000);
+      setCapabilityGates(normalizeGateMap(initialSettings.advanced?.capabilityGates));
 
       setGeminiApiKey(initialSettings.secrets?.geminiApiKey ?? "");
 
@@ -214,7 +237,9 @@ export function SettingsDialog({
       },
       presets,
       announcements,
-      advanced: {
+      // bead 8sq: re-attach the global capability-gate matrix from form state via withAdvancedGates,
+      // so a save no longer ERASES advanced.capabilityGates (the drop-on-save data-loss bug).
+      advanced: withAdvancedGates({
         webSocketUrl: "",
         latencyMode: "Balanced",
         throughputBps: 16000,
@@ -228,7 +253,7 @@ export function SettingsDialog({
         globalPermissionsMode,
         historyMaxCommands,
         historyMaxOutputLength
-      },
+      }, capabilityGates) as SystemSettings["advanced"],
       secrets: {
         geminiApiKey
       }
@@ -244,7 +269,7 @@ export function SettingsDialog({
     activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
-    announcements
+    announcements, capabilityGates
   ]);
 
   // Handle Saving
@@ -296,6 +321,8 @@ export function SettingsDialog({
         if (parsed.advanced.globalPermissionsMode !== undefined) setGlobalPermissionsMode(parsed.advanced.globalPermissionsMode);
         if (parsed.advanced.historyMaxCommands !== undefined) setHistoryMaxCommands(parsed.advanced.historyMaxCommands);
         if (parsed.advanced.historyMaxOutputLength !== undefined) setHistoryMaxOutputLength(parsed.advanced.historyMaxOutputLength);
+        // bead 8sq: round-trip the global capability-gate matrix through the JSON tab too.
+        if (parsed.advanced.capabilityGates !== undefined) setCapabilityGates(normalizeGateMap(parsed.advanced.capabilityGates));
       }
       if (parsed.secrets) {
         if (parsed.secrets.geminiApiKey !== undefined) setGeminiApiKey(parsed.secrets.geminiApiKey);
@@ -437,6 +464,17 @@ export function SettingsDialog({
                 >
                   <Terminal className="w-3.5 h-3.5 shrink-0" />
                   CLI profiles
+                </button>
+
+                <div className="hidden lg:block h-px bg-white/5 my-2" />
+                <span className="hidden lg:block text-[9px] text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Safety</span>
+                <button
+                  onClick={() => setFormTab("gates")}
+                  data-testid="settings-tab-gates"
+                  className={`px-3 py-2 text-left shrink-0 rounded transition-colors flex items-center gap-2 cursor-pointer ${formTab === "gates" ? "bg-cyan-950/40 border border-cyan-500/20 text-cyan-400 font-bold" : "border border-transparent text-zinc-400 hover:bg-white/[0.02]"}`}
+                >
+                  <Shield className="w-3.5 h-3.5 shrink-0" />
+                  Capability Matrix
                 </button>
 
                 <div className="hidden lg:block h-px bg-white/5 my-2" />
@@ -897,6 +935,35 @@ export function SettingsDialog({
                       </div>
                     </div>
                   </div>
+                )}
+
+                {/* 2b. Capability Matrix (bead 8sq, spec §2.B). Global + preset gates edit form state
+                    (round-trip via settingsGatesRoundTrip on Save); the per-pane scope persists
+                    immediately via the per-pane REST path. */}
+                {formTab === "gates" && (
+                  <CapabilityMatrixTab
+                    globalGates={capabilityGates}
+                    onChangeGlobalGates={setCapabilityGates}
+                    presets={presets}
+                    onChangePresetGates={(presetId, gates) =>
+                      setPresets(prev => prev.map(p => p.id === presetId ? { ...p, capabilityGates: gates } : p))
+                    }
+                    panes={Object.values(activePanes).map(p => ({ id: p.pane_id, name: p.name || p.pane_id }))}
+                    paneGatesFor={(paneId) => paneGateOverrides[paneId]}
+                    onSavePaneGates={async (paneId, gates) => {
+                      // Optimistic local mirror so the toggle reflects immediately.
+                      setPaneGateOverrides(prev => ({ ...prev, [paneId]: gates }));
+                      try {
+                        await apiFetch(`/api/projects/${activeProjectId}/panes/${paneId}/capability-gates`, {
+                          method: "PUT",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ capabilityGates: gates ?? {} }),
+                        });
+                      } catch (e) {
+                        console.error("Failed to persist per-pane capability gates", e);
+                      }
+                    }}
+                  />
                 )}
 
                 {/* 3. Advanced Plumbing Section */}

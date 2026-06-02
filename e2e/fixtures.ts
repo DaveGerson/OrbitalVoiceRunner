@@ -16,6 +16,8 @@ declare global {
       injectPendingAction: (capability: string, summary: string) => void;
       simulateDisconnect: () => void;
       simulateReconnect: () => string | null;
+      setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
+      setFrozenMock: (frozen: boolean, running: string[]) => void;
     };
   }
 }
@@ -68,6 +70,26 @@ export async function simulateDisconnect(page: Page): Promise<void> {
  */
 export async function simulateReconnect(page: Page): Promise<string | null> {
   return page.evaluate(() => window.__ORBITAL_E2E__?.simulateReconnect() ?? null);
+}
+
+/** bead 8sq: set the mock pane's server-resolved posture so the GateChip renders deterministically. */
+export async function setPostureMock(
+  page: Page,
+  posture: "OPEN" | "GUARDED" | "LOCKED",
+  effectiveGates: Record<string, "Auto" | "Ask" | "Off">,
+): Promise<void> {
+  await page.evaluate(
+    ([p, g]) => window.__ORBITAL_E2E__?.setPostureMock(p as "OPEN" | "GUARDED" | "LOCKED", g as Record<string, "Auto" | "Ask" | "Off">),
+    [posture, effectiveGates] as const,
+  );
+}
+
+/** bead 8sq: drive the two-stage STOP-ALL FROZEN banner (frozen flag + still-running pane count). */
+export async function setFrozenMock(page: Page, frozen: boolean, running: string[] = []): Promise<void> {
+  await page.evaluate(
+    ([f, r]) => window.__ORBITAL_E2E__?.setFrozenMock(f as boolean, r as string[]),
+    [frozen, running] as const,
+  );
 }
 
 export const test = base;
