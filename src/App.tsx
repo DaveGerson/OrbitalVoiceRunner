@@ -755,11 +755,18 @@ function AppRaw() {
 
   const handleApplyRecipe = async (recipeId: string) => {
     try {
-      await apiFetch("/api/recipes/apply", {
+      // G6: /api/recipes/apply is now gated. A whole-layout apply_recipe=Off returns 403 (no panes
+      // spawned). A 200 may still carry blocked/deferred panes in its body — that is a success render
+      // (some panes spawned, deferred ones surface via the existing action_pending chip path).
+      const res = await apiFetch("/api/recipes/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ recipeId })
       });
+      if (res.status === 403) {
+        playEarcon("alert"); // whole-layout gated Off (NO "error" earcon token exists)
+        return;
+      }
       fetchTerminals();
       fetchLedger();
       playEarcon("success");
@@ -1067,7 +1074,12 @@ function AppRaw() {
     }
     
     try {
-      await apiFetch("/api/terminals", {
+      // G6: /api/terminals is now gated. apiFetch does NOT throw on non-2xx, so branch on res.status:
+      //   403 (gate Off)  -> pane was NOT created; close modal, surface refusal, do NOT activate.
+      //   202 (gate Ask)  -> deferred; the action_pending broadcast already added a pending chip.
+      //                      Close modal but do NOT activate — the pane does not exist yet.
+      //   200 (gate Auto) -> pane spawned; activate it.
+      const res = await apiFetch("/api/terminals", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1079,6 +1091,16 @@ function AppRaw() {
           projectId: activeProjectId
         })
       });
+      if (res.status === 403) {
+        setShowCreateModal(false);
+        playEarcon("alert"); // gate Off refusal (NO "error" earcon token exists)
+        return;
+      }
+      if (res.status === 202) {
+        setShowCreateModal(false);
+        playEarcon("execute"); // queued, awaiting confirm
+        return;
+      }
       setShowCreateModal(false);
       fetchTerminals();
       fetchLedger();

@@ -36,6 +36,7 @@ import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
+import { restGateOutcome } from "./src/restGate";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
 import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
@@ -825,10 +826,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         manager.ledger.addProject(projectId, resolvedCwd, "", []);
       }
     }
-    const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, result });
+    // G6: route the PTY spawn through the SAME capability gate the voice `create_pane` handler uses.
+    // The broadcasts MOVE INSIDE spawnEffect so a deferred-then-confirmed spawn still repaints the UI
+    // (the effect runs once via POST /api/actions/:id/confirm). Off -> 403, Ask -> 202+actionId,
+    // Auto -> 200 + addTerminal result. (The projectId ledger-sync above stays before the gate,
+    // matching the voice handler's "ensure the project exists" behavior — it mutates metadata, not a PTY.)
+    const spawnEffect = (): string => {
+      const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
+      broadcastLedgerUpdate();
+      broadcast({ type: "terminals_updated" });
+      return String(result);
+    };
+    const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect);
+    const out = restGateOutcome(g);
+    if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
+    res.status(out.status).json(out.body);
   });
 
   // Web API to restart terminal node
@@ -1381,25 +1393,41 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       return;
     }
     const recipe = recipes.find(r => r.id === recipeId);
-    if (recipe) {
-      const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
-      for (const p of recipe.panes) {
-        if (!manager.terminals[p.id]) {
-          // Always open a bare shell — never auto-run the recipe's startupCommand.
-          manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
-          // Record the suggested startup command as a pane note so the operator can
-          // run it explicitly (auditable), rather than baking it into the spawn.
-          if (p.startupCommand) {
-            manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
-          }
-        }
-      }
-      broadcastLedgerUpdate();
-      broadcastTerminalsUpdated();
-      res.json({ success: true });
-    } else {
+    if (!recipe) {
       res.status(404).json({ error: "Recipe layout not found." });
+      return;
     }
+    // G6: mirror the voice `apply_orchestration_recipe` gate semantics. Off on apply_recipe forbids
+    // the WHOLE layout (403); otherwise each spawn rides create_pane (Off -> blocked, Ask -> deferred,
+    // Auto -> spawn now). Each pane's broadcast lives INSIDE spawnPane so a deferred-confirm repaints.
+    if (gateCapability("apply_recipe", null).forbidden) {
+      res.status(403).json({ error: "apply_recipe is gated Off; spawning template layouts is forbidden by policy.", capability: "apply_recipe" });
+      return;
+    }
+    const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+    const spawned: string[] = [];
+    const deferred: { paneId: string; actionId: string }[] = [];
+    const blocked: string[] = [];
+    for (const p of recipe.panes) {
+      if (manager.terminals[p.id]) continue;
+      const spawnPane = (): string => {
+        // Always open a bare shell — never auto-run the recipe's startupCommand.
+        manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+        // Record the suggested startup command as a pane note so the operator can
+        // run it explicitly (auditable), rather than baking it into the spawn.
+        if (p.startupCommand) {
+          manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+        }
+        broadcastLedgerUpdate();
+        broadcast({ type: "terminals_updated" });
+        return p.id;
+      };
+      const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+      if (g.disposition === "forbidden") blocked.push(p.id);
+      else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
+      else { spawnPane(); spawned.push(p.id); }
+    }
+    res.json({ success: true, spawned, deferred, blocked });
   });
 
   // 5. Cross-pane context handoff
