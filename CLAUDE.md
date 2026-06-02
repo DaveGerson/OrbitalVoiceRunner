@@ -60,13 +60,14 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Worktree Isolation (REQUIRED for commit-authorized agents)
 
-Concurrent **team-maintainer** agents share one git store; in a shared working tree they stash/commit/switch over each other and over human WIP. (2026-06-01: a team-maintainer session stashed + branch-switched the shared main checkout, absorbing in-progress `.gitignore`/`server.ts` edits.)
+Concurrent **team-maintainer** agents share one git store; in a shared working tree they stash/commit/switch over each other and over human WIP. (2026-06-01: a team-maintainer session stashed + branch-switched the shared main checkout, absorbing in-progress `.gitignore`/`server.ts` edits.) **This policy governs MUTATION (commits/writes), not reads** — see "Reads vs. writes" below.
 
 - **Isolate before committing** — any commit-authorized agent works in its **own worktree**, never the shared main checkout. Launch with `dev <task>` (or `claude --worktree`); keep `worktree.bgIsolation: "worktree"`.
 - **Main = integration-only** — review, merges, `git pull`; no autonomous commits there.
-- **One committer per tree** — never `git stash`/`reset`/`checkout`/`add -A`/rebase against a tree you don't exclusively own. Find foreign uncommitted changes? **STOP and report** — don't rescue/park/stash them.
+- **One committer per tree** — never `git stash`/`reset`/`checkout`/`add -A`/rebase against a tree you don't exclusively own. Find foreign uncommitted changes? **STOP and report** — don't rescue/park/stash them. (This is about **mutation**: stash/reset/checkout/add/commit/rebase. Read-only inspection of another tree is always fine — next bullet.)
+- **Reads vs. writes** — the single-owner rule is about WRITES. **READS are always safe and never gated:** any number of agents may concurrently read, explore, and run `git -C <path> diff` / `git -C <path> status` / `git -C <path> log` against ANY worktree, including one another agent is actively editing. The lock only ever fires on `git commit`. This makes **multi-agent read-only review of in-progress feature work** a blessed pattern — see the recipe in [`docs/process/WORKTREE_LOCK.md`](docs/process/WORKTREE_LOCK.md#recipe-multi-agent-read-only-review-of-an-existing-worktree). To review uncommitted work in a feature worktree, point reviewers at its absolute path and keep them read-only — do NOT use `isolation:'worktree'` (that branches a FRESH tree off main, so it can't see the feature tree's uncommitted changes).
 - Prefer sibling worktrees (`../<repo>-wt/<task>`) over nested `.claude/worktrees/`.
-- **Enforcement (opt-in):** a `pre-commit` worktree-mutex lock backs this policy — advisory by default (warns), blocking via `JANUS_WT_LOCK=strict`. Enable per clone: `sh scripts/install-wt-lock.sh` (or `.ps1`). Clear a dead lock: `node scripts/wt-lock.mjs release --force`. Full details: `docs/process/WORKTREE_LOCK.md`.
+- **Enforcement (opt-in):** a `pre-commit` worktree-mutex lock backs this policy — advisory by default (warns), blocking via `JANUS_WT_LOCK=strict`. It gates **commits only**; reads are never touched. Enable per clone: `sh scripts/install-wt-lock.sh` (or `.ps1`). Clear a dead lock: `node scripts/wt-lock.mjs release --force`. Full details: `docs/process/WORKTREE_LOCK.md`.
 
 ## Build & Test
 

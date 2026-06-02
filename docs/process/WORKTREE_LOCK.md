@@ -18,6 +18,26 @@ cannot stash / commit / branch-switch over each other on a shared working tree.
 - **Cross-tool**: it's a plain `pre-commit` git hook, so it binds Claude, Codex,
   and humans — anything that runs `git commit`.
 
+## Scope: commits/writes only — reads are never gated
+
+This lock — and the whole Worktree Isolation policy behind it — guards **one
+thing**: two *writers* colliding on one tree. It fires **only on `git commit`**.
+It does **not** intercept, slow, or forbid any read:
+
+- `git -C <path> diff`, `git -C <path> status`, `git -C <path> log`, `git -C <path> show`
+- reading any file (tracked or untracked) in any worktree
+- any number of agents doing the above **concurrently**, against **any** worktree
+  — including one another agent is actively editing.
+
+So **multi-agent read-only review/exploration of in-progress work is always
+safe and is never blocked.** The strong policy wording ("never touch a tree you
+don't own", "one committer per tree") is about **mutation** — `stash`, `reset`,
+`checkout`, `add`, `commit`, `rebase`, `clean`, `restore`, `switch` — not about
+reading. If you only need to *look*, none of the isolation rules constrain you.
+
+For the blessed pattern to review another worktree's uncommitted changes, see
+[Recipe: multi-agent read-only review of an existing worktree](#recipe-multi-agent-read-only-review-of-an-existing-worktree).
+
 ## How it works (the 3B1B picture)
 
 Every worktree of a clone shares **one** `.git` object store. Picture all the
@@ -82,6 +102,56 @@ non-zero and is blocked. Default (unset / `advisory` / `warn`) only warns.
 `JANUS_WT_LOCK=off` disables the check entirely.
 
 Tuning the staleness window (default 2h): `export JANUS_WT_LOCK_STALE_MS=3600000`.
+
+## Recipe: multi-agent read-only review of an existing worktree
+
+**Problem.** A Workflow's implementation phase produces uncommitted work in an
+isolated feature worktree (e.g. `feat/odb` at
+`../OrbitalVoiceRunner-wt/odb`). In the review phase you want **N parallel
+subagents** to review/explore that **in-progress, uncommitted** work.
+
+**Why `isolation:'worktree'` does NOT fit here.** That primitive spins up a
+**fresh** worktree branched off the session's HEAD (typically `main`). A fresh
+tree off main does **not** contain the feature worktree's uncommitted changes,
+so reviewers launched that way literally cannot see the work under review.
+`isolation:'worktree'` is for parallel **writers** branching off main — not for
+reviewing someone else's in-flight feature tree.
+
+**The pattern (read-only, zero-mutation).** Point reviewers directly at the
+feature worktree's **absolute path** and keep them strictly read-only:
+
+1. Give each reviewer the feature worktree path, e.g.
+   `C:\Users\you\PycharmProjects\OrbitalVoiceRunner-wt\odb` (an absolute path,
+   not a relative one — reviewers may run from anywhere).
+2. Reviewers run **only** read-only git, always with `-C <path>` (or `cd`-free
+   `git -C`) so they never disturb their own cwd's tree either:
+   - `git -C <path> status --short` — see modified **and** untracked files.
+   - `git -C <path> diff` — tracked, unstaged changes.
+   - `git -C <path> diff --staged` — staged changes.
+   - `git -C <path> log --oneline -20` — recent history.
+   - read any file directly (tracked or untracked) with normal file tools.
+3. Reviewers run **zero** state-mutating git. Forbidden in the reviewed tree
+   **and** their own: `stash`, `reset`, `checkout`, `switch`, `restore`,
+   `add`, `commit`, `rebase`, `merge`, `clean`, `apply`. None are needed to read.
+
+**Gotcha — `git diff` hides new files.** Plain `git diff` shows only *tracked*
+changes; brand-new untracked files (a very common shape for in-progress work)
+do **not** appear. Always pair it with `git -C <path> status --short` (untracked
+files show as `??`) and read those files directly. The convenience helper
+[`scripts/worktree-changeset.mjs`](../../scripts/worktree-changeset.mjs) prints
+the **full** change set — tracked diff stat **plus** untracked files — in one
+shot:
+
+```bash
+node scripts/worktree-changeset.mjs ../OrbitalVoiceRunner-wt/odb
+# defaults to the current worktree if no path is given
+```
+
+**Safety.** This pattern is safe by construction: it is all reads, and the
+`pre-commit` lock does not fire on reads (it runs only on `git commit`). Many
+reviewers can hit one feature tree at once with no contention. The single owner
+keeps writing in their tree; reviewers only observe. See
+[Scope: commits/writes only](#scope-commitswrites-only--reads-are-never-gated).
 
 ## Clear a stale / dead lock
 
