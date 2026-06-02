@@ -15,6 +15,8 @@ export interface StoredPane {
   last_known_state: PaneStatus; is_busy: boolean; alive: boolean; context_size: number;
   last_status_change_at: string | null; last_command: string | null;
   scrollback_path: string | null; created_at: number; updated_at: number;
+  // bead 8sq (schema v4): JSON-encoded per-pane CapabilityGateMap override, or null (no override).
+  capability_gates?: string | null;
 }
 export interface StoredArchivedPane extends StoredPane { archived_at: number; archive_reason: string | null; }
 export interface StoredNote {

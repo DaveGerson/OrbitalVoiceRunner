@@ -95,6 +95,11 @@ export interface Terminal {
   tool_preset?: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   session_id?: string;
   context_size?: number;
+  // bead 8sq (spec §2.A / §5): SERVER-resolved effective posture. The chip + popover render from
+  // these (server truth) — the client never re-derives policy. Optional so older payloads / mocks
+  // that omit them degrade gracefully (no chip).
+  effective_gates?: CapabilityGateMap;
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
 }
 
 export interface PendingCommand {
