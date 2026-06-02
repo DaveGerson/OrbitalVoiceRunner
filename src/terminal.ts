@@ -66,6 +66,39 @@ export function parsePresetsSafe(input: any): CliPreset[] {
 
 
 /**
+ * Pure launch-string builder (BUG-032 regression surface). Given a fully-built
+ * base command (already carrying any --dangerously-skip-permissions mutation from
+ * the constructor — that is NOT this function's concern), decide whether to append
+ * a `--resume <id>` flag.
+ *
+ * Invariants (pinned in tests/test_launch_command.ts):
+ *  - Custom panes are never touched (no resume flag ever).
+ *  - --resume is appended ONLY when sessionId is a real UUID. A synthetic tracking
+ *    id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
+ *  - Never double-append: if the command already carries --resume or --session,
+ *    leave it alone.
+ *  - The base command is returned verbatim otherwise (no invented flags, no npx).
+ */
+export function buildLaunchCommand(
+  shellCmd: string,
+  toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
+  sessionId: string
+): string {
+  let finalCommand = shellCmd;
+  if (toolPreset !== "Custom" && sessionId) {
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
+    // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
+    // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
+    if (!alreadyHasResume && UUID_RE.test(sessionId)) {
+      finalCommand = `${finalCommand} --resume ${sessionId}`;
+    }
+  }
+  return finalCommand;
+}
+
+
+/**
  * Append `chunk` to a raw display-backfill buffer, keeping at most the most
  * recent `max` characters. Pure. Unlike the model-bound outputBuffer this keeps
  * escape sequences INTACT (no ANSI stripping) — xterm needs the raw bytes to
@@ -507,16 +540,7 @@ export class UniversalTerminal {
   }
 
   start() {
-    let finalCommand = this.shellCmd;
-    if (this.toolPreset !== "Custom" && this.sessionId) {
-      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
-      // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
-      // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
-      if (!alreadyHasResume && UUID_RE.test(this.sessionId)) {
-        finalCommand = `${finalCommand} --resume ${this.sessionId}`;
-      }
-    }
+    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId);
 
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
