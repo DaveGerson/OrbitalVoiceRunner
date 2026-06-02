@@ -23,6 +23,7 @@ test("writeInput submits with CR (\\r), not LF — ConPTY Enter is carriage retu
   const term = new UniversalTerminal("test-input-cr", ".", "cmd");
   const { transport, writes } = makeFakeTransport();
   (term as any).transport = transport;   // inject fake; never start() a real PTY
+  (term as any).spawnReady = true;       // G3: model a child that has attached its stdin (post-ready wire contract)
 
   term.writeInput("ls");
 
@@ -35,6 +36,7 @@ test("writeInput preserves the command body verbatim and appends a single CR", (
   const term = new UniversalTerminal("test-input-body", ".", "cmd");
   const { transport, writes } = makeFakeTransport();
   (term as any).transport = transport;
+  (term as any).spawnReady = true;       // G3: post-ready wire contract (see CR test above)
 
   const prompt = "Reply with PONG. token=JANUS_XQ7";
   term.writeInput(prompt);

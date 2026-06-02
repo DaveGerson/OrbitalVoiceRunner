@@ -193,6 +193,16 @@ export class UniversalTerminal {
   public shellCmd: string;
   // WS-C: the active PTY transport (node-pty preferred, legacy fallback).
   private transport: PtyTransport | null = null;
+  // G3: stdin/TTY readiness gate. A freshly spawned ConPTY child has not yet
+  // attached its stdin reader, so the earliest writeInput() bytes are lost and the
+  // agent CLI prints "Warning: no stdin data received in 3s". We buffer input until
+  // the child proves itself ready (first onData) or a short fallback timer fires.
+  private spawnReady = false;
+  private pendingInput: string[] = [];
+  private readyFallbackTimer: NodeJS.Timeout | null = null;
+  private static readonly READY_FALLBACK_MS = 750;
+  // Injectable spawn seam (tests inject a fake transport; prod uses node-pty/legacy).
+  private transportFactory: typeof createPtyTransport = createPtyTransport;
   public outputBuffer: string[] = [];
   public maxBufferLines = 100;
   // Push-observation delta cursor. `totalLines` is monotonic (never decremented by
@@ -259,7 +269,8 @@ export class UniversalTerminal {
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" = "Human-in-the-Loop",
     sessionId = "",
     projectId = "default_project",
-    statusProbe?: StatusProbe
+    statusProbe?: StatusProbe,
+    transportFactory?: typeof createPtyTransport
   ) {
     this.terminalId = terminalId;
     this.cwd = cwd;
@@ -269,6 +280,8 @@ export class UniversalTerminal {
     this.runtimeType = toolPreset === "Custom" ? "shell" : "interactive_cli";
     // Injectable for tests; defaults to the platform-selected probe (design §2.0).
     this.statusProbe = statusProbe ?? selectProbe();
+    // G3: injectable spawn seam (optional + last so no existing call site changes).
+    if (transportFactory) this.transportFactory = transportFactory;
 
     let cmd = shellCmd;
     if (toolPreset !== "Custom") {
@@ -520,7 +533,7 @@ export class UniversalTerminal {
     delete childEnv.CLAUDE_AGENT_SDK_VERSION;
 
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
-    const { transport, usingNodePty } = createPtyTransport(finalCommand, {
+    const { transport, usingNodePty } = this.transportFactory(finalCommand, {
       cwd: this.cwd,
       env: childEnv,
       cols: this.cols,
@@ -528,6 +541,11 @@ export class UniversalTerminal {
     });
     this.transport = transport;
     this.usingNodePty = usingNodePty;
+    // G3: re-enter the gated state for THIS (re)spawn — a /restart must not inherit
+    // a stale spawnReady===true or a queue from the prior process.
+    this.spawnReady = false;
+    this.pendingInput = [];
+    this.armReadyFallback();
     // C2: the legacy (non-node-pty) transport roots the process tree at `script`
     // (Linux/macOS) or a separate `cmd.exe` (Windows), whose tree shape is NOT what
     // the authoritative probe was validated against. Degrade to quiescence-driven
@@ -546,6 +564,10 @@ export class UniversalTerminal {
 
     // Merged stdout/stderr stream from the transport.
     transport.onData((decoded: string) => {
+      // G3: first data out == the child is alive and has attached its PTY. Flush
+      // any queued input BEFORE this chunk advances the status machine, so our
+      // queued command causally precedes the child's response to it.
+      if (!this.spawnReady) this.markSpawnReady();
       this.appendScrollback(decoded);
       // Display lane: keep raw bytes (escape sequences intact) for xterm backfill.
       this.rawBackfill = appendRawCapped(this.rawBackfill, decoded, this.maxRawBackfillChars);
@@ -571,6 +593,11 @@ export class UniversalTerminal {
       if (this.idleTimer) {
         clearTimeout(this.idleTimer);
         this.idleTimer = null;
+      }
+      // G3: cancel the readiness fallback so it never flushes into a dead transport.
+      if (this.readyFallbackTimer) {
+        clearTimeout(this.readyFallbackTimer);
+        this.readyFallbackTimer = null;
       }
     });
 
@@ -599,14 +626,47 @@ export class UniversalTerminal {
     return this.rawBackfill;
   }
 
+  /** Arm the belt-and-suspenders fallback: if no data arrives, still flush soon so a
+   *  silent child does not strand queued input. unref'd so it never holds the loop. */
+  private armReadyFallback() {
+    if (this.readyFallbackTimer) clearTimeout(this.readyFallbackTimer);
+    this.readyFallbackTimer = setTimeout(
+      () => this.markSpawnReady(),
+      UniversalTerminal.READY_FALLBACK_MS
+    );
+    if (this.readyFallbackTimer.unref) this.readyFallbackTimer.unref();
+  }
+
+  /** Mark the child ready and flush any queued input IN ORDER. Idempotent. */
+  private markSpawnReady() {
+    if (this.spawnReady) return;
+    this.spawnReady = true;
+    if (this.readyFallbackTimer) {
+      clearTimeout(this.readyFallbackTimer);
+      this.readyFallbackTimer = null;
+    }
+    const queued = this.pendingInput;
+    this.pendingInput = [];
+    for (const data of queued) {
+      if (this.transport) this.transport.write(data);
+    }
+  }
+
   writeInput(command: string) {
     // Record the most recent command and optimistically mark Running — an input
     // means a turn is starting (Tier A kick, design §5).
     this.lastCommand = command;
     this.applyStatusEvent({ kind: "input" });
-    if (this.transport) {
-      // CR (\r), not LF — a ConPTY-hosted TUI agent submits on Enter (carriage return); LF leaves the prompt staged-but-unsubmitted (G1).
-      this.transport.write(command + "\r");
+    // CR (\r), not LF — a ConPTY-hosted TUI agent submits on Enter (carriage return); LF leaves the prompt staged-but-unsubmitted (G1).
+    const data = command + "\r";
+    if (!this.transport) return;
+    // G3: a freshly spawned ConPTY child has not attached its stdin reader yet, so
+    // a synchronous write here is dropped on the floor. Queue until spawn-ready
+    // (first onData / fallback timer), then flush in submission order.
+    if (this.spawnReady) {
+      this.transport.write(data);
+    } else {
+      this.pendingInput.push(data);
     }
   }
 
@@ -647,6 +707,12 @@ export class UniversalTerminal {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
+    }
+    // G3: cancel the readiness fallback so a stopped pane leaves no timer that could
+    // fire a flush into a killed transport.
+    if (this.readyFallbackTimer) {
+      clearTimeout(this.readyFallbackTimer);
+      this.readyFallbackTimer = null;
     }
 
     const transport = this.transport;
