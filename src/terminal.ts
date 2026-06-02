@@ -605,7 +605,8 @@ export class UniversalTerminal {
     this.lastCommand = command;
     this.applyStatusEvent({ kind: "input" });
     if (this.transport) {
-      this.transport.write(command + "\n");
+      // CR (\r), not LF — a ConPTY-hosted TUI agent submits on Enter (carriage return); LF leaves the prompt staged-but-unsubmitted (G1).
+      this.transport.write(command + "\r");
     }
   }
 
