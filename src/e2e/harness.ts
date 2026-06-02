@@ -22,6 +22,12 @@ export interface OrbitalE2EHooks {
   injectPendingApproval: (cmd: string, terminalId?: string) => void;
   injectPendingAction: (capability: string, summary: string) => void;
   /**
+   * U3 (bead wsm-e2e-pinned-dlj): stage a WIP draft for `paneId` so the e2e can exercise the
+   * `wipDrafts.length > 0` clause of the Sync Spec tab draft-pending badge independently of
+   * `promptBuffer`. ?mock=1-gated test-support only; a no-op for real users.
+   */
+  injectWipDraft: (paneId: string, text: string) => void;
+  /**
    * WS-F resumption pin (spec §6.1, §8). The ?mock=1 harness is CLIENT-ONLY (no real server WS), so
    * the disconnect/reconnect round-trip is staged at the harness layer. `simulateDisconnect` models
    * the server's `detachSession`: it is a deliberate NO-OP on the staged arrays — staged approvals
@@ -67,6 +73,11 @@ export interface E2EHarnessDeps {
   // bead 8sq: the two-stage STOP-ALL banner state (driven by the harness setFrozenMock hook).
   setFrozen: (v: boolean) => void;
   setFrozenRunning: (running: string[]) => void;
+  // U3: setter for the wipDrafts register — type mirrors the useState shape at src/App.tsx:220.
+  setWipDrafts: (
+    updater: (prev: { paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[])
+      => { paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[],
+  ) => void;
 }
 
 /**
@@ -207,6 +218,10 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
         stagedActions.push(record);
         deps.setPendingActions((prev) => [...prev, record]);
       },
+
+      // U3: stage a WIP draft for `paneId`, driving the wipDrafts gate-clause of the Sync Spec badge.
+      injectWipDraft: (paneId, text) =>
+        deps.setWipDrafts((prev) => [...prev, { paneId, draft: { text, updatedAt: new Date().toISOString() } }]),
 
       // WS-F disconnect (spec §6.1): DETACH, not purge. Deliberately does NOT clear the staged arrays
       // (React state) NOR the shadow — the survivors must persist so their chips stay mounted across

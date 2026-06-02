@@ -14,6 +14,7 @@ declare global {
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
       injectPendingApproval: (cmd: string, terminalId?: string) => void;
       injectPendingAction: (capability: string, summary: string) => void;
+      injectWipDraft: (paneId: string, text: string) => void;
       simulateDisconnect: () => void;
       simulateReconnect: () => string | null;
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
@@ -56,6 +57,14 @@ export async function injectPendingAction(page: Page, capability: string, summar
   await page.evaluate(
     ([c, s]) => window.__ORBITAL_E2E__?.injectPendingAction(c, s),
     [capability, summary] as const,
+  );
+}
+
+/** U3: stage a WIP draft for `paneId` so the Sync Spec tab's draft-pending badge can be exercised. */
+export async function injectWipDraft(page: Page, paneId: string, text: string): Promise<void> {
+  await page.evaluate(
+    ([p, t]) => window.__ORBITAL_E2E__?.injectWipDraft(p, t),
+    [paneId, text] as const,
   );
 }
 

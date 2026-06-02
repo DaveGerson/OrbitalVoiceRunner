@@ -425,6 +425,7 @@ function AppRaw() {
     setPendingActions,
     setFrozen,
     setFrozenRunning,
+    setWipDrafts,
   });
 
   const fetchTerminals = async () => {
@@ -1999,7 +2000,11 @@ function AppRaw() {
           <div className="flex items-center gap-2 min-w-0">
             <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
             <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase truncate">Prompt Draft</h3>
-            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate" title="The pane this draft will be sent to">
+            <span
+              data-testid="composer-target-pane"
+              className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate"
+              title="The pane this draft will be sent to"
+            >
               → {activePaneName}
             </span>
           </div>
@@ -2135,11 +2140,15 @@ function AppRaw() {
 
   const renderHelperPanelTabs = () => {
     const unreadCount = attentionQueue.filter(item => !item.dismissed).length;
+    // U3: a draft is pending if the active-pane buffer holds non-whitespace text OR any pane has a
+    // staged WIP draft. Mirrors the composer-send enable gate (.trim()), unlike the legacy mobile
+    // nav dot which gates on raw promptBuffer.length and ignores wipDrafts.
+    const draftPending = promptBuffer.trim().length > 0 || wipDrafts.length > 0;
     return (
       <div className="flex bg-black/60 p-1 rounded-t border-t border-l border-r border-white/5 shrink-0 select-none">
         <button
           onClick={() => setActiveRightHelperTab("buffer")}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 uppercase ${
+          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 relative uppercase ${
             activeRightHelperTab === "buffer"
               ? "border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04]"
               : "border-transparent text-zinc-500 hover:text-zinc-300"
@@ -2147,6 +2156,13 @@ function AppRaw() {
         >
           <CheckSquare className="w-3.5 h-3.5" />
           <span>Sync Spec</span>
+          {draftPending && (
+            <span
+              data-testid="sync-spec-draft-badge"
+              title="A prompt draft is pending"
+              className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse shrink-0"
+            ></span>
+          )}
         </button>
         <button
           onClick={() => setActiveRightHelperTab("orchestration")}
