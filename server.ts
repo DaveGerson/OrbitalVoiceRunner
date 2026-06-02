@@ -40,6 +40,7 @@ import { restGateOutcome } from "./src/restGate";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
 import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
+import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 
 dotenv.config();
 
@@ -961,8 +962,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // Project and Pane management endpoints
   app.post("/api/projects", (req, res) => {
     const { id, directory, summary, keyTerms, name } = req.body;
+    if (!id) {
+      res.status(400).json({ error: "Missing required field: id" });
+      return;
+    }
+    // G5: validate the caller-supplied directory before persisting it. A non-blank
+    // dir that does not exist (or is a file) is rejected — storing it would later
+    // taint a child pane's cwd and make node-pty throw "path not found". Blank/"."
+    // resolves to the server cwd (valid intent preserved), never the literal ".".
+    if (isBadProjectDir(directory)) {
+      res.status(400).json({ error: `Project directory does not exist: ${String(directory).trim()}` });
+      return;
+    }
     const terms = Array.isArray(keyTerms) ? keyTerms : [];
-    manager.ledger.addProject(id, directory || ".", summary || "", terms);
+    manager.ledger.addProject(id, resolveProjectDir(directory), summary || "", terms);
     if (name) {
       manager.ledger.renameProject(id, name);
     }
@@ -2582,11 +2595,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "create_project") {
                 const { project_id, directory, summary, key_terms } = args;
-                manager.ledger.addProject(project_id, directory || ".", summary || "", key_terms || []);
-                broadcastLedgerUpdate();
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Project context ${project_id} created successfully.` } }]
-                });
+                // G5: reject a non-existent caller-supplied directory before persisting it
+                // (a bad dir later taints every child pane's cwd). Blank/"." resolves to the
+                // server cwd. The rejection is a spoken-friendly tool response so the model
+                // can re-prompt the operator, matching the gated-Off voice error style below.
+                if (isBadProjectDir(directory)) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: {
+                      output: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`
+                    } }]
+                  });
+                } else {
+                  manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []);
+                  broadcastLedgerUpdate();
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Project context ${project_id} created successfully.` } }]
+                  });
+                }
               } else if (name === "create_pane") {
                 const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
                 const createPaneEffect = (): string => {
