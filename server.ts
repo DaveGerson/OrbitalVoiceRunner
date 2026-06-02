@@ -31,7 +31,7 @@ import {
   type ResolveMode,
   type ResolveReason,
 } from "./src/pendingApprovals";
-import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
+import { parseApprovalIntent, selectApprovalTarget, selectPendingAction } from "./src/approvalIntent";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
@@ -2187,6 +2187,44 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                         pushApprovalNarration(session, `I have ${entries.length} pending: ${list}. Which one?`);
                       } else {
                         resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
+                      }
+                    }
+                  } else {
+                    // U1 (bead wsm-e2e-pinned-9fe): no pending pane-WRITE approval for this session,
+                    // but a gated NON-PTY mutator (create_pane / set_*_permissions) may be staged in
+                    // the GLOBAL pendingActions store (gateOrDefer Ask branch, server.ts:1407).
+                    // Resolve it by voice, MIRRORING the REST handlers (server.ts:1560-1580) so the
+                    // claim() seam keeps exactly-once across a REST+voice race.
+                    // NOTE: pendingActions is GLOBAL (not session-scoped like pendingApprovals) — a
+                    // sharp edge in multi-session setups; here the single live session owns the queue.
+                    // Precedence is preserved by being the `else` of `entries.length > 0`: a session
+                    // with BOTH a pending approval and a staged action resolves the APPROVAL first.
+                    const actions = pendingActions.all();
+                    if (actions.length > 0) {
+                      const target = selectPendingAction(
+                        actions.map((a) => ({ id: a.id, summary: a.summary })),
+                        parsed.targetHint
+                      );
+                      if (parsed.intent === "clarify") {
+                        pushApprovalNarration(session, `I heard both approve and reject — which of the ${actions.length} pending action${actions.length === 1 ? "" : "s"} did you mean?`);
+                      } else if (target.ambiguous || !target.id) {
+                        // >1 staged and nothing disambiguates -> read back the SUMMARIES (actions
+                        // have no meaningful terminalId; never narrate an empty pane id).
+                        const list = actions.map((a, i) => `${i + 1}. ${redactSecrets(a.summary)}`).join("; ");
+                        pushApprovalNarration(session, `I have ${actions.length} pending action${actions.length === 1 ? "" : "s"}: ${list}. Which one?`);
+                      } else if (parsed.intent === "approve") {
+                        const result = pendingActions.confirm(target.id);
+                        if (result.reason === "confirmed") {
+                          broadcast({ type: "action_resolved", actionId: target.id, outcome: "confirmed" });
+                          pushApprovalNarration(session, `Done — ${redactSecrets(target.summary ?? "")}.`);
+                        }
+                        // lost_race / not_found -> a concurrent REST already resolved it; stay silent
+                        // (no double-narration, no pane re-broadcast).
+                      } else {
+                        // reject
+                        const result = pendingActions.cancel(target.id);
+                        broadcast({ type: "action_resolved", actionId: target.id, outcome: "cancelled" });
+                        if (result.reason === "cancelled") pushApprovalNarration(session, `Cancelled — ${redactSecrets(target.summary ?? "")}.`);
                       }
                     }
                   }
