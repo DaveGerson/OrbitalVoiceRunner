@@ -22,6 +22,9 @@ import {
   inferKind,
   loadShellAllowlist,
   serializePending,
+  decideSweepAction,
+  renderResumptionLine,
+  APPROVAL_GRACE_MS,
   type ApprovalKind,
   type EffectiveMode,
   type PendingApproval,
@@ -343,6 +346,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   };
 
   let activeFrontendWs: any = null;
+  // WS-F (spec §5/§6.3): the current live Gemini session, hoisted to closure scope so the module-level
+  // sweep can speak a last-call for non-session-bound pending ACTIONS (approvals carry their own
+  // per-record session via sessionFor; actions do not). Single-operator, last-connection-wins: set
+  // when a connect resolves, nulled on socket close. Null === no voice channel to narrate into.
+  let activeLiveSession: any = null;
   const clients = new Set<any>();
 
   // Step 5 (single active pane): the pane the operator currently has open on screen, driven by the
@@ -1418,6 +1426,47 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
   }
 
+  // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
+  // After a fresh live session is established, re-attach every orphaned approval (a survivor whose
+  // handle was nulled by detachSession on the prior disconnect, OR a restart-hydrated row) to THIS
+  // session — opening a fresh TTL window — then speak ONE batched digest across approvals + pending
+  // actions and broadcast so the UI chips repopulate the FULL list. Survivors stay UN-APPROVED
+  // (re-require approval): the digest only re-surfaces them for a conscious yes; nothing auto-fires.
+  function reannounceSurvivors(session: any) {
+    const now = Date.now();
+    // (1) Re-attach every orphan approval to the freshly-connected session (fresh TTL window,
+    // lastCallAt cleared). pendingActions have no session binding — they survive in-process untouched.
+    for (const orphan of pendingApprovals.orphans()) {
+      pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
+    }
+    // (2) Collect the survivors: re-attached approvals (now bound to this session) + ALL pending
+    // actions (not session-bound, spec §6.2 includes them all). Build ONE digest line per item.
+    const approvals = pendingApprovals.forSession(session);
+    const actions = pendingActions.all();
+    type Survivor = { line: string; ts: number };
+    const survivors: Survivor[] = [
+      ...approvals.map((a) => ({ line: renderResumptionLine(a, now), ts: a.timestamp })),
+      ...actions.map((a) => ({ line: `${a.capability}: ${redactSecrets(a.summary)}`, ts: a.timestamp })),
+    ];
+    if (survivors.length === 0) return; // (spec §7) zero survivors -> SILENT.
+
+    // (3) Most-recent first; speak up to 3, summarize the rest (spec §7). UI shows the full list.
+    survivors.sort((x, y) => y.ts - x.ts);
+    const total = survivors.length;
+    const shown = survivors.slice(0, 3).map((s) => s.line);
+    let digest: string;
+    if (total === 1) {
+      digest = `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
+    } else if (total <= 3) {
+      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
+    } else {
+      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+    }
+    pushApprovalNarration(session, digest);
+    // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
+    broadcast({ type: "terminals_updated" });
+  }
+
   // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
   // (ApprovalDialog.tsx) keys on these EXACT strings — do NOT rename the values without changing
   // the client. The `command_auto_executed` payload has two boolean variants the UI relies on:
@@ -1552,18 +1601,56 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
   });
 
-  // WS-E.3 (BUG-019): periodic sweep auto-rejects expired approvals so an unresolved vote
-  // never freezes a session indefinitely. The interval is unref'd so the test suite/process
-  // exits cleanly; it is also cleared on shutdown. The expiry routes through the SAME mandatory
-  // claim gate as approve (via applyResolution -> resolveDecision), closing the prior asymmetry
-  // where the sweep bypassed the claim by filtering `!p.claimed`.
+  // WS-F (spec §4.1/§6.3): the sweep no longer SILENTLY auto-rejects on TTL. It drives off the pure
+  // `decideSweepAction` so the timing/connectivity policy lives in ONE unit-tested place:
+  //   - DISCONNECTED item -> "none": the clock is PAUSED (you cannot speak a last-call into a session
+  //     that isn't there, and the spec forbids rejecting without first speaking one). The item waits,
+  //     durably, until the operator returns — this is the "away at a meeting -> still there" guarantee.
+  //   - CONNECTED + past TTL, no prior last-call -> "lastcall": stamp lastCallAt=now and SPEAK a
+  //     context-rich last-call (renderResumptionLine + "approve now or I'll drop it"). Do NOT reject.
+  //   - CONNECTED + last-call already spoken + grace elapsed -> "reject": NOW route through the
+  //     UNCHANGED terminal path (applyResolution(id,"expire") -> resolveDecision claim+delete).
+  // Connectivity is resolved HERE and passed in: per-record `sessionFor(id) !== undefined` for
+  // approvals (the detach/re-attach seam), global `activeFrontendWs !== null` for the non-session-
+  // bound pending actions. Only the TRIGGER + the connected-gate change; the reject itself stays
+  // byte-for-byte (the mandatory claim gate / exactly-once / dead-pane invariants are untouched).
   function sweepExpiredApprovals(now: number = Date.now()) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
+      const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
+      const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
+      if (decision.action === "none") continue; // not due, clock paused, or inside grace.
+      if (decision.action === "lastcall") {
+        // First crossing while connected: SPEAK the last-call (no reject), stamp the transient.
+        pending.lastCallAt = now;
+        const session = pendingApprovals.sessionFor(pending.messageId);
+        if (session) pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`);
+        broadcast({ type: "terminals_updated" });
+        continue;
+      }
+      // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
       applyResolution(pending.messageId, "expire");
     }
-    // G1: expire stale deferred actions on the SAME cadence so a never-confirmed mutation does not
-    // linger forever (parity with approvals; the side effect is NOT run on expiry).
+    // G1 + WS-F: pending actions get the SAME last-call->grace shape. Connectivity is gated on the
+    // SAME ref used to narrate (`activeLiveSession`), NOT `activeFrontendWs`. The two diverge during
+    // the Gemini `ai.live.connect()` handshake window: `activeFrontendWs` is set synchronously on WS
+    // open, but `activeLiveSession` is only assigned AFTER the async connect resolves. If the gate
+    // were `activeFrontendWs`, a sweep tick in that window could return "lastcall" (gate true), stamp
+    // the one-shot `lastCallAt`, yet SKIP the narration (no live session) — and since "lastcall" never
+    // re-fires once stamped, the action would later be rejected having NEVER spoken a last-call,
+    // violating spec §4.1/§10 #4 ("a spoken last-call always precedes any reject"). Coupling the gate
+    // to `activeLiveSession` mirrors the approval path (gate ref == narration ref). The transient
+    // `lastCallAt` drives the two-phase transition; expiry stays the unchanged pendingActions.expire(id).
+    const actionsConnected = activeLiveSession !== null;
     for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
+      const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
+      if (decision.action === "none") continue;
+      if (decision.action === "lastcall") {
+        act.lastCallAt = now;
+        if (activeLiveSession) pushApprovalNarration(activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`);
+        broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        continue;
+      }
+      // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
       pendingActions.expire(act.id);
       broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
     }
@@ -3021,6 +3108,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       },
     });
 
+      // WS-F (spec §6.2): the live session is now established. Hoist it for the action last-call,
+      // then re-attach every staged survivor that outlived the prior disconnect (or a process
+      // restart) to THIS session and speak ONE batched resumption digest — "welcome back, here's
+      // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
+      // connect promise resolves so `session` is live.
+      activeLiveSession = session;
+      reannounceSurvivors(session);
+
       // Push-observation: bridge global pane signals into THIS live session. The bus owns
       // debounce; we forward each signal as a user-role nudge (same convention as approval
       // narration the model already speaks). Unsubscribed on socket close.
@@ -3083,11 +3178,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         activePaneId = null; // Step 5: no UI connected -> no source of truth -> no write permitted.
       }
       if (session) {
-        // Clean up any pending approvals associated with this session to avoid leaks or hanging
-        // tool-calls. TODO(WS-F): persist + re-announce these on reconnect instead of purging
-        // (the store's session side-map keeps the serializable record re-attachable).
-        const purged = pendingApprovals.purgeSession(session);
-        if (purged.length) console.log(`[CLEANUP] Purged ${purged.length} orphaned approval(s) for closed session.`);
+        // WS-F (spec §6.1): disconnect = DETACH, not purge. Drop the dead live-session handle but
+        // KEEP each staged approval (record + order + durable row) so the survivors re-announce on
+        // reconnect (reannounceSurvivors). The clock is paused while detached (the sweep skips items
+        // with no session), so nothing the operator stepped away from is silently dropped.
+        // pendingActions needs nothing here — it is not session-bound and survives in-process.
+        const detached = pendingApprovals.detachSession(session);
+        if (detached.length) console.log(`[DETACH] kept ${detached.length} survivor(s) for re-announce on reconnect.`);
+        // Drop the hoisted live-session ref if it points at this (now dead) session, so the action
+        // last-call doesn't narrate into a torn-down channel. The action clock also pauses now
+        // (activeFrontendWs went null above), matching the approval clock-pause-while-away.
+        if (activeLiveSession === session) activeLiveSession = null;
         try {
           session.close();
         } catch (e) {

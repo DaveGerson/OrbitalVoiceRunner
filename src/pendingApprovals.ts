@@ -44,6 +44,14 @@ export interface AddApprovalMeta {
 /** Fallback TTL when add() is called without an explicit ttlMs (mirrors server's APPROVAL_TTL_MS). */
 export const APPROVAL_DEFAULT_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * The grace window between a spoken LAST-CALL and the auto-reject that follows continued silence
+ * (spec §4.1 / §6.3). Default 60 s. Colocated with the TTL default so the sweep's two-phase
+ * "last-call → grace → reject" timing lives next to `decideSweepAction`, the pure fn it parameterizes;
+ * the server (TASK 3) imports it rather than re-declaring a literal.
+ */
+export const APPROVAL_GRACE_MS = 60 * 1000;
+
 export type ApprovalKind = "agent_instruction" | "shell";
 export type RuntimeType = "shell" | "interactive_cli";
 export type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
@@ -66,6 +74,13 @@ export interface PendingApproval {
   timestamp: number;
   /** WS-F atomic-claim seam: set before writeInput so REST+voice can't double-dispatch. */
   claimed?: boolean;
+  /**
+   * WS-F resumption transient (spec §5): the moment a spoken LAST-CALL was issued for this item
+   * while its session is connected. Drives last-call→grace→reject in the sweep. IN-MEMORY ONLY —
+   * never persisted (no durable column); cleared on re-attach. If it resets on restart the item
+   * simply earns a fresh last-call, which is harmless.
+   */
+  lastCallAt?: number;
   /** The capability this approval rides (design §3). Defaults to "write_to_pane". */
   capability?: string;
 }
@@ -331,6 +346,62 @@ export function resolveDecision(
   return { reason: "approved", record, doWrite: true };
 }
 
+/**
+ * The TRIGGER a sweep tick should fire for one staged record (spec §4.1 / §6.3). PURE — mirrors
+ * the codebase's pure-decision pattern (`decideProposal`, `resolveDecision`): all the timing/connectivity
+ * policy lives here so the server sweep (TASK 3) only RENDERS the chosen action (narrate / claim+delete /
+ * nothing). The actual reject still routes through the unchanged `applyResolution(id,"expire")` →
+ * `resolveDecision` claim+delete terminal path; this fn decides ONLY whether to last-call, reject, or wait.
+ *
+ *   - "none"     : leave the record staged (not yet due, or clock paused, or already claimed).
+ *   - "lastcall" : connected + past TTL + no prior last-call → speak the last-call, set lastCallAt, DON'T reject.
+ *   - "reject"   : connected + last-call already spoken + grace elapsed → route to applyResolution(id,"expire").
+ */
+export type SweepAction = { action: "none" } | { action: "lastcall" } | { action: "reject" };
+
+/**
+ * Decide the sweep trigger for `record` at `now` (spec §4.1 — the FORCED clock rule):
+ *
+ *   1. `isConnected === false` ⇒ "none". CLOCK PAUSED. You cannot re-announce a last-call into a
+ *      session that isn't there, and the spec forbids rejecting without first speaking a last-call —
+ *      so a disconnected item NEVER expires. It waits, durably, until the operator returns. (This is
+ *      the whole "away at a meeting → still there on return" guarantee.)
+ *   2. `claimed` truthy ⇒ "none". A claimed record is mid-resolve / already won by an approve; the
+ *      sweep must never stomp it (mirrors resolveDecision's claimed short-circuit). Checked before the
+ *      time gates so a claimed-but-undeleted survivor can never be last-called or re-rejected.
+ *   3. Connected + idle past TTL (`now - timestamp > ttlMs`) with NO `lastCallAt` ⇒ "lastcall".
+ *      First crossing: speak the context-rich last-call + grace; do NOT reject yet.
+ *   4. Connected + `lastCallAt` set + grace elapsed (`now - lastCallAt > graceMs`) ⇒ "reject".
+ *      Continued silence after the last-call: NOW route to the unchanged reject path.
+ *   5. Else ⇒ "none" (not yet at TTL, or inside the grace window post-last-call).
+ *
+ * `now - timestamp > ttlMs` is exactly `now > expires_at` (expires_at = timestamp + ttlMs); the pure fn
+ * works off the in-memory record's `timestamp` so it needs no durable column. Connectivity (per-record
+ * session for approvals; global `activeFrontendWs` for actions) is resolved by the SERVER and passed in.
+ */
+export function decideSweepAction(
+  record: { timestamp: number; claimed?: boolean; lastCallAt?: number },
+  now: number,
+  ttlMs: number,
+  graceMs: number,
+  isConnected: boolean,
+): SweepAction {
+  // (1) Clock paused while disconnected — never reject without a session to hear the last-call.
+  if (!isConnected) return { action: "none" };
+  // (2) A claimed record is mid-resolve / already won; the sweep must not touch it.
+  if (record.claimed) return { action: "none" };
+  // (4) Last-call already spoken and the grace window has elapsed → reject. (Checked before the
+  // first-crossing gate so a record with lastCallAt set isn't re-issued a last-call.)
+  if (record.lastCallAt !== undefined) {
+    if (now - record.lastCallAt > graceMs) return { action: "reject" };
+    return { action: "none" }; // still inside the grace window.
+  }
+  // (3) First crossing of the TTL while connected and idle → speak the last-call.
+  if (now - record.timestamp > ttlMs) return { action: "lastcall" };
+  // (5) Not yet due.
+  return { action: "none" };
+}
+
 /** Serialize a record for the UI / persistence (keeps a `cmd` alias for back-compat). */
 export function serializePending(p: PendingApproval): Record<string, any> {
   return {
@@ -343,6 +414,51 @@ export function serializePending(p: PendingApproval): Record<string, any> {
     timestamp: p.timestamp,
     ageSeconds: Math.max(0, Math.floor((Date.now() - p.timestamp) / 1000)),
   };
+}
+
+/**
+ * Humanize an age (ms) into the spoken digest's coarse "<age> ago" form. Sub-minute reads
+ * "just now" (no zero-minute / negative weirdness); then minutes, then hours, then days.
+ * Coarse on purpose — the digest is spoken, not a precise audit clock.
+ */
+function humanizeAge(ageMs: number): string {
+  if (ageMs < 60 * 1000) return "just now";
+  const mins = Math.floor(ageMs / (60 * 1000));
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+/** Trim a long instruction to a spoken-digest length so a single line stays scannable. */
+function shortInstruction(instruction: string, max = 80): string {
+  const oneLine = instruction.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1).trimEnd()}…` : oneLine;
+}
+
+/**
+ * PURE render of one resumption-digest line from EXISTING provenance (spec §5/§7) — no schema
+ * change, all from fields already on the record:
+ *   `<capability> → <terminalId>: "<redacted short instruction>" (you said: <trigger>) — <age> ago`
+ * The instruction is ALWAYS routed through redactSecrets (never leak a credential into the spoken
+ * digest); the durable command stays RAW (add() persists the unredacted instruction so an approved
+ * write replays verbatim) — we redact only at render time. Missing `rationale` degrades gracefully:
+ * the "you said:" clause is simply omitted (no dangling label). `capability` defaults to
+ * "write_to_pane" to mirror the gate's back-compat default.
+ */
+export function renderResumptionLine(record: PendingApproval, now: number): string {
+  const capability = record.capability ?? "write_to_pane";
+  // Redact FIRST, then shorten. If we truncated first, a secret straddling the 80-char cut would be
+  // sliced mid-token and no longer match the anchored, fixed-length redaction regexes (e.g. AKIA needs
+  // the full 20 chars), leaking a partial credential into the spoken digest (spec §5). Redacting first
+  // replaces the full secret with a short [REDACTED:…] marker, so a later truncation can only ever cut
+  // the marker — never expose raw key bytes.
+  const instruction = shortInstruction(redactSecrets(record.instruction));
+  const said = record.rationale?.trigger?.trim();
+  const saidClause = said ? ` (you said: ${said})` : "";
+  const age = humanizeAge(Math.max(0, now - record.timestamp));
+  return `${capability} → ${record.terminalId}: "${instruction}"${saidClause} — ${age}`;
 }
 
 /**
@@ -379,6 +495,12 @@ export class PendingApprovalStore {
   private sidToHandle = new Map<string, any>();
   /** Per-messageId durable session_id, so delete/claim/purge can address durable rows. */
   private sidForId: Record<string, string> = {};
+  /**
+   * Per-messageId durable `workspace_id`, captured at add()/hydrate so reattachSession can rewrite
+   * the durable row faithfully (the in-memory PendingApproval has no workspace column). Not read by
+   * any resolve path; purely to keep the rewritten row byte-faithful to the original.
+   */
+  private workspaceForId: Record<string, string> = {};
   private sidSeq = 0;
 
   constructor(store: JanusStore | ApprovalDurableStore | null = null) {
@@ -403,6 +525,7 @@ export class PendingApprovalStore {
       this.sessions[rec.messageId] = undefined; // no live handle until WS-F re-attach
       this.order.push(rec.messageId);
       this.sidForId[rec.messageId] = row.session_id;
+      this.workspaceForId[rec.messageId] = row.workspace_id;
       this.sidToHandle.set(row.session_id, undefined);
     }
   }
@@ -436,11 +559,13 @@ export class PendingApprovalStore {
 
     const sid = this.sidFor(session);
     this.sidForId[record.messageId] = sid;
+    const workspaceId = meta.workspaceId ?? "default_project";
+    this.workspaceForId[record.messageId] = workspaceId;
     const ttlMs = meta.ttlMs ?? APPROVAL_DEFAULT_TTL_MS;
     this.store.insertPendingApproval({
       id: record.messageId,
       session_id: sid,
-      workspace_id: meta.workspaceId ?? "default_project",
+      workspace_id: workspaceId,
       pane_id: record.terminalId,
       command: record.instruction, // RAW (not redacted) — the approved write replays verbatim.
       kind: record.kind,
@@ -468,6 +593,7 @@ export class PendingApprovalStore {
     delete this.records[messageId];
     delete this.sessions[messageId];
     delete this.sidForId[messageId];
+    delete this.workspaceForId[messageId];
     this.order = this.order.filter((id) => id !== messageId);
   }
 
@@ -525,6 +651,111 @@ export class PendingApprovalStore {
       if (sid) { this.sidToHandle.delete(sid); this.handleToSid.delete(session); }
     }
     return purged;
+  }
+
+  /**
+   * WS-F disconnect seam (spec §6.1): DETACH a closed session WITHOUT discarding its staged work.
+   * For every record bound to `session`, NULL the live handle in the side-map (`sessions[id] =
+   * undefined`) and clear `lastAnnounced` for the dead handle — but KEEP the record, its `order`
+   * entry, AND the durable row. The result is byte-for-byte the shape the restart-hydrate path
+   * already produces (`session === undefined`): an ORPHAN that `forSession(undefined)` enumerates
+   * and a fresh live handle can re-attach to on reconnect.
+   *
+   * This is a SIBLING of purgeSession, not a rename: purgeSession still hard-deletes (retained for
+   * callers that need true purge); only the disconnect handler switches to detachSession. We do NOT
+   * touch the durable row (the whole point — the survivor must outlive the disconnect, and durably
+   * outlive a process restart). The handle<->sid mapping IS dropped (the live handle is dead and
+   * GC-eligible); the per-id durable sid stays on `sidForId` so the row remains addressable, and
+   * the reverse map is rebound to `undefined` so a later re-attach can mint a fresh handle->sid.
+   *
+   * Legacy path (`store === null`): identical in-memory behavior, nothing durable to keep.
+   */
+  detachSession(session: any): string[] {
+    const detached = this.order.filter((id) => this.sessions[id] === session);
+    for (const id of detached) {
+      this.sessions[id] = undefined; // NULL the live handle; record + order + durable row stay.
+      if (this.sidForId[id]) this.sidToHandle.set(this.sidForId[id], undefined);
+    }
+    this.lastAnnounced.delete(session);
+    // Drop the dead live handle<->sid binding so the closed handle can't leak (mirror purgeSession),
+    // but DO NOT delete sidForId entries — the durable rows stay addressable for re-attach/sweep.
+    if (session && typeof session === "object") {
+      const sid = this.handleToSid.get(session);
+      if (sid) { this.handleToSid.delete(session); }
+    }
+    return detached;
+  }
+
+  /**
+   * The orphan survivors — records with no live session handle (`sessions[id] === undefined`), in
+   * `order`. These are exactly what detachSession produces on disconnect and what hydrateFromStore
+   * produces after a cold reopen. The reconnect path (`reannounceSurvivors`) enumerates these to
+   * re-bind them to the freshly-connected session. (forSession(undefined) returns the same set; this
+   * is the named, intention-revealing accessor for the resumption-digest call site.)
+   */
+  orphans(): PendingApproval[] {
+    return this.order
+      .filter((id) => this.sessions[id] === undefined)
+      .map((id) => this.records[id]);
+  }
+
+  /**
+   * WS-F reconnect seam (spec §6.2): RE-ATTACH one orphan record (an item with no live handle —
+   * `sessions[id] === undefined`, produced by detachSession or restart-hydrate) to the freshly-
+   * connected live `session`, opening a FRESH TTL window. This is the mirror of detachSession:
+   * detach NULLs the handle and pauses the clock; reattach binds a new handle and restarts it.
+   *
+   * Steps:
+   *   1. Bind the live handle: `sessions[id] = session`.
+   *   2. Mint/rebind a stable durable sid for the new handle (existing `sidFor`) and record it on
+   *      `sidForId[id]` so delete/claim/the durable rewrite address the SAME row under the NEW sid.
+   *   3. Clear the transient `lastCallAt` (a fresh window earns a fresh last-call if it goes idle).
+   *   4. With a durable store, REWRITE the row (INSERT OR REPLACE, keyed by the unchanged `id`) under
+   *      the new session_id with `expires_at = nowExpiresAt` — so the re-attached item is NOT seen as
+   *      expired until the fresh TTL elapses while connected, and delete/claim still hit the right row.
+   *
+   * CRITICAL (spec §9 HIGH COLLISION): the rewrite MUST carry the existing `claimed` value through.
+   * An orphan is normally unclaimed (claimed survivors were deleted on resolve), but if a claimed-but-
+   * undeleted survivor is ever re-attached, resetting claimed→0 would make it re-claimable (double
+   * write). We read `rec.claimed` (the in-memory mirror kept in lockstep by claim()) into the row.
+   *
+   * Legacy path (`store === null`): steps 1–3 only — there is no durable row to rewrite. The
+   * in-process re-attach + fresh in-memory window still function (the sweep's TTL is measured off the
+   * in-memory `timestamp`, which is unchanged here; the durable expires_at narrowing is a no-op).
+   *
+   * No-op if `orphan` is not actually an orphan (its handle is already bound) — guards against a
+   * double re-attach binding a live record to a second session.
+   */
+  reattachSession(orphan: PendingApproval, session: any, nowExpiresAt: number): void {
+    const id = orphan.messageId;
+    const rec = this.records[id];
+    if (!rec) return;                                  // gone (resolved between detach and reconnect)
+    if (this.sessions[id] !== undefined) return;       // not an orphan — already bound; never re-stomp
+
+    // (1) Bind the new live handle.
+    this.sessions[id] = session;
+    // (3) Clear the last-call transient — re-attach opens a fresh window.
+    rec.lastCallAt = undefined;
+
+    if (!this.store) return;                           // legacy: nothing durable to rewrite.
+
+    // (2) Mint/rebind the durable sid for the new live handle and address the row under it.
+    const newSid = this.sidFor(session);
+    this.sidForId[id] = newSid;
+    // (4) Rewrite the durable row (INSERT OR REPLACE on the unchanged id) under the new session_id
+    // with the fresh expires_at — carrying the EXISTING claimed through (never re-open a claimed row).
+    this.store.insertPendingApproval({
+      id,
+      session_id: newSid,
+      workspace_id: this.workspaceForId[id] ?? "default_project",
+      pane_id: rec.terminalId,
+      command: rec.instruction, // RAW — the approved write still replays verbatim (never redacted).
+      kind: rec.kind,
+      rationale: rec.rationale ? JSON.stringify(rec.rationale) : null,
+      claimed: rec.claimed ?? false, // carry claimed through (spec §9 N-1 exactly-once guard).
+      timestamp: rec.timestamp,
+      expires_at: nowExpiresAt,
+    });
   }
 
   /**
