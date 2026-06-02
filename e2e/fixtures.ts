@@ -14,6 +14,8 @@ declare global {
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
       injectPendingApproval: (cmd: string, terminalId?: string) => void;
       injectPendingAction: (capability: string, summary: string) => void;
+      simulateDisconnect: () => void;
+      simulateReconnect: () => string | null;
     };
   }
 }
@@ -53,6 +55,19 @@ export async function injectPendingAction(page: Page, capability: string, summar
     ([c, s]) => window.__ORBITAL_E2E__?.injectPendingAction(c, s),
     [capability, summary] as const,
   );
+}
+
+/** WS-F (spec §6.1): model a WS drop. The harness KEEPS staged survivors (detach, not purge). */
+export async function simulateDisconnect(page: Page): Promise<void> {
+  await page.evaluate(() => window.__ORBITAL_E2E__?.simulateDisconnect());
+}
+
+/**
+ * WS-F (spec §6.2/§7): model a reconnect. The harness pushes ONE batched resumption digest across the
+ * surviving staged items and returns it (or `null` when there were none → silent). Chips repopulate.
+ */
+export async function simulateReconnect(page: Page): Promise<string | null> {
+  return page.evaluate(() => window.__ORBITAL_E2E__?.simulateReconnect() ?? null);
 }
 
 export const test = base;

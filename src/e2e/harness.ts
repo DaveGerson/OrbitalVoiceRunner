@@ -21,6 +21,23 @@ export interface OrbitalE2EHooks {
   injectTranscript: (sender: "User" | "Janus", text: string) => void;
   injectPendingApproval: (cmd: string, terminalId?: string) => void;
   injectPendingAction: (capability: string, summary: string) => void;
+  /**
+   * WS-F resumption pin (spec §6.1, §8). The ?mock=1 harness is CLIENT-ONLY (no real server WS), so
+   * the disconnect/reconnect round-trip is staged at the harness layer. `simulateDisconnect` models
+   * the server's `detachSession`: it is a deliberate NO-OP on the staged arrays — staged approvals
+   * and actions are KEPT (not purged), which is the whole point of the pin (chips must survive). It
+   * only flips an internal flag so a subsequent reconnect knows a disconnect happened.
+   */
+  simulateDisconnect: () => void;
+  /**
+   * WS-F resumption pin (spec §6.2/§7). Models the server's `reannounceSurvivors`: reads the staged
+   * survivors that outlived `simulateDisconnect` (they were never purged) and pushes ONE batched
+   * `Janus` resumption digest line — the same "Welcome back — N actions waiting from before: …"
+   * envelope the server speaks — composed from each survivor's maintained context. The chips already
+   * persist (the arrays were untouched), so they repopulate for the full list. Returns the digest
+   * string it pushed (or `null` when there were no survivors → silent, mirroring the server).
+   */
+  simulateReconnect: () => string | null;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -36,6 +53,43 @@ export interface E2EHarnessDeps {
   setTranscript: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   setPendingCommands: (updater: (prev: PendingCommand[]) => PendingCommand[]) => void;
   setPendingActions: (updater: (prev: PendingActionEntry[]) => PendingActionEntry[]) => void;
+}
+
+/**
+ * One survivor's resumption-digest line, composed from the SAME maintained provenance the server's
+ * `renderResumptionLine` uses (spec §5/§7): `<capability/cmd> → <terminalId>: "<instruction>"` plus a
+ * `(you said: <trigger>)` clause when a heard trigger is present. Pure; missing rationale degrades to
+ * just the command line. Kept verbatim alongside the action variant so the e2e RENDERS the same digest
+ * shape the server speaks (the server round-trip itself is pinned by the T2–T4 unit/server tests).
+ */
+function approvalResumptionLine(cmd: PendingCommand): string {
+  const trigger = cmd.rationale?.trigger?.trim();
+  const saidClause = trigger ? ` (you said: ${trigger})` : "";
+  return `write_to_pane → ${cmd.terminalId}: "${cmd.cmd}"${saidClause}`;
+}
+
+/** The action variant of a resumption line: `<capability>: <summary>` (spec §6.2 — actions join the digest). */
+function actionResumptionLine(action: PendingActionEntry): string {
+  return `${action.capability}: ${action.summary}`;
+}
+
+/**
+ * The ONE batched resumption digest spoken on reconnect (spec §7) — byte-faithful to the server's
+ * `reannounceSurvivors` envelope. 0 survivors → `null` (silent). 1 → the single-item form. 2–3 → the
+ * "N actions waiting from before: …; Which first?" form. >3 → name 3, then "+N more". `lines` is the
+ * already-rendered per-survivor context, most-recent first.
+ */
+function buildResumptionDigest(lines: string[]): string | null {
+  const total = lines.length;
+  if (total === 0) return null;
+  const shown = lines.slice(0, 3);
+  if (total === 1) {
+    return `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
+  }
+  if (total <= 3) {
+    return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
+  }
+  return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
 }
 
 /**
@@ -76,23 +130,67 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
     deps.setTerminals([mockTerminal()]);
     deps.setActiveTerminalId(MOCK_TERMINAL_ID);
 
+    // WS-F (spec §6.1): tracks that a simulated disconnect happened. The staged arrays are KEPT —
+    // this flag only lets `simulateReconnect` model the server's "re-attach on a fresh session" seam.
+    let disconnected = false;
+    // A synchronous shadow of what's been staged — the harness analog of the server-side stores
+    // (`pendingApprovals` / `pendingActions`) the real `reannounceSurvivors` reads. React state is
+    // async, so the digest is built off this shadow (in lockstep with the inject hooks below), not a
+    // deferred setState read. Survivors are KEPT here across a disconnect, exactly like the durable rows.
+    const stagedApprovals: PendingCommand[] = [];
+    const stagedActions: PendingActionEntry[] = [];
+
     const hooks: OrbitalE2EHooks = {
       injectStdoutChunk: (terminalId, chunk) => deps.queueStdoutChunk(terminalId, chunk),
       injectTranscript: (sender, text) =>
         deps.setTranscript((prev) => [...prev, { sender, text, timestamp: new Date() }]),
-      injectPendingApproval: (cmd, terminalId = MOCK_TERMINAL_ID) =>
-        deps.setPendingCommands((prev) => [...prev, {
-          messageId: `mock_${prev.length + 1}`,
+      injectPendingApproval: (cmd, terminalId = MOCK_TERMINAL_ID) => {
+        const record: PendingCommand = {
+          messageId: `mock_${stagedApprovals.length + 1}`,
           cmd,
           terminalId,
           rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
-        }]),
-      injectPendingAction: (capability, summary) =>
-        deps.setPendingActions((prev) => [...prev, {
-          actionId: `mock_act_${prev.length + 1}`,
+        };
+        stagedApprovals.push(record);
+        deps.setPendingCommands((prev) => [...prev, record]);
+      },
+      injectPendingAction: (capability, summary) => {
+        const record: PendingActionEntry = {
+          actionId: `mock_act_${stagedActions.length + 1}`,
           capability,
           summary,
-        }]),
+        };
+        stagedActions.push(record);
+        deps.setPendingActions((prev) => [...prev, record]);
+      },
+
+      // WS-F disconnect (spec §6.1): DETACH, not purge. Deliberately does NOT clear the staged arrays
+      // (React state) NOR the shadow — the survivors must persist so their chips stay mounted across
+      // the round-trip. We only flip the flag; the server-side clock-pause + durable-keep is covered
+      // by the unit/server tests (T2–T4); this client pin asserts the survivors are never discarded.
+      simulateDisconnect: () => {
+        disconnected = true;
+      },
+
+      // WS-F reconnect (spec §6.2/§7): read the survivors that outlived the disconnect (they were
+      // never purged) most-recent first, render each one's maintained context, and push ONE batched
+      // Janus digest. The chips already persist (arrays untouched), so they repopulate the full list.
+      simulateReconnect: () => {
+        // A reconnect only re-announces survivors when a disconnect actually preceded it — mirrors
+        // the server, where `reannounceSurvivors` runs on a fresh connect (after a prior detach).
+        if (!disconnected) return null;
+        // Most-recent first: injection order is chronological, so reverse to lead with the newest.
+        const lines = [
+          ...[...stagedApprovals].reverse().map(approvalResumptionLine),
+          ...[...stagedActions].reverse().map(actionResumptionLine),
+        ];
+        const digest = buildResumptionDigest(lines);
+        if (digest) {
+          deps.setTranscript((prev) => [...prev, { sender: "Janus", text: digest, timestamp: new Date() }]);
+        }
+        disconnected = false; // re-attached: a fresh window is open.
+        return digest;
+      },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;
 

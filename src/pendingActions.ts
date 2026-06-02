@@ -27,6 +27,13 @@ export interface PendingAction {
   timestamp: number;
   /** Set before run() so a REST+voice double-confirm can't run the effect twice. */
   claimed?: boolean;
+  /**
+   * WS-F resumption transient (spec §5/§6.3): the moment a spoken LAST-CALL was issued while a
+   * frontend is connected. Drives the same last-call→grace→reject shape as PendingApproval. IN-MEMORY
+   * ONLY — like `run`, it is non-serializable and never persists (PendingActionStore has no durable
+   * backend). Cleared implicitly by removal on confirm/cancel/expire.
+   */
+  lastCallAt?: number;
   /** The deferred side effect. Returns a model/operator-facing result string. NOT serializable. */
   run: () => string;
 }
