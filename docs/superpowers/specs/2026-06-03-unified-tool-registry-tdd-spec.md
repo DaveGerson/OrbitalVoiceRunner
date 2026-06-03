@@ -39,17 +39,31 @@ Each path re-parses args, re-applies (or forgets) the capability gate, re-does (
 
 Net: to add or change a tool you edit **one entry**, and Gemini + the UI move together by construction.
 
-### 1.1 North Star — from vibe-coded to dependable (three pillars)
+### 1.1 North Star — a legible capability surface (then dependability)
 
-The real objective beyond DRY wiring: take this from a *works-in-the-demo* prototype into a tool that is **trustworthy enough to sit in the operator's daily critical developer workflow.** Dependability does not come from features — it comes from a **small number of choke-points you can trust, test, and reason about.** Today the app has the opposite (the same operation implemented 2–4 times, safety one surface can bypass, launch logic the model re-invents) — the vibe-coded signature: it runs, but you can't depend on it because any given path might be the unfixed one.
+The real objective beyond DRY wiring: take this from a *works-in-the-demo* prototype, where the supported functionality is **smeared across a dozen files**, into something where there is **one authoritative place that answers "what can this system do?"** — so capability **coverage** and feature **design** become tractable.
 
-The path is **three pillars, sequenced so each makes the next cheap**:
+**Primary goal — centralize the functionality into one legible surface.** Today, to know what the product actually supports you must cross-read at least:
 
-- **Pillar 1 — One trustworthy surface (this spec).** The `runAction` registry: one definition, one gate, one redaction, one result shape per action. This is the foundation; the other two pillars bolt onto its single choke-point.
-- **Pillar 2 — Resilience / known failure modes (next bead — §13).** A specified, tested recovery story for the things that actually bite a daily driver: Gemini Live session drop mid-task, a pane PTY dying, a server restart with work in flight.
-- **Pillar 3 — Observability you can see (later bead — §13).** Surfacing the audit trail and health, not just logging it.
+- `server.ts` — the voice dispatch (`if (name === …)` ×41) **and** ~55 REST routes,
+- `src/terminal.ts` — pane lifecycle / launch,
+- `src/pendingApprovals.ts` — gating + deferral,
+- `src/handoffFlow.ts` — the handoff state machine,
+- `src/gateSurface.ts` — the (hand-listed) capability set,
+- `src/App.tsx` + `src/eventBus.ts` — the UI-side actions and reactions,
+- the `JanusStore` — persisted state.
 
-**Latent wins of the single choke-point (Pillar 1 unlocks these almost for free — see §5.6):** a complete **audit trail** of every action Janus took to your work (trigger, args, gate decision, result); **metrics** (per-action counts/latency/failure); **uniform failure handling** (one try/catch, one error shape, instead of 41 hand-guarded branches that can each forget); and a natural home for **rate-limiting / circuit-breaking** a runaway model. These are impossible to do reliably across four scattered paths and trivial with one — which is *why* the registry is the right first investment toward dependability, not just toward tidiness.
+No single file tells you the surface. That makes two everyday questions *hard*: **(a) coverage** — "is X supported? on voice, UI, or both? what's missing?" — and **(b) design** — "where do I add a feature, and what does it have to wire up?" The registry makes both a **one-place read**: the `ActionDef[]` *is* the catalog of supported functionality, and a generated coverage report (§5.7) shows every capability × surface at a glance.
+
+> Scope nuance: it is the **definitions/catalog** that centralize (one legible map), not all *implementation*. Handlers stay thin and call into the domain modules above — **except** logic that is currently *duplicated* (e.g. preset→command in three places, §3.1), which collapses into one home. Net: **one place to read the surface; one home per behavior.**
+
+**Secondary goal — dependability follows from the same move.** Because every action also flows through one `runAction` choke-point, the operational properties of a tool you can *trust* in your critical path come almost for free (§5.6): a complete **audit trail** of what Janus did, **metrics**, **uniform failure handling** (one try/catch vs. 41 hand-guarded branches), and a home for **rate-limiting**. These matter — but they are downstream of, and secondary to, the legibility win above.
+
+The full arc is **three pillars**, but the headline is Pillar 1's *catalog*, not its plumbing:
+
+- **Pillar 1 — One legible, trustworthy surface (this spec).** The `ActionDef` registry: one definition (→ readable coverage map, §5.7), one gate, one redaction, one result shape per action.
+- **Pillar 2 — Resilience / known failure modes (later — §13, secondary to centralization).** Tested recovery for session drop / PTY death / server restart.
+- **Pillar 3 — Observability you can see (later — §13, secondary).** Surfacing the audit trail and health.
 
 **Governing constraints inherited from the codebase (do not regress):**
 - The capability-gate matrix stays the single choke-point (`gateOrDefer` / `effectiveCapabilityGateFor`); the registry routes *through* it, it does not replace it.
@@ -60,6 +74,7 @@ The path is **three pillars, sequenced so each makes the next cheap**:
 ## 2. Goals & Non-Goals
 
 ### Goals
+- **G0 — One legible capability surface (PRIMARY).** The registry is the single authoritative catalog of supported functionality. Reading it (and the generated coverage report, §5.7) answers "what can the system do, on which surface, and what's missing?" without cross-reading a dozen files — the prerequisite for sane coverage analysis and feature design.
 - **G1 — One definition per tool.** A tool's name, schema, gate, redaction, and handler live in exactly one place.
 - **G2 — Generated Gemini surface.** `functionDeclarations` and the dispatch are produced from the registry; they cannot drift from each other or from the handlers.
 - **G3 — Shared execution for the UI.** REST/WS handlers for registry-backed actions call the same handler the voice path does (same gate, same redaction, same result shape).
@@ -375,6 +390,22 @@ What this single point buys (the §1.1 latent wins, made concrete):
 
 Redaction note: audit args/results are redacted with the same `redactSecrets` so the log itself never becomes a secrets sink.
 
+### 5.7 The registry as the capability map — coverage & feature design (G0, the headline)
+
+The registry's first job is to be **read**, not just executed. The same `ActionDef[]` that drives the runtime is the artifact you consult to understand the product. Two derived, always-current views make this concrete; both are generated from the registry, so they can never drift from what actually ships:
+
+- **Capability catalog** — `npm run catalog` (and a committed `docs/CAPABILITIES.md`, regenerated) renders the registry as a human-readable map grouped by capability: every action, its plain-language `label`, what it does, its surfaces, its gate default. This is the one-page answer to *"what can this system do?"* — the thing that today requires cross-reading `server.ts` + 6 other files.
+- **Coverage report** — `surfaceCoverage(registry)` (already specced as a drift guard in §5.3) is **elevated to a design tool**: a matrix of *capability × {voice, rest, ws}* showing present / missing / intentionally-single-surface. Answers *"is X supported, where, and what's the gap?"* at a glance, and is exactly the worksheet for the §7 convergence track.
+
+**Why this is the headline, not a side effect:**
+
+- **Coverage analysis becomes a lookup, not an audit.** "Can Janus do X? Can the UI? Should it?" is answered by reading one table instead of grepping dispatch chains and REST routes and hoping you found them all.
+- **Feature design has one target.** Adding a capability = adding one `ActionDef` (+ one `CapabilityDef` if it's a new gate row). The schema, the Gemini declaration, the REST/WS route, the gate, and the matrix entry all *derive* from it — so "what do I have to wire up?" has a single, mechanical answer instead of the current four-places-and-don't-forget-the-gate.
+- **Gaps are visible.** The coverage report makes the current asymmetries (the voice-only handoff lifecycle, the rest-only housekeeping — §4.2) *legible* and trackable, instead of tribal knowledge.
+- **Reviewability.** A feature PR shows up as a registry diff: a reviewer sees the new capability, its gate, and its surfaces in one place, and the generated `CAPABILITIES.md`/coverage diff alongside.
+
+This is the centralization the operator is after: not "all code in one file," but **one legible surface that defines the supported functionality**, with the runtime, the Gemini schema, the UI routes, and the docs all flowing from it.
+
 ## 6. Architecture options & honest evaluation
 
 The operator's instinct: *"Python is the most expressive and advanced as we aim to scale."* That is true for **authoring/validating a large tool catalog and for agentic tool logic** (Pydantic, rich typing, the LLM-tooling ecosystem). It is **not** an unqualified win **for the part of this system that does the work**, because the work is native-TS: node-pty PTY lifecycle (incl. Windows ConPTY), `better-sqlite3` ledger, the gate resolver, the WS broadcast hub, handoff/approval flows. Below, three options, scored against the goals.
@@ -520,6 +551,8 @@ Order: write the test (RED), then the minimum code (GREEN), then refactor. Names
 18. **`mountRestRoutes registers a route per rest-surface action`** (`tests/test_action_rest.ts`) — boot the server (existing `ce7`/mockLive harness), assert each `def.rest` path responds; a 401 without token (mirrors `test_voice_tools.ts` auth test).
 19. **`REST and voice run the same handler for a shared action`** — call `propose_command` via the mock Gemini path and via `POST /api/terminals/:id/input`; assert identical gate outcome + result shape (the core "one path" proof).
 20. **`surfaceCoverage flags only allow-listed asymmetries`** (`tests/test_action_registry.ts`) — every voice-only / rest-only action is in the intentional allow-list; fail otherwise.
+20a. **`generated capability catalog is up to date`** (G0 — §5.7) — running `npm run catalog` yields **no diff** vs. the committed `docs/CAPABILITIES.md`; CI guard so the human-readable surface map can never drift from the registry.
+20b. **`coverage report is total over capability × surface`** — `surfaceCoverage(registry)` returns an entry for every action across `{voice,rest,ws}` (no holes), so the design/coverage worksheet is trustworthy.
 
 ### 8.5 Phase 1 — characterization (no behavior change, NG1)
 21. **`each migrated tool produces the pre-refactor response shape`** (`tests/test_voice_tools.ts`, extended) — for a representative set (`list_panes`, `get_pane_summary`, `propose_command` Auto/Ask/Off, `deliver_handoff`, `stop_all`/`confirm`/`release`), push synthetic tool calls through the **new** dispatch and assert the recorded `sendToolResponse` payloads equal the captured pre-refactor goldens. (Capture goldens from `main` before the refactor; commit them as fixtures.)
@@ -604,7 +637,7 @@ All judgment calls are now resolved. Lower-stakes unknowns (settle during implem
 
 ## 13. Dependability roadmap — Pillars 2 & 3 (future beads, NOT this spec's scope)
 
-This spec delivers **Pillar 1** (one trustworthy surface, §1.1). Pillars 2 and 3 are what carry the app the rest of the way from vibe-coded to a daily-driver you can depend on. They are **out of scope here** — recorded so the registry seam is built with them in mind and so they become their own specs/beads. Both are *cheap* precisely because Pillar 1 gives them a single choke-point to hook.
+This spec delivers **Pillar 1** — and the operator's prioritization is explicit: **Pillar 1's *legibility/centralization* value (G0, §5.7) is the headline; resilience and observability are secondary** and follow later. They are **out of scope here** — recorded so the registry seam is built with them in mind and so they become their own specs/beads. Both are *cheap* precisely because Pillar 1 gives them a single choke-point to hook, but neither blocks the centralization win.
 
 ### Pillar 2 — Resilience / known failure modes (next)
 A daily driver must have a **specified, tested** answer to "what happens when it breaks mid-task." Today these paths are implicit/untested. Each becomes a scenario test (the harness already boots a real server + mock Live + stub PTYs — `tests/test_voice_tools.ts`).
