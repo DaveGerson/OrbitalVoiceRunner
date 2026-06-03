@@ -39,6 +39,18 @@ Each path re-parses args, re-applies (or forgets) the capability gate, re-does (
 
 Net: to add or change a tool you edit **one entry**, and Gemini + the UI move together by construction.
 
+### 1.1 North Star — from vibe-coded to dependable (three pillars)
+
+The real objective beyond DRY wiring: take this from a *works-in-the-demo* prototype into a tool that is **trustworthy enough to sit in the operator's daily critical developer workflow.** Dependability does not come from features — it comes from a **small number of choke-points you can trust, test, and reason about.** Today the app has the opposite (the same operation implemented 2–4 times, safety one surface can bypass, launch logic the model re-invents) — the vibe-coded signature: it runs, but you can't depend on it because any given path might be the unfixed one.
+
+The path is **three pillars, sequenced so each makes the next cheap**:
+
+- **Pillar 1 — One trustworthy surface (this spec).** The `runAction` registry: one definition, one gate, one redaction, one result shape per action. This is the foundation; the other two pillars bolt onto its single choke-point.
+- **Pillar 2 — Resilience / known failure modes (next bead — §13).** A specified, tested recovery story for the things that actually bite a daily driver: Gemini Live session drop mid-task, a pane PTY dying, a server restart with work in flight.
+- **Pillar 3 — Observability you can see (later bead — §13).** Surfacing the audit trail and health, not just logging it.
+
+**Latent wins of the single choke-point (Pillar 1 unlocks these almost for free — see §5.6):** a complete **audit trail** of every action Janus took to your work (trigger, args, gate decision, result); **metrics** (per-action counts/latency/failure); **uniform failure handling** (one try/catch, one error shape, instead of 41 hand-guarded branches that can each forget); and a natural home for **rate-limiting / circuit-breaking** a runaway model. These are impossible to do reliably across four scattered paths and trivial with one — which is *why* the registry is the right first investment toward dependability, not just toward tidiness.
+
 **Governing constraints inherited from the codebase (do not regress):**
 - The capability-gate matrix stays the single choke-point (`gateOrDefer` / `effectiveCapabilityGateFor`); the registry routes *through* it, it does not replace it.
 - Secret redaction (`redactSecrets`) stays mandatory on every model-bound read.
@@ -54,6 +66,7 @@ Net: to add or change a tool you edit **one entry**, and Gemini + the UI move to
 - **G4 — Structural parity tests.** Replace source-scraping regex with set/shape assertions over the registry (and a golden snapshot of the emitted Gemini schema).
 - **G5 — Convergence path for drift.** A clear, enforced way to see which actions are missing from which surface, and to close the gap.
 - **G6 — A credible Python trajectory.** The design must let the *catalog* (and later, *execution*) move to Python without re-litigating the architecture (operator's stated direction — §7).
+- **G7 — Operational leverage from one choke-point (Pillar 1 payoff).** `runAction` is the single home for the audit trail, metrics, uniform error handling, and rate-limiting that make the tool dependable (§5.6). Phase 1 lands the *seam*; surfacing (Pillar 3) is later.
 
 ### Non-Goals (this pass)
 - **NG1 — No behavior change.** This is a refactor to a registry; each tool must behave identically (characterization-tested). New tools are out of scope.
@@ -327,6 +340,41 @@ Reads default **Auto** (Decision 6) — Janus can always orient. But `read_pane`
 
 Implication for the matrix surface (§8sq lineage): `read_pane` joins the per-pane chip/popover like any capability; a pane showing `write Auto / read Off` reads as "I act here, I don't watch here."
 
+### 5.6 The choke-point payoff — audit, metrics, uniform errors (Pillar 1 → dependability, G7)
+
+Because **every** action — voice, REST, WS — funnels through one `runAction`, the operational properties that separate a dependable tool from a vibe-coded one attach to *one wrapper* instead of 41 branches × 3 surfaces. Phase 1 builds the **seam** and the audit log; metrics/rate-limiting are thin additions; the *surfacing* of all this is Pillar 3 (§13).
+
+```ts
+// src/actions/runAction.ts — conceptual; the single wrapper around every action
+export async function runAction(name, rawArgs, ctx): Promise<ActionResult> {
+  const t0 = performance.now();
+  const def = registry.get(name);
+  if (!def) return audit({ name, outcome: "unknown" }, { kind: "error", message: `unknown action ${name}` });
+  try {
+    const args = def.params.parse(def.coerceArgs?.(rawArgs) ?? rawArgs);     // 1 validation point
+    const gate = def.capability === "ALWAYS_ALLOWED"
+      ? { disposition: "allowed" }
+      : ctx.gateOrDefer(def.capability, paneOf(args), summarize(def, args)); // 1 enforcement point
+    if (gate.disposition === "forbidden") return audit(..., { kind: "blocked", reason: "gate Off" });
+    if (gate.disposition === "deferred")  return audit(..., { kind: "pending", messageId: gate.id, ... });
+    const result = await def.handler(args, ctx);                              // 1 execution point
+    const shaped = def.readOnly ? redactResult(result, ctx.redact) : result;  // 1 redaction point
+    return audit({ name, surface: ctx.surface, args, gate, ms: performance.now() - t0 }, shaped);
+  } catch (e) {
+    return audit({ name, outcome: "threw", error: String(e) }, { kind: "error", message: "internal error" });
+  }
+}
+```
+
+What this single point buys (the §1.1 latent wins, made concrete):
+
+- **Audit trail (build in Phase 1).** `audit(record, result)` appends one structured row per action — `{ ts, surface: voice|rest|ws, actor, name, args(redacted), capability, gateDisposition, resultKind, ms }` — to the existing `JanusStore` (a new `action_log` table) and returns the result unchanged. This is the answer to *"what did Janus do to my repo, and was it allowed?"* — a single queryable record, impossible to assemble reliably from 4 scattered code paths.
+- **Metrics (cheap follow-on).** Per-action call counts, p50/p95 latency, and failure rate fall out of the same wrapper — no per-handler instrumentation.
+- **Uniform failure handling (Phase 1).** One try/catch replaces 41 hand-written guards (some of which today only *happen* to catch). Every failure becomes a typed `ActionResult` answered exactly once on every surface (pins the WS-E.1 "answer call.id once" invariant structurally).
+- **Rate-limit / circuit-break (later, optional).** A natural pre-handler hook to throttle a runaway model hammering a tool — one place, all surfaces.
+
+Redaction note: audit args/results are redacted with the same `redactSecrets` so the log itself never becomes a secrets sink.
+
 ## 6. Architecture options & honest evaluation
 
 The operator's instinct: *"Python is the most expressive and advanced as we aim to scale."* That is true for **authoring/validating a large tool catalog and for agentic tool logic** (Pydantic, rich typing, the LLM-tooling ecosystem). It is **not** an unqualified win **for the part of this system that does the work**, because the work is native-TS: node-pty PTY lifecycle (incl. Windows ConPTY), `better-sqlite3` ledger, the gate resolver, the WS broadcast hub, handoff/approval flows. Below, three options, scored against the goals.
@@ -553,6 +601,34 @@ All judgment calls are now resolved. Lower-stakes unknowns (settle during implem
 ### Phase 2 (Python catalog) — DoD
 - [ ] `catalog/tools.py` is the authored source; `catalog.generated.ts` + `gemini.tools.json` are committed and regenerated by `npm run gen:catalog`.
 - [ ] §8.6 tests green (no-drift, name-set binding, Gemini golden unchanged).
+
+## 13. Dependability roadmap — Pillars 2 & 3 (future beads, NOT this spec's scope)
+
+This spec delivers **Pillar 1** (one trustworthy surface, §1.1). Pillars 2 and 3 are what carry the app the rest of the way from vibe-coded to a daily-driver you can depend on. They are **out of scope here** — recorded so the registry seam is built with them in mind and so they become their own specs/beads. Both are *cheap* precisely because Pillar 1 gives them a single choke-point to hook.
+
+### Pillar 2 — Resilience / known failure modes (next)
+A daily driver must have a **specified, tested** answer to "what happens when it breaks mid-task." Today these paths are implicit/untested. Each becomes a scenario test (the harness already boots a real server + mock Live + stub PTYs — `tests/test_voice_tools.ts`).
+
+| Failure | Today (implicit) | Target (specified + tested) |
+|---|---|---|
+| **Gemini Live session drops mid-task** | reconnect relies on `sessionResumption` token; unclear what happens to an in-flight tool call / pending approval | On reconnect: resume from the last token; any in-flight `runAction` is either idempotent-replayable or reported as interrupted; pending approvals survive (already in `JanusStore`) and are re-announced. Test: kill the mock session between a tool call and its `sendToolResponse`. |
+| **A pane PTY dies** (crash/OOM/exit) | `UniversalTerminal` marks Exited; probe ticks notice | A pane death emits an attention item + earcon; `read_pane`/`propose_command` on a dead pane returns a clean `blocked`/`clarify` (not a throw); restart path is the shared `resolveLaunch` (§5.4). Test: transport emits exit mid-command. |
+| **Server restart with work in flight** | SQLite ledger + `frozen` flag persist; panes are INERT on boot (no auto-spawn) | On boot, the ledger/handoffs/approvals/`frozen` state restore deterministically; the operator is told "N panes were running, restart them?"; nothing silently re-executes. Test: persist state, re-import server, assert restore. |
+| **Handler hangs / never returns** | a stuck handler stalls that call | `runAction` enforces a per-action timeout → `{kind:"error"}` answered once; the realtime session is never blocked. |
+
+Deliverable: a `docs/.../resilience-design.md` + `tests/test_resilience.ts`, building on the §5.6 wrapper (timeout + idempotency hooks live there).
+
+### Pillar 3 — Observability you can see (later)
+Pillar 1 *logs* the audit trail (§5.6); Pillar 3 *surfaces* it so the operator can trust and debug what Janus did.
+
+- **Action log view** — a UI panel (and `GET /api/action-log`, itself a registry read action) over the `action_log` table: filter by pane/capability/outcome, see the gate decision and latency per action.
+- **Health/status** — pane liveness, session-connected state, in-flight/pending counts, recent error rate — a small always-visible status strip.
+- **"Why did that happen?"** — because every action carries its `trigger` (operator utterance) + gate decision, the log answers "why did Janus run this" without guesswork.
+
+Deliverable: a `docs/.../observability-design.md` + the action-log read action and panel.
+
+### Sequencing
+Pillar 1 (this spec) → Pillar 2 (resilience) → Pillar 3 (observability). 2 and 3 both attach to the §5.6 choke-point, so doing Pillar 1 first is what makes them small. None of Pillar 2/3 is required for Phase 1 to ship and add value.
 
 ---
 
