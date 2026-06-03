@@ -227,6 +227,11 @@ export class UniversalTerminal {
   public statusProbe: StatusProbe;
   private probeTimer: NodeJS.Timeout | null = null;
   private probeIntervalMs = 500;
+  // In-flight teardown promise. stop() is idempotent: a re-entrant call returns the
+  // same promise so the SIGTERM→SIGKILL escalation, a double stop(), and the
+  // onExit-driven resolve can never drive node-pty's ConPTY teardown more than once
+  // (the conout-worker double-dispose that aborts at src\win\async.c:76).
+  private _stopping: Promise<void> | null = null;
   public lastStatusChangeAt: number = Date.now();
   public lastCommand = "";
   // runtime_type drives the prompt-regex gating (I4): Custom preset ⇒ "shell";
@@ -621,6 +626,20 @@ export class UniversalTerminal {
   }
 
   public async stop(): Promise<void> {
+    // Idempotent FOR ONE teardown: re-entrant stop() (or a stop() racing the onExit-driven
+    // teardown) returns the in-flight promise instead of re-killing — node-pty's ConPTY kill()
+    // must run at most once per pty or its conout worker double-disposes. The latch is CLEARED
+    // once that teardown settles so a later stop() runs a FRESH teardown: a pane can be restarted
+    // on the SAME instance (POST /api/terminals/:id/restart does `await term.stop(); term.start()`),
+    // after which shutdown / stop-all stage-2 / close_pane must still actually kill the new pty.
+    // (Without the reset, every post-restart stop() returned this stale resolved promise and the
+    // restarted PTY leaked.)
+    if (this._stopping) return this._stopping;
+    this._stopping = this._doStop().finally(() => { this._stopping = null; });
+    return this._stopping;
+  }
+
+  private async _doStop(): Promise<void> {
     // Clear both timers up front so a stopped pane never leaves work alive
     // (prevents the runner from hanging on lingering intervals).
     this.clearProbeTimer();
@@ -636,7 +655,7 @@ export class UniversalTerminal {
     }
     this.transport = null;
 
-    return new Promise<void>((resolve) => {
+    await new Promise<void>((resolve) => {
       let resolved = false;
       // P2: declared BEFORE done() to avoid a temporal-dead-zone ReferenceError if
       // onExit fires synchronously or transport.kill() throws (already-dead pid) —
@@ -671,6 +690,16 @@ export class UniversalTerminal {
       }, 1000);
       if (killTimeout.unref) killTimeout.unref();
     });
+
+    // Windows ConPTY: block until node-pty's delayed conout-worker teardown
+    // (a libuv uv_async_t) has fully completed, so a subsequent process.exit
+    // (the unit runner's --test-force-exit) can't uv_close() it mid-terminate
+    // (the src\win\async.c:76 abort). No-op on POSIX / legacy / stub transports.
+    try {
+      await transport.drainTeardown?.();
+    } catch {
+      // best-effort drain
+    }
   }
 }
 

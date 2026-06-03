@@ -15,7 +15,7 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
@@ -41,6 +41,12 @@ function AppRaw() {
   const [promptDialog, setPromptDialog] = useState<{title: string, placeholder: string, onSubmit: (val: string) => void} | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [newNoteInputs, setNewNoteInputs] = useState<Record<string, string>>({});
+  // bead bjm: id-bearing notes for the active project, fetched from the DOM-render-only feed
+  // (GET /api/projects/:id/notes). The Node Chronicle renders pane-scoped notes from THIS so it can
+  // expose delete/amend controls keyed by note id (the ledger broadcast carries bare strings only).
+  const [activeProjectNotes, setActiveProjectNotes] = useState<{ id: string; project_id: string; pane_id: string | null; text: string; type: string; created_at: number }[]>([]);
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [editingNoteText, setEditingNoteText] = useState("");
   const [isMockMode, setIsMockMode] = useState<boolean>(false);
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
@@ -441,6 +447,41 @@ function AppRaw() {
       const data = await res.json();
       setLedger(data);
     } catch (e) {}
+  };
+
+  // bead bjm: pull the id-bearing notes for a project (DOM-render-only feed). Drives the Node
+  // Chronicle's delete/amend controls. Never forwarded to the live session — model egress goes
+  // through the redacted voice tools only.
+  const fetchProjectNotes = async (projId = activeProjectId) => {
+    if (isMockModeRef.current || !projId) return;
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/notes`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setActiveProjectNotes(Array.isArray(data.notes) ? data.notes : []);
+    } catch (e) {}
+  };
+
+  const handleDeleteNote = async (id: string) => {
+    if (isMockModeRef.current) return;
+    await apiFetch(`/api/notes/${id}`, { method: "DELETE" });
+    if (editingNoteId === id) setEditingNoteId(null);
+    fetchProjectNotes();
+    fetchLedger();
+  };
+
+  const handleSaveNoteEdit = async (id: string) => {
+    const text = editingNoteText.trim();
+    if (!text) { setEditingNoteId(null); return; }
+    await apiFetch(`/api/notes/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    setEditingNoteId(null);
+    setEditingNoteText("");
+    fetchProjectNotes();
+    fetchLedger();
   };
 
   // bead 8sq: restore the STOP-ALL freeze state on boot so the FROZEN banner survives a page reload
@@ -866,6 +907,12 @@ function AppRaw() {
     fetchActiveDraft(activeProjectId, activeTerminalId);
     fetchWipDrafts(activeProjectId);
   }, [activeTerminalId, activeProjectId]);
+
+  // bead bjm: keep the id-bearing notes feed fresh — on project switch and whenever the ledger
+  // changes (e.g. a voice-added note broadcasts a ledger_update), so the Chronicle stays in sync.
+  useEffect(() => {
+    fetchProjectNotes(activeProjectId);
+  }, [activeProjectId, ledger]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
@@ -1652,6 +1699,7 @@ function AppRaw() {
       body: JSON.stringify({ note: rawNote.trim() })
     });
     setNewNoteInputs(prev => ({ ...prev, [paneId]: "" }));
+    fetchProjectNotes(projId);
     fetchLedger();
   };
 
@@ -3867,19 +3915,62 @@ function AppRaw() {
                           <div className="mt-2 bg-black/40 rounded p-2.5 border border-white/[0.02]">
                             <div className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest mb-1.5 flex justify-between items-center">
                               <span>Node Chronicle</span>
-                              <span className="opacity-40">{pane.notes?.length || 0} Entries</span>
+                              <span className="opacity-40">{(activeProjectNotes.filter(n => n.pane_id === pane.pane_id).length || pane.notes?.length || 0)} Entries</span>
                             </div>
                             <div className="max-h-24 overflow-y-auto space-y-1 pr-1 scrollbar-thin">
-                              {pane.notes && pane.notes.length > 0 ? (
-                                pane.notes.map((note, idx) => (
-                                  <div key={idx} className="text-[10px] text-[#e0e0e0]/70 flex items-start gap-1 font-sans">
-                                    <span className="text-cyan-500/40 select-none font-mono">•</span>
-                                    <span>{note}</span>
-                                  </div>
-                                ))
-                              ) : (
-                                <div className="text-[9px] font-mono py-1.5 text-zinc-600 italic">No notes created.</div>
-                              )}
+                              {(() => {
+                                // bead bjm: render id-bearing notes (delete/amend controls keyed by id).
+                                // Fall back to the ledger's bare strings until the id-feed loads.
+                                const paneChronicle = activeProjectNotes.filter(n => n.pane_id === pane.pane_id);
+                                if (paneChronicle.length > 0) {
+                                  return paneChronicle.map((n) => (
+                                    <div key={n.id} className="text-[10px] text-[#e0e0e0]/70 flex items-start gap-1 font-sans group">
+                                      <span className="text-cyan-500/40 select-none font-mono">•</span>
+                                      {editingNoteId === n.id ? (
+                                        <input
+                                          autoFocus
+                                          type="text"
+                                          value={editingNoteText}
+                                          onChange={(e) => setEditingNoteText(e.target.value)}
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') handleSaveNoteEdit(n.id);
+                                            if (e.key === 'Escape') { setEditingNoteId(null); setEditingNoteText(""); }
+                                          }}
+                                          onBlur={() => handleSaveNoteEdit(n.id)}
+                                          className="flex-1 bg-black text-[10px] border border-cyan-500/40 rounded px-1 py-0.5 text-zinc-200 focus:outline-none"
+                                        />
+                                      ) : (
+                                        <>
+                                          <span
+                                            className="flex-1 cursor-text"
+                                            title="Double-click to edit"
+                                            onDoubleClick={() => { setEditingNoteId(n.id); setEditingNoteText(n.text); }}
+                                          >{n.text}</span>
+                                          <button
+                                            onClick={() => { setEditingNoteId(n.id); setEditingNoteText(n.text); }}
+                                            className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-zinc-400 hover:text-cyan-400 transition-opacity"
+                                            title="Edit note"
+                                          ><Pencil className="w-3 h-3" /></button>
+                                          <button
+                                            onClick={() => handleDeleteNote(n.id)}
+                                            className="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
+                                            title="Delete note"
+                                          ><Trash2 className="w-3 h-3" /></button>
+                                        </>
+                                      )}
+                                    </div>
+                                  ));
+                                }
+                                if (pane.notes && pane.notes.length > 0) {
+                                  return pane.notes.map((note, idx) => (
+                                    <div key={idx} className="text-[10px] text-[#e0e0e0]/70 flex items-start gap-1 font-sans">
+                                      <span className="text-cyan-500/40 select-none font-mono">•</span>
+                                      <span>{note}</span>
+                                    </div>
+                                  ));
+                                }
+                                return <div className="text-[9px] font-mono py-1.5 text-zinc-600 italic">No notes created.</div>;
+                              })()}
                             </div>
                             <div className="flex items-center gap-1 mt-2.5 pt-2 border-t border-white/[0.04]">
                               <input 

@@ -21,11 +21,15 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     manager.globalPermissionsMode = "Inherit";
   });
 
-  afterEach(() => {
-    // Clean up active terminals to avoid trailing background processes
-    for (const term of Object.values(manager.terminals)) {
-      term.stop();
-    }
+  afterEach(async () => {
+    // Clean up active terminals to avoid trailing background processes. AWAIT every
+    // stop(): these are real ConPTY panes (cmd.exe/yes/echo). A fire-and-forget
+    // stop() leaks node-pty's delayed conout-worker teardown (a worker_threads.Worker
+    // = a libuv uv_async_t) past the suite boundary; the unit runner's
+    // --test-force-exit then uv_close()'s that handle mid-terminate and aborts
+    // (src\win\async.c:76). stop() now internally drains that worker, so awaiting all
+    // stops in parallel is sufficient (one shared drain window, no extra settle).
+    await Promise.all(Object.values(manager.terminals).map((term) => term.stop()));
     if (fs.existsSync(TEST_LEDGER_PATH)) {
       fs.unlinkSync(TEST_LEDGER_PATH);
     }

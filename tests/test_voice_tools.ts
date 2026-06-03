@@ -35,6 +35,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { WebSocket } from "ws";
 import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
+import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 
 // Minimal stand-in for a UniversalTerminal, covering the surface stopAllPanes uses.
@@ -138,12 +139,9 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
         try { client.terminate(); } catch { resolve(); }
       });
     }
-    try { await running?.close(); } catch {}
-    // Let any in-flight libuv async-handle close (better-sqlite3) fully settle before
-    // the runner's --test-force-exit calls process.exit. With two in-process server
-    // suites sharing the singleton store, an unsettled CLOSING handle at exit aborts
-    // (Assertion: !(handle->flags & UV_HANDLE_CLOSING), src/win/async.c).
-    await new Promise((r) => setTimeout(r, 100));
+    // Deterministic teardown: close server + global fetch pool, then drain libuv so
+    // --test-force-exit can't abort on a half-closed async handle (src\win\async.c:76).
+    await teardownServerSuite(running);
     process.chdir(prevCwd);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });

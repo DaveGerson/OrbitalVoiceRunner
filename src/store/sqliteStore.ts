@@ -189,15 +189,17 @@ export class JanusStore {
     ).all(...args).map((r:any) => ({ ...r })) as any;
   }
 
-  /** Full-text search across notes + events, ranked by bm25. */
-  search(query: string, opts: { limit?: number } = {}): Array<{ source:"note"|"event"; id:string; snippet:string; rank:number }> {
+  /** Full-text search across notes + events, ranked by bm25. Pass opts.source to restrict to one
+   *  kind — the notes-recall voice tool passes 'note' so a flood of higher-ranked event rows can't
+   *  starve note hits out of the result limit (each sub-query is itself capped at `limit`). */
+  search(query: string, opts: { limit?: number; source?: "note" | "event" } = {}): Array<{ source:"note"|"event"; id:string; snippet:string; rank:number }> {
     const limit = opts.limit ?? 25;
-    const notes = this.db.prepare(
+    const notes = opts.source === "event" ? [] : this.db.prepare(
       `SELECT n.id AS id, n.text AS snippet, bm25(notes_fts) AS rank
        FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
        WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`
     ).all(query, limit) as any[];
-    const events = this.db.prepare(
+    const events = opts.source === "note" ? [] : this.db.prepare(
       `SELECT e.id AS id, e.summary AS snippet, bm25(events_fts) AS rank
        FROM events_fts JOIN events e ON e.id = events_fts.rowid
        WHERE events_fts MATCH ? ORDER BY rank LIMIT ?`
