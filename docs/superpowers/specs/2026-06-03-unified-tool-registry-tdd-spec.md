@@ -96,41 +96,112 @@ This is the whole thesis in one example: **one definition + one implementation o
 
 `list_panes, propose_command, switch_active_pane, update_draft_prompt, list_pending_approvals, get_pane_command_history, get_pane_summary, get_pane_delta, switch_context, add_project_note, add_pane_note, get_project_notes, search_notes, amend_note, delete_note, rename_project, rename_pane, get_attention_digest, dismiss_attention, create_project, create_pane, set_global_permissions, set_voice_mute, create_orchestrator_plan, execute_plan, apply_orchestration_recipe, handoff_context_between_panes, set_pane_permissions, propose_handoff, revise_handoff, stage_handoff, deliver_handoff, read_handoff, list_handoffs, reject_handoff, set_capability_gate, get_pane_gates, list_capabilities, stop_all, confirm_stop_all, release_stop_all`
 
-### 4.2 Voice ⇄ REST correspondence (the drift map)
+### 4.2 Voice ⇄ REST correspondence (the drift map, expanded)
 
-| Voice tool | REST/WS twin today | Status |
+Read-verified from source (server.ts dispatch ~2229–3109, REST routes, `src/App.tsx` ~1194–1310, `src/eventBus.ts`). Columns: **what** the step performs (+ core backend call), the **broadcast → UI impact** (what the operator sees change), **where the code lives today** (voice handler ↔ REST/WS twin), and the **drift** status. The "UI impact" cites the broadcast; the broadcast→handler legend is at the end of this section so it isn't repeated per row.
+
+#### Group 1 — Reads / orientation (no mutation; spoken read-back only)
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `list_panes` | All projects/panes w/ status, timing, last cmd (`manager.listPanes()`) | none → voice read-back only | `server.ts:2229–2233` | `GET /api/terminals` :771; `GET /api/ledger` :797 | both, shapes differ |
+| `get_pane_command_history` | Recent commands + outcomes for a pane (`HistoryManager.loadHistory()`) | none → read-back | `:2234–2256` | `GET /api/terminals/:id/history` :936 | both |
+| `get_pane_summary` | Last ~20 lines, ANSI-stripped + redacted (`manager.getPaneSummary()`) | none → read-back | `:2257–2262` | _none (UI reads stdout stream)_ | **voice-only** |
+| `get_pane_delta` | New output since last read, per-pane cursor (`manager.getPaneDelta()`) | none → read-back | `:2263–2268` | _none_ | **voice-only** |
+
+#### Group 2 — Direct work (route operator intent into a pane)
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `propose_command` | Distilled instruction/shell → active pane **through the gate** (`dispatchProposal()`) | `approval_pending` / `command_auto_executed` / `command_blocked` → approval dialog OR auto-exec/blocked toast | `:2281–2304` | `POST /api/terminals/:id/input` :897 | both, **gate logic duplicated** |
+| `switch_active_pane` | Change which pane is open; no exec (`activePaneId=…` + broadcast) | `switch_active_pane` → pane view switches | `:2305–2324` | _WS only (no REST)_ | **voice/WS only** |
+| `update_draft_prompt` | Compose/refine WIP draft, replace\|append (`ledger.setDraft/appendDraft()`) | `draft_updated` → draft box refreshes | `:2325–2342` | `PUT /api/panes/:p/:id/draft` :1436 | both |
+| `list_pending_approvals` | Recall commands awaiting approval (`pendingApprovals.forSession()`) | none → read-back | `:2343–2356` | `GET /api/commands/pending` :1860 | both |
+| `switch_context` | Make a project active + briefing (`ledger.switchContext()` + `saveSettings()`) | `ledger_updated` → project/pane tree updates | `:2269–2280` | `POST /api/projects/:id/switch` :1107 | both |
+
+#### Group 3 — Spawn / create
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `create_pane` | Spawn pane in project (gated) (`manager.addTerminal()`) | `action_pending`(Ask) / `ledger_updated` / `terminals_updated` → action dialog OR new pane in tree | `:2524–2550` | `POST /api/terminals` :802 | both — **the §3.1 keystone divergence** |
+| `create_project` | New project context (`ledger.addProject()`) | `ledger_updated` → tree updates | `:2517–2523` | `POST /api/projects` :950 | both |
+| `create_orchestrator_plan` | Draft multi-pane plan (`ledger.plans.push()`) | `plans_updated` → plans sidebar updates | `:2584–2605` | `POST /api/plans` :1305 | both |
+| `execute_plan` | Run first step of a plan (`dispatchProposal()` for step) | `approval_pending`(HiTL) / `plans_updated` / `plan_step_completed` → plan-exec UI | `:2606–2650` | `POST /api/plans/:id/execute` :1331 | both |
+| `apply_orchestration_recipe` | Spawn template layout, per-pane `create_pane`-gated (`manager.addTerminal()` ×N) | `ledger_updated` / `terminals_updated` → panes appear | `:2651–2696` | `POST /api/recipes/apply` :1375 | both |
+
+#### Group 4 — Handoffs (move context between agents)
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `handoff_context_between_panes` | Write context into target pane's model-context, not a CLI write (`ledger.addModelContext()`) | `ledger_updated` → tree updates | `:2697–2723` | `POST /api/handoff` :1406 | both |
+| `propose_handoff` | Draft handoff, snapshot source, state `composing` (`store.createHandoff()`) | `handoffs_updated` → handoff editor modal | `:2724–2773` | _none_ | **voice-only** |
+| `revise_handoff` | Rewrite prompt, ++revision (`store.updateHandoffCargo()`) | `handoffs_updated` → editor updates | `:2774–2797` | _none_ | **voice-only** |
+| `stage_handoff` | Freeze text, pre-check target, secret-scan, → `staged` (`store.updateHandoffState()`) | `handoffs_updated` → shows staged | `:2798–2841` | _none_ | **voice-only** |
+| `deliver_handoff` | Write staged handoff to target pane (**double-gated** `deliver_handoff`+`write_to_pane`) (`dispatchProposal()`) | `approval_pending`(HiTL) / `handoffs_updated` → approval dialog OR delivered | `:2906–2959` | _none_ | **voice-only** |
+| `read_handoff` | Retrieve one handoff, redacted (`store.getHandoff()`) | none → read-back | `:2842–2859` | _none_ | **voice-only** |
+| `list_handoffs` | List handoffs by state + staleness (`store.listHandoffs()`) | none → read-back | `:2860–2882` | _none_ | **voice-only** |
+| `reject_handoff` | Cancel; if pending at gate, route through reject (`applyResolution()` / `updateHandoffState()`) | `handoffs_updated` → removed/marked rejected | `:2883–2905` | _none_ | **voice-only** |
+
+#### Group 5 — Notes / metadata
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `add_project_note` | Note onto project (`ledger.addNote()`) | `ledger_updated` → sidebar notes | `:2357–2362` | `POST /api/projects/:id/notes` :985 | both |
+| `add_pane_note` | Note onto pane (default active) (`ledger.addPaneNote()`) | `ledger_updated` → sidebar | `:2363–2378` | `POST …/panes/:id/notes` :1024 | both |
+| `get_project_notes` | Recall notes, redacted (`ledger.getNotes()`) | none → read-back | `:2379–2391` | `GET /api/projects/:id/notes` :996 | both |
+| `search_notes` | Full-text note search, redacted (`ledger.search()`) | none → read-back | `:2392–2405` | _none_ | **voice-only** |
+| `amend_note` | Edit note (gated `update_metadata`) (`gateOrDefer()` + `ledger.amendNote()`) | `action_pending`(Ask) / `ledger_updated` → dialog OR note updates | `:2406–2422` | `PUT /api/notes/:id` :1003 | both |
+| `delete_note` | Delete note (gated `update_metadata`) (`gateOrDefer()` + `ledger.deleteNote()`) | `action_pending`(Ask) / `ledger_updated` → dialog OR removed | `:2423–2436` | `DELETE /api/notes/:id` :1011 | both |
+| `rename_project` | Rename project (`ledger.renameProject()`) | `ledger_updated` → name in tree | `:2437–2442` | `PUT /api/projects/:id/rename` :978 | both |
+| `rename_pane` | Rename pane (`ledger.renamePane()`) | `ledger_updated` → name in tree | `:2443–2448` | `PUT …/panes/:id/rename` :1017 | both |
+
+#### Group 6 — Attention queue
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `get_attention_digest` | Merge unread alerts + pending approvals (`pruneAttention()` + `attentionQueue` + `forSession()`) | none → read-back | `:2449–2492` | `GET /api/attention` :1241 | both, shapes differ |
+| `dismiss_attention` | Dismiss item by id (or all) (`item.dismissed=true` + `pruneAttention()`) | `attention_updated` → items disappear | `:2493–2516` | `POST /api/attention/:id/dismiss` :1245; `/clear` :1256 | both |
+
+#### Group 7 — Safety / permissions / gates
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `set_global_permissions` | Set global mode, gated (`gateOrDefer()` + `globalPermissionsMode=…`) | `action_pending`(Ask) / `settings_updated` → dialog OR settings modal | `:2551–2572` | `PUT /api/settings` :1472 | both, indirect |
+| `set_pane_permissions` | Set per-pane mode, gated (`gateOrDefer()` + `term.setPermissionsMode()`) | `action_pending`(Ask) / `ledger_updated` / `terminals_updated` → dialog OR pane chips | `:3074–3109` | `PUT …/panes/:id/permissions` :1044 | both |
+| `set_capability_gate` | Set a gate Auto/Ask/Off, global or per-pane; **voice may only tighten** (`isLoosening()` guard + `settings.advanced.capabilityGates` / `pane.capabilityGates`) | `settings_updated` → settings modal | `:2960–3006` | `PUT …/panes/:id/capability-gates` :1071 | both, shapes differ |
+| `get_pane_gates` | Read effective gates for a pane/global (`effectiveCapabilityGateFor()`) | none → read-back | `:3007–3020` | _part of `terminals_updated` payload_ | **voice-only** |
+| `list_capabilities` | List gatable capabilities (**hardcoded list** today) | none → read-back | `:3021–3030` | _static `gateSurface.ALL_CAPABILITIES`_ | **voice-only** (Decision 5 makes this derived) |
+| `set_voice_mute` | Toggle mic mute (`settings.voiceAi.isMicMuted=…` + `saveSettings()`) | `settings_updated` → settings modal shows muted | `:2573–2583` | `PUT /api/settings` :1472 | both, indirect |
+
+#### Group 8 — Emergency brake (always allowed; the wired-identically template)
+| Voice tool | What it does (core call) | Broadcast → UI impact | Voice handler | REST/WS twin | Drift |
+|---|---|---|---|---|---|
+| `stop_all` | Stage 1: freeze Janus + cancel in-flight; panes keep running (`stopAll(false)`) | `frozen` → FROZEN banner, gates→Off | `:3031–3043` | `POST /api/stop-all` :879 (+ `GET /status` :876) | both ✓ |
+| `confirm_stop_all` | Stage 2: kill running PTYs, irreversible (`stopAll(true)` + `term.stop()`) | `stop_all` → panes → Exited | `:3044–3060` | `POST /api/stop-all/confirm` :883 | both ✓ |
+| `release_stop_all` | Un-freeze; gates restore exactly; killed panes stay killed (`releaseStopAll()`) | `frozen` → banner disappears | `:3061–3073` | `POST /api/stop-all/release` :891 | both ✓ |
+
+#### REST/WS-only (no voice tool today — C3 convergence adds voice twins)
+| What | Route | UI impact | Drift |
+|---|---|---|---|
+| Resize PTY grid | `POST /api/terminals/:id/resize` :918 | pane reflows | **REST-only** (stays — pure viewport, §5.4) |
+| Clear pane history | `POST /api/terminals/:id/history/clear` :943 | `history_updated` → history panel clears | **REST-only** → `clear_history` voice (C3, Ask) |
+| Archive exited panes | `POST /api/terminals/clear-exited` :1161; `GET/POST/DELETE /api/archive…` :1179/1191/1203 | tree prunes exited panes | **REST-only** → `archive_pane` voice (C3, Auto) |
+| Close / restart a pane | `DELETE …/panes/:paneId` :1141; `POST /api/terminals/:id/restart` :835 | pane removed / restarts (note: restart has its **own** preset→cmd map :848) | **REST-only** → `close_pane`/`restart_pane` voice (C3, Ask) |
+| Watch-rule CRUD | `GET/POST/DELETE /api/watch-rules…` :1263/1267/1288 | `watch_rules_updated` → watch-rules panel | **REST-only** → `add_watch_rule` voice (C3, Ask) |
+| Add layered pane context | `POST …/panes/:paneId/context` :1033 | `ledger_updated` → tree | **REST-only** (folds into `update_metadata`) |
+
+**Broadcast → UI legend** (one place; rows above reference these `type`s):
+
+| Broadcast `type` | `App.tsx` / `eventBus.ts` | What the operator sees |
 |---|---|---|
-| `list_panes` | `GET /api/terminals`, `GET /api/ledger` | both, shapes differ |
-| `propose_command` | `POST /api/terminals/:id/input` (+ approval flow) | both, gate logic duplicated |
-| `switch_active_pane` | WS `switch_active_pane` broadcast | WS only |
-| `update_draft_prompt` | `PUT /api/panes/:p/:id/draft` | both |
-| `list_pending_approvals` | `GET /api/commands/pending` | both |
-| `get_pane_command_history` | `GET /api/terminals/:id/history` | both |
-| `get_pane_summary` / `get_pane_delta` | _(none — UI reads the stdout stream)_ | **voice only** |
-| `switch_context` | `POST /api/projects/:id/switch` | both |
-| `add_project_note` / `get_project_notes` | `POST`/`GET /api/projects/:id/notes` | both |
-| `add_pane_note` | `POST /api/projects/:p/panes/:id/notes` | both |
-| `search_notes` | _(none)_ | **voice only** |
-| `amend_note` / `delete_note` | `PUT`/`DELETE /api/notes/:id` | both |
-| `rename_project` / `rename_pane` | `PUT …/rename` | both |
-| `get_attention_digest` | `GET /api/attention` | both, shapes differ |
-| `dismiss_attention` | `POST /api/attention/:id/dismiss`, `/clear` | both |
-| `create_project` | `POST /api/projects` | both |
-| `create_pane` | `POST /api/terminals` | both |
-| `set_global_permissions` | `PUT /api/settings` (mode field) | both, indirect |
-| `set_voice_mute` | _(client-side)_ | **voice only** |
-| `create_orchestrator_plan` / `execute_plan` | `POST /api/plans`, `/:id/execute` | both |
-| `apply_orchestration_recipe` | `POST /api/recipes/apply` | both |
-| `handoff_context_between_panes` | `POST /api/handoff` | both |
-| `set_pane_permissions` | `PUT …/panes/:id/permissions` | both |
-| `propose/revise/stage/deliver/read/list/reject_handoff` | _(only `POST /api/handoff`)_ | **mostly voice only** |
-| `set_capability_gate` | `PUT …/panes/:id/capability-gates` | both, shapes differ |
-| `get_pane_gates` | _(part of `terminals_updated` payload)_ | **voice only** |
-| `list_capabilities` | _(static `gateSurface.ALL_CAPABILITIES`)_ | **voice only** |
-| `stop_all` / `confirm_stop_all` / `release_stop_all` | `POST /api/stop-all[/confirm|/release]` | both ✓ (the model to copy) |
-| — | `POST …/resize`, `…/history/clear`, `clear-exited`, `archive[/restore]`, watch-rules CRUD, `…/panes/:id/context` | **REST only** |
+| `approval_pending` | App.tsx 1198–1209 | command approval dialog + alert earcon |
+| `action_pending` / `action_resolved` | 1210–1220 | deferred-action confirm dialog appears / clears |
+| `switch_active_pane` | 1221–1224 | open pane switches |
+| `draft_updated` | 1225–1237 | draft box refreshes |
+| `terminals_updated` | 1238–1240 | pane posture chips repaint (status + effective gates) |
+| `frozen` / `stop_all` | 1240–1250 | FROZEN banner + gates→Off / panes → Exited |
+| `ledger_updated` | 1251–1252 | project/pane tree, notes, names update |
+| `settings_updated` | 1253–1267 | settings modal (mode, gates, mute) updates |
+| `command_auto_executed` / `command_blocked` | 1268–1278 | "auto-approved" / "blocked (Read-Only)" toast |
+| `stdout_chunk` | 1279–1280 | live terminal output |
+| `transcript_text` | 1281–1285 | chat transcript panel |
+| `attention_updated` / `plans_updated` / `watch_rules_updated` / `plan_step_completed` etc. | eventBus.ts 32–52 | attention panel / plans sidebar / watch-rules panel + earcons |
+| `handoffs_updated` | App state setter | handoff editor/queue updates |
 
-**Reading:** the `stop_all` family is the *only* group already wired identically across voice + REST + WS (because `8sq` built it that way on purpose, with a real test). It is the template; the registry generalizes it to all ~50 operations.
+**Reading:** the `stop_all` family is the *only* group wired identically across voice + REST + WS today (`8sq` built it that way, with a real test). Everything else either duplicates logic across two paths (`propose_command`, `create_pane`, the gated metadata/permission tools) or is single-surface (all of Group 4 handoffs and the content reads are voice-only; the housekeeping rows are REST-only). The registry generalizes the `stop_all` template to all ~50 operations.
 
 ### 4.3 The gate matrix today (the 16 hand-listed capabilities)
 
