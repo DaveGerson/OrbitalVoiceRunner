@@ -1,21 +1,55 @@
 import { useEffect } from "react";
+import type { CapabilityGate, CapabilityGateMap } from "../types";
+import {
+  POSTURE_STYLE,
+  GATE_STYLE,
+  CAPABILITY_LABELS,
+  // n2r (wsm-e2e-pinned-n2r, §5.2): sanitize the rider's posture/write-gate before the closed-union
+  // style lookup so a malformed approval_pending rider can't throw inside the approval modal.
+  normalizePostureWord,
+  normalizeGateValue,
+  type PostureWord,
+} from "../gateSurface";
 
-export function ApprovalDialog({ 
-  messageId, 
-  terminalId, 
-  cmd, 
+type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+
+/**
+ * Approve/reject dialog for a staged PTY write (Human-in-the-Loop).
+ *
+ * rbh (wsm-e2e-pinned-rbh): below the command we render the TARGET pane's EFFECTIVE posture — the
+ * posture word + the write gate (plain language) in force — so the operator can see "into what
+ * posture am I approving this write?" with the SAME truth the chip shows. Posture is SERVER truth
+ * threaded in via props (never re-derived); palette is the shared gateSurface map. Degrade-safe:
+ * no posture → today's dialog.
+ */
+export function ApprovalDialog({
+  messageId,
+  terminalId,
+  cmd,
   rationale,
-  onApprove, 
-  onReject 
-}: { 
+  posture,
+  effectiveGates,
+  effectiveMode,
+  capability,
+  onApprove,
+  onReject
+}: {
   key?: string;
-  messageId: string; 
-  terminalId: string; 
-  cmd: string; 
+  messageId: string;
+  terminalId: string;
+  cmd: string;
   rationale?: {
     trigger: string;
     summary: string;
   };
+  /** SERVER-resolved posture word for the target pane (undefined for older payloads / mocks). */
+  posture?: PostureWord;
+  /** SERVER-resolved effective gates for the target pane (the write gate is read from here). */
+  effectiveGates?: CapabilityGateMap;
+  /** SERVER-resolved effective mode the engine will enforce on this pane. */
+  effectiveMode?: EffectiveMode;
+  /** The write capability gating this approval (write_to_pane / deliver_handoff). */
+  capability?: CapabilityGate;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
 }) {
@@ -30,6 +64,21 @@ export function ApprovalDialog({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [messageId, onReject]);
+
+  // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
+  const showEffective = !!posture || !!effectiveGates;
+  // n2r §5.2: normalize before the closed-union lookups (bad posture → GUARDED, bad gate → Ask).
+  const safePosture = normalizePostureWord(posture);
+  const postureStyle = safePosture ? POSTURE_STYLE[safePosture] ?? POSTURE_STYLE.GUARDED : undefined;
+  const writeCap: CapabilityGate = capability ?? "write_to_pane";
+  const writeGate = effectiveGates?.[writeCap];
+  const safeGate = writeGate != null ? normalizeGateValue(writeGate) : undefined;
+  const gateStyle = safeGate ? GATE_STYLE[safeGate] ?? GATE_STYLE.Ask : undefined;
+  const capLabel = CAPABILITY_LABELS[writeCap] ?? writeCap;
+  // The pane's effective autonomy MODE is the second axis of "into what am I approving this write?".
+  // Read-Only is the load-bearing case: a write approved into a Read-Only pane lands in a LOCKED
+  // posture, so we surface the mode alongside the posture word (consumes the previously dead prop).
+  const showMode = !!effectiveMode;
 
   return (
     <div data-testid="approval-dialog" className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
@@ -47,6 +96,36 @@ export function ApprovalDialog({
             <p className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">
               {cmd}
             </p>
+
+            {showEffective && (
+              <div
+                data-testid="approval-effective"
+                className={`mb-4 rounded border p-2 font-mono ${postureStyle?.ring ?? "border-white/10"}`}
+              >
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="text-zinc-500 uppercase tracking-wider">Approving into:</span>
+                  {safePosture && postureStyle && (
+                    <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${postureStyle.text}`}>
+                      <span className={`inline-block w-1.5 h-1.5 rounded-full ${postureStyle.dot}`} />
+                      {safePosture}
+                    </span>
+                  )}
+                  {postureStyle && <span className="text-zinc-500 normal-case">· {postureStyle.label}</span>}
+                  {showMode && (
+                    <span data-testid="approval-mode" className="text-zinc-500 normal-case">· mode {effectiveMode}</span>
+                  )}
+                </div>
+                {gateStyle && (
+                  <div className="mt-1 flex items-center gap-2 text-[10px]">
+                    <span className="text-zinc-400">{capLabel}</span>
+                    <span className={`inline-flex items-center gap-1 ${gateStyle.text}`}>
+                      <span className={`inline-block w-1 h-1 rounded-full ${gateStyle.dot}`} />
+                      {gateStyle.word}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
 
             {rationale && (
               <div className="mb-4 space-y-2 border-l-2 border-zinc-700 pl-3">

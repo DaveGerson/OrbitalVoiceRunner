@@ -2,7 +2,7 @@
 import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
-import type { StoredPane, StoredPendingApproval, StoredHandoff, HandoffState } from "./types";
+import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHandoff, HandoffState } from "./types";
 import { pruneOnBoot, type PruneOpts } from "./retention";
 
 export class JanusStore {
@@ -233,6 +233,35 @@ export class JanusStore {
   }
   getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
+      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+  }
+
+  // ── durable deferred actions (bead wsm-e2e-pinned-kzt, schema v5) ─────────────────────────────
+  // Mirrors the pending_approvals seam: insert the INTENT, atomic-claim the exactly-once gate, delete
+  // on resolve, hydrate un-claimed survivors on boot. PendingActionStore rebuilds run() via
+  // src/actionEffects from `params`. INSERT OR REPLACE so a re-staged survivor (boot re-add) is a
+  // harmless no-op rewrite.
+  insertPendingAction(a: StoredPendingAction): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO pending_actions(id,capability,summary,params,claimed,timestamp,expires_at)
+       VALUES(@id,@capability,@summary,@params,@claimed,@timestamp,@expires_at)`
+    ).run({ ...a, claimed: a.claimed ? 1 : 0 });
+  }
+  /** Atomic claim: flips 0->1 only if currently 0. True == this caller won (exactly-once seam). */
+  claimAction(id: string): boolean {
+    return this.db.prepare("UPDATE pending_actions SET claimed=1 WHERE id=? AND claimed=0").run(id).changes === 1;
+  }
+  deletePendingAction(id: string): void {
+    this.db.prepare("DELETE FROM pending_actions WHERE id=?").run(id);
+  }
+  /** Un-claimed survivors (the boot hydration set). Claimed-but-undeleted rows are excluded so a
+   *  mid-resolve crash never re-replays. Ordered by timestamp ASC (== staging order). */
+  getPendingActions(): StoredPendingAction[] {
+    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 ORDER BY timestamp ASC").all() as any[])
+      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+  }
+  getExpiredActions(now = Date.now()): StoredPendingAction[] {
+    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
       .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
   }
 

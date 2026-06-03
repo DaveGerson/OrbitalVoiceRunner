@@ -36,6 +36,8 @@ import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
+import { buildActionRun } from "./src/actionEffects";
+import { resolveActionPendingPosture, type GlobalMode } from "./src/actionPendingPayload";
 import { restGateOutcome } from "./src/restGate";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
@@ -839,7 +841,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       broadcast({ type: "terminals_updated" });
       return String(result);
     };
-    const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect);
+    const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect,
+      // kzt: origin:"rest" -> the rebuild returns String(result) verbatim, matching spawnEffect above.
+      // Persist the ALREADY-RESOLVED cwd so a confirm-after-restart lands the pane in the same dir.
+      { origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId: projectId || "" });
     const out = restGateOutcome(g);
     if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
     res.status(out.status).json(out.body);
@@ -1451,7 +1456,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         return p.id;
       };
       if (planned.disposition === "defer") {
-        const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+        const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
+          // kzt: origin:"recipe" -> the rebuild returns the bare pane id, matching spawnPane above.
+          { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: bareShell, toolPreset: p.preset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
         if (g.disposition === "forbidden") blocked.push(p.id);
         else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
         else { spawnPane(); spawned.push(p.id); }
@@ -1552,11 +1559,45 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // store is null (JANUS_LEDGER_BACKEND=legacy or store init failed) the class is pure in-memory,
   // byte-for-byte as before — no behavioral change on the legacy path.
   const pendingApprovals = new PendingApprovalStore(store);
-  // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions). On the
-  // Ask tier these stage a side-effect here and run exactly once on operator confirm — separate
-  // from the pane-write PendingApprovalStore so the two never entangle. (src/pendingActions.)
-  const pendingActions = new PendingActionStore();
+  // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions /
+  // update_metadata). On the Ask tier these stage a side-effect here and run exactly once on operator
+  // confirm — separate from the pane-write PendingApprovalStore so the two never entangle.
+  // (src/pendingActions.)
+  // kzt (wsm-e2e-pinned-kzt): inject the durable JanusStore so a deferred action SURVIVES a process
+  // restart. The run() closure is non-serializable, so add() persists the action's INTENT
+  // (capability + params); the boot loop below rebuilds run() via buildActionRun. store===null
+  // (JANUS_LEDGER_BACKEND=legacy / store init failed) => pure in-memory, byte-for-byte as before.
+  const pendingActions = new PendingActionStore(store);
   let pendingActionSeq = 0;
+
+  // kzt: rebuild deferred-action survivors from durable intent. The run() closure is non-serializable,
+  // so we persisted the INTENT (capability+params) and rebuild it here, bound to the LIVE manager/
+  // broadcast (a deserialized closure could never re-bind them — they are fresh in this startServer()
+  // closure). Re-staging via add() carries the existing durable row (INSERT OR REPLACE is a no-op
+  // rewrite) and makes the survivor confirmable/cancellable exactly as before the restart. Hydration
+  // only REBUILDS + re-stages run; it never INVOKES it (effects run on explicit confirm only). This
+  // runs AFTER manager + pendingActions are built and BEFORE the first WS connection / sweep tick.
+  for (const row of pendingActions.hydrateIntents()) {
+    let params: Record<string, unknown> = {};
+    try { params = JSON.parse(row.params); } catch { /* corrupt -> empty params; run() degrades gracefully */ }
+    const run = buildActionRun(
+      { capability: row.capability, params },
+      { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
+    );
+    pendingActions.add({
+      id: row.id, capability: row.capability, summary: row.summary, params,
+      timestamp: row.timestamp, run, ttlMs: Math.max(0, row.expires_at - row.timestamp),
+    });
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed", project_id: "default_project", pane_id: null,
+          summary: `REHYDRATED deferred ${row.capability}: ${row.summary}`,
+          payload: { capability: row.capability, action: "rehydrated", action_id: row.id },
+        });
+      } catch { /* audit is best-effort */ }
+    }
+  }
   // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
   const shellAllowlist = loadShellAllowlist();
   // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
@@ -1629,7 +1670,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     capability: CapabilityGate,
     paneId: string | null,
     summary: string,
-    run: () => string
+    run: () => string,
+    // kzt (wsm-e2e-pinned-kzt): the serializable INTENT params the `run` closure captured. When
+    // present (and a durable store is wired), pendingActions.add() persists them so the deferred
+    // action survives a restart; the boot loop rebuilds `run` from them via buildActionRun. Keep
+    // these keys in LOCKSTEP with the per-capability param shapes in src/actionEffects.ts.
+    params?: Record<string, unknown>,
+    // rbh (wsm-e2e-pinned-rbh): the mode the operator asked for, passed STRUCTURALLY by the two
+    // permission handlers (never parsed from the summary — R5). Forwarded to the confirm dialog as
+    // `requested_mode` so it can render a divergence "heads up" when the engine resolves tighter.
+    // Non-permission capabilities (create_pane) pass nothing → no mode rider.
+    requestedMode?: string
   ): { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string } {
     const gate = effectiveCapabilityGateFor(paneId, capability);
     const activeProjectId = manager.ledger.activeProjectId || "default_project";
@@ -1639,9 +1690,38 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
     if (gate === "Ask") {
       const actionId = `act_${Date.now()}_${pendingActionSeq++}`;
-      pendingActions.add({ id: actionId, capability, summary, timestamp: Date.now(), run });
+      pendingActions.add({ id: actionId, capability, summary, params, timestamp: Date.now(), run });
       if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `DEFERRED ${capability} (await confirm): ${summary}`, payload: { capability, gate, action: "deferred", action_id: actionId } }); } catch {} }
-      broadcast({ type: "action_pending", actionId, capability, summary });
+      // rbh: enrich the confirm-dialog payload with the EFFECTIVE posture the engine WILL apply, not
+      // the nominal summary. paneId may be null for global actions (D2) — then we surface the resolved
+      // global mode + the global effective gate, no per-pane chip. The RESOLUTION is the pure
+      // resolveActionPendingPosture (src/actionPendingPayload) — the same override→spotlight→global
+      // precedence the chip uses (D1, server is the only authority), frozen-overlaid so the dialog
+      // matches the chip while STOP-ALL is engaged. It is extracted so the divergence truth (global
+      // Read-Only + pane Full Auto ⇒ LOCKED/Read-Only) is asserted at its SOURCE in
+      // tests/test_action_pending_payload.ts, not just rendered from a hand-fed mock.
+      const proj = manager.ledger.getActiveProject();
+      const targetTerm = paneId ? manager.terminals[paneId] : undefined;
+      const posture = resolveActionPendingPosture({
+        paneId,
+        capability,
+        globalMode: manager.globalPermissionsMode as GlobalMode,
+        paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
+        paneGates: paneId ? proj?.panes?.[paneId]?.capabilityGates : undefined,
+        globalGates: manager.settings.advanced?.capabilityGates,
+        isActivePane: !!paneId && activePaneId === paneId,
+        frozen,
+      });
+      broadcast({
+        type: "action_pending", actionId, capability, summary,
+        pane_id: paneId,
+        effective_gate: posture.effective_gate,
+        effective_mode: posture.effective_mode,
+        ...(posture.posture ? { posture: posture.posture } : {}),
+        ...(posture.effective_gates ? { effective_gates: posture.effective_gates } : {}),
+        ...(requestedMode ? { requested_mode: requestedMode } : {}),
+        global_override: manager.globalPermissionsMode !== "Inherit",
+      });
       return { disposition: "deferred", actionId, summary };
     }
     // Auto
@@ -2143,7 +2223,18 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           });
           // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
           announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
-          clientWs.send(JSON.stringify({ type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale }));
+          // rbh: enrich the approval frame with the TARGET pane's EFFECTIVE posture so the dialog can
+          // show "into what posture am I approving this write?". posturePayloadForPane is frozen-aware
+          // on main, so the approval path needs no separate frozen fix (only the action path did).
+          // All additive optional fields — older clients ignore them; the harness-fed e2e specs degrade.
+          const approvalPosture = posturePayloadForPane(targetId);
+          clientWs.send(JSON.stringify({
+            type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale,
+            effective_gates: approvalPosture.effective_gates,
+            posture: approvalPosture.posture,
+            effective_mode: effectiveMode,
+            capability,
+          }));
           const verb = kind === "agent_instruction" ? "direct pane" : "run on pane";
           return { kind: "pending", text: `Pending approval: ${verb} ${targetId} — "${safeInstr}". Read it back to the operator and ask them to approve or reject.` };
         }
@@ -2513,7 +2604,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   broadcastLedgerUpdate();
                   return `Note ${noteId} updated.`;
                 };
-                const g = gateOrDefer("update_metadata", null, `Amend note ${noteId}`, amendEffect);
+                // kzt: persist the amend INTENT (op + noteId + the ENQUEUE-BOUND text) so a deferred
+                // amend survives a restart and applies EXACTLY this text on confirm (#27 MUST-FIX #3).
+                const g = gateOrDefer("update_metadata", null, `Amend note ${noteId}`, amendEffect,
+                  { op: "amend", noteId, text: newText });
                 let output: string;
                 if (g.disposition === "forbidden") output = `Error: the 'update_metadata' capability is gated Off; amending notes is forbidden by policy.`;
                 else if (g.disposition === "deferred") output = `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply the amendment.`;
@@ -2527,7 +2621,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   broadcastLedgerUpdate();
                   return `Note ${noteId} deleted.`;
                 };
-                const g = gateOrDefer("update_metadata", null, `Delete note ${noteId}`, deleteEffect);
+                // kzt: persist the delete INTENT so a deferred delete survives a restart.
+                const g = gateOrDefer("update_metadata", null, `Delete note ${noteId}`, deleteEffect,
+                  { op: "delete", noteId });
                 let output: string;
                 if (g.disposition === "forbidden") output = `Error: the 'update_metadata' capability is gated Off; deleting notes is forbidden by policy.`;
                 else if (g.disposition === "deferred") output = `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to delete the note.`;
@@ -2651,7 +2747,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   broadcastTerminalsUpdated();
                   return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
                 };
-                const g = gateOrDefer("create_pane", pane_id ?? null, `Create pane ${pane_id} (${command}) in ${project_id}`, createPaneEffect);
+                const g = gateOrDefer("create_pane", pane_id ?? null, `Create pane ${pane_id} (${command}) in ${project_id}`, createPaneEffect,
+                  // kzt: origin:"voice" -> the rebuild returns `Pane … created under project …. Result: …`,
+                  // matching createPaneEffect above. Persist the resolved cwd (workspace dir) for restart parity.
+                  { origin: "voice", paneId: pane_id, cwd: manager.ledger.workspaces[project_id]?.directory, command, toolPreset: tool_preset, permissionsMode: permissions_mode, projectId: project_id });
                 if (g.disposition === "forbidden") {
                   session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.` } }] });
                 } else if (g.disposition === "deferred") {
@@ -2673,7 +2772,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   });
                   return `Global permissions updated to ${permissions_mode}.`;
                 };
-                const g = gateOrDefer("set_global_permissions", null, `Set global permissions to ${permissions_mode}`, applyGlobalPerms);
+                const g = gateOrDefer("set_global_permissions", null, `Set global permissions to ${permissions_mode}`, applyGlobalPerms,
+                  // kzt: persist the global-permissions INTENT for restart parity.
+                  { permissionsMode: permissions_mode },
+                  // rbh: pass the requested mode STRUCTURALLY (never parsed from the summary) so the
+                  // confirm dialog can render the divergence "heads up" when the engine resolves tighter.
+                  permissions_mode);
                 if (g.disposition === "forbidden") {
                   session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_global_permissions' capability is gated Off; this change is forbidden by policy.` } }] });
                 } else if (g.disposition === "deferred") {
@@ -2813,7 +2917,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                           // Route through gateOrDefer so the audit row + action_pending broadcast +
                           // pendingActions.add fire identically to REST. (gateOrDefer re-resolves the
                           // gate; the planner already classified it Ask, so this stages.)
-                          const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+                          const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
+                            // kzt: same create_pane intent shape as the REST recipe path (origin:"recipe" -> rebuild returns the bare pane id).
+                            { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: bareShell, toolPreset: p.preset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
                           if (g.disposition === "forbidden") blocked.push(p.id);
                           else if (g.disposition === "deferred") deferred.push(p.id);
                           else { spawnPane(); spawned.push(p.id); }
@@ -3237,7 +3343,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     broadcastTerminalsUpdated();
                     return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
                   };
-                  const g = gateOrDefer("set_pane_permissions", pane_id ?? null, `Set pane ${pane_id} permissions to ${permissions_mode}`, applyPanePerms);
+                  const g = gateOrDefer("set_pane_permissions", pane_id ?? null, `Set pane ${pane_id} permissions to ${permissions_mode}`, applyPanePerms,
+                    // kzt: persist the pane-permissions INTENT for restart parity.
+                    { paneId: pane_id, projectId: project_id, permissionsMode: permissions_mode },
+                    // rbh: requested mode passed structurally for the dialog divergence rider.
+                    permissions_mode);
                   if (g.disposition === "forbidden") {
                     session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.` } }] });
                   } else if (g.disposition === "deferred") {

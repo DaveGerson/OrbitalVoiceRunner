@@ -17,7 +17,7 @@
 
 import React, { useState } from "react";
 import type { CapabilityGate, GateValue, CapabilityGateMap, CliPreset } from "../types";
-import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS } from "../gateSurface";
+import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS, sanitizePartialGateMap } from "../gateSurface";
 
 const GATE_OPTIONS: GateValue[] = ["Auto", "Ask", "Off"];
 
@@ -57,16 +57,25 @@ interface CapabilityMatrixTabProps {
   onSavePaneGates: (paneId: string, gates: CapabilityGateMap | undefined) => Promise<void> | void;
 }
 
-/** Resolve the map currently being edited for a scope. */
+/**
+ * Resolve the map currently being edited for a scope.
+ *
+ * n2r (plan §2 Change 4, D7): every branch is run through `sanitizePartialGateMap`, which keeps only
+ * valid (cap, GateValue) entries and drops unknown keys / bad values. This is crash-safety, not policy:
+ * the PANE scope's map comes straight from server `effective_gates`, so a malformed pane payload (a bad
+ * value, an unknown key, or a non-object) can't crash `valueOf` (`current[cap]` on a primitive) or paint
+ * a phantom selection. It stays PARTIAL — invalid entries fall back to "follow the global default"
+ * rather than fabricating 16 Auto values, preserving the reset affordance's "absent = global" semantics.
+ */
 function gatesForScope(
   scope: MatrixScope,
   globalGates: CapabilityGateMap | undefined,
   presets: CliPreset[],
   paneGatesFor: (paneId: string) => CapabilityGateMap | undefined,
 ): CapabilityGateMap {
-  if (scope.kind === "global") return globalGates ?? {};
-  if (scope.kind === "preset") return presets.find((p) => p.id === scope.presetId)?.capabilityGates ?? {};
-  return paneGatesFor(scope.paneId) ?? {};
+  if (scope.kind === "global") return sanitizePartialGateMap(globalGates);
+  if (scope.kind === "preset") return sanitizePartialGateMap(presets.find((p) => p.id === scope.presetId)?.capabilityGates);
+  return sanitizePartialGateMap(paneGatesFor(scope.paneId));
 }
 
 export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
