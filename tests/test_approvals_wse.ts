@@ -4,6 +4,7 @@ import assert from "node:assert";
 import {
   parseApprovalIntent,
   selectApprovalTarget,
+  selectPendingAction,
   normalizeUtterance,
 } from "../src/approvalIntent";
 import {
@@ -17,6 +18,7 @@ import {
   serializePending,
   type PendingApproval,
 } from "../src/pendingApprovals";
+import { PendingActionStore } from "../src/pendingActions";
 
 /**
  * WS-E — Spoken, targeted, safe approvals. Tests for the PURE, framework-free pieces
@@ -558,4 +560,246 @@ describe("WS-E gate path integration (BUG-001/BUG-038)", () => {
   // write in the background, in ANY policy mode. The only write door remains the live, operator-
   // engaged `dispatch` path exercised by the gate tests above (and by `execute_plan`'s step 0).
   // The former "P0-3 gated auto-advance" tests modelled removed behavior and were dropped.
+});
+
+// ---------------------------------------------------------------------------
+// U1 — voice resolves a staged pendingAction (bead wsm-e2e-pinned-9fe)
+//
+// A voice-driven create_pane under the Ask tier is NOT a pane WRITE — gateOrDefer stages it
+// into the GLOBAL pendingActions store (server.ts:1407), today resolvable ONLY by a REST click.
+// The voice resolver did all its work under `pendingApprovals.forSession(session).length > 0`
+// with no `else`, so a spoken "approve" with zero pending APPROVALS was a silent no-op.
+//
+// `resolveActionByVoice` below is a trimmed re-implementation of the new fallback branch
+// (server.ts Change A) over the REAL PendingActionStore + REAL parseApprovalIntent +
+// REAL selectPendingAction — same proof-without-a-live-binary pattern as makeHarness above.
+// It MIRRORS the REST confirm/cancel handlers (server.ts:1560-1580): same store calls, same
+// `action_resolved`/outcome broadcast shape, so the claim() seam keeps exactly-once across a
+// REST+voice race. NOTE: pendingActions is GLOBAL (not session-scoped) — see plan §5 risk #1.
+// ---------------------------------------------------------------------------
+function resolveActionByVoice(
+  session: FakeSession,
+  actions: PendingActionStore,
+  utterance: string,
+  broadcasts?: any[],
+): void {
+  const parsed = parseApprovalIntent(utterance);
+  if (parsed.intent === "none") return;
+  const all = actions.all();
+  if (all.length === 0) return;
+  const broadcast = (m: any) => broadcasts?.push(m);
+  const narrate = (text: string) =>
+    session.sendClientContent({
+      turns: [{ role: "user", parts: [{ text: `SYSTEM EVENT (say this to the operator, then stop): ${text}` }] }],
+      turnComplete: true,
+    });
+  // redactSecrets is applied in the server; the harness mirrors structure, not redaction.
+  const target = selectPendingAction(all.map((a) => ({ id: a.id, summary: a.summary })), parsed.targetHint);
+  if (parsed.intent === "clarify") {
+    narrate(`I heard both approve and reject — which of the ${all.length} pending action${all.length === 1 ? "" : "s"} did you mean?`);
+    return;
+  }
+  if (!target.id || target.ambiguous) {
+    const list = all.map((a, i) => `${i + 1}. ${a.summary}`).join("; ");
+    narrate(`I have ${all.length} pending action${all.length === 1 ? "" : "s"}: ${list}. Which one?`);
+    return;
+  }
+  if (parsed.intent === "approve") {
+    const result = actions.confirm(target.id);
+    if (result.reason === "confirmed") {
+      broadcast({ type: "action_resolved", actionId: target.id, outcome: "confirmed" });
+      narrate(`Done — ${target.summary}.`);
+    }
+    // lost_race / not_found -> a concurrent REST already resolved it; stay silent.
+  } else {
+    // reject
+    const result = actions.cancel(target.id);
+    broadcast({ type: "action_resolved", actionId: target.id, outcome: "cancelled" });
+    if (result.reason === "cancelled") narrate(`Cancelled — ${target.summary}.`);
+  }
+}
+
+describe("U1 — voice resolves a staged pendingAction (bead wsm-e2e-pinned-9fe)", () => {
+  function stage(actions: PendingActionStore, id: string, summary: string, onRun: () => void): void {
+    actions.add({
+      id,
+      capability: "create_pane",
+      summary,
+      timestamp: Date.now(),
+      run: () => { onRun(); return `${summary} — done.`; },
+    });
+  }
+
+  it("single staged create_pane + spoken 'approve' runs the effect exactly once", () => {
+    const actions = new PendingActionStore();
+    let ran = 0;
+    stage(actions, "act_1", "Create pane claude_new (claude) in proj", () => { ran++; });
+
+    const sess = new FakeSession();
+    const broadcasts: any[] = [];
+    resolveActionByVoice(sess, actions, "approve", broadcasts);
+
+    assert.strictEqual(ran, 1, "the staged create_pane effect ran exactly once");
+    assert.strictEqual(actions.has("act_1"), false, "the action was removed from the queue");
+    assert.ok(sess.clientContents.length >= 1, "operator was narrated the result");
+    assert.deepStrictEqual(broadcasts, [{ type: "action_resolved", actionId: "act_1", outcome: "confirmed" }]);
+  });
+
+  // Verifier correction: the reject path MUST use "reject" or "cancel that command" — bare
+  // "cancel that" parses to NONE (the weak-verb guard) and must NOT resolve anything.
+  for (const utter of ["reject", "cancel that command"]) {
+    it(`spoken '${utter}' cancels the staged action and never runs it`, () => {
+      const actions = new PendingActionStore();
+      let ran = 0;
+      stage(actions, "act_1", "Create pane claude_new (claude) in proj", () => { ran++; });
+
+      const sess = new FakeSession();
+      const broadcasts: any[] = [];
+      resolveActionByVoice(sess, actions, utter, broadcasts);
+
+      assert.strictEqual(ran, 0, "reject never runs the effect");
+      assert.strictEqual(actions.has("act_1"), false, "the action was removed from the queue");
+      assert.deepStrictEqual(broadcasts, [{ type: "action_resolved", actionId: "act_1", outcome: "cancelled" }]);
+      const last = String(sess.clientContents.at(-1).turns[0].parts[0].text);
+      assert.ok(last.includes("Cancelled"), "operator was narrated the cancellation");
+    });
+  }
+
+  it("bare 'cancel that' parses to none and does NOT resolve the action (no-op by design)", () => {
+    const actions = new PendingActionStore();
+    let ran = 0;
+    stage(actions, "act_1", "Create pane claude_new (claude) in proj", () => { ran++; });
+
+    const sess = new FakeSession();
+    const broadcasts: any[] = [];
+    resolveActionByVoice(sess, actions, "cancel that", broadcasts);
+
+    assert.strictEqual(ran, 0);
+    assert.strictEqual(actions.has("act_1"), true, "bare 'cancel that' must NOT remove the action");
+    assert.strictEqual(broadcasts.length, 0);
+    assert.strictEqual(sess.clientContents.length, 0);
+  });
+
+  it("exactly-once under a confirm race: a voice approve then a REST-equivalent confirm does not double-run", () => {
+    const actions = new PendingActionStore();
+    let ran = 0;
+    stage(actions, "act_1", "Create pane claude_new (claude) in proj", () => { ran++; });
+
+    const sess = new FakeSession();
+    resolveActionByVoice(sess, actions, "approve");
+    // REST-equivalent second confirm (POST /api/actions/:id/confirm) — the loser of the claim race.
+    const second = actions.confirm("act_1");
+    assert.strictEqual(second.reason, "not_found", "the action is already gone after the voice confirm");
+    assert.strictEqual(ran, 1, "the effect ran exactly once across voice + REST");
+  });
+
+  it("multi-pending clarify reads back the action SUMMARIES (not an empty pane id) and resolves nothing", () => {
+    const actions = new PendingActionStore();
+    let ranA = 0, ranB = 0;
+    stage(actions, "act_a", "Create pane A in proj", () => { ranA++; });
+    stage(actions, "act_b", "Set global permissions to Full Auto", () => { ranB++; });
+
+    const sess = new FakeSession();
+    const broadcasts: any[] = [];
+    resolveActionByVoice(sess, actions, "approve", broadcasts);
+
+    assert.strictEqual(ranA, 0, "nothing resolves on ambiguous multi-pending");
+    assert.strictEqual(ranB, 0);
+    assert.strictEqual(broadcasts.length, 0, "no resolution broadcast on a clarify");
+    const text = String(sess.clientContents.at(-1).turns[0].parts[0].text);
+    assert.ok(text.includes("Create pane A in proj"), "reads back the first summary");
+    assert.ok(text.includes("Set global permissions to Full Auto"), "reads back the second summary");
+    assert.ok(!/undefined|terminalId/.test(text), "does not leak an empty terminalId");
+  });
+
+  it("ordinal disambiguation: 'approve the second one' confirms only the second action", () => {
+    const actions = new PendingActionStore();
+    let ranA = 0, ranB = 0;
+    stage(actions, "act_a", "Create pane A in proj", () => { ranA++; });
+    stage(actions, "act_b", "Set global permissions to Full Auto", () => { ranB++; });
+
+    const sess = new FakeSession();
+    const broadcasts: any[] = [];
+    resolveActionByVoice(sess, actions, "approve the second one", broadcasts);
+
+    assert.strictEqual(ranB, 1, "only the second staged action ran");
+    assert.strictEqual(ranA, 0, "the first action was untouched");
+    assert.strictEqual(actions.has("act_a"), true);
+    assert.strictEqual(actions.has("act_b"), false);
+    assert.deepStrictEqual(broadcasts, [{ type: "action_resolved", actionId: "act_b", outcome: "confirmed" }]);
+  });
+
+  // Precedence: when a pending APPROVAL and a staged ACTION both exist for the session, a spoken
+  // "approve" resolves the APPROVAL first (the pendingApprovals.forSession().length > 0 branch);
+  // the action is untouched. This pins the `else`-not-sibling wiring (plan §5 risk #2).
+  it("precedence: an approval resolves BEFORE a staged action; the action is untouched", () => {
+    const h = makeHarness();
+    h.terms["pane_a"] = new FakeTerm("interactive_cli", "Human-in-the-Loop");
+    const sess = new FakeSession();
+    h.dispatch(sess, "call1", "call1", "pane_a", "run the tests", undefined); // -> pending approval
+
+    const actions = new PendingActionStore();
+    let actionRan = 0;
+    stage(actions, "act_1", "Create pane claude_new (claude) in proj", () => { actionRan++; });
+
+    // Re-implement the server's `entries.length > 0` precedence: approvals FIRST, else actions.
+    const parsed = parseApprovalIntent("approve");
+    const entries = h.store.forSession(sess);
+    if (entries.length > 0) {
+      const tgt = selectApprovalTarget(
+        entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
+        parsed.targetHint,
+        h.store.lastAnnouncedFor(sess),
+      );
+      if (tgt.messageId) h.resolve(sess, tgt.messageId, parsed.intent === "approve");
+    } else {
+      resolveActionByVoice(sess, actions, "approve");
+    }
+
+    assert.deepStrictEqual(h.terms["pane_a"].writes, ["run the tests"], "the approval (pane write) landed");
+    assert.strictEqual(h.store.has("call1"), false, "the approval was resolved");
+    assert.strictEqual(actionRan, 0, "the staged action was NOT run");
+    assert.strictEqual(actions.has("act_1"), true, "the staged action is untouched");
+  });
+
+  // Parser regression guard (no relaxation): the tokens.length > 2 weak-verb guard stays intact.
+  for (const [utter, expected] of [["cancel", "none"], ["execute", "none"], ["send it", "none"]] as const) {
+    it(`parser guard: "${utter}" still -> ${expected}`, () => {
+      assert.strictEqual(parseApprovalIntent(utter).intent, expected);
+    });
+  }
+
+  // Pure selectPendingAction unit rows.
+  describe("selectPendingAction (pure)", () => {
+    const A = { id: "a", summary: "Create pane A in proj" };
+    const B = { id: "b", summary: "Set global permissions to Full Auto" };
+
+    it("single action -> that one, via 'only'", () => {
+      const r = selectPendingAction([A], undefined);
+      assert.strictEqual(r.id, "a");
+      assert.strictEqual(r.via, "only");
+    });
+    it("ordinal 2 -> the second action", () => {
+      const r = selectPendingAction([A, B], { ordinal: 2 });
+      assert.strictEqual(r.id, "b");
+      assert.strictEqual(r.via, "ordinal");
+    });
+    it("ordinal -1 (last) -> the last action", () => {
+      const r = selectPendingAction([A, B], { ordinal: -1 });
+      assert.strictEqual(r.id, "b");
+    });
+    it("unique fragment -> that one, via 'fragment'", () => {
+      const r = selectPendingAction([A, B], { fragment: "global permissions" });
+      assert.strictEqual(r.id, "b");
+      assert.strictEqual(r.via, "fragment");
+    });
+    it(">1 with no hint -> ambiguous (clarify)", () => {
+      const r = selectPendingAction([A, B], undefined);
+      assert.strictEqual(r.ambiguous, true);
+      assert.strictEqual(r.id, undefined);
+    });
+    it("zero actions -> empty result", () => {
+      assert.deepStrictEqual(selectPendingAction([], undefined), {});
+    });
+  });
 });

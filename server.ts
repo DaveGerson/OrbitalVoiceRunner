@@ -31,14 +31,17 @@ import {
   type ResolveMode,
   type ResolveReason,
 } from "./src/pendingApprovals";
-import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
+import { parseApprovalIntent, selectApprovalTarget, selectPendingAction } from "./src/approvalIntent";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
+import { restGateOutcome } from "./src/restGate";
+import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
 import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
+import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 
 dotenv.config();
 
@@ -825,10 +828,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         manager.ledger.addProject(projectId, resolvedCwd, "", []);
       }
     }
-    const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, result });
+    // G6: route the PTY spawn through the SAME capability gate the voice `create_pane` handler uses.
+    // The broadcasts MOVE INSIDE spawnEffect so a deferred-then-confirmed spawn still repaints the UI
+    // (the effect runs once via POST /api/actions/:id/confirm). Off -> 403, Ask -> 202+actionId,
+    // Auto -> 200 + addTerminal result. (The projectId ledger-sync above stays before the gate,
+    // matching the voice handler's "ensure the project exists" behavior — it mutates metadata, not a PTY.)
+    const spawnEffect = (): string => {
+      const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
+      broadcastLedgerUpdate();
+      broadcast({ type: "terminals_updated" });
+      return String(result);
+    };
+    const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect);
+    const out = restGateOutcome(g);
+    if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
+    res.status(out.status).json(out.body);
   });
 
   // Web API to restart terminal node
@@ -949,8 +963,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // Project and Pane management endpoints
   app.post("/api/projects", (req, res) => {
     const { id, directory, summary, keyTerms, name } = req.body;
+    if (!id) {
+      res.status(400).json({ error: "Missing required field: id" });
+      return;
+    }
+    // G5: validate the caller-supplied directory before persisting it. A non-blank
+    // dir that does not exist (or is a file) is rejected — storing it would later
+    // taint a child pane's cwd and make node-pty throw "path not found". Blank/"."
+    // resolves to the server cwd (valid intent preserved), never the literal ".".
+    if (isBadProjectDir(directory)) {
+      res.status(400).json({ error: `Project directory does not exist: ${String(directory).trim()}` });
+      return;
+    }
     const terms = Array.isArray(keyTerms) ? keyTerms : [];
-    manager.ledger.addProject(id, directory || ".", summary || "", terms);
+    manager.ledger.addProject(id, resolveProjectDir(directory), summary || "", terms);
     if (name) {
       manager.ledger.renameProject(id, name);
     }
@@ -1381,25 +1407,60 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       return;
     }
     const recipe = recipes.find(r => r.id === recipeId);
-    if (recipe) {
-      const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
-      for (const p of recipe.panes) {
-        if (!manager.terminals[p.id]) {
-          // Always open a bare shell — never auto-run the recipe's startupCommand.
-          manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
-          // Record the suggested startup command as a pane note so the operator can
-          // run it explicitly (auditable), rather than baking it into the spawn.
-          if (p.startupCommand) {
-            manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
-          }
-        }
-      }
-      broadcastLedgerUpdate();
-      broadcastTerminalsUpdated();
-      res.json({ success: true });
-    } else {
+    if (!recipe) {
       res.status(404).json({ error: "Recipe layout not found." });
+      return;
     }
+    // G6 + bri: mirror the voice `apply_orchestration_recipe` gate semantics EXACTLY by sharing the
+    // pure planner (planRecipeApply). Off on apply_recipe forbids the WHOLE layout (403); otherwise
+    // each spawn rides create_pane (Off -> blocked, Ask -> deferred, Auto -> spawn now). Each pane's
+    // broadcast lives INSIDE spawnPane so a deferred-confirm repaints. Voice and REST now consume the
+    // same planner so the Ask-tier behavior cannot drift again (the WF-2 divergence).
+    // Keep one gateCapability call for the layout-level `apply_recipe` audit row (the planner is a pure
+    // decision fn and emits none); its boolean veto is authoritative via plan.layoutForbidden below.
+    gateCapability("apply_recipe", null);
+    const plan = planRecipeApply(
+      recipe.panes,
+      new Set(Object.keys(manager.terminals)),
+      () => effectiveCapabilityGateFor(null, "apply_recipe"),
+      (id) => effectiveCapabilityGateFor(id, "create_pane"),
+    );
+    if (plan.layoutForbidden) {
+      res.status(403).json({ error: "apply_recipe is gated Off; spawning template layouts is forbidden by policy.", capability: "apply_recipe" });
+      return;
+    }
+    const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+    const paneById = new Map(recipe.panes.map(p => [p.id, p]));
+    const spawned: string[] = [];
+    const deferred: { paneId: string; actionId: string }[] = [];
+    const blocked: string[] = [];
+    for (const planned of plan.panes) {
+      if (planned.disposition === "skip-existing") continue;
+      if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
+      const p = paneById.get(planned.paneId)!;
+      const spawnPane = (): string => {
+        // Always open a bare shell — never auto-run the recipe's startupCommand.
+        manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+        // Record the suggested startup command as a pane note so the operator can
+        // run it explicitly (auditable), rather than baking it into the spawn.
+        if (p.startupCommand) {
+          manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
+        }
+        broadcastLedgerUpdate();
+        broadcast({ type: "terminals_updated" });
+        return p.id;
+      };
+      if (planned.disposition === "defer") {
+        const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+        if (g.disposition === "forbidden") blocked.push(p.id);
+        else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
+        else { spawnPane(); spawned.push(p.id); }
+      } else {
+        spawnPane();
+        spawned.push(p.id);
+      }
+    }
+    res.json({ success: true, spawned, deferred, blocked });
   });
 
   // 5. Cross-pane context handoff
@@ -2189,6 +2250,44 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                         resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
                       }
                     }
+                  } else {
+                    // U1 (bead wsm-e2e-pinned-9fe): no pending pane-WRITE approval for this session,
+                    // but a gated NON-PTY mutator (create_pane / set_*_permissions) may be staged in
+                    // the GLOBAL pendingActions store (gateOrDefer Ask branch, server.ts:1407).
+                    // Resolve it by voice, MIRRORING the REST handlers (server.ts:1560-1580) so the
+                    // claim() seam keeps exactly-once across a REST+voice race.
+                    // NOTE: pendingActions is GLOBAL (not session-scoped like pendingApprovals) — a
+                    // sharp edge in multi-session setups; here the single live session owns the queue.
+                    // Precedence is preserved by being the `else` of `entries.length > 0`: a session
+                    // with BOTH a pending approval and a staged action resolves the APPROVAL first.
+                    const actions = pendingActions.all();
+                    if (actions.length > 0) {
+                      const target = selectPendingAction(
+                        actions.map((a) => ({ id: a.id, summary: a.summary })),
+                        parsed.targetHint
+                      );
+                      if (parsed.intent === "clarify") {
+                        pushApprovalNarration(session, `I heard both approve and reject — which of the ${actions.length} pending action${actions.length === 1 ? "" : "s"} did you mean?`);
+                      } else if (target.ambiguous || !target.id) {
+                        // >1 staged and nothing disambiguates -> read back the SUMMARIES (actions
+                        // have no meaningful terminalId; never narrate an empty pane id).
+                        const list = actions.map((a, i) => `${i + 1}. ${redactSecrets(a.summary)}`).join("; ");
+                        pushApprovalNarration(session, `I have ${actions.length} pending action${actions.length === 1 ? "" : "s"}: ${list}. Which one?`);
+                      } else if (parsed.intent === "approve") {
+                        const result = pendingActions.confirm(target.id);
+                        if (result.reason === "confirmed") {
+                          broadcast({ type: "action_resolved", actionId: target.id, outcome: "confirmed" });
+                          pushApprovalNarration(session, `Done — ${redactSecrets(target.summary ?? "")}.`);
+                        }
+                        // lost_race / not_found -> a concurrent REST already resolved it; stay silent
+                        // (no double-narration, no pane re-broadcast).
+                      } else {
+                        // reject
+                        const result = pendingActions.cancel(target.id);
+                        broadcast({ type: "action_resolved", actionId: target.id, outcome: "cancelled" });
+                        if (result.reason === "cancelled") pushApprovalNarration(session, `Cancelled — ${redactSecrets(target.summary ?? "")}.`);
+                      }
+                    }
                   }
                 }
               }
@@ -2516,11 +2615,23 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 });
               } else if (name === "create_project") {
                 const { project_id, directory, summary, key_terms } = args;
-                manager.ledger.addProject(project_id, directory || ".", summary || "", key_terms || []);
-                broadcastLedgerUpdate();
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Project context ${project_id} created successfully.` } }]
-                });
+                // G5: reject a non-existent caller-supplied directory before persisting it
+                // (a bad dir later taints every child pane's cwd). Blank/"." resolves to the
+                // server cwd. The rejection is a spoken-friendly tool response so the model
+                // can re-prompt the operator, matching the gated-Off voice error style below.
+                if (isBadProjectDir(directory)) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: {
+                      output: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`
+                    } }]
+                  });
+                } else {
+                  manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []);
+                  broadcastLedgerUpdate();
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: `Project context ${project_id} created successfully.` } }]
+                  });
+                }
               } else if (name === "create_pane") {
                 const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
                 const createPaneEffect = (): string => {
@@ -2660,34 +2771,62 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   if (!recipe) {
                     resp = `Error: Template recipe ${recipe_id} not found.`;
                   } else {
-                    // Gate-bypass fix: this handler spawns live PTYs via addTerminal() directly
-                    // (NOT through the gated create_pane handler), so it must honor the gate itself.
-                    // Off on apply_recipe forbids the whole layout; we also Off-veto each individual
-                    // spawn on create_pane so a pane-level "never start panes here" policy holds.
-                    const recipeGate = gateCapability("apply_recipe", null);
-                    if (recipeGate.forbidden) {
+                    // bri (WS-F scope C): converge the voice recipe path onto the SAME staged-deferral
+                    // seam as REST `POST /api/recipes/apply`. Previously this handler spawned live PTYs
+                    // via addTerminal() on create_pane=Ask (apply-now, Off-veto only) while REST deferred
+                    // — the WF-2 divergence. Now the shared pure planner (planRecipeApply) decides each
+                    // pane's disposition, and Ask panes are STAGED in pendingActions (gateOrDefer) so
+                    // "Ask means stage+confirm" holds at BOTH the voice and REST boundaries.
+                    // Keep one gateCapability call for the layout-level `apply_recipe` audit row (the
+                    // planner is pure and emits none); the veto is authoritative via plan.layoutForbidden.
+                    gateCapability("apply_recipe", null);
+                    const plan = planRecipeApply(
+                      recipe.panes,
+                      new Set(Object.keys(manager.terminals)),
+                      () => effectiveCapabilityGateFor(null, "apply_recipe"),
+                      (id) => effectiveCapabilityGateFor(id, "create_pane"),
+                    );
+                    if (plan.layoutForbidden) {
                       resp = `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`;
                     } else {
                       const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+                      const paneById = new Map(recipe.panes.map(p => [p.id, p]));
                       const spawned: string[] = [];
+                      const deferred: string[] = [];
                       const blocked: string[] = [];
-                      for (const p of recipe.panes) {
-                        if (!manager.terminals[p.id]) {
-                          if (gateCapability("create_pane", p.id).forbidden) {
-                            blocked.push(p.id);
-                            continue;
-                          }
-                          // Always open a bare shell — never auto-run the startupCommand.
+                      for (const planned of plan.panes) {
+                        if (planned.disposition === "skip-existing") continue;
+                        if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
+                        const p = paneById.get(planned.paneId)!;
+                        // Same spawn closure shape as REST (server.ts ~1293): bare shell, startupCommand
+                        // recorded as an auditable pane note, broadcasts INSIDE so a deferred-confirm repaints.
+                        const spawnPane = (): string => {
                           manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
-                          spawned.push(p.id);
                           if (p.startupCommand) {
                             manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
                           }
+                          broadcastLedgerUpdate();
+                          broadcast({ type: "terminals_updated" });
+                          return p.id;
+                        };
+                        if (planned.disposition === "defer") {
+                          // Route through gateOrDefer so the audit row + action_pending broadcast +
+                          // pendingActions.add fire identically to REST. (gateOrDefer re-resolves the
+                          // gate; the planner already classified it Ask, so this stages.)
+                          const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+                          if (g.disposition === "forbidden") blocked.push(p.id);
+                          else if (g.disposition === "deferred") deferred.push(p.id);
+                          else { spawnPane(); spawned.push(p.id); }
+                        } else {
+                          // Auto -> spawn now.
+                          spawnPane();
+                          spawned.push(p.id);
                         }
                       }
-                      broadcastLedgerUpdate();
-                      broadcastTerminalsUpdated();
-                      resp = `Template recipe layout '${recipe.name}' applied: spawned ${spawned.length} pane(s)${blocked.length ? `; ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : ""}.`;
+                      resp = `Template recipe layout '${recipe.name}': spawned ${spawned.length} pane(s)`
+                        + (deferred.length ? `, ${deferred.length} awaiting your confirmation (create_pane=Ask: ${deferred.join(", ")})` : "")
+                        + (blocked.length ? `, ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : "")
+                        + ".";
                     }
                   }
                 }

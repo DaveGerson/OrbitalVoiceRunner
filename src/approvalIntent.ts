@@ -273,3 +273,60 @@ export function selectApprovalTarget(
   // 4. >1 pending and nothing disambiguates -> caller must clarify.
   return { ambiguous: true };
 }
+
+/**
+ * U1 (bead wsm-e2e-pinned-9fe): pick which staged pendingAction an utterance refers to.
+ *
+ * Sibling of `selectApprovalTarget`, but typed for PendingAction-like entries (id + summary).
+ * It deliberately does NOT reuse `selectApprovalTarget`: actions have no meaningful `terminalId`,
+ * so the caller reads back `summary` (never an empty pane id) on a clarify. `actions` are in
+ * staged order (oldest first), matching `PendingActionStore.all()`.
+ *
+ * Resolution order:
+ *   exactly-one -> that one (via "only"); ordinal -> actions[ordinal-1] (or last for -1);
+ *   fragment -> the UNIQUE summary substring match; otherwise ambiguous (caller clarifies).
+ * Returns `{}` for an empty list, `{ id, summary, via }` on a unique hit, or `{ ambiguous: true }`.
+ */
+export interface PendingActionLike {
+  id: string;
+  summary: string;
+}
+
+export interface ActionTargetResult {
+  id?: string;
+  summary?: string;
+  ambiguous?: boolean;
+  via?: "only" | "ordinal" | "fragment";
+}
+
+export function selectPendingAction(
+  actions: PendingActionLike[],
+  hint: TargetHint | undefined,
+): ActionTargetResult {
+  if (actions.length === 0) return {};
+  if (actions.length === 1) return { id: actions[0].id, summary: actions[0].summary, via: "only" };
+
+  // Ordinal ("the second one" -> 2; "the last one" -> -1).
+  if (hint?.ordinal !== undefined) {
+    const idx = hint.ordinal === -1 ? actions.length - 1 : hint.ordinal - 1;
+    if (idx >= 0 && idx < actions.length) {
+      return { id: actions[idx].id, summary: actions[idx].summary, via: "ordinal" };
+    }
+    return { ambiguous: true };
+  }
+
+  // Fragment: a PRESENT by-name signal must match EXACTLY one summary; 0 or >1 -> clarify
+  // (never silently resolve the wrong action — same conservative posture as selectApprovalTarget).
+  if (hint?.fragment) {
+    const needleTokens = normalizeUtterance(hint.fragment).split(" ").filter(Boolean);
+    const matches = actions.filter((a) => {
+      const hay = normalizeUtterance(a.summary);
+      return needleTokens.every((t) => hay.includes(t));
+    });
+    if (matches.length === 1) return { id: matches[0].id, summary: matches[0].summary, via: "fragment" };
+    return { ambiguous: true };
+  }
+
+  // >1 pending, no hint -> caller clarifies (reads back the summaries).
+  return { ambiguous: true };
+}
