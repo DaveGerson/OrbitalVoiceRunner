@@ -205,3 +205,86 @@ export const CAPABILITY_CATEGORIES: Record<string, readonly CapabilityGate[]> = 
   "Spawning work": ["create_pane", "execute_plan", "apply_recipe", "add_watch_rule"],
   "Orientation (low-risk)": ["create_project", "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention"],
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// n2r (bead wsm-e2e-pinned-n2r): PRESENTATION-NORMALIZERS — crash-safety for the gate UI.
+//
+// The chip + matrix render directly off SERVER-PROVIDED posture / effective_gates. A single malformed
+// payload — a posture word that isn't OPEN|GUARDED|LOCKED, a gate value that isn't Auto|Ask|Off, or a
+// non-object effective_gates — used to index an undefined POSTURE_STYLE/GATE_STYLE record and throw
+// DURING RENDER, which unwound to the one global ErrorBoundary and white-screened the entire cockpit.
+//
+// These pure, total, NEVER-THROWING functions are the single normalization choke-point both
+// components consume, so neither ever indexes a style record with an unknown key. They are
+// PRESENTATION concerns only (not policy / precedence) — there is NO server twin to keep in lockstep
+// (unlike deriveEffectiveGates, which mirrors the server resolver). Fail-safe directions (locked, §3):
+//   - unknown POSTURE  → GUARDED (D1): never falsely imply OPEN/"free to act" nor LOCKED/"can't type".
+//   - unknown GATE     → Ask     (D2): surface friction rather than silently imply Auto/Allowed.
+//   - absent posture   → null    (D3): legacy payloads legitimately omit it → caller renders no chip.
+//   - non-object gates → all-Auto(D6): coerce to a TOTAL valid map so no lookup ever throws.
+//   - pane override bad entry → stripped, stays partial (D7): preserves "absent = follow global".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Runtime guard set for the closed PostureWord union (the surface's only valid posture words). */
+const POSTURE_WORDS: ReadonlySet<string> = new Set<PostureWord>(["OPEN", "GUARDED", "LOCKED"]);
+/** Runtime guard set for the closed GateValue union. */
+const GATE_VALUES: ReadonlySet<string> = new Set<GateValue>(["Auto", "Ask", "Off"]);
+
+/**
+ * Coerce an unknown server posture to a known word. Unknown/present-but-malformed → "GUARDED"
+ * (fail-safe: never imply OPEN/free-to-act, never imply LOCKED/can't-type, when we genuinely don't
+ * know). Returns null ONLY for the legitimate "no posture at all" case (null/undefined) so the caller
+ * can render nothing (back-compat with older payloads / mocks). (D1 / D3.)
+ */
+export function normalizePostureWord(posture: unknown): PostureWord | null {
+  if (posture == null) return null;                       // genuinely absent → caller renders no chip
+  if (typeof posture === "string" && POSTURE_WORDS.has(posture)) return posture as PostureWord;
+  return "GUARDED";                                       // present but malformed → fail-safe GUARDED
+}
+
+/**
+ * Coerce one unknown gate value to a known one. Missing → "Auto" (legacy default). Present-but-bad
+ * → "Ask" (fail-safe: surface friction rather than silently imply Auto/Allowed). (D2.)
+ */
+export function normalizeGateValue(value: unknown): GateValue {
+  if (value == null) return "Auto";
+  if (typeof value === "string" && GATE_VALUES.has(value)) return value as GateValue;
+  return "Ask";
+}
+
+/** Whether a value is a plain (non-array, non-null) object we can safely index for gate keys. */
+function isPlainObject(raw: unknown): raw is Record<string, unknown> {
+  return raw != null && typeof raw === "object" && !Array.isArray(raw);
+}
+
+/**
+ * Coerce an unknown effective-gates payload to a TOTAL, well-typed map (all 16 caps, every value a
+ * valid GateValue). Non-object/array/primitive input → all-Auto. This is what GateChip iterates, so it
+ * never indexes a style record with an unknown key. Unknown keys are NOT copied through; every value
+ * is run through normalizeGateValue (bad value → Ask, D2; absent → Auto). (D6.)
+ */
+export function normalizeEffectiveGates(raw: unknown): Record<CapabilityGate, GateValue> {
+  const src = isPlainObject(raw) ? raw : {};
+  const out = {} as Record<CapabilityGate, GateValue>;
+  for (const cap of ALL_CAPABILITIES) out[cap] = normalizeGateValue(src[cap]);
+  return out;
+}
+
+/**
+ * Coerce an unknown PARTIAL gate map (a pane override) to a clean partial map: keep ONLY keys in
+ * ALL_CAPABILITIES whose value is a valid GateValue; drop unknown keys AND bad-value entries entirely.
+ *
+ * Unlike normalizeEffectiveGates this stays PARTIAL — it never fabricates the 16 missing caps. That
+ * preserves the pane-scope "absent = follow the global default" semantics the matrix's reset
+ * affordance depends on: an invalid override entry is simply IGNORED (falls back to global) rather
+ * than crashing the toggle or painting a phantom selection. (D7.)
+ */
+export function sanitizePartialGateMap(raw: unknown): CapabilityGateMap {
+  const src = isPlainObject(raw) ? raw : {};
+  const out: CapabilityGateMap = {};
+  for (const cap of ALL_CAPABILITIES) {
+    const v = src[cap];
+    if (typeof v === "string" && GATE_VALUES.has(v)) out[cap] = v as GateValue;
+  }
+  return out;
+}

@@ -1,6 +1,18 @@
 import { useEffect } from "react";
 import type { GateValue } from "../types";
-import { POSTURE_STYLE, GATE_STYLE, CAPABILITY_LABELS, deriveActionDivergence, type PostureWord } from "../gateSurface";
+import {
+  POSTURE_STYLE,
+  GATE_STYLE,
+  CAPABILITY_LABELS,
+  deriveActionDivergence,
+  // n2r (wsm-e2e-pinned-n2r, §5.2): route the rider's posture/gate through the same crash-safe
+  // normalizers the chip uses, so a malformed rider payload degrades the badge calmly instead of
+  // throwing INSIDE the confirm modal (which would block the operator's confirm path — worse than
+  // the chip case). n2r only sanitizes the presentation inputs; the divergence decision stays rbh's.
+  normalizePostureWord,
+  normalizeGateValue,
+  type PostureWord,
+} from "../gateSurface";
 
 type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
 
@@ -61,8 +73,12 @@ export function ActionConfirmDialog({
 
   // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
   const showEffective = !!posture || !!effectiveGate;
-  const postureStyle = posture ? POSTURE_STYLE[posture] : undefined;
-  const gateStyle = effectiveGate ? GATE_STYLE[effectiveGate] : undefined;
+  // n2r §5.2: normalize before the closed-union style lookup so a malformed rider never indexes an
+  // undefined record. normalizePostureWord(null) === null (render no badge); a bad word → GUARDED.
+  const safePosture = normalizePostureWord(posture);
+  const safeGate = effectiveGate != null ? normalizeGateValue(effectiveGate) : undefined;
+  const postureStyle = safePosture ? POSTURE_STYLE[safePosture] ?? POSTURE_STYLE.GUARDED : undefined;
+  const gateStyle = safeGate ? GATE_STYLE[safeGate] ?? GATE_STYLE.Ask : undefined;
   const capLabel = CAPABILITY_LABELS[capability as keyof typeof CAPABILITY_LABELS] ?? capability;
   // Scope label: a per-pane action names its pane ("Effective on p1:"); a global action (paneId
   // null/undefined — D2) has no pane scope, so we read "Effective globally:". This makes the
@@ -78,7 +94,7 @@ export function ActionConfirmDialog({
   let divergenceText = "";
   if (divergence === "global") {
     // global mode wins: the pane stays at the resolved posture until the global mode changes.
-    const stays = posture ?? "LOCKED";
+    const stays = safePosture ?? "LOCKED";
     divergenceText = `Global mode is ${effectiveMode} — this pane stays ${stays} until you change the global mode.`;
   } else if (divergence === "gate") {
     // gate veto with no mode override: the capability gate itself is Off.
@@ -109,10 +125,10 @@ export function ActionConfirmDialog({
               >
                 <div className="flex items-center gap-2 text-[11px]">
                   <span data-testid="action-scope" className="text-zinc-500 uppercase tracking-wider">{scopeLabel}</span>
-                  {posture && postureStyle && (
+                  {safePosture && postureStyle && (
                     <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${postureStyle.text}`}>
                       <span className={`inline-block w-1.5 h-1.5 rounded-full ${postureStyle.dot}`} />
-                      {posture}
+                      {safePosture}
                     </span>
                   )}
                   {postureStyle && <span className="text-zinc-500 normal-case">· {postureStyle.label}</span>}

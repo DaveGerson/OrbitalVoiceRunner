@@ -1,6 +1,15 @@
 import { useEffect } from "react";
 import type { CapabilityGate, CapabilityGateMap } from "../types";
-import { POSTURE_STYLE, GATE_STYLE, CAPABILITY_LABELS, type PostureWord } from "../gateSurface";
+import {
+  POSTURE_STYLE,
+  GATE_STYLE,
+  CAPABILITY_LABELS,
+  // n2r (wsm-e2e-pinned-n2r, §5.2): sanitize the rider's posture/write-gate before the closed-union
+  // style lookup so a malformed approval_pending rider can't throw inside the approval modal.
+  normalizePostureWord,
+  normalizeGateValue,
+  type PostureWord,
+} from "../gateSurface";
 
 type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
 
@@ -58,10 +67,13 @@ export function ApprovalDialog({
 
   // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
   const showEffective = !!posture || !!effectiveGates;
-  const postureStyle = posture ? POSTURE_STYLE[posture] : undefined;
+  // n2r §5.2: normalize before the closed-union lookups (bad posture → GUARDED, bad gate → Ask).
+  const safePosture = normalizePostureWord(posture);
+  const postureStyle = safePosture ? POSTURE_STYLE[safePosture] ?? POSTURE_STYLE.GUARDED : undefined;
   const writeCap: CapabilityGate = capability ?? "write_to_pane";
   const writeGate = effectiveGates?.[writeCap];
-  const gateStyle = writeGate ? GATE_STYLE[writeGate] : undefined;
+  const safeGate = writeGate != null ? normalizeGateValue(writeGate) : undefined;
+  const gateStyle = safeGate ? GATE_STYLE[safeGate] ?? GATE_STYLE.Ask : undefined;
   const capLabel = CAPABILITY_LABELS[writeCap] ?? writeCap;
   // The pane's effective autonomy MODE is the second axis of "into what am I approving this write?".
   // Read-Only is the load-bearing case: a write approved into a Read-Only pane lands in a LOCKED
@@ -92,10 +104,10 @@ export function ApprovalDialog({
               >
                 <div className="flex items-center gap-2 text-[11px]">
                   <span className="text-zinc-500 uppercase tracking-wider">Approving into:</span>
-                  {posture && postureStyle && (
+                  {safePosture && postureStyle && (
                     <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${postureStyle.text}`}>
                       <span className={`inline-block w-1.5 h-1.5 rounded-full ${postureStyle.dot}`} />
-                      {posture}
+                      {safePosture}
                     </span>
                   )}
                   {postureStyle && <span className="text-zinc-500 normal-case">· {postureStyle.label}</span>}
