@@ -37,6 +37,7 @@ import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
 import { restGateOutcome } from "./src/restGate";
+import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
 import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
@@ -1410,19 +1411,33 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       res.status(404).json({ error: "Recipe layout not found." });
       return;
     }
-    // G6: mirror the voice `apply_orchestration_recipe` gate semantics. Off on apply_recipe forbids
-    // the WHOLE layout (403); otherwise each spawn rides create_pane (Off -> blocked, Ask -> deferred,
-    // Auto -> spawn now). Each pane's broadcast lives INSIDE spawnPane so a deferred-confirm repaints.
-    if (gateCapability("apply_recipe", null).forbidden) {
+    // G6 + bri: mirror the voice `apply_orchestration_recipe` gate semantics EXACTLY by sharing the
+    // pure planner (planRecipeApply). Off on apply_recipe forbids the WHOLE layout (403); otherwise
+    // each spawn rides create_pane (Off -> blocked, Ask -> deferred, Auto -> spawn now). Each pane's
+    // broadcast lives INSIDE spawnPane so a deferred-confirm repaints. Voice and REST now consume the
+    // same planner so the Ask-tier behavior cannot drift again (the WF-2 divergence).
+    // Keep one gateCapability call for the layout-level `apply_recipe` audit row (the planner is a pure
+    // decision fn and emits none); its boolean veto is authoritative via plan.layoutForbidden below.
+    gateCapability("apply_recipe", null);
+    const plan = planRecipeApply(
+      recipe.panes,
+      new Set(Object.keys(manager.terminals)),
+      () => effectiveCapabilityGateFor(null, "apply_recipe"),
+      (id) => effectiveCapabilityGateFor(id, "create_pane"),
+    );
+    if (plan.layoutForbidden) {
       res.status(403).json({ error: "apply_recipe is gated Off; spawning template layouts is forbidden by policy.", capability: "apply_recipe" });
       return;
     }
     const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+    const paneById = new Map(recipe.panes.map(p => [p.id, p]));
     const spawned: string[] = [];
     const deferred: { paneId: string; actionId: string }[] = [];
     const blocked: string[] = [];
-    for (const p of recipe.panes) {
-      if (manager.terminals[p.id]) continue;
+    for (const planned of plan.panes) {
+      if (planned.disposition === "skip-existing") continue;
+      if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
+      const p = paneById.get(planned.paneId)!;
       const spawnPane = (): string => {
         // Always open a bare shell — never auto-run the recipe's startupCommand.
         manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
@@ -1435,10 +1450,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         broadcast({ type: "terminals_updated" });
         return p.id;
       };
-      const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
-      if (g.disposition === "forbidden") blocked.push(p.id);
-      else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
-      else { spawnPane(); spawned.push(p.id); }
+      if (planned.disposition === "defer") {
+        const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+        if (g.disposition === "forbidden") blocked.push(p.id);
+        else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
+        else { spawnPane(); spawned.push(p.id); }
+      } else {
+        spawnPane();
+        spawned.push(p.id);
+      }
     }
     res.json({ success: true, spawned, deferred, blocked });
   });
@@ -2751,34 +2771,62 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   if (!recipe) {
                     resp = `Error: Template recipe ${recipe_id} not found.`;
                   } else {
-                    // Gate-bypass fix: this handler spawns live PTYs via addTerminal() directly
-                    // (NOT through the gated create_pane handler), so it must honor the gate itself.
-                    // Off on apply_recipe forbids the whole layout; we also Off-veto each individual
-                    // spawn on create_pane so a pane-level "never start panes here" policy holds.
-                    const recipeGate = gateCapability("apply_recipe", null);
-                    if (recipeGate.forbidden) {
+                    // bri (WS-F scope C): converge the voice recipe path onto the SAME staged-deferral
+                    // seam as REST `POST /api/recipes/apply`. Previously this handler spawned live PTYs
+                    // via addTerminal() on create_pane=Ask (apply-now, Off-veto only) while REST deferred
+                    // — the WF-2 divergence. Now the shared pure planner (planRecipeApply) decides each
+                    // pane's disposition, and Ask panes are STAGED in pendingActions (gateOrDefer) so
+                    // "Ask means stage+confirm" holds at BOTH the voice and REST boundaries.
+                    // Keep one gateCapability call for the layout-level `apply_recipe` audit row (the
+                    // planner is pure and emits none); the veto is authoritative via plan.layoutForbidden.
+                    gateCapability("apply_recipe", null);
+                    const plan = planRecipeApply(
+                      recipe.panes,
+                      new Set(Object.keys(manager.terminals)),
+                      () => effectiveCapabilityGateFor(null, "apply_recipe"),
+                      (id) => effectiveCapabilityGateFor(id, "create_pane"),
+                    );
+                    if (plan.layoutForbidden) {
                       resp = `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`;
                     } else {
                       const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
+                      const paneById = new Map(recipe.panes.map(p => [p.id, p]));
                       const spawned: string[] = [];
+                      const deferred: string[] = [];
                       const blocked: string[] = [];
-                      for (const p of recipe.panes) {
-                        if (!manager.terminals[p.id]) {
-                          if (gateCapability("create_pane", p.id).forbidden) {
-                            blocked.push(p.id);
-                            continue;
-                          }
-                          // Always open a bare shell — never auto-run the startupCommand.
+                      for (const planned of plan.panes) {
+                        if (planned.disposition === "skip-existing") continue;
+                        if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
+                        const p = paneById.get(planned.paneId)!;
+                        // Same spawn closure shape as REST (server.ts ~1293): bare shell, startupCommand
+                        // recorded as an auditable pane note, broadcasts INSIDE so a deferred-confirm repaints.
+                        const spawnPane = (): string => {
                           manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
-                          spawned.push(p.id);
                           if (p.startupCommand) {
                             manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
                           }
+                          broadcastLedgerUpdate();
+                          broadcast({ type: "terminals_updated" });
+                          return p.id;
+                        };
+                        if (planned.disposition === "defer") {
+                          // Route through gateOrDefer so the audit row + action_pending broadcast +
+                          // pendingActions.add fire identically to REST. (gateOrDefer re-resolves the
+                          // gate; the planner already classified it Ask, so this stages.)
+                          const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane);
+                          if (g.disposition === "forbidden") blocked.push(p.id);
+                          else if (g.disposition === "deferred") deferred.push(p.id);
+                          else { spawnPane(); spawned.push(p.id); }
+                        } else {
+                          // Auto -> spawn now.
+                          spawnPane();
+                          spawned.push(p.id);
                         }
                       }
-                      broadcastLedgerUpdate();
-                      broadcastTerminalsUpdated();
-                      resp = `Template recipe layout '${recipe.name}' applied: spawned ${spawned.length} pane(s)${blocked.length ? `; ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : ""}.`;
+                      resp = `Template recipe layout '${recipe.name}': spawned ${spawned.length} pane(s)`
+                        + (deferred.length ? `, ${deferred.length} awaiting your confirmation (create_pane=Ask: ${deferred.join(", ")})` : "")
+                        + (blocked.length ? `, ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})` : "")
+                        + ".";
                     }
                   }
                 }
