@@ -14,11 +14,15 @@
  */
 
 import React, { useState, useRef, useEffect } from "react";
-import type { CapabilityGate, GateValue, CapabilityGateMap } from "../types";
+import type { CapabilityGate, CapabilityGateMap } from "../types";
 import {
   CAPABILITY_LABELS,
   CAPABILITY_CATEGORIES,
   ALL_CAPABILITIES,
+  // rbh (wsm-e2e-pinned-rbh): the posture/gate palette now lives in gateSurface so the chip and the
+  // two confirmation dialogs share ONE copy (dialog == chip == engine, D4). Class strings unchanged.
+  POSTURE_STYLE,
+  GATE_STYLE,
   type PostureWord,
 } from "../gateSurface";
 
@@ -27,20 +31,6 @@ const SPOTLIGHT_CAPS: ReadonlySet<CapabilityGate> = new Set<CapabilityGate>([
   "write_to_pane",
   "deliver_handoff",
 ]);
-
-/** Posture word → swatch classes (the one gate-language palette). */
-const POSTURE_STYLE: Record<PostureWord, { dot: string; text: string; ring: string; label: string }> = {
-  OPEN: { dot: "bg-emerald-500", text: "text-emerald-400", ring: "border-emerald-500/30 bg-emerald-500/5", label: "Janus can act here freely." },
-  GUARDED: { dot: "bg-amber-500", text: "text-amber-400", ring: "border-amber-500/30 bg-amber-500/5", label: "Some actions here need a checkpoint." },
-  LOCKED: { dot: "bg-red-500", text: "text-red-400", ring: "border-red-500/30 bg-red-500/5", label: "Janus can't type into this pane." },
-};
-
-/** Gate value → dot color + plain word. Auto = green, Ask = amber, Off = red (spec §2.A). */
-const GATE_STYLE: Record<GateValue, { dot: string; text: string; word: string }> = {
-  Auto: { dot: "bg-emerald-500", text: "text-emerald-400", word: "Allowed" },
-  Ask: { dot: "bg-amber-500", text: "text-amber-400", word: "Asks first" },
-  Off: { dot: "bg-red-500", text: "text-red-400", word: "Blocked" },
-};
 
 interface GateChipProps {
   /** The 16 server-resolved effective gate values for this pane (server truth). */

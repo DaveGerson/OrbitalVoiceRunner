@@ -1,15 +1,31 @@
 import { useEffect } from "react";
+import type { GateValue } from "../types";
+import { POSTURE_STYLE, GATE_STYLE, CAPABILITY_LABELS, deriveActionDivergence, type PostureWord } from "../gateSurface";
+
+type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
 
 /**
  * Confirm dialog for a gated NON-PTY deferred action (capability gate `Ask` tier — G1).
  * Mirrors ApprovalDialog but for actions that mutate config/panes rather than writing to a PTY:
  * create_pane, set_pane_permissions, set_global_permissions. The action's side effect is held on
  * the server (PendingActionStore) and runs exactly once when the operator confirms here.
+ *
+ * rbh (wsm-e2e-pinned-rbh): below the nominal summary we render an EFFECTIVE-posture rider — the
+ * posture word + the effective gate (plain language) the engine WILL apply — and, when the operator
+ * asked for a mode the global mode or a tighter gate overrides, a divergence "heads up" rider. The
+ * posture is SERVER truth threaded in via props (never re-derived here); the palette is the SAME
+ * gateSurface map the chip uses, so dialog == chip == engine. Degrade-safe: no posture → today's dialog.
  */
 export function ActionConfirmDialog({
   actionId,
   capability,
   summary,
+  posture,
+  effectiveGate,
+  effectiveMode,
+  requestedMode,
+  globalOverride,
+  paneId,
   onConfirm,
   onCancel,
 }: {
@@ -17,6 +33,18 @@ export function ActionConfirmDialog({
   actionId: string;
   capability: string;
   summary: string;
+  /** SERVER-resolved posture word for the target pane (undefined for global actions / older payloads). */
+  posture?: PostureWord;
+  /** SERVER-resolved effective gate for `capability` after override → spotlight → global resolution. */
+  effectiveGate?: GateValue;
+  /** SERVER-resolved effective mode (global override or pane mode) the engine will enforce. */
+  effectiveMode?: EffectiveMode;
+  /** The mode the operator asked for (structural — never parsed from the summary). */
+  requestedMode?: string;
+  /** Whether the GLOBAL mode (≠ Inherit) genuinely overrides the request (vs a staged-not-applied delta). */
+  globalOverride?: boolean;
+  /** null for global actions (no pane scope — D2). */
+  paneId?: string | null;
   onConfirm: (id: string) => void;
   onCancel: (id: string) => void;
 }) {
@@ -30,6 +58,32 @@ export function ActionConfirmDialog({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [actionId, onCancel]);
+
+  // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
+  const showEffective = !!posture || !!effectiveGate;
+  const postureStyle = posture ? POSTURE_STYLE[posture] : undefined;
+  const gateStyle = effectiveGate ? GATE_STYLE[effectiveGate] : undefined;
+  const capLabel = CAPABILITY_LABELS[capability as keyof typeof CAPABILITY_LABELS] ?? capability;
+  // Scope label: a per-pane action names its pane ("Effective on p1:"); a global action (paneId
+  // null/undefined — D2) has no pane scope, so we read "Effective globally:". This makes the
+  // pane-vs-global distinction visible and consumes the (previously dead) paneId prop.
+  const scopeLabel = paneId ? `Effective on ${paneId}:` : "Effective globally:";
+
+  // Divergence: pure decision (gateSurface) — the operator asked for `requestedMode`, but will the
+  // engine apply it? "global" leads with the root-cause global mode; "gate" reports a bare gate-Off.
+  // `globalOverride` (server: globalMode !== Inherit) keeps the "global" branch from mislabeling a
+  // staged-not-yet-applied mode change as a global override (concern-3 fix).
+  const divergence = deriveActionDivergence(requestedMode, effectiveMode, effectiveGate, globalOverride);
+  const showDivergence = divergence !== "none";
+  let divergenceText = "";
+  if (divergence === "global") {
+    // global mode wins: the pane stays at the resolved posture until the global mode changes.
+    const stays = posture ?? "LOCKED";
+    divergenceText = `Global mode is ${effectiveMode} — this pane stays ${stays} until you change the global mode.`;
+  } else if (divergence === "gate") {
+    // gate veto with no mode override: the capability gate itself is Off.
+    divergenceText = `The '${capLabel}' gate is Blocked — this stays Blocked even after you confirm.`;
+  }
 
   return (
     <div data-testid="action-dialog" className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
@@ -47,6 +101,39 @@ export function ActionConfirmDialog({
             <p data-testid="action-summary" className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">
               {summary}
             </p>
+
+            {showEffective && (
+              <div
+                data-testid="action-effective"
+                className={`mb-3 rounded border p-2 font-mono ${postureStyle?.ring ?? "border-white/10"}`}
+              >
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span data-testid="action-scope" className="text-zinc-500 uppercase tracking-wider">{scopeLabel}</span>
+                  {posture && postureStyle && (
+                    <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${postureStyle.text}`}>
+                      <span className={`inline-block w-1.5 h-1.5 rounded-full ${postureStyle.dot}`} />
+                      {posture}
+                    </span>
+                  )}
+                  {postureStyle && <span className="text-zinc-500 normal-case">· {postureStyle.label}</span>}
+                </div>
+                {gateStyle && (
+                  <div className="mt-1 flex items-center gap-2 text-[10px]">
+                    <span className="text-zinc-400">{capLabel}</span>
+                    <span className={`inline-flex items-center gap-1 ${gateStyle.text}`}>
+                      <span className={`inline-block w-1 h-1 rounded-full ${gateStyle.dot}`} />
+                      {gateStyle.word}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {showDivergence && (
+              <p data-testid="action-divergence" className="mb-3 text-[11px] font-mono text-amber-300 bg-amber-950/20 border border-amber-500/30 rounded p-2">
+                Heads up — {divergenceText}
+              </p>
+            )}
 
             <p className="text-[10px] font-mono text-zinc-500 mb-4">
               This action is gated <span className="text-sky-400">Ask</span> — Janus staged it but will not apply it until you confirm.

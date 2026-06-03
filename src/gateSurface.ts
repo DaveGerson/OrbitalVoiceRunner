@@ -108,6 +108,66 @@ export function derivePostureWord(
   return "OPEN";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// rbh (bead wsm-e2e-pinned-rbh): SHARED posture/gate PALETTE — moved here OUT of GateChip.tsx so the
+// chip AND both confirmation dialogs (ActionConfirmDialog / ApprovalDialog) import ONE copy. dialog ==
+// chip == engine, zero drift (D4). The class strings are byte-identical to the prior GateChip-local
+// consts so the chip render — and e2e/gate_chip.spec.ts — is unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Posture word → swatch classes + a plain-language label (the one gate-language palette). */
+export const POSTURE_STYLE: Record<PostureWord, { dot: string; text: string; ring: string; label: string }> = {
+  OPEN: { dot: "bg-emerald-500", text: "text-emerald-400", ring: "border-emerald-500/30 bg-emerald-500/5", label: "Janus can act here freely." },
+  GUARDED: { dot: "bg-amber-500", text: "text-amber-400", ring: "border-amber-500/30 bg-amber-500/5", label: "Some actions here need a checkpoint." },
+  LOCKED: { dot: "bg-red-500", text: "text-red-400", ring: "border-red-500/30 bg-red-500/5", label: "Janus can't type into this pane." },
+};
+
+/** Gate value → dot color + plain word. Auto = green/Allowed, Ask = amber/Asks first, Off = red/Blocked. */
+export const GATE_STYLE: Record<GateValue, { dot: string; text: string; word: string }> = {
+  Auto: { dot: "bg-emerald-500", text: "text-emerald-400", word: "Allowed" },
+  Ask: { dot: "bg-amber-500", text: "text-amber-400", word: "Asks first" },
+  Off: { dot: "bg-red-500", text: "text-red-400", word: "Blocked" },
+};
+
+/**
+ * rbh: the confirm-dialog divergence decision as a PURE function — "the operator asked for
+ * `requestedMode`, but will the engine actually apply that?" Returns the divergence KIND so the dialog
+ * renders the right plain-language "heads up" (and nothing when the action is clean). This lives here
+ * (not in the component) so the decision is unit-testable and shares ONE source with the chip/palette
+ * (D4). The two divergence sources, in precedence order:
+ *   1. "global": the GLOBAL MODE overrides the requested per-pane mode. This is the ROOT cause — a
+ *      Read-Only global mode also forces the write gate Off downstream, so we lead with the mode
+ *      reason rather than the (secondary) gate veto.
+ *   2. "gate": a bare capability gate is Off with no mode override.
+ * "none" means the engine will apply exactly what was asked (clean — calm "Effective: …" only).
+ *
+ * PRECISION (reviewer concern 3): in the staged-but-not-yet-applied Ask flow, `effectiveMode` is the
+ * pane's CURRENT mode (applyPanePerms has not run), so a mismatch with `requestedMode` does NOT by
+ * itself mean the global mode wins — when the global mode is "Inherit" the requested change WILL take
+ * effect on confirm (no divergence). The "global" branch therefore requires `globalOverrides` — the
+ * caller's explicit signal that the global mode (≠ Inherit) is the dominating cause — so we never
+ * mislabel ordinary staging as a global override. Defaults to (effectiveMode !== requestedMode) for
+ * back-compat: pass it explicitly to be precise.
+ */
+export type ActionDivergence = "none" | "global" | "gate";
+
+export function deriveActionDivergence(
+  requestedMode: string | undefined,
+  effectiveMode: EffectiveMode | undefined,
+  effectiveGate: GateValue | undefined,
+  // The global mode (≠ Inherit) genuinely dominates the requested per-pane mode. When omitted we fall
+  // back to the raw mode mismatch (legacy behavior). Pass the server's "globalMode !== Inherit" truth
+  // to avoid mislabeling staged-but-not-applied mode changes as a global override.
+  globalOverrides?: boolean
+): ActionDivergence {
+  if (!requestedMode) return "none";                                  // no requested mode → no mode rider
+  const modeMismatch = !!effectiveMode && effectiveMode !== requestedMode;
+  const globalWins = globalOverrides ?? modeMismatch;                 // explicit signal wins; else legacy
+  if (modeMismatch && globalWins) return "global";
+  if (effectiveGate === "Off") return "gate";
+  return "none";
+}
+
 /**
  * PLAIN-LANGUAGE label map (spec §6, operator directive: NO PRODUCT JARGON). Every operator-facing
  * surface (chip popover, matrix editor, voice read-backs) renders THESE strings — never the raw

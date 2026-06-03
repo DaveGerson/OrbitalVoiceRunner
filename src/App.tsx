@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
-import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
+import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
@@ -28,7 +28,9 @@ function AppRaw() {
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   // G1: gated non-PTY deferred actions (create_pane / set_*_permissions on the Ask tier).
-  const [pendingActions, setPendingActions] = useState<{ actionId: string; capability: string; summary: string }[]>([]);
+  // rbh: PendingActionView carries the SERVER-resolved EFFECTIVE posture so the confirm dialog can
+  // render the effective rider + a divergence "heads up" when nominal ≠ effective (degrade-safe).
+  const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [recentlyIdled, setRecentlyIdled] = useState<Record<string, boolean>>({});
   const prevTerminalsRef = useRef<Terminal[]>([]);
@@ -1227,7 +1229,13 @@ function AppRaw() {
               messageId: msg.messageId,
               cmd: msg.cmd,
               terminalId: msg.terminalId,
-              rationale: msg.rationale
+              rationale: msg.rationale,
+              // rbh: carry the SERVER-resolved effective posture for the target pane so the dialog
+              // shows "into what posture am I approving this write?". Optional → degrade-safe.
+              effective_gates: msg.effective_gates,
+              posture: msg.posture,
+              effective_mode: msg.effective_mode,
+              capability: msg.capability,
             }];
           });
         } else if (msg.type === "action_pending") {
@@ -1236,7 +1244,20 @@ function AppRaw() {
           triggerDesktopNotification("⚙ Action Pending", `Confirm: ${msg.summary}`);
           setPendingActions(prev => {
             if (prev.some(a => a.actionId === msg.actionId)) return prev;
-            return [...prev, { actionId: msg.actionId, capability: msg.capability, summary: msg.summary }];
+            // rbh: carry the SERVER-resolved EFFECTIVE posture into the view so the confirm dialog
+            // can render the effective rider + a divergence "heads up" when nominal ≠ effective.
+            return [...prev, {
+              actionId: msg.actionId,
+              capability: msg.capability,
+              summary: msg.summary,
+              effective_gate: msg.effective_gate,
+              effective_mode: msg.effective_mode,
+              posture: msg.posture,
+              effective_gates: msg.effective_gates,
+              pane_id: msg.pane_id,
+              requested_mode: msg.requested_mode,
+              global_override: msg.global_override,
+            }];
           });
         } else if (msg.type === "action_resolved") {
           // Confirmed/cancelled/expired elsewhere (REST/voice/TTL) — drop it from the UI.
@@ -2683,6 +2704,10 @@ function AppRaw() {
           terminalId={pending.terminalId}
           cmd={pending.cmd}
           rationale={pending.rationale}
+          posture={pending.posture}
+          effectiveGates={pending.effective_gates}
+          effectiveMode={pending.effective_mode}
+          capability={pending.capability}
           onApprove={handleApprove}
           onReject={handleReject}
         />
@@ -2694,6 +2719,12 @@ function AppRaw() {
           actionId={action.actionId}
           capability={action.capability}
           summary={action.summary}
+          posture={action.posture}
+          effectiveGate={action.effective_gate}
+          effectiveMode={action.effective_mode}
+          requestedMode={action.requested_mode}
+          globalOverride={action.global_override}
+          paneId={action.pane_id}
           onConfirm={handleConfirmAction}
           onCancel={handleCancelAction}
         />
