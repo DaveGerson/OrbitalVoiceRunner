@@ -13,6 +13,8 @@
 2. **Everything lives in this one repo and is committed together.** Generated files (`catalog.generated.ts`, `gemini.tools.json`) are *committed* alongside hand-written code — they are ordinary emitted source, not a separate service. A no-drift test (§8.6) guards staleness. There is no second server.
 3. **Register-as-is first, then converge piecemeal.** Phase 1 wraps **every existing tool** into the registry with **no surface changes** — all current asymmetries (§4.2) are recorded in the allow-list. Surface convergence (giving a tool its missing voice/REST/WS twin) happens **afterward, one small phase per tool group** (§7 Convergence track), each gated by a **parity-cutover test** that proves the new surface behaves identically to the existing one *before* the UI is pointed at it.
 4. **Params schema = `zod`.** One zod schema per tool serves both runtime validation and Gemini schema generation; the hand-maintained JSON params are retired.
+5. **The registry IS the capability matrix (like-for-like security).** Every action carries a **mandatory** capability and its gate is **encapsulated** in the action (enforced centrally by `runAction`, never re-implemented per surface). The set of capabilities is **derived from the registry**, not a hand-maintained list — so the matrix *grows with the catalog*, and previously-ungated actions (`switch_active_pane`, `update_draft_prompt`, handoff draft/stage steps, reads) become first-class, individually-tunable matrix entries. `gateSurface.ts`'s hand-listed `ALL_CAPABILITIES` / labels / categories become **generated from the registry**. See §5.0.
+6. **Behavior-preserving defaults.** Making a currently-ungated action a capability does **not** change what happens today: each new capability **defaults to the gate that matches its current effective behavior** (Auto for what's ungated now; reads default Auto). The *new ability* is that you can now tune any of them (e.g. set a sensitive pane's reads to Off). Net: Phase 1 adds tunability, not new friction.
 
 ---
 
@@ -110,21 +112,45 @@ Four edits, four chances to forget the gate or the redaction, and a regex test t
 
 **Reading:** the `stop_all` family is the *only* group already wired identically across voice + REST + WS (because `8sq` built it that way on purpose, with a real test). It is the template; the registry generalizes it to all ~50 operations.
 
-### 4.3 The gate matrix (unchanged, 16 capabilities)
+### 4.3 The gate matrix today (the 16 hand-listed capabilities)
 
-From `src/gateSurface.ts` / `src/types.ts`: `write_to_pane, deliver_handoff, create_pane, close_pane, restart_pane, set_pane_permissions, set_global_permissions, set_capability_gate, add_watch_rule, execute_plan, apply_recipe, create_project, update_metadata, switch_context, set_voice_mute, dismiss_attention`. Each action in the registry references **one** of these (or `null` for pure reads / `ALWAYS_ALLOWED` for the brake).
+From `src/gateSurface.ts` / `src/types.ts`: `write_to_pane, deliver_handoff, create_pane, close_pane, restart_pane, set_pane_permissions, set_global_permissions, set_capability_gate, add_watch_rule, execute_plan, apply_recipe, create_project, update_metadata, switch_context, set_voice_mute, dismiss_attention`.
+
+This list is **hand-maintained** and does **not** cover every action: reads, `switch_active_pane`, `update_draft_prompt`, and the handoff draft/stage steps are ungated (no row). Decision 5 makes this list a **derived projection of the registry** instead, and promotes those ungated actions to first-class capabilities (defaulting Auto, Decision 6). The expanded set is in Appendix A.
 
 ## 5. Core design — the `ActionDef` registry
 
-One module, `src/actions/registry.ts`, exports an array of `ActionDef`. Everything else is derived.
+One module, `src/actions/registry.ts`, exports an array of `ActionDef`. Everything else — the Gemini surface, the REST/WS surface, **and the capability matrix** — is derived.
+
+### 5.0 The registry *is* the capability matrix (Decision 5)
+
+Today the capability matrix is a **hand-maintained list of 16** in `gateSurface.ts` (`ALL_CAPABILITIES`, `CAPABILITY_LABELS`, `CAPABILITY_CATEGORIES`), and a swathe of actions are **ungated** (no matrix entry): all reads, `switch_active_pane`, `update_draft_prompt`, `create_orchestrator_plan`, `propose_handoff`, `revise_handoff`, `stage_handoff`, `reject_handoff`, `handoff_context_between_panes`. That is exactly the "different paths / things slip through" problem, applied to *security* rather than wiring.
+
+Under this spec the relationship is inverted: **the capability matrix is a projection of the registry.**
+
+- **Every `ActionDef` declares one mandatory `capability`** (or the `ALWAYS_ALLOWED` sentinel for the emergency brake). There is no ungated action.
+- **The capability set is *derived*** by walking the registry — `ALL_CAPABILITIES = unique(registry.map(a => a.capability))`. Adding a housekeeping action that needs a new capability *adds a matrix row automatically*; the matrix can never lag the catalog.
+- **Capability metadata lives in one `CapabilityDef` table** (`src/actions/capabilities.ts`): plain-language `label`, `category`, and `defaultGate`. `gateSurface.ts`'s three hand-lists are generated from it (or it replaces them), so the matrix UI, the voice read-backs, and the gate resolver all render the same source.
+- **Many actions → one capability is fine** (e.g. all the note/rename actions share `update_metadata`; all the pane reads share `read_pane`). The capability is the *unit of gating*; the action is the *unit of behavior*.
+- **The gate is encapsulated** (operator's answer 1): `runAction` always resolves `capability` through the existing `gateOrDefer` choke-point before invoking the handler. A handler never re-checks permissions; a surface never bypasses them. One enforcement point, used everywhere.
+- **Behavior-preserving (Decision 6):** each newly-promoted capability's `defaultGate` matches today's behavior — `Auto` for what is currently ungated (reads, focus, drafting). Nothing gets *more* friction; everything gets *tunable*.
 
 ```ts
 // src/actions/types.ts
-import type { CapabilityGate } from "../types";
-import { z } from "zod"; // proposed: zod for one schema that serves validation AND schema-gen
+import { z } from "zod"; // zod: one schema that serves validation AND Gemini schema-gen
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
+
+/** A capability = one row of the matrix. The set is DERIVED from the registry, not hand-listed. */
+export type Capability = string; // closed at runtime by the registry; see ALL_CAPABILITIES (derived)
+export interface CapabilityDef {
+  id: Capability;                 // e.g. "write_to_pane", "read_pane", "archive_pane"
+  label: string;                  // plain language, no jargon (matrix + voice read-backs)
+  category: string;               // grouping for the matrix editor
+  defaultGate: "Auto" | "Ask" | "Off"; // behavior-preserving default (Decision 6)
+  spotlightEligible?: boolean;    // may loosen to Auto on the active pane (today: write_to_pane, deliver_handoff)
+}
 
 /** Discriminated result so one handler can express every existing response shape. */
 export type ActionResult =
@@ -148,7 +174,7 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
   name: string;                        // canonical snake_case (the Gemini + dispatch + REST key)
   description: string;                 // operator-facing; fed verbatim to Gemini
   params: S;                           // ONE schema -> Gemini params + REST/WS validation
-  capability: CapabilityGate | null | "ALWAYS_ALLOWED";
+  capability: Capability | "ALWAYS_ALLOWED"; // MANDATORY — every action is a matrix entry (Decision 5)
   readOnly: boolean;                   // true => result text is redacted before leaving the process
   surfaces: ReadonlySet<Surface>;      // where it is exposed (drift made explicit & testable)
   rest?: { method: "get"|"post"|"put"|"delete"; path: string }; // optional explicit route binding
@@ -161,7 +187,8 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
 ### 5.1 Derivations (the three generators)
 
 - **`toGeminiDeclarations(registry)`** → `FunctionDeclaration[]`. Filters `surfaces.has("voice")`, maps `params` (zod) → Gemini `{ type: OBJECT, properties, required }` via a `zodToGeminiSchema` adapter (enums and `required` derived from the schema; no hand-maintained JSON). This array is what gets passed to `ai.live.connect({ config: { tools: [{ functionDeclarations }] }})`.
-- **`runAction(name, rawArgs, ctx)`** → `ActionResult`. The *entire* Gemini dispatch becomes: look up the def → `coerceArgs` → `params.parse` → route through `gateOrDefer(capability, …)` unless `ALWAYS_ALLOWED`/`null` → run `handler` → if `readOnly`, redact text in the result → return. The `onmessage` callback then maps `ActionResult` → exactly one `sendToolResponse({...call.id...})` (pending/clarify/blocked/ok/error each have a fixed wire mapping). One try/catch, one place.
+- **`runAction(name, rawArgs, ctx)`** → `ActionResult`. The *entire* Gemini dispatch becomes: look up the def → `coerceArgs` → `params.parse` → **resolve `capability` through `gateOrDefer` (the single, encapsulated enforcement point)** unless `ALWAYS_ALLOWED` → run `handler` → if `readOnly`, redact text in the result → return. Every action is gated here; no handler or surface re-checks or bypasses.
+- **`deriveCapabilities(registry)`** → the matrix. `ALL_CAPABILITIES = unique(registry.map(a => a.capability).filter(c => c !== "ALWAYS_ALLOWED"))`; labels/categories/defaults come from the `CapabilityDef` table. This *replaces* the hand-maintained lists in `gateSurface.ts` (a test asserts every referenced capability has a `CapabilityDef`, and vice-versa — no orphans). The `onmessage` callback then maps `ActionResult` → exactly one `sendToolResponse({...call.id...})` (pending/clarify/blocked/ok/error each have a fixed wire mapping). One try/catch, one place.
 - **`mountRestRoutes(app, registry, ctxFactory)`** → for every def with `surfaces.has("rest")`, register `def.rest.method`/`path`, validate the body/params with `params`, build a `ctx` with `session:null`, call `runAction`, map `ActionResult` → HTTP (`ok`→200 JSON, `pending`→202 + messageId, `blocked`→403, `clarify`→409, `error`→500). WS messages map the same way over the socket.
 
 ### 5.2 What stays hand-written
@@ -282,9 +309,15 @@ Order: write the test (RED), then the minimum code (GREEN), then refactor. Names
 ### 8.1 Phase 1 — registry totality & shape — `tests/test_action_registry.ts`
 1. **`every ActionDef has name, description, params schema, capability, readOnly, surfaces, handler`** — no field missing; `handler` is a function.
 2. **`action names are unique and snake_case`** — `Set(names).size === names.length`; each matches `/^[a-z][a-z0-9_]*$/`.
-3. **`capability is a valid CapabilityGate, null, or ALWAYS_ALLOWED`** — `capability ∈ ALL_CAPABILITIES ∪ {null,"ALWAYS_ALLOWED"}` (imports `ALL_CAPABILITIES` from `gateSurface.ts`).
+3. **`every action has a non-empty capability`** — `capability` is a non-empty string or `"ALWAYS_ALLOWED"`; **no action is ungated** (Decision 5 — there is no `null`/missing capability).
 4. **`the emergency brake trio is ALWAYS_ALLOWED`** — `stop_all`, `confirm_stop_all`, `release_stop_all` have `capability === "ALWAYS_ALLOWED"`.
-5. **`readOnly actions declare no mutating capability`** — `readOnly === true` ⇒ `capability === null`.
+5. **`readOnly actions bind only to read capabilities`** — `readOnly === true` ⇒ `capability ∈ {read_pane, read_notes}` (reads are gated like everything else, just defaulting Auto).
+
+### 8.1b Phase 1 — the matrix is derived from the registry (Decision 5)
+5a. **`ALL_CAPABILITIES === unique(registry capabilities)`** — `deriveCapabilities(registry)` equals the de-duplicated set of `ActionDef.capability` (minus `ALWAYS_ALLOWED`). The old hand-listed `gateSurface.ALL_CAPABILITIES` is gone or generated; a guard asserts no hand-list drifts from the derived set.
+5b. **`every referenced capability has a CapabilityDef, and vice-versa`** — no orphan capability (referenced but unlabeled) and no dead `CapabilityDef` (labeled but unused). Pins label/category/`defaultGate` totality (the §8.1 analogue of today's `CAPABILITY_LABELS` totality test).
+5c. **`defaultGate matches today's behavior`** — golden table: each capability's `defaultGate` equals the value transcribed from current behavior (e.g. `write_to_pane:Ask`, `update_metadata:Auto`, and every NEW promoted capability `:Auto`). Guards Decision 6 — the refactor cannot silently add friction.
+5d. **`spotlight set unchanged`** — only `write_to_pane` + `deliver_handoff` are `spotlightEligible` (pins `gateSurface` SPOTLIGHT_CAPABILITIES).
 
 ### 8.2 Phase 1 — Gemini generation — `tests/test_action_registry.ts`
 6. **`toGeminiDeclarations emits exactly the voice-surface actions`** — generated names `===` `registry.filter(surfaces.has("voice")).map(name)` (this **replaces the regex parity test** — parity is now true *by construction*, and the test proves the generator is the source).
@@ -358,8 +391,16 @@ All four open questions were answered by the operator on 2026-06-03 (see the "De
 2. **Generated artifacts** → **committed in-repo** alongside hand-written code (one repo, everything together), guarded by a no-drift test.
 3. **Surface convergence** → **register-as-is in Phase 1, then converge piecemeal** in the §7 Convergence track, each group gated by a parity-cutover test. Convergence appetite is full (reads→REST, handoffs→REST, infra→voice) but sequenced after the registry lands; only `set_voice_mute` / pure `resize` stay permanently single-surface.
 4. **Schema library** → **`zod`** (one schema for validation + Gemini generation).
+5. **Registry = capability matrix; like-for-like security** → every action is a mandatory, gated matrix entry; the capability set is derived from the registry; ungated actions get promoted (default Auto). (Decisions 5 & 6.)
 
-Remaining genuine unknowns (to settle during implementation, not blocking the spec): exact REST paths/verbs for the newly-converged tools (C1–C3); whether `resize` converges or stays rest-only; the precise WS message names in §9 (placeholder shapes today).
+### Open judgment calls (from the §5.0 promotion — to confirm before/during Phase 1)
+These are the genuinely-undecided design forks the like-for-like model surfaced. They change the *seed defaults*, not the architecture:
+
+- **Q-reads — granularity & privacy.** Reads become gateable (default Auto). One `read_state` capability, or split `read_pane` (live output) vs `read_notes` (notes/handoffs)? And do we want the *ability* to set reads to **Off** on a sensitive pane (Janus is blinded there), or are reads hard-always-allowed? (Appendix A proposes the split, Off-capable.)
+- **Q-housekeeping — defaults.** For the C3 promotions, what `defaultGate`: `archive_pane` (reversible — Auto or Ask?), `clear_history` (irreversible — Ask?), `add_watch_rule` (arms automation that acts without you — Ask, already today).
+- **Q-close — complete the like-for-like.** `close_pane`/`restart_pane` are capabilities **with no voice tool** today. Like-for-like implies Janus *should* be able to close/restart panes by voice (gated Ask). Add those two voice tools in C3, or deliberately keep pane-killing UI-only (the brake already covers emergencies)?
+
+Lower-stakes unknowns (settle during implementation): exact REST paths/verbs for C1–C3; whether `resize` ever converges; precise WS message names in §9.
 
 ## 12. Definition of Done
 
@@ -384,27 +425,37 @@ Remaining genuine unknowns (to settle during implementation, not blocking the sp
 
 ---
 
-### Appendix A — canonical action catalog (Phase-1 seed)
+### Appendix A — derived capability matrix (Phase-1 seed)
 
-The 41 voice tools (§4.1) become `ActionDef`s with these capability bindings (from today's gate usage); rest-only infra actions (`resize`, `history/clear`, `clear-exited`, `archive[/restore]`, watch-rules CRUD, `panes/:id/context`) are added with `surfaces:{"rest"}` and folded in opportunistically:
+Every action maps to exactly one capability (Decision 5). **Existing** capabilities keep their current `defaultGate`; **NEW** capabilities (rows marked) are *promotions of previously-ungated actions* and default to `Auto` to preserve today's behavior (Decision 6). `defaultGate` is the **global** default; the spotlight may still loosen `write_to_pane`/`deliver_handoff` to Auto on the active pane.
 
-| capability | actions |
-|---|---|
-| `null` (read, redacted) | `list_panes, get_pane_summary, get_pane_delta, get_pane_command_history, list_pending_approvals, get_attention_digest, get_project_notes, search_notes, get_pane_gates, list_capabilities, read_handoff, list_handoffs` |
-| `write_to_pane` | `propose_command` |
-| `deliver_handoff` | `deliver_handoff` |
-| `create_pane` | `create_pane` |
-| `create_project` | `create_project` |
-| `set_pane_permissions` | `set_pane_permissions` |
-| `set_global_permissions` | `set_global_permissions` |
-| `set_capability_gate` | `set_capability_gate` |
-| `execute_plan` | `execute_plan` |
-| `apply_recipe` | `apply_orchestration_recipe` |
-| `update_metadata` | `add_project_note, add_pane_note, amend_note, delete_note, rename_project, rename_pane` |
-| `switch_context` | `switch_context` |
-| `set_voice_mute` | `set_voice_mute` |
-| `dismiss_attention` | `dismiss_attention` |
-| `null` (ungated compose/focus) | `switch_active_pane, update_draft_prompt, create_orchestrator_plan, handoff_context_between_panes, propose_handoff, revise_handoff, stage_handoff, reject_handoff` |
-| `ALWAYS_ALLOWED` | `stop_all, confirm_stop_all, release_stop_all` |
+| capability | default | new? | actions bound to it |
+|---|---|---|---|
+| `read_pane` | Auto | **NEW** | `list_panes, get_pane_summary, get_pane_delta, get_pane_command_history, list_pending_approvals, get_attention_digest, get_pane_gates, list_capabilities` |
+| `read_notes` | Auto | **NEW** | `get_project_notes, search_notes, read_handoff, list_handoffs` |
+| `focus_pane` | Auto | **NEW** | `switch_active_pane` |
+| `compose_draft` | Auto | **NEW** | `update_draft_prompt, create_orchestrator_plan, propose_handoff, revise_handoff, stage_handoff, reject_handoff, handoff_context_between_panes` |
+| `write_to_pane` | Ask (Auto on active) | — | `propose_command` |
+| `deliver_handoff` | Ask (Auto on active) | — | `deliver_handoff` |
+| `create_pane` | Ask | — | `create_pane` |
+| `close_pane` | Ask | — | _(no voice tool today — see §11 Q-close)_ |
+| `restart_pane` | Ask | — | _(no voice tool today — see §11 Q-close)_ |
+| `create_project` | Auto | — | `create_project` |
+| `set_pane_permissions` | Ask | — | `set_pane_permissions` |
+| `set_global_permissions` | Ask | — | `set_global_permissions` |
+| `set_capability_gate` | Ask (tighten-only by voice) | — | `set_capability_gate` |
+| `execute_plan` | Ask | — | `execute_plan` |
+| `apply_recipe` | Ask | — | `apply_orchestration_recipe` |
+| `add_watch_rule` | Ask | — | _(REST today; → voice in C3)_ |
+| `update_metadata` | Auto | — | `add_project_note, add_pane_note, amend_note, delete_note, rename_project, rename_pane`, `panes/:id/context` |
+| `switch_context` | Auto | — | `switch_context` |
+| `set_voice_mute` | Auto | — | `set_voice_mute` |
+| `dismiss_attention` | Auto | — | `dismiss_attention` |
+| `archive_pane` | _Ask?_ (open — §11) | **NEW** | _(REST `clear-exited`/`archive`/`restore` today; → voice in C3)_ |
+| `clear_history` | _Ask?_ (open — §11) | **NEW** | _(REST `history/clear` today; → voice in C3)_ |
+| `ALWAYS_ALLOWED` (sentinel, not a matrix row) | — | — | `stop_all, confirm_stop_all, release_stop_all` |
 
-> Capability bindings are transcribed from the current handlers and **must be pinned by test §8.3** so the refactor cannot silently re-gate a tool.
+Notes:
+- `resize` is intentionally **not** a capability — pure viewport geometry, rest-only forever (the legitimate allow-list residue).
+- The split of reads into `read_pane` vs `read_notes` (vs a single `read_state`) and the housekeeping defaults are the **open judgment calls in §11**; the table shows the proposed shape.
+- Capability bindings + defaults are transcribed from today's behavior and **must be pinned by tests §8.3 + §8.1b** so the refactor cannot silently re-gate a tool or change a default.
