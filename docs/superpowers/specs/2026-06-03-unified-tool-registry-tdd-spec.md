@@ -65,6 +65,12 @@ The full arc is **three pillars**, but the headline is Pillar 1's *catalog*, not
 - **Pillar 2 — Resilience / known failure modes (later — §13, secondary to centralization).** Tested recovery for session drop / PTY death / server restart.
 - **Pillar 3 — Observability you can see (later — §13, secondary).** Surfacing the audit trail and health.
 
+> **Companion docs (the "vibe-coded → substantive" program).** This spec is Pillar 1. Its scope is bounded by two siblings:
+> - `2026-06-03-gap-assessment-vibe-to-substantive.md` — the candid, measured audit of what keeps this from being a dependable daily driver (severity-ranked findings A–F).
+> - `2026-06-03-substantive-roadmap.md` — the sequenced program that closes those findings, with stable item IDs, and where this spec sits in it.
+>
+> The roadmap adds a **Pillar 0 — Quick Wins** *before* Phase 1: a handful of S-effort, HIGH-value crash-safety fixes (process-level error net, PTY-spawn guard, Gemini-session `onerror`, awaited `stop_all` kills) that buy most of the *felt* reliability in ~1 day and are independent of this refactor. Land them first; the registry then inherits a process that no longer crashes at the async edges. Execution is broken into agent-sized tasks in `2026-06-03-execution-plan-subagents.md`.
+
 **Governing constraints inherited from the codebase (do not regress):**
 - The capability-gate matrix stays the single choke-point (`gateOrDefer` / `effectiveCapabilityGateFor`); the registry routes *through* it, it does not replace it.
 - Secret redaction (`redactSecrets`) stays mandatory on every model-bound read.
@@ -661,7 +667,7 @@ Pillar 1 *logs* the audit trail (§5.6); Pillar 3 *surfaces* it so the operator 
 Deliverable: a `docs/.../observability-design.md` + the action-log read action and panel.
 
 ### Sequencing
-Pillar 1 (this spec) → Pillar 2 (resilience) → Pillar 3 (observability). 2 and 3 both attach to the §5.6 choke-point, so doing Pillar 1 first is what makes them small. None of Pillar 2/3 is required for Phase 1 to ship and add value.
+**Pillar 0 (quick wins)** → Pillar 1 (this spec) → Pillar 2 (resilience) → Pillar 3 (observability). Pillar 0 is the new preface from the gap assessment: ~1 day of S-effort crash-safety fixes (process-level error net, PTY-spawn guard, session `onerror`, awaited `stop_all`) that are independent of the registry and stop the worst daily-use crashes immediately — land and merge them *before* the Phase-1 refactor so the registry rebases on top of a hardened base. Pillars 2 and 3 both attach to the §5.6 choke-point, so doing Pillar 1 first is what makes them small. None of Pillar 0/2/3 is required for Phase 1 to ship and add value. The full sequenced program, item IDs, and dependency graph live in `2026-06-03-substantive-roadmap.md`; the agent-sized task breakdown for Pillars 0–1 lives in `2026-06-03-execution-plan-subagents.md`.
 
 ---
 
