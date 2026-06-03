@@ -14,7 +14,8 @@
 3. **Register-as-is first, then converge piecemeal.** Phase 1 wraps **every existing tool** into the registry with **no surface changes** — all current asymmetries (§4.2) are recorded in the allow-list. Surface convergence (giving a tool its missing voice/REST/WS twin) happens **afterward, one small phase per tool group** (§7 Convergence track), each gated by a **parity-cutover test** that proves the new surface behaves identically to the existing one *before* the UI is pointed at it.
 4. **Params schema = `zod`.** One zod schema per tool serves both runtime validation and Gemini schema generation; the hand-maintained JSON params are retired.
 5. **The registry IS the capability matrix (like-for-like security).** Every action carries a **mandatory** capability and its gate is **encapsulated** in the action (enforced centrally by `runAction`, never re-implemented per surface). The set of capabilities is **derived from the registry**, not a hand-maintained list — so the matrix *grows with the catalog*, and previously-ungated actions (`switch_active_pane`, `update_draft_prompt`, handoff draft/stage steps, reads) become first-class, individually-tunable matrix entries. `gateSurface.ts`'s hand-listed `ALL_CAPABILITIES` / labels / categories become **generated from the registry**. See §5.0.
-6. **Behavior-preserving defaults.** Making a currently-ungated action a capability does **not** change what happens today: each new capability **defaults to the gate that matches its current effective behavior** (Auto for what's ungated now; reads default Auto). The *new ability* is that you can now tune any of them (e.g. set a sensitive pane's reads to Off). Net: Phase 1 adds tunability, not new friction.
+6. **Behavior-preserving defaults.** Making a currently-ungated action a capability does **not** change what happens today: each new capability **defaults to the gate that matches its current effective behavior** (Auto for what's ungated now). The *new ability* is that you can now tune any of them. Net: Phase 1 adds tunability, not new friction. *(Reads are the one deliberate exception — operator wants them gateable with a privacy-first default; see §11 Q-reads.)*
+7. **Mechanics in the handler, intent in the schema (the keystone, §3.1).** Deterministic, environment-sensitive logic (e.g. preset→launch-command derivation) lives **once**, in the action handler or the domain layer it calls — never in the model and never duplicated per surface. Action schemas express **intent** and act as **guardrails** that make wrong inputs unrepresentable (the model picks `tool_preset`, it does not author a launch string). A deterministic fix is then applied in exactly one place.
 
 ---
 
@@ -69,6 +70,25 @@ Adding one capability today touches, in `server.ts` alone:
 - often a WS broadcast + a `src/App.tsx` branch.
 
 Four edits, four chances to forget the gate or the redaction, and a regex test that only checks #1 vs #2 — by **string-matching the source file** (`src.indexOf("functionDeclarations: [")`, `matchAll(/name === "…"/g)`). That test breaks if someone reformats the file, and it says nothing about REST/WS parity, the params schema, the gate, or redaction.
+
+### 3.1 Keystone example — terminal bring-up (why this is about *behavior*, not just wiring)
+
+The motivating bug: the **UI** path was fixed to spin up Claude panes correctly, but **Janus keeps creating them wrong** — inferring the wrong environment, reaching for root `bash`, sending `npx @anthropic-ai/claude` instead of the bare `claude`. The fix never reached the voice path because the two paths are **separate implementations of the same behavior**. Concretely, *three* places independently "know" how to launch a pane, and the model is one of them:
+
+| Who | How it gets the launch command | Source |
+|---|---|---|
+| `addTerminal()` / `UniversalTerminal` | **Does not derive it** — runs whatever `command` string it's handed | `src/terminal.ts:872`, `:254` |
+| UI (`POST /api/terminals`) | Client already mapped preset→binary; sends `command:"claude"` | `server.ts:802` |
+| Restart (`POST …/restart`) | Its **own** hardcoded map (`Claude Code → claude`, "WS-G quick win") | `server.ts:848` |
+| **Janus (`create_pane` tool)** | The **model invents** a free-form `command` (schema: *"The command line string to run"*) → guesses wrong | `server.ts:2524`, decl `:3363` |
+
+The genuinely-shared env logic — stripping `CLAUDECODE` nesting markers, the `--dangerously-skip-permissions` flag, the `--resume` UUID guard — already lives in `UniversalTerminal.start()` and works for every caller. **The one thing not shared is preset→command derivation**, and that is exactly what the model is doing badly.
+
+**The registry fixes this two ways (both specced below):**
+1. **Mechanics move into the shared handler / domain layer (Decision 7).** Preset→command derivation is pushed down into `addTerminal` against the authoritative `presets` list (`terminal.ts:736`). The UI's client-side mapping and the restart handler's hardcoded map both **collapse into that one home**; a fix lands once and every surface inherits it.
+2. **The schema becomes a guardrail.** Janus's `create_pane` takes **intent** (`tool_preset` + project/cwd), not a free-form `command`. For a non-`Custom` preset the model literally **cannot** supply a launch string — the wrong input is *unrepresentable*. Free-form `command` survives only for `Custom`. See §5.4.
+
+This is the whole thesis in one example: **one definition + one implementation of the deterministic behavior** means deterministic fixes never have to be re-applied per surface.
 
 ## 4. Current-state inventory (authoritative)
 
@@ -201,6 +221,30 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
 A pure function `surfaceCoverage(registry)` returns, per action, which of `{voice,rest,ws}` it is on. The test suite asserts an **explicit allow-list** of intentional asymmetries. Anything voice-only or rest-only that is **not** on the allow-list **fails the build** — the opposite of today, where drift is silent.
 
 **Initial allow-list = every current asymmetry** (Decision 3 — register-as-is). Phase 1 seeds the allow-list with *all* of the §4.2 single-surface tools (the voice-only reads/handoffs and the rest-only infra), so the registry adopts reality without changing any surface. The **Convergence track (§7)** then *removes* entries from this allow-list one group at a time — each removal forces the missing surface to exist and is gated by a parity-cutover test (§8.5b). The allow-list is therefore a live to-do list: when it is empty (minus the inherently single-surface tools), parity is complete.
+
+### 5.4 Worked redesign — `create_pane` (Decision 7 in practice)
+
+**Today (the bug):** the model supplies a required free-form `command`; `addTerminal` runs it verbatim; the preset→binary map is duplicated in the client and the restart handler and *guessed* by Janus.
+
+**Target:** intent-only schema + one derivation home.
+
+- **Domain layer (one home).** `addTerminal(...)` (or a small `resolveLaunch(preset, customCommand?)` it calls) derives the command from the authoritative `settings.presets` table: `Claude Code → claude`, `Codex → codex`, `Antigravity → antigravity`; `Custom → the provided command`. The restart handler's hardcoded map (`server.ts:848`) and the client-side mapping are **deleted** and call this instead. (This is a behavior-correcting change for the voice path and a behavior-preserving refactor for UI/restart — pinned by tests below.)
+- **Action handler (shared).** The `create_pane` `ActionDef.handler` takes `{ project_id, pane_id?, tool_preset, cwd?, permissions_mode?, command? }`, resolves cwd the way the UI route already does (validate → fall back to active project dir — `server.ts:806`), and calls the domain layer. Both the voice path and `POST /api/terminals` call **this one handler**.
+- **Schema as guardrail (zod).** 
+  ```ts
+  params: z.object({
+    project_id: z.string(),
+    pane_id: z.string().optional(),                 // server can mint one
+    tool_preset: z.enum(["Claude Code","Codex","Antigravity","Custom"]),
+    cwd: z.string().optional(),
+    permissions_mode: z.enum(["Full Auto","Human-in-the-Loop","Read-Only"]).optional(),
+    command: z.string().optional(),                 // honored ONLY when tool_preset === "Custom"
+  }).refine(v => v.tool_preset !== "Custom" || !!v.command,
+            "command is required (and only allowed) for the Custom preset")
+  ```
+  The model can no longer hand a `claude` / `bash` / `npx …` string for a known preset — it's *unrepresentable*. The description tells Janus to pick a preset and describe intent, not author a launch line.
+
+**Generalizes:** any action whose mechanics are deterministic and environment-sensitive follows the same intent-vs-mechanics split (e.g. `apply_orchestration_recipe` already spawns from a template — its per-pane launches must route through the same `resolveLaunch`, not re-derive commands).
 
 ## 6. Architecture options & honest evaluation
 
@@ -335,6 +379,14 @@ Order: write the test (RED), then the minimum code (GREEN), then refactor. Names
 16. **`handler throw is caught and yields error, answering once`** — a handler that throws ⇒ `kind:"error"`; `resultToToolResponse` calls `sendToolResponse` exactly once with `call.id` (spy count `=== 1`).
 17. **`coerceArgs back-compat: propose_command accepts legacy 'command'`** — `{command:"x"}` coerces to `{instruction:"x"}` (pins the R2 alias at L2284).
 
+### 8.3b Phase 1 — deterministic terminal bring-up (the keystone, §3.1/§5.4) — `tests/test_action_create_pane.ts`
+17a. **`preset→command derivation has exactly one home`** — `resolveLaunch("Claude Code") === "claude"`, `"Codex" → "codex"`, `"Antigravity" → "antigravity"`, `"Custom" → the supplied command`; derived from `settings.presets`. Pins the single map.
+17b. **`voice create_pane derives the launch command — the model cannot supply one`** — drive `create_pane` with `{tool_preset:"Claude Code"}` and **no** `command`; the spawned pane's `shellCmd` starts with `claude` (not `bash`, not `npx …`). A `{tool_preset:"Claude Code", command:"bash"}` call is **rejected by the schema** (guardrail — §5.4 refine).
+17c. **`Custom preset still honors a free-form command`** — `{tool_preset:"Custom", command:"htop"}` runs `htop`; omitting `command` for `Custom` is a schema error.
+17d. **`voice and REST create_pane produce an identical launch`** — same preset/cwd via the mock Gemini path and via `POST /api/terminals` ⇒ identical resolved `command` + `cwd` (the keystone "fix-once" proof; this is the test that would have caught the original divergence).
+17e. **`cwd resolution matches the UI route`** — empty/`.`/non-existent cwd falls back to the active project directory then `process.cwd()` (pins `server.ts:806` behavior in the shared handler).
+17f. **`shared env hygiene preserved`** — the spawned env has `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT` stripped and applies `--dangerously-skip-permissions` per `permissions_mode` (characterizes `UniversalTerminal.start()` so the refactor keeps it).
+
 ### 8.4 Phase 1 — surface adapters & coverage
 18. **`mountRestRoutes registers a route per rest-surface action`** (`tests/test_action_rest.ts`) — boot the server (existing `ce7`/mockLive harness), assert each `def.rest` path responds; a 401 without token (mirrors `test_voice_tools.ts` auth test).
 19. **`REST and voice run the same handler for a shared action`** — call `propose_command` via the mock Gemini path and via `POST /api/terminals/:id/input`; assert identical gate outcome + result shape (the core "one path" proof).
@@ -392,13 +444,12 @@ All four open questions were answered by the operator on 2026-06-03 (see the "De
 3. **Surface convergence** → **register-as-is in Phase 1, then converge piecemeal** in the §7 Convergence track, each group gated by a parity-cutover test. Convergence appetite is full (reads→REST, handoffs→REST, infra→voice) but sequenced after the registry lands; only `set_voice_mute` / pure `resize` stay permanently single-surface.
 4. **Schema library** → **`zod`** (one schema for validation + Gemini generation).
 5. **Registry = capability matrix; like-for-like security** → every action is a mandatory, gated matrix entry; the capability set is derived from the registry; ungated actions get promoted (default Auto). (Decisions 5 & 6.)
+6. **Mechanics in the handler, intent in the schema** (Decision 7) → deterministic logic lives once (the §3.1/§5.4 terminal keystone); schemas are guardrails.
+7. **Housekeeping defaults** (operator-confirmed) → `archive_pane` = **Auto** (reversible); `clear_history` = **Ask** (destructive); `add_watch_rule` = **Ask** (arms automation).
+8. **Close/restart by voice** (operator-confirmed) → add **`close_pane` + `restart_pane` voice tools, Ask-gated**, in C3 (completes like-for-like; the capabilities already exist).
 
-### Open judgment calls (from the §5.0 promotion — to confirm before/during Phase 1)
-These are the genuinely-undecided design forks the like-for-like model surfaced. They change the *seed defaults*, not the architecture:
-
-- **Q-reads — granularity & privacy.** Reads become gateable (default Auto). One `read_state` capability, or split `read_pane` (live output) vs `read_notes` (notes/handoffs)? And do we want the *ability* to set reads to **Off** on a sensitive pane (Janus is blinded there), or are reads hard-always-allowed? (Appendix A proposes the split, Off-capable.)
-- **Q-housekeeping — defaults.** For the C3 promotions, what `defaultGate`: `archive_pane` (reversible — Auto or Ask?), `clear_history` (irreversible — Ask?), `add_watch_rule` (arms automation that acts without you — Ask, already today).
-- **Q-close — complete the like-for-like.** `close_pane`/`restart_pane` are capabilities **with no voice tool** today. Like-for-like implies Janus *should* be able to close/restart panes by voice (gated Ask). Add those two voice tools in C3, or deliberately keep pane-killing UI-only (the brake already covers emergencies)?
+### Open judgment call still to confirm
+- **Q-reads — privacy default (load-bearing).** Operator wants reads **gateable with a privacy-first default** ("some panes may have sensitive information"). Literal "default Off" globally is risky: it would blind Janus to even `list_panes`/status, and the system prompt *requires* her to call `list_panes` before reporting — so a global Off breaks core orientation and contradicts "auto for cheap" (answer 4). Needs one disambiguation (see the question posed alongside this revision): global-Off vs. a **split** where *structural/status* reads (`list_panes`, gates, capabilities) stay Auto but *pane-content* reads (`get_pane_summary`/`delta`/`history`) default Off until granted, vs. default-Auto-with-a-per-pane-"sensitive"-flag. Appendix A currently encodes the split shape pending this answer.
 
 Lower-stakes unknowns (settle during implementation): exact REST paths/verbs for C1–C3; whether `resize` ever converges; precise WS message names in §9.
 
@@ -438,8 +489,8 @@ Every action maps to exactly one capability (Decision 5). **Existing** capabilit
 | `write_to_pane` | Ask (Auto on active) | — | `propose_command` |
 | `deliver_handoff` | Ask (Auto on active) | — | `deliver_handoff` |
 | `create_pane` | Ask | — | `create_pane` |
-| `close_pane` | Ask | — | _(no voice tool today — see §11 Q-close)_ |
-| `restart_pane` | Ask | — | _(no voice tool today — see §11 Q-close)_ |
+| `close_pane` | Ask | — | **NEW voice tool `close_pane`** (Ask-gated) added in C3 — operator-confirmed |
+| `restart_pane` | Ask | — | **NEW voice tool `restart_pane`** (Ask-gated) added in C3 — operator-confirmed |
 | `create_project` | Auto | — | `create_project` |
 | `set_pane_permissions` | Ask | — | `set_pane_permissions` |
 | `set_global_permissions` | Ask | — | `set_global_permissions` |
@@ -451,8 +502,8 @@ Every action maps to exactly one capability (Decision 5). **Existing** capabilit
 | `switch_context` | Auto | — | `switch_context` |
 | `set_voice_mute` | Auto | — | `set_voice_mute` |
 | `dismiss_attention` | Auto | — | `dismiss_attention` |
-| `archive_pane` | _Ask?_ (open — §11) | **NEW** | _(REST `clear-exited`/`archive`/`restore` today; → voice in C3)_ |
-| `clear_history` | _Ask?_ (open — §11) | **NEW** | _(REST `history/clear` today; → voice in C3)_ |
+| `archive_pane` | Auto (reversible) | **NEW** | _(REST `clear-exited`/`archive`/`restore` today; → voice in C3)_ — operator-confirmed Auto |
+| `clear_history` | Ask (destructive) | **NEW** | _(REST `history/clear` today; → voice in C3)_ — operator-confirmed Ask |
 | `ALWAYS_ALLOWED` (sentinel, not a matrix row) | — | — | `stop_all, confirm_stop_all, release_stop_all` |
 
 Notes:
