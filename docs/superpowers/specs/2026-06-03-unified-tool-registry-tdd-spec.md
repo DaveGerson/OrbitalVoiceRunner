@@ -14,7 +14,7 @@
 3. **Register-as-is first, then converge piecemeal.** Phase 1 wraps **every existing tool** into the registry with **no surface changes** — all current asymmetries (§4.2) are recorded in the allow-list. Surface convergence (giving a tool its missing voice/REST/WS twin) happens **afterward, one small phase per tool group** (§7 Convergence track), each gated by a **parity-cutover test** that proves the new surface behaves identically to the existing one *before* the UI is pointed at it.
 4. **Params schema = `zod`.** One zod schema per tool serves both runtime validation and Gemini schema generation; the hand-maintained JSON params are retired.
 5. **The registry IS the capability matrix (like-for-like security).** Every action carries a **mandatory** capability and its gate is **encapsulated** in the action (enforced centrally by `runAction`, never re-implemented per surface). The set of capabilities is **derived from the registry**, not a hand-maintained list — so the matrix *grows with the catalog*, and previously-ungated actions (`switch_active_pane`, `update_draft_prompt`, handoff draft/stage steps, reads) become first-class, individually-tunable matrix entries. `gateSurface.ts`'s hand-listed `ALL_CAPABILITIES` / labels / categories become **generated from the registry**. See §5.0.
-6. **Behavior-preserving defaults.** Making a currently-ungated action a capability does **not** change what happens today: each new capability **defaults to the gate that matches its current effective behavior** (Auto for what's ungated now). The *new ability* is that you can now tune any of them. Net: Phase 1 adds tunability, not new friction. *(Reads are the one deliberate exception — operator wants them gateable with a privacy-first default; see §11 Q-reads.)*
+6. **Behavior-preserving defaults.** Making a currently-ungated action a capability does **not** change what happens today: each new capability **defaults to the gate that matches its current effective behavior** — Auto for everything currently ungated, **including reads** (`read_pane`/`read_notes` default **Auto**). The *new ability* is that you can now tune any of them. Net: Phase 1 adds tunability, not new friction. Read-gating's purpose is covered in §5.5.
 7. **Mechanics in the handler, intent in the schema (the keystone, §3.1).** Deterministic, environment-sensitive logic (e.g. preset→launch-command derivation) lives **once**, in the action handler or the domain layer it calls — never in the model and never duplicated per surface. Action schemas express **intent** and act as **guardrails** that make wrong inputs unrepresentable (the model picks `tool_preset`, it does not author a launch string). A deterministic fix is then applied in exactly one place.
 
 ---
@@ -246,6 +246,16 @@ A pure function `surfaceCoverage(registry)` returns, per action, which of `{voic
 
 **Generalizes:** any action whose mechanics are deterministic and environment-sensitive follows the same intent-vs-mechanics split (e.g. `apply_orchestration_recipe` already spawns from a template — its per-pane launches must route through the same `resolveLaunch`, not re-derive commands).
 
+### 5.5 Read-gating as context control (not just privacy)
+
+Reads default **Auto** (Decision 6) — Janus can always orient. But `read_pane` being its **own capability, independent of `write_to_pane`**, is load-bearing for two operator goals beyond security:
+
+- **Direct-without-reading.** A valid, intentional posture is `write_to_pane: Auto` + `read_pane: Off`: *"route work into this pane, but don't slurp its output into your context."* The like-for-like model gives this for free (separate capabilities); the matrix UI should make this combination easy to set per pane.
+- **Context-rot defense across panes.** The operator directs the workflow by voice; **pane output is supplementary, not primary**. Pulling verbose output (build logs, test spew) from many panes into the live Gemini session is a top cause of context rot. Per-pane `read_pane: Off` is the operator's **coarse, deliberate lever** to keep a noisy pane *out* of Janus's context window — complementing the automatic `contextWindowCompression` (triggerTokens 25000 / sliding 16000) already in the Live config. When a read is gated Off, the read tools return `blocked` ("not permitted to read pane-X"), so that pane's bytes never enter the context at all.
+- **Graceful degradation.** Because the human is directing, a read-Off pane doesn't break Janus — she leans on spoken direction and the task description instead of pane output. (Contrast an autonomous agent, which would stall.)
+
+Implication for the matrix surface (§8sq lineage): `read_pane` joins the per-pane chip/popover like any capability; a pane showing `write Auto / read Off` reads as "I act here, I don't watch here."
+
 ## 6. Architecture options & honest evaluation
 
 The operator's instinct: *"Python is the most expressive and advanced as we aim to scale."* That is true for **authoring/validating a large tool catalog and for agentic tool logic** (Pydantic, rich typing, the LLM-tooling ecosystem). It is **not** an unqualified win **for the part of this system that does the work**, because the work is native-TS: node-pty PTY lifecycle (incl. Windows ConPTY), `better-sqlite3` ledger, the gate resolver, the WS broadcast hub, handoff/approval flows. Below, three options, scored against the goals.
@@ -448,10 +458,9 @@ All four open questions were answered by the operator on 2026-06-03 (see the "De
 7. **Housekeeping defaults** (operator-confirmed) → `archive_pane` = **Auto** (reversible); `clear_history` = **Ask** (destructive); `add_watch_rule` = **Ask** (arms automation).
 8. **Close/restart by voice** (operator-confirmed) → add **`close_pane` + `restart_pane` voice tools, Ask-gated**, in C3 (completes like-for-like; the capabilities already exist).
 
-### Open judgment call still to confirm
-- **Q-reads — privacy default (load-bearing).** Operator wants reads **gateable with a privacy-first default** ("some panes may have sensitive information"). Literal "default Off" globally is risky: it would blind Janus to even `list_panes`/status, and the system prompt *requires* her to call `list_panes` before reporting — so a global Off breaks core orientation and contradicts "auto for cheap" (answer 4). Needs one disambiguation (see the question posed alongside this revision): global-Off vs. a **split** where *structural/status* reads (`list_panes`, gates, capabilities) stay Auto but *pane-content* reads (`get_pane_summary`/`delta`/`history`) default Off until granted, vs. default-Auto-with-a-per-pane-"sensitive"-flag. Appendix A currently encodes the split shape pending this answer.
+9. **Reads default Auto; read-gating is a context-control lever** (operator-confirmed) → `read_pane`/`read_notes` default **Auto** (Janus always orients). Read-gating is independent of write, and its purpose is **privacy *and* context-rot defense** — per-pane `read_pane: Off` keeps a noisy pane out of the live context while `write_to_pane` can stay Auto. See §5.5.
 
-Lower-stakes unknowns (settle during implementation): exact REST paths/verbs for C1–C3; whether `resize` ever converges; precise WS message names in §9.
+All judgment calls are now resolved. Lower-stakes unknowns (settle during implementation, non-blocking): exact REST paths/verbs for C1–C3; whether `resize` ever converges; precise WS message names in §9; whether reads stay two capabilities (`read_pane`/`read_notes`) or collapse to one `read_state` (cosmetic — both default Auto).
 
 ## 12. Definition of Done
 
@@ -508,5 +517,5 @@ Every action maps to exactly one capability (Decision 5). **Existing** capabilit
 
 Notes:
 - `resize` is intentionally **not** a capability — pure viewport geometry, rest-only forever (the legitimate allow-list residue).
-- The split of reads into `read_pane` vs `read_notes` (vs a single `read_state`) and the housekeeping defaults are the **open judgment calls in §11**; the table shows the proposed shape.
-- Capability bindings + defaults are transcribed from today's behavior and **must be pinned by tests §8.3 + §8.1b** so the refactor cannot silently re-gate a tool or change a default.
+- `read_pane`/`read_notes` default **Auto** (resolved). The two-vs-one (`read_state`) split is cosmetic and may collapse during implementation; either way reads default Auto and are independently gateable from writes (§5.5).
+- All gate defaults here are operator-confirmed or transcribed from today's behavior and **must be pinned by tests §8.3 + §8.1b** so the refactor cannot silently re-gate a tool or change a default.
