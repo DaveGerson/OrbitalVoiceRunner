@@ -28,6 +28,20 @@ export interface StoredPendingApproval {
   command: string; kind: ApprovalKind; rationale: string | null;
   claimed: boolean; timestamp: number; expires_at: number;
 }
+/**
+ * Row shape for the pending_actions table (schema v5, bead wsm-e2e-pinned-kzt). A deferred Ask-tier
+ * non-PTY mutator persisted as its serializable INTENT (capability + JSON params) so the side effect
+ * can be rebuilt on boot via src/actionEffects.ts (the run() closure itself is non-serializable).
+ */
+export interface StoredPendingAction {
+  id: string;
+  capability: string;
+  summary: string;
+  params: string;        // JSON-encoded intent params (capability-specific)
+  claimed: boolean;
+  timestamp: number;
+  expires_at: number;    // timestamp + ttlMs (parity with pending_approvals; drives boot/sweep prune)
+}
 export interface StoredAttention {
   id: string; type: string; terminal_id: string; project_id: string;
   message: string; timestamp: number; dismissed: boolean; details: any;
