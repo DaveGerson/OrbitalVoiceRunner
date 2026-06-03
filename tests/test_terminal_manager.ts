@@ -40,7 +40,13 @@ async function runTests() {
   // 3. Test removing/stopping
   console.log("Testing terminal removal...");
   if (term) {
-    term.stop();
+    // Await full teardown. On Windows ConPTY, term.stop() kills the pty AND (now)
+    // internally drains node-pty's delayed conout-worker teardown (a worker_threads
+    // Worker = a libuv uv_async_t). If the file ended with that worker mid-terminate,
+    // the unit runner's --test-force-exit would uv_close() a handle already CLOSING and
+    // abort (src\win\async.c:76, mis-attributed to a later pty-free suite). Awaiting
+    // stop() is now sufficient.
+    await term.stop();
     delete manager.terminals["test1"];
   }
   assert.ok(!manager.terminals["test1"], "Terminal test1 should have been removed");

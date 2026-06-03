@@ -16,6 +16,7 @@ import os from "os";
 import path from "path";
 import { WebSocket } from "ws";
 import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
+import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 
 describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
@@ -74,7 +75,9 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
         try { client.terminate(); } catch { resolve(); }
       });
     }
-    try { await running?.close(); } catch {}
+    // Deterministic teardown: close server + global fetch pool, then drain libuv so
+    // --test-force-exit can't abort on a half-closed async handle (src\win\async.c:76).
+    await teardownServerSuite(running);
     process.chdir(prevCwd);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });
@@ -103,8 +106,9 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
       assert.ok(names.includes(expected), `declares ${expected}`);
     }
     // Pin the exact count so a silent add/drop trips this test. Bumped 34 -> 35 by bead 8sq
-    // (stop_all), then 35 -> 37 by the 8sq two-stage rework (added confirm_stop_all + release_stop_all).
-    assert.strictEqual(decls.length, 37, "exactly 37 voice tools declared");
+    // (stop_all), then 35 -> 37 by the 8sq two-stage rework (added confirm_stop_all + release_stop_all),
+    // then 37 -> 41 by bead bjm (get_project_notes + search_notes + amend_note + delete_note).
+    assert.strictEqual(decls.length, 41, "exactly 41 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

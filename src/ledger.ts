@@ -1,5 +1,6 @@
 import fs from "fs";
 import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft } from "./types";
+import type { StoredNote } from "./store/types";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
 // re-exported here so existing `from "./ledger"` imports keep working (D7).
@@ -40,6 +41,12 @@ export interface LedgerLike {
   // Truthy-on-success: legacy Ledger returns boolean, JanusStore returns StoredNote|null.
   addNote(projectId: string, text: string): unknown;
   addPaneNote(projectId: string, paneId: string, text: string): unknown;
+  // bead bjm: notes-recall surface. JanusStore implements these over id-bearing rows + FTS5; the
+  // legacy Ledger projects its flat string[] notes into the same shape (synthetic positional ids).
+  getNotes(filter?: { projectId?: string; paneId?: string; type?: string }): StoredNote[];
+  search(query: string, opts?: { limit?: number; source?: "note" | "event" }): Array<{ source: "note" | "event"; id: string; snippet: string; rank: number }>;
+  amendNote(id: string, text: string): void;
+  deleteNote(id: string): void;
   getDraft(projectId: string, paneId: string): PaneDraft | null;
   setDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean;
   appendDraft(projectId: string, paneId: string, text: string, updatedBy?: "janus" | "operator"): boolean;
@@ -300,6 +307,79 @@ export class Ledger {
       return true;
     }
     return false;
+  }
+
+  // ── Notes-recall surface (bead bjm) ──────────────────────────────────────────────────────────
+  // The SQLite JanusStore (default backend) implements these natively over id-bearing rows + FTS5.
+  // The legacy in-memory Ledger keeps notes as bare string[] with no stable identity, so we project
+  // them into StoredNote rows with a deterministic synthetic id (`legacy:<projectId>:<paneId>:<idx>`)
+  // and back id-based amend/delete + a substring search off that. Positional and best-effort —
+  // SQLite is the supported path for durable id-based recall.
+  private legacyNoteRow(projectId: string, paneId: string | null, index: number, text: string): StoredNote {
+    return {
+      id: `legacy:${projectId}:${paneId ?? ""}:${index}`,
+      project_id: projectId, pane_id: paneId, text,
+      type: "note", author: "user", created_at: index, updated_at: index,
+    };
+  }
+  private parseLegacyNoteId(id: string): { projectId: string; paneId: string | null; index: number } | null {
+    if (!id.startsWith("legacy:")) return null;
+    const parts = id.split(":");
+    if (parts.length < 4) return null;
+    const index = Number(parts[parts.length - 1]);
+    const projectId = parts[1];
+    const paneId = parts[2] || null;
+    if (!projectId || Number.isNaN(index)) return null;
+    return { projectId, paneId, index };
+  }
+  private legacyNoteArray(projectId: string, paneId: string | null): string[] | undefined {
+    const ws = this.workspaces[projectId];
+    if (!ws) return undefined;
+    return paneId ? ws.panes[paneId]?.notes : ws.notes;
+  }
+
+  getNotes(filter: { projectId?: string; paneId?: string; type?: string } = {}): StoredNote[] {
+    const rows: StoredNote[] = [];
+    const projectIds = filter.projectId ? [filter.projectId] : Object.keys(this.workspaces);
+    for (const pid of projectIds) {
+      const ws = this.workspaces[pid];
+      if (!ws) continue;
+      if (!filter.paneId) {
+        (ws.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, null, i, text)));
+      }
+      for (const pane of Object.values(ws.panes)) {
+        if (filter.paneId && pane.pane_id !== filter.paneId) continue;
+        (pane.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, pane.pane_id, i, text)));
+      }
+    }
+    const typed = filter.type ? rows.filter((r) => r.type === filter.type) : rows;
+    // Mirror JanusStore.getNotes: newest-first.
+    return typed.sort((a, b) => b.created_at - a.created_at);
+  }
+
+  search(query: string, opts: { limit?: number; source?: "note" | "event" } = {}): Array<{ source: "note" | "event"; id: string; snippet: string; rank: number }> {
+    // The legacy in-memory Ledger has no event index — it only ever surfaces notes.
+    if (opts.source === "event") return [];
+    const limit = opts.limit ?? 25;
+    const q = query.toLowerCase();
+    return this.getNotes({})
+      .filter((n) => n.text.toLowerCase().includes(q))
+      .slice(0, limit)
+      .map((n, i) => ({ source: "note" as const, id: n.id, snippet: n.text, rank: i }));
+  }
+
+  amendNote(id: string, text: string): void {
+    const p = this.parseLegacyNoteId(id);
+    if (!p) return;
+    const arr = this.legacyNoteArray(p.projectId, p.paneId);
+    if (arr && p.index >= 0 && p.index < arr.length) { arr[p.index] = text; this.save(true); }
+  }
+
+  deleteNote(id: string): void {
+    const p = this.parseLegacyNoteId(id);
+    if (!p) return;
+    const arr = this.legacyNoteArray(p.projectId, p.paneId);
+    if (arr && p.index >= 0 && p.index < arr.length) { arr.splice(p.index, 1); this.save(true); }
   }
 
   updatePane(projectId: string, paneMeta: PaneMeta, shouldSave = true) {

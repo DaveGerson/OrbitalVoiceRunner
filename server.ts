@@ -230,6 +230,16 @@ console.log(useSqliteLedger
   ? "[STORE] OrchestratorManager ledger backend: SQLite (durable). Set JANUS_LEDGER_BACKEND=legacy to opt out."
   : `[STORE] OrchestratorManager ledger backend: legacy JSON Ledger${forceLegacy ? " (JANUS_LEDGER_BACKEND=legacy)" : " (store unavailable)"}.`);
 
+// `store` is a process-wide singleton: created once here at import and SHARED by every
+// startServer() call. Releasing it is therefore a PROCESS-level concern, not a per-server one —
+// closing it inside an individual server's close() would pull the shared DB handle out from under
+// any sibling server still running in the same process (e.g. multiple in-process test suites under
+// `tsx --test`, which previously made test_live_harness flake at the file level). We close it
+// exactly once, synchronously, on process exit: better-sqlite3 writes are already durable
+// per-statement, so this is pure handle cleanup, and a synchronous close in the 'exit' handler
+// finishes before teardown — avoiding the UV_HANDLE_CLOSING abort that a still-in-flight close hit.
+process.once("exit", () => { try { store?.close(); } catch { /* best-effort handle cleanup */ } });
+
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
 // its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
 
@@ -258,6 +268,15 @@ export interface RunningServer {
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
   const shouldListen = options.listen ?? true;
+
+  // Snapshot the live-session connector for THIS server instance. `liveConnector` is a module-level
+  // seam (setLiveConnector); reading it late, at WS-connect time, let a sibling in-process server's
+  // installMockLive() clobber the global between this server's boot and a client connecting — so a
+  // session created here would be recorded into the WRONG mock handle, and that suite's
+  // `waitFor(mock.latest())` would time out (the test_live_harness file-level flake under parallel
+  // `tsx --test`). Binding it synchronously at startServer() time — there is no await between a
+  // suite's installMockLive() and its startServer() call — pins each server to its own connector.
+  const boundLiveConnector = liveConnector;
 
   const app = express();
   app.use(express.json());
@@ -966,6 +985,31 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   app.post("/api/projects/:id/notes", (req, res) => {
     const { note } = req.body;
     manager.ledger.addNote(req.params.id, note);
+    broadcastLedgerUpdate();
+    res.json({ success: true });
+  });
+
+  // bead bjm: id-bearing notes feed for the UI (Node Chronicle delete/amend controls). This is a
+  // DOM-render-only, operator-facing feed (server -> the trusted operator's browser), so it is NOT
+  // redacted — redaction is a MODEL-egress guard; the VOICE tools redact, this feed does not. Do not
+  // forward this raw text to the live session.
+  app.get("/api/projects/:id/notes", (req, res) => {
+    res.json({ notes: manager.ledger.getNotes({ projectId: req.params.id }) });
+  });
+
+  // bead bjm: operator-direct note edit/delete from the UI. Ungated (operator intent in their own
+  // UI), consistent with the ungated POST note path above; the GATED path is the voice amend_note /
+  // delete_note tools (which route through update_metadata).
+  app.put("/api/notes/:id", (req, res) => {
+    const { text } = req.body;
+    if (typeof text !== "string") { res.status(400).json({ error: "Missing text" }); return; }
+    manager.ledger.amendNote(req.params.id, text);
+    broadcastLedgerUpdate();
+    res.json({ success: true });
+  });
+
+  app.delete("/api/notes/:id", (req, res) => {
+    manager.ledger.deleteNote(req.params.id);
     broadcastLedgerUpdate();
     res.json({ success: true });
   });
@@ -2062,8 +2106,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const liveModel = manager.settings.voiceAi?.model || "gemini-3.1-flash-live-preview";
 
       // Initialize Gemini Live session (through the injectable seam so tests /
-      // the offline simulator can substitute a fake session).
-      session = await liveConnector(sessionAi, {
+      // the offline simulator can substitute a fake session). Uses the per-server snapshot
+      // (boundLiveConnector) so a sibling test server's setLiveConnector cannot redirect us.
+      session = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
@@ -2316,11 +2361,79 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   functionResponses: [{ name, id: call.id, response: { output: ok ? `Note added to project ${args.project_id}` : `Could not add note: project ${args.project_id} not found.` } }]
                 });
               } else if (name === "add_pane_note") {
-                const ok = manager.ledger.addPaneNote(args.project_id, args.pane_id, args.note);
-                if (ok) broadcastLedgerUpdate();
+                // MUST-FIX #4 (bead bjm): pane_id defaults to the server-tracked active pane. When no
+                // pane is open there is nowhere to attach the note — write nothing and say so.
+                const paneId = (typeof args.pane_id === "string" && args.pane_id) ? args.pane_id : activePaneId;
+                if (!paneId) {
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: "No pane is open, so there's nowhere to attach this note. Open a pane first." } }]
+                  });
+                } else {
+                  const projectId = args.project_id || manager.ledger.activeProjectId || "default_project";
+                  const ok = manager.ledger.addPaneNote(projectId, paneId, args.note);
+                  if (ok) broadcastLedgerUpdate();
+                  session.sendToolResponse({
+                    functionResponses: [{ name, id: call.id, response: { output: ok ? `Note added to pane ${paneId}` : `Could not add note: pane ${paneId} not found in project ${projectId}.` } }]
+                  });
+                }
+              } else if (name === "get_project_notes") {
+                // bead bjm: read-only recall. Works WITHOUT switch_context (defaults to the active
+                // project). MUST-FIX #1: redact every snippet handed to the model (model-egress guard).
+                // An explicit project_id may recall another project's notes — intentional under the
+                // single-operator trust model (one director, one token); snippets are still redacted.
+                const projectId = args.project_id || manager.ledger.activeProjectId || "default_project";
+                const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
+                const notes = manager.ledger.getNotes({ projectId }).slice(0, limit).map((n) => ({
+                  id: n.id, pane_id: n.pane_id, type: n.type, created_at: n.created_at, text: redactSecrets(n.text),
+                }));
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: ok ? `Note added to pane ${args.pane_id}` : `Could not add note: pane ${args.pane_id} not found in project ${args.project_id}.` } }]
+                  functionResponses: [{ name, id: call.id, response: { output: { project_id: projectId, count: notes.length, notes } } }]
                 });
+              } else if (name === "search_notes") {
+                // bead bjm MUST-FIX #2: store.search returns note AND event rows — request note-only
+                // (so a flood of higher-ranked events can't starve notes out of the limit) and redact
+                // every snippet before it reaches the model. The source==='note' filter is kept as
+                // belt-and-suspenders in case a backend ignores the hint.
+                const query = String(args.query ?? "");
+                const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
+                const results = manager.ledger.search(query, { limit, source: "note" })
+                  .filter((r) => r.source === "note")
+                  .slice(0, limit)
+                  .map((r) => ({ id: r.id, snippet: redactSecrets(r.snippet) }));
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: { query, count: results.length, results } } }]
+                });
+              } else if (name === "amend_note") {
+                // bead bjm MUST-FIX #3: gate through update_metadata; mutate ONLY inside the run
+                // closure; bind the amend text at enqueue time so a later Ask-confirm applies exactly
+                // this text (not whatever the model says next).
+                const noteId = String(args.note_id ?? "");
+                const newText = String(args.text ?? "");
+                const amendEffect = (): string => {
+                  manager.ledger.amendNote(noteId, newText);
+                  broadcastLedgerUpdate();
+                  return `Note ${noteId} updated.`;
+                };
+                const g = gateOrDefer("update_metadata", null, `Amend note ${noteId}`, amendEffect);
+                let output: string;
+                if (g.disposition === "forbidden") output = `Error: the 'update_metadata' capability is gated Off; amending notes is forbidden by policy.`;
+                else if (g.disposition === "deferred") output = `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply the amendment.`;
+                else output = amendEffect();
+                session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output } }] });
+              } else if (name === "delete_note") {
+                // bead bjm MUST-FIX #3: gate through update_metadata; mutate ONLY inside the run closure.
+                const noteId = String(args.note_id ?? "");
+                const deleteEffect = (): string => {
+                  manager.ledger.deleteNote(noteId);
+                  broadcastLedgerUpdate();
+                  return `Note ${noteId} deleted.`;
+                };
+                const g = gateOrDefer("update_metadata", null, `Delete note ${noteId}`, deleteEffect);
+                let output: string;
+                if (g.disposition === "forbidden") output = `Error: the 'update_metadata' capability is gated Off; deleting notes is forbidden by policy.`;
+                else if (g.disposition === "deferred") output = `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to delete the note.`;
+                else output = deleteEffect();
+                session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output } }] });
               } else if (name === "rename_project") {
                 manager.ledger.renameProject(args.project_id, args.name);
                 broadcastLedgerUpdate();
@@ -3132,15 +3245,61 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "add_pane_note",
-              description: "Add a durable note to a specific pane.",
+              description: "Add a durable note to a pane. Omit pane_id to attach it to the pane the operator currently has open (the active pane); if no pane is open the note is not saved.",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
-                  project_id: { type: Type.STRING },
-                  pane_id: { type: Type.STRING },
+                  project_id: { type: Type.STRING, description: "Project ID. Omit to use the active project." },
+                  pane_id: { type: Type.STRING, description: "Pane ID. Omit to use the active pane." },
                   note: { type: Type.STRING }
                 },
-                required: ["project_id", "pane_id", "note"]
+                required: ["note"]
+              }
+            },
+            {
+              name: "get_project_notes",
+              description: "Recall the durable notes saved for a project (decisions, todos, warnings). Use this to answer 'what did we decide', 'what are my notes', 'remind me what we noted'. Defaults to the active project — you do NOT need to switch_context first. Returns id-bearing, secret-redacted notes, newest first.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  project_id: { type: Type.STRING, description: "Project ID. Omit to use the active project." },
+                  limit: { type: Type.NUMBER, description: "Max notes to return (default 10, max 50)." }
+                }
+              }
+            },
+            {
+              name: "search_notes",
+              description: "Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries'). Returns matching note snippets (secret-redacted) with their ids. Notes only — it does not search the raw activity log.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  query: { type: Type.STRING, description: "The words/phrase to search for." },
+                  limit: { type: Type.NUMBER, description: "Max results (default 10, max 50)." }
+                },
+                required: ["query"]
+              }
+            },
+            {
+              name: "amend_note",
+              description: "Edit the text of an existing note by its id (get the id from get_project_notes or search_notes). Gated by the 'update notes & metadata' permission: auto-applies in Auto, asks for operator confirmation in Ask, refused when Off.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  note_id: { type: Type.STRING, description: "The id of the note to edit." },
+                  text: { type: Type.STRING, description: "The new note text (replaces the old text)." }
+                },
+                required: ["note_id", "text"]
+              }
+            },
+            {
+              name: "delete_note",
+              description: "Delete a note permanently by its id (get the id from get_project_notes or search_notes). Gated by the 'update notes & metadata' permission: auto-applies in Auto, asks for operator confirmation in Ask, refused when Off.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  note_id: { type: Type.STRING, description: "The id of the note to delete." }
+                },
+                required: ["note_id"]
               }
             },
             {
@@ -3584,11 +3743,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     await new Promise<void>((resolve) => wss.close(() => resolve()));
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    // Release the better-sqlite3 native handle. Left open, its libuv async handle is
-    // still live when the unit runner's --test-force-exit calls process.exit, which
-    // double-closes it and aborts (UV_HANDLE_CLOSING). Guarded: store is null under
-    // JANUS_LEDGER_BACKEND=legacy / when the store failed to boot.
-    try { store?.close(); } catch (err) { console.error("Error closing JanusStore:", err); }
+    // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
+    // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
+    // closing it per-server would break sibling in-process servers (the test_live_harness flake).
   };
 
   const shutdown = async () => {

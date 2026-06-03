@@ -43,7 +43,20 @@ export interface PtyTransport {
   resize(cols: number, rows: number): void;
   /** Terminate the process (and its group/tree where possible). */
   kill(signal?: string): void;
+  /**
+   * Resolve once the transport's native teardown is fully complete and safe for the
+   * process to exit. On Windows ConPTY, node-pty arms a delayed (~FLUSH_DATA_INTERVAL)
+   * teardown of its conout worker_threads.Worker (a libuv uv_async_t) AFTER kill();
+   * if the process force-exits while that is in flight, libuv uv_close()'s a handle
+   * already CLOSING and aborts (src\win\async.c:76). Awaiting this in stop() makes
+   * teardown deterministic for every caller. No-op (resolved) on transports without a
+   * native async resource (legacy child_process, POSIX, stubs). */
+  drainTeardown?(): Promise<void>;
 }
+
+// node-pty's windowsConoutConnection.FLUSH_DATA_INTERVAL is 1000ms; the conout worker
+// dispose() arms worker.terminate() on that timer AFTER kill(). Wait it out + margin.
+const CONOUT_DRAIN_MS = 1300;
 
 export interface PtySpawnOptions {
   cwd: string;
@@ -93,6 +106,7 @@ export function nodePtyAvailable(): boolean {
 
 export class NodePtyTransport implements PtyTransport {
   private proc: any;
+  private _killed = false;
 
   constructor(file: string, args: string[], opts: PtySpawnOptions) {
     const pty = loadNodePty();
@@ -135,11 +149,36 @@ export class NodePtyTransport implements PtyTransport {
   }
 
   kill(signal?: string): void {
+    // Idempotent: node-pty's Windows ConPTY kill() arms the conout-worker dispose
+    // (a worker_threads.Worker, i.e. a libuv uv_async_t) AND the native
+    // _$onProcessExit callback independently tears the conout socket down. A second
+    // kill() (e.g. the SIGTERM→SIGKILL escalation in UniversalTerminal.stop(), or a
+    // double stop()) re-enters WindowsPtyAgent.kill()/ConoutConnection.dispose() and
+    // can drive a second worker.terminate() on a handle already in UV_HANDLE_CLOSING
+    // → the `src\win\async.c:76` abort under --test-force-exit. Guard so node-pty's
+    // teardown runs at most once per pty.
+    if (this._killed) return;
+    this._killed = true;
     try {
       this.proc.kill(killSignalForPlatform(process.platform, signal));
     } catch {
       // already dead
     }
+  }
+
+  /**
+   * Windows ConPTY only: after kill(), node-pty schedules its conout worker_threads
+   * teardown (worker.terminate() = closing a libuv uv_async_t) ~1000ms later. Resolve
+   * only once that window has elapsed so a subsequent process.exit (the unit runner's
+   * --test-force-exit) can't uv_close() the handle mid-terminate. Cheap elsewhere:
+   * resolves immediately when there was no kill or off Windows. */
+  async drainTeardown(): Promise<void> {
+    if (!this._killed || process.platform !== "win32") return;
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, CONOUT_DRAIN_MS);
+      // Do NOT unref: this drain must hold the loop open so the conout worker fully
+      // terminates before the runner force-exits. It is awaited only at teardown.
+    });
   }
 }
 

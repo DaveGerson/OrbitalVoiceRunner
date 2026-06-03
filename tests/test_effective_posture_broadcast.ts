@@ -13,6 +13,7 @@ import os from "os";
 import path from "path";
 import { WebSocket } from "ws";
 import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
+import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 import { ALL_CAPABILITIES } from "../src/gateSurface";
 
@@ -86,8 +87,9 @@ describe("8sq effective-posture broadcast (headless)", () => {
     if (client && client.readyState !== WebSocket.CLOSED) {
       await new Promise<void>((resolve) => { client.once("close", () => resolve()); try { client.terminate(); } catch { resolve(); } });
     }
-    try { await running?.close(); } catch {}
-    await new Promise((r) => setTimeout(r, 100));
+    // Deterministic teardown: close server + global fetch pool, then drain libuv so
+    // --test-force-exit can't abort on a half-closed async handle (src\win\async.c:76).
+    await teardownServerSuite(running);
     process.chdir(prevCwd);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });

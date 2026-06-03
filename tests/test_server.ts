@@ -34,8 +34,11 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
   describe("UniversalTerminal", () => {
     let term: UniversalTerminal;
 
-    after(() => {
-      if (term) term.stop();
+    after(async () => {
+      // Real ConPTY pane: await stop(), which now internally drains node-pty's delayed
+      // conout-worker teardown (a worker_threads.Worker = a libuv uv_async_t) so
+      // --test-force-exit can't uv_close() it mid-terminate (src\win\async.c:76 abort).
+      if (term) await term.stop();
     });
 
     it("should start a process and capture output", async () => {
@@ -83,7 +86,7 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
       assert.ok(manager.terminals["term-1"]);
 
       await new Promise((resolve) => setTimeout(resolve, 200));
-      manager.terminals["term-1"].stop();
+      await manager.terminals["term-1"].stop();
     });
 
     it("should list panes", async () => {
@@ -97,7 +100,7 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
       assert.strictEqual(list[0].panes[0].alive, true);
       assert.ok(list[0].panes[0].last_known_state);
 
-      manager.terminals["pane_1"].stop();
+      await manager.terminals["pane_1"].stop();
     });
 
     it("should get pane summary", async () => {
@@ -107,7 +110,7 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
       assert.ok(summary.includes("summary test"));
       assert.ok(summary.startsWith("```"));
 
-      manager.terminals["pane_1"].stop();
+      await manager.terminals["pane_1"].stop();
     });
 
     it("should manage and access attentionQueue and automation items layout structures", () => {
