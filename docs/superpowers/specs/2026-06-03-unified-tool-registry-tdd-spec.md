@@ -2,10 +2,17 @@
 
 - **Bead:** _(to file)_ `unified-action-registry` — "Single source of truth for tools/functions shared by Gemini Live + REST/WS UI"
 - **Date:** 2026-06-03
-- **Status:** Design / TDD — DRAFT for review (no production code in this pass; spec only)
+- **Status:** Design / TDD — open questions resolved 2026-06-03 (see "Decisions" below); spec only, no production code in this pass.
 - **Author context:** requested by operator — "all relevant tools Gemini Live uses should be 1:1 matched with the function calls and tools the backend uses, so Gemini and the UI work off the same set of functions… we only have to touch one path to make updates."
 - **Depends on (all ✓ today):** `nzt` (SQLite ledger / `JanusStore`), `odb` (deferred staging), `8sq` (capability-matrix surface + `gateSurface.ts`), `alf` (handoff flip)
-- **Blocks / enables:** future tool growth (every new capability becomes a single registry entry instead of 4 hand-edits), a possible Python tool backend (§7, Phase 2/3)
+- **Blocks / enables:** future tool growth (every new capability becomes a single registry entry instead of 4 hand-edits), a Python tool-catalog authority (§6 Phase 2)
+
+### Decisions (locked 2026-06-03)
+
+1. **Python trajectory = catalog + codegen (Phase 2).** Python (Pydantic) becomes the authoring source of truth for tool definitions; a build step generates the Gemini declarations + a TS binding table. **Execution stays in TS.** No full Python execution backend (Option B) is planned now.
+2. **Everything lives in this one repo and is committed together.** Generated files (`catalog.generated.ts`, `gemini.tools.json`) are *committed* alongside hand-written code — they are ordinary emitted source, not a separate service. A no-drift test (§8.6) guards staleness. There is no second server.
+3. **Register-as-is first, then converge piecemeal.** Phase 1 wraps **every existing tool** into the registry with **no surface changes** — all current asymmetries (§4.2) are recorded in the allow-list. Surface convergence (giving a tool its missing voice/REST/WS twin) happens **afterward, one small phase per tool group** (§7 Convergence track), each gated by a **parity-cutover test** that proves the new surface behaves identically to the existing one *before* the UI is pointed at it.
+4. **Params schema = `zod`.** One zod schema per tool serves both runtime validation and Gemini schema generation; the hand-maintained JSON params are retired.
 
 ---
 
@@ -164,7 +171,9 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
 
 ### 5.3 Drift becomes a report, not a surprise
 
-A pure function `surfaceCoverage(registry)` returns, per action, which of `{voice,rest,ws}` it is on. The test suite asserts an **explicit allow-list** of intentional asymmetries (e.g. `resize` is rest-only on purpose). Anything new that is voice-only or rest-only without being on the allow-list **fails the build** — the opposite of today, where drift is silent.
+A pure function `surfaceCoverage(registry)` returns, per action, which of `{voice,rest,ws}` it is on. The test suite asserts an **explicit allow-list** of intentional asymmetries. Anything voice-only or rest-only that is **not** on the allow-list **fails the build** — the opposite of today, where drift is silent.
+
+**Initial allow-list = every current asymmetry** (Decision 3 — register-as-is). Phase 1 seeds the allow-list with *all* of the §4.2 single-surface tools (the voice-only reads/handoffs and the rest-only infra), so the registry adopts reality without changing any surface. The **Convergence track (§7)** then *removes* entries from this allow-list one group at a time — each removal forces the missing surface to exist and is gated by a parity-cutover test (§8.5b). The allow-list is therefore a live to-do list: when it is empty (minus the inherently single-surface tools), parity is complete.
 
 ## 6. Architecture options & honest evaluation
 
@@ -209,21 +218,25 @@ Python (Pydantic) declares the canonical tool catalog (name, description, params
 | Packaging/ops | ✅ one artifact | ❌ two runtimes | ⚠️ build adds a gen step |
 | Diff size now | ✅ small | ❌ very large | ⚠️ medium |
 
-### Recommendation — phased, A → C → (B per-tool)
+### Recommendation — phased, A (now) → converge piecemeal → C (Python catalog); B deferred
 
 **Phase 1 (this work): build Option A.** Collapse the four paths into one in-process TS `ActionRegistry`. This delivers the *entire* "touch one place" win at low risk and is **never wasted** — the `ActionDef` shape is identical regardless of where the catalog eventually lives.
 
 **Phase 2 (next bead, honors the Python direction): lift the *catalog* to Python (Option C).** Author the tool catalog in Pydantic; codegen the Gemini declarations + the TS binding table from it. Now "to add or change a tool" = edit Python + run `npm run gen:catalog`. Execution stays in TS.
 
-**Phase 3 (only when scale justifies it): move *execution* per-tool to a Python worker (Option B).** Behind a typed RPC seam, migrate non-latency-critical, logic-heavy tools first (e.g. `search_notes`, plan synthesis). The gate is enforced **on the TS side before** crossing the boundary, so safety never depends on the worker.
+**Phase 3 — Option B (full Python execution backend) is NOT planned (Decision 1).** The registry seam keeps it *possible* later (an `executor:"ts"|"py"` flag, gate enforced before the boundary), but we do not build it now. Re-evaluate only under real scaling pressure.
+
+Interleaved between Phase 1 and Phase 2 is the **Surface Convergence track** (§7): register-as-is first, then add each missing surface piecemeal, every cutover gated by a parity test (Decision 3).
 
 This sequencing gives the operator the Python platform they want **without betting the realtime PTY/gate path on a premature re-platform**, and every phase ships value on its own.
 
-> **Decision needed (see §11 Q1):** confirm Phase-2 intent is "Python as catalog authority + codegen" (recommended) vs. "full Python execution backend now." The TDD below is written so Phase 1 is identical either way.
-
 ## 7. Phased plan (file-by-file)
 
-### Phase 1 — TS registry (the refactor)
+**Shape of the rollout (Decision 3):** Phase 1 is a pure **register-as-is** refactor — every existing tool becomes a registry entry with its *current* surfaces, no twin added, every asymmetry allow-listed. Then the **Convergence track** adds missing surfaces one small group at a time, each gated by a parity-cutover test. Phase 2 (Python catalog) can run in parallel once Phase 1 lands. There is no Phase-3 execution backend in this plan (Decision 1).
+
+### Phase 1 — TS registry (register-as-is refactor)
+Wrap the 41 voice tools **and** the rest-only infra actions into the registry with **no behavior or surface change**. Each `ActionDef.surfaces` reflects exactly where the tool lives **today** (voice tools → `{voice}` (+ `rest`/`ws` only where a twin already exists); infra → `{rest}`). The coverage allow-list (§5.3) is seeded with *all* current asymmetries so the build is green without converging anything. This is the cutover that collapses the four hand-edited paths into one definition; convergence is deliberately deferred.
+
 **New files**
 - `src/actions/types.ts` — `ActionDef`, `ActionResult`, `ActionContext`, `Surface`.
 - `src/actions/registry.ts` — the canonical `ActionDef[]` (the 41 voice tools + the rest-only infra actions we choose to fold in). Handlers here are **extracted from** today's `onmessage` branches and REST bodies — same logic, moved.
@@ -235,15 +248,32 @@ This sequencing gives the operator the Python platform they want **without betti
 - `server.ts` — replace the `functionDeclarations: [ … ]` literal with `toGeminiDeclarations(registry)`; replace the `if (name === …)` chain with `const result = await runAction(name, args, ctx); resultToToolResponse(result, session, call.id)`; replace registry-backed `app.<verb>` routes with `mountRestRoutes(app, registry, ctxFactory)`. Non-tool branches (audio/interrupt) untouched.
 - `tests/test_voice_tools.ts` — delete the **regex** parity guard; point its assertions at the registry (§9).
 
-### Phase 2 — Python catalog authority (separate bead)
-- `catalog/tools.py` — Pydantic models for each tool (name, description, params, capability, surfaces, readOnly).
-- `scripts/gen-catalog.mjs` (or a Python emitter) → `src/actions/catalog.generated.ts` (binding table) + `dist/gemini.tools.json` (golden declarations).
-- `package.json` — `"gen:catalog"` script; wire into `predev`/CI.
-- No-drift test (§9, Phase 2) fails CI if generated output is stale.
+**Phase 1 exit criteria:** all surfaces derive from the registry; the regex parity guard is gone; coverage allow-list = every current asymmetry; characterization goldens (§8.5) equal `main`. *No tool has gained or lost a surface.*
 
-### Phase 3 — Python execution seam (separate bead)
-- `src/actions/rpc.ts` — typed client to a Python worker; `runAction` consults a per-def `executor: "ts" | "py"` flag and, for `"py"`, calls the worker **after** the TS-side gate passes.
-- Python worker process + health/timeout handling that still yields exactly one `ActionResult`.
+### Convergence track — burn down the allow-list, one group per phase (piecemeal)
+Each convergence is an independent, small, revertible phase. The order below is by operator value (UI-meaningful first); each can ship on its own. **Every phase follows the same TDD-of-parity cutover ritual (§8.5b):**
+
+1. **RED** — add a parity test: drive the tool through the *existing* surface and the *new* surface; assert identical `ActionResult` (same gate outcome, same redaction, same shape). It fails because the new surface doesn't exist yet.
+2. **GREEN** — flip `ActionDef.surfaces` to add the twin and remove that tool from the coverage allow-list. `mountRestRoutes` / `toGeminiDeclarations` now emit the new surface automatically; the parity test passes.
+3. **CUTOVER** — point the client (`src/App.tsx`) at the now-existing endpoint (or expose the new voice tool); delete any bespoke one-off path it replaced.
+4. **GUARD** — the parity test stays in the suite forever, so the two surfaces can never re-diverge.
+
+Suggested phase slices (each removes its rows from the allow-list):
+- **C1 — Read tools → REST:** `get_pane_summary`, `get_pane_delta`, `get_pane_gates`, `search_notes`, `list_capabilities`. (UI reads from the same handlers the voice path uses.)
+- **C2 — Handoff lifecycle → REST/WS:** `propose/revise/stage/deliver/read/list/reject_handoff`. (UI can drive handoffs, not just voice.)
+- **C3 — REST-only infra → voice:** `resize`*, `clear-exited`, `archive`/`archive/restore`, watch-rule CRUD, `panes/:id/context`. (* `resize` is a candidate to stay rest-only — viewport geometry has no voice meaning; if so it remains permanently allow-listed, see Decision 3 "inherently single-surface".)
+
+Inherently single-surface tools (kept on the allow-list permanently, by design): `set_voice_mute` (voice-only — it *is* the mic), pure viewport `resize`. The allow-list's *legitimate* residue is exactly these.
+
+### Phase 2 — Python catalog authority + codegen (parallel-able after Phase 1)
+- `catalog/tools.py` — Pydantic models for each tool (name, description, params, capability, surfaces, readOnly). **This becomes the place you edit to add/change a tool.**
+- `scripts/gen-catalog.mjs` (or a Python emitter) → **committed** `src/actions/catalog.generated.ts` (binding table) + `gemini.tools.json` (golden declarations). Both files live in-repo and are committed (Decision 2).
+- `package.json` — `"gen:catalog"` script; wire into `predev`/CI.
+- No-drift test (§8.6) fails CI if the committed generated output is stale.
+- Handler bodies stay in TS, bound by name to the Python catalog entry; a binding test (§8.6) asserts the TS handler set === the Python catalog name set.
+
+### Phase 3 — Python *execution* backend — NOT PLANNED (Decision 1)
+Out of scope by decision. Documented only so the registry seam stays future-proof: `ActionDef` could later carry an `executor: "ts" | "py"` flag and route `"py"` handlers to a worker **after** the TS-side gate passes. Revisit only under real scaling pressure; do not build now.
 
 ## 8. TDD — tests first (the contract)
 
@@ -280,15 +310,23 @@ Order: write the test (RED), then the minimum code (GREEN), then refactor. Names
 ### 8.5 Phase 1 — characterization (no behavior change, NG1)
 21. **`each migrated tool produces the pre-refactor response shape`** (`tests/test_voice_tools.ts`, extended) — for a representative set (`list_panes`, `get_pane_summary`, `propose_command` Auto/Ask/Off, `deliver_handoff`, `stop_all`/`confirm`/`release`), push synthetic tool calls through the **new** dispatch and assert the recorded `sendToolResponse` payloads equal the captured pre-refactor goldens. (Capture goldens from `main` before the refactor; commit them as fixtures.)
 
-### 8.6 Phase 2 — Python catalog ↔ TS no-drift (separate bead)
-22. **`tests/test_tool_catalog.py`** (`py -3 -m unittest`): catalog totality; each tool's params is a valid Pydantic model; `capability ∈` the 16 + `{None,"ALWAYS_ALLOWED"}`; JSON-schema export round-trips.
-23. **`generated TS binding table is up to date`** (`tests/test_catalog_codegen.ts`): running the generator yields **no diff** vs. the committed `catalog.generated.ts` (CI guard against stale codegen).
-24. **`Python-emitted Gemini declarations equal the TS golden`**: `gemini.tools.json` from Python deep-equals the §8.2 golden — the contract that the catalog move changed nothing Gemini sees.
+### 8.5b Convergence track — parity-cutover test per group (the cutover gate)
+This is the **TDD-of-parity** ritual the operator asked for: a tool may not gain a surface until a test proves the new surface matches the existing one. One parametrized helper, reused per converging tool, in `tests/test_action_parity.ts`:
 
-### 8.7 Phase 3 — Python execution seam (separate bead)
-25. **`a py-executor tool returns the same ActionResult shape as its ts twin`** (contract test against a stub worker).
-26. **`the gate is enforced before the RPC boundary`** — an `Off` capability returns `blocked` **without** the worker being called (safety never depends on the worker).
-27. **`worker timeout/crash yields a single error result`** — the voice path still answers `call.id` exactly once.
+22. **`<tool> behaves identically on its existing and new surface`** — for each tool in the converging group, drive the action through both surfaces (e.g. voice mock call *and* the new REST route) against the same `manager` state and assert **deep-equal `ActionResult`**: same gate disposition (Auto/Ask/Off → ok/pending/blocked), same redaction, same payload. Written **RED first** (new surface 404s / undeclared) → flip `surfaces` + drop the allow-list row → **GREEN**.
+23. **`converged tool is removed from the coverage allow-list`** — `surfaceCoverage` shows the tool on both surfaces and the allow-list no longer lists it (so §8.4 #20 now *requires* the twin to exist — regression-proof).
+24. **`the parity test is permanent`** — left in the suite after cutover so the surfaces can never silently re-diverge (this is the §7 GUARD step, encoded).
+
+> Each Convergence phase (C1/C2/C3) adds rows 22–24 for *its* tool group only; the helper makes that a few lines per tool. The phase is mergeable the moment its parity tests are green and the client cutover is done.
+
+### 8.6 Phase 2 — Python catalog ↔ TS no-drift (separate bead)
+25. **`tests/test_tool_catalog.py`** (`py -3 -m unittest`): catalog totality; each tool's params is a valid Pydantic model; `capability ∈` the 16 + `{None,"ALWAYS_ALLOWED"}`; JSON-schema export round-trips.
+26. **`generated TS binding table is up to date`** (`tests/test_catalog_codegen.ts`): running the generator yields **no diff** vs. the **committed** `catalog.generated.ts` (CI guard against stale codegen — Decision 2).
+27. **`Python catalog name set === TS handler name set`** (binding test): every catalog entry has a TS handler and vice-versa — the cross-language analogue of the §8.2 #6 parity test.
+28. **`Python-emitted Gemini declarations equal the TS golden`**: the committed `gemini.tools.json` deep-equals the §8.2 golden — the catalog move changed nothing Gemini sees.
+
+### 8.7 Phase 3 — NOT PLANNED (Decision 1)
+No execution-backend tests in this plan. If revisited, the seam contract would be: a `"py"`-executor tool returns the same `ActionResult` shape as its TS twin; the gate is enforced **before** the RPC boundary (an `Off` capability returns `blocked` without the worker being called); a worker timeout/crash still answers `call.id` exactly once.
 
 ## 9. Wire-mapping reference (ActionResult → surface)
 
@@ -312,21 +350,37 @@ This table is the single definition of how every surface answers — pinned by t
 - **R6 — Phase 3 latency/availability.** _Mitigation:_ keep realtime-hot reads (`list_panes`, `get_pane_delta`) TS-executed; gate before RPC; one-shot error mapping (§8.7).
 - **R7 — Worktree/commit policy.** This is a refactor of `server.ts`; the implementing agent must follow the repo's worktree-isolation rule (commit-authorized agents work in their own worktree).
 
-## 11. Open questions
+## 11. Resolved decisions (was: open questions)
 
-1. **Phase-2 shape (load-bearing):** Python as **catalog authority + codegen** (recommended, low runtime risk) vs. a **full Python execution backend** now (Option B; high cost/risk)? Phase 1 is identical either way, so this can be decided after Phase 1 lands.
-2. **Generated artifacts:** commit `catalog.generated.ts` / `gemini.tools.json` to the repo (simpler diffs, no build dep) or build them in CI only?
-3. **Surface convergence targets:** which currently-asymmetric tools *should* gain their missing surface (e.g. expose `get_pane_gates`/`search_notes`/handoff-lifecycle over REST so the UI reaches parity), and which stay intentionally one-surface (e.g. `set_voice_mute` voice-only, `resize` rest-only)? This populates the §5.3 allow-list.
-4. **Schema library:** `zod` (proposed — one schema for validation + generation) vs. hand-rolled JSON Schema. Adds one dependency; pays for itself in §8.2/§8.3.
+All four open questions were answered by the operator on 2026-06-03 (see the "Decisions" block at the top):
 
-## 12. Definition of Done (Phase 1)
+1. **Phase-2 shape** → **Python catalog + codegen** (execution stays in TS; no full Python backend). 
+2. **Generated artifacts** → **committed in-repo** alongside hand-written code (one repo, everything together), guarded by a no-drift test.
+3. **Surface convergence** → **register-as-is in Phase 1, then converge piecemeal** in the §7 Convergence track, each group gated by a parity-cutover test. Convergence appetite is full (reads→REST, handoffs→REST, infra→voice) but sequenced after the registry lands; only `set_voice_mute` / pure `resize` stay permanently single-surface.
+4. **Schema library** → **`zod`** (one schema for validation + Gemini generation).
 
-- [ ] `src/actions/{types,registry,gemini,rest,coverage}.ts` exist; all 41 voice tools (plus chosen rest-only infra actions) are registry entries.
+Remaining genuine unknowns (to settle during implementation, not blocking the spec): exact REST paths/verbs for the newly-converged tools (C1–C3); whether `resize` converges or stays rest-only; the precise WS message names in §9 (placeholder shapes today).
+
+## 12. Definition of Done
+
+### Phase 1 (register-as-is) — DoD
+- [ ] `src/actions/{types,registry,gemini,rest,coverage}.ts` exist; **all 41 voice tools and the rest-only infra actions** are registry entries with their *current* surfaces.
 - [ ] `server.ts` Gemini declarations + dispatch + registry-backed REST routes are **generated** from the registry; no `if (name === …)` tool chain remains.
-- [ ] §8.1–§8.5 tests are green; the **regex** parity guard is deleted and replaced.
-- [ ] `npm run lint` (`tsc --noEmit`), `npm run test:unit`, and `npm run build` pass; `npm run smoke:claude` still drives a live pane.
-- [ ] No behavior change vs. `main` (characterization goldens equal).
-- [ ] Follow-up beads filed for Phase 2 (Python catalog) and Phase 3 (execution seam), and for each §11 decision.
+- [ ] §8.1–§8.5 tests green; the **regex** parity guard is deleted and replaced by the structural one (§8.2 #6).
+- [ ] Coverage allow-list = **every current asymmetry**; `surfaceCoverage` test (§8.4 #20) green with no surface having changed.
+- [ ] `npm run lint` (`tsc --noEmit`), `npm run test:unit`, `npm run build` pass; `npm run smoke:claude` still drives a live pane.
+- [ ] **No behavior change** vs. `main` (characterization goldens equal).
+- [ ] Follow-up beads filed for each Convergence phase (C1/C2/C3) and for Phase 2 (Python catalog).
+
+### Convergence phase Cn — DoD (repeats per group)
+- [ ] Parity-cutover tests (§8.5b) green for every tool in the group (existing surface ≡ new surface).
+- [ ] `ActionDef.surfaces` updated; the group's rows removed from the coverage allow-list.
+- [ ] Client (`src/App.tsx`) cut over to the new surface; the bespoke path it replaced is deleted.
+- [ ] Parity tests remain in the suite (permanent anti-divergence guard).
+
+### Phase 2 (Python catalog) — DoD
+- [ ] `catalog/tools.py` is the authored source; `catalog.generated.ts` + `gemini.tools.json` are committed and regenerated by `npm run gen:catalog`.
+- [ ] §8.6 tests green (no-drift, name-set binding, Gemini golden unchanged).
 
 ---
 
