@@ -42,11 +42,14 @@ export const stopAll: ActionDef<typeof NoParams> = {
   readOnly: false,
   surfaces: new Set(["voice", "rest", "ws"]),
   rest: { method: "post", path: "/api/stop-all" },
-  handler: (_args, ctx): ActionResult => {
-    // PROOF handler: the real stopAll(false) closure lives in server.ts and is wired on ctx in
-    // Phase C. Here we broadcast the same `frozen` frame the operator sees and report ok.
-    ctx.broadcast({ type: "frozen", frozen: true });
-    return { kind: "ok", output: "Frozen and cancelled everything in flight; panes keep running." };
+  handler: async (_args, ctx): Promise<ActionResult> => {
+    // Stage 1: freeze + cancel-in-flight via the real injected brake closure (it broadcasts the
+    // `frozen` frame itself). running = the still-alive pane names, which we narrate back.
+    const running = await ctx.stopAll(false);
+    const output = running.length
+      ? `I've frozen myself and cancelled everything in flight. ${running.length} pane(s) are still running (${running.join(", ")}). Should I also kill them? That can't be undone — say "kill them" to confirm, or "release" to resume.`
+      : `I've frozen myself and cancelled everything in flight. No panes are running, so there's nothing to kill. Say "release" when you want to resume.`;
+    return { kind: "ok", output };
   },
 };
 
@@ -59,9 +62,16 @@ export const confirmStopAll: ActionDef<typeof NoParams> = {
   readOnly: false,
   surfaces: new Set(["voice", "rest", "ws"]),
   rest: { method: "post", path: "/api/stop-all/confirm" },
-  handler: (_args, ctx): ActionResult => {
-    ctx.broadcast({ type: "stop_all" });
-    return { kind: "ok", output: "Killed running panes; they stay killed. Still frozen — say 'release' to resume." };
+  handler: async (_args, ctx): Promise<ActionResult> => {
+    // Stage 2: only valid while frozen-awaiting-confirm. killed = the pane names actually killed.
+    if (!ctx.isFrozen()) {
+      return { kind: "ok", output: "There's nothing to confirm — I'm not frozen. Say \"stop everything\" first if you want to halt." };
+    }
+    const killed = await ctx.stopAll(true);
+    const output = killed.length
+      ? `Done — I killed ${killed.length} pane(s): ${killed.join(", ")}. They stay killed; I'm still frozen, say "release" to resume.`
+      : `There were no running panes left to kill. I'm still frozen — say "release" to resume.`;
+    return { kind: "ok", output };
   },
 };
 
@@ -75,8 +85,11 @@ export const releaseStopAll: ActionDef<typeof NoParams> = {
   surfaces: new Set(["voice", "rest", "ws"]),
   rest: { method: "post", path: "/api/stop-all/release" },
   handler: (_args, ctx): ActionResult => {
-    ctx.broadcast({ type: "frozen", frozen: false });
-    return { kind: "ok", output: "Released — un-frozen; your safety gates are back exactly as they were." };
+    if (!ctx.isFrozen()) {
+      return { kind: "ok", output: "I wasn't frozen — nothing to release. Carrying on as normal." };
+    }
+    ctx.releaseStopAll(); // broadcasts the unfreeze frame + restores gates itself
+    return { kind: "ok", output: "Released — I've un-frozen and your safety gates are back exactly as they were. Any panes you killed stay killed." };
   },
 };
 

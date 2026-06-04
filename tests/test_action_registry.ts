@@ -139,6 +139,9 @@ function makeCtx(opts: {
     store: opts.store ?? null,
     sanitizeSettingsForClient: (settings) => settings, // passthrough (no masking needed in tests)
     recipes: opts.recipes ?? [],
+    stopAll: async () => [], // brake stubs (the brake trio is exercised by the golden suite)
+    releaseStopAll: () => {},
+    isFrozen: () => false,
   };
 }
 

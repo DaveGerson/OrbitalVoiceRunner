@@ -110,8 +110,11 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
 // ─────────────────────────────────────────────────────────────────────────────
 // create_project — FAITHFUL PORT of server.ts:2830-2848 (UNGATED).
 // G5 guard: isBadProjectDir(directory) -> spoken rejection (no persistence). The legacy
-// branch answers ONCE with the rejection string; mapped to kind:"clarify" so the model
-// re-prompts the operator (matches the §9 voice column { status:"clarify", output }).
+// branch answers ONCE with ONLY { output: "<rejection string>" } — NO status field. It is
+// kind:"ok" (a plain narrated error the model reads back), NOT kind:"clarify": clarify maps
+// to { status:"clarify", output } (§9), which would add a spurious `status` the legacy wire
+// never emitted and break the create_project.bad_dir golden. (REG1 phase-C: this was a latent
+// mis-classification in the port, surfaced once the registry path exercised it.)
 // Else: addProject(resolveProjectDir(directory), summary||"", key_terms||[]) [no-op if
 // id exists]; broadcastLedgerUpdate(); ok with the created-successfully string.
 // isBadProjectDir/resolveProjectDir are MODULE imports (src/projectDir), NOT ctx closures.
@@ -139,8 +142,8 @@ export const createProject: ActionDef<typeof CreateProjectParams> = {
     // can re-prompt the operator.
     if (isBadProjectDir(directory)) {
       return {
-        kind: "clarify",
-        text: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`,
+        kind: "ok",
+        output: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`,
       };
     }
     ctx.manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []);

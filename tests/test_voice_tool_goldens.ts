@@ -197,9 +197,18 @@ describe("REG1 voice-tool dispatch goldens (no-behavior-change oracle)", () => {
   // Make `paneId` the single active pane (the source of truth for propose_command /
   // deliver_handoff writes). The real UI sends a `set_active_pane` WS frame, but that is
   // async and races an immediately-following tool call; the voice `switch_active_pane`
-  // tool sets `activePaneId` SYNCHRONOUSLY inside the same dispatch and answers when done,
-  // so awaiting its response guarantees the active pane is set before the next call.
+  // tool sets `activePaneId` inside its dispatch and answers when done.
+  //
+  // REG1 phase-C ordering note: the PRIOR test's clearActivePane() is a fire-and-forget WS
+  // `set_active_pane:null` frame sitting in the server's inbound macrotask queue. Under the
+  // unified-registry dispatch, switch_active_pane answers one macrotask LATER than the old
+  // synchronous if-chain did (runAction awaits the handler), which used to let that stale null
+  // frame interleave AFTER switch set the pane and clobber it back to null. We FLUSH that
+  // pending inbound frame FIRST (one macrotask turn), so the prior teardown is fully applied
+  // before switch_active_pane lands — restoring this helper's documented guarantee that the
+  // active pane is set (and stays set) before the next call. No golden assertion changes.
   async function setActivePane(paneId: string): Promise<void> {
+    await new Promise((r) => setTimeout(r, 0)); // drain any in-flight set_active_pane:null teardown frame
     const call = session.emitToolCall("switch_active_pane", { pane_id: paneId });
     await waitFor(() => mock.responseFor(call));
   }

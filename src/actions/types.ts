@@ -265,6 +265,16 @@ export interface ActionContext {
    *  ReadonlyArray — handlers only read it. */
   recipes: ReadonlyArray<OrchestrationRecipe>;
 
+  // ── Emergency brake (server.ts:1879/1955 — the always-allowed STOP-ALL trio) ──────────────────
+  /** STOP-ALL: freeze + cancel-in-flight (kill=false → returns the still-running pane names) or the
+   *  irreversible kill (kill=true → returns the killed pane names). Broadcasts the frozen / stop_all
+   *  frames itself (server.ts:1879). The brake is ALWAYS allowed — never gated. */
+  stopAll: (kill: boolean) => Promise<string[]>;
+  /** Clear the freeze; safety gates restore exactly as they were (server.ts:1955). Does not restart panes. */
+  releaseStopAll: () => void;
+  /** Read the live STOP-ALL `frozen` flag — confirm_stop_all / release_stop_all guard on it. */
+  isFrozen: () => boolean;
+
   // deliver_handoff note: NO injected closure for the outcome→row mapping. `deliverOutcomeToHandoff`
   // is a PURE, EXPORTED function in src/handoffFlow (server.ts imports it as a value at server.ts:37,
   // and the deliver_handoff branch calls it at server.ts:3315). It captures NO server state, so it is
