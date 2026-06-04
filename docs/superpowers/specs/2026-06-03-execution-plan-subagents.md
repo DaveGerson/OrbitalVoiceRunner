@@ -71,6 +71,8 @@
 
 Builds the `src/actions/*` scaffolding and migrates **only `create_pane`** end-to-end, proving the registry pattern and fixing the keystone launch-divergence bug. Follows registry spec §5.4 + §8.3b exactly.
 
+> **Re-scope (2026-06-04, post `origin/main` @a977724):** the *gate* half of the keystone is already done on main — `restGateOutcome` (G6, `src/restGate.ts`) routes `POST /api/terminals` through the same `gateOrDefer` seam. So Wave B's net-new work is the **launch-derivation** half: pull the preset→binary map out of the three places that still hold it — REST/voice `create_pane` (pass-through `command`) and the **restart hack** (`server.ts:871–873`, `if tool_preset === "Claude Code"`) — into one `resolveLaunch` home, and make the schema a guardrail. `buildLaunchCommand` (`terminal.ts:82`, BUG-032) is a partial precedent that owns only the `--resume` decision; extend the "one home" to the binary map. Task B2's §8.3b tests already pin exactly this.
+
 ### Task B0 — Capture characterization goldens from `main`  *(prep, do first)*
 - Before any refactor, capture the pre-refactor `sendToolResponse` payloads for the representative set (registry spec §8.5 #21) and `create_pane`'s resolved launch, committing them as fixtures. These are the "no behavior change" oracle for KS and REG1.
 

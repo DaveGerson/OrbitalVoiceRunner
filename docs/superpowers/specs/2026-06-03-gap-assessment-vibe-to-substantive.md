@@ -4,6 +4,7 @@
 - **Status:** Assessment (companion to `2026-06-03-unified-tool-registry-tdd-spec.md`)
 - **Purpose:** Honestly size what separates OrbitalVoiceRunner from a tool dependable enough for the operator's daily developer workflow. Severity-ranked, effort-sized, and mapped to the three pillars (§1.1 of the registry spec).
 - **Method/confidence:** Two read-verified sub-audits (resilience; maintainability/tests/types/dead-code) + measured `grep`/`wc` over the source. Line numbers are indicative — **spot-verify before acting**; a few resilience findings are inferred from the absence of handlers and should be confirmed by reproduction.
+- **Reconciled 2026-06-04** against `origin/main` @a977724 (19 commits landed after the audit). Headline findings hold; three are now partly addressed. See §7 for the deltas before acting on any item.
 
 ---
 
@@ -111,5 +112,28 @@ Not everything is soft — these are already substantive and should **not** be r
 - The **handoff state machine** with on-disk flow tests (`test_handoff_flow.ts`, `test_handoff_resolve_e2e.ts`).
 - The **SQLite store** with migration + JSON↔SQLite parity (`test_store_*.ts`).
 - The **status machine / probe** with replay tests.
+
+## 6. Reconciliation — `origin/main` @a977724 (2026-06-04)
+
+19 commits landed between the audit and this merge. **The verdict is unchanged** — happy path solid, boundaries soft — and the highest-severity findings still hold, but the picture moved on a few, and the deltas *reinforce* the registry thesis rather than undercut it.
+
+**Findings that still hold (re-verified on the integrated tree):**
+- **A3 / QW1** no `uncaughtException`/`unhandledRejection` net — **still 0**. Holds.
+- **A2 / QW2** PTY spawn unguarded — `pty.spawn(...)` at `ptyTransport.ts:113` still has no try/catch. Holds.
+- **C1** server.ts monolith — **worse**: 3,789 → **4,038** lines. Intensified.
+- **B1** type erosion — **worse**: 117 → **140** `as any`. Intensified.
+- **KS keystone (launch-derivation half)** — the restart path still hardcodes its own `if tool_preset === "Claude Code"` map (`server.ts:871–873`); voice/REST still pass `command`. Open.
+
+**Findings now (partly) addressed — re-scope before acting:**
+| Finding | What landed | New status |
+|---|---|---|
+| §4.2 / KS **gate-bypass half** | `restGateOutcome` (G6, `restGate.ts`) routes REST pane-spawn through the same `gateOrDefer` seam | **Closed.** KS re-scopes to the launch-derivation half only. |
+| **E1 / RES3** approvals/actions not durable across restart | durable `PendingActionStore` (kzt) + `PendingApprovalStore` (nzt), intent persisted + `run()` rebuilt on boot via `actionEffects.ts` | **Largely addressed** at the persistence layer. Remaining: boot-time "N panes were running, restart them?" re-announce UX + running-PTY recovery (E2). |
+| **F4** cwd/dir duplication | `resolveProjectDir` shared helper used on voice + REST `create_project` (commit `ea66446`) | **Partly addressed** for project dir; pane cwd still inline. |
+| crash-safety direction | n2r added UI-side crash-safety (gate-cockpit normalizers + local error boundary) | Narrow (presentation only); does **not** touch the server-side A-theme (QW1/QW2/QW3). |
+
+**Finding now *strengthened* by the new code — F3 (mirror duplication):** main grew a whole family of hand-extracted, "*Mirrors X / keep in lockstep*" pure helpers — `restGate.ts`, `recipeApply.ts`, `actionPendingPayload.ts`, `actionEffects.ts`, `projectDir.ts` — each a per-surface twin maintained by hand because there is no unified action surface. This is precisely the proliferation the registry (Pillar 1) exists to end; the case for it is **stronger** post-merge, not weaker. (Also: the team is clearly TDD-disciplined — test files grew 30 → 61 — consistent with "strong cores, soft boundaries.")
+
+**Net:** Pillar 0 (QW1/QW2/QW3) is untouched by these commits and remains the cheapest reliability win. The registry (Pillar 1) is more justified. The keystone shrinks to its launch-derivation half. RES3 shrinks to its boot-UX/recovery half. No finding was invalidated.
 
 The registry work *builds on* these — it changes how actions are *defined and routed*, not how the gate, approval, or store internals work.

@@ -118,6 +118,11 @@ The motivating bug: the **UI** path was fixed to spin up Claude panes correctly,
 
 The genuinely-shared env logic — stripping `CLAUDECODE` nesting markers, the `--dangerously-skip-permissions` flag, the `--resume` UUID guard — already lives in `UniversalTerminal.start()` and works for every caller. **The one thing not shared is preset→command derivation**, and that is exactly what the model is doing badly.
 
+> **Reconciliation (2026-06-04, integrated `origin/main` @a977724).** Two of the three divergences above have since moved on `main`, but the keystone is **not** closed:
+> - **Closed — the gate half.** `restGateOutcome` (`src/restGate.ts`, commit `8f32415` "route REST pane-spawn through the capability gate, G6") makes `POST /api/terminals` reuse the *same* `gateOrDefer` seam the voice path uses; the REST-bypasses-the-gate drift (§4.2) is fixed.
+> - **Partial precedent — `buildLaunchCommand`** (`src/terminal.ts:82`, commit `a419bf0` / BUG-032) now owns the `--resume` UUID-guard decision in one place. But it owns **only** the resume flag — **not** the preset→binary map.
+> - **Still open — the actual keystone.** The restart path still carries its **own** hardcoded `if (pane.tool_preset === "Claude Code") cmd = "claude"` map (now `server.ts:871–873`), and voice/REST `create_pane` still pass a `command` string through. The preset→command single-home (Decision 7) and the removal of the restart hack remain exactly as specced below. The KS task is therefore **re-scoped** in the roadmap (the gate half is done; the launch-derivation half is the work).
+
 **The registry fixes this two ways (both specced below):**
 1. **Mechanics move into the shared handler / domain layer (Decision 7).** Preset→command derivation is pushed down into `addTerminal` against the authoritative `presets` list (`terminal.ts:736`). The UI's client-side mapping and the restart handler's hardcoded map both **collapse into that one home**; a fix lands once and every surface inherits it.
 2. **The schema becomes a guardrail.** Janus's `create_pane` takes **intent** (`tool_preset` + project/cwd), not a free-form `command`. For a non-`Custom` preset the model literally **cannot** supply a launch string — the wrong input is *unrepresentable*. Free-form `command` survives only for `Custom`. See §5.4.

@@ -7,6 +7,7 @@
   - `2026-06-03-unified-tool-registry-tdd-spec.md` — Pillar 1, the registry (the centrepiece refactor).
   - `2026-06-03-execution-plan-subagents.md` — agent-sized task breakdown for Pillars 0–1.
 - **Relationship to the product roadmap:** This is the **dependability/engineering** roadmap. It does **not** alter the LOCKED product priority stack in `docs/roadmap/RECONCILIATION.md §4` — it is the substrate-hardening track those features ride on. Where they touch (e.g. voice `create_pane`, item 5), the IDs are cross-referenced.
+- **Reconciled 2026-06-04** against `origin/main` @a977724 (19 post-audit commits). Pillar 0 untouched and still the cheapest win; **KS re-scoped to its launch-derivation half** (gate half done via `restGateOutcome`/G6); **RES3 re-scoped to boot-UX/recovery** (durable stores done via kzt/nzt); F4 partly done. The new "keep-in-lockstep" helper family *strengthens* the registry case. Full deltas in the gap assessment §6.
 
 ---
 
@@ -43,7 +44,7 @@ Every gap-assessment finding is assigned a roadmap item with a stable ID so the 
 ### Pillar 1 — Registry (Stages 1–2)  *— the registry spec; G0 legibility is the headline*
 | ID | Item | Closes | Sev | Effort |
 |---|---|---|---|---|
-| **KS** | **Keystone vertical slice** — `create_pane` migrated end-to-end: single-home `resolveLaunch` derivation, schema-as-guardrail (model picks `tool_preset`, cannot author a launch string), voice≡REST parity test (§8.3b). Proves the registry pattern before the bulk migration. | [B4] keystone | HIGH | M |
+| **KS** | **Keystone vertical slice** — `create_pane` migrated end-to-end: single-home `resolveLaunch` derivation, schema-as-guardrail (model picks `tool_preset`, cannot author a launch string), voice≡REST parity test (§8.3b). Proves the registry pattern before the bulk migration. **Re-scoped 2026-06-04:** the *gate* half is already done on main (`restGateOutcome`, G6); KS is now the **launch-derivation** half — fold the preset→binary map + the restart hack (`server.ts:871–873`) into one home; `buildLaunchCommand` (BUG-032) is a partial precedent (owns only `--resume`). | [B4] keystone | HIGH | M |
 | **REG1** | Full Phase-1 register-as-is — `src/actions/{types,registry,gemini,rest,coverage}.ts`; migrate all 41 voice tools + rest-only infra; swap `server.ts` dispatch + REST mount to generators; derive the capability matrix from the registry; **build the `action_log` seam** (§5.6); delete the regex parity guard; characterization goldens. | [B1][C1][D1·][D4][F3][G0] | HIGH | L |
 | **CV1** | Convergence C1 — read tools → REST (`get_pane_summary/delta/gates`, `search_notes`, `list_capabilities`) | [D1] | MED | M |
 | **CV2** | Convergence C2 — handoff lifecycle → REST/WS | [D1] | MED | M |
@@ -55,7 +56,7 @@ Every gap-assessment finding is assigned a roadmap item with a stable ID so the 
 |---|---|---|---|---|
 | **RES1** | Gemini session reconnect — resume from `sessionResumption` token; in-flight `runAction` idempotent-replayable or reported interrupted; pending approvals re-announced | [A1-full][D3] | HIGH | M |
 | **RES2** | PTY death handling — pane death → attention item + earcon; `read`/`propose` on a dead pane returns clean `blocked`/`clarify`; restart via shared `resolveLaunch`; ConPTY drain tested | [A5][D2] | MED | L |
-| **RES3** | Server-restart recovery — deterministic restore of ledger/handoffs/approvals/`frozen`; "N panes were running, restart them?"; approvals re-announced on boot; nothing silently re-executes | [E1][E2] | MED | M |
+| **RES3** | Server-restart recovery — **re-scoped 2026-06-04:** the persistence half is **done on main** (durable `PendingActionStore`/`PendingApprovalStore`, intent persisted + `run()` rebuilt on boot via `actionEffects.ts`). Remaining: boot-time "N panes were running, restart them?" re-announce UX + running-PTY recovery; nothing silently re-executes | [E1·done][E2] | MED | S |
 | **RES4** | Per-action timeout in `runAction` — stuck handler → `{kind:"error"}` answered once; realtime session never blocked | (spec §13) | MED | S |
 | **RES5** | Failure-injection test suite (`tests/test_resilience.ts`) — kill the mock session mid-tool-call, transport exit mid-command, persist+re-import server | [D3] | HIGH | M |
 | **RES6** | Attention-queue cap audit — ensure `pruneAttention()` at every mutation site (BUG-035) | [E3] | MED | S |
@@ -73,7 +74,7 @@ Every gap-assessment finding is assigned a roadmap item with a stable ID so the 
 | **DBT2** | Gemini message envelope typing — one validated shape for the `onmessage` polyfills | [B3] | MED | M |
 | **DBT3** | Legacy ledger backend decision — retire `JANUS_LEDGER_BACKEND=legacy` (~500 LOC) or keep as a documented escape hatch | [F2] | MED | M |
 | **DBT4** | `App.tsx` decomposition (4.5k lines) — split the UI monolith; own track, parallel to the server work | [C2] | HIGH | L |
-| **DBT5** | Duplication mop-up — cwd resolution, repeated broadcast shapes (mostly absorbed by REG1) | [F4] | LOW | S |
+| **DBT5** | Duplication mop-up — cwd resolution (project-dir half done on main via `resolveProjectDir`; pane cwd + broadcast shapes remain; mostly absorbed by REG1) + the new hand-mirrored helper family (`restGate`/`recipeApply`/`actionPendingPayload`/`actionEffects`, all "keep in lockstep") | [F3][F4] | LOW | S |
 
 ## 2. Sequenced plan (stages, gates, dependencies)
 
