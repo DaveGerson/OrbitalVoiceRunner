@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -225,6 +225,30 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
         expires_at INTEGER NOT NULL
       );
       CREATE INDEX idx_pending_actions_expires ON pending_actions(claimed, expires_at);
+    `);
+  },
+  // v6 (PLM2): unified ACTION LOG — one append-only row per runAction() invocation (the registry's
+  // observability spine). `ts` is the store-stamped insert time (epoch ms). `args_redacted` is a
+  // redaction-applied JSON string (nullable). `idempotency_key` is reserved for PLM4 replay-detection
+  // and is indexed so a future exactly-once lookup is O(log n). Purely additive (new table, no ALTER)
+  // — safe on an already-migrated DB. Distinct from the `events` audit spine: events tracks domain
+  // state-changes; action_log tracks the registry-action call surface (name/capability/result/latency).
+  (db) => {
+    db.exec(`
+      CREATE TABLE action_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        name TEXT,
+        capability TEXT,
+        result_kind TEXT,
+        ms INTEGER,
+        args_redacted TEXT,
+        surface TEXT,
+        idempotency_key TEXT
+      );
+      CREATE INDEX idx_action_log_ts              ON action_log(ts);
+      CREATE INDEX idx_action_log_name_ts         ON action_log(name, ts);
+      CREATE INDEX idx_action_log_idempotency_key ON action_log(idempotency_key);
     `);
   },
 ];

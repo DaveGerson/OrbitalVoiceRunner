@@ -48,6 +48,21 @@ export type ActionResult =
   | { kind: "error"; message: string };                              // handler failure (still answered once)
 
 /**
+ * One row of the per-action audit trail emitted by runAction (the audit() seam). The store stamps
+ * `ts` later — it is intentionally NOT part of this shape. `args` carries the PARSED args (the
+ * store/redaction wiring is done later in server.ts — runAction never logs raw, un-redacted args).
+ * `surface` is the dispatch surface ("voice" / "REST" / "WS"), derived from ctx.trigger.
+ */
+export interface ActionAuditRow {
+  name: string;          // the dispatched action name
+  capability: string;    // def.capability (the matrix row, or ALWAYS_ALLOWED)
+  resultKind: string;    // ActionResult.kind: ok | pending | clarify | blocked | error
+  ms: number;            // wall-clock handler elapsed (performance.now() delta)
+  args?: unknown;        // parsed args (NOT raw); redaction wired later in the store
+  surface?: string;      // dispatch surface, from ctx.trigger
+}
+
+/**
  * The exact disposition union the real server.ts gateOrDefer returns (server.ts:1768). runAction
  * branches on `.disposition`: "run" -> invoke handler, "forbidden" -> blocked, "deferred" -> pending.
  */
@@ -206,6 +221,11 @@ export interface ActionContext {
   dispatchProposal: DispatchProposal; // pane-WRITE HiTL choke-point (server.ts:2250), injected
   gateCapability: GateCapability;     // Off-veto-only gate (server.ts:1734), injected
   redact: (s: string) => string;      // redactSecrets, injected
+  /** Optional per-action audit sink. runAction best-effort calls this once per dispatch (inside a
+   *  try/catch that NEVER throws) with an ActionAuditRow. The store wiring (audit -> JanusStore,
+   *  which stamps `ts` + applies redaction) is done later in server.ts; here it is only defined +
+   *  called. Absent on the test/REST/WS paths that do not opt in. */
+  audit?: (row: ActionAuditRow) => void;
 
   // ── Active-pane source of truth (server.ts:458, a closure-local `let activePaneId`) ──────────
   /** Read the live active pane id (the single source of truth for where Janus may write).
@@ -301,6 +321,12 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
   handler: (args: z.infer<S>, ctx: ActionContext) => Promise<ActionResult> | ActionResult;
   /** Optional arg coercion for back-compat (e.g. propose_command: command -> instruction). */
   coerceArgs?: (raw: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * Optional per-action deadline override (ms). runAction races the handler against this ceiling for
+   * NON-ALWAYS_ALLOWED actions; falls back to DEFAULT_ACTION_TIMEOUT_MS when unset. A fast handler
+   * still returns immediately — this is a ceiling, not a delay. ALWAYS_ALLOWED actions are exempt.
+   */
+  timeoutMs?: number;
 }
 
 /** The ALWAYS_ALLOWED sentinel, exported so generators/tests reference one string. */

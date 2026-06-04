@@ -14,12 +14,20 @@
 
 import { Type } from "@google/genai";
 import { z } from "zod";
+import { ALWAYS_ALLOWED } from "./types";
 import type {
   ActionContext,
   ActionDef,
   ActionResult,
   LiveSessionLike,
 } from "./types";
+
+/**
+ * Per-action deadline ceiling (ms) used when an ActionDef does not set `timeoutMs`. The deadline is
+ * a CEILING, not a delay — a fast handler returns immediately. ALWAYS_ALLOWED (the emergency brake)
+ * is EXEMPT: a brake call must always run to completion, never be timed out.
+ */
+export const DEFAULT_ACTION_TIMEOUT_MS = 30000;
 
 /** A Gemini FunctionDeclaration (the subset we emit). `parameters` is always an OBJECT schema. */
 export interface GeminiFunctionDeclaration {
@@ -192,17 +200,84 @@ export async function runAction(
     // 1 execution point. The HANDLER owns gating: it calls ctx.gateOrDefer / ctx.dispatchProposal /
     // ctx.gateCapability exactly where and how its legacy server.ts branch does (or not at all, for
     // the intentionally-ungated tools). runAction applies no gate of its own.
-    const result = await def.handler(args as never, ctx);
+    //
+    // PLM1 — per-action timeout. NON-ALWAYS_ALLOWED handlers race a deadline ceiling so a wedged tool
+    // can never hang the dispatch loop; ALWAYS_ALLOWED (the emergency brake) is EXEMPT — a brake call
+    // must always run to completion. Elapsed ms is measured around the handler with performance.now()
+    // (high-resolution) and fed to the audit seam below.
+    const start = performance.now();
+    let result: ActionResult;
+    if (def.capability === ALWAYS_ALLOWED) {
+      result = await def.handler(args as never, ctx);
+    } else {
+      result = await raceDeadline(
+        () => Promise.resolve(def.handler(args as never, ctx)),
+        def.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+        name
+      );
+    }
+    const ms = performance.now() - start;
 
     // 1 redaction point: readOnly results never leave the process un-redacted (mandatory, §5.6).
-    if (def.readOnly) {
-      return redactResult(result, ctx.redact);
+    const finalResult: ActionResult = def.readOnly ? redactResult(result, ctx.redact) : result;
+
+    // audit() seam — best-effort, fired exactly once per dispatch. The store wiring (-> JanusStore,
+    // which stamps `ts` + applies redaction) is done later in server.ts; here we only define + call.
+    // The try/catch NEVER rethrows: an audit sink fault must not break dispatch.
+    try {
+      ctx.audit?.({
+        name,
+        capability: def.capability,
+        resultKind: finalResult.kind,
+        ms,
+        args, // parsed args (NOT raw); the store applies redaction later
+        surface: ctx.trigger,
+      });
+    } catch {
+      // swallow — audit must never break the dispatch path.
     }
-    return result;
+
+    return finalResult;
   } catch (e) {
     // ONE try/catch. A throwing handler becomes a typed error, answered once by the surface.
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/**
+ * Race a handler thunk against a deadline ceiling. If the deadline wins, resolve EXACTLY ONCE with a
+ * typed timeout error; the handler's eventual settle is then ignored. The timer is ALWAYS cleared
+ * (no dangling setTimeout) whether the handler or the deadline wins, or the handler throws.
+ */
+function raceDeadline(
+  run: () => Promise<ActionResult>,
+  ms: number,
+  name: string
+): Promise<ActionResult> {
+  return new Promise<ActionResult>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ kind: "error", message: `action ${name} exceeded its ${ms}ms deadline` });
+    }, ms);
+    // node timers: don't keep the event loop alive on account of this watchdog.
+    (timer as { unref?: () => void }).unref?.();
+    run().then(
+      (r) => {
+        clearTimeout(timer);
+        if (settled) return; // deadline already answered — ignore the late settle.
+        settled = true;
+        resolve(r);
+      },
+      (err) => {
+        clearTimeout(timer);
+        if (settled) return; // deadline already answered — ignore the late throw.
+        settled = true;
+        reject(err); // surfaced to the outer try/catch -> typed error, answered once.
+      }
+    );
+  });
 }
 
 /** Redact string leaves of a readOnly result so secrets never leave the process. */

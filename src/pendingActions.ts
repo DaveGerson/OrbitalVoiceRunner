@@ -23,6 +23,7 @@
  */
 
 import type { StoredPendingAction } from "./store/types";
+import type { VersionStamp } from "./actionEffects";
 
 /**
  * Durable backend contract PendingActionStore depends on. JanusStore implements it; a null backend
@@ -51,8 +52,15 @@ export interface PendingAction {
    * Serializable INTENT the durable row persists; rebuilt into `run` on boot via actionEffects.
    * Optional on the legacy / in-memory path (only the closure is needed there). When a durable store
    * is present AND `params` is set, add() also writes a pending_actions row.
+   *
+   * PLM3 version guard (F3): the server stamps the OPTIONAL { actionName, schemaHash } (VersionStamp)
+   * into this bag at staging time. On boot, checkActionVersion(actionEffects) re-derives the current
+   * actionSchemaHash(actionName) and QUARANTINES the rehydrated intent (re-confirm, never blind
+   * replay) when the action was renamed/removed or its identity/shape drifted. buildActionRun ignores
+   * the stamp; it only discriminates effects by `capability`. Legacy rows carry neither field and are
+   * treated as "unknown_action".
    */
-  params?: Record<string, unknown>;
+  params?: Record<string, unknown> & VersionStamp;
   /** TTL override for the durable expires_at (defaults to ACTION_DEFAULT_TTL_MS). */
   ttlMs?: number;
   /** Creation epoch ms — drives the TTL sweep (parity with PendingApproval). */

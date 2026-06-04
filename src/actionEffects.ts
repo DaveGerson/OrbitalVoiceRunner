@@ -29,6 +29,11 @@
  * keep both.
  */
 
+// The version guard derives an action's current schema hash from the canonical registry. registry.ts
+// imports only zod + the static ActionDef groups (NO server boot), so this keeps actionEffects PURE
+// (importable directly by the unit tests, no listener spun up).
+import { actionSchemaHash } from "./actions/registry";
+
 /**
  * Which staging site produced a create_pane intent. The three sites run the SAME side effects
  * (addTerminal + broadcasts) but each returns a DIFFERENT operator/model-facing confirm string, so
@@ -68,10 +73,56 @@ export interface SetPanePermissionsParams { paneId: string; projectId: string; p
  */
 export interface UpdateMetadataParams { op: "amend" | "delete"; noteId: string; text?: string; }
 
-/** The serializable intent of a deferred action: capability + a capability-specific param bag. */
-export interface ActionIntent {
+/**
+ * The serializable intent of a deferred action: capability + a capability-specific param bag, plus
+ * the OPTIONAL PLM3 version stamp ({ actionName, schemaHash }) the server writes when staging so a
+ * later boot can quarantine a drifted def before rebuilding its closure. The stamp is optional so
+ * legacy rows (pre-stamp) still type-check; checkActionVersion treats a missing/unknown name as
+ * "unknown_action" (re-confirm, never blind-replay). buildActionRun ignores the stamp.
+ */
+export interface ActionIntent extends VersionStamp {
   capability: string;
   params: Record<string, unknown>;
+}
+
+/**
+ * PLM3 durable-closure VERSION-GUARD stamp (F3). When a pending action is staged, the server stamps
+ * the action's canonical name and its `actionSchemaHash(name)` into the persisted intent params, so a
+ * later boot can prove the action's identity+shape is unchanged before blindly rebuilding+running the
+ * effect. Both OPTIONAL: legacy rows (pre-stamp) carry neither — they are treated as "unknown_action"
+ * by the guard (re-confirm, never silently replay against a possibly-drifted def). Stored alongside
+ * the capability-specific params; the rebuild path (buildActionRun) ignores them.
+ */
+export interface VersionStamp {
+  /** Canonical registry action name this intent was minted against (e.g. "amend_note"). */
+  actionName?: string;
+  /** actionSchemaHash(actionName) at staging time — the value boot re-derivation must still match. */
+  schemaHash?: string;
+}
+
+/**
+ * QUARANTINE gate (PLM3 F3). Given a rehydrated intent's stamped { actionName, schemaHash }, decide
+ * whether the persisted closure is SAFE to rebuild + run on this boot. ok only when the action still
+ * exists AND its current schema hash equals the stamped one; otherwise a reason a caller renders into
+ * a "re-confirm, don't blind-replay" path:
+ *   - "unknown_action": no stamped name, or the name is no longer in the registry (renamed/removed,
+ *      or a legacy pre-stamp row). actionSchemaHash returns null -> never matches a stamped hash.
+ *   - "schema_changed": the action exists but its identity/shape moved (capability or param keys
+ *      changed) since staging, so the stamped hash no longer matches the current one.
+ *
+ * A caller that gets ok:false MUST NOT run the effect — it re-confirms with the operator instead.
+ * Pure: no randomness, no time; `actionSchemaHash` is a deterministic registry lookup.
+ */
+export function checkActionVersion(
+  stored: { actionName?: string; schemaHash?: string }
+): { ok: boolean; reason?: "unknown_action" | "schema_changed" } {
+  const current = stored.actionName ? actionSchemaHash(stored.actionName) : null;
+  // No name stamped, or the action no longer exists in the registry.
+  if (current === null) return { ok: false, reason: "unknown_action" };
+  // Action exists but its identity/shape drifted since the intent was stamped (covers a missing
+  // stamped hash on an otherwise-known action — a partially-stamped/legacy row is still unsafe).
+  if (current !== stored.schemaHash) return { ok: false, reason: "schema_changed" };
+  return { ok: true };
 }
 
 /** The live references a rebuilt run() needs. Supplied by server.ts at boot (fresh per process). */

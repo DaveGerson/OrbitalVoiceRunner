@@ -5,6 +5,24 @@ import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
 import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHandoff, HandoffState } from "./types";
 import { pruneOnBoot, type PruneOpts } from "./retention";
 
+/**
+ * One persisted row of the unified ACTION LOG (schema v6, PLM2). Mirrors F1's ActionAuditRow call
+ * shape (name/capability/result_kind/ms/args/surface) so runAction's ctx.audit seam can be wired
+ * straight to recordAction() in server.ts. `ts` is store-stamped at insert; `id` is the autoincrement
+ * PK. `idempotency_key` is reserved for PLM4 replay-detection (indexed, nullable).
+ */
+export interface ActionLogRow {
+  id: number;
+  ts: number;
+  name: string | null;
+  capability: string | null;
+  result_kind: string | null;
+  ms: number | null;
+  args_redacted: string | null;
+  surface: string | null;
+  idempotency_key: string | null;
+}
+
 export class JanusStore {
   readonly db: Database.Database;
   constructor(dbPath: string) {
@@ -263,6 +281,50 @@ export class JanusStore {
   getExpiredActions(now = Date.now()): StoredPendingAction[] {
     return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
       .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+  }
+
+  // ── unified action log (schema v6, PLM2) ────────────────────────────────────────────────────────
+  // Append-only observability spine for the action registry: one row per runAction() invocation. `ts`
+  // is store-stamped (epoch ms) at insert so callers never have to. server.ts will wire runAction's
+  // ctx.audit seam (F1) to recordAction — keep the row shape compatible with F1's ActionAuditRow
+  // (name/capability/result_kind/ms/args/surface). Mirrors the recordActivity/insertPendingAction style.
+
+  /** Insert one action-log row, stamping `ts` with the current epoch ms (store-side). */
+  recordAction(row: {
+    name: string;
+    capability: string;
+    result_kind: string;
+    ms: number;
+    args_redacted?: string | null;
+    surface?: string | null;
+    idempotency_key?: string | null;
+  }): void {
+    this.db.prepare(
+      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key)
+       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key)`
+    ).run({
+      ts: Date.now(),
+      name: row.name,
+      capability: row.capability,
+      result_kind: row.result_kind,
+      ms: row.ms,
+      args_redacted: row.args_redacted ?? null,
+      surface: row.surface ?? null,
+      idempotency_key: row.idempotency_key ?? null,
+    });
+  }
+
+  /** Read the action log most-recent-first. Optional name filter + `since` (ts >= since). Default limit 100. */
+  getActionLog(filter: { limit?: number; name?: string; since?: number } = {}): ActionLogRow[] {
+    const where: string[] = []; const args: any[] = [];
+    if (filter.name) { where.push("name = ?"); args.push(filter.name); }
+    if (filter.since !== undefined) { where.push("ts >= ?"); args.push(filter.since); }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const limit = filter.limit !== undefined && filter.limit > 0 ? filter.limit : 100;
+    args.push(limit);
+    return this.db.prepare(
+      `SELECT * FROM action_log ${clause} ORDER BY id DESC LIMIT ?`
+    ).all(...args) as ActionLogRow[];
   }
 
   upsertAttention(a: import("./types").StoredAttention): void {

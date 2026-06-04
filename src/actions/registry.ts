@@ -255,3 +255,81 @@ export const REGISTRY: readonly ActionDef[] = [
   ...ORCH_ACTIONS,
   ...HANDOFF_ACTIONS,
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLM3 durable-closure VERSION GUARD (F3 core).
+//
+// A deferred action persists only its serializable INTENT ({capability, summary, params}) and
+// rebuilds its non-serializable run() closure on boot (src/actionEffects.ts buildActionRun). That
+// rebuild silently assumes the action's IDENTITY + SHAPE are unchanged across the restart. If the
+// binary that boots is a DIFFERENT build — the action was renamed, its capability moved, or its
+// param set changed — a stale intent would re-run against a mismatched effect (apply the wrong
+// thing, or apply nothing). The version guard makes that mismatch DETECTABLE: each action has a
+// stable schema hash; a staged intent stamps the hash of the action it was minted against; on boot
+// we re-derive the hash and QUARANTINE any intent whose stamp no longer matches (re-confirm instead
+// of blind replay).
+//
+// The hash is over IDENTITY + SHAPE only — { name, capability, sorted param KEY names } — NOT the
+// human-facing description, the handler body, or zod leaf TYPES. Renaming/moving an action, or
+// adding/removing/renaming a param, changes the hash (the cases that make a persisted intent unsafe
+// to replay). Reword the description or retype a field in place and the hash is unchanged — those do
+// not alter how a stamped {params} intent re-derives its effect, so an in-flight deferral survives a
+// cosmetic redeploy. It is DETERMINISTIC: no randomness, no time, no map-iteration order (keys are
+// sorted) — the same ActionDef yields the same hash in every process, which is what lets boot N+1
+// validate an intent stamped by boot N.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Read an ActionDef's param key names. Zod v4 exposes the public `.shape` getter on a ZodObject;
+ *  fall back to `.def.shape` (the internal the gemini schema walk uses) for robustness. Non-object
+ *  / shapeless schemas yield no keys (the brake trio's NoParams is a legit empty-key action). */
+function paramKeyNames(params: unknown): string[] {
+  const p = params as { shape?: Record<string, unknown>; def?: { shape?: Record<string, unknown> } };
+  const shape = p?.shape ?? p?.def?.shape;
+  return shape ? Object.keys(shape) : [];
+}
+
+/**
+ * A small, deterministic 32-bit FNV-1a string hash rendered as fixed 8-char lowercase hex. No
+ * randomness, no time, no platform dependence — pure over the input bytes. Sufficient to detect a
+ * shape/identity change of a persisted intent across a redeploy (this is a drift TRIPWIRE, not a
+ * cryptographic commitment): the realistic failure mode is an honest schema edit, not an adversary
+ * crafting a collision.
+ */
+function foldHash(s: string): string {
+  let h = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    // FNV prime multiply, kept in 32-bit unsigned via Math.imul + >>>0.
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Stable, deterministic hash of an action's IDENTITY + SHAPE, or `null` when no action by that name
+ * exists in the registry. Derived from a canonical JSON form of { name, capability, sorted param key
+ * names }. Sorting the keys removes any dependence on declaration / object-iteration order, so the
+ * hash is identical across processes and builds for an unchanged def (the property boot N+1 relies on
+ * to validate an intent stamped by boot N). Description, handler, and zod leaf types are intentionally
+ * EXCLUDED — they do not change how a stamped {params} intent re-derives its effect.
+ */
+export function actionSchemaHash(name: string): string | null {
+  const def = REGISTRY.find((a) => a.name === name);
+  if (!def) return null;
+  const canonical = JSON.stringify({
+    name: def.name,
+    capability: def.capability,
+    params: paramKeyNames(def.params).sort(),
+  });
+  return foldHash(canonical);
+}
+
+/**
+ * name -> schema hash for every action in the registry. Computed ONCE at module load (the registry is
+ * static), for boot-time bulk checks: server.ts can validate every rehydrated intent against this map
+ * without re-walking the registry per intent. `actionSchemaHash(name)` and this map agree by
+ * construction (same derivation).
+ */
+export const REGISTRY_SCHEMA_HASHES: Record<string, string> = Object.fromEntries(
+  REGISTRY.map((a) => [a.name, actionSchemaHash(a.name) as string])
+);
