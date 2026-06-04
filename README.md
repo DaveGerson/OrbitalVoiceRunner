@@ -81,8 +81,6 @@ src/
 tests/
   test_server.ts             Tests for terminal.ts / OrchestratorManager
   test_ledger.ts             Tests for the persisted project ledger
-  test_universal_terminal.py Tests for the standalone Python port
-universal_terminal.py         Standalone asyncio reference implementation of a pane
 ```
 
 State is persisted next to the server as `.janus_ledger.json` (workspaces/panes)
