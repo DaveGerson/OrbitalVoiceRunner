@@ -634,12 +634,41 @@ export class UniversalTerminal {
     delete childEnv.CLAUDE_AGENT_SDK_VERSION;
 
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
-    const { transport, usingNodePty } = this.transportFactory(finalCommand, {
-      cwd: this.cwd,
-      env: childEnv,
-      cols: this.cols,
-      rows: this.rows,
-    });
+    // QW2: pty.spawn throws SYNCHRONOUSLY on native/ENOENT failures and propagates
+    // out through createPtyTransport. Guard the single spawn chokepoint so a failed
+    // spawn DEGRADES (status="Exited") instead of crashing the process. Mirror the
+    // transport.onExit teardown below (no new "Error" status; reuse "Exited").
+    let transport: PtyTransport;
+    let usingNodePty: boolean;
+    try {
+      ({ transport, usingNodePty } = this.transportFactory(finalCommand, {
+        cwd: this.cwd,
+        env: childEnv,
+        cols: this.cols,
+        rows: this.rows,
+      }));
+    } catch (e) {
+      console.warn(
+        `[terminal] PTY spawn failed for ${this.terminalId} — pane degraded to Exited (not a crash):`,
+        e
+      );
+      // Half-assigned-state hazard: on first boot this.transport is null; on /restart
+      // it is a STALE dead transport and shellPid the old pid — explicitly reset both.
+      this.transport = null;
+      this.shellPid = undefined;
+      this.status = "Exited";
+      this.lastStatusChangeAt = Date.now();
+      this.clearProbeTimer();
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+      if (this.readyFallbackTimer) {
+        clearTimeout(this.readyFallbackTimer);
+        this.readyFallbackTimer = null;
+      }
+      return;
+    }
     this.transport = transport;
     this.usingNodePty = usingNodePty;
     // G3: re-enter the gated state for THIS (re)spawn — a /restart must not inherit

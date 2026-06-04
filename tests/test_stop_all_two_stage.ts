@@ -308,6 +308,39 @@ describe("8sq two-stage STOP-ALL (headless)", () => {
       assert.strictEqual(res.status, 409, "confirm without a freeze is rejected");
       assert.strictEqual(a.stopCount, 0, "no kill on the rejected confirm");
     });
+
+    // QW4 (bead qw4): Stage 2 used to be fire-and-forget — it reported the panes it ASKED to kill,
+    // not the panes that actually stopped. Now it awaits the kills (Promise.allSettled) and builds
+    // `killed` from FULFILLED results only; a pane whose stop() rejects is NOT in `killed`.
+    it("stop_all reports only panes that actually stopped", async () => {
+      clearPanes();
+      const ok = addPane("s2-ok");          // stops cleanly
+      const bad = addPane("s2-bad");        // stop() rejects
+      const dead = addPane("s2-dead", "Exited"); // already exited — must not be re-stopped
+
+      // Make ONE stub's stop() reject (and crucially NOT flip to Exited, mirroring a real failed kill).
+      bad.stop = async () => { bad.stopCount++; throw new Error("kill failed: process refused SIGTERM"); };
+
+      await api("/api/stop-all", { method: "POST" }); // Stage 1 freeze
+      const res = await api("/api/stop-all/confirm", { method: "POST" }); // Stage 2 (REST)
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+
+      assert.ok(Array.isArray(body.killed), "confirm reports the killed set");
+      assert.ok(body.killed.includes("s2-ok"), "the pane that actually stopped IS reported killed");
+      assert.ok(!body.killed.includes("s2-bad"), "the pane whose stop() REJECTED is NOT reported killed");
+      assert.ok(!body.killed.includes("s2-dead"), "an already-Exited pane is never reported killed");
+
+      // The rejecting pane is surfaced (not silently swallowed).
+      assert.ok(Array.isArray(body.failed), "confirm surfaces the failed kills");
+      assert.ok(body.failed.includes("s2-bad"), "the rejecting pane is reported in `failed`");
+
+      assert.strictEqual(ok.stopCount, 1, "the healthy pane was stopped exactly once");
+      assert.strictEqual(ok.status, "Exited", "the healthy pane ends Exited with stopCount===1");
+      assert.strictEqual(dead.stopCount, 0, "the already-Exited pane was not re-stopped (stopCount stays 0)");
+
+      await release();
+    });
   });
 
   describe("Release", () => {

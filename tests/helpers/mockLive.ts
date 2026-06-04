@@ -23,6 +23,10 @@ export interface MockLiveSession {
   emit: (message: any) => void;
   /** Convenience: emit a single tool call and return the messageId/callId used. */
   emitToolCall: (name: string, args?: Record<string, any>, id?: string) => string;
+  /** QW3: simulate the Gemini Live socket erroring out (invokes params.callbacks.onerror). */
+  emitError: (err?: any) => void;
+  /** QW3: simulate the Gemini Live socket closing from the server side (invokes onclose). */
+  emitClose: (info?: any) => void;
   sendToolResponse: (r: any) => void;
   sendRealtimeInput: (i: any) => void;
   close: () => void;
@@ -54,6 +58,12 @@ export function installMockLive(): MockLiveHandle {
         const callId = id ?? `mock-call-${++counter}`;
         this.emit({ toolCall: { functionCalls: [{ name, id: callId, args }] } });
         return callId;
+      },
+      emitError(err: any = new Error("mock live socket error")) {
+        params?.callbacks?.onerror?.(err);
+      },
+      emitClose(info: any = { code: 1006, reason: "mock live socket closed" }) {
+        params?.callbacks?.onclose?.(info);
       },
       sendToolResponse(r: any) {
         this.responses.push(r);

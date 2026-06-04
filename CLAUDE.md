@@ -77,12 +77,10 @@ npm run lint                                   # tsc --noEmit
 npm test                                       # unit suite (tsx --test --test-force-exit)
 npm run test:e2e                               # Playwright (auto-starts Vite, ?mock=1 harness)
 npm run build                                  # vite + esbuild → dist/server.cjs
-py -3 -m unittest tests.test_universal_terminal  # python suite (use `py -3`, NOT `python3`)
 npm run smoke:claude                           # live pane smoke (needs authed Claude binary)
 ```
 
-> Gotchas: the unit runner needs `--test-force-exit` (a PTY keeps the loop alive otherwise);
-> on Windows use `py -3` (the bare `python3` alias is a broken Store stub).
+> Gotchas: the unit runner needs `--test-force-exit` (a PTY keeps the loop alive otherwise).
 
 ## Architecture Overview
 
