@@ -32,12 +32,14 @@ import { PendingApprovalStore } from "../src/pendingApprovals";
 function makeCtx(opts: {
   audit?: (row: ActionAuditRow) => void;
   trigger?: string;
+  surface?: string;
 } = {}): ActionContext {
   return {
     manager: {} as ActionContext["manager"],
     session: null,
     callId: "call_test",
     trigger: opts.trigger ?? "test",
+    surface: opts.surface,
     userUtterance: "",
     broadcast: () => {},
     broadcastLedgerUpdate: () => {},
@@ -158,7 +160,7 @@ describe("PLM1 audit() seam", () => {
   it("(d) ctx.audit is called once with the right resultKind + a numeric ms (ok path)", async () => {
     const rows: ActionAuditRow[] = [];
     const reg = [fastAction()];
-    const result = await runAction(reg, "test_fast", {}, makeCtx({ audit: (r) => rows.push(r), trigger: "voice" }));
+    const result = await runAction(reg, "test_fast", {}, makeCtx({ audit: (r) => rows.push(r), surface: "voice" }));
     assert.strictEqual(result.kind, "ok");
     assert.strictEqual(rows.length, 1, "audit must fire exactly once per dispatch");
     const row = rows[0];
@@ -167,7 +169,7 @@ describe("PLM1 audit() seam", () => {
     assert.strictEqual(row.resultKind, "ok");
     assert.strictEqual(typeof row.ms, "number", "ms must be numeric");
     assert.ok(Number.isFinite(row.ms) && row.ms >= 0, "ms must be a finite non-negative number");
-    assert.strictEqual(row.surface, "voice", "surface is derived from ctx.trigger");
+    assert.strictEqual(row.surface, "voice", "surface comes from the explicit ctx.surface token (set by the context builder)");
   });
 
   it("(d) audit fires once with resultKind:error on the timeout path", async () => {

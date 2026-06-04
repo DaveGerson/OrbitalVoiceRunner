@@ -231,7 +231,10 @@ export async function runAction(
         resultKind: finalResult.kind,
         ms,
         args, // parsed args (NOT raw); the store applies redaction later
-        surface: ctx.trigger,
+        // Clean surface token, NOT the raw operator utterance (ctx.trigger on the voice path is the
+        // spoken phrase). The context builders set ctx.surface explicitly (the one source of truth);
+        // fall back to a session-presence heuristic (voice carries a live session; REST/WS pass null).
+        surface: ctx.surface ?? (ctx.session ? "voice" : "rest"),
       });
     } catch {
       // swallow — audit must never break the dispatch path.

@@ -107,8 +107,9 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     }
     // Pin the exact count so a silent add/drop trips this test. Bumped 34 -> 35 by bead 8sq
     // (stop_all), then 35 -> 37 by the 8sq two-stage rework (added confirm_stop_all + release_stop_all),
-    // then 37 -> 41 by bead bjm (get_project_notes + search_notes + amend_note + delete_note).
-    assert.strictEqual(decls.length, 41, "exactly 41 voice tools declared");
+    // then 37 -> 41 by bead bjm (get_project_notes + search_notes + amend_note + delete_note),
+    // then 41 -> 43 by Wave D (get_action_log + get_health observability pair).
+    assert.strictEqual(decls.length, 43, "exactly 43 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

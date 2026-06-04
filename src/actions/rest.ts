@@ -46,18 +46,34 @@ export type RestContextFactory = (req: RestRequest) => ActionContext;
  * mountRestRoutes — register a route for every def that exposes the "rest" surface AND declares an
  * explicit `def.rest` binding. (A rest-surface def without a `rest` binding is a registry error the
  * §8.4 coverage tests catch; here we skip it defensively rather than crash boot.)
+ *
+ * `opts.only` is an incremental-cutover allow-filter: when provided, ONLY defs whose `name` is in the
+ * set are mounted (every other rest-surface def is skipped). Omitting it mounts all rest-surface defs,
+ * preserving the current behavior. This lets the registry-derived REST surface be cut over a few
+ * routes at a time without colliding with the existing hand-written routes in server.ts.
+ *
+ * Arg precedence in the handler is query params (lowest) < route params < body (highest), so a GET
+ * route can carry filters via `?limit=…` while a path/body still wins on collision.
  */
 export function mountRestRoutes(
   app: RestApp,
   registry: readonly ActionDef[],
-  ctxFactory: RestContextFactory
+  ctxFactory: RestContextFactory,
+  opts?: { only?: ReadonlySet<string> }
 ): void {
   for (const def of registry) {
     if (!def.surfaces.has("rest") || !def.rest) continue;
+    if (opts?.only && !opts.only.has(def.name)) continue;
     const { method, path } = def.rest;
     const handler: RestHandler = async (req, res) => {
-      // Merge route params + body so a route like POST /api/terminals/:id/input can carry both.
-      const rawArgs: Record<string, unknown> = { ...(req.params ?? {}), ...(req.body ?? {}) };
+      // Merge query params + route params + body so a route like POST /api/terminals/:id/input can
+      // carry both, and a GET /api/... can carry filters via the query string. Precedence (lowest ->
+      // highest): query < params < body.
+      const rawArgs: Record<string, unknown> = {
+        ...(req.query ?? {}),
+        ...(req.params ?? {}),
+        ...(req.body ?? {}),
+      };
       const ctx = ctxFactory(req);
       const result = await runAction(registry, def.name, rawArgs, ctx);
       resultToHttp(result, res);

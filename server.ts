@@ -36,7 +36,7 @@ import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
 import { PendingActionStore } from "./src/pendingActions";
-import { buildActionRun } from "./src/actionEffects";
+import { buildActionRun, checkActionVersion } from "./src/actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "./src/actionPendingPayload";
 import { restGateOutcome } from "./src/restGate";
 import { planRecipeApply } from "./src/recipeApply";
@@ -44,9 +44,10 @@ import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { GateValue, CapabilityGate, CapabilityGateMap } from "./src/types";
 import { deriveEffectiveGates, derivePostureWord, ALL_CAPABILITIES, type EffectiveMode as GateSurfaceMode } from "./src/gateSurface";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
-import { REGISTRY } from "./src/actions/registry";
+import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
+import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/rest";
 
 dotenv.config();
 
@@ -924,7 +925,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // kzt: origin:"rest" -> the rebuild returns String(result) verbatim, matching spawnEffect above.
       // Persist the ALREADY-RESOLVED cwd so a confirm-after-restart lands the pane in the same dir.
       // The intent carries the DERIVED command + NORMALIZED preset for restart parity (matches voice).
-      { origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset: preset, permissionsMode, sessionId, projectId: projectId || "" });
+      // PLM3: stamp the action identity+schema hash so a boot can quarantine a drifted def.
+      { actionName: "create_pane", schemaHash: actionSchemaHash("create_pane") ?? undefined, origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset: preset, permissionsMode, sessionId, projectId: projectId || "" });
     const out = restGateOutcome(g);
     if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
     res.status(out.status).json(out.body);
@@ -1545,7 +1547,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (planned.disposition === "defer") {
         const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
           // kzt: origin:"recipe" -> the rebuild returns the bare pane id, matching spawnPane above.
-          { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: paneCommand, toolPreset: panePreset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
+          // PLM3: stamp the action identity+schema hash so a boot can quarantine a drifted def.
+          { actionName: "create_pane", schemaHash: actionSchemaHash("create_pane") ?? undefined, origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: paneCommand, toolPreset: panePreset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
         if (g.disposition === "forbidden") blocked.push(p.id);
         else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
         else { spawnPane(); spawned.push(p.id); }
@@ -1667,6 +1670,25 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   for (const row of pendingActions.hydrateIntents()) {
     let params: Record<string, unknown> = {};
     try { params = JSON.parse(row.params); } catch { /* corrupt -> empty params; run() degrades gracefully */ }
+    const versionCheck = checkActionVersion({
+      actionName: (params as { actionName?: string }).actionName,
+      schemaHash: (params as { schemaHash?: string }).schemaHash,
+    });
+    if (!versionCheck.ok) {
+      // PLM3: the staged def drifted (renamed/moved/reshaped) or is unstamped/legacy -> do NOT blindly
+      // rebuild+replay it against a possibly-mismatched effect. Quarantine: skip re-staging; record it
+      // so the operator can re-issue. (A future boot-prune sweep removes quarantined rows.)
+      if (store) {
+        try {
+          store.recordActivity({
+            type: "permission_changed", project_id: "default_project", pane_id: null,
+            summary: `QUARANTINED deferred ${row.capability} (${versionCheck.reason}): ${row.summary}`,
+            payload: { capability: row.capability, action: "quarantined", reason: versionCheck.reason, action_id: row.id },
+          });
+        } catch { /* audit best-effort */ }
+      }
+      continue;
+    }
     const run = buildActionRun(
       { capability: row.capability, params },
       { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
@@ -2382,12 +2404,16 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // live closure/binding in THIS connection scope (or a module-level value), injected by reference
       // so the migrated handlers in src/actions/* stay thin and never reach into server.ts state. One
       // fresh ctx per tool call (callId-bound); everything else is shared by reference.
-      function buildActionContext(callId: string): ActionContext {
+      function buildActionContext(callId: string, actionName?: string): ActionContext {
         return {
           manager,
           session,                              // the live Gemini session in this scope
           callId,
+          // PLM3 version stamp for THIS dispatch — the deferring handlers spread it into the intent
+          // params they persist via gateOrDefer, so a later boot can quarantine a drifted def.
+          versionStamp: actionName ? { actionName, schemaHash: actionSchemaHash(actionName) ?? undefined } : undefined,
           trigger: currentSessionUserUtterance || "voice",
+          surface: "voice",                     // explicit dispatch-surface token (action_log)
           userUtterance: currentSessionUserUtterance,
           broadcast,
           broadcastLedgerUpdate,
@@ -2411,6 +2437,25 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           stopAll,
           releaseStopAll,
           isFrozen: () => frozen,
+          // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
+          // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
+          // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
+          audit: (row) => {
+            if (!store) return;
+            let argsRedacted: string | null = null;
+            try { argsRedacted = row.args === undefined ? null : redactSecrets(JSON.stringify(row.args)); }
+            catch { argsRedacted = null; }
+            try {
+              store.recordAction({
+                name: row.name,
+                capability: row.capability,
+                result_kind: row.resultKind,
+                ms: row.ms,
+                args_redacted: argsRedacted,
+                surface: row.surface ?? "voice",
+              });
+            } catch { /* audit is best-effort; never break the dispatch */ }
+          },
         };
       }
 
@@ -2581,7 +2626,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               // to the real stopAll/releaseStopAll/isFrozen closures via ActionContext) routes through
               // the registry. runAction is itself try/caught + never throws; the outer catch is belt-and-
               // suspenders. The Gemini declarations come from the SAME REGISTRY (toGeminiDeclarations).
-              const actionCtx: ActionContext = buildActionContext(call.id);
+              const actionCtx: ActionContext = buildActionContext(call.id, name);
               const result = await runAction(REGISTRY, name, (args ?? {}) as Record<string, unknown>, actionCtx);
               resultToToolResponse(result, session, name, call.id);
               } catch (toolErr) {
@@ -2739,6 +2784,75 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       }
       console.log("Client WS closed");
     });
+  });
+
+  // ── REST surface, DERIVED from the registry (cv/PLM2). One ActionContext per request, session:null
+  // (the result maps to HTTP, not a Gemini sendToolResponse). The pane-WRITE choke-point
+  // (dispatchProposal) is connection-scoped and intentionally a refusing stub here — the only routes
+  // we mount are read-only observability tools, which never call it. The `only` allow-set scopes the
+  // mount so it never collides with the existing hand-written routes; it grows as cv1 converges reads.
+  function buildRestActionContext(_req: RestRequest): ActionContext {
+    return {
+      manager,
+      session: null,
+      callId: undefined,
+      trigger: "rest",
+      surface: "rest",                          // explicit dispatch-surface token (action_log)
+      userUtterance: "",
+      broadcast,
+      broadcastLedgerUpdate,
+      gateOrDefer,
+      dispatchProposal: (() => ({ kind: "error", text: "pane-write is not available on the REST surface" })) as ActionContext["dispatchProposal"],
+      gateCapability,
+      redact: redactSecrets,
+      getActivePaneId: () => activePaneId,
+      setActivePane: (id) => { activePaneId = id; },
+      activeDraftTarget,
+      broadcastDraft,
+      broadcastTerminalsUpdated,
+      effectiveCapabilityGateFor,
+      pruneAttention,
+      pendingApprovals,
+      applyResolution,
+      store,
+      sanitizeSettingsForClient,
+      recipes: recipes as ActionContext["recipes"],
+      stopAll,
+      releaseStopAll,
+      isFrozen: () => frozen,
+      audit: (row) => {
+        if (!store) return;
+        let argsRedacted: string | null = null;
+        try { argsRedacted = row.args === undefined ? null : redactSecrets(JSON.stringify(row.args)); }
+        catch { argsRedacted = null; }
+        try {
+          store.recordAction({
+            name: row.name, capability: row.capability, result_kind: row.resultKind,
+            ms: row.ms, args_redacted: argsRedacted, surface: row.surface ?? "rest",
+          });
+        } catch { /* best-effort */ }
+      },
+    };
+  }
+  // Mount the registry-derived REST twins. cv1 adds the six session-independent read twins
+  // (collision-free new paths) alongside the observability reads (/api/action-log + /api/health):
+  //   get_pane_summary -> GET /api/panes/:pane_id/summary
+  //   get_pane_command_history -> GET /api/panes/:pane_id/history
+  //   get_pane_gates -> GET /api/panes/:pane_id/gates
+  //   list_capabilities -> GET /api/capabilities
+  //   list_handoffs -> GET /api/handoffs
+  //   read_handoff -> GET /api/handoffs/:handoff_id
+  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext, {
+    only: new Set([
+      "get_action_log",
+      "get_health",
+      "get_pane_summary",
+      "get_pane_command_history",
+      "get_pane_gates",
+      "list_capabilities",
+      "list_handoffs",
+      "read_handoff",
+    ]),
   });
 
   // Vite middleware for development (dynamically imported so tests / production

@@ -74,7 +74,8 @@ export const getPaneCommandHistory: ActionDef<typeof PaneIdParams> = {
   params: PaneIdParams,
   capability: "read_pane",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/panes/:pane_id/history" },
   handler: (args, ctx): ActionResult => {
     const targetId = args.pane_id;
     // FAITHFUL PORT of HistoryManager.getInstance().loadHistory(targetId): read the SAME
@@ -123,7 +124,8 @@ export const getPaneSummary: ActionDef<typeof PaneIdParams> = {
   params: PaneIdParams,
   capability: "read_pane",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/panes/:pane_id/summary" },
   handler: (args, ctx): ActionResult => {
     // getPaneSummary returns either a fenced, redacted code block OR the literal
     // `Error: Pane <id> does not exist.` STRING for a missing pane — either way it is an ok-kind
@@ -240,7 +242,8 @@ export const getPaneGates: ActionDef<typeof OptionalPaneIdParams> = {
   params: OptionalPaneIdParams,
   capability: "read_notes",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/panes/:pane_id/gates" },
   handler: (args, ctx): ActionResult => {
     // UNGATED read (legacy comment). pane_id omitted/empty => resolve GLOBAL gates (pass null).
     // effectiveCapabilityGateFor merges pane gate over global, applies spotlight loosening on the
@@ -263,7 +266,8 @@ export const listCapabilities: ActionDef<typeof NoParams> = {
   params: NoParams,
   capability: "read_notes",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/capabilities" },
   handler: (_args, _ctx): ActionResult => {
     // UNGATED read. The SAME matrix as get_pane_gates (gateSurface.ALL_CAPABILITIES — one source).
     return { kind: "ok", output: [...ALL_CAPABILITIES] };

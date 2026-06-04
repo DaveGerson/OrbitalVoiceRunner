@@ -54,3 +54,46 @@ describe("§8.4 #20b surfaceCoverage totality", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cv1 — the six session-independent reads now expose a REST twin (voice+rest).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("cv1 read-twin convergence", () => {
+  const CONVERGED_READS = [
+    "get_pane_summary",
+    "get_pane_command_history",
+    "get_pane_gates",
+    "list_capabilities",
+    "list_handoffs",
+    "read_handoff",
+  ];
+
+  it("each converged read reports voice:true AND rest:true in surfaceCoverage", () => {
+    const byName = new Map(surfaceCoverage(REGISTRY).map((r) => [r.name, r]));
+    for (const name of CONVERGED_READS) {
+      const row = byName.get(name);
+      assert.ok(row, `${name} missing from surfaceCoverage`);
+      assert.strictEqual(row.voice, true, `${name} should still be on voice`);
+      assert.strictEqual(row.rest, true, `${name} should now expose a REST twin`);
+    }
+  });
+
+  it("each converged read carries a GET rest binding (route param matches its schema key)", () => {
+    const byName = new Map(REGISTRY.map((d) => [d.name, d]));
+    const expectedPaths: Record<string, string> = {
+      get_pane_summary: "/api/panes/:pane_id/summary",
+      get_pane_command_history: "/api/panes/:pane_id/history",
+      get_pane_gates: "/api/panes/:pane_id/gates",
+      list_capabilities: "/api/capabilities",
+      list_handoffs: "/api/handoffs",
+      read_handoff: "/api/handoffs/:handoff_id",
+    };
+    for (const name of CONVERGED_READS) {
+      const def = byName.get(name);
+      assert.ok(def, `${name} missing from REGISTRY`);
+      assert.ok(def.rest, `${name} must declare a rest binding`);
+      assert.strictEqual(def.rest.method, "get", `${name} rest twin must be a GET`);
+      assert.strictEqual(def.rest.path, expectedPaths[name], `${name} rest path mismatch`);
+    }
+  });
+});

@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**41** actions across **16** gated capabilities, plus the always-allowed group.
+**43** actions across **16** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -105,13 +105,15 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `get_action_log` | voice / rest | yes | Read the unified action log |
 | `get_attention_digest` | voice | yes | Speak a structured summary of items needing the operator's attention |
-| `get_pane_gates` | voice | yes | Read the resolved capability-gate matrix for a pane (or global if pane_id omitted) |
+| `get_health` | voice / rest | yes | Report a one-glance health snapshot |
+| `get_pane_gates` | voice / rest | yes | Read the resolved capability-gate matrix for a pane (or global if pane_id omitted) |
 | `get_project_notes` | voice | yes | Recall the durable notes saved for a project (decisions, todos, warnings) |
-| `list_capabilities` | voice | yes | List every gateable capability name |
-| `list_handoffs` | voice | yes | List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output) |
+| `list_capabilities` | voice / rest | yes | List every gateable capability name |
+| `list_handoffs` | voice / rest | yes | List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output) |
 | `list_pending_approvals` | voice | yes | List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count) |
-| `read_handoff` | voice | yes | Read a single handoff (UNGATED, redacted output) |
+| `read_handoff` | voice / rest | yes | Read a single handoff (UNGATED, redacted output) |
 | `search_notes` | voice | yes | Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries') |
 
 ## Read a pane's output
@@ -122,9 +124,9 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
-| `get_pane_command_history` | voice | yes | Return the list of recently executed commands in this pane with their concise, high-level final responses/outcomes, rather than raw/messy terminal outputs |
+| `get_pane_command_history` | voice / rest | yes | Return the list of recently executed commands in this pane with their concise, high-level final responses/outcomes, rather than raw/messy terminal outputs |
 | `get_pane_delta` | voice | yes | Return ONLY the pane output that is new since you last read this pane (true incremental delta; ANSI-stripped, secret-redacted) |
-| `get_pane_summary` | voice | yes | Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted) |
+| `get_pane_summary` | voice / rest | yes | Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted) |
 | `list_panes` | voice / rest | yes | List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing |
 
 ## Change these safety gates

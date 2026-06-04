@@ -212,6 +212,7 @@ export const deleteNote: ActionDef<typeof DeleteNoteParams> = {
     // kzt: persist the delete INTENT (op + noteId) so a deferred delete survives a restart. Keys in
     // lockstep with src/actionEffects.ts UpdateMetadataParams ({ op:"delete", noteId }).
     const g = ctx.gateOrDefer("update_metadata", null, `Delete note ${noteId}`, deleteEffect, {
+      ...(ctx.versionStamp ?? {}),
       op: "delete",
       noteId,
     });

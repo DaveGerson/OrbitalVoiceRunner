@@ -316,7 +316,8 @@ export const readHandoff: ActionDef<typeof ReadHandoffParams> = {
   params: ReadHandoffParams,
   capability: "read_notes",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/handoffs/:handoff_id" },
   handler: (args, ctx): ActionResult => {
     const { handoff_id } = args;
     const store = ctx.store;
@@ -358,7 +359,8 @@ export const listHandoffs: ActionDef<typeof ListHandoffsParams> = {
   params: ListHandoffsParams,
   capability: "read_notes",
   readOnly: true,
-  surfaces: new Set(["voice"]),
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "get", path: "/api/handoffs" },
   handler: (args, ctx): ActionResult => {
     const { state } = args;
     const store = ctx.store;

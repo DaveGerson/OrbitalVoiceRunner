@@ -1,0 +1,221 @@
+import { describe, it } from "node:test";
+import assert from "node:assert";
+import { z } from "zod";
+
+import {
+  mountRestRoutes,
+  resultToHttp,
+  type RestApp,
+  type RestHandler,
+  type RestRequest,
+  type RestResponse,
+} from "../src/actions/rest";
+import type { ActionContext, ActionDef, ActionResult } from "../src/actions/types";
+
+// ── Fakes ─────────────────────────────────────────────────────────────────────────────────────
+// A tiny RestApp that records (method, path, handler) registrations so we can assert what mounted
+// and later invoke a handler directly with a fake req/res.
+
+interface Registration {
+  method: "get" | "post" | "put" | "delete";
+  path: string;
+  handler: RestHandler;
+}
+
+function makeFakeApp(): { app: RestApp; regs: Registration[] } {
+  const regs: Registration[] = [];
+  const record =
+    (method: Registration["method"]) =>
+    (path: string, handler: RestHandler): unknown => {
+      regs.push({ method, path, handler });
+      return undefined;
+    };
+  const app: RestApp = {
+    get: record("get"),
+    post: record("post"),
+    put: record("put"),
+    delete: record("delete"),
+  };
+  return { app, regs };
+}
+
+// A fake RestResponse that records the status code + json payload it was handed.
+function makeFakeRes(): { res: RestResponse; sent: { status?: number; json?: unknown } } {
+  const sent: { status?: number; json?: unknown } = {};
+  const res: RestResponse = {
+    status(code: number) {
+      sent.status = code;
+      return res;
+    },
+    json(payload: unknown) {
+      sent.json = payload;
+      return undefined;
+    },
+  };
+  return { res, sent };
+}
+
+// A no-op ActionContext: the handlers under test never touch ctx, but runAction redacts readOnly
+// results via ctx.redact, so supply an identity redactor. Cast through unknown — we only need the
+// structural shape runAction reads.
+const fakeCtx = { redact: (s: string) => s } as unknown as ActionContext;
+const ctxFactory = (_req: RestRequest): ActionContext => fakeCtx;
+
+// Minimal fake defs shaped like ActionDef, cast `as unknown as ActionDef`.
+function makeDef(partial: {
+  name: string;
+  surfaces: string[];
+  rest?: { method: "get" | "post" | "put" | "delete"; path: string };
+  params?: z.ZodTypeAny;
+  handler?: ActionDef["handler"];
+}): ActionDef {
+  const def = {
+    name: partial.name,
+    description: partial.name,
+    params: partial.params ?? z.object({}).passthrough(),
+    capability: "ALWAYS_ALLOWED",
+    readOnly: true,
+    surfaces: new Set(partial.surfaces),
+    rest: partial.rest,
+    handler:
+      partial.handler ??
+      ((): ActionResult => ({ kind: "ok", output: partial.name })),
+  };
+  return def as unknown as ActionDef;
+}
+
+// ── (a) no `only` mounts every rest-surface def with a rest binding ─────────────────────────────
+describe("mountRestRoutes — default (no `only`)", () => {
+  it("registers every rest-surface def that has a rest binding", () => {
+    const registry = [
+      makeDef({ name: "x", surfaces: ["rest"], rest: { method: "get", path: "/x" } }),
+      makeDef({ name: "y", surfaces: ["rest"], rest: { method: "post", path: "/y" } }),
+      makeDef({ name: "z", surfaces: ["voice"] }), // not a rest surface -> skipped
+    ];
+    const { app, regs } = makeFakeApp();
+    mountRestRoutes(app, registry, ctxFactory);
+
+    assert.strictEqual(regs.length, 2);
+    assert.deepStrictEqual(
+      regs.map((r) => `${r.method} ${r.path}`).sort(),
+      ["get /x", "post /y"]
+    );
+  });
+});
+
+// ── (b) `only` restricts to exactly the named defs ──────────────────────────────────────────────
+describe("mountRestRoutes — `only` allow-filter", () => {
+  it("mounts ONLY the named def and skips the rest", () => {
+    const registry = [
+      makeDef({ name: "x", surfaces: ["rest"], rest: { method: "get", path: "/x" } }),
+      makeDef({ name: "y", surfaces: ["rest"], rest: { method: "post", path: "/y" } }),
+      makeDef({ name: "w", surfaces: ["rest"], rest: { method: "put", path: "/w" } }),
+    ];
+    const { app, regs } = makeFakeApp();
+    mountRestRoutes(app, registry, ctxFactory, { only: new Set(["x"]) });
+
+    assert.strictEqual(regs.length, 1);
+    assert.strictEqual(regs[0].method, "get");
+    assert.strictEqual(regs[0].path, "/x");
+  });
+});
+
+// ── (c) rest-surface def WITHOUT a rest binding is skipped (no crash) ────────────────────────────
+describe("mountRestRoutes — rest surface without a rest binding", () => {
+  it("skips the def defensively instead of crashing", () => {
+    const registry = [
+      makeDef({ name: "nobinding", surfaces: ["rest"] }), // surfaces has rest, but no def.rest
+      makeDef({ name: "ok", surfaces: ["rest"], rest: { method: "get", path: "/ok" } }),
+    ];
+    const { app, regs } = makeFakeApp();
+    assert.doesNotThrow(() => mountRestRoutes(app, registry, ctxFactory));
+
+    assert.strictEqual(regs.length, 1);
+    assert.strictEqual(regs[0].path, "/ok");
+  });
+});
+
+// ── (d) query params are merged into rawArgs and reach the handler ───────────────────────────────
+describe("mountRestRoutes — query-param merge", () => {
+  it("merges req.query into the args the handler sees", async () => {
+    let seen: unknown;
+    const echo = makeDef({
+      name: "echo",
+      surfaces: ["rest"],
+      rest: { method: "get", path: "/echo" },
+      params: z.object({ limit: z.string() }).passthrough(),
+      handler: (args): ActionResult => {
+        seen = args;
+        return { kind: "ok", output: args };
+      },
+    });
+    const { app, regs } = makeFakeApp();
+    mountRestRoutes(app, [echo], ctxFactory);
+
+    assert.strictEqual(regs.length, 1);
+    const { res, sent } = makeFakeRes();
+    await regs[0].handler({ query: { limit: "5" } }, res);
+
+    assert.deepStrictEqual(seen, { limit: "5" });
+    assert.strictEqual(sent.status, 200);
+    assert.deepStrictEqual(sent.json, { output: { limit: "5" } });
+  });
+
+  it("body wins over query on a key collision (precedence query < params < body)", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const echo = makeDef({
+      name: "echo2",
+      surfaces: ["rest"],
+      rest: { method: "post", path: "/echo2" },
+      params: z.object({}).passthrough(),
+      handler: (args): ActionResult => {
+        seen = args as Record<string, unknown>;
+        return { kind: "ok", output: args };
+      },
+    });
+    const { app, regs } = makeFakeApp();
+    mountRestRoutes(app, [echo], ctxFactory);
+
+    const { res } = makeFakeRes();
+    await regs[0].handler({ query: { limit: "5" }, body: { limit: "9" } }, res);
+    assert.strictEqual(seen?.limit, "9");
+  });
+});
+
+// ── (e) resultToHttp maps each ActionResult kind to its HTTP shape ───────────────────────────────
+describe("resultToHttp — ActionResult -> HTTP mapping", () => {
+  it("ok -> 200 { output }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "ok", output: "hi" }, res);
+    assert.strictEqual(sent.status, 200);
+    assert.deepStrictEqual(sent.json, { output: "hi" });
+  });
+
+  it("blocked -> 403 { error }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "blocked", reason: "gate off" }, res);
+    assert.strictEqual(sent.status, 403);
+    assert.deepStrictEqual(sent.json, { error: "gate off" });
+  });
+
+  it("clarify -> 409 { clarify }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "clarify", text: "which pane?" }, res);
+    assert.strictEqual(sent.status, 409);
+    assert.deepStrictEqual(sent.json, { clarify: "which pane?" });
+  });
+
+  it("pending -> 202 { status:'pending_approval', messageId }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "pending", messageId: "m1", summary: "s" }, res);
+    assert.strictEqual(sent.status, 202);
+    assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "m1" });
+  });
+
+  it("error -> 500 { error }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "error", message: "boom" }, res);
+    assert.strictEqual(sent.status, 500);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+});

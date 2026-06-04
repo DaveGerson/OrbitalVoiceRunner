@@ -71,7 +71,7 @@ export const setGlobalPermissions: ActionDef<typeof SetGlobalPermissionsParams> 
       `Set global permissions to ${permissions_mode}`,
       applyGlobalPerms,
       // kzt: persist the global-permissions INTENT for restart parity (lockstep w/ actionEffects).
-      { permissionsMode: permissions_mode },
+      { ...(ctx.versionStamp ?? {}), permissionsMode: permissions_mode },
       // rbh: pass the requested mode STRUCTURALLY (never parsed from the summary) so the confirm
       // dialog can render the divergence "heads up" when the engine resolves tighter.
       permissions_mode,
@@ -158,7 +158,7 @@ export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
       `Set pane ${pane_id} permissions to ${permissions_mode}`,
       applyPanePerms,
       // kzt: persist the pane-permissions INTENT for restart parity (lockstep w/ actionEffects).
-      { paneId: pane_id, projectId: project_id, permissionsMode: permissions_mode },
+      { ...(ctx.versionStamp ?? {}), paneId: pane_id, projectId: project_id, permissionsMode: permissions_mode },
       // rbh: requested mode passed structurally for the dialog divergence rider.
       permissions_mode,
     );

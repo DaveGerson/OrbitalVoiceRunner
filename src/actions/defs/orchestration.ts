@@ -271,6 +271,10 @@ export const applyOrchestrationRecipe: ActionDef<typeof ApplyOrchestrationRecipe
                 `Create pane ${p.id} (recipe ${recipe.id})`,
                 spawnPane,
                 {
+                  // PLM3: stamp the version guard FIRST so a deferred voice-recipe create_pane survives
+                  // a restart instead of being quarantined on boot (the 7th staging site). Spread first
+                  // so the create_pane intent keys below always win on any collision (kzt lockstep).
+                  ...(ctx.versionStamp ?? {}),
                   origin: "recipe",
                   paneId: p.id,
                   cwd: proj.directory || process.cwd(),

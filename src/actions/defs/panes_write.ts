@@ -238,6 +238,7 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       // kzt: serializable restart-intent. origin:"voice" -> the rebuild returns the voice-shaped
       // string. Keys in LOCKSTEP with buildActionRun's CreatePaneParams (src/actionEffects.ts).
       {
+        ...(ctx.versionStamp ?? {}),
         origin: "voice",
         paneId: pane_id,
         cwd: ctx.manager.ledger.workspaces[project_id]?.directory,

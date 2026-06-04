@@ -210,6 +210,11 @@ export interface ActionContext {
   session: LiveSessionLike | null;     // present on the voice path; null for REST/WS
   callId?: string;                     // Gemini call.id on the voice path
   trigger?: string;                    // operator utterance / "REST" / "WS"
+  /** Clean dispatch-surface token ("voice" | "rest" | "ws") persisted to the action_log. The context
+   *  builders set it explicitly (the ONE source of truth); runAction falls back to a session-presence
+   *  heuristic when absent. NEVER the raw operator utterance (that would leak un-redacted text into an
+   *  un-redacted column) — that is why `trigger` (the utterance) is NOT reused as the surface. */
+  surface?: string;
   /** The per-connection spoken utterance (server.ts:2233). propose_command uses it as the dispatch
    *  trigger (`currentSessionUserUtterance || "Spoken execute command"`). Empty string off the voice path. */
   userUtterance?: string;
@@ -226,6 +231,11 @@ export interface ActionContext {
    *  which stamps `ts` + applies redaction) is done later in server.ts; here it is only defined +
    *  called. Absent on the test/REST/WS paths that do not opt in. */
   audit?: (row: ActionAuditRow) => void;
+
+  /** PLM3 version stamp for THIS dispatch: { actionName, schemaHash } the deferring handlers spread
+   *  into the params they hand to ctx.gateOrDefer, so a boot can quarantine a drifted intent. Set by
+   *  the server's context builder (it knows the dispatched action name); undefined off that path. */
+  versionStamp?: { actionName?: string; schemaHash?: string };
 
   // ── Active-pane source of truth (server.ts:458, a closure-local `let activePaneId`) ──────────
   /** Read the live active pane id (the single source of truth for where Janus may write).

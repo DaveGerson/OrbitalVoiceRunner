@@ -12,6 +12,14 @@
  * know each tool's real current surfaces. For the small proof registry, the brake trio + list_panes
  * are all multi-surface (voice+rest+ws / voice+rest), so the seed only needs to cover proof tools
  * that are intentionally single-surface — currently none.
+ *
+ * cv1 CONVERGENCE: six session-independent reads gained a registry-derived REST twin
+ * (get_pane_summary -> GET /api/panes/:pane_id/summary, get_pane_command_history -> .../history,
+ * get_pane_gates -> .../gates, list_capabilities -> GET /api/capabilities,
+ * list_handoffs -> GET /api/handoffs, read_handoff -> GET /api/handoffs/:handoff_id). They are now
+ * voice+rest and were REMOVED from the allow-list below (multi-surface tools are never allow-listed).
+ * The reads that stay voice-only do so on purpose: get_pane_delta mutates a per-pane read cursor and
+ * list_pending_approvals / get_attention_digest are session-scoped (empty on session:null REST).
  */
 
 import type { ActionDef, Surface } from "./types";
@@ -48,17 +56,17 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   deliver_handoff: new Set<Surface>(["voice"]), // staged-handoff delivery (gated via dispatchProposal); voice-only today
 
   // ── Convergence-track residue: voice-only READS (REST/WS read twin is a future item) ─────────────
-  get_pane_command_history: new Set<Surface>(["voice"]),
-  get_pane_summary: new Set<Surface>(["voice"]),
+  // cv1 CONVERGED six session-independent reads to REST (get_pane_summary, get_pane_command_history,
+  // get_pane_gates, list_capabilities, list_handoffs, read_handoff) — they are now voice+rest, so they
+  // are multi-surface and MUST NOT be allow-listed here (isMultiSurface skips them). The three that
+  // remain voice-only are NOT session-independent: get_pane_delta mutates a per-pane read cursor (unsafe
+  // as an idempotent GET) and list_pending_approvals / get_attention_digest are session-scoped (always
+  // empty on a session:null REST request).
   get_pane_delta: new Set<Surface>(["voice"]),
   list_pending_approvals: new Set<Surface>(["voice"]),
   get_attention_digest: new Set<Surface>(["voice"]),
-  get_pane_gates: new Set<Surface>(["voice"]),
-  list_capabilities: new Set<Surface>(["voice"]),
   get_project_notes: new Set<Surface>(["voice"]),
   search_notes: new Set<Surface>(["voice"]),
-  read_handoff: new Set<Surface>(["voice"]),
-  list_handoffs: new Set<Surface>(["voice"]),
 
   // ── Convergence-track residue: voice-only NOTE mutators (REST/WS twin is a future item) ──────────
   amend_note: new Set<Surface>(["voice"]),

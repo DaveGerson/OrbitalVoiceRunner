@@ -29,6 +29,7 @@ import { ORIENT_ACTIONS } from "./defs/orient";
 import { LOCKS_ACTIONS } from "./defs/locks";
 import { ORCH_ACTIONS } from "./defs/orchestration";
 import { HANDOFF_ACTIONS } from "./defs/handoff";
+import { OBSERVABILITY_ACTIONS } from "./defs/observability";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -210,6 +211,7 @@ export const amendNote: ActionDef<typeof AmendNoteParams> = {
     // kzt: persist the amend INTENT (op + noteId + ENQUEUE-BOUND text) so a deferred amend survives a
     // restart and applies EXACTLY this text on confirm. Keys in lockstep with src/actionEffects.ts.
     const g = ctx.gateOrDefer("update_metadata", null, `Amend note ${noteId}`, amendEffect, {
+      ...(ctx.versionStamp ?? {}),
       op: "amend",
       noteId,
       text: newText,
@@ -236,7 +238,8 @@ export const amendNote: ActionDef<typeof AmendNoteParams> = {
  * and the phase-B contract proof (propose_command = dispatchProposal style, amend_note = gateOrDefer
  * durable Ask-defer style). The remaining 35 tools live in src/actions/defs/* (one file per capability
  * domain), faithfully ported from their legacy server.ts branches. Phase C swaps server.ts to dispatch
- * through runAction(REGISTRY, ...). Total = 41 voice tools (parity with the legacy dispatch chain).
+ * through runAction(REGISTRY, ...). Total = 43 voice tools (parity with the legacy dispatch chain
+ * + the Wave D observability pair get_action_log / get_health).
  */
 export const REGISTRY: readonly ActionDef[] = [
   // ── phase-A + contract-proof inline defs (6) ──
@@ -254,6 +257,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...LOCKS_ACTIONS,
   ...ORCH_ACTIONS,
   ...HANDOFF_ACTIONS,
+  // ── Wave D observability defs (2) ──
+  ...OBSERVABILITY_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
