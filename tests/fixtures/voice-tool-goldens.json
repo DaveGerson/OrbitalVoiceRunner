@@ -46,12 +46,18 @@
       "gates": {
         "add_watch_rule": "Ask",
         "apply_recipe": "Ask",
+        "archive_pane": "Auto",
+        "clear_history": "Auto",
         "close_pane": "Ask",
+        "compose_draft": "Auto",
         "create_pane": "Ask",
         "create_project": "Auto",
         "deliver_handoff": "Ask",
         "dismiss_attention": "Auto",
         "execute_plan": "Ask",
+        "focus_pane": "Auto",
+        "read_notes": "Auto",
+        "read_pane": "Auto",
         "restart_pane": "Ask",
         "set_capability_gate": "Ask",
         "set_global_permissions": "Ask",
@@ -102,7 +108,13 @@
       "update_metadata",
       "switch_context",
       "set_voice_mute",
-      "dismiss_attention"
+      "dismiss_attention",
+      "read_pane",
+      "read_notes",
+      "focus_pane",
+      "compose_draft",
+      "archive_pane",
+      "clear_history"
     ]
   },
   "list_handoffs": {

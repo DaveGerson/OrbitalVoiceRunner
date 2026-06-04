@@ -147,10 +147,24 @@ const CreatePaneParamsSchema = z
     permissions_mode: z.enum(["Full Auto", "Human-in-the-Loop", "Read-Only"]).optional(),
     command: z.string().optional(),
   })
-  .refine(
-    (a) => !a.command || a.command.trim() === "" || normalizePreset(a.tool_preset) === "Custom",
-    { message: "a free-form command is only allowed for the Custom preset", path: ["command"] }
-  );
+  .superRefine((a, ctx) => {
+    // §5.4 keystone guardrail. The free-form `command` field is the Custom escape hatch ONLY:
+    //   - Custom     => command is OPTIONAL. Provided + non-empty => the launch the model/operator
+    //                   owns (e.g. "htop"); OMITTED => the bare defaultShellCommand is derived
+    //                   server-side (the established U4 "just give me a shell pane" behavior,
+    //                   tests/test_voice_tools.ts "Custom derives defaultShellCommand"). Custom is the
+    //                   shell preset; requiring a command would break the common voice "open a shell".
+    //   - non-Custom => command MUST be absent/undefined. The launch is DERIVED server-side via
+    //                   presetCommand; the model cannot override an agent preset's command. THIS is the
+    //                   real guardrail (the model cannot free-form claude/codex/antigravity).
+    if (normalizePreset(a.tool_preset) !== "Custom" && a.command !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "a free-form command is only allowed for the Custom preset",
+        path: ["command"],
+      });
+    }
+  });
 
 /**
  * create_pane — FAITHFUL PORT of the voice branch (server.ts:2849-2886). DETERMINISTIC launch:
@@ -181,7 +195,7 @@ const CreatePaneParamsSchema = z
 export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   name: "create_pane",
   description:
-    "Create a new terminal pane inside a project and start its agent. The command line is derived from tool_preset ON THE SERVER — do NOT pass a raw command (there is no command field).",
+    "Create a new terminal pane inside a project and start its agent. For an agent preset (Claude Code / Codex / Antigravity) the command line is DERIVED on the server from tool_preset — do NOT pass command. ONLY for the Custom preset may you pass a free-form `command` (e.g. 'htop'); omit it to open a bare shell.",
   params: CreatePaneParamsSchema,
   capability: "create_pane",
   readOnly: false,

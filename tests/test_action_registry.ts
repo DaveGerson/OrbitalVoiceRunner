@@ -26,6 +26,7 @@ import {
   deriveCapabilities,
   spotlightCapabilities,
 } from "../src/actions/capabilities";
+import { ALL_CAPABILITIES } from "../src/gateSurface";
 import { toGeminiDeclarations, runAction, resultToToolResponse, zodToGeminiSchema } from "../src/actions/gemini";
 import { redactSecrets } from "../src/terminal";
 import { PendingApprovalStore } from "../src/pendingApprovals";
@@ -197,12 +198,22 @@ describe("§8.1 registry totality & shape", () => {
 // §8.1b — the matrix is DERIVED from the registry (Decision 5)
 // ─────────────────────────────────────────────────────────────────────────────
 describe("§8.1b matrix derived from registry", () => {
-  it("ALL_CAPABILITIES === unique(registry capabilities)", () => {
-    const derived = deriveCapabilities(REGISTRY).slice().sort();
-    const expected = Array.from(
-      new Set(REGISTRY.map((d) => d.capability).filter((c) => c !== ALWAYS_ALLOWED))
-    ).sort();
-    assert.deepStrictEqual(derived, expected);
+  it("deriveCapabilities(REGISTRY) ⊆ ALL_CAPABILITIES, and ALL_CAPABILITIES === CAPABILITY_DEFS id set", () => {
+    // F4 (wsm-e2e-pinned-lqb): the matrix authority is now the WHOLE 22-row matrix
+    // (16 original + 6 promoted). Two invariants pin it:
+    //   (1) SUBSET — every capability a registry tool actually USES is a matrix row. (Strict equality
+    //       registry === matrix is NOT yet true: close_pane / restart_pane / add_watch_rule are matrix
+    //       rows RESERVED for future voice tools per Decision 8, so the registry uses a subset.)
+    //   (2) MATRIX === DEFS — ALL_CAPABILITIES is exactly the CAPABILITY_DEFS id set, so the hand-list
+    //       in gateSurface.ts (kept as a list to dodge the capabilities↔gateSurface value-import cycle)
+    //       can never drift from the table that owns label/category/defaultGate.
+    const matrix = new Set(ALL_CAPABILITIES);
+    for (const cap of deriveCapabilities(REGISTRY)) {
+      assert.ok(matrix.has(cap as (typeof ALL_CAPABILITIES)[number]), `registry uses a capability missing from the matrix: ${cap}`);
+    }
+    const matrixSorted = [...ALL_CAPABILITIES].slice().sort();
+    const defsSorted = CAPABILITY_DEFS.map((d) => d.id).slice().sort();
+    assert.deepStrictEqual(matrixSorted, defsSorted, "ALL_CAPABILITIES must equal the CAPABILITY_DEFS id set");
   });
 
   it("every referenced capability has a CapabilityDef, and vice-versa (no orphans)", () => {

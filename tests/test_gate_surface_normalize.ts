@@ -101,11 +101,12 @@ describe("gateSurface — normalizeGateValue (n2r §4.1, D2)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// normalizeEffectiveGates (D6) — TOTAL, well-typed, all 16 caps
+// normalizeEffectiveGates (D6) — TOTAL, well-typed, every capability in ALL_CAPABILITIES
+// (F4: the matrix is now 22 caps — assert against ALL_CAPABILITIES.length, not a literal 16).
 // ---------------------------------------------------------------------------
 describe("gateSurface — normalizeEffectiveGates (n2r §4.1, D6)", () => {
   function assertTotalAllAuto(out: Record<CapabilityGate, GateValue>) {
-    assert.strictEqual(Object.keys(out).length, 16, "must be a TOTAL 16-cap map");
+    assert.strictEqual(Object.keys(out).length, ALL_CAPABILITIES.length, "must be a TOTAL cap map");
     for (const cap of ALL_CAPABILITIES) assert.strictEqual(out[cap], "Auto", `${cap} should default Auto`);
   }
 
@@ -127,10 +128,10 @@ describe("gateSurface — normalizeEffectiveGates (n2r §4.1, D6)", () => {
       if (cap === "write_to_pane" || cap === "close_pane") continue;
       assert.strictEqual(out[cap], "Auto", `${cap} unspecified → Auto`);
     }
-    // Totality: exactly the 16-cap union, no extras.
+    // Totality: exactly the full capability union, no extras.
     const keys = Object.keys(out).sort();
     assert.deepStrictEqual(keys, [...ALL_CAPABILITIES].sort());
-    assert.strictEqual(keys.length, 16);
+    assert.strictEqual(keys.length, ALL_CAPABILITIES.length);
   });
 
   it("never throws for any input", () => {
@@ -147,7 +148,7 @@ describe("gateSurface — sanitizePartialGateMap (n2r §4.1, D7)", () => {
   it("keeps valid entries, drops bad-value entries, drops unknown keys (stays PARTIAL)", () => {
     const out = sanitizePartialGateMap({ write_to_pane: "Ask", close_pane: "Allow", bogus: "Auto" });
     assert.deepStrictEqual(out, { write_to_pane: "Ask" });
-    // Crucially NOT total — the other 15 caps stay ABSENT (= follow global), unlike normalizeEffectiveGates.
+    // Crucially NOT total — every other cap stays ABSENT (= follow global), unlike normalizeEffectiveGates.
     assert.strictEqual(Object.keys(out).length, 1);
   });
 

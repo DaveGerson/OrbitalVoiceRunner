@@ -329,12 +329,10 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
   // 17c — Custom preset still honors a free-form command.
   // REST honors a client command ONLY for a Custom preset (GOAL 1).
   //
-  // DEFERRAL NOTE (REG1): the VOICE side of 17c — restoring a free-form `command` FIELD
-  // to the create_pane voice schema, guarded by a zod .refine that only permits it when
-  // tool_preset === "Custom" — is INTENTIONALLY DEFERRED to REG1, where create_pane gets
-  // its zod ActionDef schema. We do NOT add a voice command field now; the voice schema
-  // still has no command field (server.ts create_pane FunctionDeclaration), so a voice
-  // Custom-command assertion cannot pass without REG1 and is .skip'd below.
+  // REG1 UPDATE (F5 17c): the VOICE side of 17c is now LIVE — create_pane's zod ActionDef
+  // schema carries an OPTIONAL `command` field guarded by a .superRefine that permits it ONLY
+  // for the Custom preset (Custom: optional; non-Custom: forbidden). The voice assertion below
+  // is un-skipped and active. The REST case (this one) is unchanged.
   // ──────────────────────────────────────────────────────────────────────────
   it("17c Custom preset still honors a free-form command (REST)", async () => {
     const { res, call } = await restCreatePane({
@@ -350,11 +348,54 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     assert.strictEqual(call!.toolPreset, "Custom", "preset stays Custom");
   });
 
-  // Voice Custom free-form command is DEFERRED to REG1 (no command field on the voice
-  // schema yet). Skipped rather than failed so the suite stays green; REG1 will add the
-  // zod-guarded field and flip this to an active assertion.
-  it.skip("17c (voice) Custom preset honors a free-form command — DEFERRED to REG1 (zod ActionDef command field + .refine)", async () => {
-    // Intentionally empty: see the DEFERRAL NOTE above. REG1 adds a `command` field to the
-    // create_pane voice schema guarded by a zod .refine(tool_preset === "Custom").
+  // 17c (VOICE) — un-skipped in REG1 (F5 17c). The create_pane voice schema now carries an
+  // optional `command` field guarded by a zod .superRefine enforcing §5.4:
+  //   - Custom + command => launches verbatim (the model/operator owns the launch).
+  //   - Custom w/o command => derives the bare defaultShellCommand (U4 "open a shell").
+  //   - non-Custom + command => schema rejection (no addTerminal, kind:"error") — the guardrail.
+  it("17c (voice) Custom preset honors a free-form command; the guardrail rejects misuse", async () => {
+    // (a) Custom + command -> the supplied command launches VERBATIM (server does not derive).
+    const customCall = await voiceCreatePane({
+      project_id: "cp_proj",
+      pane_id: "cp-voice-c-custom",
+      tool_preset: "Custom",
+      command: "htop",
+    });
+    assert.strictEqual(customCall.command, "htop", "Custom honors the free-form command verbatim");
+    assert.strictEqual(customCall.toolPreset, "Custom", "preset stays Custom on the voice path");
+
+    // (b) Custom WITHOUT a command -> ACCEPTED; the bare defaultShellCommand is derived server-side.
+    // Custom IS the shell preset: command is OPTIONAL there (provided -> verbatim; omitted -> shell),
+    // the established U4 "just open a shell pane" behavior (tests/test_voice_tools.ts "Custom derives
+    // defaultShellCommand"). Only NON-Custom presets reject a command. (Spec 17c's "omitting is an
+    // error" was reconciled in favor of shipped behavior — requiring a command would break voice
+    // "open a shell".)
+    const shellCall = await voiceCreatePane({
+      project_id: "cp_proj",
+      pane_id: "cp-voice-c-shell",
+      tool_preset: "Custom",
+    });
+    assert.strictEqual(shellCall.toolPreset, "Custom", "Custom-without-command stays Custom");
+    assert.ok(shellCall.command && shellCall.command.length, "Custom-without-command derives a (shell) command, not rejected");
+    assert.ok(
+      !/^(claude|codex|antigravity)\b/.test(shellCall.command),
+      `Custom-without-command derives a shell, not an agent launch: ${shellCall.command}`,
+    );
+
+    // (c) non-Custom + command -> schema rejection (the model cannot override a preset's launch).
+    const beforeBogus = captured.length;
+    const bogusCall = session.emitToolCall("create_pane", {
+      project_id: "cp_proj",
+      pane_id: "cp-voice-c-bogus",
+      tool_preset: "Claude Code",
+      command: "totally-bogus-client-command",
+    });
+    const bogusOut = await waitFor(() => mock.responseFor(bogusCall));
+    assert.match(
+      String(bogusOut),
+      /invalid arguments for create_pane/,
+      `supplying command for a non-Custom preset is a schema rejection: ${bogusOut}`,
+    );
+    assert.strictEqual(captured.length, beforeBogus, "rejected non-Custom-with-command never reached addTerminal");
   });
 });

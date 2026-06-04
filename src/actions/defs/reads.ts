@@ -33,7 +33,8 @@ import fs from "fs";
 import path from "path";
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
-import type { CapabilityGate, GateValue } from "../../types";
+import type { GateValue } from "../../types";
+import { ALL_CAPABILITIES } from "../../gateSurface";
 import { stripAnsiSequences, redactSecrets } from "../../terminal";
 import { serializePending } from "../../pendingApprovals";
 
@@ -58,18 +59,10 @@ interface HistoryEntry {
   finalResponse?: string;
 }
 
-/**
- * The 16 EXISTING gateable capabilities — shared verbatim by get_pane_gates and list_capabilities so
- * they stay in lockstep. INTENTIONALLY excludes the promoted read/focus/draft/archive/clear rows; the
- * wire shape is the 16-name literal and old clients/tests assert it byte-for-byte (do NOT auto-derive
- * from the registry, that would expand the list and break parity).
- */
-const EXISTING_GATEABLE_CAPABILITIES: CapabilityGate[] = [
-  "write_to_pane", "deliver_handoff", "create_pane", "close_pane", "restart_pane",
-  "set_pane_permissions", "set_global_permissions", "set_capability_gate",
-  "add_watch_rule", "execute_plan", "apply_recipe", "create_project",
-  "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention",
-];
+// get_pane_gates + list_capabilities report the WHOLE gate matrix (gateSurface.ALL_CAPABILITIES — the
+// single source widened to 22 by the matrix-convergence work). Reporting the full matrix (incl the
+// promoted read/focus/draft/archive/clear caps) is what lets the model + UI discover the read-gating
+// lever (Decision 9). The two get_pane_gates / list_capabilities goldens are regenerated accordingly.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // get_pane_command_history (server.ts:2542)
@@ -254,7 +247,7 @@ export const getPaneGates: ActionDef<typeof OptionalPaneIdParams> = {
     // active pane, and applies the frozen short-circuit (all-Off while frozen).
     const { pane_id } = args;
     const resolved: Record<string, GateValue> = {};
-    for (const c of EXISTING_GATEABLE_CAPABILITIES) {
+    for (const c of ALL_CAPABILITIES) {
       resolved[c] = ctx.effectiveCapabilityGateFor(pane_id || null, c);
     }
     return { kind: "ok", output: { pane_id: pane_id ?? null, gates: resolved } };
@@ -272,8 +265,8 @@ export const listCapabilities: ActionDef<typeof NoParams> = {
   readOnly: true,
   surfaces: new Set(["voice"]),
   handler: (_args, _ctx): ActionResult => {
-    // UNGATED read. The SAME 16-name literal as get_pane_gates (constant — no ctx access).
-    return { kind: "ok", output: [...EXISTING_GATEABLE_CAPABILITIES] };
+    // UNGATED read. The SAME matrix as get_pane_gates (gateSurface.ALL_CAPABILITIES — one source).
+    return { kind: "ok", output: [...ALL_CAPABILITIES] };
   },
 };
 
