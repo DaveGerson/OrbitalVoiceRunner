@@ -868,11 +868,22 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   // Web API to create a terminal manually
   app.post("/api/terminals", (req, res) => {
-    const { terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId } = req.body;
-    if (!terminalId || !command) {
+    const { terminalId, cwd, command: clientCommand, toolPreset, permissionsMode, sessionId, projectId } = req.body;
+    if (!terminalId) {
       res.status(400).json({ error: "Missing required fields" });
       return;
     }
+    // KS (17d): DERIVE the launch command server-side from tool_preset via the SAME single
+    // home the voice create_pane handler uses (presetCommand(normalizePreset(...))), so voice
+    // and REST produce an IDENTICAL launch. A client-supplied `command` is honored ONLY for a
+    // Custom preset (the documented free-form escape hatch, 17c); for any agent preset the
+    // client string is IGNORED — the preset is the single source of truth. (Command is now
+    // derived, so a non-Custom create no longer needs a client `command`.)
+    const preset = normalizePreset(toolPreset);
+    const derivedCommand = presetCommand(preset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
+    const command = preset === "Custom" && typeof clientCommand === "string" && clientCommand.trim()
+      ? clientCommand
+      : derivedCommand;
     // Resolve the working directory: an empty, "." , or non-existent cwd falls back
     // to the active project's directory (or the server cwd). Passing a bad path to
     // spawn() is what produced the cryptic "The system cannot find the path specified."
@@ -899,7 +910,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // Auto -> 200 + addTerminal result. (The projectId ledger-sync above stays before the gate,
     // matching the voice handler's "ensure the project exists" behavior — it mutates metadata, not a PTY.)
     const spawnEffect = (): string => {
-      const result = manager.addTerminal(terminalId, resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId || "");
+      // Pass the NORMALIZED preset (not the raw client value) so runtimeType + the
+      // --dangerously-skip-permissions append are decided identically to the voice path.
+      const result = manager.addTerminal(terminalId, resolvedCwd, command, preset, permissionsMode, sessionId, projectId || "");
       broadcastLedgerUpdate();
       broadcast({ type: "terminals_updated" });
       return String(result);
@@ -907,7 +920,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect,
       // kzt: origin:"rest" -> the rebuild returns String(result) verbatim, matching spawnEffect above.
       // Persist the ALREADY-RESOLVED cwd so a confirm-after-restart lands the pane in the same dir.
-      { origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset, permissionsMode, sessionId, projectId: projectId || "" });
+      // The intent carries the DERIVED command + NORMALIZED preset for restart parity (matches voice).
+      { origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset: preset, permissionsMode, sessionId, projectId: projectId || "" });
     const out = restGateOutcome(g);
     if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
     res.status(out.status).json(out.body);
@@ -1500,7 +1514,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       res.status(403).json({ error: "apply_recipe is gated Off; spawning template layouts is forbidden by policy.", capability: "apply_recipe" });
       return;
     }
-    const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
     const paneById = new Map(recipe.panes.map(p => [p.id, p]));
     const spawned: string[] = [];
     const deferred: { paneId: string; actionId: string }[] = [];
@@ -1509,9 +1522,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (planned.disposition === "skip-existing") continue;
       if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
       const p = paneById.get(planned.paneId)!;
+      // KS (§5.4): derive the recipe pane's launch command from its preset via the SAME single
+      // home (presetCommand(normalizePreset(...))) instead of a hardcoded bare shell, so a
+      // recipe-spawned agent pane inherits the same launch as voice/REST create_pane. The
+      // startupCommand is still NEVER auto-run — only recorded as an auditable pane note.
+      const panePreset = normalizePreset(p.preset);
+      const paneCommand = presetCommand(panePreset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
       const spawnPane = (): string => {
-        // Always open a bare shell — never auto-run the recipe's startupCommand.
-        manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+        manager.addTerminal(p.id, proj.directory || process.cwd(), paneCommand, panePreset, p.permissionsMode as any, "", activeProjectId);
         // Record the suggested startup command as a pane note so the operator can
         // run it explicitly (auditable), rather than baking it into the spawn.
         if (p.startupCommand) {
@@ -1524,7 +1542,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       if (planned.disposition === "defer") {
         const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
           // kzt: origin:"recipe" -> the rebuild returns the bare pane id, matching spawnPane above.
-          { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: bareShell, toolPreset: p.preset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
+          { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: paneCommand, toolPreset: panePreset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
         if (g.disposition === "forbidden") blocked.push(p.id);
         else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
         else { spawnPane(); spawned.push(p.id); }
@@ -3001,7 +3019,6 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     if (plan.layoutForbidden) {
                       resp = `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`;
                     } else {
-                      const bareShell = manager.settings.advanced.defaultShellCommand || (process.platform === "win32" ? "cmd.exe" : "bash");
                       const paneById = new Map(recipe.panes.map(p => [p.id, p]));
                       const spawned: string[] = [];
                       const deferred: string[] = [];
@@ -3010,10 +3027,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                         if (planned.disposition === "skip-existing") continue;
                         if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
                         const p = paneById.get(planned.paneId)!;
-                        // Same spawn closure shape as REST (server.ts ~1293): bare shell, startupCommand
-                        // recorded as an auditable pane note, broadcasts INSIDE so a deferred-confirm repaints.
+                        // KS (§5.4): same spawn closure shape as REST, but the launch command is DERIVED
+                        // from the pane's preset via the SAME single home (presetCommand(normalizePreset(...)))
+                        // instead of a hardcoded bare shell — so a recipe pane inherits the same launch as
+                        // voice/REST create_pane. startupCommand stays an auditable note (never auto-run);
+                        // broadcasts INSIDE so a deferred-confirm repaints.
+                        const panePreset = normalizePreset(p.preset);
+                        const paneCommand = presetCommand(panePreset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
                         const spawnPane = (): string => {
-                          manager.addTerminal(p.id, proj.directory || process.cwd(), bareShell, p.preset as any, p.permissionsMode as any, "", activeProjectId);
+                          manager.addTerminal(p.id, proj.directory || process.cwd(), paneCommand, panePreset, p.permissionsMode as any, "", activeProjectId);
                           if (p.startupCommand) {
                             manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
                           }
@@ -3027,7 +3049,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                           // gate; the planner already classified it Ask, so this stages.)
                           const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
                             // kzt: same create_pane intent shape as the REST recipe path (origin:"recipe" -> rebuild returns the bare pane id).
-                            { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: bareShell, toolPreset: p.preset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
+                            { origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: paneCommand, toolPreset: panePreset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
                           if (g.disposition === "forbidden") blocked.push(p.id);
                           else if (g.disposition === "deferred") deferred.push(p.id);
                           else { spawnPane(); spawned.push(p.id); }
