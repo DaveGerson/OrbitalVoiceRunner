@@ -227,6 +227,14 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       );
       ctx.broadcastLedgerUpdate();
       ctx.broadcastTerminalsUpdated();
+      // Issue #2 (RCA): make the new pane the active WRITE target so the operator's immediate
+      // follow-up voice command lands in it. Without this, propose_command to a just-created pane is
+      // refused by the single-active-pane gate (isPaneActiveForWrite, server.ts:2387 -> kind:"clarify")
+      // and the command never reaches writeInput ("echoed, no output"). activePaneId was previously
+      // set ONLY by a UI focus message / switch_active_pane, which loses the race against a voice-only
+      // create-then-command flow. ctx.setActivePane mutates the SAME per-connection activePaneId that
+      // dispatchProposal reads, so the next voice command on this connection targets the new pane.
+      if (pane_id) ctx.setActivePane(pane_id);
       return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
     };
 
