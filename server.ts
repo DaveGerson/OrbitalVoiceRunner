@@ -245,6 +245,39 @@ console.log(useSqliteLedger
 // finishes before teardown — avoiding the UV_HANDLE_CLOSING abort that a still-in-flight close hit.
 process.once("exit", () => { try { store?.close(); } catch { /* best-effort handle cleanup */ } });
 
+// QW1 — process-level error net (bead qw1). This orchestrator drives PTYs and a Gemini Live
+// socket; a throw at an async edge (a PTY data event, a Gemini callback) surfaces here as an
+// uncaughtException, and a dropped promise as an unhandledRejection. Without a net, either one
+// tears the whole voice channel down. This is a GUARD, not a framework: structured-log and keep
+// running. We do NOT force a crash exit on a recoverable rejection — the existing
+// process.once("exit") already closes the store, so this is best-effort. Installed ONCE at module
+// scope (not inside startServer, which is re-invoked per in-process test server and would otherwise
+// accumulate listeners and trip Node's MaxListeners warning).
+export const __processSafety = { unhandledRejections: 0, uncaughtExceptions: 0 };
+let __processNetInstalled = false;
+function installProcessErrorNet(): void {
+  if (__processNetInstalled) return;
+  __processNetInstalled = true;
+  process.on("unhandledRejection", (reason: unknown) => {
+    __processSafety.unhandledRejections++;
+    console.error("[PROCESS-SAFETY] unhandledRejection (recovered, not exiting):", reason);
+    // Best-effort net: do NOT process.exit() — a dropped promise must not kill the voice channel.
+  });
+  process.on("uncaughtException", (err: unknown) => {
+    __processSafety.uncaughtExceptions++;
+    console.error("[PROCESS-SAFETY] uncaughtException (recovered, not crashing):", err);
+    // Best-effort net: keep the loop alive. The process.once("exit") handler closes the store on a
+    // real exit; we deliberately do not force one here on a single recoverable throw.
+  });
+}
+installProcessErrorNet();
+// Test-only seam: re-attach the net after a suite has temporarily detached process listeners to
+// isolate the handler under test. Idempotent — only attaches handlers that are not already present.
+export function __installProcessErrorNetForTest(): void {
+  __processNetInstalled = false;
+  installProcessErrorNet();
+}
+
 // Prompt-composer refactor (step 6): the single global prompt buffer is gone. Each pane now keeps
 // its OWN persistent WIP draft in the ledger (PaneMeta.draft), composed against the active pane.
 
@@ -268,6 +301,12 @@ export interface RunningServer {
   port: number;
   /** Stop the HTTP/WS servers and tear down all live terminals. */
   close: () => Promise<void>;
+  /** QW3 test seam: read the hoisted live session (null === no voice channel). NOT for prod use. */
+  _testActiveLiveSession?: () => any;
+  /** QW3 test seam: read the pending-approval store (for survivor/detach assertions). */
+  _testPendingApprovals?: () => PendingApprovalStore;
+  /** QW6 test seam: the broadcast client set (for dead-socket pruning assertions). NOT for prod use. */
+  _testClients?: () => Set<any>;
 }
 
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
@@ -424,6 +463,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // survives a process restart; the matrix itself is NEVER mutated, so Release is a clean clear.
   // Restored from the store on boot (below). Module-level `store` is the durable backend.
   let frozen: boolean = store?.getKV("frozen") === "1";
+  // QW4 (bead qw4): the panes whose Stage-2 stop() rejected on the most recent confirm. Set by
+  // stopAll(true) right before its return; read synchronously by the REST confirm route after it
+  // awaits stopAll (single-threaded — no race). Lets the route report a `failed` list to the caller.
+  let lastStopAllFailed: string[] = [];
   const FROZEN_KV = "frozen";
   function persistFrozen(value: boolean): void {
     frozen = value;
@@ -450,7 +493,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         try {
           client.send(data);
         } catch (e) {
+          // QW6 (bead qw6): a send that throws means the socket is dead. Drop it from the set so the
+          // next broadcast doesn't re-throw on the same corpse (and the set doesn't leak); the
+          // matching clientWs.on("close") cleanup may never have fired for an abrupt break.
           console.error("Failed to send socket broadcast:", e);
+          clients.delete(client);
         }
       }
     }
@@ -731,16 +778,32 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const term = manager.terminals[terminalId];
     if (term) {
       const cleanChunk = stripAnsiSequences(chunk);
-      // Push-observation: classify each chunk and publish error/prompt signals. The bus
-      // debounces per (pane,kind), so a chatty pane won't spam the model.
-      const cls = classifyPaneOutput(cleanChunk);
-      if (cls) {
-        paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
+      // QW5 (bead qw5): this runs on EVERY PTY data chunk. Each observation step is independent —
+      // a throw from one bad chunk in any of them used to propagate out of the PTY data event,
+      // crashing the process AND blinding the pane (the buffering/broadcast tail below never ran).
+      // Guard each step in its own try/catch so one failing step neither kills the others nor blinds
+      // the stream; log and continue. This is a net, not a behavior change.
+      try {
+        // Push-observation: classify each chunk and publish error/prompt signals. The bus
+        // debounces per (pane,kind), so a chatty pane won't spam the model.
+        const cls = classifyPaneOutput(cleanChunk);
+        if (cls) {
+          paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
+        }
+      } catch (e) {
+        console.error(`[ONOUTPUT] pane-signal step failed for ${terminalId}:`, e);
       }
-      HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
-      
-      // Classify transitions and handle trigger rules
-      detectAndTriggerTransitions(terminalId, cleanChunk);
+      try {
+        HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
+      } catch (e) {
+        console.error(`[ONOUTPUT] history step failed for ${terminalId}:`, e);
+      }
+      try {
+        // Classify transitions and handle trigger rules
+        detectAndTriggerTransitions(terminalId, cleanChunk);
+      } catch (e) {
+        console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
+      }
     }
 
     if (!outputBuffers[terminalId]) {
@@ -896,17 +959,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   app.get("/api/stop-all/status", (_req, res) => {
     res.json({ frozen, running: frozen ? runningPaneIds() : [] });
   });
-  app.post("/api/stop-all", (_req, res) => {
-    const running = stopAll(false);
+  app.post("/api/stop-all", async (_req, res) => {
+    const running = await stopAll(false);
     res.json({ success: true, frozen: true, running });
   });
-  app.post("/api/stop-all/confirm", (_req, res) => {
+  app.post("/api/stop-all/confirm", async (_req, res) => {
     if (!frozen) {
       res.status(409).json({ success: false, error: "Not frozen — Stage 2 kill requires a prior Stage 1 freeze (POST /api/stop-all)." });
       return;
     }
-    const killed = stopAll(true);
-    res.json({ success: true, killed });
+    // QW4: await the kills so `killed` names panes that ACTUALLY stopped; `failed` (read right after
+    // the await — single-threaded, no race) surfaces any kill that rejected.
+    const killed = await stopAll(true);
+    res.json({ success: true, killed, failed: lastStopAllFailed });
   });
   app.post("/api/stop-all/release", (_req, res) => {
     releaseStopAll();
@@ -1786,8 +1851,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
    *   Stage 2 (kill=true): terminate each running pane PTY via the existing term.stop() primitive.
    *     The deliberate, irreversible step; valid only after a Stage-1 freeze.
    * Returns the still-running pane ids (Stage 1) or the killed pane ids (Stage 2).
+   * QW4 (bead qw4): Stage 2 is now ASYNC and AWAITS the kills (Promise.allSettled), so the returned
+   * killed[] names panes that ACTUALLY stopped — not merely the panes we asked to kill. Panes whose
+   * stop() rejects are excluded from killed[] and surfaced separately (see killAllPanes / broadcast).
    */
-  function stopAll(kill: boolean): string[] {
+  async function stopAll(kill: boolean): Promise<string[]> {
     if (!kill) {
       persistFrozen(true);
       // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
@@ -1823,29 +1891,43 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       broadcastTerminalsUpdated();
       return stillRunning;
     }
-    // Stage 2: kill the PTYs. Fire-and-forget term.stop() (async SIGTERM->SIGKILL); the onExit
-    // will flip status to Exited and re-broadcast. We collect the set we asked to kill.
-    const killed: string[] = [];
-    for (const [id, term] of Object.entries(manager.terminals)) {
-      if (term.status !== "Exited") {
-        killed.push(id);
-        Promise.resolve(term.stop()).catch((e) => console.error(`[STOP-ALL] kill ${id} failed:`, e));
-      }
-    }
+    // Stage 2: kill the PTYs. QW4 — AWAIT every stop() (Promise.allSettled, mirroring close()'s
+    // awaited per-term stop) so we report panes that ACTUALLY stopped, not the ones we asked to.
+    const { killed, failed } = await killAllPanes();
     if (store) {
       try {
         store.recordActivity({
           type: "permission_changed",
           project_id: manager.ledger.activeProjectId || "default_project",
           pane_id: null,
-          summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)`,
-          payload: { action: "stop_all_kill", panes: killed },
+          summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)${failed.length ? `; ${failed.length} kill(s) FAILED` : ""}`,
+          payload: { action: "stop_all_kill", panes: killed, failed },
         });
       } catch { /* store optional */ }
     }
-    broadcast({ type: "stop_all", killed });
+    lastStopAllFailed = failed; // QW4: surfaced to the REST confirm route (read right after the await).
+    broadcast({ type: "stop_all", killed, failed });
     broadcastTerminalsUpdated();
     return killed;
+  }
+
+  /**
+   * QW4 (bead qw4): the awaited Stage-2 kill primitive. Asks every non-Exited pane to stop(), AWAITS
+   * all of them (Promise.allSettled — one failing kill must not abort the rest), and partitions the
+   * outcome: `killed` = panes whose stop() FULFILLED; `failed` = panes whose stop() REJECTED. The
+   * fire-and-forget loop this replaces reported the asked-to-kill set, which lied when a kill failed.
+   */
+  async function killAllPanes(): Promise<{ killed: string[]; failed: string[] }> {
+    const targets = Object.entries(manager.terminals).filter(([, term]) => term.status !== "Exited");
+    const results = await Promise.allSettled(targets.map(([, term]) => Promise.resolve(term.stop())));
+    const killed: string[] = [];
+    const failed: string[] = [];
+    results.forEach((r, i) => {
+      const id = targets[i][0];
+      if (r.status === "fulfilled") killed.push(id);
+      else { failed.push(id); console.error(`[STOP-ALL] kill ${id} failed:`, r.reason); }
+    });
+    return { killed, failed };
   }
 
   /** Clear the freeze (Release). The matrix was never mutated, so this is a clean clear. */
@@ -2258,13 +2340,30 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
       const liveModel = manager.settings.voiceAi?.model || "gemini-3.1-flash-live-preview";
 
+      // QW3 (bead qw3): shared teardown for a Gemini Live socket that dies WITHOUT the client WS
+      // closing. Mirrors the WS-close handler (clientWs.on("close")): detach (keep survivors), null
+      // the hoisted live handle behind the identity guard, and tell the frontend the voice channel
+      // is gone. Idempotent-ish: onerror and onclose can both fire for one drop, but detachSession
+      // on an already-detached session is a no-op and the identity guard makes the null a no-op.
+      const handleSessionLost = (reason: "error" | "closed") => {
+        wsClosed = true; // gate out any post-close SDK resumption-token flush (mirror WS-close)
+        if (session) {
+          const detached = pendingApprovals.detachSession(session);
+          if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
+          // Identity guard: only null if the hoisted handle still points at THIS (now dead) session,
+          // so a stale callback cannot null a newer reconnected session (copied from WS-close).
+          if (activeLiveSession === session) activeLiveSession = null;
+        }
+        broadcast({ type: "voice_channel_lost", reason });
+      };
+
       // Initialize Gemini Live session (through the injectable seam so tests /
       // the offline simulator can substitute a fake session). Uses the per-server snapshot
       // (boundLiveConnector) so a sibling test server's setLiveConnector cannot redirect us.
       session = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
-          onmessage: (message: LiveServerMessage) => {
+          onmessage: async (message: LiveServerMessage) => {
             // Check for sessionResumption update. Gemini Live emits a fresh handle on
             // (nearly) every turn; only log when it actually changes, else a single
             // session floods the log with dozens of near-identical lines (bug E).
@@ -3288,7 +3387,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 // Stage 1 is instant + reversible: freeze Janus + cancel everything in-flight; the
                 // panes KEEP RUNNING. We then ask for the spoken Stage-2 kill confirm (voice has no
                 // hold-to-fire, so the verbal "kill them" IS the deliberate second step).
-                const running = stopAll(false);
+                const running = await stopAll(false);
                 const output = running.length
                   ? `I've frozen myself and cancelled everything in flight. ${running.length} pane(s) are still running (${running.join(", ")}). Should I also kill them? That can't be undone — say "kill them" to confirm, or "release" to resume.`
                   : `I've frozen myself and cancelled everything in flight. No panes are running, so there's nothing to kill. Say "release" when you want to resume.`;
@@ -3304,7 +3403,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     functionResponses: [{ name, id: call.id, response: { output: "There's nothing to confirm — I'm not frozen. Say \"stop everything\" first if you want to halt." } }]
                   });
                 } else {
-                  const killed = stopAll(true);
+                  const killed = await stopAll(true);
                   const output = killed.length
                     ? `Done — I killed ${killed.length} pane(s): ${killed.join(", ")}. They stay killed; I'm still frozen, say "release" to resume.`
                     : `There were no running panes left to kill. I'm still frozen — say "release" to resume.`;
@@ -3376,6 +3475,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }
             }
           }
+        },
+        // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
+        // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
+        // activeLiveSession kept a dead handle and the frontend was never told. These siblings mirror
+        // the WS-close teardown (see clientWs.on("close")): DETACH (keep survivors for re-announce),
+        // null activeLiveSession behind the identity guard so a stale callback can't clobber a newer
+        // session, and broadcast a NEW voice_channel_lost frame. NO reconnect logic (that is PLM4).
+        onerror: (err: any) => {
+          console.error("[VOICE] Gemini Live session error — voice channel lost:", err);
+          handleSessionLost("error");
+        },
+        onclose: (info: any) => {
+          console.warn("[VOICE] Gemini Live session closed — voice channel lost:", info);
+          handleSessionLost("closed");
         },
       },
       config: {
@@ -3887,7 +4000,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       }));
     }
 
-    clientWs.on("message", (data) => {
+    clientWs.on("message", async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "audio" && msg.audio) {
@@ -3923,11 +4036,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             if (!frozen) {
               clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
             } else {
-              const killed = stopAll(true);
-              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed }));
+              const killed = await stopAll(true);
+              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: lastStopAllFailed }));
             }
           } else {
-            const running = stopAll(false);
+            const running = await stopAll(false);
             clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 1, frozen: true, running }));
           }
         } else if (msg.type === "release_stop_all") {
@@ -4038,7 +4151,12 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : requestedPort;
 
-  return { app, server, wss, manager, port, close };
+  return {
+    app, server, wss, manager, port, close,
+    _testActiveLiveSession: () => activeLiveSession,
+    _testPendingApprovals: () => pendingApprovals,
+    _testClients: () => clients,
+  };
 }
 
 export { startServer };
