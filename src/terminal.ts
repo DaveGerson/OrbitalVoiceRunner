@@ -64,6 +64,83 @@ export function parsePresetsSafe(input: any): CliPreset[] {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// U4 (wsm-e2e-pinned-ckf): deterministic create_pane — preset is the single
+// source of truth. The voice tool no longer exposes a free-form `command`; the
+// server derives the command from the (normalized) tool_preset via the two pure
+// helpers below, reused by the voice handler AND the restart path.
+// ---------------------------------------------------------------------------
+
+/** The voice/restart tool-preset union (also UniversalTerminal.toolPreset / addTerminal). */
+export type ToolPresetUnion = "Claude Code" | "Codex" | "Antigravity" | "Custom";
+
+// Canonical id for each non-Custom union member. Codex/Antigravity .name on the
+// seeded presets is "Codex CLI"/"Antigravity Agent" — NOT the union — so we key
+// preset lookup on the .id, never the .name (the documented blocker).
+const PRESET_ID_BY_UNION: Record<Exclude<ToolPresetUnion, "Custom">, string> = {
+  "Claude Code": "claudeCode",
+  Codex: "codex",
+  Antigravity: "antigravity",
+};
+
+// Fallback binary when settings.presets carries no override for the id.
+const PRESET_FALLBACK_CMD: Record<Exclude<ToolPresetUnion, "Custom">, string> = {
+  "Claude Code": "claude",
+  Codex: "codex",
+  Antigravity: "antigravity",
+};
+
+/**
+ * Collapse whatever the model emitted for tool_preset (a preset .id like "codex",
+ * a display .name like "Codex CLI", or an already-union value like "Codex") onto
+ * the addTerminal union. Unknown / empty -> "Custom" (fail-safe: a bare shell is
+ * harmless; a mis-spawned agent under Full Auto is not).
+ */
+export function normalizePreset(raw: string | undefined | null): ToolPresetUnion {
+  const v = (raw ?? "").trim();
+  switch (v) {
+    case "claudeCode":
+    case "Claude Code":
+      return "Claude Code";
+    case "codex":
+    case "Codex CLI":
+    case "Codex":
+      return "Codex";
+    case "antigravity":
+    case "Antigravity Agent":
+    case "Antigravity":
+      return "Antigravity";
+    case "Custom":
+      return "Custom";
+    default:
+      return "Custom";
+  }
+}
+
+/**
+ * Map a normalized tool-preset union value to the command line to launch. Single
+ * source of truth for "preset -> command", reused by the voice create_pane handler
+ * AND the restart path. Custom -> the configured bare shell
+ * (advanced.defaultShellCommand), else the platform default (cmd.exe / bash).
+ *
+ * For an agent preset we resolve the command from the matching settings.presets[].command
+ * (so a director who renamed the binary is honored), falling back to the canonical name.
+ */
+export function presetCommand(
+  preset: ToolPresetUnion,
+  presets: CliPreset[] | undefined,
+  defaultShellCommand: string | undefined,
+): string {
+  if (preset === "Custom") {
+    const shell = (defaultShellCommand ?? "").trim();
+    return shell || (process.platform === "win32" ? "cmd.exe" : "bash");
+  }
+  const id = PRESET_ID_BY_UNION[preset];
+  const match = (presets ?? []).find((p) => p.id === id);
+  const override = (match?.command ?? "").trim();
+  return override || PRESET_FALLBACK_CMD[preset];
+}
+
 
 /**
  * Pure launch-string builder (BUG-032 regression surface). Given a fully-built

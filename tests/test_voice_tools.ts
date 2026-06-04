@@ -354,4 +354,131 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
       assert.strictEqual(handlerNames.size, declNames.size, "handler set and declaration set are the same size");
     });
   });
+
+  // U4 (wsm-e2e-pinned-ckf): the voice create_pane tool is DETERMINISTIC. The schema no
+  // longer exposes a free-form `command`; the server derives the command from the
+  // (normalized) tool_preset. The misclassification bug was: command='claude' + tool_preset
+  // arriving as the preset .id 'claudeCode' (not the union) misclassified runtimeType as
+  // "shell" and dropped --dangerously-skip-permissions. These cases pin the fix end-to-end
+  // through the real voice -> gate -> addTerminal -> constructor path.
+  //
+  // Spawn note: create_pane runs the genuine addTerminal -> term.start() (a real ConPTY).
+  // We assert on constructor-set fields (shellCmd/runtimeType/toolPreset), which are decided
+  // BEFORE the spawn, then deterministically tear each pane down via term.stop() (drains the
+  // ConPTY conout worker so --test-force-exit can't abort, src\win\async.c:76).
+  describe("U4: deterministic create_pane (preset-derived command)", () => {
+    const created: string[] = [];
+
+    // Force create_pane to resolve Auto so the gated effect runs inline. We set the global
+    // matrix DIRECTLY (not via the set_capability_gate VOICE tool): create_pane defaults to
+    // Ask, and voice LOOSENING (Ask->Auto) is intentionally REFUSED (server.ts:3216). The
+    // director loosens via the Settings UI; in-test we mirror that by writing the matrix.
+    function setCreatePaneAuto() {
+      if (!running.manager.settings.advanced.capabilityGates) {
+        running.manager.settings.advanced.capabilityGates = {} as any;
+      }
+      (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
+    }
+
+    async function teardownCreated() {
+      for (const id of created.splice(0)) {
+        const t = (running.manager.terminals as any)[id];
+        if (t && typeof t.stop === "function") {
+          try { await t.stop(); } catch { /* already gone */ }
+        }
+        delete (running.manager.terminals as any)[id];
+      }
+    }
+
+    // Create a pane by voice and wait for the tool response, tracking it for teardown.
+    async function createPaneByVoice(args: Record<string, any>): Promise<void> {
+      created.push(args.pane_id);
+      const call = session.emitToolCall("create_pane", args);
+      await waitFor(() => mock.responseFor(call));
+    }
+
+    after(async () => {
+      await teardownCreated();
+      if (running.manager.settings.advanced.capabilityGates) {
+        delete (running.manager.settings.advanced.capabilityGates as any).create_pane;
+      }
+    });
+
+    it("Claude preset (sent as the .id 'claudeCode') derives 'claude', persists 'Claude Code', keeps --dangerously-skip-permissions under Full Auto", async () => {
+      clearPanes();
+      setCreatePaneAuto();
+      await createPaneByVoice({
+        project_id: "u4_proj",
+        pane_id: "u4-claude",
+        tool_preset: "claudeCode", // the misclassification case: model echoes the preset .id
+        permissions_mode: "Full Auto",
+      });
+      const term = (running.manager.terminals as any)["u4-claude"];
+      assert.ok(term, "pane was created");
+      assert.strictEqual(term.toolPreset, "Claude Code", "persisted the union, not the raw id");
+      assert.strictEqual(term.runtimeType, "interactive_cli", "agent runtime, NOT shell");
+      assert.ok(term.shellCmd.startsWith("claude"), `derived the claude command: ${term.shellCmd}`);
+      assert.ok(
+        term.shellCmd.includes("--dangerously-skip-permissions"),
+        `Full Auto keeps the skip flag: ${term.shellCmd}`
+      );
+      await teardownCreated();
+    });
+
+    it("restart of a Claude pane rebuilds the 'claude' command via presetCommand (from the persisted union)", async () => {
+      clearPanes();
+      setCreatePaneAuto();
+      // The restart-restore branch reads the ACTIVE project's ledger pane, so create under
+      // (and pin active to) u4_proj.
+      running.manager.ledger.activeProjectId = "u4_proj";
+      await createPaneByVoice({
+        project_id: "u4_proj",
+        pane_id: "u4-restart",
+        tool_preset: "Claude Code",
+        permissions_mode: "Full Auto",
+      });
+      assert.strictEqual(
+        running.manager.ledger.getActiveProject()?.id ?? running.manager.ledger.activeProjectId,
+        "u4_proj",
+        "active project is u4_proj so the restart-restore branch finds the pane"
+      );
+      // Simulate the persisted-but-not-live restore path: drop the live term (await its
+      // teardown), keep the ledger pane, then hit the restart REST endpoint -> server.ts:867
+      // branch (manager.terminals[id] absent -> rebuild cmd via presetCommand).
+      const live = (running.manager.terminals as any)["u4-restart"];
+      if (live && typeof live.stop === "function") { try { await live.stop(); } catch {} }
+      delete (running.manager.terminals as any)["u4-restart"];
+
+      const res = await api("/api/terminals/u4-restart/restart", { method: "POST" });
+      assert.strictEqual(res.status, 200, "restart endpoint accepted the restore");
+      const term = (running.manager.terminals as any)["u4-restart"];
+      assert.ok(term, "restart re-created the pane");
+      assert.ok(term.shellCmd.startsWith("claude"), `restart derived claude: ${term.shellCmd}`);
+      assert.strictEqual(term.toolPreset, "Claude Code", "restart kept the union");
+      await teardownCreated();
+    });
+
+    it("Custom derives defaultShellCommand, stays shell runtime, never carries the skip flag (even Full Auto)", async () => {
+      clearPanes();
+      setCreatePaneAuto();
+      await createPaneByVoice({
+        project_id: "u4_proj",
+        pane_id: "u4-custom",
+        tool_preset: "Custom",
+        permissions_mode: "Full Auto",
+      });
+      const term = (running.manager.terminals as any)["u4-custom"];
+      assert.ok(term, "pane was created");
+      const expectedShell =
+        (running.manager.settings.advanced.defaultShellCommand || "").trim() ||
+        (process.platform === "win32" ? "cmd.exe" : "bash");
+      assert.strictEqual(term.runtimeType, "shell", "Custom -> shell runtime");
+      assert.strictEqual(term.shellCmd, expectedShell, "Custom -> bare shell command");
+      assert.ok(
+        !term.shellCmd.includes("--dangerously-skip-permissions"),
+        `no skip flag on a Custom shell even under Full Auto: ${term.shellCmd}`
+      );
+      await teardownCreated();
+    });
+  });
 });
