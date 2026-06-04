@@ -115,6 +115,47 @@ Migrate the remaining 40 tools and flip the dispatch. This is the large, sequent
 
 ---
 
+## Wave D — Registry plumbing  *(PLM1–PLM5 — the choke-point payoff; depends on REG1)*
+
+This is what makes the registry worth installing: it hangs the dependability features off the `runAction` seam + `action_log` table that Wave C built. PLM1–PLM3 are independent of one another (parallel-safe in their own worktrees off the merged registry); PLM4 is the largest; PLM5 depends on PLM2.
+
+### Task D1 — Per-action timeout  *(PLM1, was RES4)*
+- **Files:** `src/actions/gemini.ts` (`runAction`); `src/actions/types.ts` (optional `ActionDef.timeoutMs`).
+- **RED:** `tests/test_action_timeout.ts` — `it("a handler exceeding its deadline yields {kind:'error'} answered once")`; `it("ALWAYS_ALLOWED brake actions are exempt / get a generous deadline")`.
+- **GREEN:** `Promise.race` the handler against a per-action deadline (default + override); on timeout return an `error` result; `resultToToolResponse` still answers `call.id` exactly once; the realtime session is never blocked.
+- **Acceptance:** stuck handler degrades cleanly; brake unaffected; tests green.
+
+### Task D2 — Action-log view  *(PLM2, was OBS1)*
+- **Files:** new `get_action_log` ActionDef (readOnly, `read_pane`/Auto) querying `action_log`; `mountRestRoutes` auto-exposes `GET /api/action-log`; a minimal `src/App.tsx` panel.
+- **RED:** `tests/test_action_log_view.ts` — `it("get_action_log returns redacted rows filtered by pane/capability/outcome")`; `it("each row carries surface, actor, capability, gateDisposition, resultKind, ms")`.
+- **GREEN:** a query helper on `JanusStore`; register the read action (so it inherits gate + redaction + REST generation for free — the registry dogfooding its own payoff); wire the panel.
+- **Acceptance:** the audit trail REG1 writes is now *visible and filterable*; tests green.
+
+### Task D3 — Durable-closure version guard  *(PLM3, NEW)*
+- **Context:** durable `PendingAction`s persist *intent* and rebuild `run()` on boot via `actionEffects.ts`; REG1 rewrites every handler, so a pre-refactor intent could rebuild into a changed/removed effect.
+- **Files:** `src/actionEffects.ts` (`buildActionRun`), `src/pendingActions.ts` (persist path), `src/store/schema.ts` (add a `registry_version` / action-schema-hash column).
+- **RED:** `tests/test_durable_action_version.ts` — `it("a persisted intent whose capability no longer exists is quarantined, not silently mis-run")`; `it("a persisted intent with a mismatched action-schema hash is flagged for re-confirmation, not auto-run")`.
+- **GREEN:** stamp each persisted intent with `{actionName, schemaHash}` (hash of the ActionDef params+capability); on rehydrate, validate against the live registry — on miss/mismatch mark the pending action `needs_review` and surface it, rather than rebuilding a possibly-wrong `run()`.
+- **Acceptance:** version skew is quarantined, never silently executed; tests green.
+
+### Task D4 — Session reconnect + in-flight idempotency  *(PLM4, was RES1)*
+- **Files:** `server.ts` session setup (builds on QW3's `onerror`/`onclose`); `src/actions/gemini.ts` (`runAction` idempotency hook).
+- **RED:** `tests/test_session_reconnect.ts` — `it("on reconnect the session resumes from the last sessionResumption token")`; `it("an in-flight runAction interrupted by a drop is replayed idempotently or reported interrupted — never double-applied")`; `it("pending approvals survive a reconnect and are re-announced")`.
+- **GREEN:** persist the resumption token; on `onclose` attempt reconnect with backoff; tag each `runAction` with an idempotency key `(surface+actor+name+argsHash)` recorded in `action_log` so a replay is detected; reuse `reannounceSurvivors` on the new session.
+- **Acceptance:** a network blip no longer ends the session; no double-apply; tests green.
+
+### Task D5 — Health/counters strip  *(PLM5, was OBS2; dep D2)*
+- **Files:** new `get_health` read action (session-connected, pane liveness counts, in-flight/pending counts, recent error-rate from `action_log`); a small always-visible `src/App.tsx` strip.
+- **RED:** `tests/test_health.ts` — `it("get_health reports session state, pane counts, pending count, recent error rate")`.
+- **GREEN:** aggregate from `manager` + `action_log`; register the read action; render the strip.
+- **Acceptance:** always-visible truth about the system; test green.
+
+> **Noted next add (not this wave):** a thin **rate-limit** hook at the same `runAction` seam — cheap once PLM1/PLM2 exist; file as a follow-up bead.
+
+**Wave D exit gate = the handoff doc §5 DoD:** audit log visible, per-action timeout live, durable rehydrate version-guarded, session reconnect working, health strip rendering.
+
+---
+
 ## 4. Dependency graph & parallelism
 
 ```
@@ -129,22 +170,26 @@ Migrate the remaining 40 tools and flip the dispatch. This is the large, sequent
                           Wave C  (REG1) C1 → C2 → C3       (same agent continues; single-owner)
                                    │  Phase-1 DoD
                                    ▼
+              Wave D (plumbing)   PLM1 ‖ PLM2 ‖ PLM3   →   PLM4   →   PLM5(dep PLM2)
+                                   │  handoff DoD (audit visible, timeout, version-guard, reconnect, health)
+                                   ▼
         ┌──────────── then (separate plans) ────────────┐
-        │  CV1→CV2→CV3   ‖   REG2(Python)   ‖   RES*   ‖   OBS*  │
-        └────────────────────────────────────────────────────────┘
+        │  CV1→CV2→CV3   ‖   REG2(Python)   ‖   RES2/3/5/6   ‖   OBS3  │
+        └────────────────────────────────────────────────────────────┘
 
 Parallel throughout (independent worktrees, own track): DBT4 (App.tsx), DBT1/DBT2 typing.
 ```
 
-- **Serialize:** A → B → C (each rebases on the prior merge). Within C, C1→C2→C3 are sequential edits of the same surface.
-- **Parallel-safe now:** A7/H1 (deletes), and the DBT typing/UI tracks (different files).
+- **Serialize:** A → B → C → D (each rebases on the prior merge). Within C, C1→C2→C3 are sequential edits of the same surface. Within D, PLM1/PLM2/PLM3 fan out; PLM4 then PLM5.
+- **Parallel-safe now:** A7/H1 (deletes), the DBT typing/UI tracks, and (within Wave D) PLM1/PLM2/PLM3 in separate worktrees off the merged registry.
 - **Hard rule:** only **one** agent mutates the `server.ts`/`src/actions` worktree at a time (worktree-mutex). Reviewers may read any worktree concurrently (CLAUDE.md "Reads vs. writes").
 
 ## 5. Dispatch checklist (what to launch, in order)
 1. **Agent 1 (worktree):** Wave A QW1–QW6 — serial commits, then full battery, then stop for review/merge.
    **Agent 2 (worktree, parallel):** A7/H1 dead-code delete.
 2. After A merges → **Agent 3 (worktree):** Wave B (B0→B1→B2), keystone. Stop at the Wave-B exit gate for review/merge.
-3. After B merges → **Agent 3 continues (same worktree):** Wave C (C1→C2→C3) to the Phase-1 DoD; file CV*/REG2/RES*/OBS* beads.
-4. Optional anytime: **Agent 4 (worktree):** DBT4 App.tsx decomposition (independent).
+3. After B merges → **Agent 3 continues (same worktree):** Wave C (C1→C2→C3) to the Phase-1 DoD; file backlog beads.
+4. After C merges → **Wave D plumbing:** fan out **Agent 5a/5b/5c (worktrees):** PLM1 / PLM2 / PLM3 in parallel → merge → **Agent 5 (worktree):** PLM4 → PLM5. Stop at the handoff DoD.
+5. Optional anytime: **Agent 4 (worktree):** DBT4 App.tsx decomposition (independent).
 
 Each agent reports: changed files, validation run, bead status, and any blocked commit/push step (per CLAUDE.md session-completion protocol). No PRs unless explicitly requested.

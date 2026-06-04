@@ -18,11 +18,14 @@ The gap assessment found a consistent shape: **the happy path is solid, the boun
 ```
 Pillar 0  Quick Wins        ~1 day    crash-safety + hygiene        (independent; land first)
 Pillar 1  Registry          ~1.5 wk   one legible action surface    (the registry spec; keystone-first)
-   └─ Convergence track     ~1 wk     burn down surface asymmetry   (piecemeal, post-registry)
-Pillar 2  Resilience        ~1 wk     tested failure recovery        (attaches to the runAction seam)
-Pillar 3  Observability     ~0.5 wk   surface the audit trail        (attaches to the same seam)
+   └ Pillar 1+ Plumbing      ~1 wk     make the seam pay off          (audit view, timeout, version-guard, reconnect, health)
+   └ Convergence track       ~1 wk     burn down surface asymmetry   (piecemeal, post-registry)
+Pillar 2  Resilience (rest)  ~0.5 wk   PTY death, boot-UX, fault tests
+Pillar 3  Observability(rest)~0.25 wk  remaining surfacing
    ‖ Cross-cutting debt     parallel  typing, dead code, App.tsx     (opportunistic)
 ```
+
+> **2026-06-04 — plumbing pulled into the registry epic.** Installing the `runAction` choke-point without the things that hang off it ships an *empty hook* (audit log written but unreadable, no timeout, no reconnect). The five highest-value choke-point payoffs are therefore promoted out of Pillars 2/3 into a **Pillar 1+ Registry-plumbing** stage that lands with the registry. The rest of Pillars 2/3 stay deferred.
 
 Total to a dependable daily driver: **~3–4 focused engineer-weeks**, but the *felt* jump happens on day 1 (Pillar 0) and the legibility jump on the registry merge.
 
@@ -51,21 +54,32 @@ Every gap-assessment finding is assigned a roadmap item with a stable ID so the 
 | **CV3** | Convergence C3 — rest-only infra → voice (`close_pane`/`restart_pane` Ask-gated, archive, clear-exited, watch-rule CRUD) | [D1] | MED | M |
 | **REG2** | Phase 2 — Python catalog authority + codegen (Pydantic → committed generated TS/JSON, no-drift test) | (spec §7) | — | M |
 
-### Pillar 2 — Resilience (Stage 4)  *— attaches to the runAction seam (spec §13)*
+### Pillar 1+ — Registry plumbing (Stage 2.5)  *— ships with the registry; the choke-point payoff. Detail in the handoff doc + execution-plan Wave D.*
+All depend on **REG1** (they hang off the `runAction` seam / `action_log` table).
 | ID | Item | Closes | Sev | Effort |
 |---|---|---|---|---|
-| **RES1** | Gemini session reconnect — resume from `sessionResumption` token; in-flight `runAction` idempotent-replayable or reported interrupted; pending approvals re-announced | [A1-full][D3] | HIGH | M |
+| **PLM1** | Per-action **timeout** in `runAction` — stuck handler → `{kind:"error"}` answered once; realtime never blocks *(pulled from RES4)* | [A·hang] | HIGH | S |
+| **PLM2** | **Action-log view** — `get_action_log` read action → `GET /api/action-log` + minimal UI panel over `action_log` *(pulled from OBS1)*. Makes the audit trail REG1 writes actually visible. | [G7][trust] | HIGH | M |
+| **PLM3** | **Durable-closure version guard** *(NEW)* — stamp persisted `PendingAction` intent with action-name + registry schema-hash; on boot, missing capability or changed hash → quarantine for re-confirm, never silently mis-run. REG1 rewrites every handler the durable intents rebuild against. | [correctness] | HIGH | M |
+| **PLM4** | **Session reconnect + in-flight idempotency** — resume from the resumption token; an interrupted `runAction` is replayed idempotently or reported interrupted, never double-applied; approvals re-announced *(pulled from RES1)*. Builds on QW3. | [A1-full] | HIGH | M |
+| **PLM5** | **Health/counters strip** — `get_health` read action + always-visible UI strip (session-connected, pane liveness, pending count, recent error-rate) *(pulled from OBS2)*. Dep PLM2. | [trust] | MED | S |
+
+### Pillar 2 — Resilience (remainder, Stage 4)  *— attaches to the runAction seam (spec §13)*
+| ID | Item | Closes | Sev | Effort |
+|---|---|---|---|---|
+| ~~**RES1**~~ | **→ pulled forward to PLM4** (session reconnect ships with the registry plumbing) | — | — | — |
 | **RES2** | PTY death handling — pane death → attention item + earcon; `read`/`propose` on a dead pane returns clean `blocked`/`clarify`; restart via shared `resolveLaunch`; ConPTY drain tested | [A5][D2] | MED | L |
 | **RES3** | Server-restart recovery — **re-scoped 2026-06-04:** the persistence half is **done on main** (durable `PendingActionStore`/`PendingApprovalStore`, intent persisted + `run()` rebuilt on boot via `actionEffects.ts`). Remaining: boot-time "N panes were running, restart them?" re-announce UX + running-PTY recovery; nothing silently re-executes | [E1·done][E2] | MED | S |
-| **RES4** | Per-action timeout in `runAction` — stuck handler → `{kind:"error"}` answered once; realtime session never blocked | (spec §13) | MED | S |
+| ~~**RES4**~~ | **→ pulled forward to PLM1** (per-action timeout ships with the registry plumbing) | — | — | — |
 | **RES5** | Failure-injection test suite (`tests/test_resilience.ts`) — kill the mock session mid-tool-call, transport exit mid-command, persist+re-import server | [D3] | HIGH | M |
 | **RES6** | Attention-queue cap audit — ensure `pruneAttention()` at every mutation site (BUG-035) | [E3] | MED | S |
 
-### Pillar 3 — Observability (Stage 5)  *— surface the seam (spec §13)*
+### Pillar 3 — Observability (remainder, Stage 5)  *— surface the seam (spec §13)*
 | ID | Item | Closes | Sev | Effort |
 |---|---|---|---|---|
-| **OBS1** | Action-log view — `GET /api/action-log` (itself a registry read action) + UI panel over `action_log`: filter by pane/capability/outcome, gate decision + latency per action | (spec §13) | MED | M |
-| **OBS2** | Health/status strip — pane liveness, session-connected, in-flight/pending counts, recent error rate | (spec §13) | MED | S |
+| ~~**OBS1**~~ | **→ pulled forward to PLM2** (action-log view ships with the registry plumbing) | — | — | — |
+| ~~**OBS2**~~ | **→ pulled forward to PLM5** (health strip ships with the registry plumbing) | — | — | — |
+| **OBS3** | "Why did that happen?" deep-links — per-action trigger utterance + gate decision drill-down (beyond the PLM2 list view) | (spec §13) | LOW | S |
 
 ### Cross-cutting debt (parallel / opportunistic)
 | ID | Item | Closes | Sev | Effort |
@@ -93,15 +107,20 @@ Every gap-assessment finding is assigned a roadmap item with a stable ID so the 
 - **Scope:** migrate the remaining 40 tools; swap `server.ts` dispatch + REST mount to the generators; derive the matrix; build the `action_log` seam; delete the regex guard; full characterization goldens.
 - **Exit gate:** registry-spec **Phase 1 DoD** (§12) — all surfaces generated, regex guard gone, coverage allow-list = every current asymmetry, goldens equal `main`, full battery green, convergence/Phase-2 beads filed.
 
+### Stage 2.5 — Registry plumbing  *(PLM1 → PLM2 → PLM3 → PLM4 → PLM5)*  **← in scope; ships with the registry**
+- **Depends on:** REG1 (the `runAction` seam + `action_log` table). This is the work that turns the seam from an empty hook into a working dependability surface.
+- **Order:** PLM1 (timeout — trivial at the wrapper) → PLM2 (audit view — the trust payoff) → PLM3 (version-guard — correctness before more handlers churn) → PLM4 (reconnect — voice table-stakes, builds on QW3) → PLM5 (health strip — dep PLM2). PLM1–PLM3 are independent of each other and parallel-safe in their own worktrees; PLM4 is the largest.
+- **Exit gate:** audit log is *visible* (`GET /api/action-log` + panel); a stuck handler can't block the session; durable rehydrate quarantines version skew; a network blip reconnects without double-applying; health strip live. This is the §5 DoD of the handoff doc.
+
 ### Stage 3 — Convergence  *(CV1 → CV2 → CV3)* and **REG2** (parallel-able)
 - **Depends on:** REG1. Each Cn is independent, small, revertible, and gated by its own parity-cutover test (§8.5b). REG2 (Python catalog) can run in parallel once REG1 lands.
 
-### Stage 4 — Resilience  *(RES1–RES6)*
-- **Depends on:** REG1 (RES1/RES4 hook the `runAction` seam; RES4's timeout lives in the wrapper). RES2/RES3/RES6 are largely independent and can interleave with Stage 3.
+### Stage 4 — Resilience (remainder)  *(RES2, RES3-UX, RES5, RES6)*
+- **Depends on:** REG1. (RES1/RES4 already shipped as PLM4/PLM1 in Stage 2.5.) Largely independent; can interleave with Stage 3.
 - **Exit gate:** `tests/test_resilience.ts` green; a `resilience-design.md` records the specified behavior per failure mode.
 
-### Stage 5 — Observability  *(OBS1–OBS2)*
-- **Depends on:** REG1's `action_log` table existing. Pure surfacing; lowest urgency.
+### Stage 5 — Observability (remainder)  *(OBS3)*
+- **Depends on:** PLM2's view existing. (OBS1/OBS2 already shipped as PLM2/PLM5.) Lowest urgency.
 
 **Cross-cutting debt** (DBT1–DBT5) is scheduled opportunistically: DBT5 falls out of REG1; DBT1/DBT2 ride alongside Stage 2/4; DBT3 is a decision gate (make the call before REG2 to avoid carrying both backends into codegen); DBT4 (App.tsx) is a parallel UI track that does not block the server work.
 
