@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -203,6 +203,28 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
     db.exec(`
       ALTER TABLE panes ADD COLUMN capability_gates TEXT;
       ALTER TABLE panes_archive ADD COLUMN capability_gates TEXT;
+    `);
+  },
+  // v5 (bead wsm-e2e-pinned-kzt): durable deferred ACTIONS across a process restart. An Ask-tier
+  // non-PTY mutator (create_pane / set_*_permissions / update_metadata) stages a side-effect closure
+  // in PendingActionStore; that closure is non-serializable, so we persist the action's INTENT
+  // (capability + JSON params) here and rebuild run() on boot via src/actionEffects.ts. Mirrors
+  // pending_approvals (v1): `claimed` is the exactly-once gate (atomic UPDATE … WHERE claimed=0),
+  // `expires_at` drives the boot/sweep prune. Purely additive (new table, no ALTER) — safe on an
+  // already-migrated DB. NOTE: v4 above is #26's capability_gates column — left verbatim; this slots
+  // at v5 so per-pane gate persistence is NOT clobbered.
+  (db) => {
+    db.exec(`
+      CREATE TABLE pending_actions (
+        id TEXT PRIMARY KEY NOT NULL,
+        capability TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        params TEXT NOT NULL DEFAULT '{}',
+        claimed INTEGER NOT NULL DEFAULT 0,
+        timestamp INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE INDEX idx_pending_actions_expires ON pending_actions(claimed, expires_at);
     `);
   },
 ];

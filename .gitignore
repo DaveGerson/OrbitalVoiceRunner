@@ -31,3 +31,12 @@ __pycache__/
 
 # Claude Code machine-local settings (not committed)
 .claude/settings.local.json
+
+# Superpowers brainstorm/visual-companion artifacts (local only)
+.superpowers/
+
+# git worktree directories (never commit a worktree's nested .git pointer)
+.claude/worktrees/
+
+# beads issue tracker — local Dolt DB; sync is via refs/dolt/data, not the working tree
+.beads/

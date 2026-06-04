@@ -110,6 +110,41 @@ export interface PendingCommand {
     trigger?: string;
     summary: string;
   };
+  // rbh (wsm-e2e-pinned-rbh): SERVER-resolved EFFECTIVE posture for the TARGET pane, so the
+  // approve/reject dialog answers "into what posture am I approving this write?" with the same
+  // truth the chip shows. All optional → older payloads / mocks degrade to today's dialog (D5).
+  effective_gates?: CapabilityGateMap;
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
+  effective_mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  /** The write capability gating this approval (e.g. write_to_pane / deliver_handoff). */
+  capability?: CapabilityGate;
+}
+
+/**
+ * rbh (wsm-e2e-pinned-rbh): the pending-action view the ActionConfirmDialog renders. Carries the
+ * SERVER-resolved EFFECTIVE posture the engine WILL apply (not the nominal summary string) so the
+ * dialog can render an effective rider + a divergence "heads up" when nominal ≠ effective. All
+ * posture fields optional → degrade-safe (D5). Replaces the inline shape at App.tsx.
+ */
+export interface PendingActionView {
+  actionId: string;
+  capability: string;
+  summary: string;
+  /** The effective gate for `capability` after override → spotlight → global resolution. */
+  effective_gate?: GateValue;
+  effective_mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
+  effective_gates?: CapabilityGateMap;
+  /** null for global actions (set_global_permissions has no pane scope — D2). */
+  pane_id?: string | null;
+  /** The mode the operator asked for (structural, never parsed from the summary — R5). */
+  requested_mode?: string;
+  /**
+   * Whether the GLOBAL mode (≠ Inherit) genuinely dominates the requested per-pane mode. Distinguishes
+   * a real global override (rider: "global mode is X, this pane stays …") from a staged-not-yet-applied
+   * mode change under Inherit (which will take effect on confirm — no divergence). See concern-3 fix.
+   */
+  global_override?: boolean;
 }
 
 // Single source of truth for the ledger pane/workspace shapes (D7). These live

@@ -311,6 +311,14 @@ export function createPtyTransport(
   }
 
   // Legacy fallback transport — verbatim spawn shape from the old terminal.ts.
+  // G3: the legacy path is a DELIBERATE fallback (piped stdin, no real PTY), not a
+  // failure — but it is silent today, which makes stdin/TTY-class issues hard to
+  // diagnose. Make it observable with a single loud warning; never throw / refuse
+  // to boot (node-pty is the preferred path, this is the safety net).
+  console.warn(
+    "[ptyTransport] node-pty unavailable — pane on LEGACY transport (piped stdin, no real PTY). " +
+      "This is a deliberate fallback, not a crash; interactive TUI fidelity may be reduced."
+  );
   const isDarwin = process.platform === "darwin";
   let file: string;
   let args: string[];

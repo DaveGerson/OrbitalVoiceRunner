@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
-import { Terminal, PendingCommand, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
+import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
@@ -28,7 +28,9 @@ function AppRaw() {
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   // G1: gated non-PTY deferred actions (create_pane / set_*_permissions on the Ask tier).
-  const [pendingActions, setPendingActions] = useState<{ actionId: string; capability: string; summary: string }[]>([]);
+  // rbh: PendingActionView carries the SERVER-resolved EFFECTIVE posture so the confirm dialog can
+  // render the effective rider + a divergence "heads up" when nominal ≠ effective (degrade-safe).
+  const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [recentlyIdled, setRecentlyIdled] = useState<Record<string, boolean>>({});
   const prevTerminalsRef = useRef<Terminal[]>([]);
@@ -425,6 +427,7 @@ function AppRaw() {
     setPendingActions,
     setFrozen,
     setFrozenRunning,
+    setWipDrafts,
   });
 
   const fetchTerminals = async () => {
@@ -755,11 +758,18 @@ function AppRaw() {
 
   const handleApplyRecipe = async (recipeId: string) => {
     try {
-      await apiFetch("/api/recipes/apply", {
+      // G6: /api/recipes/apply is now gated. A whole-layout apply_recipe=Off returns 403 (no panes
+      // spawned). A 200 may still carry blocked/deferred panes in its body — that is a success render
+      // (some panes spawned, deferred ones surface via the existing action_pending chip path).
+      const res = await apiFetch("/api/recipes/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ recipeId })
       });
+      if (res.status === 403) {
+        playEarcon("alert"); // whole-layout gated Off (NO "error" earcon token exists)
+        return;
+      }
       fetchTerminals();
       fetchLedger();
       playEarcon("success");
@@ -1067,7 +1077,12 @@ function AppRaw() {
     }
     
     try {
-      await apiFetch("/api/terminals", {
+      // G6: /api/terminals is now gated. apiFetch does NOT throw on non-2xx, so branch on res.status:
+      //   403 (gate Off)  -> pane was NOT created; close modal, surface refusal, do NOT activate.
+      //   202 (gate Ask)  -> deferred; the action_pending broadcast already added a pending chip.
+      //                      Close modal but do NOT activate — the pane does not exist yet.
+      //   200 (gate Auto) -> pane spawned; activate it.
+      const res = await apiFetch("/api/terminals", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1079,6 +1094,16 @@ function AppRaw() {
           projectId: activeProjectId
         })
       });
+      if (res.status === 403) {
+        setShowCreateModal(false);
+        playEarcon("alert"); // gate Off refusal (NO "error" earcon token exists)
+        return;
+      }
+      if (res.status === 202) {
+        setShowCreateModal(false);
+        playEarcon("execute"); // queued, awaiting confirm
+        return;
+      }
       setShowCreateModal(false);
       fetchTerminals();
       fetchLedger();
@@ -1204,7 +1229,13 @@ function AppRaw() {
               messageId: msg.messageId,
               cmd: msg.cmd,
               terminalId: msg.terminalId,
-              rationale: msg.rationale
+              rationale: msg.rationale,
+              // rbh: carry the SERVER-resolved effective posture for the target pane so the dialog
+              // shows "into what posture am I approving this write?". Optional → degrade-safe.
+              effective_gates: msg.effective_gates,
+              posture: msg.posture,
+              effective_mode: msg.effective_mode,
+              capability: msg.capability,
             }];
           });
         } else if (msg.type === "action_pending") {
@@ -1213,7 +1244,20 @@ function AppRaw() {
           triggerDesktopNotification("⚙ Action Pending", `Confirm: ${msg.summary}`);
           setPendingActions(prev => {
             if (prev.some(a => a.actionId === msg.actionId)) return prev;
-            return [...prev, { actionId: msg.actionId, capability: msg.capability, summary: msg.summary }];
+            // rbh: carry the SERVER-resolved EFFECTIVE posture into the view so the confirm dialog
+            // can render the effective rider + a divergence "heads up" when nominal ≠ effective.
+            return [...prev, {
+              actionId: msg.actionId,
+              capability: msg.capability,
+              summary: msg.summary,
+              effective_gate: msg.effective_gate,
+              effective_mode: msg.effective_mode,
+              posture: msg.posture,
+              effective_gates: msg.effective_gates,
+              pane_id: msg.pane_id,
+              requested_mode: msg.requested_mode,
+              global_override: msg.global_override,
+            }];
           });
         } else if (msg.type === "action_resolved") {
           // Confirmed/cancelled/expired elsewhere (REST/voice/TTL) — drop it from the UI.
@@ -1977,7 +2021,11 @@ function AppRaw() {
           <div className="flex items-center gap-2 min-w-0">
             <CheckSquare className="w-4 h-4 text-cyan-400 shrink-0" />
             <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase truncate">Prompt Draft</h3>
-            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate" title="The pane this draft will be sent to">
+            <span
+              data-testid="composer-target-pane"
+              className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate"
+              title="The pane this draft will be sent to"
+            >
               → {activePaneName}
             </span>
           </div>
@@ -2113,11 +2161,15 @@ function AppRaw() {
 
   const renderHelperPanelTabs = () => {
     const unreadCount = attentionQueue.filter(item => !item.dismissed).length;
+    // U3: a draft is pending if the active-pane buffer holds non-whitespace text OR any pane has a
+    // staged WIP draft. Mirrors the composer-send enable gate (.trim()), unlike the legacy mobile
+    // nav dot which gates on raw promptBuffer.length and ignores wipDrafts.
+    const draftPending = promptBuffer.trim().length > 0 || wipDrafts.length > 0;
     return (
       <div className="flex bg-black/60 p-1 rounded-t border-t border-l border-r border-white/5 shrink-0 select-none">
         <button
           onClick={() => setActiveRightHelperTab("buffer")}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 uppercase ${
+          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 relative uppercase ${
             activeRightHelperTab === "buffer"
               ? "border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04]"
               : "border-transparent text-zinc-500 hover:text-zinc-300"
@@ -2125,6 +2177,13 @@ function AppRaw() {
         >
           <CheckSquare className="w-3.5 h-3.5" />
           <span>Sync Spec</span>
+          {draftPending && (
+            <span
+              data-testid="sync-spec-draft-badge"
+              title="A prompt draft is pending"
+              className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse shrink-0"
+            ></span>
+          )}
         </button>
         <button
           onClick={() => setActiveRightHelperTab("orchestration")}
@@ -2645,6 +2704,10 @@ function AppRaw() {
           terminalId={pending.terminalId}
           cmd={pending.cmd}
           rationale={pending.rationale}
+          posture={pending.posture}
+          effectiveGates={pending.effective_gates}
+          effectiveMode={pending.effective_mode}
+          capability={pending.capability}
           onApprove={handleApprove}
           onReject={handleReject}
         />
@@ -2656,6 +2719,12 @@ function AppRaw() {
           actionId={action.actionId}
           capability={action.capability}
           summary={action.summary}
+          posture={action.posture}
+          effectiveGate={action.effective_gate}
+          effectiveMode={action.effective_mode}
+          requestedMode={action.requested_mode}
+          globalOverride={action.global_override}
+          paneId={action.pane_id}
           onConfirm={handleConfirmAction}
           onCancel={handleCancelAction}
         />

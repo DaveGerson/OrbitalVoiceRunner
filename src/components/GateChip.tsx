@@ -14,11 +14,15 @@
  */
 
 import React, { useState, useRef, useEffect } from "react";
-import type { CapabilityGate, GateValue, CapabilityGateMap } from "../types";
+import type { CapabilityGate, CapabilityGateMap } from "../types";
 import {
   CAPABILITY_LABELS,
   CAPABILITY_CATEGORIES,
   ALL_CAPABILITIES,
+  POSTURE_STYLE,
+  GATE_STYLE,
+  normalizePostureWord,
+  normalizeEffectiveGates,
   type PostureWord,
 } from "../gateSurface";
 
@@ -28,19 +32,8 @@ const SPOTLIGHT_CAPS: ReadonlySet<CapabilityGate> = new Set<CapabilityGate>([
   "deliver_handoff",
 ]);
 
-/** Posture word → swatch classes (the one gate-language palette). */
-const POSTURE_STYLE: Record<PostureWord, { dot: string; text: string; ring: string; label: string }> = {
-  OPEN: { dot: "bg-emerald-500", text: "text-emerald-400", ring: "border-emerald-500/30 bg-emerald-500/5", label: "Janus can act here freely." },
-  GUARDED: { dot: "bg-amber-500", text: "text-amber-400", ring: "border-amber-500/30 bg-amber-500/5", label: "Some actions here need a checkpoint." },
-  LOCKED: { dot: "bg-red-500", text: "text-red-400", ring: "border-red-500/30 bg-red-500/5", label: "Janus can't type into this pane." },
-};
-
-/** Gate value → dot color + plain word. Auto = green, Ask = amber, Off = red (spec §2.A). */
-const GATE_STYLE: Record<GateValue, { dot: string; text: string; word: string }> = {
-  Auto: { dot: "bg-emerald-500", text: "text-emerald-400", word: "Allowed" },
-  Ask: { dot: "bg-amber-500", text: "text-amber-400", word: "Asks first" },
-  Off: { dot: "bg-red-500", text: "text-red-400", word: "Blocked" },
-};
+// POSTURE_STYLE + GATE_STYLE moved to gateSurface (rbh): the chip and the confirmation dialogs now
+// share ONE palette source so they can never drift. See gateSurface.ts for the canonical maps.
 
 interface GateChipProps {
   /** The 16 server-resolved effective gate values for this pane (server truth). */
@@ -64,7 +57,7 @@ function spotlightActive(gates: CapabilityGateMap, isActivePane: boolean): boole
   return false;
 }
 
-export function GateChip({ effectiveGates, posture, isActivePane = false, compact = false }: GateChipProps) {
+function GateChipInner({ effectiveGates, posture, isActivePane = false, compact = false }: GateChipProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -78,15 +71,18 @@ export function GateChip({ effectiveGates, posture, isActivePane = false, compac
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  // Degrade gracefully: no server posture ⇒ render nothing (older payloads / mocks).
-  if (!posture || !effectiveGates) return null;
-
-  const gates = effectiveGates;
-  const style = POSTURE_STYLE[posture];
+  // n2r: normalize at the boundary so a MALFORMED server payload can never index an undefined style
+  // record and white-screen the cockpit (plan §2 Change 2). Genuinely absent posture ⇒ render nothing
+  // (older payloads / mocks, D3); a present-but-bad word degrades to GUARDED (D1) with a calm tell.
+  const safePosture = normalizePostureWord(posture);
+  if (safePosture === null) return null;                              // genuinely absent → no chip (back-compat)
+  const gates = normalizeEffectiveGates(effectiveGates);             // TOTAL, validated map (never throws below)
+  const style = POSTURE_STYLE[safePosture] ?? POSTURE_STYLE.GUARDED; // belt-and-suspenders style fallback
   const focused = spotlightActive(gates, isActivePane);
+  const degraded = posture != null && safePosture !== posture;       // server sent a malformed posture word
 
   return (
-    <div ref={ref} className="relative inline-flex" data-testid="gate-chip" data-posture={posture}>
+    <div ref={ref} className="relative inline-flex" data-testid="gate-chip" data-posture={safePosture}>
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); setOpen(true); }}
@@ -96,7 +92,7 @@ export function GateChip({ effectiveGates, posture, isActivePane = false, compac
         data-testid="gate-chip-trigger"
       >
         <span className={`inline-block rounded-full ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${style.dot}`} />
-        <span>{posture}</span>
+        <span>{safePosture}</span>
         {focused && (
           <span data-testid="gate-chip-focus-star" title="Focused — trust follows your focus here" className="text-cyan-300 leading-none">★</span>
         )}
@@ -110,18 +106,31 @@ export function GateChip({ effectiveGates, posture, isActivePane = false, compac
         >
           <div className={`flex items-center gap-2 pb-2 mb-2 border-b border-white/10 ${style.text}`}>
             <span className={`inline-block w-2 h-2 rounded-full ${style.dot}`} />
-            <span className="uppercase tracking-widest font-bold">{posture}</span>
+            <span className="uppercase tracking-widest font-bold">{safePosture}</span>
             {focused && <span className="text-cyan-300" title="Spotlight loosened a write here">★ focused</span>}
             <span className="ml-auto text-zinc-500 normal-case font-sans text-[9px]">{style.label}</span>
           </div>
+
+          {/* n2r (D8): calm degraded tell — a malformed posture frame is a transient infra hiccup, not
+              an operator emergency. Muted, no color alarm; surfaces that we fell back to the safe default. */}
+          {degraded && (
+            <div
+              data-testid="gate-chip-degraded"
+              className="mb-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-[9px] text-zinc-500 normal-case font-sans leading-snug"
+            >
+              Posture unavailable — showing safe default.
+            </div>
+          )}
 
           {Object.entries(CAPABILITY_CATEGORIES).map(([category, caps]) => (
             <div key={category} className="mb-2 last:mb-0">
               <div className="text-[8px] uppercase tracking-widest text-zinc-600 font-bold mb-1">{category}</div>
               <div className="space-y-0.5">
                 {caps.map((cap) => {
-                  const value = gates[cap] ?? "Auto";
-                  const g = GATE_STYLE[value];
+                  // `gates` is already normalized → always a valid GateValue. The `?? GATE_STYLE.Ask`
+                  // hard fallback makes this row provably non-throwing regardless of upstream changes.
+                  const value = gates[cap];
+                  const g = GATE_STYLE[value] ?? GATE_STYLE.Ask;
                   const viaFocus = isActivePane && SPOTLIGHT_CAPS.has(cap) && value === "Auto";
                   return (
                     <div key={cap} data-testid={`gate-row-${cap}`} className="flex items-center justify-between gap-2">
@@ -140,6 +149,40 @@ export function GateChip({ effectiveGates, posture, isActivePane = false, compac
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * n2r (plan §2 Change 3, D4): a GateChip-LOCAL error boundary. The chip is a peripheral, server-fed,
+ * non-load-bearing widget — an unforeseen render fault must NOT have app-wide blast radius via the one
+ * global ErrorBoundary. The normalizers make the two KNOWN crash surfaces unreachable; this boundary is
+ * defense-in-depth so even a FUTURE unguarded lookup degrades to *no chip*, never the dead-app fault
+ * page. `componentDidCatch` logs so a genuinely new fault is still visible (not silently swallowed).
+ * The global ErrorBoundary stays as the last resort for everything else.
+ */
+interface GateChipBoundaryProps { children: React.ReactNode }
+interface GateChipBoundaryState { failed: boolean }
+
+class GateChipBoundary extends React.Component<GateChipBoundaryProps, GateChipBoundaryState> {
+  state: GateChipBoundaryState;
+  props: GateChipBoundaryProps;
+
+  constructor(props: GateChipBoundaryProps) {
+    super(props);
+    this.props = props;
+    this.state = { failed: false };
+  }
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(e: unknown) { console.error("[GateChip] render fault (degraded to no chip)", e); }
+  render() { return this.state.failed ? null : this.props.children; }
+}
+
+/** Public surface: the chip wrapped in its local boundary so a render fault loses the chip, not the app. */
+export function GateChip(props: GateChipProps) {
+  return (
+    <GateChipBoundary>
+      <GateChipInner {...props} />
+    </GateChipBoundary>
   );
 }
 
