@@ -32,7 +32,6 @@ import assert from "node:assert";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { fileURLToPath } from "url";
 import { WebSocket } from "ws";
 import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import { teardownServerSuite } from "./helpers/teardown";
@@ -321,39 +320,12 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
     });
   });
 
-  describe("voice tool surface parity guard", () => {
-    it("dispatch-handler names === FunctionDeclaration names (both include stop_all)", () => {
-      const here = path.dirname(fileURLToPath(import.meta.url));
-      const src = fs.readFileSync(path.join(here, "..", "server.ts"), "utf8");
-
-      // Declaration name set: scope strictly to the functionDeclarations array region
-      // (a whole-file name:"X" match would also catch the functionResponses:[{name:"X"}]
-      // objects in the dispatch handlers — false positives).
-      const declStart = src.indexOf("functionDeclarations: [");
-      assert.ok(declStart >= 0, "located the functionDeclarations array");
-      const declEnd = src.indexOf("\n          ]", declStart);
-      assert.ok(declEnd > declStart, "located the close of the functionDeclarations array");
-      const declRegion = src.slice(declStart, declEnd);
-      const declNames = new Set([...declRegion.matchAll(/name:\s*"([a-z_]+)"/g)].map((m) => m[1]));
-
-      // Handler name set: the onmessage dispatch switch uses `name === "X"`. Scope to
-      // everything before the live-session config block (responseModalities) so the
-      // declaration region's name:"X" entries are not picked up.
-      const dispEnd = src.indexOf("responseModalities");
-      assert.ok(dispEnd > 0, "located the live-session config block");
-      const dispRegion = src.slice(0, dispEnd);
-      const handlerNames = new Set([...dispRegion.matchAll(/name === "([a-z_]+)"/g)].map((m) => m[1]));
-
-      assert.ok(handlerNames.has("stop_all"), "stop_all has a dispatch handler");
-      assert.ok(declNames.has("stop_all"), "stop_all has a FunctionDeclaration");
-
-      const onlyHandlers = [...handlerNames].filter((n) => !declNames.has(n)).sort();
-      const onlyDecls = [...declNames].filter((n) => !handlerNames.has(n)).sort();
-      assert.deepStrictEqual(onlyHandlers, [], `handlers missing a voice declaration: ${onlyHandlers.join(", ")}`);
-      assert.deepStrictEqual(onlyDecls, [], `declarations missing a dispatch handler: ${onlyDecls.join(", ")}`);
-      assert.strictEqual(handlerNames.size, declNames.size, "handler set and declaration set are the same size");
-    });
-  });
+  // REG1 phase-C: the "voice tool surface parity guard" describe block was REMOVED here. It
+  // regex-scraped server.ts to assert the functionDeclarations names matched the dispatch
+  // `name === "X"` branches. After the registry swap, BOTH the declarations
+  // (toGeminiDeclarations(REGISTRY)) and the dispatch (runAction(REGISTRY, ...)) derive from the
+  // SAME REGISTRY, so the guard is obsolete — structural parity is covered by
+  // test_action_registry.ts §8.2.
 
   // U4 (wsm-e2e-pinned-ckf): the voice create_pane tool is DETERMINISTIC. The schema no
   // longer exposes a free-form `command`; the server derives the command from the
