@@ -14,6 +14,7 @@ logs/
 .janus_settings.json
 .janus_history.json
 .janus_scrollback_*.log
+.janus_interaction_log*.jsonl
 .janus.db*
 .janus*.bak
 _ptyprobe_test*.cjs

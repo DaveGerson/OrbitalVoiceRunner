@@ -27,7 +27,12 @@ describe("capability catalog (docs/CAPABILITIES.md)", () => {
 
   it("committed doc matches the in-memory render (no drift from the registry)", () => {
     const rendered = renderCatalog();
-    const committed = fs.readFileSync(DOC_PATH, "utf8");
+    // Normalize CRLF→LF before comparing. The committed blob is LF (renderCatalog only ever emits
+    // LF via `out.join("\n")`), but on a Windows clone with core.autocrlf=true git checks the file
+    // out as CRLF and fs.readFileSync returns those raw bytes. This guard's intent is CONTENT drift
+    // from the registry, not the on-disk EOL representation (which git/autocrlf controls), so we
+    // strip the checkout-injected CR — genuine content drift still fails the assert.
+    const committed = fs.readFileSync(DOC_PATH, "utf8").replace(/\r\n/g, "\n");
     assert.strictEqual(
       committed,
       rendered,

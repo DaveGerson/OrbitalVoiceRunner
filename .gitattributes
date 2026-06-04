@@ -2,3 +2,11 @@
 # /bin/sh on macOS/Linux. Scoped narrowly to avoid touching other files.
 *.sh text eol=lf
 .githooks/pre-commit text eol=lf
+.githooks/post-merge text eol=lf
+.githooks/post-checkout text eol=lf
+
+# The generated catalog doc is LF-only (renderCatalog emits LF). Pin THIS file to
+# LF so a core.autocrlf=true checkout cannot inject CR and make the no-drift guard
+# (tests/test_catalog.ts) spuriously fail on Windows clones. Scoped to the one
+# generated file so unrelated prose markdown is not renormalized.
+docs/CAPABILITIES.md text eol=lf

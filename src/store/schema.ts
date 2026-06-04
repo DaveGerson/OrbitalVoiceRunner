@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -249,6 +249,17 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       CREATE INDEX idx_action_log_ts              ON action_log(ts);
       CREATE INDEX idx_action_log_name_ts         ON action_log(name, ts);
       CREATE INDEX idx_action_log_idempotency_key ON action_log(idempotency_key);
+    `);
+  },
+  // v7: correlated interaction log — thread an interaction_id (one per operator TURN) onto every
+  // action_log row so a runAction record joins back to the voice utterance that caused it (the SQLite
+  // half of the interaction log; the JSONL half is src/interactionLog.ts). Additive ALTER — safe on an
+  // already-migrated v6 DB (existing rows get NULL). Indexed so a "show me everything in turn X" join
+  // stays O(log n).
+  (db) => {
+    db.exec(`
+      ALTER TABLE action_log ADD COLUMN interaction_id TEXT;
+      CREATE INDEX idx_action_log_interaction_id ON action_log(interaction_id);
     `);
   },
 ];

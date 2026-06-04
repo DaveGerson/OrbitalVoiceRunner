@@ -31,7 +31,8 @@ import {
   type ResolveMode,
   type ResolveReason,
 } from "./src/pendingApprovals";
-import { parseApprovalIntent, selectApprovalTarget, selectPendingAction } from "./src/approvalIntent";
+import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
+import { shouldRouteUtterance, resolvePendingActionByVoice } from "./src/voiceApprovalRouting";
 import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff, applyHandoffFlipOnResolve, type HandoffResolveReason } from "./src/handoffFlow";
@@ -48,10 +49,35 @@ import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
 import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/rest";
+import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
+import { extractTranscripts } from "./src/liveTranscripts";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
+
+// ── Correlated interaction log (Issue #1 instrumentation + "capture voice/thinking/actions/system,
+// analyzed together") ───────────────────────────────────────────────────────────────────────────
+// Append-only JSONL: every leg of an operator TURN (voice_in -> gemini_thinking/text -> tool_call ->
+// action_result -> approval -> pty) is one redacted line keyed by a shared interaction_id, so a whole
+// turn is reconstructable (scripts/analyze-interactions.ts) — and the approve→dispatch lag of Issue #1
+// becomes visible in the per-leg timestamps. Always on; JANUS_INTERACTION_LOG=off disables, or set a
+// path to relocate. JANUS_DEBUG_VOICE additionally echoes legs to stderr AND enables the (higher-
+// volume) pty leg.
+const INTERACTION_LOG_PATH = process.env.JANUS_INTERACTION_LOG ?? ".janus_interaction_log.jsonl";
+const VOICE_TRACE = !!process.env.JANUS_DEBUG_VOICE && process.env.JANUS_DEBUG_VOICE !== "0";
+const interactionSink =
+  INTERACTION_LOG_PATH.toLowerCase() === "off" ? NOOP_SINK : createFileInteractionSink(INTERACTION_LOG_PATH);
+const interactionLog = new InteractionLogger({
+  sink: (line) => {
+    interactionSink(line);
+    if (VOICE_TRACE) console.error("[VOICE-TRACE]", line);
+  },
+  redact: redactSecrets,
+});
+// Best-effort PTY attribution: the active turn's id, mirrored to module scope so manager.onOutput
+// (server-scope, not per-connection) can tag terminal output with the turn it most likely belongs to.
+let lastInteractionId: string | null = null;
 
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot.
 // Exported so in-process integration tests can authenticate without guessing the token.
@@ -832,6 +858,20 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       } catch (e) {
         console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
       }
+    }
+
+    // Correlated log: attribute terminal output to the active turn (best-effort; VOICE_TRACE-gated
+    // because PTY is high-volume). Lets "what did the operator's command actually produce?" be
+    // answered from the same stream as the voice/tool legs.
+    if (VOICE_TRACE && lastInteractionId) {
+      try {
+        interactionLog.log({
+          interactionId: lastInteractionId,
+          kind: "pty",
+          paneId: terminalId,
+          text: stripAnsiSequences(chunk).slice(0, 500),
+        });
+      } catch { /* observability never breaks the PTY loop */ }
     }
 
     if (!outputBuffers[terminalId]) {
@@ -2312,6 +2352,22 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     let wsClosed = false;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
+    // Correlated interaction log: one interaction_id per operator TURN. `lastSpeaker` flips the turn —
+    // when the operator speaks after the model, mint a fresh id; the model's response + tool calls +
+    // result + pty all share it. turnId() lazily mints for model-first events (e.g. a greeting).
+    let currentInteractionId: string | null = null;
+    let lastSpeaker: "operator" | "model" | null = null;
+    const turnId = (): string => {
+      if (currentInteractionId == null) currentInteractionId = interactionLog.mint();
+      lastInteractionId = currentInteractionId;
+      return currentInteractionId;
+    };
+    const onOperatorSpeech = (): string => {
+      if (lastSpeaker !== "operator") currentInteractionId = interactionLog.mint();
+      lastSpeaker = "operator";
+      lastInteractionId = currentInteractionId;
+      return currentInteractionId!;
+    };
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
 
     // PLM4 (2): AUTO-RECONNECT with BOUNDED exponential backoff. On a Gemini Live session loss we
@@ -2521,6 +2577,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // so the migrated handlers in src/actions/* stay thin and never reach into server.ts state. One
       // fresh ctx per tool call (callId-bound); everything else is shared by reference.
       function buildActionContext(callId: string, actionName?: string): ActionContext {
+        const interactionIdForCall = currentInteractionId; // stamp the active turn onto this dispatch's audit row
         return {
           manager,
           session,                              // the live Gemini session in this scope
@@ -2572,6 +2629,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 args_redacted: argsRedacted,
                 surface: row.surface ?? "voice",
                 idempotency_key: callId ?? null,
+                interaction_id: interactionIdForCall ?? null,
               });
             } catch { /* audit is best-effort; never break the dispatch */ }
           },
@@ -2595,41 +2653,31 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               const prevHandle = lastSessionResumptionToken?.newHandle;
               lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
               if (lastSessionResumptionToken?.newHandle !== prevHandle) {
-                console.log("[SESSION RESUMPTION] Token updated:", lastSessionResumptionToken?.newHandle);
+                // Don't log the handle value — it's a session-resumption token (mildly sensitive) and
+                // rotates almost every turn (log spam). It's persisted to KV for debugging if needed.
+                console.log("[SESSION RESUMPTION] Handle rotated.");
                 // PLM4 (1): persist the fresh handle so a process restart can resume. Best-effort,
                 // never-throw; guarded for store === null inside persistResumptionToken.
                 persistResumptionToken(lastSessionResumptionToken);
               }
             }
 
-            // Extract user or model verbal transcripts
-            let userUtterance = "";
-            let modelUtterance = "";
+            // Extract operator + model transcripts. The operator's words arrive on
+            // serverContent.inputTranscription (the REAL ASR channel, enabled in the config below); the
+            // legacy serverContent.turn/userTurn casts are a fallback. Feeding inputTranscription into
+            // userUtterance is THE fix for "spoken approve/commands never reached the parser" — the
+            // approval router + dictation + transcript frame all read userUtterance. (The 2026-06 live
+            // capture showed every operator utterance on inputTranscription while userUtterance was empty.)
+            const { operator: userUtterance, model: modelUtterance, modelThinking } = extractTranscripts(message);
 
-            if (message.serverContent?.modelTurn?.parts) {
-              for (const part of message.serverContent.modelTurn.parts) {
-                if (part.text) {
-                  modelUtterance += part.text;
-                }
-              }
-            }
-            if ((message.serverContent as any)?.turn?.parts) {
-              for (const part of (message.serverContent as any).turn.parts) {
-                if (part.text) {
-                  userUtterance += part.text;
-                }
-              }
-            }
-            if ((message.serverContent as any)?.userTurn?.parts) {
-              for (const part of (message.serverContent as any).userTurn.parts) {
-                if (part.text) {
-                  userUtterance += part.text;
-                }
-              }
+            if (modelThinking) {
+              interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });
+              lastSpeaker = "model";
             }
 
             if (userUtterance) {
               currentSessionUserUtterance = userUtterance;
+              interactionLog.log({ interactionId: onOperatorSpeech(), kind: "voice_in", text: userUtterance, data: { source: "operator" } });
               clientWs.send(JSON.stringify({
                 type: "transcript_text",
                 sender: "User",
@@ -2637,7 +2685,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               }));
 
               const cleanUtter = userUtterance.trim();
-              if (cleanUtter.length > 2) {
+              if (shouldRouteUtterance(cleanUtter)) {
+                // A4: route any utterance with non-whitespace content so bare votes ("no"/"ok", 2
+                // chars) reach the parser (was `cleanUtter.length > 2`, which amputated them before
+                // parseApprovalIntent — which already resolves bare yes/no). Empty/whitespace drops.
                 // Step 6: capture dictation into the ACTIVE pane's WIP draft (raw material the
                 // operator refines before sending). No-op if no pane is open.
                 appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
@@ -2646,6 +2697,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 // + most-recently-announced targeting (NOT FIFO, NOT substring matching).
                 const parsed = parseApprovalIntent(cleanUtter);
                 if (parsed.intent !== "none") {
+                  interactionLog.log({ interactionId: turnId(), kind: "approval", data: { intent: parsed.intent, targetHint: parsed.targetHint } });
                   const entries = pendingApprovals.forSession(session);
                   if (entries.length > 0) {
                     // Collision/ambiguity in the utterance itself -> clarify, never approve.
@@ -2675,40 +2727,19 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                     // sharp edge in multi-session setups; here the single live session owns the queue.
                     // Precedence is preserved by being the `else` of `entries.length > 0`: a session
                     // with BOTH a pending approval and a staged action resolves the APPROVAL first.
-                    const actions = pendingActions.all();
-                    if (actions.length > 0) {
-                      const target = selectPendingAction(
-                        actions.map((a) => ({ id: a.id, summary: a.summary })),
-                        parsed.targetHint
-                      );
-                      if (parsed.intent === "clarify") {
-                        pushApprovalNarration(session, `I heard both approve and reject — which of the ${actions.length} pending action${actions.length === 1 ? "" : "s"} did you mean?`);
-                      } else if (target.ambiguous || !target.id) {
-                        // >1 staged and nothing disambiguates -> read back the SUMMARIES (actions
-                        // have no meaningful terminalId; never narrate an empty pane id).
-                        const list = actions.map((a, i) => `${i + 1}. ${redactSecrets(a.summary)}`).join("; ");
-                        pushApprovalNarration(session, `I have ${actions.length} pending action${actions.length === 1 ? "" : "s"}: ${list}. Which one?`);
-                      } else if (parsed.intent === "approve") {
-                        const result = pendingActions.confirm(target.id);
-                        if (result.reason === "confirmed") {
-                          broadcast({ type: "action_resolved", actionId: target.id, outcome: "confirmed" });
-                          pushApprovalNarration(session, `Done — ${redactSecrets(target.summary ?? "")}.`);
-                        }
-                        // lost_race / not_found -> a concurrent REST already resolved it; stay silent
-                        // (no double-narration, no pane re-broadcast).
-                      } else {
-                        // reject
-                        const result = pendingActions.cancel(target.id);
-                        broadcast({ type: "action_resolved", actionId: target.id, outcome: "cancelled" });
-                        if (result.reason === "cancelled") pushApprovalNarration(session, `Cancelled — ${redactSecrets(target.summary ?? "")}.`);
-                      }
-                    }
+                    resolvePendingActionByVoice(cleanUtter, pendingActions, {
+                      broadcast,
+                      narrate: (t) => pushApprovalNarration(session, t),
+                      redact: redactSecrets,
+                    });
                   }
                 }
               }
             }
             if (modelUtterance) {
               currentSessionModelUtterance = modelUtterance;
+              interactionLog.log({ interactionId: turnId(), kind: "gemini_text", text: modelUtterance });
+              lastSpeaker = "model";
               clientWs.send(JSON.stringify({
                 type: "transcript_text",
                 sender: "Janus",
@@ -2736,6 +2767,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             for (const call of message.toolCall.functionCalls || []) {
               const name = call.name;
               const args = call.args as Record<string, any>;
+              const ixnId = turnId();
+              lastSpeaker = "model";
+              interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name, callId: call.id, args: args ?? {} } });
 
               // Guard every tool handler: an uncaught throw here would escape the Gemini SDK
               // onmessage callback, leave this call.id unanswered, and stall the conversation.
@@ -2769,6 +2803,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               } else {
                 const actionCtx: ActionContext = buildActionContext(call.id, name);
                 const result = await runAction(REGISTRY, name, (args ?? {}) as Record<string, unknown>, actionCtx);
+                interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
                 resultToToolResponse(result, session, name, call.id);
               }
               } catch (toolErr) {
@@ -2789,16 +2824,25 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         // null activeLiveSession behind the identity guard so a stale callback can't clobber a newer
         // session, and broadcast a NEW voice_channel_lost frame. NO reconnect logic (that is PLM4).
         onerror: (err: any) => {
-          console.error("[VOICE] Gemini Live session error — voice channel lost:", err);
+          // Log only the message, NOT the raw error/socket — the live WebSocket's URL carries the API
+          // key (?key=…), so dumping the object leaks the key into logs (security hazard).
+          console.error("[VOICE] Gemini Live session error — voice channel lost:", err instanceof Error ? err.message : String(err?.message ?? "error"));
           handleSessionLost("error");
         },
         onclose: (info: any) => {
-          console.warn("[VOICE] Gemini Live session closed — voice channel lost:", info);
+          // Log only code/reason, NOT the raw CloseEvent — its kTarget is the live WebSocket whose URL
+          // contains the API key (?key=…). Dumping the object leaks the key into logs (security hazard).
+          console.warn(`[VOICE] Gemini Live session closed — voice channel lost (code=${info?.code ?? "n/a"}, reason=${info?.reason || "n/a"}).`);
           handleSessionLost("closed");
         },
       },
       config: {
         responseModalities: [Modality.AUDIO],
+        // Correlated log: capture operator ASR + the model's spoken transcription ("thinking"/
+        // narration) so the voice_in + gemini_thinking legs carry real content. Additive (the existing
+        // modelTurn parsing is untouched); an empty object enables each channel.
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },

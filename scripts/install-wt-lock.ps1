@@ -1,7 +1,9 @@
-# scripts/install-wt-lock.ps1 — opt-in installer for the Worktree Mutex Lock (Windows).
+# scripts/install-wt-lock.ps1 — opt-in installer for the Worktree Mutex Lock +
+# the dependency-sync warning hooks (Windows).
 #
-# Installs .githooks/pre-commit into THIS CLONE's active hooks directory. This
-# is a deliberate, MANUAL, per-clone step. It does NOT modify shared git config
+# Installs .githooks/pre-commit AND .githooks/post-merge + .githooks/post-checkout
+# (the "node_modules out of sync after a pull" warning) into THIS CLONE's active
+# hooks directory. This is a deliberate, MANUAL, per-clone step. It does NOT modify shared git config
 # (it never runs `git config core.hooksPath ...`), so it cannot change behavior
 # fleet-wide for other clones.
 #
@@ -35,6 +37,22 @@ $dest = Join-Path $hooksDir "pre-commit"
 
 $marker = "Worktree Mutual-Exclusion Lock"
 
+# Install the dependency-sync warning hooks (post-merge/post-checkout) alongside the lock.
+# Idempotent; only manages hooks carrying our marker, never clobbers a foreign same-named hook.
+function Install-DepHooks {
+  foreach ($h in @("post-merge", "post-checkout")) {
+    $hsrc = Join-Path $root ".githooks/$h"
+    $hdest = Join-Path $hooksDir $h
+    if (-not (Test-Path $hsrc)) { continue }
+    if ((Test-Path $hdest) -and (-not (Select-String -Path $hdest -SimpleMatch "check-deps.mjs" -Quiet))) {
+      Write-Warning "existing non-managed $h hook at $hdest left untouched."
+      continue
+    }
+    Copy-Item -Force $hsrc $hdest
+    Write-Output "[install-wt-lock] installed dep-sync hook -> $hdest"
+  }
+}
+
 if ($Uninstall) {
   if ((Test-Path $dest) -and (Select-String -Path $dest -SimpleMatch $marker -Quiet)) {
     Remove-Item -Force $dest
@@ -42,11 +60,18 @@ if ($Uninstall) {
   } else {
     Write-Output "[install-wt-lock] no managed pre-commit hook at $dest (nothing to do)"
   }
+  foreach ($h in @("post-merge", "post-checkout")) {
+    $hd = Join-Path $hooksDir $h
+    if ((Test-Path $hd) -and (Select-String -Path $hd -SimpleMatch "check-deps.mjs" -Quiet)) {
+      Remove-Item -Force $hd; Write-Output "[install-wt-lock] removed $hd"
+    }
+  }
   return
 }
 
 if (-not (Test-Path $src)) {
   Write-Error "[install-wt-lock] missing $src"
+  exit 1  # explicit (matches install-wt-lock.sh); Write-Error already terminates under ErrorActionPreference=Stop
 }
 
 New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
@@ -55,6 +80,7 @@ if ((Test-Path $dest) -and (-not $Force)) {
   if (Select-String -Path $dest -SimpleMatch $marker -Quiet) {
     Copy-Item -Force $src $dest
     Write-Output "[install-wt-lock] refreshed existing managed hook at $dest"
+    Install-DepHooks
     return
   }
   Write-Warning "A different pre-commit hook already exists at:`n    $dest"
@@ -66,3 +92,5 @@ if ((Test-Path $dest) -and (-not $Force)) {
 Copy-Item -Force $src $dest
 Write-Output "[install-wt-lock] installed worktree lock hook -> $dest"
 Write-Output "[install-wt-lock] mode: advisory (warn only). For blocking: `$env:JANUS_WT_LOCK='strict'"
+
+Install-DepHooks

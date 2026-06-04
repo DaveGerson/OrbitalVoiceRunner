@@ -1,8 +1,10 @@
 #!/bin/sh
-# scripts/install-wt-lock.sh — opt-in installer for the Worktree Mutex Lock.
+# scripts/install-wt-lock.sh — opt-in installer for the Worktree Mutex Lock +
+# the dependency-sync warning hooks.
 #
-# Installs .githooks/pre-commit into THIS CLONE's active hooks directory. This
-# is a deliberate, MANUAL, per-clone step. It does NOT modify shared git config
+# Installs .githooks/pre-commit AND .githooks/post-merge + .githooks/post-checkout
+# (the "node_modules out of sync after a pull" warning) into THIS CLONE's active
+# hooks directory. This is a deliberate, MANUAL, per-clone step. It does NOT modify shared git config
 # (it never runs `git config core.hooksPath ...`), so it cannot change behavior
 # fleet-wide for other clones.
 #
@@ -52,8 +54,31 @@ if [ "$UNINSTALL" -eq 1 ]; then
   else
     echo "[install-wt-lock] no managed pre-commit hook at $DEST (nothing to do)"
   fi
+  for h in post-merge post-checkout; do
+    d="$HOOKS_DIR/$h"
+    if [ -f "$d" ] && grep -q "check-deps.mjs" "$d" 2>/dev/null; then
+      rm -f "$d"; echo "[install-wt-lock] removed $d"
+    fi
+  done
   exit 0
 fi
+
+# Install the dependency-sync warning hooks (post-merge/post-checkout) alongside the lock.
+# Idempotent; only manages hooks carrying our marker, never clobbers a foreign same-named hook.
+install_dep_hooks() {
+  for h in post-merge post-checkout; do
+    src="$ROOT/.githooks/$h"
+    dest="$HOOKS_DIR/$h"
+    [ -f "$src" ] || continue
+    if [ -f "$dest" ] && ! grep -q "check-deps.mjs" "$dest" 2>/dev/null; then
+      echo "[install-wt-lock] note: existing non-managed $h hook at $dest left untouched." 1>&2
+      continue
+    fi
+    cp "$src" "$dest"
+    chmod +x "$dest" 2>/dev/null || true
+    echo "[install-wt-lock] installed dep-sync hook -> $dest"
+  done
+}
 
 if [ ! -f "$SRC" ]; then
   echo "[install-wt-lock] missing $SRC" 1>&2
@@ -68,6 +93,7 @@ if [ -f "$DEST" ] && [ "$FORCE" -ne 1 ]; then
     cp "$SRC" "$DEST"
     chmod +x "$DEST" 2>/dev/null || true
     echo "[install-wt-lock] refreshed existing managed hook at $DEST"
+    install_dep_hooks
     exit 0
   fi
   echo "[install-wt-lock] a different pre-commit hook already exists at:" 1>&2
@@ -81,3 +107,5 @@ cp "$SRC" "$DEST"
 chmod +x "$DEST" 2>/dev/null || true
 echo "[install-wt-lock] installed worktree lock hook -> $DEST"
 echo "[install-wt-lock] mode: advisory (warn only). For blocking: export JANUS_WT_LOCK=strict"
+
+install_dep_hooks

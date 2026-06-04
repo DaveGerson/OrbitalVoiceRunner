@@ -78,9 +78,16 @@ npm test                                       # unit suite (tsx --test --test-f
 npm run test:e2e                               # Playwright (auto-starts Vite, ?mock=1 harness)
 npm run build                                  # vite + esbuild → dist/server.cjs
 npm run smoke:claude                           # live pane smoke (needs authed Claude binary)
+node scripts/check-deps.mjs                     # verify node_modules is in sync with package.json
 ```
 
-> Gotchas: the unit runner needs `--test-force-exit` (a PTY keeps the loop alive otherwise).
+> Gotchas:
+> - The unit runner needs `--test-force-exit` (a PTY keeps the loop alive otherwise).
+> - **Any pull/checkout that changes `package*.json` must be followed by `npm ci`** before
+>   lint/test/dev — git does NOT reinstall on pull, so a new dependency (e.g. the Wave D `zod`
+>   add) leaves `node_modules` stale and `tsc` fails with a cryptic "cannot find module". The
+>   `post-merge`/`post-checkout` hooks warn about this automatically once installed via
+>   `sh scripts/install-wt-lock.sh` (they run `node scripts/check-deps.mjs --warn`, fail-open).
 
 ## Architecture Overview
 

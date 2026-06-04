@@ -204,7 +204,12 @@ function main(): number {
   const rendered = renderCatalog();
 
   if (isCheckMode()) {
-    const existing = fs.existsSync(DOC_PATH) ? fs.readFileSync(DOC_PATH, "utf8") : null;
+    // Normalize CRLF→LF (see tests/test_catalog.ts): the check guards CONTENT drift, not the
+    // on-disk EOL that core.autocrlf controls. CI runs on Linux (no CR injection) so this only
+    // matters for a Windows `npm run catalog -- --check`, but keep it consistent with the test.
+    const existing = fs.existsSync(DOC_PATH)
+      ? fs.readFileSync(DOC_PATH, "utf8").replace(/\r\n/g, "\n")
+      : null;
     if (existing === rendered) {
       process.stdout.write(`catalog: docs/CAPABILITIES.md is up to date (${REGISTRY.length} actions).\n`);
       return 0;

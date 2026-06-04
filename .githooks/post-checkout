@@ -1,0 +1,22 @@
+#!/bin/sh
+# .githooks/post-checkout — same dep-sync warning as post-merge, for BRANCH switches that change
+# dependencies (e.g. moving between branches with different package.json). See .githooks/post-merge.
+#
+# Git args: $1=prev-HEAD  $2=new-HEAD  $3=branch-flag (1 = branch checkout, 0 = file checkout).
+# We only warn on branch checkouts to avoid noise on `git checkout -- <file>`.
+#
+# SAFETY: warn-only + fail-open — never blocks. Uses only `node`. Activate per clone via
+# scripts/install-wt-lock.{sh,ps1}.
+
+[ "${3:-0}" = "1" ] || exit 0   # not a branch checkout -> nothing to do
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$ROOT" ] || exit 0
+
+GUARD="$ROOT/scripts/check-deps.mjs"
+[ -f "$GUARD" ] || exit 0
+
+if command -v node >/dev/null 2>&1; then
+  node "$GUARD" --warn || true
+fi
+exit 0

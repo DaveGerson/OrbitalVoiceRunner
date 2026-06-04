@@ -21,6 +21,7 @@ export interface ActionLogRow {
   args_redacted: string | null;
   surface: string | null;
   idempotency_key: string | null;
+  interaction_id: string | null;
 }
 
 export class JanusStore {
@@ -298,10 +299,11 @@ export class JanusStore {
     args_redacted?: string | null;
     surface?: string | null;
     idempotency_key?: string | null;
+    interaction_id?: string | null;
   }): void {
     this.db.prepare(
-      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key)
-       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key)`
+      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key,interaction_id)
+       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key,@interaction_id)`
     ).run({
       ts: Date.now(),
       name: row.name,
@@ -311,6 +313,7 @@ export class JanusStore {
       args_redacted: row.args_redacted ?? null,
       surface: row.surface ?? null,
       idempotency_key: row.idempotency_key ?? null,
+      interaction_id: row.interaction_id ?? null,
     });
   }
 

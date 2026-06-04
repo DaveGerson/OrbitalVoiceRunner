@@ -1,0 +1,23 @@
+#!/bin/sh
+# .githooks/post-merge — warn when a merge (e.g. `git pull`) changed dependencies but node_modules
+# was not reinstalled.
+#
+# Fixes the "stale node_modules after pull" class (the Wave D zod incident: a pull added `zod` to
+# package.json + package-lock.json, node_modules was not refreshed, and `tsc --noEmit` then failed
+# with a cryptic "cannot find module 'zod'"). This turns that into an actionable warning right after
+# the pull that caused it.
+#
+# SAFETY: warn-only + fail-open — it NEVER blocks (the heavy lifting is scripts/check-deps.mjs in
+# --warn mode, which always exits 0). Uses only `node` (no tsx/zod) so it runs even when
+# node_modules is broken. Activate per clone via scripts/install-wt-lock.{sh,ps1}.
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$ROOT" ] || exit 0
+
+GUARD="$ROOT/scripts/check-deps.mjs"
+[ -f "$GUARD" ] || exit 0   # older checkout without the guard -> fail open
+
+if command -v node >/dev/null 2>&1; then
+  node "$GUARD" --warn || true
+fi
+exit 0
