@@ -1,0 +1,68 @@
+/**
+ * src/actions/coverage.ts — drift becomes a REPORT, not a surprise (§5.3 / §5.7).
+ *
+ * surfaceCoverage(registry) returns, per action, which of {voice, rest, ws} it is exposed on. The
+ * test suite (§8.4 #20) asserts that every single-surface action is on the INTENTIONAL_ASYMMETRY
+ * allow-list; anything voice-only or rest-only that is NOT allow-listed fails the build. The
+ * Convergence track (§7) then REMOVES entries from the allow-list one group at a time, each removal
+ * forcing the missing surface to exist.
+ *
+ * PHASE A NOTE: this is the empty-ish SEED. The full §4.2 asymmetry list (every current voice-only
+ * read/handoff + rest-only infra) is filled in REG1 Phase C, when the other 37 tools land and we
+ * know each tool's real current surfaces. For the small proof registry, the brake trio + list_panes
+ * are all multi-surface (voice+rest+ws / voice+rest), so the seed only needs to cover proof tools
+ * that are intentionally single-surface — currently none.
+ */
+
+import type { ActionDef, Surface } from "./types";
+
+/** Per-action surface presence. */
+export interface SurfacePresence {
+  name: string;
+  voice: boolean;
+  rest: boolean;
+  ws: boolean;
+}
+
+/**
+ * INTENTIONAL_ASYMMETRY — the allow-list of actions that are legitimately single-surface.
+ *
+ * Map of action name -> the surfaces it is intentionally restricted to. An action appears here ONLY
+ * if its single-surface status is by design (e.g. set_voice_mute is voice-only because it IS the
+ * mic; pure-viewport resize is rest-only). Phase-A seed is empty: the proof registry's tools are all
+ * multi-surface, and the full §4.2 residue is populated in Phase C as those tools migrate.
+ */
+export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>>> = Object.freeze({
+  // Phase C will add e.g.:
+  //   set_voice_mute: new Set<Surface>(["voice"]),   // voice-only by design — it IS the mic
+  //   resize:         new Set<Surface>(["rest"]),    // pure viewport geometry, no voice meaning
+});
+
+/** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
+export function surfaceCoverage(registry: readonly ActionDef[]): SurfacePresence[] {
+  return registry.map((def) => ({
+    name: def.name,
+    voice: def.surfaces.has("voice"),
+    rest: def.surfaces.has("rest"),
+    ws: def.surfaces.has("ws"),
+  }));
+}
+
+/** True if an action is exposed on more than one surface (multi-surface = no asymmetry concern). */
+export function isMultiSurface(presence: SurfacePresence): boolean {
+  return [presence.voice, presence.rest, presence.ws].filter(Boolean).length > 1;
+}
+
+/**
+ * Returns the names of actions that are single-surface but NOT on the INTENTIONAL_ASYMMETRY
+ * allow-list — i.e. the drift the build should reject (§8.4 #20). Empty === parity is clean.
+ */
+export function unexpectedAsymmetries(registry: readonly ActionDef[]): string[] {
+  const out: string[] = [];
+  for (const presence of surfaceCoverage(registry)) {
+    if (isMultiSurface(presence)) continue;            // multi-surface: never an asymmetry
+    if (INTENTIONAL_ASYMMETRY[presence.name]) continue; // allow-listed single-surface: fine
+    out.push(presence.name);
+  }
+  return out;
+}

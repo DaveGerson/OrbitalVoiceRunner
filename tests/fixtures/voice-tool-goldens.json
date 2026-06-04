@@ -1,0 +1,59 @@
+{
+  "confirm_stop_all": {
+    "output": "Done — I killed 1 pane(s): gold-confirm-a. They stay killed; I'm still frozen, say \"release\" to resume."
+  },
+  "deliver_handoff.pending": {
+    "messageId": "<ID>",
+    "pane_id": "gold-handoff-target",
+    "prompt": "Pending approval: direct pane gold-handoff-target — \"Please continue the build and report status.\". Read it back to the operator and ask them to approve or reject.",
+    "status": "pending_approval"
+  },
+  "get_pane_summary": {
+    "output": "```\nstub output line A\nstub output line B\n```"
+  },
+  "list_panes": {
+    "output": [
+      {
+        "panes": [],
+        "project_id": "default_project"
+      },
+      {
+        "panes": [
+          {
+            "alive": true,
+            "context_size": 0,
+            "is_busy": true,
+            "last_command": "stub-last-command",
+            "last_known_state": "Running active command",
+            "name": "gold-list",
+            "notes": [],
+            "pane_id": "gold-list",
+            "permissions_mode": "Human-in-the-Loop",
+            "runtime_type": "interactive_cli",
+            "session_id": "<ID>",
+            "tool_preset": "Claude Code"
+          }
+        ],
+        "project_id": "gold_proj"
+      }
+    ]
+  },
+  "propose_command.Ask": {
+    "messageId": "<ID>",
+    "pane_id": "gold-ask",
+    "prompt": "Pending approval: direct pane gold-ask — \"echo needs-approval\". Read it back to the operator and ask them to approve or reject.",
+    "status": "pending_approval"
+  },
+  "propose_command.Auto": {
+    "output": "Command executed automatically on pane gold-auto: \"echo hello\""
+  },
+  "propose_command.Off": {
+    "output": "Error: the 'write_to_pane' capability is gated Off for pane gold-off; this action is forbidden by policy."
+  },
+  "release_stop_all": {
+    "output": "Released — I've un-frozen and your safety gates are back exactly as they were. Any panes you killed stay killed."
+  },
+  "stop_all": {
+    "output": "I've frozen myself and cancelled everything in flight. 2 pane(s) are still running (gold-stop-a, gold-stop-b). Should I also kill them? That can't be undone — say \"kill them\" to confirm, or \"release\" to resume."
+  }
+}
