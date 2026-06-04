@@ -290,12 +290,13 @@ describe("§8.2 Gemini generation", () => {
     }
   });
 
-  it("zodToGeminiSchema covers scalars/enums/optional and throws on unsupported shapes", () => {
+  it("zodToGeminiSchema covers scalars/enums/optional/arrays and throws on unsupported shapes", () => {
     const schema = z.object({
       a: z.string(),
       b: z.number().optional(),
       c: z.enum(["x", "y"]),
       d: z.boolean(),
+      e: z.array(z.string()).optional(), // create_project.key_terms shape
     });
     const g = zodToGeminiSchema(schema);
     assert.strictEqual(g.type, "OBJECT");
@@ -303,9 +304,12 @@ describe("§8.2 Gemini generation", () => {
     assert.strictEqual(g.properties!.b.type, "NUMBER");
     assert.deepStrictEqual(g.properties!.c.enum, ["x", "y"]);
     assert.strictEqual(g.properties!.d.type, "BOOLEAN");
-    assert.deepStrictEqual(g.required!.sort(), ["a", "c", "d"]); // b optional -> not required
-    // Unsupported leaf throws at build, not runtime (R4).
-    assert.throws(() => zodToGeminiSchema(z.object({ bad: z.array(z.string()) })), /unsupported/i);
+    // Array -> { type: ARRAY, items: <element schema> }; optional -> not required.
+    assert.strictEqual(g.properties!.e.type, "ARRAY");
+    assert.strictEqual(g.properties!.e.items!.type, "STRING");
+    assert.deepStrictEqual(g.required!.sort(), ["a", "c", "d"]); // b + e optional -> not required
+    // A genuinely unsupported leaf still throws at build, not runtime (R4).
+    assert.throws(() => zodToGeminiSchema(z.object({ bad: z.date() })), /unsupported/i);
   });
 });
 

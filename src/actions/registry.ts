@@ -21,6 +21,14 @@ import { z } from "zod";
 import type { ActionDef, ActionResult } from "./types";
 import type { ApprovalKind } from "../pendingApprovals";
 import { ALWAYS_ALLOWED } from "./types";
+// Phase-B grouped ActionDefs (one file per capability domain, src/actions/defs/*).
+import { READS_ACTIONS } from "./defs/reads";
+import { NOTES_ACTIONS } from "./defs/notes";
+import { PANES_WRITE_ACTIONS } from "./defs/panes_write";
+import { ORIENT_ACTIONS } from "./defs/orient";
+import { LOCKS_ACTIONS } from "./defs/locks";
+import { ORCH_ACTIONS } from "./defs/orchestration";
+import { HANDOFF_ACTIONS } from "./defs/handoff";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -210,14 +218,27 @@ export const amendNote: ActionDef<typeof AmendNoteParams> = {
 };
 
 /**
- * The canonical registry array. Phase B appends the remaining tools; Phase C swaps server.ts to
- * dispatch through runAction(REGISTRY, ...). Keep this the SINGLE export everything derives from.
+ * The canonical registry — the SINGLE export everything derives from (Gemini declarations, REST mount,
+ * capability matrix, coverage). The 6 inline defs above are the phase-A proof (brake trio + list_panes)
+ * and the phase-B contract proof (propose_command = dispatchProposal style, amend_note = gateOrDefer
+ * durable Ask-defer style). The remaining 35 tools live in src/actions/defs/* (one file per capability
+ * domain), faithfully ported from their legacy server.ts branches. Phase C swaps server.ts to dispatch
+ * through runAction(REGISTRY, ...). Total = 41 voice tools (parity with the legacy dispatch chain).
  */
 export const REGISTRY: readonly ActionDef[] = [
+  // ── phase-A + contract-proof inline defs (6) ──
   stopAll,
   confirmStopAll,
   releaseStopAll,
   listPanes,
   proposeCommand,
   amendNote,
+  // ── phase-B grouped defs (35) ──
+  ...READS_ACTIONS,
+  ...NOTES_ACTIONS,
+  ...PANES_WRITE_ACTIONS,
+  ...ORIENT_ACTIONS,
+  ...LOCKS_ACTIONS,
+  ...ORCH_ACTIONS,
+  ...HANDOFF_ACTIONS,
 ];

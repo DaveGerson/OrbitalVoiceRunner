@@ -35,6 +35,7 @@ export interface GeminiSchema {
   properties?: Record<string, GeminiSchema>;
   required?: string[];
   enum?: string[];
+  items?: GeminiSchema; // element schema for Type.ARRAY (e.g. create_project.key_terms: string[])
 }
 
 /** Unwrap zod 4 wrappers (optional/default/nullable) down to the inner concrete node. */
@@ -59,7 +60,7 @@ function unwrap(schema: z.ZodTypeAny): { inner: z.ZodTypeAny; optional: boolean 
 
 /** Map ONE non-object zod leaf to its Gemini scalar schema. Throws on an unsupported shape (R4). */
 function leafToGemini(schema: z.ZodTypeAny): GeminiSchema {
-  const def = (schema as { def?: { type?: string; entries?: Record<string, string> } }).def;
+  const def = (schema as { def?: { type?: string; entries?: Record<string, string>; element?: z.ZodTypeAny } }).def;
   const t = def?.type;
   switch (t) {
     case "string":
@@ -73,12 +74,19 @@ function leafToGemini(schema: z.ZodTypeAny): GeminiSchema {
       const values = Object.values(def?.entries ?? {}).map((v) => String(v));
       return { type: Type.STRING, enum: values };
     }
+    case "array": {
+      // zod 4 array: def.element is the element schema. Unwrap any optional/default/nullable on the
+      // element, then recurse (e.g. create_project.key_terms: z.array(z.string()) -> items STRING).
+      const element = def?.element;
+      if (!element) throw new Error(`zodToGeminiSchema: z.array with no element type`);
+      return { type: Type.ARRAY, items: leafToGemini(unwrap(element).inner) };
+    }
     case "object":
       // Nested objects recurse through the top-level converter.
       return zodToGeminiSchema(schema as z.ZodObject<z.ZodRawShape>);
     default:
       throw new Error(
-        `zodToGeminiSchema: unsupported zod type "${String(t)}" — only object/string/number/boolean/enum/optional are supported`
+        `zodToGeminiSchema: unsupported zod type "${String(t)}" — only object/string/number/boolean/enum/array/optional are supported`
       );
   }
 }
