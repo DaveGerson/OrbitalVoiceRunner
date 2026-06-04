@@ -2,6 +2,49 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Platform Notes (Windows / PowerShell — read first)
+
+This project runs on Windows 11. The single largest source of wasted session time in past
+sessions was shell-idiom mismatch. Internalize these before running any command:
+
+**Shell routing (the #1 failure class):**
+- The **Bash tool** runs Git Bash (`/usr/bin/bash`). Use POSIX syntax only — never PowerShell
+  (`$x = ...`, `Write-Output`, `2>$null`, `[string]::...`).
+- The **PowerShell tool** runs Windows PowerShell 5.1. Use PowerShell syntax only — never POSIX
+  (`grep`, `cat`, `head`, `awk`, `2>/dev/null`, `&&`/`||` chains).
+- A syntax error in ONE call of a parallel Bash batch **cancels every sibling call** in that
+  batch. Do not mix shells in one call; do not parallelize shell calls that might error.
+
+**Prefer dedicated tools over shell commands:**
+- Read files with the **Read tool**, not `cat`. Reading a file via `cat` does NOT mark it read —
+  the Edit tool will then fail with "File has not been read yet."
+- Search with the **Grep** and **Glob** tools, not `grep` / `find`.
+- Inspect ports/processes with PowerShell `Get-NetTCPConnection` / `Get-Process`, not `netstat | grep`.
+
+**Paths:**
+- In Read/Edit/Glob/Grep tool calls, always use absolute Windows paths (`C:/Users/gerso/...`).
+  Forward slashes are fine and preferred.
+- Hook and statusLine command strings run through Git Bash — use forward slashes there too, or
+  they silently no-op (blank status line / dead hook).
+- Avoid `/tmp/` in Bash (Git Bash maps it to a transient location subagents can't reach); use
+  `$env:TEMP` or `C:/Users/gerso/AppData/Local/Temp`.
+
+**PowerShell gotchas:**
+- Logs written by PowerShell/Tee-Object are UTF-16. Don't Read `dev-server.log` directly; use
+  `Get-Content -Raw -Encoding UTF8`.
+- A `NativeCommandError` wrapping node's stderr is a display artifact, not a crash — confirm
+  health by the actual log line (e.g. "Server running on ...").
+- Set `$env:PYTHONIOENCODING='utf-8'` before any `py -3` invocation (Windows defaults to cp1252).
+
+**server.ts navigation:**
+- `server.ts` lives at the **repo root** (not `src/`) and is ~3,200 lines. Never Read it without
+  an `offset`. **Grep for the handler/function name first**, then Read a tight `offset`+`limit`
+  (<= 60 lines) window.
+
+**Session start:**
+- Read CLAUDE.md and memory files as sequential calls *before* firing Bash for git status — do
+  not parallelize orientation Reads with a Bash command (a Bash EOF cascades and cancels the Reads).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 

@@ -1,15 +1,36 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "bd prime --hook-json",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
-      }
+  "permissions": {
+    "allow": [
+      "Bash(npm run lint:*)",
+      "Bash(npm run test:*)",
+      "Bash(npm test:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run smoke:*)",
+      "Bash(npm run catalog:*)",
+      "Bash(npm run test:e2e:*)",
+      "Bash(npx tsx:*)",
+      "Bash(tsx:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git -C * status:*)",
+      "Bash(git -C * diff:*)",
+      "Bash(git -C * log:*)",
+      "Bash(git -C * rev-parse:*)",
+      "Bash(git -C * worktree list:*)",
+      "Bash(bd ready:*)",
+      "Bash(bd show:*)",
+      "Bash(bd list:*)",
+      "Bash(bd prime:*)",
+      "Bash(bd memories:*)",
+      "Bash(node -e:*)",
+      "Bash(node --version)",
+      "Bash(npx playwright:*)",
+      "Bash(npx kill-port:*)"
     ]
   }
 }
