@@ -182,6 +182,75 @@ describe("mountRestRoutes — query-param merge", () => {
   });
 });
 
+// ── (f) defense-in-depth: a thrown failure on the route seam responds 500, never hangs ───────────
+describe("mountRestRoutes — defense-in-depth on an unexpected throw", () => {
+  it("a handler that THROWS yields a 500 { error } response (not a hang / unhandled rejection)", async () => {
+    // Today runAction is the never-throw choke-point: a throwing handler is caught INSIDE runAction
+    // and surfaced as a typed { kind:"error" } -> resultToHttp 500. This asserts the end-to-end seam
+    // answers 500 with an error field rather than hanging the request.
+    const boom = makeDef({
+      name: "boom",
+      surfaces: ["rest"],
+      rest: { method: "post", path: "/boom" },
+      handler: (): ActionResult => {
+        throw new Error("handler exploded");
+      },
+    });
+    const { app, regs } = makeFakeApp();
+    mountRestRoutes(app, [boom], ctxFactory);
+
+    assert.strictEqual(regs.length, 1);
+    const { res, sent } = makeFakeRes();
+    await regs[0].handler({ body: {} }, res);
+
+    assert.strictEqual(sent.status, 500);
+    assert.ok(
+      sent.json && typeof sent.json === "object" && "error" in (sent.json as Record<string, unknown>),
+      "500 response json must carry an `error` field"
+    );
+    assert.strictEqual((sent.json as { error: unknown }).error, "handler exploded");
+  });
+
+  it("a throwing ctxFactory is caught by the route try/catch and answered 500 (belt-and-suspenders)", async () => {
+    // This exercises the route-handler guard directly: if ctxFactory (or any future change to the
+    // never-throw contract) throws BEFORE runAction is reached, the seam must still answer 500 and
+    // never let an unhandled async rejection escape the Express handler.
+    const ok = makeDef({
+      name: "ctxboom",
+      surfaces: ["rest"],
+      rest: { method: "get", path: "/ctxboom" },
+    });
+    const { app, regs } = makeFakeApp();
+    const throwingCtxFactory = (_req: RestRequest): ActionContext => {
+      throw new Error("ctxFactory exploded");
+    };
+    mountRestRoutes(app, [ok], throwingCtxFactory);
+
+    assert.strictEqual(regs.length, 1);
+    const { res, sent } = makeFakeRes();
+    await assert.doesNotReject(() => Promise.resolve(regs[0].handler({ query: {} }, res)));
+
+    assert.strictEqual(sent.status, 500);
+    assert.strictEqual((sent.json as { error: unknown }).error, "ctxFactory exploded");
+  });
+});
+
+// ── (g) `only` with names absent from the registry registers zero routes (no crash) ──────────────
+describe("mountRestRoutes — `only` names not in the registry", () => {
+  it("skips every unknown name and mounts zero routes", () => {
+    const registry = [
+      makeDef({ name: "x", surfaces: ["rest"], rest: { method: "get", path: "/x" } }),
+      makeDef({ name: "y", surfaces: ["rest"], rest: { method: "post", path: "/y" } }),
+    ];
+    const { app, regs } = makeFakeApp();
+    assert.doesNotThrow(() =>
+      mountRestRoutes(app, registry, ctxFactory, { only: new Set(["does_not_exist"]) })
+    );
+
+    assert.strictEqual(regs.length, 0);
+  });
+});
+
 // ── (e) resultToHttp maps each ActionResult kind to its HTTP shape ───────────────────────────────
 describe("resultToHttp — ActionResult -> HTTP mapping", () => {
   it("ok -> 200 { output }", () => {

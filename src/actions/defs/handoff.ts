@@ -319,6 +319,12 @@ export const readHandoff: ActionDef<typeof ReadHandoffParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "get", path: "/api/handoffs/:handoff_id" },
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: handoffs carry note-class CONTENT, so gate them under "read_notes"
+    // (null pane scope — handoffs are project/workspace-scoped, matching the notes reads).
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(null, "read_notes") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_notes' capability is gated Off; reading handoff content is forbidden by policy." };
+    }
     const { handoff_id } = args;
     const store = ctx.store;
     let resp: unknown;
@@ -362,6 +368,12 @@ export const listHandoffs: ActionDef<typeof ListHandoffsParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "get", path: "/api/handoffs" },
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: handoffs carry note-class CONTENT, so gate them under "read_notes"
+    // (null pane scope — handoffs are project/workspace-scoped, matching the notes reads).
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(null, "read_notes") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_notes' capability is gated Off; reading handoff content is forbidden by policy." };
+    }
     const { state } = args;
     const store = ctx.store;
     let resp: unknown;

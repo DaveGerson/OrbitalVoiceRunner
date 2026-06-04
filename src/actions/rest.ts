@@ -66,17 +66,27 @@ export function mountRestRoutes(
     if (opts?.only && !opts.only.has(def.name)) continue;
     const { method, path } = def.rest;
     const handler: RestHandler = async (req, res) => {
-      // Merge query params + route params + body so a route like POST /api/terminals/:id/input can
-      // carry both, and a GET /api/... can carry filters via the query string. Precedence (lowest ->
-      // highest): query < params < body.
-      const rawArgs: Record<string, unknown> = {
-        ...(req.query ?? {}),
-        ...(req.params ?? {}),
-        ...(req.body ?? {}),
-      };
-      const ctx = ctxFactory(req);
-      const result = await runAction(registry, def.name, rawArgs, ctx);
-      resultToHttp(result, res);
+      // Belt-and-suspenders: runAction is the never-throw voice choke-point, so today this catch is
+      // dead code. But the seam must stay self-contained regardless of a future change to that
+      // contract (or to ctxFactory) — an unhandled async rejection escaping an Express handler hangs
+      // the request and can crash the process. On any unexpected throw, map it to the same 500-error
+      // shape resultToHttp emits for an `error` ActionResult.
+      try {
+        // Merge query params + route params + body so a route like POST /api/terminals/:id/input can
+        // carry both, and a GET /api/... can carry filters via the query string. Precedence (lowest ->
+        // highest): query < params < body.
+        const rawArgs: Record<string, unknown> = {
+          ...(req.query ?? {}),
+          ...(req.params ?? {}),
+          ...(req.body ?? {}),
+        };
+        const ctx = ctxFactory(req);
+        const result = await runAction(registry, def.name, rawArgs, ctx);
+        resultToHttp(result, res);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        resultToHttp({ kind: "error", message }, res);
+      }
     };
     app[method](path, handler);
   }

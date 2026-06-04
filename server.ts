@@ -65,6 +65,27 @@ let liveConnector: LiveConnector = (ai, params) => ai.live.connect(params);
 export function setLiveConnector(fn: LiveConnector) {
   liveConnector = fn;
 }
+
+// PLM4 (Finding A): the per-session GoogleGenAI client (built from the operator's key) is constructed
+// through this seam so a test can simulate the PRE-TRY setup throwing (e.g. a malformed-but-present
+// key making `new GoogleGenAI(...)` throw) BEFORE connectLiveSession's own try — the never-throw hole
+// the initial-connect wrap now closes. Prod default just constructs the real client. Returns the
+// SDK client to use; `fallback` is the server's shared `ai` (used when there is no per-session key).
+export type SessionAiFactory = (key: string, fallback: GoogleGenAI) => GoogleGenAI;
+let sessionAiFactory: SessionAiFactory = (key, fallback) =>
+  key
+    ? new GoogleGenAI({ apiKey: key, httpOptions: { headers: { "User-Agent": "aistudio-build" } } })
+    : fallback;
+export function setSessionAiFactory(fn: SessionAiFactory) {
+  sessionAiFactory = fn;
+}
+/** Restore the default (real) session-AI factory. Tests call this in their teardown. */
+export function resetSessionAiFactory() {
+  sessionAiFactory = (key, fallback) =>
+    key
+      ? new GoogleGenAI({ apiKey: key, httpOptions: { headers: { "User-Agent": "aistudio-build" } } })
+      : fallback;
+}
 console.log("-----------------------------------------------------------------");
 console.log(`[SECURITY] Session API Authentication Token generated.`);
 console.log("-----------------------------------------------------------------");
@@ -325,6 +346,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // `tsx --test`). Binding it synchronously at startServer() time — there is no await between a
   // suite's installMockLive() and its startServer() call — pins each server to its own connector.
   const boundLiveConnector = liveConnector;
+  // PLM4 (Finding A): snapshot the session-AI factory for THIS server too (same pinning rationale as
+  // boundLiveConnector) so a sibling test server cannot redirect our pre-try client construction.
+  const boundSessionAiFactory = sessionAiFactory;
 
   const app = express();
   app.use(express.json());
@@ -2234,7 +2258,33 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   const approvalSweepTimer = setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS);
   if (typeof approvalSweepTimer.unref === "function") approvalSweepTimer.unref();
 
-  let lastSessionResumptionToken: any = null;
+  // PLM4 (1): RESUMPTION-TOKEN PERSISTENCE. The Gemini Live resume handle was in-memory only, so a
+  // process restart lost it and the next connect could not resume the conversation. Persist the FULL
+  // sessionResumptionUpdate to the durable KV whenever it changes, and rehydrate it at boot. Guarded
+  // for store === null (legacy backend) — the in-memory value is then the only source, exactly as
+  // before. The same KV the `frozen` flag uses (store.setKV / getKV).
+  const VOICE_RESUMPTION_KV = "voiceResumptionToken";
+  function rehydrateResumptionToken(): any {
+    if (!store) return null;
+    try {
+      const raw = store.getKV(VOICE_RESUMPTION_KV);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      console.error("[SESSION RESUMPTION] failed to rehydrate persisted token:", e);
+      return null;
+    }
+  }
+  function persistResumptionToken(token: any): void {
+    if (!store) return;
+    try {
+      if (token == null) store.deleteKV(VOICE_RESUMPTION_KV);
+      else store.setKV(VOICE_RESUMPTION_KV, JSON.stringify(token));
+    } catch (e) {
+      console.error("[SESSION RESUMPTION] failed to persist token:", e);
+    }
+  }
+  // Boot rehydrate: a restart resumes from the last persisted handle.
+  let lastSessionResumptionToken: any = rehydrateResumptionToken();
 
   wss.on("connection", async (clientWs, req) => {
     const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
@@ -2254,10 +2304,47 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
     let session: any = null;
     let unsubscribePaneSignals: (() => void) | null = null;
+    // `wsClosed` is now STRICTLY "the operator's client WS has closed" (set in clientWs.on("close")).
+    // It is the reconnect kill-switch: a scheduled reconnect aborts if the operator already left.
+    // A dead Gemini live session is tracked SEPARATELY by a per-attempt `sessionDead` flag inside
+    // connectLiveSession (so a stale session's post-close flush can't poison the token WITHOUT also
+    // blocking a fresh reconnect — the two used to share `wsClosed`, which would have defeated PLM4).
     let wsClosed = false;
     let currentSessionUserUtterance = "";
     let currentSessionModelUtterance = "";
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
+
+    // PLM4 (2): AUTO-RECONNECT with BOUNDED exponential backoff. On a Gemini Live session loss we
+    // schedule connectLiveSession() again with a capped attempt count AND a capped delay — NO storm.
+    // The timer is cleared on operator WS close (no reconnect after the operator leaves). The three
+    // tunables read optional env overrides so the reconnect suite can shrink the delays + attempt cap
+    // to run deterministically fast (prod defaults: 6 attempts, 500ms base, 30s ceiling).
+    const RECONNECT_MAX_ATTEMPTS = Number(process.env.JANUS_RECONNECT_MAX_ATTEMPTS) || 6;
+    const RECONNECT_BASE_DELAY_MS = Number(process.env.JANUS_RECONNECT_BASE_DELAY_MS) || 500;
+    const RECONNECT_MAX_DELAY_MS = Number(process.env.JANUS_RECONNECT_MAX_DELAY_MS) || 30000;
+    // PLM4 (Finding: flap-unbounded backoff): the bounded-retry budget is only refreshed after a
+    // session has stayed CONTINUOUSLY live for this long. A session that connects then immediately
+    // drops in a loop never reaches the threshold, so its budget keeps depleting and it gives up at
+    // the cap (permanent loss frame) instead of reconnecting forever at the base delay. Env-tunable so
+    // the flap suite can shrink it (prod default: 30s of continuous uptime counts as a stable session).
+    const RECONNECT_STABLE_UPTIME_MS = Number(process.env.JANUS_RECONNECT_STABLE_UPTIME_MS) || 30000;
+    let reconnectAttempts = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // PLM4 (Finding: flap): one-shot timer armed on each successful hoist; it resets the retry budget
+    // ONLY once the session has been live for RECONNECT_STABLE_UPTIME_MS. Cleared if the session drops
+    // (or the operator leaves) before then, so a flapping session never refreshes its budget.
+    let stableResetTimer: ReturnType<typeof setTimeout> | null = null;
+    function clearStableResetTimer(): void {
+      if (stableResetTimer) { clearTimeout(stableResetTimer); stableResetTimer = null; }
+    }
+    // PLM4 (2): monotonic connect generation. Each connectLiveSession() invocation bumps it and
+    // captures its own number; when its async connect resolves it bails if a NEWER connect has since
+    // started (so a slow stale connect can never clobber a newer live session). Mirrors the QW3
+    // `activeLiveSession === session` identity guard for the in-flight (not-yet-hoisted) window.
+    let connectGeneration = 0;
+    function clearReconnectTimer(): void {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    }
 
     // WS-E.2/E.3: resolve a single targeted approval by voice. Speaks a pane+instruction
     // read-back at resolution (R3 push), claims atomically (BUG-013/N-1 seam), and reports a
@@ -2367,39 +2454,68 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       }
     }
 
-    try {
+    // PLM4 (2): the session-establish logic, extracted into a reusable closure callable on BOTH the
+    // initial connect AND every bounded reconnect attempt. On the reconnect path the resumption token
+    // (config.sessionResumption below) lets the conversation resume, and reannounceSurvivors(session)
+    // re-announces the surviving approvals for free (PLM4 (4)). The per-attempt `sessionDead` flag
+    // gates that attempt's stale post-close resumption flush WITHOUT touching `wsClosed` (so a dead
+    // session never blocks the next reconnect). identity guards mirror the QW3 teardown.
+    async function connectLiveSession(isReconnect: boolean): Promise<void> {
+    // Claim a fresh generation; a later invocation bumps this and our post-connect guard then bails.
+    const myGeneration = ++connectGeneration;
+    // This attempt's dead flag (the QW3 post-close-flush gate, now per-session, not shared on wsClosed).
+    let sessionDead = false;
+    // QW3 (bead qw3) + PLM4 (2): teardown for a Gemini Live socket that dies WITHOUT the client WS
+    // closing. Detach (keep survivors for re-announce), null activeLiveSession behind the identity
+    // guard so a stale callback can't clobber a newer session, broadcast voice_channel_lost, THEN
+    // (PLM4) schedule a bounded reconnect. Idempotent-ish: onerror + onclose can both fire for one
+    // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
+    const handleSessionLost = (reason: "error" | "closed") => {
+      if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
+      sessionDead = true;
+      if (session) {
+        const detached = pendingApprovals.detachSession(session);
+        if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
+        // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
+        // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
+        // job — it only nulls the hoisted handle if it still points at THIS session, so a LATE stale
+        // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
+        // session. `session` is the mutated connection-scope let, so the comparison is by reference
+        // against whatever is currently hoisted (copied from WS-close).
+        if (activeLiveSession === session) {
+          activeLiveSession = null;
+          // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
+          // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
+          // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
+          clearStableResetTimer();
+        }
+      }
+      broadcast({ type: "voice_channel_lost", reason });
+      // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
+      scheduleReconnect();
+    };
+
       const sessionKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
         ? manager.settings.secrets.geminiApiKey
         : (process.env.GEMINI_API_KEY || "");
-      
-      const sessionAi = sessionKey ? new GoogleGenAI({
-        apiKey: sessionKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      }) : ai;
+
+      // PLM4 (Finding A): constructed through the per-server factory seam (default = `new GoogleGenAI`).
+      // This sits OUTSIDE the inner try below, so a throw here escapes connectLiveSession; on the
+      // INITIAL connect the wrap around `await connectLiveSession(false)` now catches it (mirrors the
+      // inner catch's initial-failure frame) and falls through so the WS listeners still register.
+      const sessionAi = boundSessionAiFactory(sessionKey, ai);
 
       const liveModel = manager.settings.voiceAi?.model || "gemini-3.1-flash-live-preview";
 
-      // QW3 (bead qw3): shared teardown for a Gemini Live socket that dies WITHOUT the client WS
-      // closing. Mirrors the WS-close handler (clientWs.on("close")): detach (keep survivors), null
-      // the hoisted live handle behind the identity guard, and tell the frontend the voice channel
-      // is gone. Idempotent-ish: onerror and onclose can both fire for one drop, but detachSession
-      // on an already-detached session is a no-op and the identity guard makes the null a no-op.
-      const handleSessionLost = (reason: "error" | "closed") => {
-        wsClosed = true; // gate out any post-close SDK resumption-token flush (mirror WS-close)
-        if (session) {
-          const detached = pendingApprovals.detachSession(session);
-          if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
-          // Identity guard: only null if the hoisted handle still points at THIS (now dead) session,
-          // so a stale callback cannot null a newer reconnected session (copied from WS-close).
-          if (activeLiveSession === session) activeLiveSession = null;
-        }
-        broadcast({ type: "voice_channel_lost", reason });
-      };
+      // PLM4 (Finding B2) STALE-HANDLE SELF-HEAL: capture whether THIS attempt will feed a persisted
+      // resume handle. A persisted handle can be expired/invalid (a prior crash, a server-side expiry)
+      // and would otherwise wedge reconnect forever — every bounded attempt would re-feed the same
+      // poison and fail. If a connect that USED a handle fails (inner catch below), we null the handle
+      // AND delete the persisted KV before the next attempt, so the retry connects FRESH and recovers.
+      // Net: a bad handle costs at most one failed attempt, never a permanent wedge.
+      const attemptUsedHandle = !!lastSessionResumptionToken?.newHandle;
 
+      try {
       // REG1 phase-C: assemble the ActionContext for the unified registry dispatch. Every field is a
       // live closure/binding in THIS connection scope (or a module-level value), injected by reference
       // so the migrated handlers in src/actions/* stay thin and never reach into server.ts state. One
@@ -2440,6 +2556,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
+          // PLM4 (3): stamp idempotency_key = ctx.callId (the Gemini call.id, unique per dispatch) so a
+          // re-delivered tool call after a reconnect can be detected by the replay guard above.
           audit: (row) => {
             if (!store) return;
             let argsRedacted: string | null = null;
@@ -2453,6 +2571,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 ms: row.ms,
                 args_redacted: argsRedacted,
                 surface: row.surface ?? "voice",
+                idempotency_key: callId ?? null,
               });
             } catch { /* audit is best-effort; never break the dispatch */ }
           },
@@ -2472,11 +2591,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             // Also ignore the SDK's final post-close token flush (wsClosed): writing it
             // would overwrite the live handle with a stale one from a dead session and
             // poison the next reconnect's resume attempt.
-            if ((message as any).sessionResumptionUpdate && !wsClosed) {
+            if ((message as any).sessionResumptionUpdate && !wsClosed && !sessionDead) {
               const prevHandle = lastSessionResumptionToken?.newHandle;
               lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
               if (lastSessionResumptionToken?.newHandle !== prevHandle) {
                 console.log("[SESSION RESUMPTION] Token updated:", lastSessionResumptionToken?.newHandle);
+                // PLM4 (1): persist the fresh handle so a process restart can resume. Best-effort,
+                // never-throw; guarded for store === null inside persistResumptionToken.
+                persistResumptionToken(lastSessionResumptionToken);
               }
             }
 
@@ -2626,9 +2748,29 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
               // to the real stopAll/releaseStopAll/isFrozen closures via ActionContext) routes through
               // the registry. runAction is itself try/caught + never throws; the outer catch is belt-and-
               // suspenders. The Gemini declarations come from the SAME REGISTRY (toGeminiDeclarations).
-              const actionCtx: ActionContext = buildActionContext(call.id, name);
-              const result = await runAction(REGISTRY, name, (args ?? {}) as Record<string, unknown>, actionCtx);
-              resultToToolResponse(result, session, name, call.id);
+              // PLM4 (3): PER-DISPATCH IDEMPOTENCY / replay guard. A tool call RE-DELIVERED after a
+              // reconnect (Gemini may replay the same functionCall id on a resumed session) must NOT
+              // double-apply a SIDE-EFFECTING (non-readOnly) action. If this idempotency_key (the
+              // Gemini call.id, unique per dispatch) already has a SUCCEEDED action_log row, answer the
+              // model it was already done and DO NOT re-run the handler. Reads (readOnly) are exempt —
+              // replaying a read is harmless. The store lookup is best-effort: any fault falls through
+              // to normal dispatch (the guard NEVER blocks the never-throw path).
+              const replayDef = REGISTRY.find((d) => d.name === name);
+              let replayShortCircuit = false;
+              if (store && call.id && replayDef && !replayDef.readOnly) {
+                try {
+                  if (store.hasSucceededIdempotencyKey(call.id)) replayShortCircuit = true;
+                } catch { /* store fault -> proceed; the guard must never block dispatch. */ }
+              }
+              if (replayShortCircuit) {
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
+                });
+              } else {
+                const actionCtx: ActionContext = buildActionContext(call.id, name);
+                const result = await runAction(REGISTRY, name, (args ?? {}) as Record<string, unknown>, actionCtx);
+                resultToToolResponse(result, session, name, call.id);
+              }
               } catch (toolErr) {
                 console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
                 try {
@@ -2662,7 +2804,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         },
         systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.\n\nEMERGENCY BRAKE (two stages, always allowed): if the operator says "stop", "halt", "abort", "freeze", or "stop everything", call stop_all IMMEDIATELY — it freezes you (every capability becomes Off) and cancels everything in flight, but the panes KEEP RUNNING. After it freezes, tell the operator how many panes are still running and ASK whether to also kill them (that is irreversible). If they confirm the kill ("kill them", "yes"), call confirm_stop_all. When they say "release"/"resume", call release_stop_all to un-freeze (your gates restore exactly; killed panes stay killed).`,
         ...({
-          sessionResumption: lastSessionResumptionToken ? { token: lastSessionResumptionToken.token } : {},
+          // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The
+          // @google/genai `SessionResumptionConfig` field is `handle` (node.d.ts:10236-10243), NOT
+          // `token`, and the persisted update's handle is `newHandle` (LiveServerSessionResumptionUpdate,
+          // node.d.ts:7968-7979) — NOT `token`. The previous `{ token: …token }` mismatched on BOTH, so
+          // resume was always `{}` (a fresh session every reconnect) and PLM4's persistence bought
+          // nothing. Empty object => start a brand-new session (the SDK treats an absent handle as new).
+          sessionResumption: lastSessionResumptionToken?.newHandle
+            ? { handle: lastSessionResumptionToken.newHandle }
+            : {},
           contextWindowCompression: {
             triggerTokens: 25000,
             slidingWindow: { targetTokens: 16000 }
@@ -2674,20 +2824,54 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       },
     });
 
+      // PLM4 (2): IDENTITY GUARD on the just-resolved connect. The async connect could have raced the
+      // operator leaving (wsClosed) or a newer session winning the hoist. If so, this freshly-minted
+      // session is stale — close it and bail WITHOUT clobbering the live channel. (`session` is the
+      // connection-scope let; on a reconnect a newer attempt could already have overwritten it, but
+      // last-write-wins here is fine: we only proceed if NOTHING newer has hoisted.)
+      const justConnected = session;
+      if (wsClosed || myGeneration !== connectGeneration) {
+        // Operator left during the await, OR a newer connect attempt has superseded this one. Either
+        // way this session is stale: close it and bail WITHOUT clobbering the live channel.
+        try { justConnected?.close?.(); } catch { /* best-effort */ }
+        return;
+      }
+
       // WS-F (spec §6.2): the live session is now established. Hoist it for the action last-call,
       // then re-attach every staged survivor that outlived the prior disconnect (or a process
       // restart) to THIS session and speak ONE batched resumption digest — "welcome back, here's
       // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
       // connect promise resolves so `session` is live.
-      activeLiveSession = session;
-      reannounceSurvivors(session);
+      activeLiveSession = justConnected;
+      clearReconnectTimer();
+      // PLM4 (Finding: flap-unbounded backoff): do NOT refresh the bounded-retry budget eagerly on
+      // hoist — a flapping session (connect -> immediate drop -> reconnect -> …) would then reset
+      // `reconnectAttempts` every cycle and reconnect forever at the base delay. Instead arm a one-shot
+      // timer that refreshes the budget ONLY after the session has stayed continuously live for
+      // RECONNECT_STABLE_UPTIME_MS. A drop before then (handleSessionLost) clears this timer, so the
+      // budget keeps depleting and a flapping session exhausts the cap and gives up (permanent loss).
+      clearStableResetTimer();
+      stableResetTimer = setTimeout(() => {
+        stableResetTimer = null;
+        if (wsClosed) return; // operator already left.
+        // Only the CURRENTLY-live session earns the refresh; a stale callback can't credit a newer one.
+        if (activeLiveSession === justConnected) {
+          reconnectAttempts = 0;
+          console.log(`[VOICE] session stable for ${RECONNECT_STABLE_UPTIME_MS}ms — reconnect budget refreshed.`);
+        }
+      }, RECONNECT_STABLE_UPTIME_MS);
+      if (typeof stableResetTimer.unref === "function") stableResetTimer.unref();
+      // PLM4 (4): reannounceSurvivors runs on the reconnect path too (this closure IS the reconnect
+      // path), so the surviving approvals are re-attached + re-announced for free on every (re)connect.
+      reannounceSurvivors(justConnected);
 
       // Push-observation: bridge global pane signals into THIS live session. The bus owns
       // debounce; we forward each signal as a user-role nudge (same convention as approval
       // narration the model already speaks). Unsubscribed on socket close.
+      if (unsubscribePaneSignals) { unsubscribePaneSignals(); unsubscribePaneSignals = null; }
       unsubscribePaneSignals = paneSignalBus.subscribe((sig) => {
         try {
-          session.sendClientContent({
+          justConnected.sendClientContent({
             turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
             turnComplete: true,
           });
@@ -2696,11 +2880,77 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         }
       });
     } catch (err: any) {
-      console.error("Failed to establish Gemini Live session:", err);
-      clientWs.send(JSON.stringify({ 
-        type: "error", 
-        message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings." 
-      }));
+      console.error(`Failed to establish Gemini Live session${isReconnect ? " (reconnect attempt)" : ""}:`, err);
+      // PLM4 (Finding B2) STALE-HANDLE SELF-HEAL: this attempt fed a persisted resume handle and still
+      // failed — treat the handle as poisoned. Null the in-memory token AND delete the persisted KV so
+      // the NEXT bounded attempt (scheduled below, or the next initial connect) starts a FRESH session
+      // instead of re-feeding the same bad handle. Best-effort + never-throw (persistResumptionToken
+      // swallows store faults). A bad handle thus costs at most ONE failed attempt, never a wedge.
+      if (attemptUsedHandle) {
+        console.warn("[SESSION RESUMPTION] connect with a persisted handle failed — clearing the poisoned handle so the next attempt connects fresh.");
+        lastSessionResumptionToken = null;
+        persistResumptionToken(null);
+      }
+      if (isReconnect) {
+        // PLM4 (2) NEVER-THROW: a failed reconnect attempt schedules the next bounded attempt (or
+        // gives up with a final voice_channel_lost), and must NOT escape this async callback.
+        scheduleReconnect();
+      } else {
+        clientWs.send(JSON.stringify({
+          type: "error",
+          message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
+        }));
+      }
+    }
+    }
+
+    // PLM4 (2): schedule ONE bounded, identity-guarded reconnect attempt. Caps BOTH the attempt count
+    // and the delay (exponential, ceilinged) — NO unbounded loop / no storm. Aborts (no-op) if the
+    // operator's WS already closed. On exhaustion, broadcasts a final "could not reconnect" frame.
+    // NEVER throws: the inner connectLiveSession is try/caught; a scheduling fault is swallowed.
+    function scheduleReconnect(): void {
+      if (wsClosed) return;                 // operator left — no reconnect.
+      if (reconnectTimer) return;           // one in flight already.
+      if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+        console.warn(`[VOICE] reconnect giving up after ${reconnectAttempts} attempts.`);
+        broadcast({ type: "voice_channel_lost", reason: "reconnect_failed", permanent: true });
+        return;
+      }
+      const attempt = reconnectAttempts++;
+      const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, RECONNECT_MAX_DELAY_MS);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (wsClosed) return;               // re-check at fire time: operator may have left during the wait.
+        // connectLiveSession is itself try/caught (initial + reconnect arms); it never throws. We add a
+        // .catch belt as defense-in-depth so a rejected promise can never escape this timer callback.
+        Promise.resolve(connectLiveSession(true)).catch((e) => {
+          console.error("[VOICE] reconnect attempt threw (unexpected):", e);
+          scheduleReconnect();
+        });
+      }, delay);
+      if (typeof reconnectTimer.unref === "function") reconnectTimer.unref();
+      console.log(`[VOICE] scheduled reconnect attempt ${attempt + 1}/${RECONNECT_MAX_ATTEMPTS} in ${delay}ms.`);
+    }
+
+    // PLM4 (2): the INITIAL connect. Same closure the reconnect path re-enters.
+    // PLM4 (Finding A) NEVER-THROW: connectLiveSession's PRE-TRY setup (sessionKey / the GoogleGenAI
+    // client construction via boundSessionAiFactory) sits OUTSIDE its own inner try, so a throw there
+    // (e.g. a malformed-but-present key) would escape connectLiveSession. On the INITIAL connect that
+    // would become an unhandled rejection in this `async` connection handler — the error frame would
+    // never reach the client and the message/close listeners below would never register. Wrap it,
+    // mirror the inner catch's initial-failure behavior, and FALL THROUGH so the listeners still bind.
+    // The inner catch (initial path) already sends the frame and RETURNS (no rethrow), so this outer
+    // catch only fires on a pre-try throw — there is no double error-frame.
+    try {
+      await connectLiveSession(false);
+    } catch (err: any) {
+      console.error("Failed to establish Gemini Live session (initial setup):", err);
+      try {
+        clientWs.send(JSON.stringify({
+          type: "error",
+          message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings.",
+        }));
+      } catch { /* client gone */ }
     }
 
     clientWs.on("message", async (data) => {
@@ -2757,7 +3007,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     });
 
     clientWs.on("close", () => {
-      wsClosed = true; // gate out the SDK's post-close resumption-token flush
+      wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
+      // PLM4 (2): the operator left — cancel any pending reconnect attempt (no reconnect storm after
+      // the WS closes). scheduleReconnect also re-checks wsClosed, so this is belt-and-suspenders.
+      clearReconnectTimer();
+      clearStableResetTimer(); // PLM4 (Finding: flap): no budget-refresh timer should outlive the WS.
       if (unsubscribePaneSignals) { unsubscribePaneSignals(); unsubscribePaneSignals = null; }
       clients.delete(clientWs);
       if (activeFrontendWs === clientWs) {
@@ -2791,7 +3045,17 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // (dispatchProposal) is connection-scoped and intentionally a refusing stub here — the only routes
   // we mount are read-only observability tools, which never call it. The `only` allow-set scopes the
   // mount so it never collides with the existing hand-written routes; it grows as cv1 converges reads.
-  function buildRestActionContext(_req: RestRequest): ActionContext {
+  function buildRestActionContext(req: RestRequest): ActionContext {
+    // PLM4 (3): synthesize a STABLE per-request idempotency key for the REST surface (REST has no
+    // Gemini call.id). The key is a hash of the action name + the request shape (params/query/body),
+    // so an identical retried request maps to the same key while distinct requests stay unique. Pure
+    // + best-effort: a hashing fault falls back to null (no key recorded, never blocks the request).
+    const restIdempotencyKey = (name: string): string | null => {
+      try {
+        const material = JSON.stringify({ name, params: req.params ?? {}, query: req.query ?? {}, body: req.body ?? {} });
+        return "rest:" + crypto.createHash("sha256").update(material).digest("hex").slice(0, 32);
+      } catch { return null; }
+    };
     return {
       manager,
       session: null,
@@ -2829,6 +3093,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           store.recordAction({
             name: row.name, capability: row.capability, result_kind: row.resultKind,
             ms: row.ms, args_redacted: argsRedacted, surface: row.surface ?? "rest",
+            idempotency_key: restIdempotencyKey(row.name),
           });
         } catch { /* best-effort */ }
       },

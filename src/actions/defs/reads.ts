@@ -77,6 +77,13 @@ export const getPaneCommandHistory: ActionDef<typeof PaneIdParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "get", path: "/api/panes/:pane_id/history" },
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: block ONLY on the explicit Off veto for "read_pane" (an unseeded
+    // capability resolves to Auto, so this is behavior-preserving until the operator sets Off).
+    // ctx.effectiveCapabilityGateFor is the PURE resolver (no audit side effect on the allowed path).
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(args.pane_id, "read_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy." };
+    }
     const targetId = args.pane_id;
     // FAITHFUL PORT of HistoryManager.getInstance().loadHistory(targetId): read the SAME
     // .janus_history.json at process.cwd(), parse, return parsed[terminalId] sliced to the last
@@ -127,6 +134,12 @@ export const getPaneSummary: ActionDef<typeof PaneIdParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "get", path: "/api/panes/:pane_id/summary" },
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: block ONLY on the explicit Off veto for "read_pane" (Auto fallback =
+    // behavior-preserving). PURE resolver, so the common allowed path adds no audit row.
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(args.pane_id, "read_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy." };
+    }
     // getPaneSummary returns either a fenced, redacted code block OR the literal
     // `Error: Pane <id> does not exist.` STRING for a missing pane — either way it is an ok-kind
     // string output (the pane-missing case is NOT an ActionResult error).
@@ -146,6 +159,12 @@ export const getPaneDelta: ActionDef<typeof PaneIdParams> = {
   readOnly: true,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: block ONLY on the explicit Off veto for "read_pane" (Auto fallback =
+    // behavior-preserving). PURE resolver — gate the read BEFORE the cursor advances on the Off path.
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(args.pane_id, "read_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy." };
+    }
     // getPaneDelta consumes the per-pane read cursor (intended mutation inside the domain method —
     // it is what makes repeated calls non-redundant) and returns a fenced redacted block, the
     // '[No new output since last read]' string, or the `Error: Pane <id> does not exist.` string.

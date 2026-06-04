@@ -314,6 +314,23 @@ export class JanusStore {
     });
   }
 
+  /**
+   * PLM4 replay-detection: has this idempotency_key already produced a SUCCEEDED action-log row?
+   * A row counts as succeeded when result_kind is anything OTHER than "error" (ok / pending / clarify
+   * / blocked are all "this dispatch already ran" — re-running it would double-apply a side effect; a
+   * prior "error" did NOT land a side effect, so a retry is allowed). Empty/undefined keys never match.
+   * Backed by idx_action_log_idempotency_key (schema v6).
+   */
+  hasSucceededIdempotencyKey(key: string | null | undefined): boolean {
+    if (!key) return false;
+    const r = this.db.prepare(
+      `SELECT 1 FROM action_log
+        WHERE idempotency_key = ? AND (result_kind IS NULL OR result_kind <> 'error')
+        LIMIT 1`
+    ).get(key);
+    return r !== undefined;
+  }
+
   /** Read the action log most-recent-first. Optional name filter + `since` (ts >= since). Default limit 100. */
   getActionLog(filter: { limit?: number; name?: string; since?: number } = {}): ActionLogRow[] {
     const where: string[] = []; const args: any[] = [];

@@ -130,6 +130,14 @@ export const getProjectNotes: ActionDef<typeof GetProjectNotesParams> = {
   readOnly: true,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: block ONLY on the explicit Off veto for "read_notes" (an unseeded
+    // capability resolves to Auto, so this is behavior-preserving until the operator sets Off).
+    // Notes are PROJECT-scoped, not pane-scoped -> resolve the matrix with paneId null. PURE
+    // resolver (no audit side effect on the common allowed path).
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(null, "read_notes") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_notes' capability is gated Off; reading note content is forbidden by policy." };
+    }
     const projectId = args.project_id || ctx.manager.ledger.activeProjectId || "default_project";
     const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
     const notes = ctx.manager.ledger.getNotes({ projectId }).slice(0, limit).map((n) => ({
@@ -164,6 +172,12 @@ export const searchNotes: ActionDef<typeof SearchNotesParams> = {
   readOnly: true,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // igc read-gating lever: block ONLY on the explicit Off veto for "read_notes" (Auto fallback =
+    // behavior-preserving). Notes are PROJECT-scoped -> resolve with paneId null. PURE resolver.
+    // Block only on an EXPLICIT operator Off, NOT the STOP-ALL frozen short-circuit (reads stay available during a freeze — behavior-preserving).
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(null, "read_notes") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_notes' capability is gated Off; reading note content is forbidden by policy." };
+    }
     const query = String(args.query ?? "");
     const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
     const results = ctx.manager.ledger.search(query, { limit, source: "note" })
