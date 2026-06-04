@@ -1,6 +1,27 @@
 {
+  "add_pane_note": {
+    "output": "Note added to pane gold-panenote-pane"
+  },
+  "add_project_note": {
+    "output": "Note added to project gold_notes_proj"
+  },
+  "add_project_note.missing": {
+    "output": "Could not add note: project no-such-project not found."
+  },
+  "amend_note": {
+    "output": "Note gold-fixed-note-id updated."
+  },
   "confirm_stop_all": {
     "output": "Done — I killed 1 pane(s): gold-confirm-a. They stay killed; I'm still frozen, say \"release\" to resume."
+  },
+  "create_project": {
+    "output": "Project context gold_created_proj created successfully."
+  },
+  "create_project.bad_dir": {
+    "output": "Error: the directory '/definitely/not/a/real/dir/xyzzy' does not exist, so I did not create project gold_baddir_proj. Give me a folder that exists, or omit it to use the current workspace."
+  },
+  "delete_note": {
+    "output": "Note gold-fixed-note-id deleted."
   },
   "deliver_handoff.pending": {
     "messageId": "<ID>",
@@ -8,8 +29,84 @@
     "prompt": "Pending approval: direct pane gold-handoff-target — \"Please continue the build and report status.\". Read it back to the operator and ask them to approve or reject.",
     "status": "pending_approval"
   },
+  "dismiss_attention": {
+    "output": "Dismissed all 0 pending attention items."
+  },
+  "get_attention_digest": {
+    "output": "There are no pending alerts or actions requiring your attention right now."
+  },
+  "get_pane_command_history": {
+    "output": []
+  },
+  "get_pane_delta": {
+    "output": "```\nstub delta line 1\nstub delta line 2\n```"
+  },
+  "get_pane_gates": {
+    "output": {
+      "gates": {
+        "add_watch_rule": "Ask",
+        "apply_recipe": "Ask",
+        "close_pane": "Ask",
+        "create_pane": "Ask",
+        "create_project": "Auto",
+        "deliver_handoff": "Ask",
+        "dismiss_attention": "Auto",
+        "execute_plan": "Ask",
+        "restart_pane": "Ask",
+        "set_capability_gate": "Ask",
+        "set_global_permissions": "Ask",
+        "set_pane_permissions": "Ask",
+        "set_voice_mute": "Auto",
+        "switch_context": "Auto",
+        "update_metadata": "Auto",
+        "write_to_pane": "Ask"
+      },
+      "pane_id": null
+    }
+  },
   "get_pane_summary": {
     "output": "```\nstub output line A\nstub output line B\n```"
+  },
+  "get_pane_summary.missing": {
+    "output": "Error: Pane no-such-pane does not exist."
+  },
+  "get_project_notes": {
+    "output": {
+      "count": 1,
+      "notes": [
+        {
+          "created_at": "<TS>",
+          "id": "<ID>",
+          "pane_id": null,
+          "text": "recall me later",
+          "type": "note"
+        }
+      ],
+      "project_id": "gold_getnotes_proj"
+    }
+  },
+  "list_capabilities": {
+    "output": [
+      "write_to_pane",
+      "deliver_handoff",
+      "create_pane",
+      "close_pane",
+      "restart_pane",
+      "set_pane_permissions",
+      "set_global_permissions",
+      "set_capability_gate",
+      "add_watch_rule",
+      "execute_plan",
+      "apply_recipe",
+      "create_project",
+      "update_metadata",
+      "switch_context",
+      "set_voice_mute",
+      "dismiss_attention"
+    ]
+  },
+  "list_handoffs": {
+    "output": []
   },
   "list_panes": {
     "output": [
@@ -38,6 +135,12 @@
       }
     ]
   },
+  "list_pending_approvals": {
+    "output": {
+      "count": 0,
+      "items": []
+    }
+  },
   "propose_command.Ask": {
     "messageId": "<ID>",
     "pane_id": "gold-ask",
@@ -50,10 +153,65 @@
   "propose_command.Off": {
     "output": "Error: the 'write_to_pane' capability is gated Off for pane gold-off; this action is forbidden by policy."
   },
+  "read_handoff.missing": {
+    "output": "Error: handoff no-such-handoff not found."
+  },
   "release_stop_all": {
     "output": "Released — I've un-frozen and your safety gates are back exactly as they were. Any panes you killed stay killed."
   },
+  "rename_pane": {
+    "output": "Pane renamed to Renamed Pane"
+  },
+  "rename_project": {
+    "output": "Project renamed to Renamed Project"
+  },
+  "search_notes": {
+    "output": {
+      "count": 1,
+      "query": "uniquetokenxyzzy",
+      "results": [
+        {
+          "id": "<ID>",
+          "snippet": "uniquetokenxyzzy appears once"
+        }
+      ]
+    }
+  },
+  "set_capability_gate.invalid": {
+    "output": "Invalid gate \"Bogus\". Must be one of: Auto, Ask, Off."
+  },
+  "set_capability_gate.refuse": {
+    "output": "For safety I can't LOOSEN a capability gate by voice (you asked to change 'write_to_pane' from Ask to Auto). Loosening must be done deliberately in the Settings UI. I can TIGHTEN gates by voice anytime."
+  },
+  "set_capability_gate.tighten": {
+    "output": "Set global gate 'update_metadata' = Ask."
+  },
+  "set_global_permissions": {
+    "output": "'Set global permissions to Full Auto' needs operator confirmation (gated Ask). I've queued it — confirm to apply."
+  },
+  "set_pane_permissions": {
+    "output": "'Set pane gold-perm-pane permissions to Read-Only' needs operator confirmation (gated Ask). I've queued it — confirm to apply."
+  },
+  "set_pane_permissions.invalid_mode": {
+    "output": "Invalid permissions mode \"Nonsense\". Must be one of: Full Auto, Human-in-the-Loop, Read-Only."
+  },
+  "set_voice_mute": {
+    "output": "Microphone now muted."
+  },
   "stop_all": {
     "output": "I've frozen myself and cancelled everything in flight. 2 pane(s) are still running (gold-stop-a, gold-stop-b). Should I also kill them? That can't be undone — say \"kill them\" to confirm, or \"release\" to resume."
+  },
+  "switch_context": {
+    "output": {
+      "directory": "/stable/ctx/dir",
+      "key_codebase_terms": [
+        "alpha",
+        "beta"
+      ],
+      "notes": [],
+      "panes": [],
+      "project_id": "gold_ctx_proj",
+      "summary": "context briefing summary"
+    }
   }
 }

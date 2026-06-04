@@ -20,7 +20,6 @@ import type {
   ActionResult,
   LiveSessionLike,
 } from "./types";
-import { ALWAYS_ALLOWED } from "./types";
 
 /** A Gemini FunctionDeclaration (the subset we emit). `parameters` is always an OBJECT schema. */
 export interface GeminiFunctionDeclaration {
@@ -129,10 +128,34 @@ export function toGeminiDeclarations(registry: readonly ActionDef[]): GeminiFunc
 
 /**
  * runAction(name, rawArgs, ctx) — the SINGLE dispatch wrapper (§5.6). The entire Gemini tool
- * dispatch collapses into this: lookup -> coerceArgs -> params.parse -> gate (unless ALWAYS_ALLOWED)
- * -> handler -> redact if readOnly -> return. ONE try/catch wraps everything; it NEVER throws — a
- * missing action, a bad arg, or a handler throw all return a typed { kind:"error" } ActionResult
- * (so the surface can still answer call.id exactly once).
+ * dispatch collapses into this: lookup -> coerceArgs -> params.parse -> handler -> redact if readOnly
+ * -> return. ONE try/catch wraps everything; it NEVER throws — a missing action, a bad arg, or a
+ * handler throw all return a typed { kind:"error" } ActionResult (so the surface can still answer
+ * call.id exactly once).
+ *
+ * GATE MODEL — HANDLER-OWNED (Decision: model B; the gating in server.ts is heterogeneous, not a
+ * uniform central gate). runAction does NOT apply a capability gate. WHY NOT a central gate:
+ *
+ *   1. DURABLE-REPLAY (kzt) CORRECTNESS. A central gate could only pass a GENERIC run-thunk to
+ *      gateOrDefer. The scaffold passed `() => summary` — a NO-OP. An Ask-deferred action would then
+ *      stage a no-op closure; buildActionRun (src/actionEffects.ts) only re-derives 5 known
+ *      capability/op cases from `params`, so any other deferred tool replays as the `default` no-op
+ *      and LOSES its side effect after confirm/restart. The HANDLER, by contrast, hands gateOrDefer
+ *      the SAME real `run` closure + the SAME `params` bag buildActionRun already mirrors — exactly
+ *      as today. Closure ⇄ params stay in lockstep by construction.
+ *   2. THE GATING IS HETEROGENEOUS. Mutators call gateOrDefer themselves (tool-specific summary +
+ *      real run + durable params + optional requestedMode rider); propose_command/deliver_handoff/
+ *      execute_plan route through dispatchProposal (its own gate + HiTL staging + DispatchOutcome);
+ *      apply_recipe rides the lighter Off-veto gateCapability; and SEVERAL tools are intentionally
+ *      UNGATED (drafts, notes, focus, mute, handoff staging). No single central gate reproduces this.
+ *   3. ZERO-BEHAVIOR-CHANGE. Each handler faithfully ports its branch, so the 38 voice-tool goldens
+ *      stay a TRUE no-behavior-change oracle. "Enforce every capability uniformly" is a real Phase-2
+ *      enhancement (needs a buildActionRun entry per newly-deferrable tool) — out of Phase-1 scope.
+ *
+ * gateOrDefer / dispatchProposal / gateCapability remain THE single enforcement FUNCTIONS (one impl
+ * each, injected on ctx); handlers merely call them. `def.capability` stays declared for the matrix
+ * projection + docs; runAction does not read it to gate (ALWAYS_ALLOWED is no longer special-cased
+ * here — the brake handlers simply never call a gate).
  *
  * @param registry the canonical ActionDef[] to dispatch against (injected so tests pass a fixture).
  */
@@ -158,25 +181,9 @@ export async function runAction(
       return { kind: "error", message: `invalid arguments for ${name}: ${msg}` };
     }
 
-    // 1 enforcement point: the gate. ALWAYS_ALLOWED (the emergency brake) bypasses it entirely.
-    if (def.capability !== ALWAYS_ALLOWED) {
-      const paneId = paneOf(args);
-      const summary = summarize(def, args);
-      // `run` is a no-op here: the registry handler performs the real side effect AFTER the gate
-      // returns "run". The legacy server passes a closure that DOES the work; in the registry model
-      // the handler owns the work, so the gate's `run` closure is only the deferred-replay hook.
-      // We pass a thunk that returns the summary so the durable-replay record is well-formed.
-      const disposition = ctx.gateOrDefer(def.capability, paneId, summary, () => summary, paneIntent(args));
-      if (disposition.disposition === "forbidden") {
-        return { kind: "blocked", reason: `the '${def.capability}' capability is gated Off; forbidden by policy.` };
-      }
-      if (disposition.disposition === "deferred") {
-        return { kind: "pending", messageId: disposition.actionId, summary: disposition.summary };
-      }
-      // disposition === "run" falls through to the handler.
-    }
-
-    // 1 execution point.
+    // 1 execution point. The HANDLER owns gating: it calls ctx.gateOrDefer / ctx.dispatchProposal /
+    // ctx.gateCapability exactly where and how its legacy server.ts branch does (or not at all, for
+    // the intentionally-ungated tools). runAction applies no gate of its own.
     const result = await def.handler(args as never, ctx);
 
     // 1 redaction point: readOnly results never leave the process un-redacted (mandatory, §5.6).
@@ -188,28 +195,6 @@ export async function runAction(
     // ONE try/catch. A throwing handler becomes a typed error, answered once by the surface.
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
   }
-}
-
-/** Best-effort extraction of the target paneId from validated args (for the gate's pane scope). */
-function paneOf(args: unknown): string | null {
-  if (args && typeof args === "object") {
-    const a = args as Record<string, unknown>;
-    const id = a.pane_id ?? a.paneId ?? a.terminal_id ?? a.id;
-    if (typeof id === "string" && id.length) return id;
-  }
-  return null;
-}
-
-/** The serializable INTENT params handed to gateOrDefer for durable-restart replay (kzt seam). */
-function paneIntent(args: unknown): Record<string, unknown> | undefined {
-  if (args && typeof args === "object") return { ...(args as Record<string, unknown>) };
-  return undefined;
-}
-
-/** A short human summary for the gate's deferred-action dialog. */
-function summarize(def: ActionDef, args: unknown): string {
-  const pane = paneOf(args);
-  return pane ? `${def.name} (pane ${pane})` : def.name;
 }
 
 /** Redact string leaves of a readOnly result so secrets never leave the process. */
