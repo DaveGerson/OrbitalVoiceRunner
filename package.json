@@ -14,6 +14,7 @@
     "test:e2e": "playwright test",
     "setup": "npm install && npm run typecheck && npm run test:unit && npm run build && npm run e2e:install",
     "e2e:install": "playwright install chromium",
+    "catalog": "tsx scripts/catalog.ts",
     "smoke:claude": "tsx scripts/smoke-claude-pane.ts",
     "smoke:handoff": "tsx scripts/smoke-handoff.ts",
     "sim": "tsx scripts/simulate-voice.ts",

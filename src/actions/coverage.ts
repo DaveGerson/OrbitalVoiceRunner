@@ -28,14 +28,54 @@ export interface SurfacePresence {
  * INTENTIONAL_ASYMMETRY — the allow-list of actions that are legitimately single-surface.
  *
  * Map of action name -> the surfaces it is intentionally restricted to. An action appears here ONLY
- * if its single-surface status is by design (e.g. set_voice_mute is voice-only because it IS the
- * mic; pure-viewport resize is rest-only). Phase-A seed is empty: the proof registry's tools are all
- * multi-surface, and the full §4.2 residue is populated in Phase C as those tools migrate.
+ * if its single-surface status is currently sanctioned: either PERMANENT by design (set_voice_mute IS
+ * the mic — no REST/WS twin will ever exist) or a CONVERGENCE-TRACK residue (a voice-only read/mutator
+ * whose REST/WS twin is a future §7 Convergence item, allow-listed now under Decision 3 register-as-is
+ * so the §8.4 #20 build-gate is green WITHOUT mutating any tool's surfaces).
+ *
+ * REG1 Phase-1 exit (workstream A): every single-surface action in REGISTRY (all 41 tools surveyed —
+ * the 6 inline registry.ts defs + the 35 grouped defs/* defs) is enumerated below. Multi-surface tools
+ * (voice+rest, e.g. list_panes / create_pane / the brake trio at voice+rest+ws) are NOT listed —
+ * isMultiSurface skips them. Removing an entry here is how the Convergence track later FORCES the
+ * missing surface to be implemented (the build-gate goes red until the twin exists).
  */
 export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>>> = Object.freeze({
-  // Phase C will add e.g.:
-  //   set_voice_mute: new Set<Surface>(["voice"]),   // voice-only by design — it IS the mic
-  //   resize:         new Set<Surface>(["rest"]),    // pure viewport geometry, no voice meaning
+  // ── PERMANENT (by design — no twin will ever exist) ─────────────────────────────────────────────
+  set_voice_mute: new Set<Surface>(["voice"]), // voice-only BY DESIGN — it IS the mic toggle (permanent)
+
+  // ── Convergence-track residue: voice-only pane-WRITE choke-points (REST/WS twin is a future item) ─
+  propose_command: new Set<Surface>(["voice"]), // dispatchProposal pane-WRITE HiTL path; voice-only today
+  deliver_handoff: new Set<Surface>(["voice"]), // staged-handoff delivery (gated via dispatchProposal); voice-only today
+
+  // ── Convergence-track residue: voice-only READS (REST/WS read twin is a future item) ─────────────
+  get_pane_command_history: new Set<Surface>(["voice"]),
+  get_pane_summary: new Set<Surface>(["voice"]),
+  get_pane_delta: new Set<Surface>(["voice"]),
+  list_pending_approvals: new Set<Surface>(["voice"]),
+  get_attention_digest: new Set<Surface>(["voice"]),
+  get_pane_gates: new Set<Surface>(["voice"]),
+  list_capabilities: new Set<Surface>(["voice"]),
+  get_project_notes: new Set<Surface>(["voice"]),
+  search_notes: new Set<Surface>(["voice"]),
+  read_handoff: new Set<Surface>(["voice"]),
+  list_handoffs: new Set<Surface>(["voice"]),
+
+  // ── Convergence-track residue: voice-only NOTE mutators (REST/WS twin is a future item) ──────────
+  amend_note: new Set<Surface>(["voice"]),
+  add_project_note: new Set<Surface>(["voice"]),
+  add_pane_note: new Set<Surface>(["voice"]),
+  delete_note: new Set<Surface>(["voice"]),
+
+  // ── Convergence-track residue: voice-only draft/focus composers (REST/WS twin is a future item) ──
+  switch_active_pane: new Set<Surface>(["voice"]),
+  update_draft_prompt: new Set<Surface>(["voice"]),
+  propose_handoff: new Set<Surface>(["voice"]),
+  revise_handoff: new Set<Surface>(["voice"]),
+  stage_handoff: new Set<Surface>(["voice"]),
+  reject_handoff: new Set<Surface>(["voice"]),
+
+  // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
+  set_global_permissions: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
