@@ -6,7 +6,7 @@ import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets } from "./src/terminal";
+import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
 import { SHELL_PROMPT } from "./src/statusConstants";
 import { PaneSignalBus } from "./src/paneSignalBus";
 import { classifyPaneOutput, formatPaneSignal } from "./src/paneSignals";
@@ -867,14 +867,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const activeProject = manager.ledger.getActiveProject();
       const pane = activeProject?.panes[id];
       if (pane) {
-        let cmd = "bash";
-        // WS-G quick win: Claude Code is installed globally here, so the bare
-        // `claude` binary is correct; `npx @anthropic-ai/claude` is the wrong package.
-        if (pane.tool_preset === "Claude Code") cmd = "claude";
-        else if (pane.tool_preset === "Codex") cmd = "codex";
-        else if (pane.tool_preset === "Antigravity") cmd = "antigravity";
-        
-        manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, pane.tool_preset, pane.permissions_mode, pane.session_id);
+        // U4 (wsm-e2e-pinned-ckf): derive the restart command from the persisted union via the
+        // SAME presetCommand() helper the voice create_pane handler uses — one source of truth.
+        // This kills the 'Claude Code'/'Codex'/'Antigravity' literal comparisons (the spot most
+        // exposed to the id/name drift) and the hardcoded "bash" default; a director-renamed
+        // binary (settings.presets[].command) is honored, and Custom -> the configured shell.
+        const preset = normalizePreset(pane.tool_preset);
+        const cmd = presetCommand(preset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
+
+        manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, preset, pane.permissions_mode, pane.session_id);
         broadcastLedgerUpdate();
         broadcastTerminalsUpdated();
         res.json({ success: true, message: `Terminal ${id} restored and started.` });
@@ -2729,7 +2730,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   });
                 }
               } else if (name === "create_pane") {
-                const { project_id, pane_id, command, tool_preset, permissions_mode } = args;
+                // U4 (wsm-e2e-pinned-ckf): DETERMINISTIC create_pane. The model no longer sends a
+                // free-form `command`; tool_preset is the single source of truth. Normalize it onto
+                // the addTerminal union (id|name|union -> union) and DERIVE the command server-side,
+                // so runtimeType + the --dangerously-skip-permissions append are always correct.
+                const { project_id, pane_id, tool_preset, permissions_mode } = args; // NOTE: no `command`
+                const preset = normalizePreset(tool_preset);
+                const command = presetCommand(preset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
                 const createPaneEffect = (): string => {
                   if (!manager.ledger.getProject(project_id)) {
                     manager.ledger.addProject(project_id, ".", "Co-created with pane");
@@ -2737,8 +2744,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                   const result = manager.addTerminal(
                     pane_id,
                     manager.ledger.workspaces[project_id]?.directory || process.cwd(),
-                    command,
-                    tool_preset || "Custom",
+                    command,                                    // derived from the preset, not the model
+                    preset,                                     // normalized union (was tool_preset || "Custom")
                     permissions_mode || "Human-in-the-Loop",
                     "",
                     project_id
@@ -2750,7 +2757,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
                 const g = gateOrDefer("create_pane", pane_id ?? null, `Create pane ${pane_id} (${command}) in ${project_id}`, createPaneEffect,
                   // kzt: origin:"voice" -> the rebuild returns `Pane … created under project …. Result: …`,
                   // matching createPaneEffect above. Persist the resolved cwd (workspace dir) for restart parity.
-                  { origin: "voice", paneId: pane_id, cwd: manager.ledger.workspaces[project_id]?.directory, command, toolPreset: tool_preset, permissionsMode: permissions_mode, projectId: project_id });
+                  // The intent carries the DERIVED command + NORMALIZED toolPreset so a confirm-after-restart
+                  // rebuilds the same agent (buildActionRun reads CreatePaneParams.command, unchanged).
+                  { origin: "voice", paneId: pane_id, cwd: manager.ledger.workspaces[project_id]?.directory, command, toolPreset: preset, permissionsMode: permissions_mode, projectId: project_id });
                 if (g.disposition === "forbidden") {
                   session.sendToolResponse({ functionResponses: [{ name, id: call.id, response: { output: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.` } }] });
                 } else if (g.disposition === "deferred") {
@@ -3610,23 +3619,29 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
             },
             {
               name: "create_pane",
-              description: "Create a new terminal pane inside a project and live restore start its process environment.",
+              description: "Create a new terminal pane inside a project and start its agent. The command line is "
+                + "derived from tool_preset ON THE SERVER — do NOT pass a raw command (there is no command field).",
               parameters: {
                 type: Type.OBJECT,
                 properties: {
                   project_id: { type: Type.STRING, description: "Project ID context to create under." },
                   pane_id: { type: Type.STRING, description: "Unique pane terminal identifier." },
-                  command: { type: Type.STRING, description: "The command line string to run." },
-                  tool_preset: { 
-                    type: Type.STRING, 
-                    description: "Tool preset environment to configure (Claude Code, Codex, Antigravity, Custom)."
+                  tool_preset: {
+                    type: Type.STRING,
+                    // enum keeps the model deterministic — it can no longer free-form a command. Both
+                    // preset ids (claudeCode/codex/antigravity) and union names are accepted;
+                    // normalizePreset() collapses either onto the addTerminal union server-side.
+                    enum: ["claudeCode", "codex", "antigravity", "Claude Code", "Codex", "Antigravity", "Custom"],
+                    description: "Which agent to launch. Claude Code / Codex / Antigravity start that CLI; "
+                      + "Custom opens a bare shell. The command line is chosen by the server from this preset."
                   },
                   permissions_mode: {
                     type: Type.STRING,
-                    description: "Local permission safety policy mode (Full Auto, Human-in-the-Loop, Read-Only)."
+                    enum: ["Full Auto", "Human-in-the-Loop", "Read-Only"],
+                    description: "Local permission safety policy mode."
                   }
                 },
-                required: ["project_id", "pane_id", "command"]
+                required: ["project_id", "pane_id", "tool_preset"]
               }
             },
             {
