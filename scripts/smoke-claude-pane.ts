@@ -16,7 +16,11 @@
  */
 import { UniversalTerminal } from "../src/terminal";
 
-const PROMPT = "Reply with exactly the word PONG and nothing else.";
+// Default is a short prompt; override with JANUS_SMOKE_PROMPT to probe the paste-burst/submit
+// behavior with longer, multi-clause instructions (Issue B: the live failure used ~74-char
+// instructions). Whatever the prompt, it must still direct the model to answer "PONG" so the
+// content assertion below holds.
+const PROMPT = process.env.JANUS_SMOKE_PROMPT || "Reply with exactly the word PONG and nothing else.";
 const STARTUP_MS = 6000;   // let the TUI come up
 const RESPONSE_MS = 25000; // allow for the model round-trip
 

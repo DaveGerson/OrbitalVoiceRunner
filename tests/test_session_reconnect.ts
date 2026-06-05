@@ -601,3 +601,53 @@ describe("PLM4 (h) Finding flap: an immediately-dropping (flapping) session is b
     assert.strictEqual(permanent.reason, "reconnect_failed", "the flap gave up with the permanent reconnect-failed frame");
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// (i) Issue A — a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
+//     with the SAME unresolved key can only 1007 again, so it must NOT consume the bounded reconnect
+//     budget (the boot-time 1007 cascade burned 3/6 attempts before recovering only on a reload).
+//     It broadcasts a distinct key-problem loss and STOPS; recovery comes from the next client
+//     connect after a valid key is configured.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+describe("Issue A: a 1007 (invalid/missing API key) close does NOT consume the reconnect budget", () => {
+  let running: RunningServer;
+  let client: WebSocket;
+  let messages: any[];
+  let scripted: ReturnType<typeof makeScriptedConnector>;
+
+  before(async () => {
+    scripted = makeScriptedConnector(0); // initial connect succeeds.
+    serverMod.setLiveConnector(scripted.connector);
+    serverMod.resetSessionAiFactory();
+    running = await serverMod.startServer({ port: 0, enableVite: false });
+    messages = [];
+    client = await openClient(running, messages);
+    await waitFor(() => scripted.sessions.length >= 1 && running._testActiveLiveSession?.());
+  });
+
+  after(async () => {
+    await closeClient(client);
+    await teardownServerSuite(running);
+  });
+
+  it("closes with code=1007 -> broadcasts a key-problem loss and schedules NO reconnect", async () => {
+    const connectsBefore = scripted.state.connectCount; // 1 (the initial success).
+    // Arm failures so that IF a reconnect were (wrongly) attempted, connectCount would climb.
+    scripted.state.failuresRemaining = 1000;
+
+    scripted.sessions[0].emitClose({ code: 1007, reason: "API key not valid. Please pass a valid API key." });
+
+    // The loss frame names the key problem (no key configured in this tmp cwd -> "no_api_key";
+    // a configured-but-rejected key in prod -> "invalid_api_key"). It is NOT the permanent frame.
+    const lost = await waitFor(() => messages.find(
+      (m) => m.type === "voice_channel_lost" && (m.reason === "no_api_key" || m.reason === "invalid_api_key")));
+    assert.ok(lost, "a voice_channel_lost frame naming the key problem was broadcast");
+    assert.notStrictEqual(lost.permanent, true, "a 1007 is not the permanent reconnect-failed frame");
+
+    // CRITICAL: no reconnect attempt fired — the bounded budget was NOT spent on an unfixable 1007.
+    // (That a transient 1006 close DOES still reconnect is proven by suites (a)/(b)/(c)/(h) above —
+    // the 1007 guard is narrow and does not over-broaden onto other close codes.)
+    await new Promise((r) => setTimeout(r, 200));
+    assert.strictEqual(scripted.state.connectCount, connectsBefore, "a 1007 close consumes NO reconnect attempt");
+  });
+});

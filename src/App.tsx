@@ -1262,6 +1262,13 @@ function AppRaw() {
         } else if (msg.type === "action_resolved") {
           // Confirmed/cancelled/expired elsewhere (REST/voice/TTL) — drop it from the UI.
           setPendingActions(prev => prev.filter(a => a.actionId !== msg.actionId));
+        } else if (msg.type === "approval_resolved") {
+          // Issue E: a pending PTY command was resolved elsewhere — a VOICE approve, a cross-client
+          // REST approve, or a TTL-expire/dead-pane sweep. Drop it from pendingCommands so the
+          // ApprovalDialog dismisses in real time (mirroring action_resolved above), instead of
+          // lingering until the ~20s safety-net poll. The optimistic click filter in
+          // handleApprove/handleReject already covers the button path and harmlessly double-filters.
+          setPendingCommands(prev => prev.filter(item => item.messageId !== msg.messageId));
         } else if (msg.type === "switch_active_pane") {
           // Step 5: Janus switched the open pane at the operator's spoken direction. The UI obeys
           // (it remains the source of truth); the activeTerminalId effect echoes set_active_pane back.

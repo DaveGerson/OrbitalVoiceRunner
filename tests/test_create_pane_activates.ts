@@ -13,7 +13,7 @@ import { createPane } from "../src/actions/defs/panes_write";
 // FIX CONTRACT: create_pane makes the newly-created pane the active write target (ctx.setActivePane),
 // so the operator's immediate follow-up voice command lands in it (subject to the normal mode gate).
 
-function runCtx(spy: { activated: string | null }): ActionContext {
+function runCtx(spy: { activated: string | null; broadcasts: any[] }): ActionContext {
   const ctx: Partial<ActionContext> = {
     manager: {
       settings: { presets: [], advanced: {} },
@@ -26,7 +26,7 @@ function runCtx(spy: { activated: string | null }): ActionContext {
     } as unknown as ActionContext["manager"],
     // Auto gate -> the handler runs createPaneEffect inline (mirrors the live server's Auto branch).
     gateOrDefer: () => ({ disposition: "run" }),
-    broadcast: () => {},
+    broadcast: (m: any) => { spy.broadcasts.push(m); },
     broadcastLedgerUpdate: () => {},
     broadcastTerminalsUpdated: () => {},
     setActivePane: (id) => { spy.activated = id; },
@@ -36,7 +36,7 @@ function runCtx(spy: { activated: string | null }): ActionContext {
 }
 
 test("create_pane (Auto) sets the new pane as the active WRITE target", async () => {
-  const spy = { activated: null as string | null };
+  const spy = { activated: null as string | null, broadcasts: [] as any[] };
   const ctx = runCtx(spy);
   const res = await createPane.handler(
     { project_id: "p", pane_id: "newpane", tool_preset: "Claude Code", permissions_mode: "Human-in-the-Loop" } as never,
@@ -47,5 +47,27 @@ test("create_pane (Auto) sets the new pane as the active WRITE target", async ()
     spy.activated,
     "newpane",
     "create_pane must activate the new pane so the operator's next voice command can write to it",
+  );
+});
+
+// ── Issue C (latent VIEW desync: a voice-created pane's output is invisible to the operator) ──────
+// setActivePane (above) only moves the SERVER's per-connection WRITE target. The OPERATOR'S browser
+// xterm is mounted on activeTerminal.id and follows ONLY a {type:'switch_active_pane'} broadcast
+// (App.tsx -> setActiveTerminalId). A voice create previously broadcast only ledger_updated/
+// terminals_updated (which just refetch the list, never switch activeTerminalId), so the browser
+// stayed on the OLD pane and the NEW pane's stdout_chunk frames had no listener — the operator could
+// not see the agent's output until they manually clicked the pane (round3c: "you can see them, but I
+// can't"). FIX CONTRACT: a voice create must also broadcast switch_active_pane so the browser follows.
+test("create_pane (Auto) broadcasts switch_active_pane so the operator's browser follows to the new pane", async () => {
+  const spy = { activated: null as string | null, broadcasts: [] as any[] };
+  const ctx = runCtx(spy);
+  const res = await createPane.handler(
+    { project_id: "p", pane_id: "newpane", tool_preset: "Claude Code", permissions_mode: "Human-in-the-Loop" } as never,
+    ctx,
+  );
+  assert.strictEqual(res.kind, "ok", "Auto create_pane returns ok");
+  assert.ok(
+    spy.broadcasts.some((m) => m && m.type === "switch_active_pane" && m.paneId === "newpane"),
+    "create_pane must broadcast {type:'switch_active_pane', paneId} so the browser remounts the terminal view on the new pane and subscribes its PTY stream",
   );
 });

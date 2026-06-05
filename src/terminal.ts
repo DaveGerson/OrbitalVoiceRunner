@@ -297,6 +297,20 @@ export function classifySecrets(text: string): SecretScan {
   return { confidence: "none", labels: [] };
 }
 
+/**
+ * Issue B: default gap (ms) between writing a submitted command's BODY and its terminating CR, so a
+ * ConPTY-hosted TUI (Claude Code) reads the CR as a DISCRETE Enter keypress rather than absorbing it
+ * into a paste burst. A combined `body + "\r"` write submits SHORT prompts fine, but for longer /
+ * multi-clause instructions Claude's paste-burst detector treats the whole chunk (incl. the trailing
+ * CR) as pasted text, so the CR lands as a literal newline in the composer and the prompt sits
+ * staged-but-unsubmitted (reproduced via smoke:claude with a ~280-char prompt). 0 disables the gap
+ * (synchronous two-write). Override via JANUS_PTY_SUBMIT_DELAY_MS.
+ */
+const DEFAULT_PTY_SUBMIT_DELAY_MS = (() => {
+  const n = Number(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 20;
+})();
+
 export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
@@ -311,6 +325,12 @@ export class UniversalTerminal {
   private pendingInput: string[] = [];
   private readyFallbackTimer: NodeJS.Timeout | null = null;
   private static readonly READY_FALLBACK_MS = 750;
+  // Issue B: gap (ms) between writing a submitted command's BODY and its terminating CR (see
+  // deliverSubmit). Default from env via DEFAULT_PTY_SUBMIT_DELAY_MS; tests set it to 0 for
+  // deterministic synchronous byte assertions. submitChain serializes the (body, gap, CR) pairs so
+  // rapid back-to-back submits stay ordered body,CR,body,CR instead of interleaving body,body,CR,CR.
+  private submitEnterDelayMs = DEFAULT_PTY_SUBMIT_DELAY_MS;
+  private submitChain: Promise<void> = Promise.resolve();
   // Injectable spawn seam (tests inject a fake transport; prod uses node-pty/legacy).
   private transportFactory: typeof createPtyTransport = createPtyTransport;
   public outputBuffer: string[] = [];
@@ -777,8 +797,8 @@ export class UniversalTerminal {
     }
     const queued = this.pendingInput;
     this.pendingInput = [];
-    for (const data of queued) {
-      if (this.transport) this.transport.write(data);
+    for (const command of queued) {
+      this.deliverSubmit(command);
     }
   }
 
@@ -787,17 +807,51 @@ export class UniversalTerminal {
     // means a turn is starting (Tier A kick, design §5).
     this.lastCommand = command;
     this.applyStatusEvent({ kind: "input" });
-    // CR (\r), not LF — a ConPTY-hosted TUI agent submits on Enter (carriage return); LF leaves the prompt staged-but-unsubmitted (G1).
-    const data = command + "\r";
     if (!this.transport) return;
     // G3: a freshly spawned ConPTY child has not attached its stdin reader yet, so
-    // a synchronous write here is dropped on the floor. Queue until spawn-ready
-    // (first onData / fallback timer), then flush in submission order.
+    // a synchronous write here is dropped on the floor. Queue the RAW command until
+    // spawn-ready (first onData / fallback timer), then flush in submission order
+    // through deliverSubmit (so the queued path gets the same body/Enter split).
     if (this.spawnReady) {
-      this.transport.write(data);
+      this.deliverSubmit(command);
     } else {
-      this.pendingInput.push(data);
+      this.pendingInput.push(command);
     }
+  }
+
+  /**
+   * Issue B: submit a command by writing the BODY and the terminating ENTER as TWO writes — the CR
+   * after `submitEnterDelayMs` — so a ConPTY-hosted Ink TUI (Claude Code) registers the CR as a
+   * DISCRETE Enter keypress instead of absorbing `body + "\r"` as a single PASTE burst. A combined
+   * write submitted SHORT prompts fine, but for longer / multi-clause instructions Claude's
+   * paste-burst detector treated the whole chunk (incl. the trailing CR) as pasted text, so the CR
+   * became a literal newline in the multiline composer and the prompt sat staged-but-unsubmitted
+   * (the operator's "I can see the terminal but it's not doing anything"; reproduced via smoke:claude
+   * with a ~280-char prompt). CR (\r), not LF — a TUI agent submits on Enter (carriage return); LF
+   * only inserts a newline (G1).
+   *
+   * When the gap is 0 (tests / opt-out) the two writes are SYNCHRONOUS and ordering is trivial. When
+   * > 0 the (body, CR) pairs are SERIALIZED through `submitChain` so multiple rapid submits stay
+   * ordered body,CR,body,CR rather than interleaving as body,body,CR,CR.
+   */
+  private deliverSubmit(command: string): void {
+    if (!this.transport) return;
+    if (this.submitEnterDelayMs <= 0) {
+      this.transport.write(command);
+      this.transport.write("\r");
+      return;
+    }
+    this.submitChain = this.submitChain.then(
+      () =>
+        new Promise<void>((resolve) => {
+          if (!this.transport) { resolve(); return; }
+          this.transport.write(command);
+          setTimeout(() => {
+            if (this.transport) this.transport.write("\r");
+            resolve();
+          }, this.submitEnterDelayMs);
+        }),
+    );
   }
 
   getRecentOutput(linesCount = 10): string {
