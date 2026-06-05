@@ -68,6 +68,8 @@ export interface ObserveDeps {
   redact: (s: string) => string;
   historyManager: ObserveHistoryManager;
   ai: GoogleGenAI;
+  // P0a memory: optional sink for decaying cross-pane breadcrumbs (redacted one-liners).
+  onBreadcrumb?: (b: { ts: number; paneId: string | null; text: string }) => void;
 }
 
 /** The handlers wired onto the manager. */
@@ -106,6 +108,7 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     redact,
     historyManager,
     ai,
+    onBreadcrumb,
   } = deps;
 
   // ── Private observation state (was server-local; moves here as locals scoped to this server) ──
@@ -186,6 +189,11 @@ ${redact(rawOutput.slice(-3000))}`;
       // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
       announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
       paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
+      // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
+      if (onBreadcrumb) {
+        const lc = redact(summaryText).slice(0, 80);
+        onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
+      }
     }
   };
 
@@ -201,6 +209,11 @@ ${redact(rawOutput.slice(-3000))}`;
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "running", detail });
     broadcast({ type: "pane_status", terminalId, status: "Running" });
+    // P0a memory: drop a redacted one-liner breadcrumb on the Running edge (cross-pane working memory).
+    if (onBreadcrumb) {
+      const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} started${lc ? `: ${lc}` : ""}` });
+    }
   };
 
   // Conservative Phase 2: the HUMBLE pre-idle "cooking…" handle. Fired by the manager when the
@@ -216,6 +229,11 @@ ${redact(rawOutput.slice(-3000))}`;
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "quiescing", detail });
     broadcast({ type: "pane_quiescing", terminalId });
+    // P0a memory: drop a redacted one-liner breadcrumb on the pre-idle "wrapping up" edge.
+    if (onBreadcrumb) {
+      const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} wrapping up${lc ? `: ${lc}` : ""}` });
+    }
   };
 
   function handleWatchRulesTrigger(terminalId: string, transition: Transition) {
