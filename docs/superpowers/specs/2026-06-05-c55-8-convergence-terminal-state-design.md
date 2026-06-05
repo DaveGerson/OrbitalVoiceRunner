@@ -56,8 +56,15 @@ declared-inline module (§4.1) and a short `docs/` pointer, so future contributo
 
 ## 4. Deliverables
 
-Because the design **declares** settings/drafts inline (rather than rewriting them into defs), c55.8
-is small — roughly one focused PR.
+**Re-scope note (2026-06-05, post-recon):** a scan of the *current* `server.ts` found **~30** inline
+routes, not the ~6 this doc first illustrated — a whole untwinned surface (notes, archive,
+approvals/pending, project-CRUD, several reads) that c55 A–G never touched. And **dropping `opts.only`
+is blocked**: at least `set_capability_gate` is a registry def whose REST path collides with the
+surviving inline *bulk* gates route (the held semantic-split decision), so removing the filter would
+mount a shadowed/half-right def. Therefore **c55.8 is scoped to the LID only** — the declared-inline
+catalog (§4.1, all ~30 routes) + the no-twin guard (§4.3). **Dropping `opts.only` (§4.2) and converging
+the untwinned families are DEFERRED to a sequenced multi-bead program** (see §10). The lid is still
+~one focused PR and delivers the whole point: stop drift, institutionalize the modularization.
 
 ### 4.1 The declared-inline catalog — `src/actions/inlineExceptions.ts` (new)
 
@@ -75,12 +82,13 @@ implementation time — the guard's first run reveals every inline route on the 
 
 The module header carries P1 + P2 (§3).
 
-### 4.2 Drop `opts.only` — `server.ts`
+### 4.2 Drop `opts.only` — `server.ts` — **DEFERRED (not in c55.8)**
 
-Delete the `{ only: new Set([...]) }` filter from the `mountRestRoutes(app, REGISTRY, …)` call so it
-mounts **every** registry rest-surface def. The declared-inline routes have no def, so they remain
-inline; everything else is registry-served. (A–G already removed the twinned inline routes, so this
-does not double-register.)
+The end-state goal is to delete the `{ only: new Set([...]) }` filter so `mountRestRoutes` mounts every
+registry rest-def with no allow-list. **This is blocked** today: registry defs deliberately held out of
+`opts.only` (e.g. `set_capability_gate`) have REST paths that collide with surviving inline routes whose
+held semantics differ. Dropping the filter must wait until those held items resolve. Tracked as the
+final step of the §10 program — **not implemented in this batch.**
 
 ### 4.3 The no-twin guard — `tests/test_no_inline_twins.ts` (new)
 
@@ -99,11 +107,15 @@ team keeps adding routes — because drift becomes a build failure, not a silent
 
 ## 5. End state
 
+**After c55.8 (the lid):**
 ```
-  server.ts = hub + ~6 declared-inline routes (each justified in the catalog)
-  everything else = registry defs, mounted with NO filter
-  guard test = the lock that keeps it that way
+  server.ts = hub + ~30 declared-inline routes (each categorized + justified in the catalog)
+  opts.only = retained for now (mount allow-list); registry still the single definition home
+  guard test = the lock — server.ts can gain NO undeclared route without failing CI
 ```
+**Ultimate end state (after the §10 program):** the untwinned families are registry defs, the held
+collisions are resolved, `opts.only` is dropped, and the catalog shrinks to the genuine permanent
+exceptions (drafts, settings, raw-input, infra).
 
 ## 6. Testing & verification
 
@@ -139,3 +151,25 @@ declaring them in the catalog.
 ## 9. Open decisions
 None blocking. The one soft choice — whether to ever fully converge settings (translator vs.
 rewrite-to-WS) — is deferred to a follow-up bead; c55.8 declares it inline either way.
+
+## 10. The convergence program (post-lid, sequenced beads)
+
+c55.8 lands the lid; the remaining inline surface converges in sequenced batches, each mirroring the
+c55 A–G discipline (HTTP-level contract test first, then cut over, then verify). Order is rough — the
+read endpoints are cheapest, the held collisions gate the final `opts.only` drop:
+
+1. **Read endpoints** → rest-only defs (`ledger`, `attention`, `plans`, `recipes`). Likely need
+   `rest.toHttp` for structured bodies; no gating questions.
+2. **Notes** → registry defs (project notes ×2, note edit/delete, pane notes). Ungated plumbing (P2).
+3. **Archive** → registry defs (list/restore/delete). Plumbing.
+4. **Project / pane lifecycle** → registry defs (project update/delete, pane delete/stop, add context).
+   Some are consequential (delete) → gated per P2.
+5. **Approvals / pending (HiTL)** → registry defs (`actions/pending`, `confirm`, `cancel`,
+   `commands/pending`, `approve`). The human-in-the-loop surface; gating is the whole point — design care.
+6. **Resolve held collisions + drop `opts.only`** (the terminal step): author the bulk `set_pane_gates`
+   action (capability-gates split), settle `create_project`'s 2nd mutation, land the `execute_plan` REST
+   seam (c55.9), then delete the `opts.only` filter and tighten the guard to also flag inline routes that
+   shadow a *mounted* def.
+
+Each step removes its rows from the declared-inline catalog (the guard enforces no stale entries), so the
+catalog visibly shrinks toward the genuine permanent exceptions as the program completes.
