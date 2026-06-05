@@ -5,7 +5,7 @@ import type { AnnouncementTemplates } from "./announcementKinds";
 // loosen, the pane's effectiveMode (AND-veto). Absent matrix ⇒ all "Auto"
 // (back-compat: today's implicit behavior).
 // ─────────────────────────────────────────────────────────────────────────────
-// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (22 rows) — the 16 original
+// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (24 rows) — the 16 original
 // gates PLUS the 6 promoted capabilities (read_pane / read_notes / focus_pane / compose_draft /
 // archive_pane / clear_history). Promotions default to today's effective behavior (Auto, except
 // clear_history=Ask) so widening the type is behavior-preserving. Kept in lockstep with

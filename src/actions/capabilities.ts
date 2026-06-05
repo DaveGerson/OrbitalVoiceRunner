@@ -63,7 +63,7 @@ const CATEGORY: Record<string, string> = {
  */
 export const CAPABILITY_DEFS: readonly CapabilityDef[] = [
   // ── NEW promotions (Decision 6/7) — default to today's effective behavior. Labels come from
-  //    CAPABILITY_LABELS (gateSurface) — the SINGLE label source for all 22 caps, so no drift (F4). ──
+  //    CAPABILITY_LABELS (gateSurface) — the SINGLE label source for all 24 caps, so no drift (F4). ──
   { id: "read_pane", label: CAPABILITY_LABELS.read_pane, category: CATEGORY.read_pane, defaultGate: "Auto" },
   { id: "read_notes", label: CAPABILITY_LABELS.read_notes, category: CATEGORY.read_notes, defaultGate: "Auto" },
   { id: "focus_pane", label: CAPABILITY_LABELS.focus_pane, category: CATEGORY.focus_pane, defaultGate: "Auto" },
