@@ -106,6 +106,38 @@ describe("ClaudeAdapter (HIGH confidence — §5)", () => {
   });
 });
 
+// parseCurrentMode read-after-write markers — pinned to the LIVE status-bar
+// strings captured in P5 (bead wsm-e2e-pinned-8sw, Claude v2.x over ConPTY via
+// scripts/verify-live-modeswitch.ts). The observed ring (HITL launch floor):
+//   default(NO pill) → "⏵⏵ accept edits on" → "⏸ plan mode on" → "⏵⏵ auto mode on".
+// REGRESSION GUARD: accept-edits is a MID tier and must NOT read back as Full Auto
+// (the original bug — it would falsely confirm a promotion that never reached
+// bypass). Full Auto is "auto mode on" (or "bypass permissions on" when the bypass
+// flag seeds the ring). default/accept-edits are not one of the 3 Janus modes → null.
+describe("ClaudeAdapter.parseCurrentMode (live markers — §5/§12, bead 8sw)", () => {
+  const a = createAdapter("Claude Code");
+
+  it("'plan mode on' ⇒ Read-Only", () => {
+    assert.strictEqual(a.parseCurrentMode("⏸ plan mode on (shift+tab to cycle) · ← for agents"), "Read-Only");
+  });
+
+  it("'auto mode on' ⇒ Full Auto", () => {
+    assert.strictEqual(a.parseCurrentMode("⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"), "Full Auto");
+  });
+
+  it("'bypass permissions on' ⇒ Full Auto (seeded-bypass ring)", () => {
+    assert.strictEqual(a.parseCurrentMode("⏵⏵ bypass permissions on (shift+tab to cycle)"), "Full Auto");
+  });
+
+  it("'accept edits on' ⇒ null — a MID tier, NEVER Full Auto (regression guard)", () => {
+    assert.strictEqual(a.parseCurrentMode("⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"), null);
+  });
+
+  it("an idle frame with no mode pill ⇒ null (default/HITL has no marker)", () => {
+    assert.strictEqual(a.parseCurrentMode("OrbitalVoiceRunner main · ctx -- Opus 4.8 (1M)"), null);
+  });
+});
+
 describe("CodexAdapter (LOW confidence — §5)", () => {
   const a = createAdapter("Codex");
 

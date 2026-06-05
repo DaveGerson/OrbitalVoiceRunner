@@ -34,7 +34,9 @@ import { PendingActionStore } from "../src/pendingActions";
 // Shift+Tab = ESC [ Z = 0x1b 0x5b 0x5a — Claude's live mode-cycle key.
 const SHIFT_TAB = "\x1b\x5b\x5a";
 // A fixture status-bar marker the ClaudeAdapter.parseCurrentMode recognizes as Full Auto.
-const FULL_AUTO_MARKER = "⏵⏵ accept edits on";
+// Pinned to the LIVE string captured in P5 (bead 8sw): the Full-Auto ring stop reads
+// "auto mode on", NOT "accept edits on" (which is a MID tier and reads back as null).
+const FULL_AUTO_MARKER = "⏵⏵ auto mode on";
 
 /**
  * A scripted fake pane that records every writeRaw byte, the stop->start ORDER, and lets a test

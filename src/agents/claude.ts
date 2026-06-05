@@ -81,10 +81,19 @@ export class ClaudeAdapter implements AgentAdapter {
     return SHIFT_TAB;
   }
 
-  // TODO(multi-cli-live-switch-verification): pin against captured status-bar
-  // strings. Only `acceptEdits`⇒`⏵⏵ accept edits on` is confirmed; rest TBD live.
+  // Read-after-write mode markers — pinned to the LIVE status-bar strings captured
+  // in P5 (bead wsm-e2e-pinned-8sw, Claude v2.x over ConPTY). Observed ring:
+  //   default(NO pill) → "⏵⏵ accept edits on" → "⏸ plan mode on" → "⏵⏵ auto mode on".
+  // Only the three Janus modes are recognized; everything else returns null so the
+  // read-after-write loop keeps cycling (never blind-counts). NOTE: accept-edits is a
+  // MID tier — it must NOT read as Full Auto, or a promotion that stalled at
+  // accept-edits would be falsely confirmed (the original §5 bug).
   parseCurrentMode(ptyFrame: string): Mode | null {
-    if (/accept edits on/i.test(ptyFrame)) return "Full Auto";
+    if (/plan mode on/i.test(ptyFrame)) return "Read-Only";
+    // Full Auto = "auto mode on" (cycle-reachable top) OR "bypass permissions on"
+    // (present only when --allow-dangerously-skip-permissions seeds the ring).
+    if (/auto mode on/i.test(ptyFrame) || /bypass permissions on/i.test(ptyFrame)) return "Full Auto";
+    // accept-edits (mid tier) and default/HITL (no pill) have no Janus mode → null.
     return null; // keep reading — never blind-count.
   }
 
