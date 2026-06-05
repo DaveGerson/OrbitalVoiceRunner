@@ -50,10 +50,6 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "delete", path: "/api/projects/:id", category: "future-convergence", reason: "project delete — future registry def" },
   { method: "delete", path: "/api/projects/:projectId/panes/:paneId", category: "future-convergence", reason: "pane delete — future registry def" },
   { method: "post", path: "/api/projects/:projectId/panes/:paneId/stop", category: "future-convergence", reason: "non-destructive pane stop — future registry def" },
-  // ── future-convergence: archive ──
-  { method: "get", path: "/api/archive", category: "future-convergence", reason: "archive list read — future rest-only def" },
-  { method: "post", path: "/api/archive/:paneId/restore", category: "future-convergence", reason: "restore archived pane — future registry def" },
-  { method: "delete", path: "/api/archive/:paneId", category: "future-convergence", reason: "delete archived pane — future registry def" },
   // ── future-convergence: approvals / pending (HiTL) ──
   { method: "get", path: "/api/commands/pending", category: "future-convergence", reason: "pending commands read — future rest-only def" },
   { method: "get", path: "/api/actions/pending", category: "future-convergence", reason: "pending actions read — future rest-only def" },

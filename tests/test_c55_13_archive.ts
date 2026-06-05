@@ -111,3 +111,32 @@ describe("c55.13 — fidelity", () => {
     assert.ok(calls.includes("delete:nope") && !calls.includes("ledger_broadcast"));
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// cutover guard — server.ts inline routes deleted + names added to the only-set
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("c55.13 — server.ts cutover guard (no double-registration)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  const mountIdx = serverSrc.indexOf("mountRestRoutes(");
+  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
+  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
+  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+
+  for (const name of ["list_archived_panes", "restore_archived_pane", "delete_archived_pane"]) {
+    it(`mountRestRoutes only-set includes "${name}"`, () => {
+      assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
+      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the c55.13 cutover`);
+    });
+  }
+  const goneLiterals: Array<{ label: string; needle: RegExp }> = [
+    { label: "GET /api/archive", needle: /app\.get\(\s*["']\/api\/archive["']/ },
+    { label: "POST /api/archive/:paneId/restore", needle: /app\.post\(\s*["']\/api\/archive\/:paneId\/restore["']/ },
+    { label: "DELETE /api/archive/:paneId", needle: /app\.delete\(\s*["']\/api\/archive\/:paneId["']/ },
+  ];
+  for (const { label, needle } of goneLiterals) {
+    it(`inline route is deleted: ${label}`, () => {
+      assert.ok(!needle.test(serverSrc), `inline ${label} must be deleted (converged to the registry)`);
+    });
+  }
+});

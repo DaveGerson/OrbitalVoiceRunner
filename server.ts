@@ -901,40 +901,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // Same effect: stop+drop dead live terminal objects, ledger.archiveExitedPanes(activeId), then
   // ledger_updated + terminals_updated broadcasts. The {archived} count rides in the ok output body.
 
-  app.get("/api/archive", (req, res) => {
-    const archived = manager.ledger.listArchived().map(a => ({
-      pane_id: a.pane.pane_id,
-      name: a.pane.name,
-      project_id: a.project_id,
-      tool_preset: a.pane.tool_preset,
-      last_command: a.pane.last_command || "",
-      archived_at: a.archived_at
-    }));
-    res.json({ archived });
-  });
-
-  app.post("/api/archive/:paneId/restore", (req, res) => {
-    const { paneId } = req.params;
-    const entry = manager.ledger.restoreArchivedPane(paneId);
-    if (!entry) {
-      res.status(404).json({ error: "Archived pane not found" });
-      return;
-    }
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true });
-  });
-
-  app.delete("/api/archive/:paneId", (req, res) => {
-    const { paneId } = req.params;
-    const ok = manager.ledger.deleteArchivedPane(paneId);
-    if (!ok) {
-      res.status(404).json({ error: "Archived pane not found" });
-      return;
-    }
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55.13: GET /api/archive, POST /api/archive/:paneId/restore, DELETE /api/archive/:paneId are now
+  // served by the registry-derived list_archived_panes / restore_archived_pane / delete_archived_pane
+  // defs (mountRestRoutes only-set above). Same projection + broadcasts; rest-only, ungated operator-UI.
 
   // --- ORCHESTRATION PIPELINES & AUTOMATIONS ENDPOINTS ---
   const recipes = [
@@ -1421,6 +1390,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "remove_note",
       "create_pane_note",
       "add_pane_context",
+      // c55.13 — 3 rest-only operator-UI archive defs, cut over from the inline app.* routes deleted
+      // below. Ungated operator-direct; the UI repaints off ledger_updated/terminals_updated.
+      "list_archived_panes",
+      "restore_archived_pane",
+      "delete_archived_pane",
     ]),
   });
 
