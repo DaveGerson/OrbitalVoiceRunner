@@ -52,6 +52,7 @@ import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/r
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { resolveResumeHandleTtlMs, shouldClearHandleOnClose, wrapHandleForPersist, readFreshHandle, isInvalidKeyClose, isBlankApiKey } from "./src/voiceResumption";
 import { extractTranscripts } from "./src/liveTranscripts";
+import { createCoreState } from "./src/core/coreState";
 
 dotenv.config();
 
@@ -499,36 +500,13 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     }
   };
 
-  let activeFrontendWs: any = null;
-  // WS-F (spec §5/§6.3): the current live Gemini session, hoisted to closure scope so the module-level
-  // sweep can speak a last-call for non-session-bound pending ACTIONS (approvals carry their own
-  // per-record session via sessionFor; actions do not). Single-operator, last-connection-wins: set
-  // when a connect resolves, nulled on socket close. Null === no voice channel to narrate into.
-  let activeLiveSession: any = null;
-  const clients = new Set<any>();
-
-  // Step 5 (single active pane): the pane the operator currently has open on screen, driven by the
-  // UI via `set_active_pane`. It is the SINGLE source of truth for where Janus may write — see
-  // `isPaneActiveForWrite`. Null when no pane is open / no UI is connected (no write permitted).
-  let activePaneId: string | null = null;
-
-  // STOP-ALL Stage-1 freeze (bead 8sq, spec §2.C / §3). When set, the gate resolver short-circuits
-  // EVERY capability to Off at the single choke-point (effectiveCapabilityGateFor) — Janus cannot
-  // act anywhere until Release. PERSISTED to the durable kv ("frozen"="1") so a froze-for-a-reason
-  // survives a process restart; the matrix itself is NEVER mutated, so Release is a clean clear.
-  // Restored from the store on boot (below). Module-level `store` is the durable backend.
-  let frozen: boolean = store?.getKV("frozen") === "1";
-  // QW4 (bead qw4): the panes whose Stage-2 stop() rejected on the most recent confirm. Set by
-  // stopAll(true) right before its return; read synchronously by the REST confirm route after it
-  // awaits stopAll (single-threaded — no race). Lets the route report a `failed` list to the caller.
-  let lastStopAllFailed: string[] = [];
-  const FROZEN_KV = "frozen";
-  function persistFrozen(value: boolean): void {
-    frozen = value;
-    if (!store) return;
-    try { if (value) store.setKV(FROZEN_KV, "1"); else store.deleteKV(FROZEN_KV); }
-    catch (e) { console.error("[STOP-ALL] failed to persist frozen flag:", e); }
-  }
+  // dec-1 (DBT5): the shared mutable runtime state — coreState.activeFrontendWs, coreState.activeLiveSession, the broadcast
+  // client set, coreState.activePaneId (the single write-target source of truth), the STOP-ALL `frozen` freeze
+  // (durably persisted, restored from the kv on construction), and coreState.lastStopAllFailed — hoisted into ONE
+  // shared object so the domains later carved out of this file (observe/gating/voice) mutate the SAME
+  // cells via their injected deps bag rather than closing over server-local `let`s. Mutate `frozen`
+  // ONLY via coreState.setFrozen so persistence stays coupled. See src/core/coreState.ts.
+  const coreState = createCoreState(store);
 
   // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
   // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
@@ -543,7 +521,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
-    for (const client of clients) {
+    for (const client of coreState.clients) {
       if (client.readyState === 1) { // OPEN
         try {
           client.send(data);
@@ -552,7 +530,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // next broadcast doesn't re-throw on the same corpse (and the set doesn't leak); the
           // matching clientWs.on("close") cleanup may never have fired for an abrupt break.
           console.error("Failed to send socket broadcast:", e);
-          clients.delete(client);
+          coreState.clients.delete(client);
         }
       }
     }
@@ -561,8 +539,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // Step 6 (the Workbench): per-pane WIP draft helpers. The draft is composed against the ACTIVE
   // pane (single source of truth, step 5); composing/editing it is not a CLI write and is ungated.
   function activeDraftTarget(): { projectId: string; paneId: string } | null {
-    if (!activePaneId) return null;
-    return { projectId: manager.ledger.activeProjectId || "default_project", paneId: activePaneId };
+    if (!coreState.activePaneId) return null;
+    return { projectId: manager.ledger.activeProjectId || "default_project", paneId: coreState.activePaneId };
   }
   function broadcastDraft(projectId: string, paneId: string) {
     const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
@@ -1041,21 +1019,21 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // GET the current freeze state so the client can restore the FROZEN banner on a fresh page load
   // (spec §2.C/§10.3 — "frozen survives a restart"; the flag is persisted in the durable kv).
   app.get("/api/stop-all/status", (_req, res) => {
-    res.json({ frozen, running: frozen ? runningPaneIds() : [] });
+    res.json({ frozen: coreState.frozen, running: coreState.frozen ? runningPaneIds() : [] });
   });
   app.post("/api/stop-all", async (_req, res) => {
     const running = await stopAll(false);
     res.json({ success: true, frozen: true, running });
   });
   app.post("/api/stop-all/confirm", async (_req, res) => {
-    if (!frozen) {
+    if (!coreState.frozen) {
       res.status(409).json({ success: false, error: "Not frozen — Stage 2 kill requires a prior Stage 1 freeze (POST /api/stop-all)." });
       return;
     }
     // QW4: await the kills so `killed` names panes that ACTUALLY stopped; `failed` (read right after
     // the await — single-threaded, no race) surfaces any kill that rejected.
     const killed = await stopAll(true);
-    res.json({ success: true, killed, failed: lastStopAllFailed });
+    res.json({ success: true, killed, failed: coreState.lastStopAllFailed });
   });
   app.post("/api/stop-all/release", (_req, res) => {
     releaseStopAll();
@@ -1805,11 +1783,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       const proj = manager.ledger.getActiveProject();
       paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
     }
-    const isActivePane = !!paneId && activePaneId === paneId;
+    const isActivePane = !!paneId && coreState.activePaneId === paneId;
     const resolved = resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
     // STOP-ALL Stage-1: the ONE place the `frozen` short-circuit is applied. While frozen every
     // capability resolves Off; the matrix above is untouched, so Release re-exposes it exactly.
-    return applyFrozenShortCircuit(frozen, resolved);
+    return applyFrozenShortCircuit(coreState.frozen, resolved);
   }
 
   // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
@@ -1883,8 +1861,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
         paneGates: paneId ? proj?.panes?.[paneId]?.capabilityGates : undefined,
         globalGates: manager.settings.advanced?.capabilityGates,
-        isActivePane: !!paneId && activePaneId === paneId,
-        frozen,
+        isActivePane: !!paneId && coreState.activePaneId === paneId,
+        frozen: coreState.frozen,
       });
       broadcast({
         type: "action_pending", actionId, capability, summary,
@@ -1913,9 +1891,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     const globalGates = manager.settings.advanced?.capabilityGates;
     const proj = manager.ledger.getActiveProject();
     const paneGates = proj?.panes?.[paneId]?.capabilityGates;
-    const isActivePane = activePaneId === paneId;
+    const isActivePane = coreState.activePaneId === paneId;
     const base = deriveEffectiveGates(paneGates, globalGates, isActivePane);
-    if (!frozen) return base;
+    if (!coreState.frozen) return base;
     // Frozen overlay — mirror the resolver's single-choke-point short-circuit on the surface.
     const out = {} as Record<CapabilityGate, GateValue>;
     for (const cap of ALL_CAPABILITIES) out[cap] = applyFrozenShortCircuit(true, base[cap]);
@@ -1965,7 +1943,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
    */
   async function stopAll(kill: boolean): Promise<string[]> {
     if (!kill) {
-      persistFrozen(true);
+      coreState.setFrozen(true);
       // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
       for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
       // Expire every deferred non-PTY action (no side effect runs).
@@ -2013,7 +1991,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         });
       } catch { /* store optional */ }
     }
-    lastStopAllFailed = failed; // QW4: surfaced to the REST confirm route (read right after the await).
+    coreState.lastStopAllFailed = failed; // QW4: surfaced to the REST confirm route (read right after the await).
     broadcast({ type: "stop_all", killed, failed });
     broadcastTerminalsUpdated();
     return killed;
@@ -2040,7 +2018,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   /** Clear the freeze (Release). The matrix was never mutated, so this is a clean clear. */
   function releaseStopAll(): void {
-    persistFrozen(false);
+    coreState.setFrozen(false);
     if (store) {
       try {
         store.recordActivity({
@@ -2265,7 +2243,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   //   - CONNECTED + last-call already spoken + grace elapsed -> "reject": NOW route through the
   //     UNCHANGED terminal path (applyResolution(id,"expire") -> resolveDecision claim+delete).
   // Connectivity is resolved HERE and passed in: per-record `sessionFor(id) !== undefined` for
-  // approvals (the detach/re-attach seam), global `activeFrontendWs !== null` for the non-session-
+  // approvals (the detach/re-attach seam), global `coreState.activeFrontendWs !== null` for the non-session-
   // bound pending actions. Only the TRIGGER + the connected-gate change; the reject itself stays
   // byte-for-byte (the mandatory claim gate / exactly-once / dead-pane invariants are untouched).
   function sweepExpiredApprovals(now: number = Date.now()) {
@@ -2285,22 +2263,22 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       applyResolution(pending.messageId, "expire");
     }
     // G1 + WS-F: pending actions get the SAME last-call->grace shape. Connectivity is gated on the
-    // SAME ref used to narrate (`activeLiveSession`), NOT `activeFrontendWs`. The two diverge during
-    // the Gemini `ai.live.connect()` handshake window: `activeFrontendWs` is set synchronously on WS
-    // open, but `activeLiveSession` is only assigned AFTER the async connect resolves. If the gate
-    // were `activeFrontendWs`, a sweep tick in that window could return "lastcall" (gate true), stamp
+    // SAME ref used to narrate (`coreState.activeLiveSession`), NOT `coreState.activeFrontendWs`. The two diverge during
+    // the Gemini `ai.live.connect()` handshake window: `coreState.activeFrontendWs` is set synchronously on WS
+    // open, but `coreState.activeLiveSession` is only assigned AFTER the async connect resolves. If the gate
+    // were `coreState.activeFrontendWs`, a sweep tick in that window could return "lastcall" (gate true), stamp
     // the one-shot `lastCallAt`, yet SKIP the narration (no live session) — and since "lastcall" never
     // re-fires once stamped, the action would later be rejected having NEVER spoken a last-call,
     // violating spec §4.1/§10 #4 ("a spoken last-call always precedes any reject"). Coupling the gate
-    // to `activeLiveSession` mirrors the approval path (gate ref == narration ref). The transient
+    // to `coreState.activeLiveSession` mirrors the approval path (gate ref == narration ref). The transient
     // `lastCallAt` drives the two-phase transition; expiry stays the unchanged pendingActions.expire(id).
-    const actionsConnected = activeLiveSession !== null;
+    const actionsConnected = coreState.activeLiveSession !== null;
     for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
       const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
       if (decision.action === "none") continue;
       if (decision.action === "lastcall") {
         act.lastCallAt = now;
-        if (activeLiveSession) pushApprovalNarration(activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`);
+        if (coreState.activeLiveSession) pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`);
         broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
         continue;
       }
@@ -2365,8 +2343,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       return;
     }
 
-    activeFrontendWs = clientWs;
-    clients.add(clientWs);
+    coreState.activeFrontendWs = clientWs;
+    coreState.clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
     // Step 6: drafts are per-pane now; the client fetches the active pane's draft once it has told
@@ -2426,7 +2404,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // PLM4 (2): monotonic connect generation. Each connectLiveSession() invocation bumps it and
     // captures its own number; when its async connect resolves it bails if a NEWER connect has since
     // started (so a slow stale connect can never clobber a newer live session). Mirrors the QW3
-    // `activeLiveSession === session` identity guard for the in-flight (not-yet-hoisted) window.
+    // `coreState.activeLiveSession === session` identity guard for the in-flight (not-yet-hoisted) window.
     let connectGeneration = 0;
     function clearReconnectTimer(): void {
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -2470,8 +2448,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // the operator can SEE and improve the command before it lands (HiTL). A proposal for any
       // other pane is refused here — never written, in ANY policy mode — and Janus is told to ask
       // for a switch. This sits ABOVE the effective-mode gate on purpose. (architecture step 5.)
-      if (!isPaneActiveForWrite(activePaneId, targetId)) {
-        return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
+      if (!isPaneActiveForWrite(coreState.activePaneId, targetId)) {
+        return { kind: "clarify", text: inactivePaneClarify(coreState.activePaneId, targetId) };
       }
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
@@ -2552,7 +2530,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // This attempt's dead flag (the QW3 post-close-flush gate, now per-session, not shared on wsClosed).
     let sessionDead = false;
     // QW3 (bead qw3) + PLM4 (2): teardown for a Gemini Live socket that dies WITHOUT the client WS
-    // closing. Detach (keep survivors for re-announce), null activeLiveSession behind the identity
+    // closing. Detach (keep survivors for re-announce), null coreState.activeLiveSession behind the identity
     // guard so a stale callback can't clobber a newer session, broadcast voice_channel_lost, THEN
     // (PLM4) schedule a bounded reconnect. Idempotent-ish: onerror + onclose can both fire for one
     // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
@@ -2568,8 +2546,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
         // session. `session` is the mutated connection-scope let, so the comparison is by reference
         // against whatever is currently hoisted (copied from WS-close).
-        if (activeLiveSession === session) {
-          activeLiveSession = null;
+        if (coreState.activeLiveSession === session) {
+          coreState.activeLiveSession = null;
           // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
           // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
           // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
@@ -2648,8 +2626,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           dispatchProposal: dispatchProposal as ActionContext["dispatchProposal"],
           gateCapability,
           redact: redactSecrets,
-          getActivePaneId: () => activePaneId,
-          setActivePane: (id) => { activePaneId = id; },
+          getActivePaneId: () => coreState.activePaneId,
+          setActivePane: (id) => { coreState.activePaneId = id; },
           activeDraftTarget,
           broadcastDraft,
           broadcastTerminalsUpdated,
@@ -2663,7 +2641,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // Emergency brake — the real connection-scoped closures (they broadcast their own frames).
           stopAll,
           releaseStopAll,
-          isFrozen: () => frozen,
+          isFrozen: () => coreState.frozen,
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
@@ -2873,9 +2851,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         },
         // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
         // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
-        // activeLiveSession kept a dead handle and the frontend was never told. These siblings mirror
+        // coreState.activeLiveSession kept a dead handle and the frontend was never told. These siblings mirror
         // the WS-close teardown (see clientWs.on("close")): DETACH (keep survivors for re-announce),
-        // null activeLiveSession behind the identity guard so a stale callback can't clobber a newer
+        // null coreState.activeLiveSession behind the identity guard so a stale callback can't clobber a newer
         // session, and broadcast a NEW voice_channel_lost frame. NO reconnect logic (that is PLM4).
         onerror: (err: any) => {
           // Log only the message, NOT the raw error/socket — the live WebSocket's URL carries the API
@@ -2940,7 +2918,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       // restart) to THIS session and speak ONE batched resumption digest — "welcome back, here's
       // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
       // connect promise resolves so `session` is live.
-      activeLiveSession = justConnected;
+      coreState.activeLiveSession = justConnected;
       clearReconnectTimer();
       // PLM4 (Finding: flap-unbounded backoff): do NOT refresh the bounded-retry budget eagerly on
       // hoist — a flapping session (connect -> immediate drop -> reconnect -> …) would then reset
@@ -2953,7 +2931,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         stableResetTimer = null;
         if (wsClosed) return; // operator already left.
         // Only the CURRENTLY-live session earns the refresh; a stale callback can't credit a newer one.
-        if (activeLiveSession === justConnected) {
+        if (coreState.activeLiveSession === justConnected) {
           reconnectAttempts = 0;
           console.log(`[VOICE] session stable for ${RECONNECT_STABLE_UPTIME_MS}ms — reconnect budget refreshed.`);
         }
@@ -3069,14 +3047,14 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // Step 6: operator editing a pane's WIP draft. Defaults to the active pane when the
           // client doesn't name one. Not a CLI write — ungated.
           const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
-          const paneId = msg.paneId || activePaneId;
+          const paneId = msg.paneId || coreState.activePaneId;
           if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
             broadcastDraft(projectId, paneId);
           }
         } else if (msg.type === "set_active_pane") {
           // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
           // open (or null if nothing is open) is recorded here and gates every Janus write.
-          activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
+          coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
         } else if (msg.type === "stop_all") {
           // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated.
           // Stage 1 (default / kill=false): freeze + cancel in-flight; panes keep running.
@@ -3084,11 +3062,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // stopAll broadcasts {type:'frozen'}/{type:'stop_all'} to ALL clients; this is the
           // per-client ack so the requesting UI can confirm completion.
           if (msg.kill === true) {
-            if (!frozen) {
+            if (!coreState.frozen) {
               clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
             } else {
               const killed = await stopAll(true);
-              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: lastStopAllFailed }));
+              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: coreState.lastStopAllFailed }));
             }
           } else {
             const running = await stopAll(false);
@@ -3111,10 +3089,10 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       clearReconnectTimer();
       clearStableResetTimer(); // PLM4 (Finding: flap): no budget-refresh timer should outlive the WS.
       if (unsubscribePaneSignals) { unsubscribePaneSignals(); unsubscribePaneSignals = null; }
-      clients.delete(clientWs);
-      if (activeFrontendWs === clientWs) {
-        activeFrontendWs = null;
-        activePaneId = null; // Step 5: no UI connected -> no source of truth -> no write permitted.
+      coreState.clients.delete(clientWs);
+      if (coreState.activeFrontendWs === clientWs) {
+        coreState.activeFrontendWs = null;
+        coreState.activePaneId = null; // Step 5: no UI connected -> no source of truth -> no write permitted.
       }
       if (session) {
         // WS-F (spec §6.1): disconnect = DETACH, not purge. Drop the dead live-session handle but
@@ -3126,8 +3104,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         if (detached.length) console.log(`[DETACH] kept ${detached.length} survivor(s) for re-announce on reconnect.`);
         // Drop the hoisted live-session ref if it points at this (now dead) session, so the action
         // last-call doesn't narrate into a torn-down channel. The action clock also pauses now
-        // (activeFrontendWs went null above), matching the approval clock-pause-while-away.
-        if (activeLiveSession === session) activeLiveSession = null;
+        // (coreState.activeFrontendWs went null above), matching the approval clock-pause-while-away.
+        if (coreState.activeLiveSession === session) coreState.activeLiveSession = null;
         try {
           session.close();
         } catch (e) {
@@ -3167,8 +3145,8 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       dispatchProposal: (() => ({ kind: "error", text: "pane-write is not available on the REST surface" })) as ActionContext["dispatchProposal"],
       gateCapability,
       redact: redactSecrets,
-      getActivePaneId: () => activePaneId,
-      setActivePane: (id) => { activePaneId = id; },
+      getActivePaneId: () => coreState.activePaneId,
+      setActivePane: (id) => { coreState.activePaneId = id; },
       activeDraftTarget,
       broadcastDraft,
       broadcastTerminalsUpdated,
@@ -3181,7 +3159,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
       recipes: recipes as ActionContext["recipes"],
       stopAll,
       releaseStopAll,
-      isFrozen: () => frozen,
+      isFrozen: () => coreState.frozen,
       audit: (row) => {
         if (!store) return;
         let argsRedacted: string | null = null;
@@ -3288,9 +3266,9 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
 
   return {
     app, server, wss, manager, port, close,
-    _testActiveLiveSession: () => activeLiveSession,
+    _testActiveLiveSession: () => coreState.activeLiveSession,
     _testPendingApprovals: () => pendingApprovals,
-    _testClients: () => clients,
+    _testClients: () => coreState.clients,
   };
 }
 
