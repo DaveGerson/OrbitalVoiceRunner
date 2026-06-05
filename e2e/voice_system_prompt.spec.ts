@@ -6,7 +6,7 @@ import { test, expect, gotoMockedApp } from "./fixtures";
  * cover — pure JSX): the multiline textarea + "Reset to default" button appear in the Voice Session
  * sub-tab, the reset button is disabled while blank and enabled once a custom prompt is typed, and
  * clicking it clears the field back to blank (which the parent persists as undefined => the builder
- * falls back to DEFAULT_SYSTEM_PROMPT — proven byte-identical in tests/test_system_prompt.ts).
+ * falls back to DEFAULT_SYSTEM_PROMPT — guarded by content invariants in tests/test_system_prompt.ts).
  *
  * The save→server→reconnect leg needs a live server (the ?mock=1 harness is client-only); that is
  * unit-pinned by tests/test_secrets_at_rest.ts (persist, not blanked) + tests/test_system_prompt.ts.
