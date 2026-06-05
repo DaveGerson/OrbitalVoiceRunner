@@ -27,6 +27,7 @@ import type { CapabilityGate, GateValue, CapabilityGateMap } from "../src/types"
 // capabilities (read_pane / read_notes / focus_pane / compose_draft / archive_pane / clear_history).
 const ALL_CAPABILITIES: CapabilityGate[] = [
   "write_to_pane", "deliver_handoff", "create_pane", "close_pane",
+  "delete_pane", "delete_project",
   "restart_pane", "set_pane_permissions", "set_global_permissions",
   "set_capability_gate", "add_watch_rule", "execute_plan",
   "apply_recipe", "create_project", "update_metadata",
@@ -185,7 +186,7 @@ describe("gateSurface — CAPABILITY_CATEGORIES (spec §6)", () => {
     // (clear_history → Destructive; archive_pane/focus_pane/compose_draft → Orientation; reads → Reading).
     const expected: Record<string, CapabilityGate[]> = {
       "Acting in a pane": ["write_to_pane", "deliver_handoff"],
-      "Destructive": ["close_pane", "restart_pane", "clear_history"],
+      "Destructive": ["close_pane", "delete_pane", "delete_project", "restart_pane", "clear_history"],
       "Changing the locks": ["set_pane_permissions", "set_global_permissions", "set_capability_gate"],
       "Spawning work": ["create_pane", "execute_plan", "apply_recipe", "add_watch_rule"],
       "Orientation (low-risk)": ["create_project", "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention", "archive_pane", "focus_pane", "compose_draft"],

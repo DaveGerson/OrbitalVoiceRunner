@@ -212,6 +212,8 @@ const DEFAULT_MOCK_GATES: CapabilityGateMap = {
   deliver_handoff: "Auto",
   create_pane: "Ask",
   close_pane: "Ask",
+  delete_pane: "Ask",
+  delete_project: "Ask",
   restart_pane: "Ask",
   set_pane_permissions: "Ask",
   set_global_permissions: "Ask",

@@ -12,6 +12,7 @@ import type { AnnouncementTemplates } from "./announcementKinds";
 // CAPABILITY_DEFS (src/actions/capabilities.ts) — a test asserts ALL_CAPABILITIES === that id set.
 export type CapabilityGate =
   | "write_to_pane" | "deliver_handoff" | "create_pane" | "close_pane"
+  | "delete_pane" | "delete_project"
   | "restart_pane" | "set_pane_permissions" | "set_global_permissions"
   | "set_capability_gate" | "add_watch_rule" | "execute_plan"
   | "apply_recipe" | "create_project" | "update_metadata"
@@ -43,6 +44,8 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   deliver_handoff: "Ask",
   create_pane: "Ask",
   close_pane: "Ask",
+  delete_pane: "Ask",
+  delete_project: "Ask",
   restart_pane: "Ask",
   set_pane_permissions: "Ask",
   set_global_permissions: "Ask",

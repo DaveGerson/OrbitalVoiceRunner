@@ -249,6 +249,8 @@ describe("§8.1b matrix derived from registry", () => {
       deliver_handoff: "Ask",
       create_pane: "Ask",
       close_pane: "Ask",
+      delete_pane: "Ask",
+      delete_project: "Ask",
       restart_pane: "Ask",
       set_pane_permissions: "Ask",
       set_global_permissions: "Ask",
