@@ -1070,7 +1070,13 @@ export class OrchestratorManager {
 
   public saveSettings() {
     try {
-      fs.writeFileSync(this.settingsFilePath, JSON.stringify(this.settings, null, 2), "utf-8");
+      // Secrets-at-rest hardening (director decision 2026-06-05): the Gemini API key is an
+      // IN-MEMORY-ONLY secret. It stays in this.settings.secrets for the running session (so voice
+      // works once the operator enters it in the UI) but is NEVER written to disk — a restart drops
+      // it and the operator re-enters it. Persist a copy with the live secret blanked; everything
+      // else (gates, presets, voiceAi, etc.) persists unchanged.
+      const persisted = { ...this.settings, secrets: { ...this.settings.secrets, geminiApiKey: "" } };
+      fs.writeFileSync(this.settingsFilePath, JSON.stringify(persisted, null, 2), "utf-8");
     } catch (e) {
       console.error("Failed to save settings:", e);
     }

@@ -52,7 +52,14 @@ export function migrateFromObjects(store: JanusStore, input: MigrationInput): vo
     if (ledger.watchRules) store.setKV("watchRules", JSON.stringify(ledger.watchRules));
     if (ledger.plans) store.setKV("plans", JSON.stringify(ledger.plans));
 
-    flatten(input.settings ?? {}, "").forEach(([k,v]) => store.saveSettings(k, typeof v === "string" ? v : JSON.stringify(v)));
+    // Secrets-at-rest hardening: NEVER import secrets.* into the durable store. The Gemini API key
+    // is an in-memory-only secret (director decision 2026-06-05); flattening secrets.geminiApiKey
+    // into settings_kv is exactly what leaked the key into .janus.db on the 2026-06-05 boot. Migrate
+    // every non-secret setting unchanged.
+    flatten(input.settings ?? {}, "").forEach(([k, v]) => {
+      if (k === "secrets" || k.startsWith("secrets.")) return;
+      store.saveSettings(k, typeof v === "string" ? v : JSON.stringify(v));
+    });
 
     for (const [paneId, entries] of Object.entries<any>(input.history ?? {})) {
       for (const e of (entries as any[])) {
