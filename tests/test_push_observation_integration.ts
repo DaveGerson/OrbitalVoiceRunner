@@ -34,6 +34,27 @@ describe("push-observation end-to-end (classify -> bus -> session)", () => {
     assert.match(fake.spoken[0], /Module not found/);
   });
 
+  it("Phase 1 ears: a 'running' signal reaches the session as a compact started/cooking nudge", () => {
+    // Proves the NEW kind survives the bus -> FakeSession.sendClientContent path of fact [C]
+    // (the model's only live channel). The text must narrate a BEGINNING and name the pane,
+    // not fall through to the 'exited' verb.
+    const bus = new PaneSignalBus(0);
+    const fake = new FakeSession();
+    bus.subscribe((sig) =>
+      fake.sendClientContent({
+        turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
+        turnComplete: true,
+      }),
+    );
+
+    bus.publish({ paneId: "agent-2", kind: "running", detail: "npm test" });
+
+    assert.strictEqual(fake.spoken.length, 1);
+    assert.match(fake.spoken[0], /agent-2/);
+    assert.match(fake.spoken[0], /start|cook|working|began|begin|running/i);
+    assert.doesNotMatch(fake.spoken[0], /\bexited\b/i, "a start must not narrate as 'exited'");
+  });
+
   it("benign output produces no push", () => {
     const bus = new PaneSignalBus(0);
     const fake = new FakeSession();

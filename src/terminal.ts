@@ -356,12 +356,32 @@ export class UniversalTerminal {
   public sessionId: string;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
+  // Phase 1 "ears": the symmetric BEGINNING edge to onIdle. Fires once when the pane
+  // transitions INTO Running from a non-Running status (an input kick or an authoritative
+  // busy probe). Unlike onIdle it is NOT gated on sawWorkSinceIdle — a beginning has no
+  // spurious-done concern, and the PaneSignalBus debounce coalesces a chatty edge.
+  public onRunning?: (terminalId: string) => void;
+  // Conservative Phase 2: the HUMBLE pre-idle "cooking…" edge. Fires exactly once when the idle
+  // debounce timer is armed (the existing 'last output -> waiting out quiescence' window) while
+  // the pane is STILL Running — i.e. it OBSERVES a window the state machine already has, adding
+  // NO new idle decision. Cancelled/reset when work resumes (clearIdleTimer / Running edge) or
+  // once true Idle is declared. Distinct from onIdle (which is the authoritative completion edge).
+  public onQuiescing?: (terminalId: string) => void;
+  // True while inside one armed pre-idle window. Drives the once-guard for onQuiescing (fire only
+  // on the false->armed transition; the fallback path re-arms on every output chunk) and the
+  // UI's humble "cooking…" overlay (server snapshot reads this).
+  public quiescing = false;
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
   // Silence-to-idle timeout (ms). Honors advanced.idleTimeoutMs; defaults to the
   // documented 2000ms rather than the previously hardcoded 1000ms (BUG-034).
   public idleTimeoutMs = 2000;
+  // Conservative Phase 2 safeguard (fact [F]): a modestly LARGER silence-to-idle timeout used
+  // ONLY for interactive_cli (agent) panes on the fallback/quiescence path, where quiet != done.
+  // Defaults a touch above the shell idleTimeoutMs so a brief agent pause is less likely to read
+  // as premature 'done'. Shell panes ignore this and keep idleTimeoutMs. Setting-overridable.
+  public agentIdleTimeoutMs = 3500;
 
   // WS-C status-detection state (design §5).
   public statusProbe: StatusProbe;
@@ -541,9 +561,16 @@ export class UniversalTerminal {
       this.sawWorkSinceIdle = true;
     }
 
-    if (result.clearIdleTimer && this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
+    if (result.clearIdleTimer) {
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+      // Conservative Phase 2: work resumed (the state machine cancelled the pre-idle window) —
+      // the pane is no longer "wrapping up". Clear the humble cooking overlay so a stale label
+      // can't linger (self-correcting: the next quiescence honestly re-arms it). No signal is
+      // emitted on cancel; the Running edge (onRunning) / next snapshot already speak for it.
+      this.quiescing = false;
     }
     if (result.armIdleTimer) {
       if (this.idleTimer) clearTimeout(this.idleTimer);
@@ -552,20 +579,43 @@ export class UniversalTerminal {
       // "done" before the next authoritative tick has a chance to re-confirm a
       // reappearing child — a spurious onIdle. Floor the effective debounce at
       // probeIntervalMs there. Fallback mode is pure quiescence, so it keeps the
-      // configured timeout verbatim.
+      // configured timeout verbatim — except interactive_cli (agent) panes, which
+      // use the modestly larger agentIdleTimeoutMs so a brief mid-turn pause is less
+      // likely to read as premature 'done' (Conservative Phase 2 safeguard, fact [F]).
+      const fallbackIdleMs =
+        this.runtimeType === "interactive_cli" ? this.agentIdleTimeoutMs : this.idleTimeoutMs;
       const effectiveIdleMs =
         this.lastConfidence === "authoritative"
           ? Math.max(this.idleTimeoutMs, this.probeIntervalMs)
-          : this.idleTimeoutMs;
+          : fallbackIdleMs;
       this.idleTimer = setTimeout(() => {
         this.idleTimer = null;
         this.applyStatusEvent({ kind: "idleTimer" });
       }, effectiveIdleMs);
+      // Conservative Phase 2: this is the pre-idle "cooking…" edge. The state machine just
+      // armed the debounce while the pane is still Running — fire onQuiescing exactly once on
+      // the false->armed transition (the fallback path re-arms on every chunk, so the once-guard
+      // prevents flapping; the PaneSignalBus 3s debounce is a second backstop on the model leg).
+      // This adds NO new judgement about doneness — it only observes the window idle already owns.
+      if (!this.quiescing) {
+        this.quiescing = true;
+        if (this.onQuiescing) this.onQuiescing(this.terminalId);
+      }
     }
 
     if (result.status !== this.status) {
+      // Phase 1 "ears": capture the PRIOR status so the Running edge is exact. A transition
+      // INTO Running from any non-Running status (Idle or Exited won't reach here — Exited
+      // returns early at the top of applyStatusEvent) is a genuine "beginning" — fire
+      // onRunning exactly once on the edge. Running->Running probe/output ticks never reach
+      // this block (result.status === this.status), so there is no re-fire. NOT gated on
+      // sawWorkSinceIdle (unlike onIdle): a beginning has no spurious-done risk.
+      const prevStatus = this.status;
       this.status = result.status;
       this.lastStatusChangeAt = Date.now();
+      if (result.status === "Running" && prevStatus !== "Running" && this.onRunning) {
+        this.onRunning(this.terminalId);
+      }
     }
     if (result.fireOnIdle) {
       // Only a Running→Idle edge that followed genuine work is a real "done".
@@ -980,6 +1030,12 @@ export class OrchestratorManager {
   public attentionQueue: AttentionItem[] = [];
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
+  // Phase 1 "ears": the manager-level fan of UniversalTerminal.onRunning (mirrors onIdle).
+  // server.ts assigns this to the observe pipeline's onRunning handler.
+  public onRunning?: (terminalId: string) => void;
+  // Conservative Phase 2: the manager-level fan of UniversalTerminal.onQuiescing (mirrors onIdle).
+  // server.ts assigns this to the observe pipeline's onQuiescing handler.
+  public onQuiescing?: (terminalId: string) => void;
   public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
   public settings!: SystemSettings;
   private settingsFilePath = ".janus_settings.json";
@@ -1100,6 +1156,13 @@ export class OrchestratorManager {
           term.idleTimeoutMs = newSettings.advanced.idleTimeoutMs;
         }
       }
+      // Conservative Phase 2: propagate the agent idle-timing safeguard to live terminals
+      // (only interactive_cli panes consume it on the fallback arm; shell panes ignore it).
+      if (newSettings.advanced.agentIdleTimeoutMs !== undefined) {
+        for (const term of Object.values(this.terminals)) {
+          term.agentIdleTimeoutMs = newSettings.advanced.agentIdleTimeoutMs;
+        }
+      }
     }
     if (newSettings.secrets) {
       this.settings.secrets = { ...this.settings.secrets, ...newSettings.secrets };
@@ -1154,11 +1217,19 @@ export class OrchestratorManager {
     const realProjId = projectId || this.ledger.activeProjectId || "default_project";
     const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
     term.idleTimeoutMs = this.settings?.advanced?.idleTimeoutMs ?? term.idleTimeoutMs;
+    // Conservative Phase 2: seed the agent (interactive_cli) idle-timing safeguard from settings.
+    term.agentIdleTimeoutMs = this.settings?.advanced?.agentIdleTimeoutMs ?? term.agentIdleTimeoutMs;
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
     };
     term.onIdle = (tid) => {
       if (this.onIdle) this.onIdle(tid);
+    };
+    term.onRunning = (tid) => {
+      if (this.onRunning) this.onRunning(tid);
+    };
+    term.onQuiescing = (tid) => {
+      if (this.onQuiescing) this.onQuiescing(tid);
     };
     term.start();
     this.terminals[terminalId] = term;
@@ -1175,6 +1246,14 @@ export class OrchestratorManager {
     const term = this.terminals[terminalId];
     if (!term) return;
     term.resize(cols, rows);
+  }
+
+  /** Phase 1 "ears": force a live PTY->ledger sync without building the listPanes payload.
+   *  switch_context calls this immediately before getProjectBriefing so the catch-up briefing
+   *  reflects the current term.status (fact [E]). syncLedger() is private; this is the public
+   *  seam. (listPanes() also calls syncLedger() — this just avoids the payload allocation.) */
+  refreshLedger() {
+    this.syncLedger();
   }
 
   listPanes() {

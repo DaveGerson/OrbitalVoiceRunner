@@ -1,7 +1,7 @@
 import { SHELL_PROMPT } from "./statusConstants";
 import { redactSecrets } from "./terminal";
 
-export type PaneSignalKind = "idle" | "error" | "prompt" | "exited";
+export type PaneSignalKind = "idle" | "error" | "prompt" | "exited" | "running" | "quiescing";
 
 export interface PaneSignal {
   paneId: string;
@@ -46,6 +46,16 @@ export function formatPaneSignal(s: PaneSignal): string {
     s.kind === "idle" ? "went idle (finished)"
     : s.kind === "error" ? "reported an error"
     : s.kind === "prompt" ? "is waiting at a prompt"
+    // "running" is the BEGINNING edge (Phase 1 "ears"). It MUST be matched explicitly: the
+    // chain falls through to "exited" for any unhandled kind, so an unmatched "running" would
+    // mis-narrate a start as an end — actively misleading the model.
+    : s.kind === "running" ? "started working (cooking)"
+    // "quiescing" is the Conservative Phase 2 HUMBLE pre-idle nudge: the pane has gone quiet but
+    // is NOT yet declared done (it sits inside the idle-debounce window the state machine already
+    // arms). It MUST be matched explicitly for the same exhaustiveness reason — and it must NOT
+    // read as a completion ('finished'/'done'/'idle') or it would re-introduce the premature-done
+    // problem this phase exists to soften. Wording stays tentative ("appears to be wrapping up").
+    : s.kind === "quiescing" ? "appears to be wrapping up (still cooking — not yet confirmed complete)"
     : "exited";
   const tail = s.detail ? `: ${s.detail}` : "";
   return `PANE STATUS (mention to the operator if relevant, then stop): pane ${s.paneId} ${verb}${tail}`;

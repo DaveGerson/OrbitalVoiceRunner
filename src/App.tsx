@@ -1286,6 +1286,21 @@ function AppRaw() {
             });
           }
           fetchWipDrafts(msg.projectId);
+        } else if (msg.type === "pane_status") {
+          // Phase 1 "ears" (fact [D]): a real-time pane status push (today: the Running edge).
+          // Patch the matching pane's status IN PLACE — mirroring the in-place setTerminals
+          // patch at handleApprove — so the chip flips immediately, without the 20s poll
+          // round-trip. Deliberately NOT routed through eventBus.effectForEvent (that maps to
+          // fetchTerminals, re-introducing the lag this fix removes). The poll stays as fallback.
+          // Conservative Phase 2: a real status change (Running/Idle) means the pane is no longer
+          // merely "cooking" — clear the humble overlay so a stale label can't linger.
+          setTerminals(prev => prev.map(t => t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t));
+        } else if (msg.type === "pane_quiescing") {
+          // Conservative Phase 2: the pane went quiet inside the pre-idle window. Optimistically
+          // set the humble "cooking…" overlay flag IN PLACE so the label appears instantly,
+          // without a refetch. The pane stays "Running"; the flag only changes the label color/text.
+          // Cleared by the next pane_status (Running/Idle) push or the 20s poll reconcile.
+          setTerminals(prev => prev.map(t => t.id === msg.terminalId ? { ...t, quiescing: true } : t));
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
         } else if (msg.type === "frozen") {
@@ -1854,6 +1869,13 @@ function AppRaw() {
                   textClass = "text-amber-300 font-extrabold";
                   animateDot = "animate-ping";
                   dotColor = "bg-amber-500";
+                } else if (term.status === "Running" && term.quiescing) {
+                  // Conservative Phase 2: humble "cooking…" — quiet inside the pre-idle window.
+                  // Muted amber, NOT the emerald "executing" pulse and NOT the yellow "idle".
+                  bgClass = "bg-amber-500/5";
+                  borderClass = "border-amber-500/20";
+                  textClass = "text-amber-400/70";
+                  dotColor = "bg-amber-400/70";
                 } else if (term.status === "Running") {
                   bgClass = "bg-emerald-500/10";
                   borderClass = "border-emerald-500/30";
@@ -1945,6 +1967,10 @@ function AppRaw() {
           if (isAlertActive) {
             statusLabel = "AWAITING APPROVAL";
             statusBadgeClass = "bg-amber-500 text-black font-extrabold shadow-[0_0_8px_#f59e0b]";
+          } else if (term.status === "Running" && term.quiescing) {
+            // Conservative Phase 2: humble "cooking…" — quiet inside the pre-idle window, NOT done.
+            statusLabel = "COOKING…";
+            statusBadgeClass = "bg-amber-500/10 text-amber-400/80 border border-amber-500/10";
           } else if (term.status === "Running") {
             statusLabel = "ACTIVE EXECUTING";
             statusBadgeClass = "bg-emerald-500/10 text-emerald-400 border border-emerald-500/10";
@@ -3027,6 +3053,10 @@ function AppRaw() {
             colorClass = "border-amber-500 text-amber-400 bg-amber-500/15 animate-pulse font-bold";
           } else if (isActive) {
             colorClass = "border-cyan-500 text-cyan-400 bg-cyan-500/10 font-bold";
+          } else if (term.status === "Running" && term.quiescing) {
+            // Conservative Phase 2: humble "cooking…" overlay — quiet inside the pre-idle window,
+            // NOT the green "executing" and NOT the yellow "idle". A muted amber distinguishes it.
+            colorClass = "border-amber-500/40 text-amber-400/80 bg-amber-500/5";
           } else if (term.status === "Running") {
             colorClass = "border-green-500/50 text-green-400 bg-green-500/5";
           } else if (term.status === "Idle") {
@@ -3043,6 +3073,7 @@ function AppRaw() {
             >
               <span className={`w-1.5 h-1.5 rounded-full ${
                 isAlertActive ? "bg-amber-500 animate-ping2" :
+                term.status === "Running" && term.quiescing ? "bg-amber-400/70" :
                 term.status === "Running" ? "bg-green-500" : "bg-yellow-500"
               }`}></span>
               {(term.id).toUpperCase()}

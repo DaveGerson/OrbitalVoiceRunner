@@ -468,7 +468,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
   // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
   // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
-  const { onOutput, onIdle } = attachObserve(manager, {
+  const { onOutput, onIdle, onRunning, onQuiescing } = attachObserve(manager, {
     broadcast,
     announcementBus,
     paneSignalBus,
@@ -481,6 +481,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   });
   manager.onOutput = onOutput;
   manager.onIdle = onIdle;
+  // Phase 1 "ears": fan the BEGINNING edge (pane_status WS frame + 'running' model signal),
+  // mirroring the onIdle wiring above. The pane_status broadcast is emitted from inside
+  // attachObserve via the injected broadcast — server.ts only binds the handler.
+  manager.onRunning = onRunning;
+  // Conservative Phase 2: fan the HUMBLE pre-idle "cooking…" edge (pane_quiescing WS frame +
+  // 'quiescing' model signal), mirroring the onRunning/onIdle wiring above. The frames are
+  // emitted from inside attachObserve via the injected broadcast/paneSignalBus.
+  manager.onQuiescing = onQuiescing;
 
   function broadcastLedgerUpdate() {
     broadcast({
@@ -506,6 +514,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     store,
     broadcast,
     broadcastLedgerUpdate,
+    broadcastDraft,
     coreState,
     announcementBus,
     pushApprovalNarration,
@@ -549,6 +558,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
         backfill: term.getRawBackfill(),
         output: term.getRecentOutput(20),
         status: term.status,
+        // Conservative Phase 2: the humble "cooking…" overlay. True when the pane is STILL
+        // Running but has gone quiet inside the pre-idle window — a fresh fetch/poll reflects
+        // it too (the WS pane_quiescing frame is the instant path; this is the snapshot fallback).
+        quiescing: term.quiescing || undefined,
         permissions_mode: term.permissionsMode,
         tool_preset: term.toolPreset,
         session_id: term.sessionId,
