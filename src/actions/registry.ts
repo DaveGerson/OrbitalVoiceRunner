@@ -25,6 +25,7 @@ import { ALWAYS_ALLOWED } from "./types";
 import { READS_ACTIONS } from "./defs/reads";
 import { NOTES_ACTIONS } from "./defs/notes";
 import { PANES_WRITE_ACTIONS } from "./defs/panes_write";
+import { PANES_REST_ACTIONS } from "./defs/panes_rest";
 import { ORIENT_ACTIONS } from "./defs/orient";
 import { LOCKS_ACTIONS } from "./defs/locks";
 import { ORCH_ACTIONS } from "./defs/orchestration";
@@ -253,6 +254,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...READS_ACTIONS,
   ...NOTES_ACTIONS,
   ...PANES_WRITE_ACTIONS,
+  // ── c55 Batch C rest-only pane/UI defs (5) ──
+  ...PANES_REST_ACTIONS,
   ...ORIENT_ACTIONS,
   ...LOCKS_ACTIONS,
   ...ORCH_ACTIONS,

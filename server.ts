@@ -644,40 +644,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.status(out.status).json(out.body);
   });
 
-  // Web API to restart terminal node
-  app.post("/api/terminals/:id/restart", async (req, res) => {
-    const { id } = req.params;
-    const term = manager.terminals[id];
-    if (term) {
-      // stop() is async (SIGTERM→SIGKILL escalation); await it so the dying PTY's onExit
-      // fires BEFORE start() spawns the replacement, otherwise the late exit flips the
-      // freshly-restarted pane to Exited and tears down its probe timer (zombie pane).
-      await term.stop();
-      term.start();
-      broadcastLedgerUpdate();
-      broadcastTerminalsUpdated();
-      res.json({ success: true, message: `Terminal ${id} restarted.` });
-    } else {
-      const activeProject = manager.ledger.getActiveProject();
-      const pane = activeProject?.panes[id];
-      if (pane) {
-        // U4 (wsm-e2e-pinned-ckf): derive the restart command from the persisted union via the
-        // SAME presetCommand() helper the voice create_pane handler uses — one source of truth.
-        // This kills the 'Claude Code'/'Codex'/'Antigravity' literal comparisons (the spot most
-        // exposed to the id/name drift) and the hardcoded "bash" default; a director-renamed
-        // binary (settings.presets[].command) is honored, and Custom -> the configured shell.
-        const preset = normalizePreset(pane.tool_preset);
-        const cmd = presetCommand(preset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
-
-        manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, preset, pane.permissions_mode, pane.session_id);
-        broadcastLedgerUpdate();
-        broadcastTerminalsUpdated();
-        res.json({ success: true, message: `Terminal ${id} restored and started.` });
-      } else {
-        res.status(404).json({ error: "Terminal not found" });
-      }
-    }
-  });
+  // c55 Batch C: POST /api/terminals/:pane_id/restart is now served by the registry-derived restart_pane
+  // def (mountRestRoutes only-set above). It NOW ENFORCES the restart_pane gate (the inline route here
+  // skipped it — a deliberate safety improvement). Same stop()+start() / ledger-rebuild branches and the
+  // same ledger_updated + terminals_updated broadcasts. Accepted delta: inline 404 -> 200 ok-narration.
 
   // TWO-STAGE EMERGENCY STOP-ALL (bead 8sq, spec §2.C). Auth is enforced by
   // app.use("/api", authMiddleware) — the single shared director token. Always-allowed
@@ -696,58 +666,22 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // and broadcast the same frames. GET /api/stop-all/status stays inline (out of scope — Batch F).
   // Accepted body deltas (client ignores the body): confirm-while-not-frozen 409 -> 200 ok-narration.
 
-  // Web API to write input command directly to terminal node (for broadcast or target manipulation)
-  app.post("/api/terminals/:id/input", (req, res) => {
-    const { id } = req.params;
-    const { command } = req.body;
-    if (command === undefined) {
-      res.status(400).json({ error: "Missing command body parameter" });
-      return;
-    }
-    const term = manager.terminals[id];
-    if (term) {
-      HistoryManager.getInstance().addCommand(id, command);
-      term.writeInput(command);
-      broadcastLedgerUpdate();
-      res.json({ success: true, message: `Command successfully dispatched to terminal ${id}.` });
-    } else {
-      res.status(404).json({ error: "Terminal not found or offline" });
-    }
-  });
+  // c55 Batch C: POST /api/terminals/:pane_id/input (send_keys) and /resize (resize_pane) are now served
+  // by the registry-derived rest-only defs (mountRestRoutes only-set above) — both ALWAYS_ALLOWED to
+  // preserve the inline routes' ungated behavior. send_keys records history + writeInput + ledger_updated;
+  // resize_pane validates cols/rows as positive ints via zod (replacing the inline 400) and calls
+  // manager.resize. Accepted deltas (client ignores the body): inline 404 -> 200 ok, inline 400 -> zod 500.
 
-  // Web API to sync a pane's PTY grid to the operator's xterm viewport. The
-  // program inside wraps to the PTY's column count, so this MUST track the
-  // display or line wrapping diverges from a real terminal.
-  app.post("/api/terminals/:id/resize", (req, res) => {
-    const { id } = req.params;
-    const cols = Number(req.body?.cols);
-    const rows = Number(req.body?.rows);
-    if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 1 || rows < 1) {
-      res.status(400).json({ error: "cols and rows must be positive numbers" });
-      return;
-    }
-    const term = manager.terminals[id];
-    if (!term) {
-      res.status(404).json({ error: "Terminal not found or offline" });
-      return;
-    }
-    manager.resize(id, cols, rows);
-    res.json({ success: true });
-  });
-
-  // Web API to get terminal history
+  // Web API to get terminal history (Batch F — kept inline; structured array body needs rest.toHttp).
   app.get("/api/terminals/:id/history", (req, res) => {
     const { id } = req.params;
     const history = HistoryManager.getInstance().loadHistory(id);
     res.json(history);
   });
 
-  // Web API to clear terminal history
-  app.post("/api/terminals/:id/history/clear", (req, res) => {
-    const { id } = req.params;
-    HistoryManager.getInstance().saveHistory(id, []);
-    res.json({ success: true, history: [] });
-  });
+  // c55 Batch C: POST /api/terminals/:pane_id/history/clear is now served by the registry-derived
+  // clear_history def (mountRestRoutes only-set above), ALWAYS_ALLOWED (preserving the inline route's
+  // ungated behavior). Same HistoryManager.saveHistory(id, []) effect; client ignores the body.
 
   // Project and Pane management endpoints
   app.post("/api/projects", (req, res) => {
@@ -972,24 +906,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 
   // --- Terminal archive (recoverable "clear exited") ---
 
-  // Archive all Exited panes in the active project (recoverable, not a hard delete).
-  app.post("/api/terminals/clear-exited", (req, res) => {
-    const activeId = manager.ledger.activeProjectId || undefined;
-    // Stop+drop any live terminal objects for panes about to be archived.
-    const ws = activeId ? manager.ledger.getProject(activeId) : null;
-    if (ws) {
-      for (const paneId of Object.keys(ws.panes)) {
-        if (!ws.panes[paneId].alive && manager.terminals[paneId]) {
-          manager.terminals[paneId].stop();
-          delete manager.terminals[paneId];
-        }
-      }
-    }
-    const archived = manager.ledger.archiveExitedPanes(activeId);
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, archived });
-  });
+  // c55 Batch C: POST /api/terminals/clear-exited is now served by the registry-derived clear_exited def
+  // (mountRestRoutes only-set above), ALWAYS_ALLOWED (preserving the inline route's ungated behavior).
+  // Same effect: stop+drop dead live terminal objects, ledger.archiveExitedPanes(activeId), then
+  // ledger_updated + terminals_updated broadcasts. The {archived} count rides in the ok output body.
 
   app.get("/api/archive", (req, res) => {
     const archived = manager.ledger.listArchived().map(a => ({
@@ -1525,6 +1445,23 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "rename_project",
       "rename_pane",
       "switch_context",
+      // c55 Batch C — five NEW rest-only defs for inline pane/UI routes with no voice twin. The inline
+      // app.post(...) twins are deleted below in the SAME change. Clients read only res.ok and repaint
+      // off the terminals_updated / ledger_updated WS frames the handlers fan out.
+      //   restart_pane  POST /api/terminals/:pane_id/restart       — NOW GATED via gateOrDefer
+      //                 (capability restart_pane, default Ask): the inline route skipped the gate, so this
+      //                 ENFORCES it (a deliberate safety improvement — behaviorDelta). 403 Off / 202 Ask.
+      //   send_keys     POST /api/terminals/:pane_id/input         — ALWAYS_ALLOWED (was ungated).
+      //   resize_pane   POST /api/terminals/:pane_id/resize        — ALWAYS_ALLOWED; zod cols/rows int>0
+      //                 replaces the inline 400 (zod-500 on bad input).
+      //   clear_history POST /api/terminals/:pane_id/history/clear — ALWAYS_ALLOWED (was ungated).
+      //   clear_exited  POST /api/terminals/clear-exited            — ALWAYS_ALLOWED (was ungated).
+      // Accepted status deltas (client ignores the body): inline 404 not-found -> 200 ok-narration.
+      "restart_pane",
+      "send_keys",
+      "resize_pane",
+      "clear_history",
+      "clear_exited",
     ]),
   });
 

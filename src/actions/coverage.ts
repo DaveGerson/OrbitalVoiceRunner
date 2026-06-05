@@ -84,6 +84,15 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
 
   // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
   set_global_permissions: new Set<Surface>(["voice"]),
+
+  // ── c55 Batch C: NEW rest-only pane/UI defs (no voice twin BY DESIGN — pure UI/operator-direct) ──
+  // These converge inline app.post(...) routes that never had a Gemini voice tool. They are rest-only
+  // (surfaces = {'rest'}) so they don't force a voice-tool description; a voice twin is not planned.
+  restart_pane: new Set<Surface>(["rest"]),
+  send_keys: new Set<Surface>(["rest"]),
+  resize_pane: new Set<Surface>(["rest"]),
+  clear_history: new Set<Surface>(["rest"]),
+  clear_exited: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

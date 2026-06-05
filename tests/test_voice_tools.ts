@@ -409,6 +409,15 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
     it("restart of a Claude pane rebuilds the 'claude' command via presetCommand (from the persisted union)", async () => {
       clearPanes();
       setCreatePaneAuto();
+      // c55 Batch C behaviorDelta: POST /api/terminals/:id/restart now routes through the registry
+      // restart_pane def, which ENFORCES the restart_pane gate (the old inline route skipped it). The
+      // capability defaults to Ask -> the restore would 202-defer instead of running. Set it to Auto in
+      // the matrix (mirroring setCreatePaneAuto's "director loosens via the Settings UI" convention) so
+      // the restore runs inline and this test continues to assert the rebuild contract. Cleaned up below.
+      if (!running.manager.settings.advanced.capabilityGates) {
+        running.manager.settings.advanced.capabilityGates = {} as any;
+      }
+      (running.manager.settings.advanced.capabilityGates as any).restart_pane = "Auto";
       // The restart-restore branch reads the ACTIVE project's ledger pane, so create under
       // (and pin active to) u4_proj.
       running.manager.ledger.activeProjectId = "u4_proj";
@@ -436,6 +445,10 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
       assert.ok(term, "restart re-created the pane");
       assert.ok(term.shellCmd.startsWith("claude"), `restart derived claude: ${term.shellCmd}`);
       assert.strictEqual(term.toolPreset, "Claude Code", "restart kept the union");
+      // Clean up the per-test restart_pane=Auto override (suite hygiene).
+      if (running.manager.settings.advanced.capabilityGates) {
+        delete (running.manager.settings.advanced.capabilityGates as any).restart_pane;
+      }
       await teardownCreated();
     });
 
