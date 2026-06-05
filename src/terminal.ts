@@ -869,6 +869,19 @@ export class UniversalTerminal {
     );
   }
 
+  /**
+   * Raw control-byte passthrough (multi-cli adapter spec §7) — the sole RAW path. Unlike
+   * writeInput/deliverSubmit (SUBMIT semantics: a separate CR, paste-burst split, optimistic
+   * Running, history), writeRaw writes the bytes VERBATIM in a single transport.write with NO
+   * appended \r and no split. It is the ONE primitive behind the raw-input endpoint and the GUI
+   * control-key bar (a Shift+Tab button writes ESC[Z verbatim). No-op on an inert/un-spawned pane
+   * (transport === null) — the REST caller surfaces a 409.
+   */
+  writeRaw(bytes: string): void {
+    if (!this.transport) return;
+    this.transport.write(bytes);
+  }
+
   getRecentOutput(linesCount = 10): string {
     return this.outputBuffer.slice(-linesCount).join('\n');
   }
