@@ -5,7 +5,11 @@
 //    bypass flag IS --dangerously-skip-permissions (this is CORRECT for agy — distinct
 //    from Codex). agy has NO --allow- equivalent → the launch window is HOT under
 //    Full Auto (assert safe-mode before dispatch; spec §15 hot-launch risk).
-//  - Live → Full-Auto: shift+down (ESC[1;2B) cycle is an UNVERIFIED axis → restart-resume.
+//  - Live → Full-Auto: shift+down (ESC[1;2B) cycle is UNVERIFIED → restart-resume.
+//    P5 live probe (bead 8sw, 2026-06-05): a real agy pane over ConPTY reaches only the
+//    "Select login method" screen — agy v1.0.4 requires interactive Google OAuth before
+//    any session, so the cycle axis is unreachable here. The conservative floor below is
+//    evidence-backed; re-run `npm run verify:modeswitch:agy` once agy is signed in.
 //  - Session pin: none → capture quit-msg / newest ~/.gemini/antigravity-cli/brain/<uuid>/.
 //  - Lossless resume: ALWAYS by explicit `--conversation=<uuid>` (a bare -c resumes the
 //    most-recent globally-in-workspace → multi-pane hazard) + bypass re-arm.
