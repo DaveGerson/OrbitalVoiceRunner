@@ -690,24 +690,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   app.get("/api/stop-all/status", (_req, res) => {
     res.json({ frozen: coreState.frozen, running: coreState.frozen ? runningPaneIds() : [] });
   });
-  app.post("/api/stop-all", async (_req, res) => {
-    const running = await stopAll(false);
-    res.json({ success: true, frozen: true, running });
-  });
-  app.post("/api/stop-all/confirm", async (_req, res) => {
-    if (!coreState.frozen) {
-      res.status(409).json({ success: false, error: "Not frozen — Stage 2 kill requires a prior Stage 1 freeze (POST /api/stop-all)." });
-      return;
-    }
-    // QW4: await the kills so `killed` names panes that ACTUALLY stopped; `failed` (read right after
-    // the await — single-threaded, no race) surfaces any kill that rejected.
-    const killed = await stopAll(true);
-    res.json({ success: true, killed, failed: coreState.lastStopAllFailed });
-  });
-  app.post("/api/stop-all/release", (_req, res) => {
-    releaseStopAll();
-    res.json({ success: true, frozen: false });
-  });
+  // c55 Batch A: the three POST brake twins (POST /api/stop-all, /confirm, /release) are now served
+  // by the registry-derived REST mount (stop_all / confirm_stop_all / release_stop_all in the
+  // mountRestRoutes only-set above). They run the SAME injected brake closures (stopAll / releaseStopAll)
+  // and broadcast the same frames. GET /api/stop-all/status stays inline (out of scope — Batch F).
+  // Accepted body deltas (client ignores the body): confirm-while-not-frozen 409 -> 200 ok-narration.
 
   // Web API to write input command directly to terminal node (for broadcast or target manipulation)
   app.post("/api/terminals/:id/input", (req, res) => {
@@ -1081,16 +1068,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json(manager.attentionQueue);
   });
 
-  app.post("/api/attention/:id/dismiss", (req, res) => {
-    const item = manager.attentionQueue.find(i => i.id === req.params.id);
-    if (item) {
-      item.dismissed = true;
-      broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Attention item not found" });
-    }
-  });
+  // c55 Batch A: POST /api/attention/:id/dismiss is now served by the registry twin dismiss_attention
+  // (mountRestRoutes only-set above) — same attention_updated broadcast. Accepted body delta (client
+  // ignores the body): unknown-id 404 -> 200 ok-narration. GET /api/attention and POST
+  // /api/attention/clear stay inline (out of scope — later batch).
 
   app.post("/api/attention/clear", (req, res) => {
     manager.attentionQueue.forEach(i => i.dismissed = true);
@@ -1141,31 +1122,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json(manager.ledger.plans);
   });
 
-  app.post("/api/plans", (req, res) => {
-    const { name, steps } = req.body;
-    if (!name || !Array.isArray(steps)) {
-      res.status(400).json({ error: "Missing name or steps checklist." });
-      return;
-    }
-    const formattedSteps = steps.map((s: any, idx: number) => ({
-      id: "step_" + idx,
-      terminalId: s.terminalId,
-      command: s.command,
-      expectedTransition: s.expectedTransition || "idle",
-      status: "pending" as const
-    }));
-    const newPlan = {
-      id: "plan_" + Math.random().toString(36).substring(2, 11),
-      name,
-      steps: formattedSteps,
-      currentStepIndex: 0,
-      status: "idle" as const
-    };
-    manager.ledger.plans.push(newPlan);
-    manager.ledger["save"](true);
-    broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-    res.json({ success: true, plan: newPlan });
-  });
+  // c55 Batch A: POST /api/plans (create) is now served by the registry twin create_orchestrator_plan
+  // (mountRestRoutes only-set above) — same plans_updated broadcast and ledger["save"](true) persist.
+  // Accepted body delta (client ignores the body): the inline missing-name/steps 400 becomes a zod
+  // validation 500 (no valid client sends an empty payload). GET /api/plans, POST /api/plans/:id/execute,
+  // and DELETE /api/plans/:id stay inline (out of scope — later batches).
 
   app.post("/api/plans/:id/execute", (req, res) => {
     const plan = manager.ledger.plans.find(p => p.id === req.params.id);
@@ -1546,6 +1507,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "list_capabilities",
       "list_handoffs",
       "read_handoff",
+      // c55 Batch A — emergency-brake trio + dismiss + plan-create, cut over from the inline
+      // app.post(...) twins deleted below. The client ignores the HTTP body; the registry handlers
+      // broadcast the same WS frames the inline routes did (frozen / stop_all kill / unfreeze /
+      // attention_updated / plans_updated), so the live feed repaints identically.
+      "stop_all",
+      "confirm_stop_all",
+      "release_stop_all",
+      "dismiss_attention",
+      "create_orchestrator_plan",
     ]),
   });
 

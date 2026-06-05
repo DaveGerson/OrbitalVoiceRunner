@@ -238,16 +238,23 @@ describe("8sq two-stage STOP-ALL (headless)", () => {
       await release();
     });
 
-    it("REST POST /api/stop-all freezes and returns {frozen:true, running:[...]}", async () => {
+    it("REST POST /api/stop-all freezes and returns 200 + the converged { output } narration", async () => {
+      // c55 Batch A: POST /api/stop-all is now the registry twin stop_all. The converged body is the
+      // SAME { output } narration the voice path returns; the client repaints off the broadcast
+      // `frozen` frame (asserted separately above), not the body. We pin 200 + that the narration
+      // confirms the freeze and names the still-running panes (proving the brake closure ran).
       clearPanes();
       addPane("s1-rest-a");
       addPane("s1-rest-b");
       const res = await api("/api/stop-all", { method: "POST" });
       assert.strictEqual(res.status, 200);
       const body = await res.json();
-      assert.strictEqual(body.frozen, true, "REST Stage 1 reports frozen");
-      assert.ok(Array.isArray(body.running), "REST Stage 1 reports the still-running panes");
-      assert.ok(body.running.includes("s1-rest-a") && body.running.includes("s1-rest-b"), "running set names live panes");
+      assert.strictEqual(typeof body.output, "string", "converged Stage-1 body is { output: string }");
+      assert.ok(/froze|frozen|freeze/i.test(body.output), `narration confirms the freeze: ${body.output}`);
+      assert.ok(
+        body.output.includes("s1-rest-a") && body.output.includes("s1-rest-b"),
+        `narration names the still-running panes: ${body.output}`
+      );
       await release();
     });
   });
@@ -287,32 +294,48 @@ describe("8sq two-stage STOP-ALL (headless)", () => {
       assert.ok(/not frozen|nothing to confirm|haven't frozen|no freeze/i.test(out), `refusal read-back: ${out}`);
     });
 
-    it("REST POST /api/stop-all/confirm kills running PTYs and stays frozen", async () => {
+    it("REST POST /api/stop-all/confirm kills running PTYs (converged { output }) and stays frozen", async () => {
+      // c55 Batch A: POST /api/stop-all/confirm is now the registry twin confirm_stop_all. The kill
+      // side effect is unchanged (the handler calls the SAME ctx.stopAll(true) brake closure -> the
+      // pane PTY is stopped exactly once); only the response body converges to { output }.
       clearPanes();
       const a = addPane("s2-rest");
       await api("/api/stop-all", { method: "POST" }); // Stage 1
       const res = await api("/api/stop-all/confirm", { method: "POST" });
       assert.strictEqual(res.status, 200);
       const body = await res.json();
-      assert.ok(Array.isArray(body.killed), "confirm reports the killed set");
-      assert.ok(body.killed.includes("s2-rest"), "killed names the running pane");
-      assert.strictEqual(a.stopCount, 1, "the pane PTY was stopped");
+      assert.strictEqual(typeof body.output, "string", "converged Stage-2 body is { output: string }");
+      assert.ok(body.output.includes("s2-rest"), `narration names the killed pane: ${body.output}`);
+      assert.strictEqual(a.stopCount, 1, "the pane PTY was stopped (kill side effect preserved)");
       await release();
     });
 
-    it("REST POST /api/stop-all/confirm without a prior freeze is a 409 no-op", async () => {
+    it("REST POST /api/stop-all/confirm without a prior freeze is a 200 no-op narration (delta: was 409)", async () => {
+      // c55 Batch A accepted wire-contract delta (spec Open Decision #2): the inline route returned
+      // 409 when not frozen; the registry twin confirm_stop_all returns kind:"ok" -> 200 with a
+      // "nothing to confirm — I'm not frozen" narration. The SAFETY-CRITICAL invariant is unchanged
+      // and asserted here: NO pane is killed when not frozen.
       clearPanes();
       const a = addPane("s2-409");
       await release();
       const res = await api("/api/stop-all/confirm", { method: "POST" });
-      assert.strictEqual(res.status, 409, "confirm without a freeze is rejected");
-      assert.strictEqual(a.stopCount, 0, "no kill on the rejected confirm");
+      assert.strictEqual(res.status, 200, "confirm-while-not-frozen now answers 200 (converged)");
+      const body = await res.json();
+      assert.ok(/not frozen|nothing to confirm/i.test(body.output), `no-op narration: ${body.output}`);
+      assert.strictEqual(a.stopCount, 0, "no kill on the not-frozen confirm (safety invariant preserved)");
     });
 
     // QW4 (bead qw4): Stage 2 used to be fire-and-forget — it reported the panes it ASKED to kill,
     // not the panes that actually stopped. Now it awaits the kills (Promise.allSettled) and builds
     // `killed` from FULFILLED results only; a pane whose stop() rejects is NOT in `killed`.
-    it("stop_all reports only panes that actually stopped", async () => {
+    //
+    // c55 Batch A: this REST route is now the registry twin confirm_stop_all -> converged { output }
+    // narration. The QW4 GUARANTEE itself is unchanged (the handler calls the SAME ctx.stopAll(true)
+    // brake closure, which still builds `killed` from FULFILLED kills only). We re-pin it through the
+    // narration (only the actually-stopped pane is named) PLUS the durable stub side effects. The
+    // `failed` set is no longer surfaced in the converged voice narration — it remains observable via
+    // the broadcast/log path; the inline `body.failed` wire field is intentionally retired here.
+    it("confirm_stop_all narrates only panes that actually stopped (converged { output })", async () => {
       clearPanes();
       const ok = addPane("s2-ok");          // stops cleanly
       const bad = addPane("s2-bad");        // stop() rejects
@@ -326,15 +349,13 @@ describe("8sq two-stage STOP-ALL (headless)", () => {
       assert.strictEqual(res.status, 200);
       const body = await res.json();
 
-      assert.ok(Array.isArray(body.killed), "confirm reports the killed set");
-      assert.ok(body.killed.includes("s2-ok"), "the pane that actually stopped IS reported killed");
-      assert.ok(!body.killed.includes("s2-bad"), "the pane whose stop() REJECTED is NOT reported killed");
-      assert.ok(!body.killed.includes("s2-dead"), "an already-Exited pane is never reported killed");
+      assert.strictEqual(typeof body.output, "string", "converged Stage-2 body is { output: string }");
+      assert.ok(body.output.includes("s2-ok"), "the pane that actually stopped IS named in the narration");
+      assert.ok(!body.output.includes("s2-bad"), "the pane whose stop() REJECTED is NOT named killed");
+      assert.ok(!body.output.includes("s2-dead"), "an already-Exited pane is never named killed");
 
-      // The rejecting pane is surfaced (not silently swallowed).
-      assert.ok(Array.isArray(body.failed), "confirm surfaces the failed kills");
-      assert.ok(body.failed.includes("s2-bad"), "the rejecting pane is reported in `failed`");
-
+      // The QW4 behavioral guarantees, verified via the durable stub side effects (still authoritative).
+      assert.strictEqual(bad.stopCount, 1, "the rejecting pane's stop() WAS attempted exactly once");
       assert.strictEqual(ok.stopCount, 1, "the healthy pane was stopped exactly once");
       assert.strictEqual(ok.status, "Exited", "the healthy pane ends Exited with stopCount===1");
       assert.strictEqual(dead.stopCount, 0, "the already-Exited pane was not re-stopped (stopCount stays 0)");

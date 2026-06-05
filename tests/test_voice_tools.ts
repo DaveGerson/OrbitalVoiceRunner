@@ -250,19 +250,28 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
       if (proj) delete proj.panes["vt-bypass2-a"];
     });
 
-    it("REST: POST /api/stop-all (Stage 1) returns 200, frozen:true, and the still-running set", async () => {
+    it("REST: POST /api/stop-all (Stage 1) returns 200 + the converged { output } narration naming the still-running set", async () => {
+      // c55 Batch A: POST /api/stop-all is now the registry twin stop_all (mountRestRoutes). The
+      // converged REST body is the SAME { output } narration the voice path returns (the client
+      // ignores the body and repaints off the broadcast `frozen` frame). We pin status 200 and assert
+      // the narration both confirms the freeze AND names the still-running panes (proving the brake
+      // closure ran and surfaced the running set), plus that the panes were NOT killed in Stage 1.
       clearPanes();
-      addPane("vt-rest-a");
-      addPane("vt-rest-b");
+      const a = addPane("vt-rest-a");
+      const b = addPane("vt-rest-b");
 
       const res = await api("/api/stop-all", { method: "POST" });
       assert.strictEqual(res.status, 200);
       const body = await res.json();
-      assert.strictEqual(body.success, true);
-      assert.strictEqual(body.frozen, true, "Stage 1 reports frozen:true");
-      assert.ok(Array.isArray(body.running), "running is an array");
-      assert.ok(body.running.includes("vt-rest-a"), "running includes vt-rest-a");
-      assert.ok(body.running.includes("vt-rest-b"), "running includes vt-rest-b");
+      assert.strictEqual(typeof body.output, "string", "converged Stage-1 body is { output: string }");
+      assert.ok(/froze|frozen|freeze/i.test(body.output), `narration confirms the freeze: ${body.output}`);
+      assert.ok(
+        body.output.includes("vt-rest-a") && body.output.includes("vt-rest-b"),
+        `narration names the still-running panes: ${body.output}`
+      );
+      // Stage 1 freezes but never kills.
+      assert.strictEqual(a.stopCount, 0, "pane a not killed in Stage 1");
+      assert.strictEqual(b.stopCount, 0, "pane b not killed in Stage 1");
       await releaseFreeze();
     });
 
