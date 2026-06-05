@@ -284,10 +284,12 @@ describe("c55 Batch A — server.ts cutover guard (no double-registration)", () 
   // /api/stop-all/status was a Batch-A out-of-scope neighbor, but c55 Batch F intentionally converges
   // it (get_stop_all_status) — so it is no longer asserted here; the Batch F cutover guard
   // (test_c55_batch_f.ts) now asserts that inline route is DELETED.
+  // SAME PATTERN: GET /api/attention (get_attention_queue) and GET /api/plans (list_orchestrator_plans)
+  // were Batch-A out-of-scope neighbors, but c55.11 intentionally converges them — so they are no
+  // longer asserted here; the c55.11 cutover guard (test_c55_11_reads.ts) now asserts those inline
+  // routes are DELETED. POST /api/attention/clear remains genuinely inline / out of scope.
   const keptLiterals: Array<{ label: string; needle: RegExp }> = [
-    { label: "GET /api/attention queue", needle: /app\.get\(\s*["']\/api\/attention["']/ },
     { label: "POST /api/attention/clear", needle: /app\.post\(\s*["']\/api\/attention\/clear["']/ },
-    { label: "GET /api/plans (fetch)", needle: /app\.get\(\s*["']\/api\/plans["']/ },
   ];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {

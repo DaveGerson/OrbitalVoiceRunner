@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**56** actions across **18** gated capabilities, plus the always-allowed group.
+**60** actions across **18** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -22,7 +22,11 @@ These bypass the capability gate entirely — they work even while the system is
 | `confirm_stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 2 (always allowed) |
 | `delete_orchestrator_plan` | rest | no | Delete a multi-step orchestrator plan by its id, removing it from the plan board |
 | `deliver_handoff` | voice | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
+| `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
+| `get_ledger` | rest | no | Read the full workspaces ledger (project/pane tree the UI loads on page open) |
 | `get_stop_all_status` | rest | no | Read the live STOP-ALL freeze state {frozen, running} so a fresh page load can restore the FROZEN banner |
+| `list_orchestration_recipes` | rest | no | Read the orchestration recipe templates (suggested multi-pane suites the UI offers) |
+| `list_orchestrator_plans` | rest | no | Read the multi-step orchestrator plans board (id/status/steps per plan) |
 | `list_watch_rules` | rest | no | List all configured watch-automation rules |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
 | `remove_watch_rule` | rest | no | Delete a watch-automation rule by its id |

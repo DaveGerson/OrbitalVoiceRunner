@@ -61,11 +61,6 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "get", path: "/api/archive", category: "future-convergence", reason: "archive list read — future rest-only def" },
   { method: "post", path: "/api/archive/:paneId/restore", category: "future-convergence", reason: "restore archived pane — future registry def" },
   { method: "delete", path: "/api/archive/:paneId", category: "future-convergence", reason: "delete archived pane — future registry def" },
-  // ── future-convergence: reads (ledger/attention/plans/recipes) ──
-  { method: "get", path: "/api/ledger", category: "future-convergence", reason: "full ledger read — future rest-only def (structured body)" },
-  { method: "get", path: "/api/attention", category: "future-convergence", reason: "attention queue read — future rest-only def" },
-  { method: "get", path: "/api/plans", category: "future-convergence", reason: "plans board read — future rest-only def" },
-  { method: "get", path: "/api/recipes", category: "future-convergence", reason: "recipes list read — future rest-only def" },
   // ── future-convergence: approvals / pending (HiTL) ──
   { method: "get", path: "/api/commands/pending", category: "future-convergence", reason: "pending commands read — future rest-only def" },
   { method: "get", path: "/api/actions/pending", category: "future-convergence", reason: "pending actions read — future rest-only def" },
