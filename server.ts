@@ -776,61 +776,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // rename_project (mountRestRoutes only-set above) — same renameProject + ledger_updated broadcast.
   // Accepted body delta (client ignores it): { success:true } -> 200 { output:"Project renamed to …" }.
 
-  app.post("/api/projects/:id/notes", (req, res) => {
-    const { note } = req.body;
-    manager.ledger.addNote(req.params.id, note);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
-
-  // bead bjm: id-bearing notes feed for the UI (Node Chronicle delete/amend controls). This is a
-  // DOM-render-only, operator-facing feed (server -> the trusted operator's browser), so it is NOT
-  // redacted — redaction is a MODEL-egress guard; the VOICE tools redact, this feed does not. Do not
-  // forward this raw text to the live session.
-  app.get("/api/projects/:id/notes", (req, res) => {
-    res.json({ notes: manager.ledger.getNotes({ projectId: req.params.id }) });
-  });
-
-  // bead bjm: operator-direct note edit/delete from the UI. Ungated (operator intent in their own
-  // UI), consistent with the ungated POST note path above; the GATED path is the voice amend_note /
-  // delete_note tools (which route through update_metadata).
-  app.put("/api/notes/:id", (req, res) => {
-    const { text } = req.body;
-    if (typeof text !== "string") { res.status(400).json({ error: "Missing text" }); return; }
-    manager.ledger.amendNote(req.params.id, text);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
-
-  app.delete("/api/notes/:id", (req, res) => {
-    manager.ledger.deleteNote(req.params.id);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55.12: POST /api/projects/:id/notes now served by the registry-derived create_project_note def (mountRestRoutes only-set above).
+  // c55.12: GET /api/projects/:id/notes now served by the registry-derived read_project_notes def (unredacted {notes:[…]} feed; only-set above).
+  // c55.12: PUT /api/notes/:id now served by the registry-derived edit_note def (mountRestRoutes only-set above).
+  // c55.12: DELETE /api/notes/:id now served by the registry-derived remove_note def (mountRestRoutes only-set above).
 
   // c55 Batch B: PUT /api/projects/:project_id/panes/:pane_id/rename is now served by the registry
   // twin rename_pane (mountRestRoutes only-set above) — same renamePane + ledger_updated broadcast.
   // Accepted body delta (client ignores it): { success:true } -> 200 { output:"Pane renamed to …" }.
 
-  app.post("/api/projects/:projectId/panes/:paneId/notes", (req, res) => {
-    const { note } = req.body;
-    manager.ledger.addPaneNote(req.params.projectId, req.params.paneId, note);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
-
-  // Step 6 / §4: add a layered context entry to a pane. Operator-typed entries land in the human
-  // layer (authoritative steering); this is not a CLI write and is never gated.
-  app.post("/api/projects/:projectId/panes/:paneId/context", (req, res) => {
-    const { text, layer } = req.body;
-    if (!text || typeof text !== "string") { res.status(400).json({ error: "Missing text" }); return; }
-    const ok = layer === "model"
-      ? manager.ledger.addModelContext(req.params.projectId, req.params.paneId, text, "operator-ui")
-      : manager.ledger.addHumanContext(req.params.projectId, req.params.paneId, text);
-    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55.12: POST /api/projects/:projectId/panes/:paneId/notes now served by the registry-derived create_pane_note def (mountRestRoutes only-set above).
+  // c55.12: POST /api/projects/:projectId/panes/:paneId/context now served by the registry-derived add_pane_context def (mountRestRoutes only-set above).
 
   // c55 Batch D: PUT /api/projects/:project_id/panes/:pane_id/permissions (set_pane_permissions) is now
   // served by the registry twin (mountRestRoutes only-set above). The rest.path uses snake_case segments
@@ -1457,6 +1413,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "get_attention_queue",
       "list_orchestrator_plans",
       "list_orchestration_recipes",
+      // c55.12 — 6 rest-only operator-UI note/context defs, cut over from the inline app.* routes
+      // deleted below. Ungated operator-direct; the UI repaints off the ledger_updated broadcast.
+      "create_project_note",
+      "read_project_notes",
+      "edit_note",
+      "remove_note",
+      "create_pane_note",
+      "add_pane_context",
     ]),
   });
 

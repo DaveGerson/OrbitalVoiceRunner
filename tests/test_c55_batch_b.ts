@@ -536,8 +536,10 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
   // NOTE: DELETE /api/plans/:id was likewise a Batch-B out-of-scope neighbor, but c55 Batch G CONVERGED
   // it (delete_orchestrator_plan, snake_case :plan_id rest.path), so it is no longer asserted-preserved
   // here — Batch G's own contract suite (test_watch_rules_c55.ts) pins the converged def + the WS frame.
+  // NOTE: POST /api/projects/:id/notes was a Batch-B out-of-scope neighbor, but c55.12 CONVERGED it
+  // (create_project_note, snake_case :project_id rest.path), so it is no longer asserted-preserved here —
+  // c55.12's own contract suite (test_c55_12_notes.ts) pins the converged def + asserts the inline twin is GONE.
   const keptLiterals: Array<{ label: string; needle: RegExp }> = [
-    { label: "POST /api/projects/:id/notes", needle: /app\.post\(\s*["']\/api\/projects\/:id\/notes["']/ },
     { label: "DELETE /api/projects/:id", needle: /app\.delete\(\s*["']\/api\/projects\/:id["']/ },
   ];
   for (const { label, needle } of keptLiterals) {
