@@ -327,7 +327,20 @@ export interface ActionDef<S extends z.ZodTypeAny = z.ZodTypeAny> {
   capability: Capability | "ALWAYS_ALLOWED"; // MANDATORY — every action is a matrix entry (Decision 5)
   readOnly: boolean;                   // true => result text is redacted before leaving the process
   surfaces: ReadonlySet<Surface>;      // where it is exposed (drift made explicit & testable)
-  rest?: { method: "get" | "post" | "put" | "delete"; path: string }; // optional explicit route binding
+  rest?: {
+    method: "get" | "post" | "put" | "delete";
+    path: string;
+    /**
+     * OPTIONAL per-action response translator (c55 Batch E — the `rest.toHttp` primitive). When set,
+     * mountRestRoutes routes this def's ActionResult through `toHttp(result, args)` instead of the
+     * default `resultToHttp` map, letting a page-load READ emit a bespoke structured body (a rich
+     * array/object) the flat `{output:string}` cannot carry. Reserved for the ~4 structured reads;
+     * status-via-kinds is preferred wherever the handler can return blocked/pending directly. The
+     * VOICE path never consults this — it always projects `result.output` via resultToToolResponse,
+     * so a def using `toHttp` for a pure-UI shape should be `surfaces: new Set(['rest'])`.
+     */
+    toHttp?: (result: ActionResult, args: Record<string, unknown>) => { status: number; body: unknown };
+  }; // optional explicit route binding (+ optional response translator)
   handler: (args: z.infer<S>, ctx: ActionContext) => Promise<ActionResult> | ActionResult;
   /** Optional arg coercion for back-compat (e.g. propose_command: command -> instruction). */
   coerceArgs?: (raw: Record<string, unknown>) => Record<string, unknown>;

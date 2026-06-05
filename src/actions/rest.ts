@@ -4,11 +4,27 @@
  * mountRestRoutes(app, registry, ctxFactory) registers one Express route per rest-surface action
  * (using its explicit `def.rest` binding), validates the body against the SAME zod schema the voice
  * path uses, builds a per-request ActionContext (session:null), runs the SAME runAction choke-point,
- * and maps the ActionResult to HTTP via resultToHttp. So a REST button and a voice command execute
- * the identical handler, gate, and redaction (G3 — "one path").
+ * and maps the ActionResult to HTTP via applyResultToHttp. So a REST button and a voice command
+ * execute the identical handler, gate, and redaction (G3 — "one path").
  *
  * This file is Phase-A scaffolding: it wires the seam. server.ts is NOT modified in this phase
  * (that is REG1 Phase C); the existing hand-written routes still serve traffic until the cutover.
+ *
+ * The `rest.toHttp` primitive (c55 Batch E)
+ * ----------------------------------------
+ * ~99% of routes ride the default `{output:string}` body (200) via `resultToHttp`. A handful of
+ * page-load READS return a structured fact-sheet (a rich array/object) the flat string cannot carry,
+ * and they fire BEFORE any WebSocket frame exists to lean on. For those only, a def may declare an
+ * OPTIONAL, declarative response translator on its REST binding:
+ *
+ *     rest: { method, path, toHttp?: (result, args) => { status, body } }
+ *
+ * `mountRestRoutes` dispatches every response through `applyResultToHttp(def, result, args, res)`:
+ * if `def.rest.toHttp` is present it re-projects the typed `result.output` into the exact bespoke
+ * body and wins; otherwise the unchanged default `resultToHttp` map applies (no regression). The
+ * hook is REST-only — the voice path (resultToToolResponse) never consults it, so a `toHttp` def
+ * whose output shape is pure-UI must be `surfaces: new Set(['rest'])`. Status-via-kinds (a handler
+ * returning `kind:'blocked'`/`kind:'pending'`) is preferred over `toHttp` wherever possible.
  */
 
 import type { ActionContext, ActionDef, ActionResult } from "./types";
@@ -82,7 +98,7 @@ export function mountRestRoutes(
         };
         const ctx = ctxFactory(req);
         const result = await runAction(registry, def.name, rawArgs, ctx);
-        resultToHttp(result, res);
+        applyResultToHttp(def, result, rawArgs, res);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         resultToHttp({ kind: "error", message }, res);
@@ -90,6 +106,29 @@ export function mountRestRoutes(
     };
     app[method](path, handler);
   }
+}
+
+/**
+ * applyResultToHttp(def, result, args, res) — the c55 Batch E response-translation dispatcher.
+ *
+ * If the def declares an optional `rest.toHttp` hook, route through it: it re-projects the typed
+ * `result.output` into a bespoke `{ status, body }` (the escape hatch for the ~4 structured page-load
+ * reads whose body the flat `{output}` cannot carry) and that response wins. Otherwise fall through to
+ * the unchanged default `resultToHttp` map — so any def WITHOUT a hook is byte-identical to the legacy
+ * behavior (no regression). This is the single REST projection seam; the voice path never reaches it.
+ */
+export function applyResultToHttp(
+  def: ActionDef,
+  result: ActionResult,
+  args: Record<string, unknown>,
+  res: RestResponse
+): void {
+  if (def.rest?.toHttp) {
+    const { status, body } = def.rest.toHttp(result, args);
+    res.status(status).json(body);
+    return;
+  }
+  resultToHttp(result, res);
 }
 
 /**
