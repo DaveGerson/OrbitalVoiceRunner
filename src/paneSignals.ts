@@ -1,7 +1,7 @@
 import { SHELL_PROMPT } from "./statusConstants";
 import { redactSecrets } from "./terminal";
 
-export type PaneSignalKind = "idle" | "error" | "prompt" | "exited";
+export type PaneSignalKind = "idle" | "error" | "prompt" | "exited" | "created";
 
 export interface PaneSignal {
   paneId: string;
@@ -43,7 +43,8 @@ export function classifyPaneOutput(cleanText: string): OutputClass | null {
  *  approval-narration convention: a user-role nudge the model may speak, then stop. */
 export function formatPaneSignal(s: PaneSignal): string {
   const verb =
-    s.kind === "idle" ? "went idle (finished)"
+    s.kind === "created" ? "is up and ready"
+    : s.kind === "idle" ? "went idle (finished)"
     : s.kind === "error" ? "reported an error"
     : s.kind === "prompt" ? "is waiting at a prompt"
     : "exited";
