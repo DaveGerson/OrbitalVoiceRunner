@@ -29,6 +29,9 @@ export interface MockLiveSession {
   emitClose: (info?: any) => void;
   sendToolResponse: (r: any) => void;
   sendRealtimeInput: (i: any) => void;
+  /** Client-content pushes the server sent (approval narration, B1 spawn acks, pane signals), in order. */
+  clientContents: any[];
+  sendClientContent: (c: any) => void;
   close: () => void;
 }
 
@@ -70,6 +73,14 @@ export function installMockLive(): MockLiveHandle {
       },
       sendRealtimeInput(i: any) {
         this.realtimeInputs.push(i);
+      },
+      clientContents: [],
+      // The real Gemini Live session exposes sendClientContent (user-role pushes the model speaks then
+      // stops): approval narration, B1 two-phase spawn acks, and pane-status signals all route through
+      // it. Capturing it (a) keeps the test console clean (no caught "is not a function" noise) and (b)
+      // lets a test assert the pushed ack text.
+      sendClientContent(c: any) {
+        this.clientContents.push(c);
       },
       close() {
         this.closed = true;

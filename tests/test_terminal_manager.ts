@@ -14,7 +14,13 @@ async function runTests() {
   // 1. Test addition
   console.log("Testing terminal addition...");
   manager.addTerminal("test1", ".", "echo hello");
+  // The registry slot exists SYNCHRONOUSLY (B1 registers before deferring the spawn).
   assert.ok(manager.terminals["test1"], "Terminal test1 should have been added");
+  // B1 (async spawn): addTerminal now DEFERS the real ConPTY start() to a setImmediate. Without
+  // awaiting it here, term.start() could run AFTER the term.stop() teardown below — a zombie spawn
+  // that races past the unit runner's --test-force-exit and aborts on Windows (uv_close on a CLOSING
+  // handle). Drain the deferred spawn before any further assertion / teardown.
+  await (manager as any).flushPendingSpawns();
   
   // 2. Test ledger sync logic (Running to Idle transition)
   console.log("Testing ledger synchronization for Running -> Idle status change...");

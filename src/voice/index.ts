@@ -28,7 +28,7 @@
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
-import { formatPaneSignal } from "../paneSignals";
+import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
 import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite, inactivePaneClarify } from "../activePane";
@@ -42,6 +42,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts } from "../liveTranscripts";
+import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext } from "../actions/types";
 import type { CapabilityGate } from "../types";
@@ -62,6 +63,20 @@ export function pushApprovalNarration(session: any, text: string): void {
     });
   } catch (e) {
     console.error("Failed to push approval narration to session:", e);
+  }
+}
+
+/**
+ * B1 (async spawn): a lighter sibling of pushApprovalNarration for the two-phase spawn acks. No
+ * "SYSTEM EVENT" framing — these are natural-cadence confirmations ("Opening the pane now.") the
+ * model speaks then stops. Additive + own try/catch: a failed ack push NEVER breaks dispatch (the
+ * tool response was already answered before this runs). Caller gates speak/defer/suppress upstream.
+ */
+function pushAck(session: any, text: string): void {
+  try {
+    session.sendClientContent({ turns: [{ role: "user", parts: [{ text }] }], turnComplete: true });
+  } catch (e) {
+    console.error("Failed to push ack:", e);
   }
 }
 
@@ -130,6 +145,16 @@ interface VoiceSessionState {
   currentSessionModelUtterance: string;
   currentInteractionId: string | null;
   lastSpeaker: "operator" | "model" | null;
+  // B1 (turn-aware ack): the async-spawn acks must NOT speak over the operator. Tracked from the
+  // SAME live Gemini signals the loop reads — `lastOperatorSpeechAt` (inputTranscription recency,
+  // stamped in onOperatorSpeech) and `lastInterrupted` (the serverContent.interrupted barge-in latch).
+  lastOperatorSpeechAt: number;
+  lastInterrupted: boolean;
+  // B1 (phase-2 defer): a "ready" pane signal arriving mid-utterance is QUEUED here and re-tried at
+  // the next safe gap (armReadyDrain) instead of speaking over the operator. The drain timer is
+  // unref'd (force-exit hygiene) and cleared on socket close.
+  deferredReady: PaneSignal[];
+  readyDrainTimer: ReturnType<typeof setTimeout> | null;
   reconnectAttempts: number;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   stableResetTimer: ReturnType<typeof setTimeout> | null;
@@ -273,6 +298,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // result + pty all share it. turnId() lazily mints for model-first events (e.g. a greeting).
       currentInteractionId: null,
       lastSpeaker: null,
+      // B1 (turn-aware ack): 0 = the operator has never spoken; no barge-in latched yet.
+      lastOperatorSpeechAt: 0,
+      lastInterrupted: false,
+      // B1 (phase-2 defer): empty queue, no drain timer in flight.
+      deferredReady: [],
+      readyDrainTimer: null,
       reconnectAttempts: 0,
       reconnectTimer: null,
       // PLM4 (Finding: flap): one-shot timer armed on each successful hoist; it resets the retry budget
@@ -294,9 +325,20 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const onOperatorSpeech = (): string => {
       if (state.lastSpeaker !== "operator") state.currentInteractionId = interactionLog.mint();
       state.lastSpeaker = "operator";
+      state.lastOperatorSpeechAt = Date.now(); // B1: stamp recency for the turn-aware ack gate.
+      state.lastInterrupted = false;           // B1: a fresh operator transcript clears a stale barge-in latch.
       setLastInteractionId(state.currentInteractionId);
       return state.currentInteractionId!;
     };
+    // B1 (turn-aware ack): a pure snapshot of the turn state for the gate (src/voiceAckGate.ts).
+    const ackState = () => ({
+      lastOperatorSpeechAt: state.lastOperatorSpeechAt,
+      interrupted: state.lastInterrupted,
+      now: Date.now(),
+    });
+    // B1: centralize the "model took the turn" transition so every site that sets lastSpeaker="model"
+    // also clears a stale barge-in latch (a barge-in is consumed once the model is talking again).
+    const setModelTurn = () => { state.lastSpeaker = "model"; state.lastInterrupted = false; };
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
 
     // PLM4 (2): AUTO-RECONNECT with BOUNDED exponential backoff. On a Gemini Live session loss we
@@ -615,7 +657,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             if (modelThinking) {
               interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });
-              state.lastSpeaker = "model";
+              setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
             }
 
             if (userUtterance) {
@@ -682,7 +724,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             if (modelUtterance) {
               state.currentSessionModelUtterance = modelUtterance;
               interactionLog.log({ interactionId: turnId(), kind: "gemini_text", text: modelUtterance });
-              state.lastSpeaker = "model";
+              setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
               clientWs.send(JSON.stringify({
                 type: "transcript_text",
                 sender: "Janus",
@@ -703,6 +745,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           }
           if (message.serverContent?.interrupted) {
             clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
+            // B1 (turn-aware ack): a barge-in means the operator seized the turn. Latch it (so an
+            // async-spawn ack SUPPRESSES rather than speaks over them) and stamp recency. Cleared
+            // when the model next takes the turn (setModelTurn) or on the next operator transcript.
+            state.lastInterrupted = true;
+            state.lastOperatorSpeechAt = Date.now();
           }
 
           // Handle Tool Calls
@@ -711,7 +758,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               const name = call.name;
               const args = call.args as Record<string, any>;
               const ixnId = turnId();
-              state.lastSpeaker = "model";
+              setModelTurn(); // B1: entering the toolCall loop is a model turn -> clear barge-in latch.
               interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name, callId: call.id, args: args ?? {} } });
 
               // Guard every tool handler: an uncaught throw here would escape the Gemini SDK
@@ -748,6 +795,22 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
                 interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
                 resultToToolResponse(result, session, name!, call.id!);
+                // B1 (phase-1 ack): an AUTO-created pane now boots asynchronously, so confirm "opening"
+                // immediately — BUT only when it will not speak over the operator (turn-aware gate).
+                // Placed on the NON-replay path (replay short-circuits above), so a reconnect-replayed
+                // create_pane never double-narrates. The `startsWith("Pane ")` check matches ONLY the
+                // Auto-created success string (panes_write.ts) — NOT the gated-Ask "needs operator
+                // confirmation" / forbidden "Error" strings — so a deferred create gets no false ack
+                // (its phase-2 fires later, after the operator confirms and the pane truly boots).
+                if (
+                  name === "create_pane" &&
+                  (result as any)?.kind === "ok" &&
+                  typeof (result as any).output === "string" &&
+                  (result as any).output.startsWith("Pane ") &&
+                  shouldSpeakOpeningAck(ackState()) === "speak"
+                ) {
+                  pushAck(session, "Opening the pane now.");
+                }
               }
               } catch (toolErr) {
                 console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
@@ -856,7 +919,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // debounce; we forward each signal as a user-role nudge (same convention as approval
       // narration the model already speaks). Unsubscribed on socket close.
       if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
-      state.unsubscribePaneSignals = paneSignalBus.subscribe((sig) => {
+      // B1 (phase-2 defer): reset the queue for this fresh session — its `sig` payloads + timer belong
+      // to the prior session's closure; a survivor "ready" is re-published by the bus, not replayed.
+      state.deferredReady = [];
+      if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
+
+      // B1 (phase-2 defer): stale ceiling — a "ready" older than this is dropped on drain (the UI
+      // already shows the pane, so a 10s-late "it's up" is pure noise).
+      const READY_DEFER_MAX_MS = 10_000;
+
+      // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds).
+      const pushSignal = (sig: PaneSignal) => {
         try {
           justConnected.sendClientContent({
             turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
@@ -865,6 +938,45 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         } catch (e) {
           console.error("Failed to push pane signal to session:", e);
         }
+      };
+
+      // B1 (phase-2 defer): re-evaluate the queued "ready" signals at the next safe gap. Single unref'd
+      // timer (re-armed if still mid-utterance); each queued sig is dropped once stale or suppressed on
+      // a barge-in, spoken when the turn is clear.
+      const armReadyDrain = () => {
+        if (state.readyDrainTimer) return; // one timer in flight; it re-arms itself if needed.
+        state.readyDrainTimer = setTimeout(() => {
+          state.readyDrainTimer = null;
+          const now = Date.now();
+          const still: PaneSignal[] = [];
+          for (const sig of state.deferredReady) {
+            const age = now - ((sig as any).__deferredAt ?? now);
+            if (age > READY_DEFER_MAX_MS) continue; // stale -> drop (UI already reflects the pane).
+            const d = shouldSpeakReadyAck(ackState());
+            if (d === "speak") { pushSignal(sig); }
+            else if (d === "suppress") { /* barge-in -> drop */ }
+            else { still.push(sig); } // defer again
+          }
+          state.deferredReady = still;
+          if (state.deferredReady.length > 0) armReadyDrain();
+        }, OPERATOR_HOLD_MS);
+        if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
+      };
+
+      state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
+        // B1 (phase-2 gate): ONLY the async-spawn "ready" signal is turn-gated. All other kinds
+        // (idle/error/prompt/exited) keep today's immediate-push behavior verbatim.
+        if (sig.kind === "created") {
+          const d = shouldSpeakReadyAck(ackState());
+          if (d === "suppress") return;                       // barge-in -> drop the "ready".
+          if (d === "defer") {                                // mid-utterance -> queue + re-arm.
+            (sig as any).__deferredAt = Date.now();
+            state.deferredReady.push(sig);
+            armReadyDrain();
+            return;
+          }
+        }
+        pushSignal(sig);
       });
     } catch (err: any) {
       console.error(`Failed to establish Gemini Live session${isReconnect ? " (reconnect attempt)" : ""}:`, err);
@@ -1000,6 +1112,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       clearReconnectTimer();
       clearStableResetTimer(); // PLM4 (Finding: flap): no budget-refresh timer should outlive the WS.
       if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
+      // B1 (phase-2 defer): no queued-ack drain timer should outlive the operator's WS.
+      if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
+      state.deferredReady = [];
       coreState.clients.delete(clientWs);
       if (coreState.activeFrontendWs === clientWs) {
         coreState.activeFrontendWs = null;
