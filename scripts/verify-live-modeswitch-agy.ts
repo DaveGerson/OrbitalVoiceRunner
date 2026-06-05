@@ -80,6 +80,7 @@ async function probeAxis(term: UniversalTerminal, name: string, bytes: string): 
     const m = modeMarker();
     seen.push(m ?? "(null)");
     log(`  ${name} #${i}: marker=${JSON.stringify(m)}`);
+    log(`           screen=${JSON.stringify(tail(4).slice(-260))}`);
   }
   return seen;
 }
@@ -113,8 +114,44 @@ async function main() {
   log(`startup OK  : status=${term.status}, ${stripAnsi(raw).length} cleaned chars`);
   log(`startup tail: ${JSON.stringify(tail().slice(-400))}`);
 
+  // agy gates a fresh session behind a one-time "Do you trust this folder?" nav-list
+  // (↑/↓ + enter, default = "Yes, I trust this folder") and possibly a tips screen.
+  // Clear setup prompts with Enter so we land IN the session before probing the axis.
+  // Idempotent: once the folder is trusted agy skips it; a stray Enter at an empty
+  // composer is harmless (it does not dispatch a model turn).
+  const ENTER = "\r";
+  for (let k = 0; k < 3; k++) {
+    const screen = tail(14);
+    if (/trust (the contents|this folder)|Navigate|Confirm|press enter|continue|get started/i.test(screen)) {
+      log(`clearing setup prompt (Enter) #${k + 1}`);
+      term.writeRaw(ENTER);
+      await sleep(3500);
+    } else break;
+  }
+  log(`in-session tail: ${JSON.stringify(tail(14).slice(-700))}`);
+
   const floorMarker = modeMarker();
   log(`floor marker: ${JSON.stringify(floorMarker)}`);
+
+  // agy v1.0.5 added /permissions (a picker), the REAL live-switch mechanism — there is
+  // no shift-key cycle axis. Drive it and capture the option strings, then ESC back out
+  // WITHOUT committing a change (read-only discovery).
+  log("=== /permissions picker probe (agy v1.0.5 live-switch mechanism) ===");
+  term.writeRaw("/permissions");
+  await sleep(1800);
+  log(`  typed /permissions: ${JSON.stringify(tail(10).slice(-400))}`);
+  term.writeRaw("\r");
+  await sleep(2800);
+  log(`  picker open?      : ${JSON.stringify(tail(16).slice(-700))}`);
+  const ARROW_DOWN = "\x1b[B";
+  for (let i = 1; i <= 4; i++) {
+    term.writeRaw(ARROW_DOWN);
+    await sleep(1400);
+    log(`  picker ↓ #${i}: ${JSON.stringify(tail(12).slice(-500))}`);
+  }
+  term.writeRaw("\x1b"); // ESC out without committing a permission change
+  await sleep(1200);
+  log(`  after ESC (backed out): ${JSON.stringify(tail(8).slice(-300))}`);
 
   log("=== probe axis A: shift+down (ESC[1;2B) — the adapter's assumed axis ===");
   const axisDown = await probeAxis(term, "shift+down", SHIFT_DOWN);
@@ -140,9 +177,12 @@ async function main() {
 
   const inconclusive = distinct.size <= 1;
   if (inconclusive) {
-    log("RESULT: no permission/mode axis responded to either key — agy v1.0.4 exposes no live "
-      + "cycle axis reachable this way (commonly because it is unauthenticated and sits at the "
-      + "login selector). readyForLiveCycle=false + restart-resume is CONFIRMED correct.");
+    log("RESULT: no permission/mode axis responded to shift+down or shift+tab. P5-VERIFIED in an "
+      + "AUTHENTICATED agy v1.0.5 session: there is NO live key-cycle permission axis, and "
+      + "/permissions is a Permission Config Editor (rule scopes), not a session-mode dial. "
+      + "Full-Auto ⇒ relaunch with --dangerously-skip-permissions. readyForLiveCycle=false + "
+      + "restart-resume is CONFIRMED correct. (If you instead saw a login/trust screen above, "
+      + "agy is not signed in / the folder is untrusted — clear those, then re-run.)");
   } else {
     log("RESULT: a cycle axis moved the marker — capture the strings above into "
       + "AntigravityAdapter.parseCurrentMode and reconsider readyForLiveCycle.");

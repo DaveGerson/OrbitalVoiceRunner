@@ -45,7 +45,7 @@ export interface AgentAdapter {
 
   // — live permission mode —
   planModeChange(from: Mode, to: Mode): PlanModeChange;
-  modeCycleByte(): string | null; // Claude ESC[Z; Codex null; agy axis unverified
+  modeCycleByte(): string | null; // Claude ESC[Z; Codex null; agy null (P5: no live axis)
   parseCurrentMode(ptyFrame: string): Mode | null; // read-after-write status-bar parser (null = keep reading)
 
   // — session continuity —

@@ -184,7 +184,7 @@ describe("CodexAdapter (LOW confidence — §5)", () => {
   });
 });
 
-describe("AntigravityAdapter (agy v1.0.4, LOW — §5)", () => {
+describe("AntigravityAdapter (agy v1.0.5, P5-VERIFIED — §5)", () => {
   const a = createAdapter("Antigravity");
 
   it("uses agy's OWN bypass flag (--dangerously-skip-permissions IS correct for agy)", () => {
@@ -207,20 +207,30 @@ describe("AntigravityAdapter (agy v1.0.4, LOW — §5)", () => {
     assert.ok(r.argv.includes(CLAUDE_SKIP), "agy bypass re-armed on resume");
   });
 
-  // P5 live probe (bead 8sw, 2026-06-05 via scripts/verify-live-modeswitch-agy.ts):
-  // a real agy v1.0.4 pane over ConPTY reaches only the "Select login method" screen —
-  // agy requires interactive Google OAuth before ANY session, so no permission-cycle
-  // axis is reachable (neither ESC[1;2B nor ESC[Z moved the marker). The conservative
-  // floor below is therefore EVIDENCE-BACKED, not a guess: restart-resume +
-  // readyForLiveCycle=false is correct until agy is signed in and re-verified.
-  it("planModeChange is restart-resume (cycle axis unreachable pre-auth — P5 confirmed)", () => {
+  // P5 live verification (bead 8sw, 2026-06-05 via scripts/verify-live-modeswitch-agy.ts):
+  // an AUTHENTICATED agy v1.0.5 session over ConPTY DISPROVED the assumed shift+down
+  // (ESC[1;2B) cycle axis — neither shift+down nor shift+tab moves anything in-session.
+  // /permissions opens a "Permission Config Editor" (scope: Project/Shared/Global rule
+  // editing), NOT a session-mode dial. So agy has NO live permission switch: Full-Auto
+  // is reachable only by relaunch with the bypass flag → restart-resume is the correct,
+  // only path, and readyForLiveCycle=false is VERIFIED (not provisional).
+  it("planModeChange is restart-resume (no live axis exists — P5 verified)", () => {
     assert.strictEqual(a.planModeChange("Read-Only", "Full Auto").kind, "restart-resume");
   });
 
-  it("capabilities: NOT ready for live cycle, no session pin (P5 evidence-backed floor)", () => {
+  it("modeCycleByte is null — the assumed shift+down axis was disproven (P5)", () => {
+    assert.strictEqual(a.modeCycleByte(), null);
+  });
+
+  it("parseCurrentMode always null — no in-session mode pill to read (P5)", () => {
+    assert.strictEqual(a.parseCurrentMode("? for shortcuts            Gemini 3.5 Flash (Medium)"), null);
+  });
+
+  it("capabilities: NOT ready for live cycle, no session pin (P5 verified floor)", () => {
     const c = a.capabilities();
     assert.strictEqual(c.readyForLiveCycle, false);
     assert.strictEqual(c.supportsSessionPin, false);
+    assert.strictEqual(c.supportsLivePermissionSwitch, false);
   });
 
   it("generateSessionId is null (capture post-spawn)", () => {

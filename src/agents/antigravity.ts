@@ -1,15 +1,18 @@
-// AntigravityAdapter — `agy` v1.0.4 (LOW confidence). Spec §5.
+// AntigravityAdapter — `agy` v1.0.5 (P5 VERIFIED 2026-06-05). Spec §5.
 //
 // Strategy (the §5 "Antigravity" column):
 //  - Safe-but-ready launch: `agy --dangerously-skip-permissions -i "<seed>"`. agy's OWN
 //    bypass flag IS --dangerously-skip-permissions (this is CORRECT for agy — distinct
 //    from Codex). agy has NO --allow- equivalent → the launch window is HOT under
 //    Full Auto (assert safe-mode before dispatch; spec §15 hot-launch risk).
-//  - Live → Full-Auto: shift+down (ESC[1;2B) cycle is UNVERIFIED → restart-resume.
-//    P5 live probe (bead 8sw, 2026-06-05): a real agy pane over ConPTY reaches only the
-//    "Select login method" screen — agy v1.0.4 requires interactive Google OAuth before
-//    any session, so the cycle axis is unreachable here. The conservative floor below is
-//    evidence-backed; re-run `npm run verify:modeswitch:agy` once agy is signed in.
+//  - Live → Full-Auto: NONE. P5 live verification (bead 8sw, authed agy session over
+//    ConPTY) DISPROVED the assumed shift+down (ESC[1;2B) cycle axis — neither shift+down
+//    nor shift+tab moves anything in-session. agy v1.0.5's `/permissions` is a
+//    "Permission Config Editor" (scope picker: Project / Shared with Antigravity / Global
+//    → persistent rule editing), NOT a session-mode dial. So there is no live in-session
+//    permission switch: Full-Auto is reachable ONLY by relaunching with
+//    --dangerously-skip-permissions → planModeChange = restart-resume, readyForLiveCycle
+//    = false are VERIFIED-correct (not provisional). Re-probe: `npm run verify:modeswitch:agy`.
 //  - Session pin: none → capture quit-msg / newest ~/.gemini/antigravity-cli/brain/<uuid>/.
 //  - Lossless resume: ALWAYS by explicit `--conversation=<uuid>` (a bare -c resumes the
 //    most-recent globally-in-workspace → multi-pane hazard) + bypass re-arm.
@@ -21,8 +24,8 @@ import type { AdapterConfig, AgentAdapter, Capabilities, LaunchPlan, Mode, ModeS
 // agy's own bypass flag. (Coincidentally the same string as Claude's, but it is the
 // adapter's OWN decision — the B2 fix is that this is no longer hardcoded globally.)
 const SKIP_FLAG = "--dangerously-skip-permissions";
-// shift+down = ESC [ 1 ; 2 B (unverified permission axis).
-const SHIFT_DOWN = "\x1b[1;2B";
+// (P5 VERIFIED: there is NO live permission-cycle key in agy v1.0.5 — the once-assumed
+// shift+down ESC[1;2B does nothing in-session; /permissions is a rule editor, not a dial.)
 
 export class AntigravityAdapter implements AgentAdapter {
   readonly preset = "Antigravity" as const;
@@ -63,18 +66,21 @@ export class AntigravityAdapter implements AgentAdapter {
   }
 
   planModeChange(_from: Mode, _to: Mode): PlanModeChange {
-    // ESC[1;2B axis unverified → safe restart-resume floor until the verification bead.
+    // P5 VERIFIED: agy v1.0.5 has no live in-session permission switch (no key-cycle axis;
+    // /permissions is a rule editor, not a mode dial). Full-Auto ⇒ relaunch with the bypass
+    // flag, re-attaching the conversation. So restart-resume is the correct, only path.
     return { kind: "restart-resume" };
   }
 
-  modeCycleByte(): string {
-    // Returned for completeness; the orchestrator does NOT cycle live until verified
-    // (capabilities().readyForLiveCycle === false gates that).
-    return SHIFT_DOWN;
+  modeCycleByte(): string | null {
+    // P5 VERIFIED: the assumed shift+down (ESC[1;2B) axis does NOT cycle anything in an
+    // agy session, and there is no alternative live cycle key. There is no cycle byte.
+    return null;
   }
 
-  // TODO(multi-cli-live-switch-verification): tokens request-review|proceed-in-sandbox|
-  // always-proceed|strict, customizable via /statusline.
+  // P5 VERIFIED: an agy session shows no in-session permission-mode pill (the model/status
+  // line is just "Gemini 3.x …"; /permissions opens a separate Config Editor). There is no
+  // status-bar mode marker to read back → always null. read-after-write does not apply.
   parseCurrentMode(_ptyFrame: string): Mode | null {
     return null;
   }
