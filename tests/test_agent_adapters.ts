@@ -236,6 +236,50 @@ describe("AntigravityAdapter (agy v1.0.5, P5-VERIFIED — §5)", () => {
   it("generateSessionId is null (capture post-spawn)", () => {
     assert.strictEqual(a.generateSessionId(), null);
   });
+
+  // Conversation-id capture (bead 1h0, P5-VERIFIED): the id is the newest
+  // conversations/<uuid>.db that appeared AFTER the pane spawned. Inject the store reader so
+  // these are hermetic (no real ~/.gemini access).
+  const BASE = "11111111-1111-4111-8111-111111111111";
+  const NEW1 = "22222222-2222-4222-8222-222222222222";
+  const NEW2 = "33333333-3333-4333-8333-333333333333";
+
+  it("captureSessionId picks the NEWEST conversation .db created since spawn", () => {
+    let store = [{ id: BASE, mtimeMs: 100 }];
+    const adp = createAdapter("Antigravity", { convLister: () => store }); // baseline = {BASE}
+    store = [{ id: BASE, mtimeMs: 100 }, { id: NEW1, mtimeMs: 200 }, { id: NEW2, mtimeMs: 300 }];
+    assert.strictEqual(adp.captureSessionId({ ptyOutput: "", cwd: "." }), NEW2);
+  });
+
+  it("captureSessionId returns null until a NEW conversation appears (pre-first-turn)", () => {
+    const store = [{ id: BASE, mtimeMs: 100 }];
+    const adp = createAdapter("Antigravity", { convLister: () => store });
+    assert.strictEqual(adp.captureSessionId({ ptyOutput: "", cwd: "." }), null);
+  });
+
+  it("captureSessionId is STICKY — won't switch to another pane's later conversation", () => {
+    let store = [{ id: BASE, mtimeMs: 100 }];
+    const adp = createAdapter("Antigravity", { convLister: () => store });
+    store = [{ id: BASE, mtimeMs: 100 }, { id: NEW1, mtimeMs: 200 }];
+    assert.strictEqual(adp.captureSessionId({ ptyOutput: "", cwd: "." }), NEW1);
+    store = [...store, { id: NEW2, mtimeMs: 999 }]; // a concurrent pane's newer conversation
+    assert.strictEqual(adp.captureSessionId({ ptyOutput: "", cwd: "." }), NEW1, "sticky");
+    assert.strictEqual(adp.pinnedSessionId(), NEW1);
+  });
+
+  it("captureSessionId PREFERS agy's printed 'Resume: --conversation=<uuid>' hint (race-free)", () => {
+    // fs store offers a different id; the pane's OWN printed hint must win.
+    const adp = createAdapter("Antigravity", { convLister: () => [{ id: NEW2, mtimeMs: 999 }] });
+    const HINT = "44444444-4444-4444-8444-444444444444";
+    const out = `streaming...\nResume: agy --conversation=${HINT} (or -c)\n? for shortcuts`;
+    assert.strictEqual(adp.captureSessionId({ ptyOutput: out, cwd: "." }), HINT);
+  });
+
+  it("buildResumeCommand DROPS --conversation for a non-uuid id (no fake-resume)", () => {
+    const r = a.buildResumeCommand({ sessionId: "antigravity-session-abc123", mode: "Full Auto", cwd: "." });
+    assert.ok(!r.argv.some((x) => x.startsWith("--conversation=")), `synthetic id → no --conversation: ${r.argv.join(" ")}`);
+    assert.ok(r.argv.includes(CLAUDE_SKIP), "still re-arms the bypass flag on relaunch");
+  });
 });
 
 describe("CustomAdapter (identity passthrough — §5)", () => {
