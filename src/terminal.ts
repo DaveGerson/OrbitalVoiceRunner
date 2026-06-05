@@ -1174,7 +1174,16 @@ export class OrchestratorManager {
         isMicMuted: false,
         // sa4: unset by default => buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT.
         // This is config (persists to disk via saveSettings), NOT a secret.
-        systemPrompt: undefined
+        systemPrompt: undefined,
+        // BEAD tkd: the should-I-speak silence gate is DEFAULT OFF. Off => speakGate() short-circuits
+        // to speak (byte-for-byte today's audio path). Settable via .janus_settings.json; loadSettings
+        // shallow-merges voiceAi so a persisted file without this key degrades to false.
+        silenceGate: false,
+        // BEAD aqx: the Gemini googleSearch grounding tool is DEFAULT OFF. Off => buildVoiceTools()
+        // emits ONLY the function-declarations entry (byte-for-byte today's tools array). Settable via
+        // .janus_settings.json / Settings UI; loadSettings shallow-merges voiceAi so a persisted file
+        // without this key degrades to false. CONFIG (persists to disk), NOT a secret.
+        groundingEnabled: false
       },
       projects: {
         activeContext: "default_project",

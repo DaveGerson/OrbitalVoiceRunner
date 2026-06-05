@@ -257,6 +257,20 @@ export interface SystemSettings {
     // {{workspaces}} placeholders are substituted with live values at connect time. This is
     // CONFIG (persists to disk), NOT a secret.
     systemPrompt?: string;
+    // BEAD tkd: the code-side "should-I-speak" silence gate. When TRUE, Janus's spoken AUDIO is
+    // MUTED for a turn the gate judges HIGH-confidence thinking-aloud / human-to-human discussion
+    // (the on-screen transcript still renders). DEFAULT FALSE — with it off, the gate hard-short-
+    // circuits to speak (byte-for-byte today's audio path). Fails OPEN toward speaking. This is a
+    // voiceAi SETTING (spoken-output axis), NOT a capability-gate matrix row. See src/voice/speakGate.ts.
+    silenceGate?: boolean;
+    // BEAD aqx: enable the Gemini Live BUILT-IN googleSearch grounding tool for the session. When TRUE,
+    // buildVoiceTools() appends a { googleSearch: {} } entry to config.tools at connect time so Janus
+    // can do grounded research; when FALSE/unset the tools array is the function-declarations entry ONLY
+    // (today's path, byte-identical). DEFAULT FALSE. This is a connect-time boolean — NOT an Auto/Ask/Off
+    // capability-gate row — because googleSearch is a server-side built-in with no per-call functionCall
+    // hook to interpose an "Ask" on an individual search (only Off/Auto are real). It is CONFIG (persists
+    // to disk via saveSettings), NOT a secret, so it flows to the client untouched. See src/voice/liveConfig.ts.
+    groundingEnabled?: boolean;
   };
   projects: {
     activeContext: string;

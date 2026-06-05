@@ -30,6 +30,8 @@ import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
+import { shouldSpeak } from "./speakGate";
+import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite, inactivePaneClarify } from "../activePane";
 import { decideProposal, inferKind, type ApprovalKind, type PendingApproval } from "../pendingApprovals";
@@ -157,6 +159,12 @@ interface VoiceSessionState {
   // stamped in onOperatorSpeech) and `lastInterrupted` (the serverContent.interrupted barge-in latch).
   lastOperatorSpeechAt: number;
   lastInterrupted: boolean;
+  // BEAD tkd (should-I-speak gate): per-TURN latch. Computed once when the operator transcript lands
+  // (shouldSpeak on the input transcript); when TRUE the model's spoken AUDIO for this turn is
+  // suppressed at the single audio choke point. Cleared at the start of each operator turn
+  // (onOperatorSpeech) and on turnComplete/generationComplete so it can NEVER bleed past one turn.
+  // Default false (off => never set true). The on-screen transcript_text stays unconditional.
+  muteCurrentModelTurn: boolean;
   // B1 (phase-2 defer): a "ready" pane signal arriving mid-utterance is QUEUED here and re-tried at
   // the next safe gap (armReadyDrain) instead of speaking over the operator. The drain timer is
   // unref'd (force-exit hygiene) and cleared on socket close.
@@ -311,6 +319,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // B1 (turn-aware ack): 0 = the operator has never spoken; no barge-in latched yet.
       lastOperatorSpeechAt: 0,
       lastInterrupted: false,
+      // BEAD tkd: no turn muted yet. Set per-turn from shouldSpeak when the operator transcript lands.
+      muteCurrentModelTurn: false,
       // B1 (phase-2 defer): empty queue, no drain timer in flight.
       deferredReady: [],
       readyDrainTimer: null,
@@ -337,6 +347,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       state.lastSpeaker = "operator";
       state.lastOperatorSpeechAt = Date.now(); // B1: stamp recency for the turn-aware ack gate.
       state.lastInterrupted = false;           // B1: a fresh operator transcript clears a stale barge-in latch.
+      state.muteCurrentModelTurn = false;      // BEAD tkd: a new operator turn clears the speak-gate latch (recomputed below).
       setLastInteractionId(state.currentInteractionId);
       return state.currentInteractionId!;
     };
@@ -716,6 +727,24 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             if (userUtterance) {
               state.currentSessionUserUtterance = userUtterance;
               interactionLog.log({ interactionId: onOperatorSpeech(), kind: "voice_in", text: userUtterance, data: { source: "operator" } });
+
+              // BEAD tkd (should-I-speak gate): decide ONCE per operator turn whether Janus's spoken
+              // AUDIO for the model's reply should be muted. DEFAULT OFF (silenceGate:false) =>
+              // shouldSpeak short-circuits to {speak:true}, so this is a no-op and the audio path is
+              // byte-for-byte today's. When ON it mutes ONLY at high confidence the director is
+              // thinking-aloud (fail-open). The decision is LATCHED on state for this turn's audio and
+              // logged so a mute is auditable (guards a silent dead-voice regression). Decision logic
+              // lives ENTIRELY in speakGate.ts — here we only read the boolean.
+              const gate = shouldSpeak(userUtterance.trim(), { enabled: !!manager.settings.voiceAi?.silenceGate });
+              state.muteCurrentModelTurn = !gate.speak;
+              if (!gate.speak) {
+                interactionLog.log({
+                  interactionId: turnId(),
+                  kind: "system",
+                  data: { tag: "speak_gate", speak: gate.speak, reason: gate.reason, confidence: gate.confidence },
+                });
+              }
+
               clientWs.send(JSON.stringify({
                 type: "transcript_text",
                 sender: "User",
@@ -791,10 +820,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               }
             }
 
-            // Pass audio back to client
+            // Pass audio back to client. This is the SINGLE spoken-output choke point — the only
+            // place model audio reaches the operator (responseModalities is [AUDIO]-only).
+            // BEAD tkd: if the should-I-speak gate latched a MUTE for this turn, suppress the AUDIO
+            // here (and only here). The transcript_text frame above stays UNCONDITIONAL — a muted
+            // turn is still visible on-screen (graceful, debuggable, NOT dead voice). With the flag
+            // off, muteCurrentModelTurn is always false, so this is byte-for-byte today's path.
             const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
           if (audio) {
-            clientWs.send(JSON.stringify({ type: "audio", audio }));
+            if (!state.muteCurrentModelTurn) {
+              clientWs.send(JSON.stringify({ type: "audio", audio }));
+            }
           }
           if (message.serverContent?.interrupted) {
             clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
@@ -803,6 +839,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // when the model next takes the turn (setModelTurn) or on the next operator transcript.
             state.lastInterrupted = true;
             state.lastOperatorSpeechAt = Date.now();
+          }
+          // BEAD tkd: clear the speak-gate mute latch at the model turn boundary so it can NEVER bleed
+          // past one turn. (Also cleared at the START of the next operator turn in onOperatorSpeech.)
+          if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
+            state.muteCurrentModelTurn = false;
           }
 
           // Handle Tool Calls
@@ -930,9 +971,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             slidingWindow: { targetTokens: 16000 }
           }
         } as any),
-        tools: [{
-          functionDeclarations: toGeminiDeclarations(REGISTRY),
-        }]
+        // BEAD aqx: the live tools array is now built by buildVoiceTools(). With grounding OFF (the
+        // default) it is EXACTLY [{ functionDeclarations: toGeminiDeclarations(REGISTRY) }] — byte-for-
+        // byte the former inline literal. With voiceAi.groundingEnabled ON it appends the built-in
+        // { googleSearch: {} } grounding tool as a sibling entry (functionDeclarations stays FIRST, so
+        // the function-calling path and the tools[0] golden are untouched). The flag is read HERE at
+        // connect time (same next-session semantics as voiceAi.systemPrompt / voiceAi.voice), so toggling
+        // it takes effect on the next session via the existing Apply & Reconnect path.
+        tools: buildVoiceTools({
+          groundingEnabled: !!manager.settings.voiceAi?.groundingEnabled,
+          declarations: toGeminiDeclarations(REGISTRY),
+        }),
       },
     });
 
