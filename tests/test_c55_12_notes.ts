@@ -46,7 +46,7 @@ function makeCtx(): { ctx: ActionContext; calls: string[]; notes: unknown[] } {
     amendNote: (id: string, t: string) => { calls.push(`amendNote:${id}:${t}`); return { id }; },
     deleteNote: (id: string) => { calls.push(`deleteNote:${id}`); return true; },
     addPaneNote: (p: string, pane: string, n: string) => { calls.push(`addPaneNote:${p}:${pane}:${n}`); return { id: "n2" }; },
-    addModelContext: (p: string, pane: string, t: string) => { calls.push(`addModelContext:${p}:${pane}:${t}`); return true; },
+    addModelContext: (p: string, pane: string, t: string, src?: string) => { calls.push(`addModelContext:${p}:${pane}:${t}:${src ?? ""}`); return true; },
     addHumanContext: (p: string, pane: string, t: string) => { calls.push(`addHumanContext:${p}:${pane}:${t}`); return true; },
   };
   const ctx = {
@@ -115,7 +115,7 @@ describe("c55.12 — fidelity: handlers hit the right ledger method + write defs
     const { ctx, calls } = makeCtx();
     const { status } = await runToHttp("add_pane_context", { project_id: "proj", pane_id: "p1", text: "ctx", layer: "model" }, ctx);
     assert.strictEqual(status, 200);
-    assert.ok(calls.includes("addModelContext:proj:p1:ctx") && calls.includes("broadcast"));
+    assert.ok(calls.includes("addModelContext:proj:p1:ctx:operator-ui") && calls.includes("broadcast"));
   });
   it("add_pane_context (no layer) -> addHumanContext + broadcast, 200", async () => {
     const { ctx, calls } = makeCtx();

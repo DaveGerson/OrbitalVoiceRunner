@@ -269,6 +269,7 @@ export const createProjectNote: ActionDef<typeof CreateProjectNoteParams> = {
   rest: { method: "post", path: "/api/projects/:project_id/notes" },
   handler: (args, ctx): ActionResult => {
     ctx.manager.ledger.addNote(args.project_id, args.note);
+    // Faithful to the inline route: broadcasts unconditionally (the voice add_project_note guards on success). Harmless spurious broadcast if the project is missing.
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note added to project ${args.project_id}.` };
   },
@@ -304,6 +305,7 @@ export const editNote: ActionDef<typeof EditNoteParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "put", path: "/api/notes/:note_id" },
   handler: (args, ctx): ActionResult => {
+    // Accepted delta: the inline 400 "Missing text" type-guard is superseded by Zod (text: z.string()) upstream.
     ctx.manager.ledger.amendNote(args.note_id, args.text);
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note ${args.note_id} updated.` };
@@ -355,6 +357,8 @@ export const addPaneContext: ActionDef<typeof AddPaneContextParams> = {
     const ok = args.layer === "model"
       ? ctx.manager.ledger.addModelContext(args.project_id, args.pane_id, args.text, "operator-ui")
       : ctx.manager.ledger.addHumanContext(args.project_id, args.pane_id, args.text);
+    // Accepted delta (c55 program): pane-not-found maps to 200 ok-narration, not the inline 404.
+    // The UI ignores the body and repaints off ledger_updated (which does NOT fire on this failure path).
     if (!ok) return { kind: "ok", output: `Pane ${args.pane_id} not found in project ${args.project_id}.` };
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Context added to pane ${args.pane_id}.` };
