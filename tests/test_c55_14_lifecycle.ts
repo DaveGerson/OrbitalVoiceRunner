@@ -16,6 +16,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import { REGISTRY } from "../src/actions/registry";
 import { runAction } from "../src/actions/gemini";
@@ -366,4 +369,36 @@ describe("c55.14 — delete_pane gating (status-via-kinds)", () => {
     applyResultToHttp(findDef("delete_pane"), result, {}, res);
     assert.strictEqual(sent.status, 200);
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// cutover guard — server.ts inline lifecycle routes deleted + names added to the only-set
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("c55.14 — server.ts cutover guard (no double-registration)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  const mountIdx = serverSrc.indexOf("mountRestRoutes(");
+  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
+  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
+  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+
+  for (const name of ["update_project", "stop_pane", "delete_project", "delete_pane"]) {
+    it(`mountRestRoutes only-set includes "${name}"`, () => {
+      assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
+      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the c55.14 cutover`);
+    });
+  }
+  // method-anchored + quote-terminated so the HELD capability-gates PUT (whose path CONTAINS
+  // /api/projects/:projectId/panes/:paneId) is never matched.
+  const goneLiterals: Array<{ label: string; needle: RegExp }> = [
+    { label: "PUT /api/projects/:id", needle: /app\.put\(\s*["']\/api\/projects\/:id["']/ },
+    { label: "DELETE /api/projects/:id", needle: /app\.delete\(\s*["']\/api\/projects\/:id["']/ },
+    { label: "DELETE /api/projects/:projectId/panes/:paneId", needle: /app\.delete\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId["']/ },
+    { label: "POST /api/projects/:projectId/panes/:paneId/stop", needle: /app\.post\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/stop["']/ },
+  ];
+  for (const { label, needle } of goneLiterals) {
+    it(`inline route is deleted: ${label}`, () => {
+      assert.ok(!needle.test(serverSrc), `inline ${label} must be deleted (converged to the registry)`);
+    });
+  }
 });
