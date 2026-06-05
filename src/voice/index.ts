@@ -50,6 +50,7 @@ import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
 import type { Gating } from "../gating";
 import type { CreatedMemory } from "../memory";
+import { briefIsForActivePane } from "../memory";
 
 /**
  * narrate a SYSTEM EVENT into the live session so the model speaks it to the operator. Pure (no
@@ -354,10 +355,15 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // ears use. Wrapped in try/catch and fully NON-BLOCKING — a synthesis/inject failure must NEVER
     // throw into the live loop (the brief is best-effort context, not a turn the model owes a reply).
     // `now` is the Node runtime epoch-ms clock. Called on (a) session start and (b) pane switch.
-    const injectMemoryBrief = (sess: any, activeId: string | null): void => {
+    const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
       try {
         if (!sess) return;
-        const brief = memory.service.synthesize(activeId, Date.now());
+        // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
+        // synthesizeAsync owns the race + `source` authority and NEVER rejects.
+        const brief = await memory.service.synthesizeAsync(activeId, Date.now());
+        // Latest-wins (invariant I3): if the operator switched panes while we awaited, the active
+        // pane moved on — DROP this brief rather than inject stale context for a backgrounded pane.
+        if (!briefIsForActivePane(brief.activePaneId, coreState.activePaneId)) return;
         if (brief.text.trim()) {
           sess.sendClientContent({
             turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
@@ -365,6 +371,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           });
         }
       } catch (e) {
+        // The whole body is guarded so the returned promise NEVER rejects — the three fire-and-forget
+        // call sites ignore it, and an unhandled rejection must never escape into the live loop.
         console.error("[memory] brief injection failed:", e);
       }
     };
