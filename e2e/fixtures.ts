@@ -19,11 +19,13 @@ declare global {
       simulateReconnect: () => string | null;
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
       setFrozenMock: (frozen: boolean, running: string[]) => void;
+      switchActivePane: (paneId: string) => void;
     };
   }
 }
 
 export const MOCK_TERMINAL_ID = "mock_pane_1";
+export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
 export async function gotoMockedApp(page: Page): Promise<void> {
   await page.goto("/?mock=1");
@@ -99,6 +101,15 @@ export async function setFrozenMock(page: Page, frozen: boolean, running: string
     ([f, r]) => window.__ORBITAL_E2E__?.setFrozenMock(f as boolean, r as string[]),
     [frozen, running] as const,
   );
+}
+
+/**
+ * f06: switch the active pane via the REAL setActiveTerminalId path (the same a tile click fires),
+ * with NO terminals_updated / ledger_updated broadcast — the condition under which the context body
+ * must still flip in-frame from the local ledger.
+ */
+export async function switchActivePane(page: Page, paneId: string): Promise<void> {
+  await page.evaluate((id) => window.__ORBITAL_E2E__?.switchActivePane(id), paneId);
 }
 
 export const test = base;

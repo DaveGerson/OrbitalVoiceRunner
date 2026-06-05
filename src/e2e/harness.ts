@@ -1,5 +1,5 @@
 import { useEffect, useRef, type MutableRefObject } from "react";
-import type { Terminal, PendingCommand, CapabilityGateMap } from "../types";
+import type { Terminal, PendingCommand, CapabilityGateMap, Workspace, PaneMeta } from "../types";
 
 /**
  * E2E test harness — fully isolated from the application internals.
@@ -12,6 +12,9 @@ import type { Terminal, PendingCommand, CapabilityGateMap } from "../types";
  */
 
 export const MOCK_TERMINAL_ID = "mock_pane_1";
+// f06: a SECOND seeded pane so the e2e can exercise a real A→B context switch with distinct
+// model/human context — the felt bug is "highlight moves, context body lags."
+export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
 export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date };
 
@@ -55,6 +58,13 @@ export interface OrbitalE2EHooks {
    * `running` sets the still-running pane count the Stage-2 hold-to-fire kill targets.
    */
   setFrozenMock: (frozen: boolean, running: string[]) => void;
+  /**
+   * f06 (bead wsm-e2e-pinned-f06): switch the active pane the SAME way a tile click does —
+   * `setActiveTerminalId(paneId)` — with NO terminals_updated / ledger_updated broadcast. This is
+   * exactly the condition under test: the context body must flip to the new pane's name + model/human
+   * context in the same frame as the cyan highlight, derived from the already-seeded local ledger.
+   */
+  switchActivePane: (paneId: string) => void;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -66,6 +76,9 @@ export interface E2EHarnessDeps {
   setShowTranscriptPanel: (v: boolean) => void;
   setTerminals: (terminals: Terminal[]) => void;
   setActiveTerminalId: (id: string | null) => void;
+  // f06: seed a ledger so the context body (derived from `ledger`) has real per-pane model/human
+  // context to render — without this the harness ledger is `{}` and activePaneMeta is always null.
+  setLedger: (ledger: Record<string, Workspace>) => void;
   queueStdoutChunk: (terminalId: string, chunk: string) => void;
   setTranscript: (updater: (prev: TranscriptEntry[]) => TranscriptEntry[]) => void;
   setPendingCommands: (updater: (prev: PendingCommand[]) => PendingCommand[]) => void;
@@ -125,9 +138,10 @@ function buildResumptionDigest(lines: string[]): string | null {
 function mockTerminal(
   posture: "OPEN" | "GUARDED" | "LOCKED" = "GUARDED",
   effectiveGates: CapabilityGateMap = DEFAULT_MOCK_GATES,
+  id: string = MOCK_TERMINAL_ID,
 ): Terminal {
   return {
-    id: MOCK_TERMINAL_ID,
+    id,
     cwd: ".",
     command: "bash",
     backfill: "\x1b[32mMOCKTERM_READY\x1b[0m web-app@1.0.0 dev server\r\n$ ",
@@ -136,6 +150,55 @@ function mockTerminal(
     // bead 8sq: seed a server-resolved posture so the GateChip renders deterministically under ?mock=1.
     posture,
     effective_gates: effectiveGates,
+  };
+}
+
+/**
+ * f06: a minimal PaneMeta for the seeded ledger. Only the fields the context body reads
+ * (name + modelContext + humanContext, App.tsx:2031-2034) carry distinct A/B values; the rest are
+ * inert defaults so the ledger type-checks. ?mock=1-gated test-support only.
+ */
+function mockPaneMeta(
+  paneId: string,
+  name: string,
+  modelText: string,
+  humanText: string,
+): PaneMeta {
+  const at = new Date().toISOString();
+  return {
+    pane_id: paneId,
+    name,
+    runtime_type: "bash",
+    last_known_state: "Running",
+    is_busy: false,
+    alive: true,
+    notes: [],
+    modelContext: [{ text: modelText, at }],
+    humanContext: [{ text: humanText, at }],
+    permissions_mode: "Human-in-the-Loop",
+    session_id: `sess_${paneId}`,
+    tool_preset: "Claude Code",
+    context_size: 0,
+  };
+}
+
+/**
+ * f06: a 2-pane ledger with DISTINCT per-pane context so the e2e can prove the context body flips
+ * A→B with no broadcast. `mock_pane_1` = "React Frontend" (A-*), `mock_pane_2` = "Python Backend" (B-*).
+ */
+function mockLedger(): Record<string, Workspace> {
+  return {
+    mock_project: {
+      id: "mock_project",
+      name: "Mock Project",
+      directory: ".",
+      summary: "",
+      notes: [],
+      panes: {
+        [MOCK_TERMINAL_ID]: mockPaneMeta(MOCK_TERMINAL_ID, "React Frontend", "A-model-context", "A-human-context"),
+        [MOCK_TERMINAL_ID_2]: mockPaneMeta(MOCK_TERMINAL_ID_2, "Python Backend", "B-model-context", "B-human-context"),
+      },
+    },
   };
 }
 
@@ -182,7 +245,13 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
     deps.setIsMockMode(true);
     // Open the transcript panel so injected transcript lines are mounted/visible.
     deps.setShowTranscriptPanel(true);
-    deps.setTerminals([mockTerminal()]);
+    // f06: seed BOTH panes (so a switch target tile exists) and a ledger with distinct per-pane
+    // context (so the body has something real to flip between). mock_pane_1 stays the default active.
+    deps.setTerminals([
+      mockTerminal(),
+      mockTerminal("GUARDED", DEFAULT_MOCK_GATES, MOCK_TERMINAL_ID_2),
+    ]);
+    deps.setLedger(mockLedger());
     deps.setActiveTerminalId(MOCK_TERMINAL_ID);
 
     // WS-F (spec §6.1): tracks that a simulated disconnect happened. The staged arrays are KEPT —
@@ -262,6 +331,12 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       setFrozenMock: (frozen, running) => {
         deps.setFrozen(frozen);
         deps.setFrozenRunning(running);
+      },
+
+      // f06: switch the active pane via the REAL setter a tile click fires — NO broadcast. The body
+      // must flip from the local (already-seeded) ledger in the same frame as the highlight.
+      switchActivePane: (paneId) => {
+        deps.setActiveTerminalId(paneId);
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;
