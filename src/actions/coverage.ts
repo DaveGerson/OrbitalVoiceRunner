@@ -110,6 +110,15 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   list_orchestrator_plans: new Set<Surface>(["rest"]),
   list_orchestration_recipes: new Set<Surface>(["rest"]),
 
+  // ── c55.12: NEW rest-only operator-UI note/context defs (no voice twin BY DESIGN — the voice note
+  // tools are the gated/redacted model-facing path; these are the ungated operator-direct UI path). ──
+  create_project_note: new Set<Surface>(["rest"]),
+  read_project_notes: new Set<Surface>(["rest"]),
+  edit_note: new Set<Surface>(["rest"]),
+  remove_note: new Set<Surface>(["rest"]),
+  create_pane_note: new Set<Surface>(["rest"]),
+  add_pane_context: new Set<Surface>(["rest"]),
+
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
   // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for
