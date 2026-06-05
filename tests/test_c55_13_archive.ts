@@ -102,13 +102,13 @@ describe("c55.13 — fidelity", () => {
     const { ctx, calls } = makeCtx();
     const { status } = await runToHttp("delete_archived_pane", { pane_id: "p1" }, ctx);
     assert.strictEqual(status, 200);
-    assert.ok(calls.includes("delete:p1") && calls.includes("ledger_broadcast"));
+    assert.ok(calls.includes("delete:p1") && calls.includes("ledger_broadcast") && !calls.includes("terminals_broadcast"));
   });
   it("delete_archived_pane not-found -> 200 ok-narration, NO broadcast", async () => {
     const { ctx, calls } = makeCtx({ deleteOk: false });
     const { status } = await runToHttp("delete_archived_pane", { pane_id: "nope" }, ctx);
     assert.strictEqual(status, 200);
-    assert.ok(calls.includes("delete:nope") && !calls.includes("ledger_broadcast"));
+    assert.ok(calls.includes("delete:nope") && !calls.includes("ledger_broadcast") && !calls.includes("terminals_broadcast"));
   });
 });
 
