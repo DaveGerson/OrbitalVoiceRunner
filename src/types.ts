@@ -290,6 +290,11 @@ export interface SystemSettings {
     memoryBudgetChars?: number;   // default 4800
     breadcrumbMax?: number;       // default 12
     breadcrumbMaxAgeMs?: number;  // default 900000
+    // Janus Memory Synthesis P0b (advanced, optional/additive). The Python Context Synthesizer
+    // is a STRICT UPGRADE, never a dependency — disabling it (or its absence) silently falls
+    // back to the in-process deterministic assembler. See docs/.../p0b-design.md (D1/D3).
+    memoryPythonEnabled?: boolean;   // default true — master switch for the Python synthesizer
+    memorySynthTimeoutMs?: number;   // default 150 — per-call race deadline before fallback
   };
   secrets: {
     geminiApiKey: string;
