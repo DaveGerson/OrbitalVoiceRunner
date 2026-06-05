@@ -147,32 +147,39 @@ export function presetCommand(
  * Pure launch-string builder (BUG-032 regression surface). Given a fully-built
  * base command (already carrying any --dangerously-skip-permissions mutation from
  * the constructor — that is NOT this function's concern), decide whether to append
- * a `--resume <id>` flag.
+ * a `--session-id <id>` (fresh pin) or `--resume <id>` (re-attach) flag.
  *
- * Invariants (pinned in tests/test_launch_command.ts):
- *  - Custom panes are never touched (no resume flag ever).
- *  - --resume is appended ONLY when sessionId is a real UUID. A synthetic tracking
- *    id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
- *  - Never double-append: if the command already carries --resume or --session,
+ * Invariants (pinned in tests/test_launch_command.ts + tests/test_session_pinning.ts):
+ *  - Custom panes are never touched (no session flag ever).
+ *  - The flag is appended ONLY when sessionId is a real UUID. A synthetic tracking
+ *    id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+ *  - B3 fix (spec §9): a FRESH pinned session (isFreshPin && supportsSessionPin)
+ *    launches with --session-id <uuid> (the deterministic pin). A resume launches
+ *    with --resume <uuid>. The two are mutually exclusive in one invocation.
+ *  - Never double-append: if the command already carries --resume / --session(-id),
  *    leave it alone.
  *  - The base command is returned verbatim otherwise (no invented flags, no npx).
  */
 export function buildLaunchCommand(
   shellCmd: string,
   toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
-  sessionId: string
+  sessionId: string,
+  isFreshPin = false
 ): string {
   let finalCommand = shellCmd;
-  // Delegate the "is this preset resumable at all?" decision to the adapter (B5):
-  // every agent preset supports resume; Custom does not.
-  const supportsResume = createAdapter(toolPreset).capabilities().supportsResume;
-  if (supportsResume && sessionId) {
+  // Delegate the per-preset session model to the adapter (B5): supportsSessionPin
+  // (Claude → deterministic --session-id) and supportsResume (agents → --resume).
+  const caps = createAdapter(toolPreset).capabilities();
+  if ((caps.supportsResume || caps.supportsSessionPin) && sessionId) {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
-    // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
-    // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
-    if (!alreadyHasResume && UUID_RE.test(sessionId)) {
-      finalCommand = `${finalCommand} --resume ${sessionId}`;
+    const alreadyHasSession = /--resume\b|--session\b/.test(finalCommand);
+    // Only act on a genuine UUID: the CLI requires a real UUID. A synthetic tracking
+    // id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+    if (!alreadyHasSession && UUID_RE.test(sessionId)) {
+      // FRESH pinned launch (spec §9): pin the orchestrator-generated id via
+      // --session-id. Otherwise re-attach a prior session via --resume.
+      const flag = isFreshPin && caps.supportsSessionPin ? "--session-id" : "--resume";
+      finalCommand = `${finalCommand} ${flag} ${sessionId}`;
     }
   }
   return finalCommand;
@@ -383,6 +390,11 @@ export class UniversalTerminal {
   // B2 (Codex/agy no longer inherit Claude's Anthropic-only skip flag).
   public adapter: AgentAdapter;
   public sessionId: string;
+  // True until the FIRST launch of a freshly-pinned session (spec §9): drives the
+  // start() decision to emit --session-id <uuid> (pin) vs --resume <uuid> (re-attach).
+  // Set by the ctor (fresh-pin true; supplied/resume false) and flipped to false once
+  // start() has launched, so an in-process restart (stop(); start()) resumes correctly.
+  private sessionIsFresh = false;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
   public projectId: string;
@@ -451,17 +463,28 @@ export class UniversalTerminal {
     this.shellCmd = applyBypassFlag(shellCmd, this.adapter, permissionsMode);
 
     if (sessionId) {
+      // A supplied id means we are RESUMING a prior session (spec §9): the launch
+      // re-attaches via --resume <uuid>, never a fresh --session-id pin.
       this.sessionId = sessionId;
+      this.sessionIsFresh = false;
+    } else if (this.adapter.capabilities().supportsSessionPin) {
+      // B3 fix (spec §9): Claude pins a DETERMINISTIC, orchestrator-generated UUID
+      // and passes it as --session-id at first launch. No stdout scrape — Claude
+      // never prints the id. start() emits --session-id <uuid> while sessionIsFresh.
+      this.sessionId = this.adapter.generateSessionId() ?? "";
+      this.sessionIsFresh = true;
     } else if (this.adapter.capabilities().supportsResume) {
-      // Synthetic "<tool>-session-<hex>" id is for internal tracking/display ONLY.
-      // It is intentionally never passed to the CLI --resume flag, which requires a
-      // real UUID. Real session UUIDs are captured later by checkForSessionId() once
-      // the CLI prints them. start() guards on UUID format before appending --resume.
+      // Codex/agy have no pin flag → capture the id post-spawn. The synthetic
+      // "<tool>-session-<hex>" id is for internal tracking/display ONLY; it is never
+      // passed to --resume (which requires a real UUID). Real ids arrive later via
+      // captureSessionId(); start() guards on UUID format before appending --resume.
       const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
       const randomId = Math.random().toString(16).substring(2, 10);
       this.sessionId = `${toolLower}-session-${randomId}`;
+      this.sessionIsFresh = false;
     } else {
       this.sessionId = "";
+      this.sessionIsFresh = false;
     }
   }
 
@@ -478,6 +501,16 @@ export class UniversalTerminal {
   }
 
   private checkForSessionId(text: string) {
+    // B3 fix (spec §9): route session capture through the adapter. A pinned-session
+    // CLI (Claude) returns its DETERMINISTIC UUID and never scrapes stdout — Claude
+    // never prints the id, so the legacy scrape below would only ever match noise and
+    // CLOBBER the pinned uuid, breaking --resume. captureSessionId(ptyOutput) returns
+    // the pinned id for Claude; we adopt it and short-circuit the scrape.
+    if (this.adapter.capabilities().supportsSessionPin) {
+      const pinned = this.adapter.captureSessionId({ ptyOutput: text, cwd: this.cwd });
+      if (pinned) this.sessionId = pinned;
+      return; // never run the free-form scrape against a pinned-session CLI
+    }
     if (this.sessionId && this.sessionId.includes("-session-") && this.adapter.capabilities().supportsResume) {
       // Keep preset/simulated unless a more granular one is found in output
     }
@@ -670,7 +703,10 @@ export class UniversalTerminal {
   }
 
   start() {
-    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId);
+    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId, this.sessionIsFresh);
+    // After the first launch the pinned session EXISTS on disk → a subsequent
+    // in-process restart (stop(); start()) must re-attach via --resume, not re-pin.
+    this.sessionIsFresh = false;
 
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
