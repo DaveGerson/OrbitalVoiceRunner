@@ -979,6 +979,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json({ success: true });
   });
 
+  // Graceful per-pane EXIT: terminate the PTY and archive the pane (recoverable),
+  // PRESERVING the ledger record — the non-destructive middle between the DELETE
+  // hard-delete above (which erases the record) and the reactive clear-exited below.
+  app.post("/api/projects/:projectId/panes/:paneId/stop", async (req, res) => {
+    const { projectId, paneId } = req.params;
+    const archived = await manager.stopAndArchivePane(projectId, paneId);
+    broadcastLedgerUpdate();
+    broadcastTerminalsUpdated();
+    res.json({ success: true, archived });
+  });
+
   // --- Terminal archive (recoverable "clear exited") ---
 
   // Archive all Exited panes in the active project (recoverable, not a hard delete).

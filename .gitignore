@@ -29,6 +29,7 @@ __pycache__/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+e2e-artifacts/
 
 # Claude Code machine-local settings (not committed)
 .claude/settings.local.json

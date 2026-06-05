@@ -620,20 +620,35 @@ export class UniversalTerminal {
     }
   }
 
+  // Ordered async scrollback writer. The previous per-chunk fs.appendFileSync ran on the
+  // SAME event loop as the Gemini voice callback, so every PTY output burst injected a
+  // synchronous disk write that widened the pane-open stall (B2). Writes now queue on a
+  // single in-flight promise-chain — async (off the hot path) yet strictly ordered, so
+  // appends can't race or reorder. flushScrollback() awaits the chain for durability.
+  private scrollbackChain: Promise<void> = Promise.resolve();
+
   private appendScrollback(chunk: string) {
     const file = `.janus_scrollback_${this.terminalId}.log`;
-    try {
-      fs.appendFileSync(file, chunk);
-      const stat = fs.statSync(file);
-      if (stat.size > 1024 * 512) { // 512KB limit
-        const data = fs.readFileSync(file, "utf-8");
-        const lines = data.split(/\r?\n/).filter(l => l.trim() !== "");
-        const pruned = lines.slice(-this.maxBufferLines).join("\n") + "\n";
-        fs.writeFileSync(file, pruned, "utf-8");
+    this.scrollbackChain = this.scrollbackChain.then(async () => {
+      try {
+        await fs.promises.appendFile(file, chunk);
+        const stat = await fs.promises.stat(file);
+        if (stat.size > 1024 * 512) { // 512KB limit
+          const data = await fs.promises.readFile(file, "utf-8");
+          const lines = data.split(/\r?\n/).filter(l => l.trim() !== "");
+          const pruned = lines.slice(-this.maxBufferLines).join("\n") + "\n";
+          await fs.promises.writeFile(file, pruned, "utf-8");
+        }
+      } catch {
+        // best-effort: scrollback is a convenience cache, not the ledger
       }
-    } catch (e) {
-      // ignore
-    }
+    });
+  }
+
+  /** Await all pending async scrollback writes. Called on teardown so a restarted pane
+   *  (stop() -> start() -> loadScrollback) observes everything written before the stop. */
+  public flushScrollback(): Promise<void> {
+    return this.scrollbackChain;
   }
 
   start() {
@@ -951,6 +966,10 @@ export class UniversalTerminal {
     } catch {
       // best-effort drain
     }
+
+    // Flush queued async scrollback writes so a restart's loadScrollback() sees output
+    // written before this stop (the writer is now async/ordered — B2).
+    try { await this.scrollbackChain; } catch { /* best-effort */ }
   }
 }
 
@@ -1168,6 +1187,25 @@ export class OrchestratorManager {
       });
     }
     return result;
+  }
+
+  /** Graceful per-pane EXIT: kill the pane's PTY and move it into the RECOVERABLE
+   *  archive, preserving the ledger record (restorable). The non-destructive middle
+   *  between DELETE /panes/:id (hard delete — erases the record) and the reactive
+   *  "Clear Exited". Returns true if a pane was archived. Backend-agnostic: archives via
+   *  the shared archiveExitedPanes interface method, so it holds for legacy + SQLite.
+   *  Note: like "Clear Exited", this also sweeps any already-Exited sibling panes in the
+   *  project into the archive. */
+  async stopAndArchivePane(projectId: string, paneId: string): Promise<boolean> {
+    const term = this.terminals[paneId];
+    if (term) {
+      await term.stop();        // SIGTERM->SIGKILL; awaits full ConPTY teardown + scrollback flush
+      term.status = "Exited";   // deterministic: a stopped pane is Exited (don't rely on the onExit race)
+      this.syncLedger();        // persist alive=false to the ledger/store via updatePane
+      delete this.terminals[paneId];
+    }
+    const realProj = projectId || this.ledger.activeProjectId || "default_project";
+    return this.ledger.archiveExitedPanes(realProj) > 0;
   }
 
   // Synchronize actual terminal state to ledger
