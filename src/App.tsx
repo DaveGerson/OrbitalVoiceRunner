@@ -32,12 +32,12 @@ const RAW_KEY = {
 // Compact control-key strip for a pane (arrows / Tab / Esc / Enter / Ctrl+C / Shift+Tab). Each
 // button POSTs its raw bytes through `onKey` (App.writeControlKey). Reuses the existing icon-button
 // styling; disruptive keys (Ctrl+C, Shift+Tab) carry the warn palette per spec §8.
-function ControlKeyBar({ paneId, onKey }: { paneId: string; onKey: (paneId: string, bytes: string) => void }) {
+function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: string; onKey: (paneId: string, bytes: string) => void; testId?: string }) {
   const navBtn = "p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all";
   const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-[9px] font-mono uppercase tracking-wider font-bold";
   const press = (bytes: string) => onKey(paneId, bytes);
   return (
-    <div className="flex items-center gap-1 flex-wrap" data-testid="control-key-bar" role="group" aria-label="Send control key to pane">
+    <div className="flex items-center gap-1 flex-wrap" data-testid={testId} role="group" aria-label="Send control key to pane">
       {/* Navigation — always-allowed */}
       <button type="button" onClick={() => press(RAW_KEY.up)} className={navBtn} title="Send Up arrow"><ArrowUp className="w-3 h-3" /></button>
       <button type="button" onClick={() => press(RAW_KEY.down)} className={navBtn} title="Send Down arrow"><ArrowDown className="w-3 h-3" /></button>
@@ -88,6 +88,10 @@ function AppRaw() {
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
+  // Raw control-key outcome toast (multi-cli adapter nit #3): writeControlKey used to swallow non-2xx
+  // silently. Surface the gated/deferred/refused outcomes (403 / 202 / 409) so the operator gets a
+  // visible signal instead of a dead button. `tone` keys the palette; cleared on a timer.
+  const [rawKeyNotification, setRawKeyNotification] = useState<{ tone: "blocked" | "deferred" | "refused"; title: string; detail: string } | null>(null);
   // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
   const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
   // bead 8sq (spec §2.C): two-stage emergency STOP-ALL state. `frozen` = Stage-1 freeze active (Janus
@@ -1166,8 +1170,42 @@ function AppRaw() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ bytes }),
       });
-      if (res.status === 202) playEarcon("execute"); // queued, awaiting operator confirm
+      // Nit #3: surface every non-2xx outcome to the operator (no more silent swallow). apiFetch does
+      // NOT throw on non-2xx, so branch on status. 403 = gated Off; 202 = deferred (Ask); 409 = the
+      // pane is not active / not running. Each gets an earcon + a transient toast.
+      if (res.status === 202) {
+        playEarcon("execute"); // queued, awaiting operator confirm
+        showRawKeyToast("deferred", "Key Deferred — Awaiting Confirm", `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.`);
+      } else if (res.status === 403) {
+        playEarcon("alert"); // gated Off (NO "error" earcon token exists)
+        showRawKeyToast("blocked", "Key Blocked by Policy", `Pane ${paneId}: this key is gated Off and was not sent.`);
+      } else if (res.status === 409) {
+        playEarcon("alert");
+        const reason = await res.json().then((b) => (b && typeof b.error === "string" ? b.error : "")).catch(() => "");
+        showRawKeyToast("refused", "Key Not Delivered", reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.`);
+      }
     } catch (e) {}
+  };
+
+  // Nit #3 helper: raise a transient raw-key outcome toast (auto-dismiss). Mirrors the existing
+  // blocked/auto-approved toast pattern (a one-shot useState cleared on a timer).
+  const showRawKeyToast = (tone: "blocked" | "deferred" | "refused", title: string, detail: string) => {
+    setRawKeyNotification({ tone, title, detail });
+    setTimeout(() => setRawKeyNotification(null), 5000);
+  };
+
+  // Nit #2 helper: grid-view control keys. The server's active-pane guard (nit #1) refuses raw input
+  // to any pane that is not coreState.activePaneId, so a grid pane's key must FIRST activate that pane
+  // — the SAME switch-active-pane path a pane click uses — and THEN send the key, so it lands on the
+  // now-active pane and passes the guard. We push set_active_pane on the WS directly (ordered,
+  // synchronous server-side activation ahead of the raw-input POST) AND set activeTerminalId so the UI
+  // stays in lockstep; then writeControlKey POSTs the bytes (carrying its own 403/202/409 feedback).
+  const writeControlKeyFromGrid = (paneId: string, bytes: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_active_pane", paneId }));
+    }
+    setActiveTerminalId(paneId);
+    writeControlKey(paneId, bytes);
   };
 
   const handleUpdatePermissions = async (paneId: string, val: string) => {
@@ -2844,6 +2882,24 @@ function AppRaw() {
             <span className="text-[11px] font-mono text-white/90">{wsErrorNotification.message}</span>
           </div>
         )}
+        {/* Nit #3: raw control-key outcome toast — gated (403) / deferred (202) / refused (409). */}
+        {rawKeyNotification && (
+          <div
+            data-testid="raw-key-notification"
+            className={`bg-[#111] p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300 border ${
+              rawKeyNotification.tone === "deferred"
+                ? "border-amber-500/30 text-amber-400"
+                : "border-red-500/30 text-red-400"
+            }`}
+          >
+            <span className={`text-[10px] font-mono uppercase tracking-widest font-bold ${
+              rawKeyNotification.tone === "deferred" ? "text-amber-500" : "text-red-500"
+            }`}>
+              {rawKeyNotification.tone === "deferred" ? "⏳ " : "⛔ "}{rawKeyNotification.title}
+            </span>
+            <span className="text-[11px] font-mono text-white/90">{rawKeyNotification.detail}</span>
+          </div>
+        )}
       </div>
 
       {/* WS-D (BUG-024): proactive completion/error notification stack */}
@@ -3912,10 +3968,12 @@ function AppRaw() {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -10 }}
                           transition={{ duration: 0.15 }}
-                          className={`bg-[#0d0d0d] border rounded-lg p-3 lg:p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 transition-colors duration-200 ${
+                          className={`bg-[#0d0d0d] border rounded-lg p-3 lg:p-4 flex flex-col gap-3 transition-colors duration-200 ${
                             isAlertActive ? 'border-amber-500 bg-amber-950/[0.04]' : 'border-white/5 bg-black/40'
                           } ${bgHover}`}
                         >
+                          {/* Identity + stats row */}
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
                           {/* Inner element container */}
                           <div className="flex items-center gap-3 flex-1 min-w-0">
                             <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 transition-all duration-1000 ${
@@ -3989,6 +4047,17 @@ function AppRaw() {
                                 CONNECT
                               </button>
                             </div>
+                          </div>
+                          </div>
+                          {/* Nit #2: grid-view raw control-key bar. Mirrors the active-pane control bar
+                              into the grid cluster so panes are controllable without leaving grid view.
+                              Each key FIRST activates this pane (writeControlKeyFromGrid → set_active_pane)
+                              then sends the byte, so it always lands on the now-active pane and passes the
+                              server's active-pane guard (nit #1). Reuses ControlKeyBar (no duplicated byte
+                              map) and carries the raw-key-bar-grid testid. */}
+                          <div className="flex items-center gap-2 pt-2 border-t border-white/[0.04]">
+                            <span className="text-[8px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                            <ControlKeyBar paneId={pane.pane_id} onKey={writeControlKeyFromGrid} testId="raw-key-bar-grid" />
                           </div>
                         </motion.div>
                       );

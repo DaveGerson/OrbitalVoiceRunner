@@ -17,6 +17,7 @@ import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 import { restGateOutcome } from "./src/restGate";
 import { classifyRawKey } from "./src/rawKeyClass";
+import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { CapabilityGate, CapabilityGateMap } from "./src/types";
@@ -337,6 +338,9 @@ export interface RunningServer {
   _testPendingApprovals?: () => PendingApprovalStore;
   /** QW6 test seam: the broadcast client set (for dead-socket pruning assertions). NOT for prod use. */
   _testClients?: () => Set<any>;
+  /** Active-pane-guard test seam: pin coreState.activePaneId (the UI's set_active_pane WS effect)
+   *  so REST suites can assert the single-active-pane refusal without a live socket. NOT for prod use. */
+  _testSetActivePane?: (id: string | null) => void;
 }
 
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
@@ -764,6 +768,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // 409 when the pane exists but has no live PTY (inert / un-spawned) — writeRaw would no-op.
     if (!(term as any).transport) {
       res.status(409).json({ error: "Pane has no live process (not spawned)." });
+      return;
+    }
+    // Active-pane guard (mirrors the voice write path in src/voice/index.ts): raw keystrokes may
+    // only ever reach the SINGLE pane the operator has open (coreState.activePaneId). Refuse a key
+    // aimed at any other pane — in ALL gate modes and for EVERY key, including the always-allowed
+    // nav keys and the Ctrl+C brake — because the guard is about WHICH pane, not which key. This
+    // sits BEFORE the always-allowed/gated branching so nothing reaches a non-active pane's PTY.
+    if (!isPaneActiveForWrite(coreState.activePaneId, id)) {
+      res.status(409).json({
+        error: coreState.activePaneId
+          ? `Raw input refused: pane '${id}' is not the active pane ('${coreState.activePaneId}'). Switch to it first.`
+          : `Raw input refused: no pane is active, so there is nowhere to write. Open the pane first.`,
+      });
       return;
     }
     // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
@@ -1675,6 +1692,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testActiveLiveSession: () => coreState.activeLiveSession,
     _testPendingApprovals: () => pendingApprovals,
     _testClients: () => coreState.clients,
+    _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
   };
 }
 
