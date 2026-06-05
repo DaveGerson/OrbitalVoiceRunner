@@ -1140,6 +1140,10 @@ export class OrchestratorManager {
   // B1 (async spawn): forwarded from UniversalTerminal.onReady — fires once when the child attaches
   // its PTY (markSpawnReady). The phase-2 "ready" publish source.
   public onReady?: (terminalId: string) => void;
+  // wsm-e2e-pinned-5h0 (A-voice): fires once after stopAndArchivePane terminates + archives a pane.
+  // server.ts wires it to publish a turn-gated "closed" pane signal — the completion ack that confirms
+  // the exit by voice only when it won't talk over the operator (same phase-2 gate as the create ack).
+  public onClosed?: (terminalId: string) => void;
   // B1 (async spawn): in-flight deferred starts (one per scheduleStart). flushPendingSpawns() awaits
   // them — the mandatory test/teardown seam so a real ConPTY spawn never outlives the test.
   private pendingStarts = new Set<Promise<void>>();
@@ -1442,7 +1446,11 @@ export class OrchestratorManager {
       delete this.terminals[paneId];
     }
     const realProj = projectId || this.ledger.activeProjectId || "default_project";
-    return this.ledger.archiveExitedPanes(realProj) > 0;
+    const archived = this.ledger.archiveExitedPanes(realProj) > 0;
+    // Completion edge: publish the turn-gated "closed" ack source (server wires onClosed -> bus).
+    // Best-effort + never-throw — a failed ack must not fail the close.
+    try { this.onClosed?.(paneId); } catch (e) { console.warn(`[terminal] onClosed subscriber threw (ignored):`, e); }
+    return archived;
   }
 
   // Synchronize actual terminal state to ledger

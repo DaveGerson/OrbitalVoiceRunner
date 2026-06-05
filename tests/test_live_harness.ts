@@ -111,6 +111,7 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
       "switch_active_pane",
       "set_global_permissions",
       "create_pane",
+      "close_pane",
     ]) {
       assert.ok(names.includes(expected), `declares ${expected}`);
     }
@@ -118,8 +119,9 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // (stop_all), then 35 -> 37 by the 8sq two-stage rework (added confirm_stop_all + release_stop_all),
     // then 37 -> 41 by bead bjm (get_project_notes + search_notes + amend_note + delete_note),
     // then 41 -> 43 by Wave D (get_action_log + get_health observability pair),
-    // then 43 -> 44 by P4 / bead 1y8 (restart_pane — the live Full-Auto promotion voice tool).
-    assert.strictEqual(decls.length, 44, "exactly 44 voice tools declared");
+    // then 43 -> 44 by P4 / bead 1y8 (restart_pane — the live Full-Auto promotion voice tool),
+    // then 44 -> 45 by wsm-e2e-pinned-5h0 (close_pane — the exit+archive voice tool).
+    assert.strictEqual(decls.length, 45, "exactly 45 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

@@ -117,6 +117,12 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // live applyPaneMode choke point); a separate restart_pane REST twin would be a redundant affordance. ─
   // (c55: this is the CONCURRENT live-mode voice tool; c55's process-restart is the distinct `respawn_pane` above.)
   restart_pane: new Set<Surface>(["voice"]),
+
+  // ── Voice-only by design (wsm-e2e-pinned-5h0 A-voice): close_pane is the SEMANTIC exit+archive
+  // voice tool. The REST/UI surface for the same intent is the hand-rolled POST /api/projects/:p/
+  // panes/:id/stop route + the UI Exit button — both call manager.stopAndArchivePane — so a separate
+  // close_pane REST registry twin would be a redundant affordance (same reasoning as restart_pane). ─
+  close_pane: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
