@@ -1,5 +1,6 @@
 // src/memory/types.ts — shared shapes for the in-process memory layer (P0a).
 // Budget is CHAR-based (≈4 chars/token) to avoid a tokenizer dependency in v1.
+import { z } from "zod";
 
 export interface ProjectTier {
   projectId: string;
@@ -54,3 +55,40 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
   breadcrumbMax: 12,
   breadcrumbMaxAgeMs: 15 * 60 * 1000,
 };
+
+/** The NDJSON wire protocol version. A mismatch ⇒ daemon treated as unavailable ⇒ fallback. */
+export const WIRE_VERSION = 1;
+
+/** Shape of the brief Python returns (TS stamps `source` authoritatively; Python cannot claim it). */
+export const PythonBriefSchema = z.object({
+  text: z.string(),
+  perTierChars: z.record(z.string(), z.number()),
+  activePaneId: z.string().nullable(),
+});
+
+export const PingResponseSchema = z.object({
+  id: z.string(),
+  v: z.literal(WIRE_VERSION),
+  ok: z.literal(true),
+  pong: z.literal(true),
+  synthVersion: z.string(),
+});
+
+export const SynthesizeResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(true),
+    brief: PythonBriefSchema,
+    meta: z.object({ strategy: z.string(), synthVersion: z.string() }).optional(),
+  }),
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string() }),
+  }),
+]);
+
+export type PingResponse = z.infer<typeof PingResponseSchema>;
+export type SynthesizeResponse = z.infer<typeof SynthesizeResponseSchema>;

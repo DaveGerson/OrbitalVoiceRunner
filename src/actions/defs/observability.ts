@@ -71,6 +71,7 @@ export const getHealth: ActionDef<typeof HealthParams> = {
         panes,
         pending_approvals: pendingApprovals,
         recent: { total: recentTotal, errors: recentErrors, error_rate: recentTotal ? recentErrors / recentTotal : 0 },
+        memory: { synthesizer: ctx.memorySynthesizerState?.() ?? "fallback" },
       },
     };
   },

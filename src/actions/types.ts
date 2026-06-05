@@ -249,6 +249,10 @@ export interface ActionContext {
    *  ledger sync (the "catch me up" path). Wired by the server's voice context builder; absent on
    *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws. */
   injectMemoryBrief?: () => void;
+  /** P0b observability: which synthesis path is currently live ("python" when the warm daemon is
+   *  available + the breaker is closed, else "fallback"). Wired by the server on the REST surface;
+   *  absent on voice/test paths, where get_health reports the safe default "fallback". */
+  memorySynthesizerState?: () => "python" | "fallback";
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;

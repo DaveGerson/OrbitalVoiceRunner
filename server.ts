@@ -33,7 +33,7 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService } from "./src/memory";
+import { createMemoryService, createPythonSynthClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
 import { createGating } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -494,6 +494,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     get settings() { return { globalPermissionsMode: manager.globalPermissionsMode }; },
     listPanes: () => manager.listPanes(),
   };
+  // P0b: the optional warm Python synthesizer. A STRICT UPGRADE — gated by the master switch, eagerly
+  // pre-warmed and non-fatal. Absent/broken interpreter ⇒ permanent fallback; Janus stays fully functional.
+  const memoryPythonEnabled = manager.settings.advanced?.memoryPythonEnabled !== false; // default true
+  const memorySynthTimeoutMs = manager.settings.advanced?.memorySynthTimeoutMs ?? 150;
+  let pythonSynthClient: PythonSynthClient | undefined;
+  if (memoryPythonEnabled) {
+    try {
+      pythonSynthClient = createPythonSynthClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+    } catch (e) {
+      console.error("[memory] python synth client init failed (continuing on fallback):", e);
+      pythonSynthClient = undefined;
+    }
+  }
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -502,6 +515,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
       breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
     },
+    pythonSynthClient,
+    memorySynthTimeoutMs,
   );
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
@@ -1267,6 +1282,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       stopAll,
       releaseStopAll,
       isFrozen: () => coreState.frozen,
+      memorySynthesizerState: () => memory.service.synthesizerState(),
       // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,
@@ -1461,6 +1477,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     await new Promise<void>((resolve) => wss.close(() => resolve()));
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    // Tear down the Python synthesizer daemon — stops the orphaned `python ... __main__.py` per instance.
+    pythonSynthClient?.dispose();
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).
