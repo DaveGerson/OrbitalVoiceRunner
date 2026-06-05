@@ -70,7 +70,9 @@ test.describe("sync-spec draft badge (U3)", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await gotoMockedApp(page);
 
-    // Under ?mock=1 the ledger is empty, so activePaneName falls back to the active pane id.
-    await expect(page.getByTestId("composer-target-pane")).toContainText("mock_pane_1");
+    // f06: the ?mock=1 harness now seeds a 2-pane ledger, so the chip shows the active pane's real
+    // NAME from the ledger ("React Frontend" for mock_pane_1), not the bare pane id. (Pre-f06 the
+    // ledger was empty and activePaneName fell back to the pane id.)
+    await expect(page.getByTestId("composer-target-pane")).toContainText("React Frontend");
   });
 });

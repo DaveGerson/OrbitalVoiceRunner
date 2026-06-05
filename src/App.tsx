@@ -19,6 +19,7 @@ import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, Fi
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
+import { resolveActivePaneMeta } from "./activePaneMeta";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -421,6 +422,7 @@ function AppRaw() {
     setShowTranscriptPanel,
     setTerminals,
     setActiveTerminalId,
+    setLedger,
     queueStdoutChunk,
     setTranscript,
     setPendingCommands,
@@ -1564,19 +1566,13 @@ function AppRaw() {
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
-  let activePaneMeta = null;
-  let activeProjectMeta = null;
   const projectList = Object.values(ledger) as Workspace[];
-
-  if (activeTerminalId) {
-    for (const proj of projectList) {
-      if (proj.panes && proj.panes[activeTerminalId]) {
-        activePaneMeta = proj.panes[activeTerminalId];
-        activeProjectMeta = proj;
-        break;
-      }
-    }
-  }
+  // f06: the context body (name + model/human context, rendered at App.tsx:2031-2034) must track
+  // the active pane in the SAME render that moves the cyan highlight (which keys off activeTerminalId
+  // directly). The data is already local — derive it synchronously from the ledger, no round-trip.
+  // Extracted to a pure, unit-pinned resolver; keys solely off activeTerminalId (stale-active-project safe).
+  const { pane: activePaneMeta, project: activeProjectMeta } =
+    resolveActivePaneMeta(ledger, activeTerminalId);
 
   const handleCreateProject = () => {
     setEditingProject(null);
@@ -2114,7 +2110,7 @@ function AppRaw() {
 
         {/* Context (C): the layered orientation that shapes this draft. */}
         {activeTerminalId && (
-          <div className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
+          <div data-testid="pane-context-body" className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
             <div className="text-[8px] font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
             {(modelCtx.length > 0 || humanCtx.length > 0) ? (
               <div className="space-y-0.5 mb-1.5">
