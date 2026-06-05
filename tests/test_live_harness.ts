@@ -92,6 +92,15 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
       "systemInstruction mentions Project Janus"
     );
 
+    // Issue D: the Prompt Draft must DEFAULT to a synthesized instruction, not the operator's raw
+    // dictation. The dictation auto-mirror is intended (a co-authored scratchpad), so the fix is a
+    // prompt default: Janus must own the open pane's draft via update_draft_prompt(mode='replace').
+    // Pin that the system instruction directs this — it previously never mentioned update_draft_prompt.
+    assert.ok(
+      typeof sysInstr === "string" && sysInstr.includes("update_draft_prompt"),
+      "systemInstruction directs Janus to maintain a synthesized prompt draft via update_draft_prompt (Issue D)"
+    );
+
     const decls = session.params?.config?.tools?.[0]?.functionDeclarations;
     assert.ok(Array.isArray(decls), "functionDeclarations is an array");
     const names = decls.map((d: any) => d.name);

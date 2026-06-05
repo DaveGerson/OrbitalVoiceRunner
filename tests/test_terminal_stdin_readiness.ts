@@ -40,7 +40,7 @@ class FakeTransport implements PtyTransport {
 }
 
 function makeTerm(id: string, fake: FakeTransport): UniversalTerminal {
-  return new UniversalTerminal(
+  const term = new UniversalTerminal(
     id,
     ".",
     "cmd",
@@ -51,6 +51,11 @@ function makeTerm(id: string, fake: FakeTransport): UniversalTerminal {
     undefined,
     () => ({ transport: fake, usingNodePty: true })
   );
+  // Issue B: writeInput now splits the body and the submit CR into two writes with a gap. Force the
+  // gap to 0 so this queue-ordering suite asserts the flushed bytes SYNCHRONOUSLY (the gap behavior
+  // is covered by test_terminal_input.ts + smoke:claude). Each queued command flushes as body, CR.
+  (term as any).submitEnterDelayMs = 0;
+  return term;
 }
 
 // THE FAILING TEST (write/run this FIRST — on pre-fix code writeInput writes
@@ -68,7 +73,7 @@ test("writeInput before ready queues, then flushes in order on first onData", ()
 
   assert.deepStrictEqual(
     fake.writes,
-    ["first\r", "second\r"], // flushed IN ORDER, CR-terminated (Enter submit, G1)
+    ["first", "\r", "second", "\r"], // flushed IN ORDER as body,CR pairs (Issue B two-write submit)
     "queued input flushed in submission order once ready"
   );
 });
@@ -81,7 +86,7 @@ test("writeInput after ready passes straight through (no queue residue)", () => 
   fake.emitData("ready\n"); // child attaches before any input
   term.writeInput("third"); // post-ready -> immediate
 
-  assert.deepStrictEqual(fake.writes, ["third\r"], "post-ready write is immediate, no residue");
+  assert.deepStrictEqual(fake.writes, ["third", "\r"], "post-ready write is immediate (body, CR), no residue");
 });
 
 test("silent child still drains the queue via the ~750ms fallback timer", () => {
@@ -99,8 +104,8 @@ test("silent child still drains the queue via the ~750ms fallback timer", () => 
 
     assert.deepStrictEqual(
       fake.writes,
-      ["a\r", "b\r"],
-      "fallback timer flushes queued input in order without any child output"
+      ["a", "\r", "b", "\r"],
+      "fallback timer flushes queued input in order (body, CR) without any child output"
     );
   } finally {
     mock.timers.reset();
@@ -116,7 +121,7 @@ test("markSpawnReady is idempotent — a second onData does not double-write", (
   fake.emitData("first chunk\n"); // flush
   fake.emitData("second chunk\n"); // must NOT re-flush
 
-  assert.deepStrictEqual(fake.writes, ["once\r"], "queued command written exactly once");
+  assert.deepStrictEqual(fake.writes, ["once", "\r"], "queued command written exactly once (body, CR)");
 });
 
 test("empty queue on first data is a harmless no-op", () => {

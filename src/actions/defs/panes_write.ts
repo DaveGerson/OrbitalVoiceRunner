@@ -234,7 +234,18 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       // set ONLY by a UI focus message / switch_active_pane, which loses the race against a voice-only
       // create-then-command flow. ctx.setActivePane mutates the SAME per-connection activePaneId that
       // dispatchProposal reads, so the next voice command on this connection targets the new pane.
-      if (pane_id) ctx.setActivePane(pane_id);
+      if (pane_id) {
+        ctx.setActivePane(pane_id);
+        // Issue C (latent VIEW desync): setActivePane above only moves the SERVER's per-connection
+        // WRITE target. The OPERATOR'S browser xterm is mounted on activeTerminal.id and follows ONLY
+        // a switch_active_pane broadcast (App.tsx -> setActiveTerminalId). Without this, a VOICE-created
+        // pane leaves the browser on the OLD pane, so the new pane's stdout_chunk frames have no
+        // listener and the agent's output is invisible until the operator manually clicks it
+        // (round3c: "you can see them, but I can't"). Mirror switch_active_pane's proven wire contract
+        // (panes_write.ts:64) so the browser remounts TerminalView on the new pane and subscribes its
+        // PTY stream — keeping the server write target and the browser view in lockstep.
+        ctx.broadcast({ type: "switch_active_pane", paneId: pane_id });
+      }
       return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
     };
 

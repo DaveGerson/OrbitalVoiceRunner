@@ -50,6 +50,7 @@ import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/act
 import type { ActionContext } from "./src/actions/types";
 import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/rest";
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
+import { resolveResumeHandleTtlMs, shouldClearHandleOnClose, wrapHandleForPersist, readFreshHandle, isInvalidKeyClose, isBlankApiKey } from "./src/voiceResumption";
 import { extractTranscripts } from "./src/liveTranscripts";
 
 dotenv.config();
@@ -2117,6 +2118,11 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     APPROVAL_PENDING: "approval_pending",
     AUTO_EXECUTED: "command_auto_executed",
     BLOCKED: "command_blocked",
+    // Issue E: a messageId-keyed "this pending command is resolved — clear its modal" event,
+    // broadcast on EVERY non-lost_race resolve so a VOICE approval (or a cross-client REST approve,
+    // or a TTL-expire sweep) dismisses the ApprovalDialog in real time instead of lingering until
+    // the ~20s safety-net poll. Mirrors the action_resolved event the pendingActions flow uses.
+    APPROVAL_RESOLVED: "approval_resolved",
   } as const;
 
   // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
@@ -2184,7 +2190,15 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     if (reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane") {
       flipHandoffOnResolve(messageId, reason, opts);
     }
-    if (reason !== "lost_race") broadcastTerminalsUpdated();
+    // Issue E: emit a messageId-keyed resolve event so EVERY client dismisses the ApprovalDialog in
+    // real time — voice approvals, cross-client REST approvals, and TTL-expire/dead-pane sweeps
+    // alike. lost_race is skipped: the resolver that WON the claim already broadcast for this
+    // messageId, and its record fields are the authoritative ones. The client's optimistic click
+    // filter still gives instant button feedback and harmlessly double-filters on this event.
+    if (reason !== "lost_race") {
+      broadcast({ type: WS_EVT.APPROVAL_RESOLVED, messageId, terminalId: record.terminalId, outcome: reason });
+      broadcastTerminalsUpdated();
+    }
     return action;
   }
 
@@ -2303,12 +2317,28 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
   // sessionResumptionUpdate to the durable KV whenever it changes, and rehydrate it at boot. Guarded
   // for store === null (legacy backend) — the in-memory value is then the only source, exactly as
   // before. The same KV the `frozen` flag uses (store.setKV / getKV).
+  //
+  // RESILIENCE (bead wsm-e2e-pinned-aiu): the persisted value is now AGE-STAMPED (wrapHandleForPersist)
+  // and rehydrate refuses a handle older than JANUS_RESUME_HANDLE_TTL_MS (default 1h) — a stale handle
+  // from a long-gone session would otherwise be re-fed and rejected with code=1008 "session expired".
+  // A discarded/legacy/garbage row is deleted so it can never be re-read. The matching onclose
+  // self-heal in handleSessionLost clears a handle that 1008s despite passing the age guard.
   const VOICE_RESUMPTION_KV = "voiceResumptionToken";
+  const RESUME_HANDLE_TTL_MS = resolveResumeHandleTtlMs(process.env);
   function rehydrateResumptionToken(): any {
     if (!store) return null;
     try {
       const raw = store.getKV(VOICE_RESUMPTION_KV);
-      return raw ? JSON.parse(raw) : null;
+      const fresh = readFreshHandle(raw, Date.now(), RESUME_HANDLE_TTL_MS);
+      if (!fresh) {
+        // Stale (past TTL), legacy (no age stamp), or malformed → purge so it can never be re-fed.
+        if (raw) {
+          store.deleteKV(VOICE_RESUMPTION_KV);
+          console.warn("[SESSION RESUMPTION] discarded a stale/unstamped persisted handle at boot — connecting fresh.");
+        }
+        return null;
+      }
+      return fresh.token;
     } catch (e) {
       console.error("[SESSION RESUMPTION] failed to rehydrate persisted token:", e);
       return null;
@@ -2318,7 +2348,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     if (!store) return;
     try {
       if (token == null) store.deleteKV(VOICE_RESUMPTION_KV);
-      else store.setKV(VOICE_RESUMPTION_KV, JSON.stringify(token));
+      else store.setKV(VOICE_RESUMPTION_KV, wrapHandleForPersist(token, Date.now()));
     } catch (e) {
       console.error("[SESSION RESUMPTION] failed to persist token:", e);
     }
@@ -2526,7 +2556,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     // guard so a stale callback can't clobber a newer session, broadcast voice_channel_lost, THEN
     // (PLM4) schedule a bounded reconnect. Idempotent-ish: onerror + onclose can both fire for one
     // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
-    const handleSessionLost = (reason: "error" | "closed") => {
+    const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
       if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
       sessionDead = true;
       if (session) {
@@ -2545,6 +2575,30 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
           clearStableResetTimer();
         }
+      }
+      // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
+      // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
+      // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
+      // reconnect AND re-seeded from the durable KV on restart. Clear it HERE, before scheduleReconnect,
+      // so the next bounded attempt connects FRESH — bounding any handle-induced wedge to one attempt.
+      if (shouldClearHandleOnClose(closeCode, attemptUsedHandle)) {
+        console.warn("[SESSION RESUMPTION] handle-fed session closed with code=1008 — clearing the poisoned handle so the next attempt connects fresh.");
+        lastSessionResumptionToken = null;
+        persistResumptionToken(null);
+      }
+      // Issue A: a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
+      // with the SAME unresolved key can only 1007 again, so it must NOT spend a bounded reconnect
+      // attempt — that silently drains the budget (the boot-time 1007 cascade burned 3/6 attempts
+      // before recovering only on a reload). Broadcast a distinct key-problem loss and STOP; recovery
+      // comes from the next client connect once a valid key is set in Settings. isBlankApiKey
+      // distinguishes "no key configured" from "key configured but rejected" for a precise reason.
+      // (`sessionKey` is the later-declared const in this same scope, safely captured by this closure
+      // because handleSessionLost only ever fires AFTER the connect — same pattern as attemptUsedHandle.)
+      if (isInvalidKeyClose(closeCode)) {
+        const blank = isBlankApiKey(sessionKey);
+        console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
+        broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
+        return;
       }
       broadcast({ type: "voice_channel_lost", reason });
       // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
@@ -2833,7 +2887,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
           // Log only code/reason, NOT the raw CloseEvent — its kTarget is the live WebSocket whose URL
           // contains the API key (?key=…). Dumping the object leaks the key into logs (security hazard).
           console.warn(`[VOICE] Gemini Live session closed — voice channel lost (code=${info?.code ?? "n/a"}, reason=${info?.reason || "n/a"}).`);
-          handleSessionLost("closed");
+          handleSessionLost("closed", typeof info?.code === "number" ? info.code : undefined);
         },
       },
       config: {
@@ -2846,7 +2900,7 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.\n\nEMERGENCY BRAKE (two stages, always allowed): if the operator says "stop", "halt", "abort", "freeze", or "stop everything", call stop_all IMMEDIATELY — it freezes you (every capability becomes Off) and cancels everything in flight, but the panes KEEP RUNNING. After it freezes, tell the operator how many panes are still running and ASK whether to also kill them (that is irreversible). If they confirm the kill ("kill them", "yes"), call confirm_stop_all. When they say "release"/"resume", call release_stop_all to un-freeze (your gates restore exactly; killed panes stay killed).`,
+        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map(pId => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). When the operator is composing a prompt to review before sending (the Prompt Draft / Workbench), keep that draft SYNTHESIZED: call update_draft_prompt(mode='replace') with your distilled, ready-to-send instruction — do NOT leave the draft as the operator's raw dictation — and refine it as the conversation evolves so the draft is always a clean instruction the operator can review and send. If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.\n\nEMERGENCY BRAKE (two stages, always allowed): if the operator says "stop", "halt", "abort", "freeze", or "stop everything", call stop_all IMMEDIATELY — it freezes you (every capability becomes Off) and cancels everything in flight, but the panes KEEP RUNNING. After it freezes, tell the operator how many panes are still running and ASK whether to also kill them (that is irreversible). If they confirm the kill ("kill them", "yes"), call confirm_stop_all. When they say "release"/"resume", call release_stop_all to un-freeze (your gates restore exactly; killed panes stay killed).`,
         ...({
           // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The
           // @google/genai `SessionResumptionConfig` field is `handle` (node.d.ts:10236-10243), NOT
