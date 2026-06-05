@@ -577,7 +577,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // broadcast (the client already self-activates on 200). The cwd existsSync fallback is now resolved
   // inside the def from the project directory.
 
-  // c55 Batch C: POST /api/terminals/:pane_id/restart is now served by the registry-derived restart_pane
+  // c55 Batch C: POST /api/terminals/:pane_id/restart is now served by the registry-derived respawn_pane
   // def (mountRestRoutes only-set above). It NOW ENFORCES the restart_pane gate (the inline route here
   // skipped it — a deliberate safety improvement). Same stop()+start() / ledger-rebuild branches and the
   // same ledger_updated + terminals_updated broadcasts. Accepted delta: inline 404 -> 200 ok-narration.
@@ -1263,16 +1263,18 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       // c55 Batch C — five NEW rest-only defs for inline pane/UI routes with no voice twin. The inline
       // app.post(...) twins are deleted below in the SAME change. Clients read only res.ok and repaint
       // off the terminals_updated / ledger_updated WS frames the handlers fan out.
-      //   restart_pane  POST /api/terminals/:pane_id/restart       — NOW GATED via gateOrDefer
+      //   respawn_pane  POST /api/terminals/:pane_id/restart       — NOW GATED via gateOrDefer
       //                 (capability restart_pane, default Ask): the inline route skipped the gate, so this
       //                 ENFORCES it (a deliberate safety improvement — behaviorDelta). 403 Off / 202 Ask.
+      //                 (action renamed restart_pane -> respawn_pane to avoid colliding with the
+      //                 concurrent voice-only restart_pane live-mode action; capability row unchanged.)
       //   send_keys     POST /api/terminals/:pane_id/input         — ALWAYS_ALLOWED (was ungated).
       //   resize_pane   POST /api/terminals/:pane_id/resize        — ALWAYS_ALLOWED; zod cols/rows int>0
       //                 replaces the inline 400 (zod-500 on bad input).
       //   clear_history POST /api/terminals/:pane_id/history/clear — ALWAYS_ALLOWED (was ungated).
       //   clear_exited  POST /api/terminals/clear-exited            — ALWAYS_ALLOWED (was ungated).
       // Accepted status deltas (client ignores the body): inline 404 not-found -> 200 ok-narration.
-      "restart_pane",
+      "respawn_pane",
       "send_keys",
       "resize_pane",
       "clear_history",

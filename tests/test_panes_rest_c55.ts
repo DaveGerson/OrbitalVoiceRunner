@@ -1,7 +1,7 @@
 // c55 Batch C — rest-only pane/UI ActionDefs contract suite (wsm-e2e-pinned-c55.3).
 //
 // Five NEW rest-only defs that converge inline pane/UI routes with NO voice twin today:
-//   restart_pane   POST /api/terminals/:pane_id/restart   (GATED via restart_pane — behaviorDelta)
+//   respawn_pane   POST /api/terminals/:pane_id/restart   (GATED via restart_pane capability — behaviorDelta)
 //   send_keys      POST /api/terminals/:pane_id/input      (ALWAYS_ALLOWED — was ungated)
 //   resize_pane    POST /api/terminals/:pane_id/resize      (ALWAYS_ALLOWED; zod rejects bad cols/rows)
 //   clear_history  POST /api/terminals/:pane_id/history/clear (ALWAYS_ALLOWED)
@@ -9,7 +9,7 @@
 //
 // DOCTRINE (def-level deterministic): call runAction with a fake ctx + fake manager, assert the
 // ActionResult kind/output, then assert resultToHttp maps it to {status,body}. No server boot, no PTY.
-// Also pins: each def is rest-only (surfaces === {'rest'}), has its rest binding, restart_pane routes
+// Also pins: each def is rest-only (surfaces === {'rest'}), has its rest binding, respawn_pane routes
 // THROUGH ctx.gateOrDefer (gate consulted), resize zod REJECTS non-positive cols/rows, send_keys writes
 // input + records command history, clear_history zeroes a pane's history, clear_exited archives.
 
@@ -145,42 +145,43 @@ function readHistoryFile(): Record<string, unknown[]> {
 
 // ── registry shape: all five defs present, rest-only, with a rest binding ─────────────────────────
 describe("c55 Batch C — registry shape", () => {
-  const names = ["restart_pane", "send_keys", "resize_pane", "clear_history", "clear_exited"];
+  const names = ["respawn_pane", "send_keys", "resize_pane", "clear_history", "clear_exited"];
   for (const name of names) {
     it(`${name} is a rest-only def with a rest binding`, () => {
       const def = findDef(name);
       assert.deepStrictEqual([...def.surfaces].sort(), ["rest"], `${name} surfaces must be exactly {rest}`);
       assert.ok(def.rest, `${name} must declare a rest binding`);
-      assert.strictEqual(def.rest!.method, name === "clear_exited" || name === "restart_pane" || name === "send_keys" || name === "resize_pane" || name === "clear_history" ? "post" : "post");
+      assert.strictEqual(def.rest!.method, name === "clear_exited" || name === "respawn_pane" || name === "send_keys" || name === "resize_pane" || name === "clear_history" ? "post" : "post");
     });
   }
 
   it("rest paths match the inline routes they replace", () => {
-    assert.strictEqual(findDef("restart_pane").rest!.path, "/api/terminals/:pane_id/restart");
+    assert.strictEqual(findDef("respawn_pane").rest!.path, "/api/terminals/:pane_id/restart");
     assert.strictEqual(findDef("send_keys").rest!.path, "/api/terminals/:pane_id/input");
     assert.strictEqual(findDef("resize_pane").rest!.path, "/api/terminals/:pane_id/resize");
     assert.strictEqual(findDef("clear_history").rest!.path, "/api/terminals/:pane_id/history/clear");
     assert.strictEqual(findDef("clear_exited").rest!.path, "/api/terminals/clear-exited");
   });
 
-  it("safe-default gates: send_keys/resize_pane/clear_history/clear_exited are ALWAYS_ALLOWED; restart_pane enforces", () => {
+  it("safe-default gates: send_keys/resize_pane/clear_history/clear_exited are ALWAYS_ALLOWED; respawn_pane enforces", () => {
     assert.strictEqual(findDef("send_keys").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("resize_pane").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("clear_history").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("clear_exited").capability, "ALWAYS_ALLOWED");
-    assert.strictEqual(findDef("restart_pane").capability, "restart_pane");
+    // The action is respawn_pane; the CAPABILITY it rides is still named restart_pane (matrix row).
+    assert.strictEqual(findDef("respawn_pane").capability, "restart_pane");
   });
 });
 
-// ── restart_pane ─────────────────────────────────────────────────────────────────────────────────
-describe("c55 restart_pane", () => {
+// ── respawn_pane ─────────────────────────────────────────────────────────────────────────────────
+describe("c55 respawn_pane", () => {
   it("live terminal -> gate consulted -> stop()+start(); ok -> 200 {output}", async () => {
     const term = makeFakeTerm();
     const { ctx, rec } = makeCtx({ terminals: { p1: term } });
-    const result = await runAction(REGISTRY, "restart_pane", { pane_id: "p1" }, ctx);
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
     assert.strictEqual(result.kind, "ok");
-    // The gate was consulted with the restart_pane capability (the deliberate safety improvement).
-    assert.strictEqual(rec.gateCalls.length, 1, "restart_pane MUST route through ctx.gateOrDefer");
+    // The gate was consulted with the restart_pane CAPABILITY (the deliberate safety improvement).
+    assert.strictEqual(rec.gateCalls.length, 1, "respawn_pane MUST route through ctx.gateOrDefer");
     assert.strictEqual(rec.gateCalls[0].capability, "restart_pane");
     assert.strictEqual(rec.gateCalls[0].paneId, "p1");
     assert.strictEqual(term.stopped, 1, "live pane stopped");
@@ -196,7 +197,7 @@ describe("c55 restart_pane", () => {
       activeProjectId: "proj",
       activeProject: { directory: "/tmp/proj", panes: { p2: { tool_preset: "Custom", permissions_mode: "Human-in-the-Loop", session_id: "s2" } } },
     });
-    const result = await runAction(REGISTRY, "restart_pane", { pane_id: "p2" }, ctx);
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p2" }, ctx);
     assert.strictEqual(result.kind, "ok");
     assert.strictEqual(rec.gateCalls.length, 1, "gate consulted for the ledger-only rebuild too");
     assert.strictEqual(rec.addTerminalCalls.length, 1, "ledger-only pane rebuilt via addTerminal");
@@ -206,7 +207,7 @@ describe("c55 restart_pane", () => {
   it("Off gate -> blocked -> 403 {error}; no restart side effect", async () => {
     const term = makeFakeTerm();
     const { ctx } = makeCtx({ terminals: { p1: term }, gateDisposition: { disposition: "forbidden" } });
-    const result = await runAction(REGISTRY, "restart_pane", { pane_id: "p1" }, ctx);
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
     assert.strictEqual(result.kind, "blocked");
     assert.strictEqual(term.stopped, 0, "forbidden restart performs NO stop");
     assert.strictEqual(term.started, 0, "forbidden restart performs NO start");
@@ -222,7 +223,7 @@ describe("c55 restart_pane", () => {
       terminals: { p1: term },
       gateDisposition: { disposition: "deferred", actionId: "act_1", summary: "Restart pane p1" },
     });
-    const result = await runAction(REGISTRY, "restart_pane", { pane_id: "p1" }, ctx);
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
     assert.strictEqual(result.kind, "pending");
     assert.strictEqual(term.stopped, 0, "deferred restart does NOT run the stop yet");
     const { res, sent } = makeFakeRes();
@@ -233,7 +234,7 @@ describe("c55 restart_pane", () => {
 
   it("unknown pane (no live term, not in active project) -> ok narration -> 200 (404->200 delta)", async () => {
     const { ctx, rec } = makeCtx({ activeProjectId: "proj", activeProject: { panes: {} } });
-    const result = await runAction(REGISTRY, "restart_pane", { pane_id: "ghost" }, ctx);
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "ghost" }, ctx);
     assert.strictEqual(result.kind, "ok");
     assert.strictEqual(rec.addTerminalCalls.length, 0, "no rebuild for an unknown pane");
     const { res, sent } = makeFakeRes();

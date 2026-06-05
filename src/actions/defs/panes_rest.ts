@@ -8,20 +8,21 @@
  *
  * Routes converged (the inline app.post(...) twins are deleted in the SAME change — never both, or
  * Express keeps the first-registered handler and silently masks the cutover):
- *   - restart_pane   POST /api/terminals/:pane_id/restart        (server.ts ~648)
+ *   - respawn_pane   POST /api/terminals/:pane_id/restart        (server.ts ~648)
  *   - send_keys      POST /api/terminals/:pane_id/input          (server.ts ~700)
  *   - resize_pane    POST /api/terminals/:pane_id/resize         (server.ts ~721)
  *   - clear_history  POST /api/terminals/:pane_id/history/clear  (server.ts ~746)
  *   - clear_exited   POST /api/terminals/clear-exited            (server.ts ~976)
  *
  * GATING / SAFE DEFAULTS (Decision 3 + the c55 safe-default policy):
- *   - restart_pane is GATED via ctx.gateOrDefer("restart_pane", ...) — the capability already exists in
- *     the matrix (default Ask). The inline route SKIPPED the gate; converging it ENFORCES the gate
- *     (a deliberate safety improvement — recorded as a behaviorDelta). Off->blocked->403, Ask->pending->202,
- *     Auto->run-now->200. NOTE: buildActionRun (src/actionEffects.ts) has no restart_pane case, so an
- *     IN-PROCESS Ask->confirm replays the real `run` closure correctly (pendingActions keeps it), while a
- *     confirm-AFTER-process-restart would degrade to the "unknown capability" no-op string — an accepted
- *     limitation for this batch (durable restart-intent replay for restart_pane is out of scope here).
+ *   - respawn_pane is GATED via ctx.gateOrDefer("restart_pane", ...) — the capability (still named
+ *     restart_pane) already exists in the matrix (default Ask). The inline route SKIPPED the gate;
+ *     converging it ENFORCES the gate (a deliberate safety improvement — recorded as a behaviorDelta).
+ *     Off->blocked->403, Ask->pending->202, Auto->run-now->200. NOTE: buildActionRun (src/actionEffects.ts)
+ *     has no restart_pane case, so an IN-PROCESS Ask->confirm replays the real `run` closure correctly
+ *     (pendingActions keeps it), while a confirm-AFTER-process-restart would degrade to the "unknown
+ *     capability" no-op string — an accepted limitation for this batch (durable restart-intent replay for
+ *     respawn_pane is out of scope here).
  *   - send_keys / resize_pane / clear_history / clear_exited were UNGATED inline → registered
  *     ALWAYS_ALLOWED to preserve current instant behavior (recorded in appliedDefaults). A clear_history
  *     capability row exists in the matrix (default Ask), but the inline route was ungated, so the c55
@@ -116,15 +117,19 @@ function addCommand(ctx: ActionContext, terminalId: string, command: string): vo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// restart_pane — POST /api/terminals/:pane_id/restart (GATED; behaviorDelta).
+// respawn_pane — POST /api/terminals/:pane_id/restart (GATED; behaviorDelta).
+//   Renamed from restart_pane to resolve a name collision with the concurrent voice-only
+//   `restart_pane` action (src/actions/defs/locks.ts), which applies a LIVE permission mode (it
+//   does NOT restart a process). This action genuinely respawns the pane process (stop()+start()).
+//   The CAPABILITY it rides is still named `restart_pane` (unchanged matrix row).
 // ─────────────────────────────────────────────────────────────────────────────
 
-const RestartPaneParams = z.object({
+const RespawnPaneParams = z.object({
   pane_id: z.string(),
 });
 
 /**
- * restart_pane — FAITHFUL PORT of the inline app.post("/api/terminals/:id/restart") (server.ts ~648),
+ * respawn_pane — FAITHFUL PORT of the inline app.post("/api/terminals/:id/restart") (server.ts ~648),
  * now ROUTED THROUGH ctx.gateOrDefer("restart_pane", ...) (the inline route skipped the gate). The gated
  * `run` closure (a single synchronous closure, so the SAME closure serves Auto-run-now AND the in-process
  * Ask->confirm replay via pendingActions) branches:
@@ -139,10 +144,10 @@ const RestartPaneParams = z.object({
  *                          stage/forbid of a non-existent pane.
  * Off->blocked->403, Ask->pending->202, Auto->run-now->200.
  */
-export const restartPane: ActionDef<typeof RestartPaneParams> = {
-  name: "restart_pane",
-  description: "Restart a terminal pane (stop its process and start it again). REST/UI surface only.",
-  params: RestartPaneParams,
+export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
+  name: "respawn_pane",
+  description: "Respawn a terminal pane (stop its process and start it again). REST/UI surface only.",
+  params: RespawnPaneParams,
   capability: "restart_pane",
   readOnly: false,
   surfaces: new Set(["rest"]),
@@ -345,7 +350,7 @@ export const clearExited: ActionDef<typeof ClearExitedParams> = {
 
 /** The c55 Batch C rest-only registry slice. */
 export const PANES_REST_ACTIONS: ActionDef[] = [
-  restartPane,
+  respawnPane,
   sendKeys,
   resizePane,
   clearHistory,

@@ -147,7 +147,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
-| `restart_pane` | rest | no | Restart a terminal pane (stop its process and start it again) |
+| `respawn_pane` | rest | no | Respawn a terminal pane (stop its process and start it again) |
 
 ## Change these safety gates
 

@@ -88,7 +88,7 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // ── c55 Batch C: NEW rest-only pane/UI defs (no voice twin BY DESIGN — pure UI/operator-direct) ──
   // These converge inline app.post(...) routes that never had a Gemini voice tool. They are rest-only
   // (surfaces = {'rest'}) so they don't force a voice-tool description; a voice twin is not planned.
-  restart_pane: new Set<Surface>(["rest"]),
+  respawn_pane: new Set<Surface>(["rest"]),
   send_keys: new Set<Surface>(["rest"]),
   resize_pane: new Set<Surface>(["rest"]),
   clear_history: new Set<Surface>(["rest"]),
