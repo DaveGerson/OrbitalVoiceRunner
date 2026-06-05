@@ -102,6 +102,12 @@ export const deletePane: ActionDef<typeof DeletePaneParams> = {
   rest: { method: "delete", path: "/api/projects/:project_id/panes/:pane_id" },
   handler: (args, ctx): ActionResult => {
     const { project_id, pane_id } = args;
+    // Resolve a non-existent pane to ok-narration BEFORE the gate — consistent with delete_project /
+    // respawn_pane: we never stage (Ask) or forbid (Off) a delete of a pane that does not exist.
+    const existingWs = ctx.manager.ledger.getProject(project_id);
+    if (!ctx.manager.terminals[pane_id] && !(existingWs && existingWs.panes[pane_id])) {
+      return { kind: "ok", output: `Pane ${pane_id} not found.` };
+    }
     const deleteEffect = (): string => {
       const term = ctx.manager.terminals[pane_id];
       if (term) { term.stop(); delete ctx.manager.terminals[pane_id]; }

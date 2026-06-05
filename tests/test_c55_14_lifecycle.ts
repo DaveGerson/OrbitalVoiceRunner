@@ -348,4 +348,22 @@ describe("c55.14 — delete_pane gating (status-via-kinds)", () => {
     assert.deepStrictEqual(rec.saves, [false], "ledger.save() fired for the ledger-only delete");
     assert.strictEqual(rec.terminalsUpdated, 1, "broadcastTerminalsUpdated fired");
   });
+
+  it("missing pane (no live term AND no ledger record) -> ok narration -> 200; gate NOT consulted, no mutation/broadcast", async () => {
+    // Workspace exists but has NO pane record, and there is no live terminal -> the pane is a ghost.
+    const opts: CtxOpts = { workspaces: { proj: { panes: {} } as FakeWs }, activeProjectId: "proj", terminals: {} };
+    const { ctx, rec, manager } = makeCtx(opts);
+    const result = await runAction(REGISTRY, "delete_pane", { project_id: "proj", pane_id: "ghost_pane" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.match((result as { output?: string }).output ?? "", /not found/i, "narration says the pane was not found");
+    assert.strictEqual(rec.gateCalls.length, 0, "a non-existent pane is never staged (Ask) or forbidden (Off) — gate NOT consulted");
+    // No mutation / no broadcast: nothing to stop, nothing to delete, nothing to save or announce.
+    assert.deepStrictEqual(rec.saves, [], "no ledger.save() for a ghost pane");
+    assert.strictEqual(rec.ledgerUpdates, 0, "no broadcastLedgerUpdate for a ghost pane");
+    assert.strictEqual(rec.terminalsUpdated, 0, "no broadcastTerminalsUpdated for a ghost pane");
+    assert.deepStrictEqual((manager.ledger.workspaces["proj"] as FakeWs).panes, {}, "workspace pane map untouched");
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("delete_pane"), result, {}, res);
+    assert.strictEqual(sent.status, 200);
+  });
 });
