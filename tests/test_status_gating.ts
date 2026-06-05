@@ -127,6 +127,161 @@ describe("runProbeTick / applyStatusEvent gating (real terminal, fake probe)", (
     await teardown(term);
   });
 
+  it("Phase 1 ears: onRunning fires EXACTLY ONCE on the Idle->Running edge, never on Running->Running ticks", async () => {
+    // Mirror of the onIdle edge-once invariant (I3/I5), but for the symmetric "beginning"
+    // edge. A shell pane starts Idle; an authoritative busy probe drives it INTO Running
+    // (the genuine edge -> onRunning once). Subsequent busy ticks keep it Running and must
+    // NOT re-fire onRunning (the bus debounce is a second line of defense, but the EDGE
+    // itself must be exact so a long-running pane can't re-publish each debounce window).
+    const probe = new FakeProbe({ hasRunningChild: false, confidence: "authoritative" });
+    const term = makeTerminal("Custom", probe);
+    term.status = "Idle"; // start from a non-Running prior status so the first busy tick is a real edge
+    let runningFired = 0;
+    term.onRunning = () => { runningFired++; };
+
+    // No-child tick first: stays Idle, no edge.
+    (term as any).runProbeTick();
+    assert.strictEqual(term.status, "Idle", "no running child keeps it Idle");
+    assert.strictEqual(runningFired, 0, "no onRunning without a Running edge");
+
+    // Busy tick: Idle -> Running is the genuine edge -> onRunning once.
+    probe.set({ hasRunningChild: true, confidence: "authoritative" });
+    (term as any).runProbeTick();
+    assert.strictEqual(term.status, "Running", "authoritative busy ⇒ Running");
+    assert.strictEqual(runningFired, 1, "exactly one onRunning on the Idle->Running edge");
+
+    // Two more busy ticks: Running -> Running is NOT an edge -> no re-fire.
+    (term as any).runProbeTick();
+    (term as any).runProbeTick();
+    assert.strictEqual(runningFired, 1, "onRunning does NOT re-fire while the pane stays Running");
+    await teardown(term);
+  });
+
+  it("Phase 1 ears: writeInput drives the Running edge so command dispatch fires onRunning once", async () => {
+    // writeInput -> applyStatusEvent({kind:'input'}) -> Running. A pane sitting Idle that
+    // receives a command is a beginning; assert the single edge emission covers dispatch too.
+    const probe = new FakeProbe({ hasRunningChild: false, confidence: "fallback" });
+    const term = makeTerminal("Custom", probe);
+    term.status = "Idle";
+    let runningFired = 0;
+    term.onRunning = () => { runningFired++; };
+
+    (term as any).applyStatusEvent({ kind: "input" });
+    assert.strictEqual(term.status, "Running", "input optimistically marks Running (Tier A kick)");
+    assert.strictEqual(runningFired, 1, "the input-driven Idle->Running edge fires onRunning once");
+
+    // A second input while already Running is not a new edge.
+    (term as any).applyStatusEvent({ kind: "input" });
+    assert.strictEqual(runningFired, 1, "no re-fire on a Running->Running input");
+    await teardown(term);
+  });
+
+  it("Conservative Phase 2: onQuiescing fires once on the armed-timer edge while STILL Running (no new idle)", async () => {
+    // The "cooking…" overlay is a pure OBSERVATION of the pre-idle debounce window the state
+    // machine already arms — it must NOT change WHEN idle is declared. For an interactive_cli
+    // (fallback) pane: an output chunk arms the idle timer (status stays Running) and fires
+    // onQuiescing exactly once synchronously, while onIdle has NOT fired and status is STILL
+    // Running. Only after the (agent) timeout does onIdle fire exactly once and status become Idle.
+    const probe = new FakeProbe({ hasRunningChild: false, confidence: "fallback" });
+    const term = makeTerminal("Claude Code", probe);
+    assert.strictEqual(term.runtimeType, "interactive_cli");
+    term.status = "Idle";
+    term.agentIdleTimeoutMs = 40; // short agent timeout so the test is fast
+    let quiescingFired = 0;
+    let idleFired = 0;
+    term.onQuiescing = () => { quiescingFired++; };
+    term.onIdle = () => { idleFired++; };
+
+    // Output drives Running in fallback mode AND arms the idle (quiescence) timer => the
+    // quiescing edge. Synchronously: cooking is observed, true idle is NOT yet declared.
+    (term as any).applyStatusEvent({ kind: "output", text: "thinking..." });
+    assert.strictEqual(term.status, "Running", "output keeps it Running — NOT idle yet");
+    assert.strictEqual(quiescingFired, 1, "exactly one onQuiescing on the false->armed edge");
+    assert.strictEqual(idleFired, 0, "true idle is NOT declared on the quiescing edge");
+    assert.strictEqual((term as any).quiescing, true, "the quiescing flag is set while the timer is armed");
+
+    // A second output chunk re-arms the SAME window (fallback re-arms each chunk) — must NOT
+    // re-fire onQuiescing (still inside the one armed window).
+    (term as any).applyStatusEvent({ kind: "output", text: "still thinking..." });
+    assert.strictEqual(quiescingFired, 1, "onQuiescing does NOT re-fire while the window stays armed");
+
+    // Wait out the agent timeout: NOW true idle fires exactly once and the cooking flag clears.
+    await new Promise((r) => setTimeout(r, 90));
+    assert.strictEqual(term.status, "Idle", "the timer eventually declares Idle (unchanged idle logic)");
+    assert.strictEqual(idleFired, 1, "exactly one onIdle on the genuine Running->Idle edge");
+    assert.strictEqual((term as any).quiescing, false, "the quiescing flag clears once Idle is declared");
+    await teardown(term);
+  });
+
+  it("Conservative Phase 2: resumed work cancels quiescing (self-correcting), no spurious onIdle", async () => {
+    // Arm the quiescing edge (output), then a busy authoritative probe before the timeout
+    // resumes work: status returns to/stays Running, the quiescing flag clears, and NO idle.
+    // Guards the self-correcting property (the next output republishes running).
+    const probe = new FakeProbe({ hasRunningChild: false, confidence: "fallback" });
+    const term = makeTerminal("Custom", probe); // shell pane (fallback output-driven)
+    term.status = "Idle";
+    term.idleTimeoutMs = 80;
+    let quiescingFired = 0;
+    let idleFired = 0;
+    term.onQuiescing = () => { quiescingFired++; };
+    term.onIdle = () => { idleFired++; };
+
+    (term as any).applyStatusEvent({ kind: "output", text: "building..." });
+    assert.strictEqual(quiescingFired, 1, "quiescing armed on first output");
+    assert.strictEqual((term as any).quiescing, true);
+
+    // Resumed work via an authoritative busy probe cancels the idle timer (setRunning =>
+    // clearIdleTimer) => the cooking flag must clear.
+    probe.set({ hasRunningChild: true, confidence: "authoritative" });
+    (term as any).runProbeTick();
+    assert.strictEqual(term.status, "Running", "busy probe keeps it Running");
+    assert.strictEqual((term as any).quiescing, false, "quiescing clears when work resumes (timer cleared)");
+
+    // Past the original idle window: no idle fired (work resumed), and a NEW quiescing window
+    // can arm honestly on the next quiescence.
+    await new Promise((r) => setTimeout(r, 120));
+    assert.strictEqual(idleFired, 0, "no spurious onIdle — work resumed before the window elapsed");
+    await teardown(term);
+  });
+
+  it("Conservative Phase 2 safeguard: interactive_cli uses a LARGER effective idle timeout than a shell pane", async () => {
+    // The low-risk timing safeguard (fact [F]): agents are forced to the fallback path, where
+    // quiet != done. Bump their effective fallback idle timeout above a shell pane's so a brief
+    // agent pause is less likely to read as premature 'done'. Shell panes are UNCHANGED.
+    // Measure the armed delay via a fake setTimeout so no real wall-clock is needed.
+    function armedDelayFor(preset: "Custom" | "Claude Code", overrides?: (t: UniversalTerminal) => void): number {
+      const probe = new FakeProbe({ hasRunningChild: false, confidence: "fallback" });
+      const term = makeTerminal(preset, probe);
+      term.status = "Idle";
+      if (overrides) overrides(term);
+      let captured = -1;
+      const realSetTimeout = globalThis.setTimeout;
+      (globalThis as any).setTimeout = (fn: any, ms?: number) => {
+        captured = ms ?? 0;
+        return realSetTimeout(() => {}, 100000) as any; // a real (cleanable) handle, never fires fn
+      };
+      try {
+        (term as any).applyStatusEvent({ kind: "output", text: "x" });
+      } finally {
+        (globalThis as any).setTimeout = realSetTimeout;
+      }
+      // Clean the dummy timer the patched setTimeout created on the term.
+      const t = (term as any).idleTimer;
+      if (t) clearTimeout(t);
+      return captured;
+    }
+
+    const shellDelay = armedDelayFor("Custom");
+    const agentDelay = armedDelayFor("Claude Code");
+    assert.strictEqual(shellDelay, 2000, "shell pane keeps the documented 2000ms idle timeout (no regression)");
+    assert.ok(agentDelay > shellDelay, `interactive_cli idle timeout (${agentDelay}) must exceed the shell timeout (${shellDelay})`);
+    assert.strictEqual(agentDelay, 3500, "interactive_cli default agentIdleTimeoutMs is the modest 3500ms bump");
+
+    // And it is honored after an explicit override.
+    const overridden = armedDelayFor("Claude Code", (t) => { t.agentIdleTimeoutMs = 5000; });
+    assert.strictEqual(overridden, 5000, "an explicit agentIdleTimeoutMs override is honored on the fallback arm");
+  });
+
   it("C2: a FallbackProbe never yields an authoritative busy signal (legacy-transport degrade)", async () => {
     // start() swaps in a FallbackProbe when usingNodePty is false, so the legacy
     // (script/cmd.exe) transport degrades to quiescence-driven idle rather than an
