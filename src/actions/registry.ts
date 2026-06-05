@@ -25,6 +25,7 @@ import { ALWAYS_ALLOWED } from "./types";
 import { READS_ACTIONS } from "./defs/reads";
 import { NOTES_ACTIONS } from "./defs/notes";
 import { ARCHIVE_ACTIONS } from "./defs/archive";
+import { LIFECYCLE_REST_ACTIONS } from "./defs/lifecycle_rest";
 import { PANES_WRITE_ACTIONS } from "./defs/panes_write";
 import { PANES_REST_ACTIONS } from "./defs/panes_rest";
 import { ORIENT_ACTIONS } from "./defs/orient";
@@ -313,6 +314,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...OBSERVABILITY_ACTIONS,
   // ── c55 Batch G net-new rest-only watch-rule / plan-delete defs (4) ──
   ...WATCH_RULES_ACTIONS,
+  // ── c55.14 net-new rest-only lifecycle defs (4: update/stop ungated; delete project/pane gated Ask) ──
+  ...LIFECYCLE_REST_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
