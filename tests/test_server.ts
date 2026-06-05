@@ -105,8 +105,16 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
 
     it("should get pane summary", async () => {
       manager.addTerminal("pane_1", process.cwd(), process.platform === "win32" ? "echo 'summary test'" : "echo 'summary test'");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const summary = manager.getPaneSummary("pane_1");
+      // Poll for the captured echo instead of a single fixed sleep: under full-suite
+      // parallel ConPTY load the PTY-capture latency can exceed any fixed wait (this step
+      // has been observed taking ~3s), so a hard `setTimeout(500)` race-flakes. Poll
+      // getPaneSummary until the echoed line lands, with a generous ceiling.
+      let summary = manager.getPaneSummary("pane_1");
+      const deadline = Date.now() + 15000;
+      while (!summary.includes("summary test") && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        summary = manager.getPaneSummary("pane_1");
+      }
       assert.ok(summary.includes("summary test"));
       assert.ok(summary.startsWith("```"));
 
