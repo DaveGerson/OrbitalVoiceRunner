@@ -102,6 +102,14 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   get_stop_all_status: new Set<Surface>(["rest"]),
   get_terminal_history: new Set<Surface>(["rest"]),
 
+  // ── c55.11: NEW rest-only structured page-load READS (no voice twin BY DESIGN) ───────────────────
+  // Faithful ports of the inline GET /api/{ledger,attention,plans,recipes}; each rides rest.toHttp to
+  // emit its value TOP-LEVEL. ALWAYS_ALLOWED plumbing reads (the inline routes were ungated/unredacted).
+  get_ledger: new Set<Surface>(["rest"]),
+  get_attention_queue: new Set<Surface>(["rest"]),
+  list_orchestrator_plans: new Set<Surface>(["rest"]),
+  list_orchestration_recipes: new Set<Surface>(["rest"]),
+
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
   // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for

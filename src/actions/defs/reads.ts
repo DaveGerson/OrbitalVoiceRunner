@@ -380,6 +380,86 @@ export const getTerminalHistory: ActionDef<typeof PaneIdParams> = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// c55.11 — 4 rest-only structured reads (faithful ports of the inline GET routes)
+// ─────────────────────────────────────────────────────────────────────────────
+// Each converges an inline `res.json(<value>)` read into a rest-only def returning <value> off ctx,
+// riding rest.toHttp to emit it TOP-LEVEL (byte-identical to the legacy body). ALWAYS_ALLOWED +
+// readOnly:false (system-state plumbing read, never gated; the inline routes did NO redaction, so
+// readOnly:false preserves that — same reasoning as get_stop_all_status). No voice twin planned.
+
+export const getLedger: ActionDef<typeof NoParams> = {
+  name: "get_ledger",
+  description: "Read the full workspaces ledger (project/pane tree the UI loads on page open). UNGATED plumbing read.",
+  params: NoParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/ledger",
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
+  handler: (_args, ctx): ActionResult => ({ kind: "ok", output: ctx.manager.ledger.workspaces }),
+};
+
+export const getAttentionQueue: ActionDef<typeof NoParams> = {
+  name: "get_attention_queue",
+  description: "Read the raw attention/alert queue (panes that transitioned to error/exit). UNGATED plumbing read. (The voice prose digest is get_attention_digest.)",
+  params: NoParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/attention",
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
+  handler: (_args, ctx): ActionResult => ({ kind: "ok", output: ctx.manager.attentionQueue }),
+};
+
+export const listOrchestratorPlans: ActionDef<typeof NoParams> = {
+  name: "list_orchestrator_plans",
+  description: "Read the multi-step orchestrator plans board (id/status/steps per plan). UNGATED plumbing read.",
+  params: NoParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/plans",
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
+  handler: (_args, ctx): ActionResult => ({ kind: "ok", output: ctx.manager.ledger.plans }),
+};
+
+export const listOrchestrationRecipes: ActionDef<typeof NoParams> = {
+  name: "list_orchestration_recipes",
+  description: "Read the orchestration recipe templates (suggested multi-pane suites the UI offers). UNGATED plumbing read.",
+  params: NoParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/recipes",
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
+  handler: (_args, ctx): ActionResult => ({ kind: "ok", output: ctx.recipes }),
+};
+
 /** The READS group registry slice. */
 export const READS_ACTIONS: ActionDef[] = [
   getPaneCommandHistory,
@@ -391,4 +471,8 @@ export const READS_ACTIONS: ActionDef[] = [
   listCapabilities,
   getStopAllStatus,
   getTerminalHistory,
+  getLedger,
+  getAttentionQueue,
+  listOrchestratorPlans,
+  listOrchestrationRecipes,
 ];
