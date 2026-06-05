@@ -63,6 +63,8 @@ function makeCtx(opts: {
     stopAll: async () => [],
     releaseStopAll: () => {},
     isFrozen: () => false,
+    runningPaneIds: () => [],
+    posturePayloadForPane: (id) => ({ id, effective_gates: {} as never, posture: undefined }),
   };
 }
 

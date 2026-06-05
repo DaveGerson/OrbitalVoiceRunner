@@ -304,6 +304,20 @@ export interface ActionContext {
   releaseStopAll: () => void;
   /** Read the live STOP-ALL `frozen` flag — confirm_stop_all / release_stop_all guard on it. */
   isFrozen: () => boolean;
+  /** The pane ids that are still RUNNING (a live PTY) — the STOP-ALL boot-restore snapshot uses it to
+   *  list what survived a freeze (server.ts runningPaneIds). get_stop_all_status reads it on Off-frozen. */
+  runningPaneIds: () => string[];
+
+  // ── Effective per-pane posture (server.ts gating posturePayloadForPane) ───────────────────────
+  /** Resolve a pane's SERVER-truth posture: its id, the 16 effective gate values, and the derived
+   *  posture word (frozen-aware). list_panes builds its flat per-pane REST array from this so the chip
+   *  renders from server truth (no client policy re-derivation). The `posture` field is structurally
+   *  typed here to avoid coupling the action contract to the gating module's internal posture-word type. */
+  posturePayloadForPane: (paneId: string) => {
+    id: string;
+    effective_gates: Record<CapabilityGate, GateValue>;
+    posture: unknown;
+  };
 
   // deliver_handoff note: NO injected closure for the outcome→row mapping. `deliverOutcomeToHandoff`
   // is a PURE, EXPORTED function in src/handoffFlow (server.ts imports it as a value at server.ts:37,

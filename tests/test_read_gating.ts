@@ -189,6 +189,8 @@ function makeCtx(
     // Controllable freeze flag. When true, the read-gating guards short-circuit OUT (reads stay
     // available during a STOP-ALL freeze — the behavior-preserving guarantee).
     isFrozen: () => opts.frozen ?? false,
+    runningPaneIds: () => [],
+    posturePayloadForPane: (id) => ({ id, effective_gates: {} as never, posture: undefined }),
   };
 }
 

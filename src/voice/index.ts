@@ -216,6 +216,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     broadcastTerminalsUpdated,
     stopAll,
     releaseStopAll,
+    runningPaneIds,
   } = gating;
 
   // PLM4 (1): RESUMPTION-TOKEN PERSISTENCE. The Gemini Live resume handle was in-memory only, so a
@@ -594,6 +595,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           stopAll,
           releaseStopAll,
           isFrozen: () => coreState.frozen,
+          // c55 Batch F: the running-pane set + frozen-aware per-pane posture (server truth). list_panes
+          // builds its flat REST array from posturePayloadForPane; get_stop_all_status reads runningPaneIds.
+          runningPaneIds,
+          posturePayloadForPane,
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.

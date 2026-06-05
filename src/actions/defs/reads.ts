@@ -34,6 +34,7 @@ import path from "path";
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import type { GateValue } from "../../types";
+import { ALWAYS_ALLOWED } from "../types";
 import { ALL_CAPABILITIES } from "../../gateSurface";
 import { stripAnsiSequences, redactSecrets } from "../../terminal";
 import { serializePending } from "../../pendingApprovals";
@@ -293,6 +294,92 @@ export const listCapabilities: ActionDef<typeof NoParams> = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// get_stop_all_status (c55 Batch F — NEW rest-only boot-restore snapshot)
+// ─────────────────────────────────────────────────────────────────────────────
+// FAITHFUL PORT of the inline GET /api/stop-all/status (server.ts): the snapshot the client reads ONCE
+// on page load to RESTORE the FROZEN banner before any WS frame exists (the `{type:'frozen'}` frame
+// only fires on a CHANGE, so a fresh load against an already-frozen server would otherwise miss it —
+// spec §2.C/§10.3 "frozen survives a restart"). Structured body {frozen, running} that the flat
+// {output:string} cannot carry, so it rides the rest.toHttp primitive and emits the object TOP-LEVEL.
+// ALWAYS_ALLOWED (a brake-state READ is never gated) + rest-only (pure-UI; no voice tool). running is
+// EMPTY unless frozen — exactly the inline guard `frozen ? runningPaneIds() : []`.
+export const getStopAllStatus: ActionDef<typeof NoParams> = {
+  name: "get_stop_all_status",
+  description:
+    "Read the live STOP-ALL freeze state {frozen, running} so a fresh page load can restore the FROZEN banner. running lists the still-alive pane ids only while frozen. UNGATED boot-restore read.",
+  params: NoParams,
+  capability: ALWAYS_ALLOWED,
+  // ALWAYS_ALLOWED (the brake status must be readable even while frozen, exactly like the brake trio).
+  // readOnly:false because the §8.1 invariant binds readOnly ONLY to the read_pane/read_notes caps; the
+  // body is {frozen:boolean, running:string[]} (pane ids — no secrets), so no egress redaction is lost
+  // (faithful to the inline route, which did none).
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/stop-all/status",
+    // Emit {frozen, running} TOP-LEVEL (not wrapped in {output}) — the exact legacy inline body shape.
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : { frozen: false, running: [] },
+    }),
+  },
+  handler: (_args, ctx): ActionResult => {
+    const frozen = ctx.isFrozen();
+    return { kind: "ok", output: { frozen, running: frozen ? ctx.runningPaneIds() : [] } };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_terminal_history (c55 Batch F — NEW rest-only RAW history array)
+// ─────────────────────────────────────────────────────────────────────────────
+// FAITHFUL PORT of the inline GET /api/terminals/:id/history (server.ts): returns the RAW
+// HistoryManager.loadHistory(id) array — full `output` per entry, NO ANSI strip / redaction / concise
+// mapping (that is get_pane_command_history's PROSE shape, deliberately NOT reused here). HistoryManager
+// lives in server.ts and cannot be imported without booting the listener, so this reproduces
+// loadHistory EXACTLY: read the SAME .janus_history.json at process.cwd(), parse, return
+// parsed[paneId].slice(-maxCmds) (or [] on missing key / corrupt file). Structured array body -> the
+// rest.toHttp primitive emits it TOP-LEVEL. rest-only (no voice twin — the voice history read is prose).
+export const getTerminalHistory: ActionDef<typeof PaneIdParams> = {
+  name: "get_terminal_history",
+  description:
+    "Return the RAW recorded command history array for one pane (full command + timestamp + output + finalResponse per entry) for the UI history panel. UNGATED read.",
+  params: PaneIdParams,
+  capability: "read_pane",
+  readOnly: true,
+  surfaces: new Set(["rest"]),
+  rest: {
+    method: "get",
+    path: "/api/terminals/:pane_id/history",
+    // Emit the raw history array TOP-LEVEL (not wrapped in {output}) — the exact legacy inline body.
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
+  handler: (args, ctx): ActionResult => {
+    const targetId = args.pane_id;
+    const maxCmds = ctx.manager.settings?.advanced?.historyMaxCommands ?? 50;
+    let history: HistoryEntry[] = [];
+    try {
+      const filePath = path.join(process.cwd(), ".janus_history.json");
+      if (fs.existsSync(filePath)) {
+        const data = fs.readFileSync(filePath, "utf-8");
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const list = parsed[targetId];
+          if (Array.isArray(list)) history = list.slice(-maxCmds);
+        }
+      }
+    } catch {
+      history = [];
+    }
+    // RAW: the entries are returned verbatim (no concise/redacted mapping) — the UI history panel shape.
+    return { kind: "ok", output: history };
+  },
+};
+
 /** The READS group registry slice. */
 export const READS_ACTIONS: ActionDef[] = [
   getPaneCommandHistory,
@@ -302,4 +389,6 @@ export const READS_ACTIONS: ActionDef[] = [
   getAttentionDigest,
   getPaneGates,
   listCapabilities,
+  getStopAllStatus,
+  getTerminalHistory,
 ];

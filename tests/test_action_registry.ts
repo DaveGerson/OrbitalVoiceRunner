@@ -143,6 +143,8 @@ function makeCtx(opts: {
     stopAll: async () => [], // brake stubs (the brake trio is exercised by the golden suite)
     releaseStopAll: () => {},
     isFrozen: () => false,
+    runningPaneIds: () => [], // c55 Batch F: get_stop_all_status snapshot (exercised in test_c55_batch_f)
+    posturePayloadForPane: (id) => ({ id, effective_gates: {} as never, posture: undefined }), // c55 Batch F: list_panes flat REST array
   };
 }
 

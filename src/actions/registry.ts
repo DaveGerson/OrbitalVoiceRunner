@@ -102,10 +102,52 @@ export const listPanes: ActionDef<typeof NoParams> = {
   params: NoParams,
   capability: "read_pane",
   readOnly: true, // result is redacted on the way out (§5.6) — readOnly binds only read capabilities (§8.1 #5)
-  surfaces: new Set(["voice", "rest"]), // voice tool + GET /api/terminals (§4.2 Group 1)
-  rest: { method: "get", path: "/api/terminals" },
+  surfaces: new Set(["voice", "rest"]), // voice tool (TREE narration) + GET /api/terminals (FLAT array)
+  rest: {
+    method: "get",
+    path: "/api/terminals",
+    // c55 Batch F: the REST surface returns the FLAT per-pane array TOP-LEVEL (the shape setTerminals()
+    // consumes), NOT the default `{output}` wrapper. The handler already built that array into
+    // result.output on the rest surface (surface-aware below), so this re-projects it verbatim.
+    toHttp: (result): { status: number; body: unknown } => ({
+      status: 200,
+      body: result.kind === "ok" ? result.output : [],
+    }),
+  },
   handler: (_args, ctx): ActionResult => {
-    // THIN: the genuine domain call. listPanes() syncs the ledger and returns the project/pane tree.
+    // SURFACE-AWARE (c55 Batch F): voice narrates the project/pane TREE (manager.listPanes(), which
+    // syncs the ledger); REST returns the FLAT per-pane array the UI's setTerminals() needs — a rich
+    // fact-sheet the tree narration cannot carry (raw ANSI backfill, the ANSI-stripped tail, the 16
+    // effective gate values, the posture word, context_size). toHttp emits the flat array top-level;
+    // the voice path keeps reading result.output via resultToToolResponse, so the tree must stay the
+    // VOICE output. Field-for-field parity with the legacy inline GET /api/terminals body (server.ts).
+    if (ctx.surface === "rest") {
+      const flat = Object.keys(ctx.manager.terminals).map((id) => {
+        const term = ctx.manager.terminals[id];
+        // SERVER-resolved effective posture (16 gate values + posture word) so the per-pane chip
+        // renders from server truth — no client policy re-derivation (spec §5).
+        const posture = ctx.posturePayloadForPane(id);
+        return {
+          id,
+          cwd: term.cwd,
+          command: term.shellCmd,
+          // Display lane: raw bytes (escape sequences intact) for xterm to render exactly. `output`
+          // stays ANSI-stripped for the pane-card text previews.
+          backfill: term.getRawBackfill(),
+          output: term.getRecentOutput(20),
+          status: term.status,
+          permissions_mode: term.permissionsMode,
+          tool_preset: term.toolPreset,
+          session_id: term.sessionId,
+          context_size: term.contextSize,
+          effective_gates: posture.effective_gates,
+          posture: posture.posture,
+        };
+      });
+      return { kind: "ok", output: flat };
+    }
+    // Voice (and any non-rest surface): the genuine domain call. listPanes() syncs the ledger and
+    // returns the project/pane tree the model narrates.
     return { kind: "ok", output: ctx.manager.listPanes() };
   },
 };

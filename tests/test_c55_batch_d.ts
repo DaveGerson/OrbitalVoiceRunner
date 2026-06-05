@@ -541,11 +541,13 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
     assert.ok(/runAction\(\s*REGISTRY\s*,\s*["']dismiss_attention["']/.test(m![0]), "the shim must route execution through runAction('dismiss_attention')");
   });
 
-  // Guard out-of-scope neighbors stayed inline (this batch must NOT touch them).
+  // Guard out-of-scope neighbors stayed inline (this batch must NOT touch them). NOTE: GET
+  // /api/terminals/:id/history was a Batch-D out-of-scope neighbor, but c55 Batch F intentionally
+  // converges it (get_terminal_history) — so it is no longer asserted here; the Batch F cutover guard
+  // (test_c55_batch_f.ts) now asserts that inline route is DELETED.
   const keptLiterals: Array<{ label: string; needle: RegExp }> = [
     { label: "PUT /api/projects/:projectId/panes/:paneId/capability-gates", needle: /app\.put\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/capability-gates["']/ },
     { label: "POST /api/watch-rules", needle: /app\.post\(\s*["']\/api\/watch-rules["']/ },
-    { label: "GET /api/terminals/:id/history", needle: /app\.get\(\s*["']\/api\/terminals\/:id\/history["']/ },
   ];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {

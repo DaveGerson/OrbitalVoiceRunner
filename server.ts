@@ -554,32 +554,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     catch (e) { console.error("[onReady] pane-signal publish failed:", e); }
   };
 
-  // Web API to get terminals state
-  app.get("/api/terminals", (req, res) => {
-    const list = Object.keys(manager.terminals).map((id) => {
-      const term = manager.terminals[id];
-      // bead 8sq: include the SERVER-resolved effective posture (16 gate values + posture word)
-      // so the per-pane chip renders from server truth — no client policy re-derivation (spec §5).
-      const posture = posturePayloadForPane(id);
-      return {
-        id,
-        cwd: term.cwd,
-        command: term.shellCmd,
-        // Display lane: raw bytes (escape sequences intact) for xterm to render
-        // exactly. `output` stays ANSI-stripped for the pane-card text previews.
-        backfill: term.getRawBackfill(),
-        output: term.getRecentOutput(20),
-        status: term.status,
-        permissions_mode: term.permissionsMode,
-        tool_preset: term.toolPreset,
-        session_id: term.sessionId,
-        context_size: term.contextSize,
-        effective_gates: posture.effective_gates,
-        posture: posture.posture,
-      };
-    });
-    res.json(list);
-  });
+  // c55 Batch F: GET /api/terminals (list_panes) is now served by the registry-derived list_panes def
+  // (mountRestRoutes only-set above). The rest surface builds the SAME flat per-pane array this inline
+  // route did (id/cwd/command/backfill[raw ANSI]/output[getRecentOutput(20)]/status/permissions_mode/
+  // tool_preset/session_id/context_size/effective_gates[16]/posture from posturePayloadForPane), and
+  // the def's rest.toHttp emits it TOP-LEVEL — byte-identical to this body. The voice surface still
+  // narrates the project/pane TREE (the handler is surface-aware: ctx.surface==='rest' -> flat array).
 
   app.get("/api/ledger", (req, res) => {
     res.json(manager.ledger.workspaces);
@@ -608,15 +588,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   //   POST /api/stop-all          -> Stage 1 (freeze + cancel in-flight; panes keep running).
   //   POST /api/stop-all/confirm  -> Stage 2 (hold-to-fire kill of running PTYs; only when frozen).
   //   POST /api/stop-all/release  -> clear the freeze (clean restore; matrix was never mutated).
-  // GET the current freeze state so the client can restore the FROZEN banner on a fresh page load
-  // (spec §2.C/§10.3 — "frozen survives a restart"; the flag is persisted in the durable kv).
-  app.get("/api/stop-all/status", (_req, res) => {
-    res.json({ frozen: coreState.frozen, running: coreState.frozen ? runningPaneIds() : [] });
-  });
+  // c55 Batch F: GET /api/stop-all/status (the boot-restore freeze snapshot) is now served by the
+  // registry-derived get_stop_all_status def (mountRestRoutes only-set above). The handler returns the
+  // SAME {frozen, running} object (running = ctx.runningPaneIds() iff frozen, via the injected closures)
+  // and the def's rest.toHttp emits it TOP-LEVEL — byte-identical to this inline body. This is the
+  // snapshot the client reads ONCE on page load to restore the FROZEN banner before any WS frame exists
+  // ({type:'frozen'} only fires on a CHANGE — spec §2.C/§10.3 "frozen survives a restart").
+
   // c55 Batch A: the three POST brake twins (POST /api/stop-all, /confirm, /release) are now served
   // by the registry-derived REST mount (stop_all / confirm_stop_all / release_stop_all in the
   // mountRestRoutes only-set above). They run the SAME injected brake closures (stopAll / releaseStopAll)
-  // and broadcast the same frames. GET /api/stop-all/status stays inline (out of scope — Batch F).
+  // and broadcast the same frames.
   // Accepted body deltas (client ignores the body): confirm-while-not-frozen 409 -> 200 ok-narration.
 
   // c55 Batch C: POST /api/terminals/:pane_id/input (send_keys) and /resize (resize_pane) are now served
@@ -625,12 +607,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // resize_pane validates cols/rows as positive ints via zod (replacing the inline 400) and calls
   // manager.resize. Accepted deltas (client ignores the body): inline 404 -> 200 ok, inline 400 -> zod 500.
 
-  // Web API to get terminal history (Batch F — kept inline; structured array body needs rest.toHttp).
-  app.get("/api/terminals/:id/history", (req, res) => {
-    const { id } = req.params;
-    const history = HistoryManager.getInstance().loadHistory(id);
-    res.json(history);
-  });
+  // c55 Batch F: GET /api/terminals/:id/history (the RAW history array) is now served by the
+  // registry-derived get_terminal_history def (mountRestRoutes only-set above) at GET
+  // /api/terminals/:pane_id/history (snake_case route segment lands directly on the snake zod key). The
+  // def reproduces HistoryManager.loadHistory(id) EXACTLY (same .janus_history.json read at
+  // process.cwd(), same maxCmds slice, RAW entries — NOT the concise get_pane_command_history prose) and
+  // rest.toHttp emits the raw array TOP-LEVEL — byte-identical to this inline body.
 
   // c55 Batch C: POST /api/terminals/:pane_id/history/clear is now served by the registry-derived
   // clear_history def (mountRestRoutes only-set above), ALWAYS_ALLOWED (preserving the inline route's
@@ -1254,6 +1236,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       stopAll,
       releaseStopAll,
       isFrozen: () => coreState.frozen,
+      // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
+      // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
+      runningPaneIds,
+      posturePayloadForPane,
       audit: (row) => {
         if (!store) return;
         let argsRedacted: string | null = null;
@@ -1351,6 +1337,24 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "handoff_context_between_panes",
       "apply_orchestration_recipe",
       "create_pane",
+      // c55 Batch F — hard structured page-load READS. Each rides the Batch-E rest.toHttp primitive to
+      // emit a structured body the flat {output:string} cannot carry, and each inline GET twin is
+      // deleted below in the SAME change (Express keeps the first-registered handler, so a stale inline
+      // route would silently mask the cutover).
+      //   list_panes           GET /api/terminals               — the FLAT per-pane array setTerminals()
+      //     consumes (id/cwd/command/backfill[raw ANSI]/output[stripped tail]/status/permissions_mode/
+      //     tool_preset/session_id/context_size/effective_gates[16]/posture). Field-for-field identical
+      //     to the legacy inline body. The handler is SURFACE-AWARE: voice still narrates the project/
+      //     pane TREE (manager.listPanes()); only the rest surface builds the flat array, emitted
+      //     top-level by toHttp (NOT wrapped in {output}).
+      //   get_stop_all_status  GET /api/stop-all/status         — the boot-restore snapshot {frozen,
+      //     running}; running = runningPaneIds() iff frozen. ALWAYS_ALLOWED, rest-only. Read once on
+      //     load to restore the FROZEN banner before any WS frame ({type:'frozen'} only fires on change).
+      //   get_terminal_history GET /api/terminals/:pane_id/history — the RAW HistoryManager array
+      //     (full output per entry; NOT the concise/redacted get_pane_command_history prose). rest-only.
+      "list_panes",
+      "get_stop_all_status",
+      "get_terminal_history",
     ]),
   });
 

@@ -93,6 +93,14 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   resize_pane: new Set<Surface>(["rest"]),
   clear_history: new Set<Surface>(["rest"]),
   clear_exited: new Set<Surface>(["rest"]),
+
+  // ── c55 Batch F: NEW rest-only STRUCTURED page-load READS (no voice twin BY DESIGN) ─────────────
+  // Both converge an inline GET route whose structured body the flat {output:string} cannot carry; they
+  // ride the rest.toHttp primitive. get_stop_all_status is the boot-restore snapshot {frozen,running};
+  // get_terminal_history is the RAW history array (the voice history read get_pane_command_history emits
+  // PROSE, so it is a separate def — not reused). No voice tool is planned for either.
+  get_stop_all_status: new Set<Surface>(["rest"]),
+  get_terminal_history: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
