@@ -20,7 +20,8 @@
 | File | Responsibility |
 |---|---|
 | `python/synthesizer/synth.py` | Pure `synthesize(tiers, cfg, now) -> brief`. Adaptive-extractive logic (D2). No I/O, no clock/env/fs reads (I6). |
-| `python/synthesizer/__main__.py` | Stdio dispatch shell: read NDJSON lines → `handle(msg)` → write NDJSON. UTF-8 hardened. stdout = protocol only, stderr = logs. |
+| `python/synthesizer/dispatch.py` | Importable stdio dispatch logic: `handle(msg)` (pure message dispatcher) + `main()` (read NDJSON lines → `handle` → write NDJSON; UTF-8 hardened; stdout = protocol only, stderr = logs). |
+| `python/synthesizer/__main__.py` | Thin entry the TS client spawns: bootstraps sys.path, calls `dispatch.main()`. |
 | `python/synthesizer/tests/test_synth.py` | `unittest` golden tests for `synth.py` (budget reallocation, dedup, ranking, partial/empty, budget cap, determinism). |
 | `python/synthesizer/tests/test_dispatch.py` | `unittest` tests for `__main__.handle()` (ping/synthesize/bad-version/bad-op/synth-failure). |
 | `src/memory/pythonClient.ts` | The daemon client: interpreter discovery, script-dir resolver, UTF-8 spawn, NDJSON framing + `id` correlation, per-request expiry, `ping` handshake, respawn + circuit breaker, `available()` / `synthesizerState()`. |
@@ -471,8 +472,11 @@ git commit -m "feat(memory): P0b pure python synthesizer (adaptive-extractive, s
 ## Task 3: The stdio dispatch loop (Python)
 
 **Files:**
-- Create: `python/synthesizer/__main__.py`
+- Create: `python/synthesizer/dispatch.py` (importable: `handle()` + `main()` — the testable logic)
+- Create: `python/synthesizer/__main__.py` (thin entry; this is the file the TS client spawns)
 - Test: `python/synthesizer/tests/test_dispatch.py`
+
+> Why the split: Python reserves the module name `__main__` for the currently-running entry module, so a test cannot `import __main__` to reach `python/synthesizer/__main__.py` — it would import the test runner's own main. Putting `handle()`/`main()` in `dispatch.py` makes them importable; `__main__.py` is a one-line entry that the daemon-spawn launches.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -484,7 +488,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import __main__ as dispatch  # noqa: E402
+import dispatch  # noqa: E402
 
 CFG = {"totalBudgetChars": 4800,
        "weights": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05},
@@ -531,17 +535,18 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `py -3 -m unittest python.synthesizer.tests.test_dispatch -v` *(or rerun the discover command from Task 2)*
-Expected: FAIL — `__main__` has no attribute `handle`.
+Run: `py -3 -m unittest discover -s python/synthesizer/tests -p "test_*.py" -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'dispatch'`.
 
-- [ ] **Step 3: Write `python/synthesizer/__main__.py`**
+- [ ] **Step 3: Write `python/synthesizer/dispatch.py` (the importable logic)**
 
 ```python
-"""Stdio dispatch shell for the Janus context synthesizer (P0b).
+"""Stdio dispatch logic for the Janus context synthesizer (P0b).
 
 Protocol: one JSON object per line on stdin → one JSON object per line on stdout
 (NDJSON). stdout is PROTOCOL ONLY; all logs/tracebacks go to stderr. Correlate by `id`.
-Runs as a long-lived warm daemon; loops until stdin EOF.
+`main()` runs a long-lived warm daemon, looping until stdin EOF. `handle()` is the pure
+message dispatcher (importable + unit-testable).
 """
 import json
 import os
@@ -593,7 +598,20 @@ def main():
         resp = handle(msg)
         sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+```
 
+- [ ] **Step 3b: Write `python/synthesizer/__main__.py` (the thin spawn entry)**
+
+```python
+"""Entry point the TS client spawns: `python -X utf8 -u <dir>/synthesizer/__main__.py`.
+Bootstraps the synthesizer dir onto sys.path so `import dispatch` resolves whether launched
+as a file path (sys.path[0] = this dir) or via `-m`, then runs the daemon loop.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dispatch import main  # noqa: E402
 
 if __name__ == "__main__":
     main()
@@ -607,7 +625,7 @@ Expected: PASS (all synth + dispatch tests OK).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add python/synthesizer/__main__.py python/synthesizer/tests/test_dispatch.py
+git add python/synthesizer/dispatch.py python/synthesizer/__main__.py python/synthesizer/tests/test_dispatch.py
 git commit -m "feat(memory): P0b stdio dispatch loop (NDJSON ping/synthesize) + tests"
 ```
 
@@ -619,7 +637,7 @@ git commit -m "feat(memory): P0b stdio dispatch loop (NDJSON ping/synthesize) + 
 - Create: `src/memory/pythonClient.ts`
 - Test: `tests/test_memory_python_client.ts`
 
-This task delivers the client with a **single spawn** (no respawn/breaker yet — Task 5 adds those). The transport is injectable so framing/correlation/timeout are unit-testable without a real process.
+This task delivers the client's full spawn lifecycle — interpreter-candidate iteration (via the ping-timeout, per D4 discovery order), crash-respawn with exponential backoff, NDJSON framing, `id` correlation, and the per-request expiry. The **circuit breaker** (the storm cap) is the only piece deferred to Task 5. The transport is injectable (`spawnImpl`) so the whole lifecycle is unit-testable without a real process.
 
 - [ ] **Step 1: Write the failing test**
 
