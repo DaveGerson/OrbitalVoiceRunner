@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "tsx server.ts",
     "predev": "npm run typecheck && npm run test:unit",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && node scripts/copy-python.mjs",
     "start": "node dist/server.cjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit",
     "test:unit": "tsx --test --test-force-exit tests/*.ts",
+    "test:py": "tsx scripts/run-pytests.ts",
     "test:e2e": "playwright test",
     "setup": "npm install && npm run typecheck && npm run test:unit && npm run build && npm run e2e:install",
     "e2e:install": "playwright install chromium",

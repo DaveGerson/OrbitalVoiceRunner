@@ -23,6 +23,7 @@ dist-tmp/
 # Python bytecode
 __pycache__/
 *.pyc
+python/**/__pycache__/
 
 # Playwright e2e
 /test-results/
