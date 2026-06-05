@@ -21,9 +21,17 @@ const TIERS: MemoryTiers = {
 function delay(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
 test("real python daemon: ping + one synthesize round-trip → python brief, budget respected", { skip: !haveInterpreter() && "no Python interpreter found" }, async () => {
-  const client = createPythonSynthClient({ moduleDir: process.cwd(), repoRoot: process.cwd() });
-  // wait for the eager ping handshake to land
-  for (let i = 0; i < 50 && !client.available(); i++) await delay(20);
+  // Generous timeouts: this is a REAL process spawn that runs amid the full parallel test suite,
+  // where a loaded Windows box can take >1s for python cold-start + handshake. The pingTimeout is
+  // raised so the candidate-iteration logic doesn't prematurely advance off a slow-but-healthy
+  // daemon, and requestExpiry so a busy round-trip still resolves. None of this changes prod
+  // behavior (prod uses the defaults via the server wiring) — it only de-flakes the integration test.
+  const client = createPythonSynthClient({
+    moduleDir: process.cwd(), repoRoot: process.cwd(),
+    pingTimeoutMs: 10_000, requestExpiryMs: 10_000,
+  });
+  // wait for the eager ping handshake to land (up to ~6s under suite load)
+  for (let i = 0; i < 300 && !client.available(); i++) await delay(20);
   assert.equal(client.available(), true, "daemon should be available after the ping handshake");
 
   const res = await client.request(TIERS, DEFAULT_MEMORY_CONFIG, 1733443200000);
