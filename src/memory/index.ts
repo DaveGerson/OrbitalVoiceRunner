@@ -1,18 +1,57 @@
-// src/memory/index.ts — the public facade. P0a synthesizes via the deterministic fallback;
-// P0b will route to the Python synthesizer here, falling back to assembleBrief on timeout/error.
 import { WorldModel, type WorldModelDeps } from "./worldModel";
 import { BreadcrumbRing } from "./breadcrumbs";
 import { assembleBrief } from "./assembler";
 import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb } from "./types";
+import type { PythonSynthClient } from "./pythonClient";
 
 export { WorldModel } from "./worldModel";
 export { BreadcrumbRing } from "./breadcrumbs";
 export * from "./types";
+export * from "./pythonClient";
+
+/** Latest-wins predicate (invariant I3): a brief is only injectable if its pane is still the focus. */
+export function briefIsForActivePane(briefActivePaneId: string | null, currentActivePaneId: string | null): boolean {
+  return briefActivePaneId === currentActivePaneId;
+}
 
 export class MemoryService {
-  constructor(private wm: WorldModel, private cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG) {}
+  constructor(
+    private wm: WorldModel,
+    private cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG,
+    private pythonClient?: PythonSynthClient,
+    private timeoutMs: number = 150,
+  ) {}
+
+  /** Synchronous deterministic fallback — unchanged P0a path (REST/tests + the race else-branch). */
   synthesize(activePaneId: string | null, now: number): SynthesizedBrief {
     return assembleBrief(this.wm.getTiers(activePaneId, now), this.cfg, now);
+  }
+
+  /** P0b: race the Python daemon (≤timeoutMs) against the in-process floor; TS owns `source` (I1/I4). */
+  async synthesizeAsync(activePaneId: string | null, now: number): Promise<SynthesizedBrief> {
+    const tiers = this.wm.getTiers(activePaneId, now);
+    const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
+    const client = this.pythonClient;
+    if (!client || !client.available()) return fallback();
+    try {
+      const timeout = new Promise<null>((res) => { const t = setTimeout(() => res(null), this.timeoutMs); if (typeof (t as any).unref === "function") (t as any).unref(); });
+      const raced = await Promise.race([client.request(tiers, this.cfg, now), timeout]);
+      if (raced && raced.ok) {
+        return {
+          text: raced.brief.text,
+          perTierChars: raced.brief.perTierChars as Record<string, number>,
+          activePaneId: raced.brief.activePaneId,
+          source: "python",
+        };
+      }
+    } catch {
+      // never let a client error escape — the floor always answers
+    }
+    return fallback();
+  }
+
+  synthesizerState(): "python" | "fallback" {
+    return this.pythonClient?.synthesizerState() ?? "fallback";
   }
 }
 
@@ -22,12 +61,14 @@ export interface CreatedMemory {
   addBreadcrumb: (b: Breadcrumb) => void;
 }
 
-/** Build the wired memory service from the live manager/store + redactor. */
+/** Build the wired memory service. `pythonClient`/`timeoutMs` are optional (P0b); absent ⇒ pure fallback. */
 export function createMemoryService(
   deps: Omit<WorldModelDeps, "breadcrumbs">,
   cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG,
+  pythonClient?: PythonSynthClient,
+  timeoutMs: number = 150,
 ): CreatedMemory {
   const breadcrumbs = new BreadcrumbRing(cfg);
   const wm = new WorldModel({ ...deps, breadcrumbs });
-  return { service: new MemoryService(wm, cfg), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
+  return { service: new MemoryService(wm, cfg, pythonClient, timeoutMs), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
 }
