@@ -32,7 +32,7 @@ export const listArchivedPanes: ActionDef<typeof NoParams> = {
     }),
   },
   handler: (_args, ctx): ActionResult => {
-    const archived = ctx.manager.ledger.listArchived().map((a: any) => ({
+    const archived = ctx.manager.ledger.listArchived().map((a) => ({
       pane_id: a.pane.pane_id,
       name: a.pane.name,
       project_id: a.project_id,
