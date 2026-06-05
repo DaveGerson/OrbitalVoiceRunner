@@ -72,6 +72,8 @@ export interface SetPanePermissionsParams { paneId: string; projectId: string; p
  * #3): a confirm-after-restart must apply exactly this text, not whatever the model says next.
  */
 export interface UpdateMetadataParams { op: "amend" | "delete"; noteId: string; text?: string; }
+/** Params captured by the close_pane closure (terminate + recoverable archive). */
+export interface ClosePaneParams { paneId: string; projectId?: string; }
 
 /**
  * The serializable intent of a deferred action: capability + a capability-specific param bag, plus
@@ -230,6 +232,19 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
         deps.manager.ledger.deleteNote(p.noteId);
         deps.broadcastLedgerUpdate();
         return `Note ${p.noteId} deleted.`;       // EXACT — matches server.ts:2528
+      };
+    }
+    case "close_pane": {
+      // wsm-e2e-pinned-5h0 (A-voice): rebuild the deferred terminate+archive. stopAndArchivePane is
+      // async; fire-and-forget (the rebuild has no awaiting seam) and broadcast on completion —
+      // mirrors the panes_write closeEffect. manager.onClosed (wired in server.ts) publishes the
+      // turn-gated "closed" pane signal when the archive lands.
+      const p = intent.params as unknown as ClosePaneParams;
+      return () => {
+        Promise.resolve(deps.manager.stopAndArchivePane(p.projectId ?? "", p.paneId))
+          .then(() => { deps.broadcastLedgerUpdate(); deps.broadcast({ type: "terminals_updated" }); })
+          .catch((e: unknown) => console.error(`[close_pane replay] failed for ${p.paneId}:`, e));
+        return `Exiting and archiving pane ${p.paneId}. It's recoverable from the archive.`;
       };
     }
     default:

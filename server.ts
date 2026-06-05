@@ -600,6 +600,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     try { paneSignalBus.publish({ paneId: terminalId, kind: "created" }); }
     catch (e) { console.error("[onReady] pane-signal publish failed:", e); }
   };
+  // wsm-e2e-pinned-5h0 (A-voice): the operator-initiated exit+archive completion edge. Publishes a
+  // turn-gated "closed" pane signal (voice/index.ts defers it mid-utterance) so Janus confirms the
+  // close only in a gap. Fires for BOTH the close_pane voice tool and the UI Exit button (both route
+  // through manager.stopAndArchivePane), so the confirmation is consistent across surfaces.
+  manager.onClosed = (terminalId) => {
+    try { paneSignalBus.publish({ paneId: terminalId, kind: "closed" }); }
+    catch (e) { console.error("[onClosed] pane-signal publish failed:", e); }
+  };
 
   // Web API to get terminals state
   app.get("/api/terminals", (req, res) => {

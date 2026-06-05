@@ -1006,9 +1006,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       };
 
       state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
-        // B1 (phase-2 gate): ONLY the async-spawn "ready" signal is turn-gated. All other kinds
-        // (idle/error/prompt/exited) keep today's immediate-push behavior verbatim.
-        if (sig.kind === "created") {
+        // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
+        // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
+        // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
+        // immediate-push behavior verbatim.
+        if (sig.kind === "created" || sig.kind === "closed") {
           const d = shouldSpeakReadyAck(ackState());
           if (d === "suppress") return;                       // barge-in -> drop the "ready".
           if (d === "defer") {                                // mid-utterance -> queue + re-arm.

@@ -284,9 +284,78 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// close_pane — GATED (Ask) graceful pane EXIT + archive (wsm-e2e-pinned-5h0 A-voice).
+//
+// The voice route for "exit it and archive it" / "shut that pane down". Without it the model had no
+// closure tool and degraded to propose_command{kind:'shell', instruction:'exit'} (typed into the
+// shell → clarify-loop). It mirrors create_pane's gateOrDefer shape EXACTLY (durable Ask-defer; the
+// intent params are in lockstep with ClosePaneParams in src/actionEffects.ts so a deferred-then-
+// confirmed close survives a restart). The effect calls the EXISTING manager.stopAndArchivePane
+// (terminate + recoverable archive — the same backend the UI Exit button and REST /stop use).
+// ─────────────────────────────────────────────────────────────────────────────
+const ClosePaneParams = z.object({
+  pane_id: z.string(),
+  project_id: z.string().optional(),
+});
+
+export const closePane: ActionDef<typeof ClosePaneParams> = {
+  name: "close_pane",
+  description:
+    "Exit (terminate) a pane's agent/process and ARCHIVE the pane — recoverable; the operator can restore it from the archive later. THIS is the tool for 'exit it and archive it', 'close that pane', 'shut it down'. Do NOT type 'exit' as a shell command — call this instead. Gated 'Ask' by default: it stages a confirmation the operator approves by voice ('confirmed'), so do not ask again yourself — just call it. Targets the active project unless you pass project_id.",
+  params: ClosePaneParams,
+  capability: "close_pane",
+  readOnly: false,
+  surfaces: new Set(["voice"]),
+  handler: (args, ctx): ActionResult => {
+    const paneId = args.pane_id;
+    const projectId =
+      (args.project_id && args.project_id.trim()) ||
+      ctx.manager.ledger.getActiveProject?.()?.id ||
+      "";
+
+    // The terminate+archive effect. stopAndArchivePane is ASYNC (it awaits full ConPTY teardown);
+    // per B1 we do NOT block the voice loop on it — fire it, and let manager.onClosed publish the
+    // turn-aware "closed" pane signal on completion (Janus confirms in a gap, defers mid-utterance,
+    // suppresses on barge-in — the same phase-2 gate as the create "ready" ack).
+    const closeEffect = (): string => {
+      Promise.resolve(ctx.manager.stopAndArchivePane(projectId, paneId))
+        .then(() => { ctx.broadcastLedgerUpdate(); ctx.broadcastTerminalsUpdated(); })
+        .catch((e) => console.error(`[close_pane] stopAndArchivePane failed for ${paneId}:`, e));
+      // If the closing pane is the active WRITE target, clear it NOW — it is going away, and a stale
+      // active pointer would refuse the operator's next propose_command (isPaneActiveForWrite).
+      if (ctx.getActivePaneId() === paneId) ctx.setActivePane(null);
+      return `Exiting and archiving pane ${paneId}. It's recoverable from the archive.`;
+    };
+
+    // kzt: persist the close INTENT (paneId + projectId) so a deferred close survives a restart and
+    // rebuilds the SAME effect on confirm. Keys in lockstep with ClosePaneParams (src/actionEffects.ts).
+    const g = ctx.gateOrDefer("close_pane", paneId, `Exit and archive pane ${paneId}`, closeEffect, {
+      ...(ctx.versionStamp ?? {}),
+      paneId,
+      projectId,
+    });
+
+    if (g.disposition === "forbidden") {
+      return {
+        kind: "ok",
+        output: `Error: the 'close_pane' capability is gated Off; exiting panes is forbidden by policy.`,
+      };
+    }
+    if (g.disposition === "deferred") {
+      return {
+        kind: "ok",
+        output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to exit and archive the pane.`,
+      };
+    }
+    return { kind: "ok", output: closeEffect() };
+  },
+};
+
 /** The PANES_WRITE group registry slice. */
 export const PANES_WRITE_ACTIONS: ActionDef[] = [
   switchActivePane,
   updateDraftPrompt,
   createPane,
+  closePane,
 ];
