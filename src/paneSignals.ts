@@ -1,7 +1,7 @@
 import { SHELL_PROMPT } from "./statusConstants";
 import { redactSecrets } from "./terminal";
 
-export type PaneSignalKind = "idle" | "error" | "prompt" | "exited" | "created" | "running" | "quiescing";
+export type PaneSignalKind = "idle" | "error" | "prompt" | "exited" | "created" | "running" | "quiescing" | "closed";
 
 export interface PaneSignal {
   paneId: string;
@@ -44,6 +44,10 @@ export function classifyPaneOutput(cleanText: string): OutputClass | null {
 export function formatPaneSignal(s: PaneSignal): string {
   const verb =
     s.kind === "created" ? "is up and ready"
+    // "closed" is the OPERATOR-initiated exit+archive completion (close_pane / UI Exit), distinct
+    // from "exited" (a pane that ended on its own, detected by the state machine). It is turn-gated
+    // in voice/index.ts so the confirmation never talks over the operator.
+    : s.kind === "closed" ? "is exited and archived (recoverable)"
     : s.kind === "idle" ? "went idle (finished)"
     : s.kind === "error" ? "reported an error"
     : s.kind === "prompt" ? "is waiting at a prompt"

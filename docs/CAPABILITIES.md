@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**55** actions across **17** gated capabilities, plus the always-allowed group.
+**56** actions across **18** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -39,6 +39,16 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `apply_orchestration_recipe` | voice / rest | no | Apply a pre-configured template layout suite (such as full-stack-web or python-worker) to standard workspaces |
+
+## Close a pane
+
+- **Capability:** `close_pane`
+- **Default gate:** Ask
+- **Category:** Destructive
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `close_pane` | voice | no | Exit (terminate) a pane's agent/process and ARCHIVE the pane — recoverable; the operator can restore it from the archive later |
 
 ## Compose a draft or handoff
 
@@ -234,5 +244,4 @@ These capability rows exist in the matrix (so they are tunable and reserved) but
 | `add_watch_rule` | Add an automation rule | Ask | Spawning work |
 | `archive_pane` | Archive an exited pane | Auto | Orientation (low-risk) |
 | `clear_history` | Clear a pane's history | Ask | Destructive |
-| `close_pane` | Close a pane | Ask | Destructive |
 | `deliver_handoff` | Hand a prompt to another pane | Ask | Acting in a pane |
