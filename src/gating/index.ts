@@ -1,0 +1,722 @@
+/**
+ * src/gating/index.ts — the SHARED GATING / SAFETY CORE (DBT5 / dec-4).
+ *
+ * This is the behaviour-preserving carve of the capability-gate resolver, the deferred-action +
+ * pending-approval stores (with their durable boot hydration), the effective-posture surface, the
+ * single resolve choke-point (applyResolution), the TWO-STAGE EMERGENCY STOP-ALL brake, and the TTL
+ * sweep out of `startServer()`. It is the safety substrate the REST surface AND the voice/WS path
+ * BOTH consume — so it MUST stay ONE cohesive module. Splitting applyResolution /
+ * broadcastTerminalsUpdated across a REST/voice boundary would re-introduce exactly the coupling this
+ * decomposition removes (they are genuinely shared), so they live together here.
+ *
+ * Coupling flows ONLY through the injected `deps` bag. This module imports the pure helpers it already
+ * used (pendingApprovals / pendingActions / actionEffects / actionPendingPayload / gateSurface /
+ * handoffFlow / types) and the concrete types of its deps — NEVER server.ts.
+ *
+ * INVARIANTS preserved verbatim:
+ *  - The pending stores are CONSTRUCTED inside createGating and EXPOSED so the REST ctxFactory + the
+ *    voice ActionContext inject the SAME instances (one set of pending state, not two).
+ *  - The boot hydration loop (buildActionRun + checkActionVersion quarantine) is kept EXACTLY, or
+ *    survivors mis-rehydrate after a restart.
+ *  - `broadcastTerminalsUpdated` reads coreState.frozen / coreState.activePaneId by reference, so a WS
+ *    `set_active_pane` write is immediately visible to the posture surface across the boundary.
+ *  - `pushApprovalNarration` is an INJECTED slot (voice owns the live session), so gating NEVER imports
+ *    voice. For now server.ts passes its existing inline pushApprovalNarration in; dec-5 moves the
+ *    definition into voice and injects it from there.
+ *  - The frozen short-circuit (applyFrozenShortCircuit) stays the ONE choke-point in
+ *    effectiveCapabilityGateFor; the matrix is never mutated, so Release re-exposes it exactly.
+ */
+
+import { OrchestratorManager, redactSecrets } from "../terminal";
+import {
+  PendingApprovalStore,
+  resolveDecision,
+  resolveCapabilityGateWithContext,
+  loadShellAllowlist,
+  decideSweepAction,
+  renderResumptionLine,
+  applyFrozenShortCircuit,
+  APPROVAL_GRACE_MS,
+  type EffectiveMode,
+  type ResolveMode,
+  type ResolveReason,
+} from "../pendingApprovals";
+import { PendingActionStore } from "../pendingActions";
+import { buildActionRun, checkActionVersion } from "../actionEffects";
+import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
+import { applyHandoffFlipOnResolve, type HandoffResolveReason } from "../handoffFlow";
+import {
+  deriveEffectiveGates,
+  derivePostureWord,
+  ALL_CAPABILITIES,
+  type EffectiveMode as GateSurfaceMode,
+} from "../gateSurface";
+import type { GateValue, CapabilityGate } from "../types";
+import type { JanusStore } from "../store/sqliteStore";
+import type { AnnouncementBus } from "../announcementBus";
+import type { CoreState } from "../core/coreState";
+
+/**
+ * The gating core's injected dependency bag — everything the moved closures used from `startServer()`
+ * scope, threaded explicitly so the SAME shared cells are mutated across the boundary.
+ *
+ *  - manager:                   the OrchestratorManager (terminals, ledger, settings, globalPermissionsMode).
+ *  - store:                     the durable JanusStore (or null on the legacy / failed-init path).
+ *  - broadcast / broadcastLedgerUpdate: the WS notification sinks.
+ *  - coreState:                 the shared mutable state (frozen / activePaneId / activeLiveSession / lastStopAllFailed).
+ *  - announcementBus:           the proactive-feedback sink (earcons + on-screen stack).
+ *  - pushApprovalNarration:     INJECTED — narrates a system event into the live session (voice owns it; dec-5 moves the def into voice).
+ *  - redact:                    redactSecrets, applied before any instruction/summary is narrated/broadcast.
+ *  - sanitizeSettingsForClient: passed through to buildActionRun's deps for the rehydrated set_*_permissions effects.
+ *  - addCommand:                the HistoryManager singleton's addCommand (server.ts HistoryManager is not importable);
+ *                               the approved-write path records the command in command history exactly as before.
+ */
+export interface GatingDeps {
+  manager: OrchestratorManager;
+  store: JanusStore | null;
+  broadcast: (msg: any) => void;
+  broadcastLedgerUpdate: () => void;
+  coreState: CoreState;
+  announcementBus: AnnouncementBus;
+  pushApprovalNarration: (session: any, text: string) => void;
+  redact: (s: string) => string;
+  sanitizeSettingsForClient: (settings: any) => any;
+  addCommand: (terminalId: string, command: string) => void;
+}
+
+/** The cohesive seam createGating returns. The pending stores + the constants are exposed so the
+ *  server-owned consumers (REST ctxFactory, voice ActionContext, dispatchProposal, the close handler)
+ *  reference the SAME instances. */
+export interface Gating {
+  effectiveModeFor: (targetId: string) => EffectiveMode;
+  effectiveCapabilityGateFor: (paneId: string | null | undefined, capability: CapabilityGate) => GateValue;
+  gateCapability: (capability: CapabilityGate, paneId: string | null) => { forbidden: boolean; gate: GateValue };
+  gateOrDefer: (
+    capability: CapabilityGate,
+    paneId: string | null,
+    summary: string,
+    run: () => string,
+    params?: Record<string, unknown>,
+    requestedMode?: string
+  ) => { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string };
+  effectiveGatesForPane: (paneId: string) => Record<CapabilityGate, GateValue>;
+  posturePayloadForPane: (paneId: string) => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> };
+  allPanePostures: () => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> }[];
+  broadcastTerminalsUpdated: () => void;
+  runningPaneIds: () => string[];
+  stopAll: (kill: boolean) => Promise<string[]>;
+  killAllPanes: () => Promise<{ killed: string[]; failed: string[] }>;
+  releaseStopAll: () => void;
+  applyResolution: (messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) => ReturnType<typeof resolveDecision>;
+  reannounceSurvivors: (session: any) => void;
+  pendingApprovals: PendingApprovalStore;
+  pendingActions: PendingActionStore;
+  sweepExpiredApprovals: (now?: number) => void;
+  startSweepTimer: () => ReturnType<typeof setInterval>;
+  /** The read-only first-token allowlist for kind:"shell" — consumed by the (server-owned) dispatchProposal decideProposal call. */
+  shellAllowlist: ReturnType<typeof loadShellAllowlist>;
+  /** TTL for an unresolved approval — consumed by the (server-owned) dispatchProposal pendingApprovals.add. */
+  APPROVAL_TTL_MS: number;
+  /** Sweep cadence — exposed for symmetry; the timer is armed via startSweepTimer. */
+  APPROVAL_SWEEP_MS: number;
+}
+
+/**
+ * createGating(deps) — build the shared gating/safety core plus its private, per-server pending state.
+ * The pending stores are constructed here (and exposed) so EVERY surface (REST + voice) injects the
+ * SAME instances. The boot hydration loop runs INSIDE here, AFTER the stores are built and BEFORE the
+ * first WS connection / sweep tick — exactly the order it ran inline in startServer().
+ */
+export function createGating(deps: GatingDeps): Gating {
+  const {
+    manager,
+    store,
+    broadcast,
+    broadcastLedgerUpdate,
+    coreState,
+    announcementBus,
+    pushApprovalNarration,
+    redact,
+    sanitizeSettingsForClient,
+    addCommand,
+  } = deps;
+  // `redact` is part of the canonical deps bag for symmetry with the other module carves; the moved
+  // code calls the imported `redactSecrets` directly (server passes `redact: redactSecrets`, so they
+  // are the same identity). Reference it so an unused-binding lint stays quiet without changing behavior.
+  void redact;
+
+  // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
+  // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can
+  // add durability/atomicity without a rewrite (see src/pendingApprovals.ts §8).
+  // WS-M (bead wsm-e2e-pinned-nzt): inject the durable JanusStore so pending approvals SURVIVE a
+  // process restart, while the N-1 atomic-claim gate is backed by the durable SQL claim. When the
+  // store is null (JANUS_LEDGER_BACKEND=legacy or store init failed) the class is pure in-memory,
+  // byte-for-byte as before — no behavioral change on the legacy path.
+  const pendingApprovals = new PendingApprovalStore(store);
+  // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions /
+  // update_metadata). On the Ask tier these stage a side-effect here and run exactly once on operator
+  // confirm — separate from the pane-write PendingApprovalStore so the two never entangle.
+  // (src/pendingActions.)
+  // kzt (wsm-e2e-pinned-kzt): inject the durable JanusStore so a deferred action SURVIVES a process
+  // restart. The run() closure is non-serializable, so add() persists the action's INTENT
+  // (capability + params); the boot loop below rebuilds run() via buildActionRun. store===null
+  // (JANUS_LEDGER_BACKEND=legacy / store init failed) => pure in-memory, byte-for-byte as before.
+  const pendingActions = new PendingActionStore(store);
+  let pendingActionSeq = 0;
+
+  // kzt: rebuild deferred-action survivors from durable intent. The run() closure is non-serializable,
+  // so we persisted the INTENT (capability+params) and rebuild it here, bound to the LIVE manager/
+  // broadcast (a deserialized closure could never re-bind them — they are fresh in this startServer()
+  // closure). Re-staging via add() carries the existing durable row (INSERT OR REPLACE is a no-op
+  // rewrite) and makes the survivor confirmable/cancellable exactly as before the restart. Hydration
+  // only REBUILDS + re-stages run; it never INVOKES it (effects run on explicit confirm only). This
+  // runs AFTER manager + pendingActions are built and BEFORE the first WS connection / sweep tick.
+  for (const row of pendingActions.hydrateIntents()) {
+    let params: Record<string, unknown> = {};
+    try { params = JSON.parse(row.params); } catch { /* corrupt -> empty params; run() degrades gracefully */ }
+    const versionCheck = checkActionVersion({
+      actionName: (params as { actionName?: string }).actionName,
+      schemaHash: (params as { schemaHash?: string }).schemaHash,
+    });
+    if (!versionCheck.ok) {
+      // PLM3: the staged def drifted (renamed/moved/reshaped) or is unstamped/legacy -> do NOT blindly
+      // rebuild+replay it against a possibly-mismatched effect. Quarantine: skip re-staging; record it
+      // so the operator can re-issue. (A future boot-prune sweep removes quarantined rows.)
+      if (store) {
+        try {
+          store.recordActivity({
+            type: "permission_changed", project_id: "default_project", pane_id: null,
+            summary: `QUARANTINED deferred ${row.capability} (${versionCheck.reason}): ${row.summary}`,
+            payload: { capability: row.capability, action: "quarantined", reason: versionCheck.reason, action_id: row.id },
+          });
+        } catch { /* audit best-effort */ }
+      }
+      continue;
+    }
+    const run = buildActionRun(
+      { capability: row.capability, params },
+      { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
+    );
+    pendingActions.add({
+      id: row.id, capability: row.capability, summary: row.summary, params,
+      timestamp: row.timestamp, run, ttlMs: Math.max(0, row.expires_at - row.timestamp),
+    });
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed", project_id: "default_project", pane_id: null,
+          summary: `REHYDRATED deferred ${row.capability}: ${row.summary}`,
+          payload: { capability: row.capability, action: "rehydrated", action_id: row.id },
+        });
+      } catch { /* audit is best-effort */ }
+    }
+  }
+  // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
+  const shellAllowlist = loadShellAllowlist();
+  // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
+  const APPROVAL_TTL_MS = 5 * 60 * 1000;
+  const APPROVAL_SWEEP_MS = 30 * 1000;
+
+  // R3: a fresh client-content push delivers the spoken read-back / resolution result. The
+  // original call.id is consumed once by the non-blocking pending_approval response, so the
+  // outcome cannot be a 2nd sendToolResponse — it is an ephemeral interactive turn.
+  // M3: single-source effective-mode resolution. `globalPermissionsMode === "Inherit"` defers to
+  // the pane's own mode (HiTL default when the pane is unknown); otherwise the global override
+  // wins. Used by EVERY write path (dispatchProposal + handoff_context) so "gate a new write" =
+  // resolve the mode here, never re-derive it inline.
+  function effectiveModeFor(targetId: string): EffectiveMode {
+    if (manager.globalPermissionsMode === "Inherit") {
+      const term = manager.terminals[targetId];
+      return (term ? term.permissionsMode : "Human-in-the-Loop") as EffectiveMode;
+    }
+    return manager.globalPermissionsMode as EffectiveMode;
+  }
+
+  // Capability-gate resolution (design §3) with the SPOTLIGHT (director posture 2026-06-01:
+  // "trust follows focus"). Precedence: explicit per-pane override > spotlight (active pane +
+  // productive capability => Auto) > global default > Auto. The gate is AND-composed with
+  // effectiveMode inside decideProposal (a gate only TIGHTENS the mode). Resolution itself is the
+  // pure, unit-tested resolveCapabilityGateWithContext — keep this in lockstep with that function.
+  function effectiveCapabilityGateFor(paneId: string | null | undefined, capability: CapabilityGate): GateValue {
+    const globalGates = manager.settings.advanced?.capabilityGates;
+    let paneGate: GateValue | undefined;
+    if (paneId) {
+      const proj = manager.ledger.getActiveProject();
+      paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
+    }
+    const isActivePane = !!paneId && coreState.activePaneId === paneId;
+    const resolved = resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
+    // STOP-ALL Stage-1: the ONE place the `frozen` short-circuit is applied. While frozen every
+    // capability resolves Off; the matrix above is untouched, so Release re-exposes it exactly.
+    return applyFrozenShortCircuit(coreState.frozen, resolved);
+  }
+
+  // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
+  // (create_pane, set_pane_permissions, set_global_permissions, add_watch_rule, apply_recipe).
+  // These have no in-flight writeInput to defer, so the gate semantics are:
+  //   Off  -> forbidden (the safety-critical veto): returns a blocked result, no side effect.
+  //   Ask  -> proceed but flag `requiresConfirm` so the handler narrates "confirm?" to the
+  //           operator (v1: the side effect is applied and audited; full deferred-execution is
+  //           WS-F — see openQuestions). Off is the hard guarantee here.
+  //   Auto -> proceed silently.
+  // Returns null when allowed (caller proceeds), or a {forbidden} object the caller renders.
+  function gateCapability(capability: CapabilityGate, paneId: string | null): { forbidden: boolean; gate: GateValue } {
+    const gate = effectiveCapabilityGateFor(paneId, capability);
+    if (store) {
+      const activeProjectId = manager.ledger.activeProjectId || "default_project";
+      try {
+        store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `capability ${capability} gate=${gate}`, payload: { capability, gate, action: "exercise" } });
+      } catch { /* audit is best-effort */ }
+    }
+    return { forbidden: gate === "Off", gate };
+  }
+
+  // G1: gate a NON-PTY mutator with full Auto/Ask/Off semantics. Unlike gateCapability (which only
+  // enforced the Off veto and let Ask proceed), this DEFERS the side effect on Ask by staging
+  // `run` in pendingActions; the operator confirms via POST /api/actions/:id/confirm and the effect
+  // runs exactly once. Returns the disposition so the handler can answer the model appropriately.
+  //   { disposition: "run" }      -> Auto: caller invokes the effect now.
+  //   { disposition: "forbidden"} -> Off:  caller refuses.
+  //   { disposition: "deferred", actionId, summary } -> Ask: effect staged; caller tells the model
+  //                                it is awaiting operator confirmation (no side effect yet).
+  function gateOrDefer(
+    capability: CapabilityGate,
+    paneId: string | null,
+    summary: string,
+    run: () => string,
+    // kzt (wsm-e2e-pinned-kzt): the serializable INTENT params the `run` closure captured. When
+    // present (and a durable store is wired), pendingActions.add() persists them so the deferred
+    // action survives a restart; the boot loop rebuilds `run` from them via buildActionRun. Keep
+    // these keys in LOCKSTEP with the per-capability param shapes in src/actionEffects.ts.
+    params?: Record<string, unknown>,
+    // rbh (wsm-e2e-pinned-rbh): the mode the operator asked for, passed STRUCTURALLY by the two
+    // permission handlers (never parsed from the summary — R5). Forwarded to the confirm dialog as
+    // `requested_mode` so it can render a divergence "heads up" when the engine resolves tighter.
+    // Non-permission capabilities (create_pane) pass nothing → no mode rider.
+    requestedMode?: string
+  ): { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string } {
+    const gate = effectiveCapabilityGateFor(paneId, capability);
+    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+    if (gate === "Off") {
+      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `FORBIDDEN ${capability}: ${summary}`, payload: { capability, gate, action: "forbidden" } }); } catch {} }
+      return { disposition: "forbidden" };
+    }
+    if (gate === "Ask") {
+      const actionId = `act_${Date.now()}_${pendingActionSeq++}`;
+      pendingActions.add({ id: actionId, capability, summary, params, timestamp: Date.now(), run });
+      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `DEFERRED ${capability} (await confirm): ${summary}`, payload: { capability, gate, action: "deferred", action_id: actionId } }); } catch {} }
+      // rbh: enrich the confirm-dialog payload with the EFFECTIVE posture the engine WILL apply, not
+      // the nominal summary. paneId may be null for global actions (D2) — then we surface the resolved
+      // global mode + the global effective gate, no per-pane chip. The RESOLUTION is the pure
+      // resolveActionPendingPosture (src/actionPendingPayload) — the same override→spotlight→global
+      // precedence the chip uses (D1, server is the only authority), frozen-overlaid so the dialog
+      // matches the chip while STOP-ALL is engaged. It is extracted so the divergence truth (global
+      // Read-Only + pane Full Auto ⇒ LOCKED/Read-Only) is asserted at its SOURCE in
+      // tests/test_action_pending_payload.ts, not just rendered from a hand-fed mock.
+      const proj = manager.ledger.getActiveProject();
+      const targetTerm = paneId ? manager.terminals[paneId] : undefined;
+      const posture = resolveActionPendingPosture({
+        paneId,
+        capability,
+        globalMode: manager.globalPermissionsMode as GlobalMode,
+        paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
+        paneGates: paneId ? proj?.panes?.[paneId]?.capabilityGates : undefined,
+        globalGates: manager.settings.advanced?.capabilityGates,
+        isActivePane: !!paneId && coreState.activePaneId === paneId,
+        frozen: coreState.frozen,
+      });
+      broadcast({
+        type: "action_pending", actionId, capability, summary,
+        pane_id: paneId,
+        effective_gate: posture.effective_gate,
+        effective_mode: posture.effective_mode,
+        ...(posture.posture ? { posture: posture.posture } : {}),
+        ...(posture.effective_gates ? { effective_gates: posture.effective_gates } : {}),
+        ...(requestedMode ? { requested_mode: requestedMode } : {}),
+        global_override: manager.globalPermissionsMode !== "Inherit",
+      });
+      return { disposition: "deferred", actionId, summary };
+    }
+    // Auto
+    return { disposition: "run" };
+  }
+
+  // ── EFFECTIVE-POSTURE SERVER TRUTH (bead 8sq, spec §3 item 1 / §5) ─────────────────────────────
+  // The chips + popover render from SERVER truth — never client policy re-derivation. We resolve
+  // the 16 effective gate values + the derived posture word per pane here (reusing the pure
+  // gateSurface) and expose them in /api/terminals AND the terminals_updated broadcast. The frozen
+  // short-circuit is reflected because effectiveCapabilityGateFor (which deriveEffectiveGates mirrors)
+  // already returns Off while frozen — but deriveEffectiveGates is pure (no `frozen` arg), so we
+  // overlay the same applyFrozenShortCircuit here to keep the surface in lockstep with the resolver.
+  function effectiveGatesForPane(paneId: string): Record<CapabilityGate, GateValue> {
+    const globalGates = manager.settings.advanced?.capabilityGates;
+    const proj = manager.ledger.getActiveProject();
+    const paneGates = proj?.panes?.[paneId]?.capabilityGates;
+    const isActivePane = coreState.activePaneId === paneId;
+    const base = deriveEffectiveGates(paneGates, globalGates, isActivePane);
+    if (!coreState.frozen) return base;
+    // Frozen overlay — mirror the resolver's single-choke-point short-circuit on the surface.
+    const out = {} as Record<CapabilityGate, GateValue>;
+    for (const cap of ALL_CAPABILITIES) out[cap] = applyFrozenShortCircuit(true, base[cap]);
+    return out;
+  }
+  function posturePayloadForPane(paneId: string): { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> } {
+    const effective = effectiveGatesForPane(paneId);
+    const mode = effectiveModeFor(paneId) as GateSurfaceMode;
+    return { id: paneId, effective_gates: effective, posture: derivePostureWord(effective, mode) };
+  }
+  function allPanePostures() {
+    return Object.keys(manager.terminals).map((id) => posturePayloadForPane(id));
+  }
+  // Single helper so every pane-state mutation broadcasts the SAME shape: a terminals_updated frame
+  // carrying the per-pane posture payload (chips repaint from this without a /api/terminals refetch).
+  function broadcastTerminalsUpdated() {
+    broadcast({ type: "terminals_updated", postures: allPanePostures() });
+  }
+
+  // ── TWO-STAGE EMERGENCY STOP-ALL (bead 8sq, spec §2.C / §3) ───────────────────────────────────
+  //
+  // DELIBERATELY UNGATED — these are the ONE set of paths that do NOT route through
+  // gateOrDefer/effectiveCapabilityGateFor, and that is correct, not a regression. Capability
+  // gates only ever TIGHTEN; the stop-all brake is the inverse (de-escalation / withdrawing
+  // autonomy). A gate set to Off must never be able to FORBID an emergency halt — that would
+  // defeat the gate's own safety purpose. So an always-allowed brake is consistent with the gate
+  // model, not a bypass of it. (Mirrors the directional precedent in set_capability_gate: voice may
+  // always TIGHTEN/de-escalate, never LOOSEN.) Single source of truth shared by REST, WS, voice.
+  function runningPaneIds(): string[] {
+    return Object.entries(manager.terminals)
+      .filter(([, term]) => term.status !== "Exited") // union: 'Running'|'Exited'|'Idle'
+      .map(([id]) => id);
+  }
+
+  /**
+   * STOP-ALL stage routine.
+   *   Stage 1 (kill=false): set+persist `frozen` (gate resolver now short-circuits every capability
+   *     to Off), then CANCEL EVERYTHING IN-FLIGHT — reject all pending approvals (expire), expire all
+   *     deferred actions, halt running plans (paused) + enabled watch-rules (disabled). PANES AND
+   *     THEIR PTYs KEEP RUNNING (spec §2.C) — the freeze is reversible; only Release clears it.
+   *   Stage 2 (kill=true): terminate each running pane PTY via the existing term.stop() primitive.
+   *     The deliberate, irreversible step; valid only after a Stage-1 freeze.
+   * Returns the still-running pane ids (Stage 1) or the killed pane ids (Stage 2).
+   * QW4 (bead qw4): Stage 2 is now ASYNC and AWAITS the kills (Promise.allSettled), so the returned
+   * killed[] names panes that ACTUALLY stopped — not merely the panes we asked to kill. Panes whose
+   * stop() rejects are excluded from killed[] and surfaced separately (see killAllPanes / broadcast).
+   */
+  async function stopAll(kill: boolean): Promise<string[]> {
+    if (!kill) {
+      coreState.setFrozen(true);
+      // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
+      for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
+      // Expire every deferred non-PTY action (no side effect runs).
+      for (const a of [...pendingActions.all()]) pendingActions.expire(a.id);
+      // Halt running plans + enabled watch-rules (passive co-pilot state, no pane writes).
+      let ledgerChanged = false;
+      for (const plan of manager.ledger.plans) {
+        if (plan.status === "running") { plan.status = "paused"; ledgerChanged = true; }
+      }
+      for (const rule of manager.ledger.watchRules) {
+        if (rule.enabled) { rule.enabled = false; ledgerChanged = true; }
+      }
+      if (ledgerChanged) {
+        manager.ledger["save"]?.(true);
+        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+        broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+      }
+      const stillRunning = runningPaneIds();
+      if (store) {
+        try {
+          store.recordActivity({
+            type: "permission_changed",
+            project_id: manager.ledger.activeProjectId || "default_project",
+            pane_id: null,
+            summary: `STOP_ALL Stage 1: froze Janus + cancelled in-flight (${stillRunning.length} pane(s) still running)`,
+            payload: { action: "stop_all_freeze", running: stillRunning },
+          });
+        } catch { /* store optional */ }
+      }
+      broadcast({ type: "frozen", frozen: true, running: stillRunning });
+      broadcastTerminalsUpdated();
+      return stillRunning;
+    }
+    // Stage 2: kill the PTYs. QW4 — AWAIT every stop() (Promise.allSettled, mirroring close()'s
+    // awaited per-term stop) so we report panes that ACTUALLY stopped, not the ones we asked to.
+    const { killed, failed } = await killAllPanes();
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: null,
+          summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)${failed.length ? `; ${failed.length} kill(s) FAILED` : ""}`,
+          payload: { action: "stop_all_kill", panes: killed, failed },
+        });
+      } catch { /* store optional */ }
+    }
+    coreState.lastStopAllFailed = failed; // QW4: surfaced to the REST confirm route (read right after the await).
+    broadcast({ type: "stop_all", killed, failed });
+    broadcastTerminalsUpdated();
+    return killed;
+  }
+
+  /**
+   * QW4 (bead qw4): the awaited Stage-2 kill primitive. Asks every non-Exited pane to stop(), AWAITS
+   * all of them (Promise.allSettled — one failing kill must not abort the rest), and partitions the
+   * outcome: `killed` = panes whose stop() FULFILLED; `failed` = panes whose stop() REJECTED. The
+   * fire-and-forget loop this replaces reported the asked-to-kill set, which lied when a kill failed.
+   */
+  async function killAllPanes(): Promise<{ killed: string[]; failed: string[] }> {
+    const targets = Object.entries(manager.terminals).filter(([, term]) => term.status !== "Exited");
+    const results = await Promise.allSettled(targets.map(([, term]) => Promise.resolve(term.stop())));
+    const killed: string[] = [];
+    const failed: string[] = [];
+    results.forEach((r, i) => {
+      const id = targets[i][0];
+      if (r.status === "fulfilled") killed.push(id);
+      else { failed.push(id); console.error(`[STOP-ALL] kill ${id} failed:`, r.reason); }
+    });
+    return { killed, failed };
+  }
+
+  /** Clear the freeze (Release). The matrix was never mutated, so this is a clean clear. */
+  function releaseStopAll(): void {
+    coreState.setFrozen(false);
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "permission_changed",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: null,
+          summary: "STOP_ALL released: freeze cleared, matrix restored",
+          payload: { action: "stop_all_release" },
+        });
+      } catch { /* store optional */ }
+    }
+    broadcast({ type: "frozen", frozen: false });
+    broadcastTerminalsUpdated();
+  }
+
+  // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
+  // After a fresh live session is established, re-attach every orphaned approval (a survivor whose
+  // handle was nulled by detachSession on the prior disconnect, OR a restart-hydrated row) to THIS
+  // session — opening a fresh TTL window — then speak ONE batched digest across approvals + pending
+  // actions and broadcast so the UI chips repopulate the FULL list. Survivors stay UN-APPROVED
+  // (re-require approval): the digest only re-surfaces them for a conscious yes; nothing auto-fires.
+  function reannounceSurvivors(session: any) {
+    const now = Date.now();
+    // (1) Re-attach every orphan approval to the freshly-connected session (fresh TTL window,
+    // lastCallAt cleared). pendingActions have no session binding — they survive in-process untouched.
+    for (const orphan of pendingApprovals.orphans()) {
+      pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
+    }
+    // (2) Collect the survivors: re-attached approvals (now bound to this session) + ALL pending
+    // actions (not session-bound, spec §6.2 includes them all). Build ONE digest line per item.
+    const approvals = pendingApprovals.forSession(session);
+    const actions = pendingActions.all();
+    type Survivor = { line: string; ts: number };
+    const survivors: Survivor[] = [
+      ...approvals.map((a) => ({ line: renderResumptionLine(a, now), ts: a.timestamp })),
+      ...actions.map((a) => ({ line: `${a.capability}: ${redactSecrets(a.summary)}`, ts: a.timestamp })),
+    ];
+    if (survivors.length === 0) return; // (spec §7) zero survivors -> SILENT.
+
+    // (3) Most-recent first; speak up to 3, summarize the rest (spec §7). UI shows the full list.
+    survivors.sort((x, y) => y.ts - x.ts);
+    const total = survivors.length;
+    const shown = survivors.slice(0, 3).map((s) => s.line);
+    let digest: string;
+    if (total === 1) {
+      digest = `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
+    } else if (total <= 3) {
+      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
+    } else {
+      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+    }
+    pushApprovalNarration(session, digest);
+    // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
+    broadcastTerminalsUpdated();
+  }
+
+  // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
+  // (ApprovalDialog.tsx) keys on these EXACT strings — do NOT rename the values without changing
+  // the client. The `command_auto_executed` payload has two boolean variants the UI relies on:
+  //   - `approved: true`  -> operator-APPROVED a HiTL command (REST or voice) — not auto-run.
+  //   - `vocal: true`     -> the approval/dispatch arrived via VOICE (vs the REST dialog).
+  //   - (neither flag)    -> a genuine Full-Auto auto-execution (no operator in the loop).
+  const WS_EVT = {
+    APPROVAL_PENDING: "approval_pending",
+    AUTO_EXECUTED: "command_auto_executed",
+    BLOCKED: "command_blocked",
+    // Issue E: a messageId-keyed "this pending command is resolved — clear its modal" event,
+    // broadcast on EVERY non-lost_race resolve so a VOICE approval (or a cross-client REST approve,
+    // or a TTL-expire sweep) dismisses the ApprovalDialog in real time instead of lingering until
+    // the ~20s safety-net poll. Mirrors the action_resolved event the pendingActions flow uses.
+    APPROVAL_RESOLVED: "approval_resolved",
+  } as const;
+
+  // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
+  // resolve path (REST approve, voice approve/reject, TTL sweep) renders the outcome of the pure
+  // `resolveDecision`. The MANDATORY atomic `claim()` lives INSIDE `resolveDecision`, so no path
+  // here can write without winning the claim (the sweep now goes through the SAME gate too).
+  // Returns the ResolveAction so a caller can branch on the reason for its own response shape.
+  // R3 (P0-1): `call.id` was already answered ONCE by the non-blocking `pending_approval`
+  // response at proposal time; resolution NEVER sends a 2nd `sendToolResponse` — the model-facing
+  // outcome is the `pushApprovalNarration` push only.
+  // Handoff gate leg (design §5.3 / step 9): when a resolved pending approval corresponds to a
+  // staged handoff (the handoff delivery uses pendingId == handoff_id; gate_approval_id also
+  // tracks it), flip the persisted handoff row to its terminal/transition state in the SAME
+  // resolver choke-point — one added store call, no forked path. Approve => delivered (the write
+  // already landed via the approved branch); reject => rejected; expire/dead-pane => expired.
+  function flipHandoffOnResolve(messageId: string, reason: ResolveReason, opts?: { vocal?: boolean }) {
+    // Delegate to the EXPORTED, unit-tested resolve-leg flip (src/handoffFlow) so the lookup +
+    // reason->state mapping + provenance live in ONE source of truth and are exercised end-to-end
+    // against a real JanusStore without a live session. `reason` is narrowed there to the handoff
+    // resolve reasons; lost_race/not_found never reach here (gated at the applyResolution call site).
+    applyHandoffFlipOnResolve(store, messageId, reason as HandoffResolveReason, { vocal: opts?.vocal });
+  }
+
+  function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
+    const action = resolveDecision(
+      pendingApprovals,
+      messageId,
+      mode,
+      (terminalId) => !!manager.terminals[terminalId]
+    );
+    const { reason, record } = action;
+    if (!record) return action; // not_found: idempotent no-op
+    const session = pendingApprovals.sessionFor(messageId);
+    const safeInstr = redactSecrets(record.instruction);
+    const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
+
+    switch (reason) {
+      case "lost_race":
+        // Another resolver already won the claim — render nothing (exactly-once preserved).
+        break;
+      case "dead_pane":
+        if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+        break;
+      case "approved": {
+        // Claim already won inside resolveDecision — this is the single write path.
+        addCommand(record.terminalId, record.instruction);
+        manager.terminals[record.terminalId]!.writeInput(record.instruction);
+        if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+        // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
+        broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+        break;
+      }
+      case "rejected":
+        if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+        break;
+      case "expired":
+        if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
+        announcementBus.enqueue({ kind: "exited", terminalId: record.terminalId, summary: "Approval expired." });
+        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+        break;
+    }
+    // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
+    if (reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane") {
+      flipHandoffOnResolve(messageId, reason, opts);
+    }
+    // Issue E: emit a messageId-keyed resolve event so EVERY client dismisses the ApprovalDialog in
+    // real time — voice approvals, cross-client REST approvals, and TTL-expire/dead-pane sweeps
+    // alike. lost_race is skipped: the resolver that WON the claim already broadcast for this
+    // messageId, and its record fields are the authoritative ones. The client's optimistic click
+    // filter still gives instant button feedback and harmlessly double-filters on this event.
+    if (reason !== "lost_race") {
+      broadcast({ type: WS_EVT.APPROVAL_RESOLVED, messageId, terminalId: record.terminalId, outcome: reason });
+      broadcastTerminalsUpdated();
+    }
+    return action;
+  }
+
+  // WS-F (spec §4.1/§6.3): the sweep no longer SILENTLY auto-rejects on TTL. It drives off the pure
+  // `decideSweepAction` so the timing/connectivity policy lives in ONE unit-tested place:
+  //   - DISCONNECTED item -> "none": the clock is PAUSED (you cannot speak a last-call into a session
+  //     that isn't there, and the spec forbids rejecting without first speaking one). The item waits,
+  //     durably, until the operator returns — this is the "away at a meeting -> still there" guarantee.
+  //   - CONNECTED + past TTL, no prior last-call -> "lastcall": stamp lastCallAt=now and SPEAK a
+  //     context-rich last-call (renderResumptionLine + "approve now or I'll drop it"). Do NOT reject.
+  //   - CONNECTED + last-call already spoken + grace elapsed -> "reject": NOW route through the
+  //     UNCHANGED terminal path (applyResolution(id,"expire") -> resolveDecision claim+delete).
+  // Connectivity is resolved HERE and passed in: per-record `sessionFor(id) !== undefined` for
+  // approvals (the detach/re-attach seam), global `coreState.activeFrontendWs !== null` for the non-session-
+  // bound pending actions. Only the TRIGGER + the connected-gate change; the reject itself stays
+  // byte-for-byte (the mandatory claim gate / exactly-once / dead-pane invariants are untouched).
+  function sweepExpiredApprovals(now: number = Date.now()) {
+    for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
+      const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
+      const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
+      if (decision.action === "none") continue; // not due, clock paused, or inside grace.
+      if (decision.action === "lastcall") {
+        // First crossing while connected: SPEAK the last-call (no reject), stamp the transient.
+        pending.lastCallAt = now;
+        const session = pendingApprovals.sessionFor(pending.messageId);
+        if (session) pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`);
+        broadcastTerminalsUpdated();
+        continue;
+      }
+      // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
+      applyResolution(pending.messageId, "expire");
+    }
+    // G1 + WS-F: pending actions get the SAME last-call->grace shape. Connectivity is gated on the
+    // SAME ref used to narrate (`coreState.activeLiveSession`), NOT `coreState.activeFrontendWs`. The two diverge during
+    // the Gemini `ai.live.connect()` handshake window: `coreState.activeFrontendWs` is set synchronously on WS
+    // open, but `coreState.activeLiveSession` is only assigned AFTER the async connect resolves. If the gate
+    // were `coreState.activeFrontendWs`, a sweep tick in that window could return "lastcall" (gate true), stamp
+    // the one-shot `lastCallAt`, yet SKIP the narration (no live session) — and since "lastcall" never
+    // re-fires once stamped, the action would later be rejected having NEVER spoken a last-call,
+    // violating spec §4.1/§10 #4 ("a spoken last-call always precedes any reject"). Coupling the gate
+    // to `coreState.activeLiveSession` mirrors the approval path (gate ref == narration ref). The transient
+    // `lastCallAt` drives the two-phase transition; expiry stays the unchanged pendingActions.expire(id).
+    const actionsConnected = coreState.activeLiveSession !== null;
+    for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
+      const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
+      if (decision.action === "none") continue;
+      if (decision.action === "lastcall") {
+        act.lastCallAt = now;
+        if (coreState.activeLiveSession) pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`);
+        broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        continue;
+      }
+      // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
+      pendingActions.expire(act.id);
+      broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
+    }
+  }
+
+  /**
+   * Arm the TTL sweep interval and return the timer so the server's close handler can clearInterval
+   * it. Mirrors the inline `const approvalSweepTimer = setInterval(...)` + `.unref()` exactly — the
+   * server calls this ONCE (where the inline setInterval used to run) and keeps the returned handle.
+   */
+  function startSweepTimer(): ReturnType<typeof setInterval> {
+    const approvalSweepTimer = setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS);
+    if (typeof approvalSweepTimer.unref === "function") approvalSweepTimer.unref();
+    return approvalSweepTimer;
+  }
+
+  return {
+    effectiveModeFor,
+    effectiveCapabilityGateFor,
+    gateCapability,
+    gateOrDefer,
+    effectiveGatesForPane,
+    posturePayloadForPane,
+    allPanePostures,
+    broadcastTerminalsUpdated,
+    runningPaneIds,
+    stopAll,
+    killAllPanes,
+    releaseStopAll,
+    applyResolution,
+    reannounceSurvivors,
+    pendingApprovals,
+    pendingActions,
+    sweepExpiredApprovals,
+    startSweepTimer,
+    shellAllowlist,
+    APPROVAL_TTL_MS,
+    APPROVAL_SWEEP_MS,
+  };
+}
