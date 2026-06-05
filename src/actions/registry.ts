@@ -24,6 +24,7 @@ import { ALWAYS_ALLOWED } from "./types";
 // Phase-B grouped ActionDefs (one file per capability domain, src/actions/defs/*).
 import { READS_ACTIONS } from "./defs/reads";
 import { NOTES_ACTIONS } from "./defs/notes";
+import { ARCHIVE_ACTIONS } from "./defs/archive";
 import { PANES_WRITE_ACTIONS } from "./defs/panes_write";
 import { PANES_REST_ACTIONS } from "./defs/panes_rest";
 import { ORIENT_ACTIONS } from "./defs/orient";
@@ -300,6 +301,7 @@ export const REGISTRY: readonly ActionDef[] = [
   // ── phase-B grouped defs (35) ──
   ...READS_ACTIONS,
   ...NOTES_ACTIONS,
+  ...ARCHIVE_ACTIONS,
   ...PANES_WRITE_ACTIONS,
   // ── c55 Batch C rest-only pane/UI defs (5) ──
   ...PANES_REST_ACTIONS,

@@ -119,6 +119,12 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   create_pane_note: new Set<Surface>(["rest"]),
   add_pane_context: new Set<Surface>(["rest"]),
 
+  // ── c55.13: NEW rest-only operator-UI archive defs (no voice twin BY DESIGN — archive management is
+  // operator-direct UI plumbing, spec §10 step 3). ──
+  list_archived_panes: new Set<Surface>(["rest"]),
+  restore_archived_pane: new Set<Surface>(["rest"]),
+  delete_archived_pane: new Set<Surface>(["rest"]),
+
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
   // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for
