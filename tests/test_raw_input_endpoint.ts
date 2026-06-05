@@ -72,8 +72,12 @@ describe("POST /api/terminals/:id/raw-input (headless real server)", () => {
     running = await startServer({ port: 0, enableVite: false });
     base = `http://127.0.0.1:${running.port}`;
 
-    // Pin the GLOBAL write_to_pane gate to Ask so an off-spotlight pane DEFERS deterministically
-    // (the resolver falls back to globalGate ?? "Auto"; without this an unset gate would resolve Auto).
+    // Pin the GLOBAL write_to_pane gate to Ask. NOTE (active-pane guard reconciliation): raw input can
+    // now ONLY reach the active pane — the guard 409s every off-active-pane key BEFORE the capability
+    // gate — and the active pane is BY DEFINITION on-spotlight. Since write_to_pane is a spotlight-
+    // loosened capability ("trust follows focus"), it resolves Auto on the active pane regardless of the
+    // global Ask. So the "off-spotlight => 202 defer" path is now UNREACHABLE through this REST surface;
+    // the gated Shift+Tab on the active pane resolves Auto and writes (asserted below).
     running.manager.settings.advanced = running.manager.settings.advanced || ({} as any);
     (running.manager.settings.advanced as any).capabilityGates = { write_to_pane: "Ask" };
   });
@@ -120,39 +124,44 @@ describe("POST /api/terminals/:id/raw-input (headless real server)", () => {
   it("an always-allowed nav key (arrow) delivers the EXACT bytes to the spawned pane (200)", async () => {
     const { term, writes } = spawnedPane("ri-nav");
     running.manager.terminals["ri-nav"] = term;
+    running._testSetActivePane?.("ri-nav"); // active-pane guard: the target must be the open pane
     const res = await api("/api/terminals/ri-nav/raw-input", {
       method: "POST",
       body: JSON.stringify({ bytes: ARROW_UP }),
     });
     assert.strictEqual(res.status, 200, "always-allowed key runs immediately => 200");
     assert.deepStrictEqual(writes, [ARROW_UP], "the arrow bytes are written verbatim, exactly once, no CR");
+    running._testSetActivePane?.(null);
     delete running.manager.terminals["ri-nav"];
   });
 
   it("Ctrl+C is an always-allowed emergency brake — delivered immediately, NOT gated (200)", async () => {
     const { term, writes } = spawnedPane("ri-ctrlc");
     running.manager.terminals["ri-ctrlc"] = term;
+    running._testSetActivePane?.("ri-ctrlc"); // active-pane guard: Ctrl+C still only on the open pane
     const res = await api("/api/terminals/ri-ctrlc/raw-input", {
       method: "POST",
       body: JSON.stringify({ bytes: "\x03" }),
     });
     assert.strictEqual(res.status, 200, "Ctrl+C is never gated (emergency brake)");
     assert.deepStrictEqual(writes, ["\x03"], "0x03 reaches the pane verbatim");
+    running._testSetActivePane?.(null);
     delete running.manager.terminals["ri-ctrlc"];
   });
 
-  it("Shift+Tab on an off-spotlight HITL pane is GATED — write_to_pane Ask => 202 deferred, NOT yet written", async () => {
+  it("Shift+Tab routes through the capability gate on the ACTIVE pane — spotlight resolves Auto => 200, written", async () => {
+    // The active pane is on-spotlight, and write_to_pane is spotlight-loosened, so the global Ask
+    // resolves to Auto here: the gated branch's Auto disposition runs and the bytes ARE written.
     const { term, writes } = spawnedPane("ri-shifttab");
     running.manager.terminals["ri-shifttab"] = term;
+    running._testSetActivePane?.("ri-shifttab"); // active-pane guard passes; spotlight loosens the gate to Auto
     const res = await api("/api/terminals/ri-shifttab/raw-input", {
       method: "POST",
       body: JSON.stringify({ bytes: SHIFT_TAB }),
     });
-    assert.strictEqual(res.status, 202, "gated Shift+Tab off-spotlight => 202 deferred (awaiting confirm)");
-    const body = await res.json();
-    assert.ok(body.deferred, "body flags the deferral");
-    assert.ok(typeof body.actionId === "string" && body.actionId.length > 0, "a pending actionId is returned");
-    assert.deepStrictEqual(writes, [], "no bytes reach the pane until the operator confirms");
+    assert.strictEqual(res.status, 200, "gated Shift+Tab on the on-spotlight active pane resolves Auto => 200");
+    assert.deepStrictEqual(writes, [SHIFT_TAB], "the Shift+Tab bytes reach the active pane (Auto disposition ran)");
+    running._testSetActivePane?.(null);
     delete running.manager.terminals["ri-shifttab"];
   });
 });
