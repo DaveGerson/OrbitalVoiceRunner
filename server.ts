@@ -16,6 +16,7 @@ import {
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 import { restGateOutcome } from "./src/restGate";
+import { classifyRawKey } from "./src/rawKeyClass";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { CapabilityGate, CapabilityGateMap } from "./src/types";
@@ -538,6 +539,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     stopAll,
     releaseStopAll,
     applyResolution,
+    applyPaneMode,
     pendingApprovals,
     pendingActions,
   } = gating;
@@ -739,6 +741,43 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     } else {
       res.status(404).json({ error: "Terminal not found or offline" });
     }
+  });
+
+  // Raw control-byte path (multi-cli adapter spec §7, §10): writes literal keystrokes (arrows,
+  // Tab, Esc, Enter, PgUp/PgDn, Ctrl+C, Shift+Tab) into a pane's PTY via writeRaw — NO Enter-append,
+  // NO history (contrast the /input endpoint above, which is SUBMIT semantics). The gate is
+  // BIFURCATED: navigation keys + Ctrl+C (the emergency brake) are always-allowed and run
+  // immediately; the disruptive Shift+Tab (ESC[Z) routes through gateOrDefer("write_to_pane", …)
+  // so it is Ask off-spotlight (202 deferred), Auto on-spotlight (200), or Off (403).
+  app.post("/api/terminals/:id/raw-input", (req, res) => {
+    const { id } = req.params;
+    const { bytes } = req.body;
+    if (typeof bytes !== "string" || bytes.length === 0) {
+      res.status(400).json({ error: "Missing or empty bytes parameter" });
+      return;
+    }
+    const term = manager.terminals[id];
+    if (!term) {
+      res.status(404).json({ error: "Terminal not found or offline" });
+      return;
+    }
+    // 409 when the pane exists but has no live PTY (inert / un-spawned) — writeRaw would no-op.
+    if (!(term as any).transport) {
+      res.status(409).json({ error: "Pane has no live process (not spawned)." });
+      return;
+    }
+    // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
+    if (classifyRawKey(bytes) === "always-allowed") {
+      term.writeRaw(bytes);
+      res.json({ success: true });
+      return;
+    }
+    // Gated disruptive key (Shift+Tab): defer the writeRaw effect through the capability gate.
+    const rawEffect = (): string => { term.writeRaw(bytes); return "ok"; };
+    const g = gateOrDefer("write_to_pane", id, `Send Shift+Tab (mode cycle) to pane ${id}`, rawEffect);
+    const out = restGateOutcome(g);
+    if (g.disposition === "run") rawEffect(); // Auto: run now
+    res.status(out.status).json(out.body);
   });
 
   // Web API to sync a pane's PTY grid to the operator's xterm viewport. The
@@ -1520,6 +1559,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       pruneAttention,
       pendingApprovals,
       applyResolution,
+      applyPaneMode,
       store,
       sanitizeSettingsForClient,
       recipes: recipes as ActionContext["recipes"],

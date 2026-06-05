@@ -10,6 +10,7 @@ import {
   Status as MachineStatus,
   RuntimeType,
 } from "./statusMachine";
+import { AgentAdapter, createAdapter } from "./agents";
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
@@ -146,32 +147,62 @@ export function presetCommand(
  * Pure launch-string builder (BUG-032 regression surface). Given a fully-built
  * base command (already carrying any --dangerously-skip-permissions mutation from
  * the constructor — that is NOT this function's concern), decide whether to append
- * a `--resume <id>` flag.
+ * a `--session-id <id>` (fresh pin) or `--resume <id>` (re-attach) flag.
  *
- * Invariants (pinned in tests/test_launch_command.ts):
- *  - Custom panes are never touched (no resume flag ever).
- *  - --resume is appended ONLY when sessionId is a real UUID. A synthetic tracking
- *    id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
- *  - Never double-append: if the command already carries --resume or --session,
+ * Invariants (pinned in tests/test_launch_command.ts + tests/test_session_pinning.ts):
+ *  - Custom panes are never touched (no session flag ever).
+ *  - The flag is appended ONLY when sessionId is a real UUID. A synthetic tracking
+ *    id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+ *  - B3 fix (spec §9): a FRESH pinned session (isFreshPin && supportsSessionPin)
+ *    launches with --session-id <uuid> (the deterministic pin). A resume launches
+ *    with --resume <uuid>. The two are mutually exclusive in one invocation.
+ *  - Never double-append: if the command already carries --resume / --session(-id),
  *    leave it alone.
  *  - The base command is returned verbatim otherwise (no invented flags, no npx).
  */
 export function buildLaunchCommand(
   shellCmd: string,
   toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
-  sessionId: string
+  sessionId: string,
+  isFreshPin = false
 ): string {
   let finalCommand = shellCmd;
-  if (toolPreset !== "Custom" && sessionId) {
+  // Delegate the per-preset session model to the adapter (B5): supportsSessionPin
+  // (Claude → deterministic --session-id) and supportsResume (agents → --resume).
+  const caps = createAdapter(toolPreset).capabilities();
+  if ((caps.supportsResume || caps.supportsSessionPin) && sessionId) {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
-    // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
-    // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
-    if (!alreadyHasResume && UUID_RE.test(sessionId)) {
-      finalCommand = `${finalCommand} --resume ${sessionId}`;
+    const alreadyHasSession = /--resume\b|--session\b/.test(finalCommand);
+    // Only act on a genuine UUID: the CLI requires a real UUID. A synthetic tracking
+    // id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+    if (!alreadyHasSession && UUID_RE.test(sessionId)) {
+      // FRESH pinned launch (spec §9): pin the orchestrator-generated id via
+      // --session-id. Otherwise re-attach a prior session via --resume.
+      const flag = isFreshPin && caps.supportsSessionPin ? "--session-id" : "--resume";
+      finalCommand = `${finalCommand} ${flag} ${sessionId}`;
     }
   }
   return finalCommand;
+}
+
+/**
+ * Add or strip the adapter's OWN permission-bypass flag on a command string per the
+ * target mode. The single choke point used by the constructor AND setPermissionsMode,
+ * so the add/remove paths always agree on which flag string to touch. Custom (and any
+ * adapter whose bypassFlag() is null) is left untouched. B2 fix: Codex/agy get their
+ * own flag, NOT Claude's Anthropic-only --dangerously-skip-permissions.
+ */
+function applyBypassFlag(
+  shellCmd: string,
+  adapter: AgentAdapter,
+  mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only"
+): string {
+  const flag = adapter.bypassFlag();
+  if (!flag) return shellCmd;
+  if (mode === "Full Auto") {
+    return shellCmd.includes(flag) ? shellCmd : `${shellCmd} ${flag}`;
+  }
+  return shellCmd.replace(` ${flag}`, "");
 }
 
 
@@ -353,7 +384,17 @@ export class UniversalTerminal {
   public status: "Running" | "Exited" | "Idle" = "Idle";
   public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+  // The per-CLI adapter (multi-cli spec §4). Owns every preset-conditional decision
+  // (bypass flag, launch/resume argv, live mode-switch disposition, capabilities),
+  // retiring the inline `if (toolPreset !== "Custom")` branches (B5) and correcting
+  // B2 (Codex/agy no longer inherit Claude's Anthropic-only skip flag).
+  public adapter: AgentAdapter;
   public sessionId: string;
+  // True until the FIRST launch of a freshly-pinned session (spec §9): drives the
+  // start() decision to emit --session-id <uuid> (pin) vs --resume <uuid> (re-attach).
+  // Set by the ctor (fresh-pin true; supplied/resume false) and flipped to false once
+  // start() has launched, so an in-process restart (stop(); start()) resumes correctly.
+  private sessionIsFresh = false;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
   // Phase 1 "ears": the symmetric BEGINNING edge to onIdle. Fires once when the pane
@@ -432,51 +473,51 @@ export class UniversalTerminal {
     this.permissionsMode = permissionsMode;
     this.projectId = projectId;
     this.runtimeType = toolPreset === "Custom" ? "shell" : "interactive_cli";
+    // The pane's per-CLI adapter (spec §4). All preset-conditional decisions below
+    // delegate here instead of branching inline on the preset string.
+    this.adapter = createAdapter(toolPreset);
     // Injectable for tests; defaults to the platform-selected probe (design §2.0).
     this.statusProbe = statusProbe ?? selectProbe();
     // G3: injectable spawn seam (optional + last so no existing call site changes).
     if (transportFactory) this.transportFactory = transportFactory;
 
-    let cmd = shellCmd;
-    if (toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (permissionsMode === "Full Auto") {
-        if (!cmd.includes(skipFlag)) {
-          cmd = `${cmd} ${skipFlag}`;
-        }
-      } else {
-        cmd = cmd.replace(` ${skipFlag}`, "");
-      }
-    }
-    this.shellCmd = cmd;
-    
+    // Flag injection: the adapter owns its OWN bypass flag (Claude/agy
+    // --dangerously-skip-permissions; Codex --dangerously-bypass-approvals-and-sandbox;
+    // Custom none). B2 fix: we no longer hardcode Claude's flag for every agent.
+    this.shellCmd = applyBypassFlag(shellCmd, this.adapter, permissionsMode);
+
     if (sessionId) {
+      // A supplied id means we are RESUMING a prior session (spec §9): the launch
+      // re-attaches via --resume <uuid>, never a fresh --session-id pin.
       this.sessionId = sessionId;
-    } else if (toolPreset !== "Custom") {
-      // Synthetic "<tool>-session-<hex>" id is for internal tracking/display ONLY.
-      // It is intentionally never passed to the CLI --resume flag, which requires a
-      // real UUID. Real session UUIDs are captured later by checkForSessionId() once
-      // the CLI prints them. start() guards on UUID format before appending --resume.
+      this.sessionIsFresh = false;
+    } else if (this.adapter.capabilities().supportsSessionPin) {
+      // B3 fix (spec §9): Claude pins a DETERMINISTIC, orchestrator-generated UUID
+      // and passes it as --session-id at first launch. No stdout scrape — Claude
+      // never prints the id. start() emits --session-id <uuid> while sessionIsFresh.
+      this.sessionId = this.adapter.generateSessionId() ?? "";
+      this.sessionIsFresh = true;
+    } else if (this.adapter.capabilities().supportsResume) {
+      // Codex/agy have no pin flag → capture the id post-spawn. The synthetic
+      // "<tool>-session-<hex>" id is for internal tracking/display ONLY; it is never
+      // passed to --resume (which requires a real UUID). Real ids arrive later via
+      // captureSessionId(); start() guards on UUID format before appending --resume.
       const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
       const randomId = Math.random().toString(16).substring(2, 10);
       this.sessionId = `${toolLower}-session-${randomId}`;
+      this.sessionIsFresh = false;
     } else {
       this.sessionId = "";
+      this.sessionIsFresh = false;
     }
   }
 
   public setPermissionsMode(mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only") {
     this.permissionsMode = mode;
-    if (this.toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (mode === "Full Auto") {
-        if (!this.shellCmd.includes(skipFlag)) {
-          this.shellCmd = `${this.shellCmd} ${skipFlag}`;
-        }
-      } else {
-        this.shellCmd = this.shellCmd.replace(` ${skipFlag}`, "");
-      }
-    }
+    // Mutate the NEXT spawn's command string via the adapter's OWN bypass flag.
+    // (This only affects the next launch — bead 1y8/applyPaneMode reaches a LIVE
+    // process; that is P4 and out of this wave's scope.)
+    this.shellCmd = applyBypassFlag(this.shellCmd, this.adapter, mode);
   }
 
   get contextSize(): number {
@@ -484,7 +525,17 @@ export class UniversalTerminal {
   }
 
   private checkForSessionId(text: string) {
-    if (this.sessionId && this.sessionId.includes("-session-") && this.toolPreset !== "Custom") {
+    // B3 fix (spec §9): route session capture through the adapter. A pinned-session
+    // CLI (Claude) returns its DETERMINISTIC UUID and never scrapes stdout — Claude
+    // never prints the id, so the legacy scrape below would only ever match noise and
+    // CLOBBER the pinned uuid, breaking --resume. captureSessionId(ptyOutput) returns
+    // the pinned id for Claude; we adopt it and short-circuit the scrape.
+    if (this.adapter.capabilities().supportsSessionPin) {
+      const pinned = this.adapter.captureSessionId({ ptyOutput: text, cwd: this.cwd });
+      if (pinned) this.sessionId = pinned;
+      return; // never run the free-form scrape against a pinned-session CLI
+    }
+    if (this.sessionId && this.sessionId.includes("-session-") && this.adapter.capabilities().supportsResume) {
       // Keep preset/simulated unless a more granular one is found in output
     }
     const matchers = [
@@ -706,7 +757,10 @@ export class UniversalTerminal {
   }
 
   start() {
-    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId);
+    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId, this.sessionIsFresh);
+    // After the first launch the pinned session EXISTS on disk → a subsequent
+    // in-process restart (stop(); start()) must re-attach via --resume, not re-pin.
+    this.sessionIsFresh = false;
 
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
@@ -947,6 +1001,19 @@ export class UniversalTerminal {
           }, this.submitEnterDelayMs);
         }),
     );
+  }
+
+  /**
+   * Raw control-byte passthrough (multi-cli adapter spec §7) — the sole RAW path. Unlike
+   * writeInput/deliverSubmit (SUBMIT semantics: a separate CR, paste-burst split, optimistic
+   * Running, history), writeRaw writes the bytes VERBATIM in a single transport.write with NO
+   * appended \r and no split. It is the ONE primitive behind the raw-input endpoint and the GUI
+   * control-key bar (a Shift+Tab button writes ESC[Z verbatim). No-op on an inert/un-spawned pane
+   * (transport === null) — the REST caller surfaces a 409.
+   */
+  writeRaw(bytes: string): void {
+    if (!this.transport) return;
+    this.transport.write(bytes);
   }
 
   getRecentOutput(linesCount = 10): string {

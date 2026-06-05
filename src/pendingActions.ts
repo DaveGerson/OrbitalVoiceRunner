@@ -204,6 +204,27 @@ export class PendingActionStore {
     return { reason: "cancelled", record };
   }
 
+  /**
+   * Per-pane DRAIN (multi-cli adapter spec §11): on a pane's promotion to Full Auto its staged
+   * actions are moot (the live agent self-approves), so every pending action TARGETING that pane is
+   * CANCELLED — claimed + removed, the side effect NEVER runs (a promotion is not a confirm). Targets
+   * by `params.paneId` (the field set_pane_permissions / write actions stamp; a global action with no
+   * paneId is never pane-drained). Routes each through cancel() so the durable claim flips before
+   * remove (parity with cancel/expire — a mid-drain crash doesn't re-replay). Returns the drained
+   * records (in `order`) for the caller's audit/broadcast.
+   */
+  drainForPane(paneId: string): PendingAction[] {
+    const targets = this.order
+      .map((id) => this.records.get(id))
+      .filter((a): a is PendingAction => !!a && (a.params as { paneId?: unknown } | undefined)?.paneId === paneId);
+    const drained: PendingAction[] = [];
+    for (const a of targets) {
+      const r = this.cancel(a.id); // claim + remove, NO run
+      if (r.reason === "cancelled" && r.record) drained.push(r.record);
+    }
+    return drained;
+  }
+
   /** Records older than ttlMs (for the TTL sweep). */
   expired(ttlMs: number, now: number = Date.now()): PendingAction[] {
     return this.all().filter((a) => now - a.timestamp > ttlMs && !a.claimed);

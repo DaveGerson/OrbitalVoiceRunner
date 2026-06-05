@@ -23,6 +23,7 @@ import type {
   ResolveMode,
 } from "../pendingApprovals";
 import type { JanusStore } from "../store/sqliteStore";
+import type { PaneModeResult } from "../applyPaneMode";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -257,6 +258,21 @@ export interface ActionContext {
   /** Broadcast `{type:'terminals_updated', postures: allPanePostures()}` so the chips repaint
    *  without a /api/terminals refetch (server.ts:1844). create_pane + set_pane_permissions emit it. */
   broadcastTerminalsUpdated: () => void;
+
+  // ── Live mode-switch choke point (multi-cli adapter spec §6, bead 1y8) ─────────────────────────
+  /**
+   * The injected applyPaneMode choke point — the ONE path that makes a pane permission change reach
+   * the LIVE process (Claude live-signal / Codex+agy restart-resume), draining pending on a Full-Auto
+   * promotion (§11). The server binds it to the real terminal + gateOrDefer + pending stores +
+   * broadcast + ledger persist. OPTIONAL so test/REST contexts that don't wire it fall back to the
+   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the new `restart_pane`
+   * tool delegate here when present. `source` is the caller surface (audit only).
+   */
+  applyPaneMode?: (
+    paneId: string,
+    targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
+    source: "voice" | "ui" | "restart_pane",
+  ) => Promise<PaneModeResult>;
 
   // ── Gate inspection (server.ts:1711 — the resolver behind gateCapability/gateOrDefer) ─────────
   /** Resolve the EFFECTIVE per-capability gate for a (pane, capability), spotlight + frozen applied

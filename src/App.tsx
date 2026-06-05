@@ -15,10 +15,43 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
+
+// Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
+// the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
+const RAW_KEY = {
+  up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
+  enter: "\r", tab: "\t", esc: "\x1b",
+  ctrlC: "\x03", shiftTab: "\x1b[Z",
+} as const;
+
+// Compact control-key strip for a pane (arrows / Tab / Esc / Enter / Ctrl+C / Shift+Tab). Each
+// button POSTs its raw bytes through `onKey` (App.writeControlKey). Reuses the existing icon-button
+// styling; disruptive keys (Ctrl+C, Shift+Tab) carry the warn palette per spec §8.
+function ControlKeyBar({ paneId, onKey }: { paneId: string; onKey: (paneId: string, bytes: string) => void }) {
+  const navBtn = "p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all";
+  const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-[9px] font-mono uppercase tracking-wider font-bold";
+  const press = (bytes: string) => onKey(paneId, bytes);
+  return (
+    <div className="flex items-center gap-1 flex-wrap" data-testid="control-key-bar" role="group" aria-label="Send control key to pane">
+      {/* Navigation — always-allowed */}
+      <button type="button" onClick={() => press(RAW_KEY.up)} className={navBtn} title="Send Up arrow"><ArrowUp className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.down)} className={navBtn} title="Send Down arrow"><ArrowDown className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.left)} className={navBtn} title="Send Left arrow"><ArrowLeft className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.right)} className={navBtn} title="Send Right arrow"><ArrowRight className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.enter)} className={navBtn} title="Send Enter (commit staged line)"><CornerDownLeft className="w-3 h-3" /></button>
+      {/* Terminal-ops — always-allowed */}
+      <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
+      <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
+      {/* Disruptive — gated (warn tint) */}
+      <button type="button" onClick={() => press(RAW_KEY.ctrlC)} className={warnBtn} title="Send Ctrl+C (interrupt / emergency brake)">^C</button>
+      <button type="button" onClick={() => press(RAW_KEY.shiftTab)} className={warnBtn} title="Send Shift+Tab (cycle agent mode — gated)">⇧Tab</button>
+    </div>
+  );
+}
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -1118,6 +1151,20 @@ function AppRaw() {
       });
       fetchTerminals();
       fetchLedger();
+    } catch (e) {}
+  };
+
+  // Raw control-key bar (multi-cli adapter spec §8): POST literal control bytes to a pane's PTY via
+  // the raw-input endpoint (writeRaw — no Enter-append, no history). Nav keys + Ctrl+C are
+  // always-allowed; Shift+Tab is gated (write_to_pane) and may return 202 (deferred awaiting confirm).
+  const writeControlKey = async (paneId: string, bytes: string) => {
+    try {
+      const res = await apiFetch(`/api/terminals/${paneId}/raw-input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bytes }),
+      });
+      if (res.status === 202) playEarcon("execute"); // queued, awaiting operator confirm
     } catch (e) {}
   };
 
@@ -3343,6 +3390,13 @@ function AppRaw() {
                       <Square className="w-3.5 h-3.5" />
                     </button>
                   </div>
+                </div>
+                {/* Raw control-key bar (multi-cli adapter spec §8): send literal keystrokes (arrows,
+                    Tab, Esc, Enter, Ctrl+C, Shift+Tab) straight into the pane's PTY. Independent of
+                    the mode <select>; Ctrl+C/Shift+Tab carry the warn tint (Shift+Tab is gated). */}
+                <div className="px-2 sm:px-4 lg:px-6 py-1.5 border-b border-white/5 bg-black/30 flex items-center gap-2">
+                  <span className="text-[8.5px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                  <ControlKeyBar paneId={activeTerminal.id} onKey={writeControlKey} />
                 </div>
                 <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
                   <TerminalView

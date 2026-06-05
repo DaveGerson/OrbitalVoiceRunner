@@ -84,6 +84,11 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
 
   // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
   set_global_permissions: new Set<Surface>(["voice"]),
+
+  // ── Voice-only by design (multi-cli spec §8, bead 1y8): restart_pane is the SEMANTIC live-promotion
+  // tool. The REST/UI surface for the same intent is set_pane_permissions (which also delegates to the
+  // live applyPaneMode choke point); a separate restart_pane REST twin would be a redundant affordance. ─
+  restart_pane: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
