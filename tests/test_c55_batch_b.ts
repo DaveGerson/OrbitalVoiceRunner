@@ -526,14 +526,13 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
 
   // Guard the OUT-OF-SCOPE neighbors stayed inline (this batch must NOT touch them). These share the
   // `/api/projects/:id/...` and `/api/plans/:id/...` shape but are different paths / later batches.
+  // NOTE: PUT /api/projects/:projectId/panes/:paneId/permissions was a Batch-B out-of-scope neighbor,
+  // but c55 Batch D CONVERGED it (set_pane_permissions snake_case rest.path + permissions coerce), so it
+  // is no longer asserted-preserved here — Batch D's own cutover guard asserts that inline twin is GONE.
   const keptLiterals: Array<{ label: string; needle: RegExp }> = [
     { label: "POST /api/projects/:id/notes", needle: /app\.post\(\s*["']\/api\/projects\/:id\/notes["']/ },
     { label: "DELETE /api/projects/:id", needle: /app\.delete\(\s*["']\/api\/projects\/:id["']/ },
     { label: "DELETE /api/plans/:id", needle: /app\.delete\(\s*["']\/api\/plans\/:id["']/ },
-    {
-      label: "PUT /api/projects/:projectId/panes/:paneId/permissions",
-      needle: /app\.put\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/permissions["']/,
-    },
   ];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {

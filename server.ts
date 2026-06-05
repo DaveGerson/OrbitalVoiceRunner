@@ -15,7 +15,10 @@ import {
 } from "./src/pendingApprovals";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
-import { restGateOutcome } from "./src/restGate";
+// c55 Batch D: restGateOutcome (the inline create_pane / recipes REST gate-status mapper) is no longer
+// imported here — those routes are now served by the registry mount, which maps gate dispositions via
+// resultToHttp (status-via-kinds). The pure helper + its unit test (src/restGate.ts / test_rest_gate.ts)
+// remain for any future REST gate mapping that doesn't ride the registry.
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { CapabilityGate, CapabilityGateMap } from "./src/types";
@@ -23,7 +26,7 @@ import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
-import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/rest";
+import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
@@ -582,67 +585,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json(manager.ledger.workspaces);
   });
 
-  // Web API to create a terminal manually
-  app.post("/api/terminals", (req, res) => {
-    const { terminalId, cwd, command: clientCommand, toolPreset, permissionsMode, sessionId, projectId } = req.body;
-    if (!terminalId) {
-      res.status(400).json({ error: "Missing required fields" });
-      return;
-    }
-    // KS (17d): DERIVE the launch command server-side from tool_preset via the SAME single
-    // home the voice create_pane handler uses (presetCommand(normalizePreset(...))), so voice
-    // and REST produce an IDENTICAL launch. A client-supplied `command` is honored ONLY for a
-    // Custom preset (the documented free-form escape hatch, 17c); for any agent preset the
-    // client string is IGNORED — the preset is the single source of truth. (Command is now
-    // derived, so a non-Custom create no longer needs a client `command`.)
-    const preset = normalizePreset(toolPreset);
-    const derivedCommand = presetCommand(preset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
-    const command = preset === "Custom" && typeof clientCommand === "string" && clientCommand.trim()
-      ? clientCommand
-      : derivedCommand;
-    // Resolve the working directory: an empty, "." , or non-existent cwd falls back
-    // to the active project's directory (or the server cwd). Passing a bad path to
-    // spawn() is what produced the cryptic "The system cannot find the path specified."
-    const activeProj = manager.ledger.getActiveProject();
-    let resolvedCwd = (cwd && cwd.trim() && cwd.trim() !== ".") ? cwd.trim() : (activeProj?.directory || process.cwd());
-    try {
-      if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
-        resolvedCwd = activeProj?.directory || process.cwd();
-      }
-    } catch {
-      resolvedCwd = process.cwd();
-    }
-    // ensure the active projectId is synced with this new terminal if requested
-    if (projectId) {
-      manager.ledger.activeProjectId = projectId;
-      // also ensure the project exists, just in case
-      if (!manager.ledger.getProject(projectId)) {
-        manager.ledger.addProject(projectId, resolvedCwd, "", []);
-      }
-    }
-    // G6: route the PTY spawn through the SAME capability gate the voice `create_pane` handler uses.
-    // The broadcasts MOVE INSIDE spawnEffect so a deferred-then-confirmed spawn still repaints the UI
-    // (the effect runs once via POST /api/actions/:id/confirm). Off -> 403, Ask -> 202+actionId,
-    // Auto -> 200 + addTerminal result. (The projectId ledger-sync above stays before the gate,
-    // matching the voice handler's "ensure the project exists" behavior — it mutates metadata, not a PTY.)
-    const spawnEffect = (): string => {
-      // Pass the NORMALIZED preset (not the raw client value) so runtimeType + the
-      // --dangerously-skip-permissions append are decided identically to the voice path.
-      const result = manager.addTerminal(terminalId, resolvedCwd, command, preset, permissionsMode, sessionId, projectId || "");
-      broadcastLedgerUpdate();
-      broadcast({ type: "terminals_updated" });
-      return String(result);
-    };
-    const g = gateOrDefer("create_pane", terminalId, `Create pane ${terminalId} (${command})`, spawnEffect,
-      // kzt: origin:"rest" -> the rebuild returns String(result) verbatim, matching spawnEffect above.
-      // Persist the ALREADY-RESOLVED cwd so a confirm-after-restart lands the pane in the same dir.
-      // The intent carries the DERIVED command + NORMALIZED preset for restart parity (matches voice).
-      // PLM3: stamp the action identity+schema hash so a boot can quarantine a drifted def.
-      { actionName: "create_pane", schemaHash: actionSchemaHash("create_pane") ?? undefined, origin: "rest", paneId: terminalId, cwd: resolvedCwd, command, toolPreset: preset, permissionsMode, sessionId, projectId: projectId || "" });
-    const out = restGateOutcome(g);
-    if (g.disposition === "run") out.body.result = spawnEffect(); // Auto: run now, return its result
-    res.status(out.status).json(out.body);
-  });
+  // c55 Batch D: POST /api/terminals (create_pane) is now served by the registry-derived create_pane
+  // def (mountRestRoutes only-set above). coerceArgs aliases the camelCase body (terminalId/projectId/
+  // toolPreset/permissionsMode) onto the snake_case zod keys and drops a client `command` for a
+  // non-Custom preset (the inline route ignored it; the def's .superRefine forbids it). The launch
+  // command is DERIVED server-side via the SAME presetCommand(normalizePreset(...)) home, and the spawn
+  // rides the SAME create_pane gateOrDefer. STATUS-VIA-KINDS: Off -> kind:"blocked" (403), Ask ->
+  // kind:"pending" (202), Auto -> kind:"ok" (200) — the status branches survive; only the 403/202/200
+  // BODY shape changes to the registry shape (was restGateOutcome). The registry handler ALSO sets the
+  // new pane active + broadcasts switch_active_pane (the inline route did not) — a benign redundant
+  // broadcast (the client already self-activates on 200). The cwd existsSync fallback is now resolved
+  // inside the def from the project directory.
 
   // c55 Batch C: POST /api/terminals/:pane_id/restart is now served by the registry-derived restart_pane
   // def (mountRestRoutes only-set above). It NOW ENFORCES the restart_pane gate (the inline route here
@@ -784,26 +737,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json({ success: true });
   });
 
-  app.put("/api/projects/:projectId/panes/:paneId/permissions", (req, res) => {
-    const { permissions } = req.body;
-    const { projectId, paneId } = req.params;
-    
-    // Update live terminal config
-    const term = manager.terminals[paneId];
-    if (term) {
-      term.setPermissionsMode(permissions);
-    }
-    
-    // Update ledger pane
-    const ws = manager.ledger.getProject(projectId);
-    if (ws && ws.panes[paneId]) {
-      ws.panes[paneId].permissions_mode = permissions;
-      manager.ledger["save"](); // use string to bypass bracket checks if needed
-    }
-    
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55 Batch D: PUT /api/projects/:project_id/panes/:pane_id/permissions (set_pane_permissions) is now
+  // served by the registry twin (mountRestRoutes only-set above). The rest.path uses snake_case segments
+  // and coerceArgs aliases the body {permissions -> permissions_mode}. behaviorDelta: the registry twin
+  // is GATED via gateOrDefer (on Ask it STAGES a pending action instead of applying — the inline route
+  // applied unconditionally + skipped the invalid-mode/pane-not-found pre-checks). Same setPermissionsMode
+  // + ledger write + ledger_updated/terminals_updated broadcasts on the Auto path. Client ignores the body.
 
   // bead 8sq (spec §2.B / §5): set the per-pane capability-gate OVERRIDE map from the matrix editor's
   // per-pane scope. This is the UI sibling of the voice `set_capability_gate` tool, but the UI is the
@@ -979,13 +918,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 
   // c55 Batch A: POST /api/attention/:id/dismiss is now served by the registry twin dismiss_attention
   // (mountRestRoutes only-set above) — same attention_updated broadcast. Accepted body delta (client
-  // ignores the body): unknown-id 404 -> 200 ok-narration. GET /api/attention and POST
-  // /api/attention/clear stay inline (out of scope — later batch).
+  // ignores the body): unknown-id 404 -> 200 ok-narration. GET /api/attention stays inline (a bare read,
+  // out of scope). POST /api/attention/clear is a c55 Batch D thin shim over the SAME def (below).
 
-  app.post("/api/attention/clear", (req, res) => {
-    manager.attentionQueue.forEach(i => i.dismissed = true);
-    broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-    res.json({ success: true });
+  // c55 Batch D: POST /api/attention/clear is the "dismiss ALL" alias of dismiss_attention (id omitted).
+  // dismiss_attention's rest binding owns the PER-ITEM path (POST /api/attention/:id/dismiss, Batch A);
+  // a second path binding for one def needs the multi-path mount seam (Batch H). Until then this stays a
+  // THIN inline SHIM: the only inline part is the PATH ALIAS — EXECUTION routes through the registry
+  // (runAction('dismiss_attention', {}) -> the SAME handler does the mass-dismiss + prune +
+  // attention_updated broadcast), so there is NO logic twin to drift. Pipes through resultToHttp.
+  app.post("/api/attention/clear", async (req, res) => {
+    const ctx = buildRestActionContext(req as unknown as RestRequest);
+    const result = await runAction(REGISTRY, "dismiss_attention", {}, ctx);
+    resultToHttp(result, res as unknown as RestResponse);
   });
 
   // 2. Watch automation rules
@@ -1088,101 +1033,20 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json(recipes);
   });
 
-  app.post("/api/recipes/apply", (req, res) => {
-    const { recipeId } = req.body;
-    const activeProjectId = manager.ledger.activeProjectId || "default_project";
-    const proj = manager.ledger.getProject(activeProjectId);
-    if (!proj) {
-      res.status(404).json({ error: "No active workspace is registered." });
-      return;
-    }
-    const recipe = recipes.find(r => r.id === recipeId);
-    if (!recipe) {
-      res.status(404).json({ error: "Recipe layout not found." });
-      return;
-    }
-    // G6 + bri: mirror the voice `apply_orchestration_recipe` gate semantics EXACTLY by sharing the
-    // pure planner (planRecipeApply). Off on apply_recipe forbids the WHOLE layout (403); otherwise
-    // each spawn rides create_pane (Off -> blocked, Ask -> deferred, Auto -> spawn now). Each pane's
-    // broadcast lives INSIDE spawnPane so a deferred-confirm repaints. Voice and REST now consume the
-    // same planner so the Ask-tier behavior cannot drift again (the WF-2 divergence).
-    // Keep one gateCapability call for the layout-level `apply_recipe` audit row (the planner is a pure
-    // decision fn and emits none); its boolean veto is authoritative via plan.layoutForbidden below.
-    gateCapability("apply_recipe", null);
-    const plan = planRecipeApply(
-      recipe.panes,
-      new Set(Object.keys(manager.terminals)),
-      () => effectiveCapabilityGateFor(null, "apply_recipe"),
-      (id) => effectiveCapabilityGateFor(id, "create_pane"),
-    );
-    if (plan.layoutForbidden) {
-      res.status(403).json({ error: "apply_recipe is gated Off; spawning template layouts is forbidden by policy.", capability: "apply_recipe" });
-      return;
-    }
-    const paneById = new Map(recipe.panes.map(p => [p.id, p]));
-    const spawned: string[] = [];
-    const deferred: { paneId: string; actionId: string }[] = [];
-    const blocked: string[] = [];
-    for (const planned of plan.panes) {
-      if (planned.disposition === "skip-existing") continue;
-      if (planned.disposition === "block") { blocked.push(planned.paneId); continue; }
-      const p = paneById.get(planned.paneId)!;
-      // KS (§5.4): derive the recipe pane's launch command from its preset via the SAME single
-      // home (presetCommand(normalizePreset(...))) instead of a hardcoded bare shell, so a
-      // recipe-spawned agent pane inherits the same launch as voice/REST create_pane. The
-      // startupCommand is still NEVER auto-run — only recorded as an auditable pane note.
-      const panePreset = normalizePreset(p.preset);
-      const paneCommand = presetCommand(panePreset, manager.settings.presets, manager.settings.advanced?.defaultShellCommand);
-      const spawnPane = (): string => {
-        manager.addTerminal(p.id, proj.directory || process.cwd(), paneCommand, panePreset, p.permissionsMode as any, "", activeProjectId);
-        // Record the suggested startup command as a pane note so the operator can
-        // run it explicitly (auditable), rather than baking it into the spawn.
-        if (p.startupCommand) {
-          manager.ledger.addPaneNote(activeProjectId, p.id, `Suggested startup command: ${p.startupCommand}`);
-        }
-        broadcastLedgerUpdate();
-        broadcast({ type: "terminals_updated" });
-        return p.id;
-      };
-      if (planned.disposition === "defer") {
-        const g = gateOrDefer("create_pane", p.id, `Create pane ${p.id} (recipe ${recipe.id})`, spawnPane,
-          // kzt: origin:"recipe" -> the rebuild returns the bare pane id, matching spawnPane above.
-          // PLM3: stamp the action identity+schema hash so a boot can quarantine a drifted def.
-          { actionName: "create_pane", schemaHash: actionSchemaHash("create_pane") ?? undefined, origin: "recipe", paneId: p.id, cwd: proj.directory || process.cwd(), command: paneCommand, toolPreset: panePreset, permissionsMode: p.permissionsMode, startupCommand: p.startupCommand, projectId: activeProjectId });
-        if (g.disposition === "forbidden") blocked.push(p.id);
-        else if (g.disposition === "deferred") deferred.push({ paneId: p.id, actionId: g.actionId });
-        else { spawnPane(); spawned.push(p.id); }
-      } else {
-        spawnPane();
-        spawned.push(p.id);
-      }
-    }
-    res.json({ success: true, spawned, deferred, blocked });
-  });
+  // c55 Batch D: POST /api/recipes/apply (apply_orchestration_recipe) is now served by the registry twin
+  // (mountRestRoutes only-set above). coerceArgs aliases the body {recipeId -> recipe_id}; the handler
+  // shares the SAME pure planner (planRecipeApply) + per-pane gateOrDefer("create_pane") + the SAME
+  // presetCommand(normalizePreset()) launch derivation, and STATUS-VIA-KINDS makes the layout
+  // apply_recipe=Off veto a kind:"blocked" -> 403 (the inline route already 403'd; preserved). The
+  // per-pane broadcasts live INSIDE the def's spawnPane so a deferred-confirm repaints. behaviorDelta
+  // (client ignores the body): inline 404 (no active project / unknown recipe) -> 200 ok-narration; the
+  // 200 body is now { output:<spawned/deferred/blocked summary string> } (was {success,spawned,deferred,blocked}).
 
-  // 5. Cross-pane context handoff
-  app.post("/api/handoff", (req, res) => {
-    const { sourcePaneId, targetPaneId, contextNotes } = req.body;
-    const sourceTerm = manager.terminals[sourcePaneId];
-    const targetTerm = manager.terminals[targetPaneId];
-    if (!sourceTerm || !targetTerm) {
-      res.status(400).json({ error: "Both source and target terminals must be active." });
-      return;
-    }
-    const sourceHistory = HistoryManager.getInstance().loadHistory(sourcePaneId);
-    const lastFiveOutlines = sourceHistory.map(h => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-5).join(" | ");
-    
-    const activeProjectId = manager.ledger.activeProjectId || "default_project";
-    const handoffNote = `Handoff from [${sourcePaneId}] with notes: ${contextNotes}. Last events: ${lastFiveOutlines}`;
-
-    // Prompt-composer refactor: handoff carries CONTEXT, not commands. It writes to the target
-    // pane's model-context layer (ungated, not a CLI write) and never injects into the target
-    // pane's stdin. (architecture §5: Remove handoff stdin injection.)
-    manager.ledger.addModelContext(activeProjectId, targetPaneId, handoffNote, "handoff");
-
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55 Batch D: POST /api/handoff (handoff_context_between_panes) is now served by the registry twin
+  // (mountRestRoutes only-set above). coerceArgs aliases the camelCase body {sourcePaneId,targetPaneId,
+  // contextNotes} onto the snake_case zod keys. Same addModelContext write to the target pane's
+  // model-context layer (ungated — handoff carries CONTEXT, not commands) + ledger_updated broadcast.
+  // behaviorDelta (client ignores the body): inline 400 (both panes must be active) -> 200 ok-narration.
 
   // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
   app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
@@ -1462,6 +1326,31 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "resize_pane",
       "clear_history",
       "clear_exited",
+      // c55 Batch D — Easy aliasing + status-via-kinds. The inline app.* twins are deleted below in
+      // the SAME change. Param skew is resolved at the registry (snake_case rest.path / coerceArgs):
+      //   set_pane_permissions  PUT /api/projects/:project_id/panes/:pane_id/permissions
+      //     coerceArgs aliases body {permissions -> permissions_mode}. behaviorDelta: the registry twin
+      //     is GATED (gateOrDefer) — on Ask it STAGES a pending action instead of applying (the inline
+      //     route was ungated + applied unconditionally + skipped the invalid-mode/not-found checks).
+      //   handoff_context_between_panes  POST /api/handoff
+      //     coerceArgs aliases camel->snake {sourcePaneId,targetPaneId,contextNotes}. behaviorDelta:
+      //     inline 400 (both-panes-required) -> 200 ok-narration (client ignores the body).
+      //   apply_orchestration_recipe  POST /api/recipes/apply
+      //     coerceArgs aliases {recipeId -> recipe_id}. STATUS-VIA-KINDS: layout apply_recipe=Off now
+      //     returns kind:"blocked" -> 403 (the inline route already 403'd; preserved). behaviorDelta:
+      //     inline 404 (no active project / unknown recipe) -> 200 ok-narration.
+      //   create_pane  POST /api/terminals
+      //     coerceArgs aliases camel->snake + drops a client command for a non-Custom preset (the
+      //     superRefine forbids it; the inline route ignored it). STATUS-VIA-KINDS: Off -> kind:"blocked"
+      //     (403), Ask -> kind:"pending" (202), Auto -> kind:"ok" (200) — the 403/202/200 status branches
+      //     SURVIVE. behaviorDelta: the 403/202/200 BODY shape is now the registry shape (was
+      //     restGateOutcome's {error,capability}/{deferred,actionId,summary}/{success}); inline 400
+      //     (missing terminalId) -> zod 500. The voice handler also sets the active pane + broadcasts
+      //     switch_active_pane (the inline route did not) — a benign redundant broadcast on REST.
+      "set_pane_permissions",
+      "handoff_context_between_panes",
+      "apply_orchestration_recipe",
+      "create_pane",
     ]),
   });
 

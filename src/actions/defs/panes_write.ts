@@ -201,6 +201,40 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/terminals" },
+  // c55 Batch D: the UI POSTs a camelCase body { terminalId, projectId, toolPreset, permissionsMode,
+  // command, ... }; the voice schema keys are snake_case. Alias camel->snake (only when the snake key
+  // is absent, so a voice call carrying snake_case is never clobbered).
+  //
+  // REST-ONLY command drop (preserves the §5.4 voice guardrail): the inline REST route IGNORED a client
+  // `command` for an agent preset, but the zod .superRefine REJECTS one. So for a REST body we drop a
+  // command on a non-Custom preset (matching the inline ignore). We MUST NOT do this on the VOICE path —
+  // there a bogus command for an agent preset is the guardrail violation the superRefine must REJECT
+  // ("invalid arguments for create_pane", tests/test_action_create_pane.ts 17c-voice). The REST shape is
+  // identified by the presence of a camelCase alias key (terminalId / toolPreset); voice sends only
+  // snake_case, so a voice command always reaches the superRefine.
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    const isRestShape = out.terminalId != null || out.toolPreset != null;
+    if (out.pane_id == null && out.terminalId != null) out.pane_id = out.terminalId;
+    if (out.project_id == null && out.projectId != null) out.project_id = out.projectId;
+    if (out.tool_preset == null && out.toolPreset != null) out.tool_preset = out.toolPreset;
+    if (out.permissions_mode == null && out.permissionsMode != null) out.permissions_mode = out.permissionsMode;
+    delete out.terminalId;
+    delete out.projectId;
+    delete out.toolPreset;
+    delete out.permissionsMode;
+    // cwd/sessionId are inline-only REST resolution inputs the registry def does not model — drop them so
+    // they never reach the strict zod object (the def derives cwd from the project + ignores sessionId).
+    delete out.cwd;
+    delete out.sessionId;
+    // REST-only: drop a command for a non-Custom preset (mirrors the inline ignore). Voice keeps it so
+    // the superRefine rejects an agent-preset command (the §5.4 guardrail).
+    const presetRaw = out.tool_preset;
+    if (isRestShape && typeof presetRaw === "string" && out.command != null && normalizePreset(presetRaw) !== "Custom") {
+      delete out.command;
+    }
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     const { project_id, pane_id, tool_preset, permissions_mode } = args;
     const preset = normalizePreset(tool_preset);
@@ -268,16 +302,26 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       }
     );
 
+    // c55 Batch D — STATUS-VIA-KINDS. The REST client status-branches: 403 = refusal earcon, 202 =
+    // queued. So the gate Off case returns kind:"blocked" (-> resultToHttp 403) and the Ask/deferred
+    // case returns kind:"pending" (-> resultToHttp 202) instead of the old kind:"ok" strings — the
+    // 403/202 branches now SURVIVE the registry mount. The voice surface still narrates from the SAME
+    // kinds: voiceResponse maps blocked -> { output: reason } (so the refusal string is spoken
+    // byte-identical), and pending -> { status, messageId, ...extra } — we carry the queued narration
+    // in extra.output so the model still SPEAKS "needs operator confirmation" exactly as before.
     if (g.disposition === "forbidden") {
       return {
-        kind: "ok",
-        output: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.`,
+        kind: "blocked",
+        reason: `Error: the 'create_pane' capability is gated Off; pane creation is forbidden by policy.`,
       };
     }
     if (g.disposition === "deferred") {
+      const queued = `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to create the pane.`;
       return {
-        kind: "ok",
-        output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to create the pane.`,
+        kind: "pending",
+        messageId: g.actionId,
+        summary: queued,
+        extra: { output: queued },
       };
     }
     return { kind: "ok", output: createPaneEffect() };

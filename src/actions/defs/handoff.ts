@@ -92,6 +92,19 @@ export const handoffContextBetweenPanes: ActionDef<typeof HandoffContextParams> 
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/handoff" },
+  // c55 Batch D: the UI POSTs a camelCase body { sourcePaneId, targetPaneId, contextNotes }; the
+  // voice schema keys are snake_case. Alias camel->snake (only when the snake key is absent, so a
+  // voice call carrying snake_case is never clobbered) so the inline route's body shape keeps working.
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.source_pane_id == null && out.sourcePaneId != null) out.source_pane_id = out.sourcePaneId;
+    if (out.target_pane_id == null && out.targetPaneId != null) out.target_pane_id = out.targetPaneId;
+    if (out.context_notes == null && out.contextNotes != null) out.context_notes = out.contextNotes;
+    delete out.sourcePaneId;
+    delete out.targetPaneId;
+    delete out.contextNotes;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     const { source_pane_id, target_pane_id, context_notes } = args;
     const sourceTerm = ctx.manager.terminals[source_pane_id];

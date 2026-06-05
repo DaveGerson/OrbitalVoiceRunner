@@ -115,7 +115,19 @@ export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
   capability: "set_pane_permissions",
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "put", path: "/api/projects/:projectId/panes/:paneId/permissions" },
+  // c55 Batch D: snake_case route segments so Express injects :project_id/:pane_id directly onto the
+  // snake_case zod keys (no camelCase param skew). The inline twin read camelCase :projectId/:paneId
+  // and a `permissions` BODY key; coerceArgs below aliases body {permissions -> permissions_mode}.
+  rest: { method: "put", path: "/api/projects/:project_id/panes/:pane_id/permissions" },
+  // REST body alias: the UI matrix editor PUTs { permissions: <mode> }; the voice schema key is
+  // `permissions_mode`. Alias it so the REST body lands on the snake_case zod key (only when the
+  // snake key is absent, so a voice call carrying permissions_mode is never clobbered).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.permissions_mode == null && out.permissions != null) out.permissions_mode = out.permissions;
+    delete out.permissions;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     const { project_id, pane_id, permissions_mode } = args;
     // Ungated validation pre-checks (cheap reads, no side effect) BEFORE the gate.

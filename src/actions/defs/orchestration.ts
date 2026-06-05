@@ -194,6 +194,14 @@ export const applyOrchestrationRecipe: ActionDef<typeof ApplyOrchestrationRecipe
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/recipes/apply" },
+  // c55 Batch D: the UI POSTs { recipeId }; the voice schema key is recipe_id. Alias camel->snake
+  // (only when the snake key is absent, so a voice call carrying recipe_id is never clobbered).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.recipe_id == null && out.recipeId != null) out.recipe_id = out.recipeId;
+    delete out.recipeId;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     const { recipe_id } = args;
     const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
@@ -216,7 +224,15 @@ export const applyOrchestrationRecipe: ActionDef<typeof ApplyOrchestrationRecipe
           (id) => ctx.effectiveCapabilityGateFor(id, "create_pane"),
         );
         if (plan.layoutForbidden) {
-          resp = `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`;
+          // c55 Batch D — STATUS-VIA-KINDS: the layout-level apply_recipe Off-veto is a REFUSAL, so
+          // return kind:"blocked" (was a kind:"ok" string). resultToHttp maps blocked -> 403, which the
+          // REST client status-branches on for the refusal earcon (the inline twin emitted 403 too). The
+          // voice surface still narrates from the same kind (voiceResponse blocked -> { output: reason }),
+          // so the spoken refusal is byte-identical to the old ok-string. No toHttp hook needed.
+          return {
+            kind: "blocked",
+            reason: `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`,
+          };
         } else {
           const paneById = new Map(recipe.panes.map((p) => [p.id, p]));
           const spawned: string[] = [];
