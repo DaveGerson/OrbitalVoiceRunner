@@ -7,9 +7,8 @@ import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
-import { SHELL_PROMPT } from "./src/statusConstants";
 import { PaneSignalBus } from "./src/paneSignalBus";
-import { classifyPaneOutput, formatPaneSignal } from "./src/paneSignals";
+import { formatPaneSignal } from "./src/paneSignals";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
@@ -53,6 +52,7 @@ import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/i
 import { resolveResumeHandleTtlMs, shouldClearHandleOnClose, wrapHandleForPersist, readFreshHandle, isInvalidKeyClose, isBlankApiKey } from "./src/voiceResumption";
 import { extractTranscripts } from "./src/liveTranscripts";
 import { createCoreState } from "./src/core/coreState";
+import { attachObserve } from "./src/observe";
 
 dotenv.config();
 
@@ -421,84 +421,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     }
   });
 
-  async function summarizeCommandOutcome(command: string, rawOutput: string): Promise<string> {
-    try {
-      const apiKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
-        ? manager.settings.secrets.geminiApiKey
-        : (process.env.GEMINI_API_KEY || "");
-
-      const summarizeAi = apiKey ? new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      }) : ai;
-
-      // WS-B: redactSecrets applied to raw output before it reaches the model (was UNREDACTED,
-      // finding N-5). Secrets printed to a pane are now scrubbed before this Gemini call.
-      const prompt = `You are a strict, command-line terminal outcome synthesizer.
-Summarize the final response and outcome of the following command execution. Do NOT include raw or verbose stdout log sequences. Focus exclusively on the ultimate outcome, success/failure of the command, and any critical final lines of output (key numbers, final results, final generated file text, or compile error statements). Do not say who you are. Keep your summary to 1-2 small conversational sentences, highly professional and compact.
-
-Command: ${command}
-Verbose Output:
-${redactSecrets(rawOutput.slice(-3000))}`;
-
-      // NOTE: `rawOutput` is now sent to the summarizer model via redactSecrets(), which
-      // scrubs AWS keys, JWTs, PEM blocks, Google API keys, GitHub/Slack tokens, and
-      // generic key=value secret assignments before any content reaches the model.
-      const response = await summarizeAi.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: prompt,
-      });
-      return response.text?.trim() || "No outcomes summary available.";
-    } catch (err) {
-      console.error("[summarizeCommandOutcome] Error:", err);
-      // Honest neutral fallback — do NOT claim success; the outcome is unknown here.
-      return "Command outcome summary unavailable.";
-    }
-  }
-
   // Push-observation: one bus per server; each /live connection subscribes its session.
   const paneSignalBus = new PaneSignalBus();
 
-  manager.onIdle = async (terminalId) => {
-    const term = manager.terminals[terminalId];
-    if (term) {
-      const history = HistoryManager.getInstance().loadHistory(terminalId);
-      // WS-D summary for the proactive completion notification. Built ONLY from
-      // already-redacted/derived sources (never raw pane text): a fresh summarization when
-      // there is substantive output, else the existing redacted finalResponse, else a brief
-      // last-command-based fallback. Always set so the announcement below can fire.
-      let summaryText = "finished";
-      if (history.length > 0) {
-        const lastEntry = history[history.length - 1];
-        try {
-          const cleanOutput = lastEntry.output ? stripAnsiSequences(lastEntry.output).trim() : "";
-          if (cleanOutput.length > 5 && !lastEntry.finalResponse) {
-            summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
-            lastEntry.finalResponse = summaryText;
-            HistoryManager.getInstance().saveHistory(terminalId, history);
-            broadcast({ type: "history_updated", terminalId, history });
-          } else if (lastEntry.finalResponse) {
-            summaryText = lastEntry.finalResponse; // already WS-B redacted
-          } else if (lastEntry.command) {
-            summaryText = `${lastEntry.command} finished`;
-          }
-        } catch (err) {
-          console.error("Auto-summarization failed for command outcomes:", err);
-        }
-      }
-
-      // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
-      // idle inference. Fires regardless of whether there was substantive output / an existing
-      // finalResponse, with the redacted summary above as the message. The bus owns the
-      // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
-      announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
-      paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
-    }
-  };
+  // dec-2 (DBT5): the PTY observation/trigger pipeline (summarizeCommandOutcome, onIdle,
+  // handleWatchRulesTrigger, handlePlansTrigger, detectAndTriggerTransitions, onOutput) moved to
+  // src/observe/index.ts. attachObserve(...) is invoked below — AFTER broadcast / announcementBus /
+  // pruneAttention are constructed — and its returned handlers are assigned to manager.onOutput /
+  // manager.onIdle there. (The handlers are late-bound closures, exactly as the inline assignments
+  // were, so the call must follow the deps it captures.)
 
   // dec-1 (DBT5): the shared mutable runtime state — coreState.activeFrontendWs, coreState.activeLiveSession, the broadcast
   // client set, coreState.activePaneId (the single write-target source of truth), the STOP-ALL `frozen` freeze
@@ -567,313 +498,25 @@ ${redactSecrets(rawOutput.slice(-3000))}`;
     pruneAttentionQueue(manager.attentionQueue);
   }
 
-  const lastStates: Record<string, string> = {};
-
-  function handleWatchRulesTrigger(terminalId: string, transition: "idle" | "prompt" | "error" | "build-failed" | "exited") {
-    const rules = manager.ledger.watchRules;
-    let changed = false;
-    for (const rule of rules) {
-      if (rule.enabled && rule.triggerTerminalId === terminalId && rule.triggerTransition === transition) {
-        // Prompt-composer refactor: watch rules NEVER write to a CLI pane. They are co-pilot
-        // nudges — when the trigger matches, we SURFACE the suggested command for the operator
-        // (who can act on it, gated, on the active pane). No autonomous, background, or
-        // cross-pane write happens here. (architecture §5: Remove watch-rule autonomous writes.)
-        console.log(`[WATCH RULE NUDGE] Rule ${rule.id} matched: suggesting '${rule.actionCommand}' for '${rule.actionTerminalId}' (not writing).`);
-        const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-        manager.attentionQueue.push({
-          id: itemID,
-          type: "confirmation",
-          terminalId: rule.actionTerminalId,
-          projectId: manager.ledger.activeProjectId || "default_project",
-          message: `Suggestion: run '${rule.actionCommand}' on '${rule.actionTerminalId}' (trigger: '${terminalId}' → '${transition}').`,
-          timestamp: new Date().toISOString(),
-          dismissed: false,
-          details: {
-            kind: "watch_rule_suggestion",
-            ruleId: rule.id,
-            suggestedCommand: rule.actionCommand,
-            targetTerminalId: rule.actionTerminalId,
-          },
-        });
-        pruneAttention(); // BUG-035 cap/TTL
-        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-        broadcast({
-          type: "watch_rule_suggested",
-          ruleId: rule.id,
-          suggestedCommand: rule.actionCommand,
-          targetTerminalId: rule.actionTerminalId,
-          message: `Watch rule matched — suggested '${rule.actionCommand}' on '${rule.actionTerminalId}'. Not executed; awaiting the operator.`
-        });
-        if (rule.oneShot) {
-          rule.enabled = false;
-          changed = true;
-        }
-      }
-    }
-    if (changed) {
-      manager.ledger["save"](true);
-      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-    }
-  }
-
-  function handlePlansTrigger(terminalId: string, transition: "idle" | "prompt" | "error" | "build-failed" | "exited") {
-    const plans = manager.ledger.plans;
-    let changed = false;
-    for (const plan of plans) {
-      if (plan.status === "running") {
-        const currentStep = plan.steps[plan.currentStepIndex];
-        if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
-          if (transition === currentStep.expectedTransition) {
-            currentStep.status = "completed";
-            console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
-            broadcast({
-              type: "plan_step_completed",
-              planId: plan.id,
-              stepId: currentStep.id,
-              message: `Plan step completed successfully on '${terminalId}'.`
-            });
-            const nextIndex = plan.currentStepIndex + 1;
-            if (nextIndex < plan.steps.length) {
-              // Prompt-composer refactor: a plan is an OUTLINE, not an execution engine. We do
-              // NOT auto-advance by writing the next step into a pane. Mark the next step pending,
-              // pause the plan awaiting the operator, and SURFACE it as a co-pilot suggestion the
-              // operator can act on (gated, on the active pane). (architecture §5: Demote plans.)
-              plan.currentStepIndex = nextIndex;
-              const nextStep = plan.steps[nextIndex];
-              nextStep.status = "pending";
-              plan.status = "paused";
-              const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-              manager.attentionQueue.push({
-                id: itemID,
-                type: "confirmation",
-                terminalId: nextStep.terminalId,
-                projectId: manager.ledger.activeProjectId || "default_project",
-                message: `Plan '${plan.name}': step ${nextIndex + 1} ready — suggest '${nextStep.command}' on '${nextStep.terminalId}'.`,
-                timestamp: new Date().toISOString(),
-                dismissed: false,
-                details: {
-                  kind: "plan_step_suggestion",
-                  planId: plan.id,
-                  stepId: nextStep.id,
-                  suggestedCommand: nextStep.command,
-                  targetTerminalId: nextStep.terminalId,
-                },
-              });
-              pruneAttention(); // BUG-035 cap/TTL
-              broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-              announcementBus.enqueue({
-                kind: "plan_paused",
-                terminalId: nextStep.terminalId,
-                summary: `Plan '${plan.name}' — step ${nextIndex + 1} ready for your approval.`
-              });
-              changed = true;
-            } else {
-              plan.status = "completed";
-              console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
-              broadcast({
-                type: "plan_completed",
-                planId: plan.id,
-                message: `Plan '${plan.name}' completed all steps successfully!`
-              });
-              announcementBus.enqueue({
-                kind: "plan_completed",
-                terminalId: plan.id,
-                summary: `Plan '${plan.name}' completed.`
-              });
-              changed = true;
-            }
-          } else if (transition === "error" || transition === "build-failed" || transition === "exited") {
-            currentStep.status = "failed";
-            plan.status = "paused";
-            console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
-            
-            const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-            manager.attentionQueue.push({
-              id: itemID,
-              type: "build-failed",
-              terminalId,
-              projectId: manager.ledger.activeProjectId || "default_project",
-              message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
-              timestamp: new Date().toISOString(),
-              dismissed: false
-            });
-            pruneAttention(); // BUG-035 cap/TTL
-            broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-            broadcast({
-              type: "plan_paused",
-              planId: plan.id,
-              message: `Plan '${plan.name}' paused due to execution error.`
-            });
-            announcementBus.enqueue({
-              kind: "plan_paused",
-              terminalId,
-              summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
-            });
-            changed = true;
-          }
-        }
-      }
-    }
-    if (changed) {
-      manager.ledger["save"](true);
-      broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-    }
-  }
-
-  function detectAndTriggerTransitions(terminalId: string, cleanChunk: string) {
-    const term = manager.terminals[terminalId];
-    if (!term) return;
-
-    let transition: "idle" | "prompt" | "error" | "build-failed" | "exited" | null = null;
-    if (term.status === "Exited") {
-      transition = "exited";
-    } else {
-      const lower = cleanChunk.toLowerCase();
-      if (
-        lower.includes("failed to compile") ||
-        lower.includes("build failed") ||
-        lower.includes("modulenotfounderror") ||
-        lower.includes("compile error") ||
-        lower.includes("npm err!") ||
-        lower.includes("failed to build") ||
-        lower.includes("error: command failed") ||
-        lower.includes("error: not found")
-      ) {
-        transition = "build-failed";
-      } else if (
-        cleanChunk.includes("Error:") ||
-        cleanChunk.includes("Exception:") ||
-        cleanChunk.includes("Stderr:") ||
-        lower.includes("traceback") ||
-        lower.includes("fatal: ")
-      ) {
-        transition = "error";
-      } else if (term.status === "Idle") {
-        // The busy/idle status is now owned by the authoritative state machine
-        // (src/statusMachine.ts). Here we only refine an already-Idle pane into a
-        // "prompt" attention if it looks like a shell prompt awaiting input —
-        // using the shared SHELL_PROMPT regex from statusConstants.ts (I4: shell
-        // panes only, never an interactive_cli TUI). This is an attention-label
-        // concern independent of the idle decision. Otherwise we defer to "idle".
-        const isShell = term.runtimeType === "shell";
-        const tail = stripAnsiSequences(cleanChunk);
-        if (isShell && SHELL_PROMPT.test(tail)) {
-          transition = "prompt";
-        } else {
-          transition = "idle";
-        }
-      }
-    }
-
-    const previousState = lastStates[terminalId];
-    if (transition && transition !== previousState) {
-      lastStates[terminalId] = transition;
-      console.log(`[TRANSITION] Terminal ${terminalId} transitioned: ${previousState || "none"} -> ${transition}`);
-      
-      broadcast({
-        type: "pane_transition",
-        terminalId,
-        transition,
-        message: `Pane ${terminalId} is now ${transition}.`
-      });
-
-      if (transition === "build-failed" || transition === "error" || transition === "exited") {
-        const activeProjectId = manager.ledger.activeProjectId || "default_project";
-        const id = "att_" + Math.random().toString(36).substring(2, 11);
-        // WS-B: scrub the chunk before it becomes a displayed/announced hint.
-        const hint = redactSecrets(cleanChunk.trim()).slice(-160);
-        manager.attentionQueue.push({
-          id,
-          type: transition,
-          terminalId,
-          projectId: activeProjectId,
-          message: `Pane '${terminalId}' transitioned to '${transition}' state.`,
-          timestamp: new Date().toISOString(),
-          dismissed: false
-        });
-        pruneAttention(); // BUG-035 cap/TTL
-        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-
-        // WS-D (BUG-024): high-severity proactive announcement (reuses the existing
-        // lastStates edge-dedup, so this fires once per genuine transition edge).
-        announcementBus.enqueue({ kind: transition, terminalId, summary: hint });
-      }
-
-      handleWatchRulesTrigger(terminalId, transition);
-      handlePlansTrigger(terminalId, transition);
-    }
-  }
-
-  const outputBuffers: Record<string, string[]> = {};
-  let flushTimeout: NodeJS.Timeout | null = null;
-
-  manager.onOutput = (terminalId, chunk) => {
-    const term = manager.terminals[terminalId];
-    if (term) {
-      const cleanChunk = stripAnsiSequences(chunk);
-      // QW5 (bead qw5): this runs on EVERY PTY data chunk. Each observation step is independent —
-      // a throw from one bad chunk in any of them used to propagate out of the PTY data event,
-      // crashing the process AND blinding the pane (the buffering/broadcast tail below never ran).
-      // Guard each step in its own try/catch so one failing step neither kills the others nor blinds
-      // the stream; log and continue. This is a net, not a behavior change.
-      try {
-        // Push-observation: classify each chunk and publish error/prompt signals. The bus
-        // debounces per (pane,kind), so a chatty pane won't spam the model.
-        const cls = classifyPaneOutput(cleanChunk);
-        if (cls) {
-          paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
-        }
-      } catch (e) {
-        console.error(`[ONOUTPUT] pane-signal step failed for ${terminalId}:`, e);
-      }
-      try {
-        HistoryManager.getInstance().appendOutputToLastCommand(terminalId, cleanChunk);
-      } catch (e) {
-        console.error(`[ONOUTPUT] history step failed for ${terminalId}:`, e);
-      }
-      try {
-        // Classify transitions and handle trigger rules
-        detectAndTriggerTransitions(terminalId, cleanChunk);
-      } catch (e) {
-        console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
-      }
-    }
-
-    // Correlated log: attribute terminal output to the active turn (best-effort; VOICE_TRACE-gated
-    // because PTY is high-volume). Lets "what did the operator's command actually produce?" be
-    // answered from the same stream as the voice/tool legs.
-    if (VOICE_TRACE && lastInteractionId) {
-      try {
-        interactionLog.log({
-          interactionId: lastInteractionId,
-          kind: "pty",
-          paneId: terminalId,
-          text: stripAnsiSequences(chunk).slice(0, 500),
-        });
-      } catch { /* observability never breaks the PTY loop */ }
-    }
-
-    if (!outputBuffers[terminalId]) {
-      outputBuffers[terminalId] = [];
-    }
-    outputBuffers[terminalId].push(chunk);
-
-    if (!flushTimeout) {
-      flushTimeout = setTimeout(() => {
-        flushTimeout = null;
-        for (const [tid, chunks] of Object.entries(outputBuffers)) {
-          if (chunks.length > 0) {
-            broadcast({
-              type: "stdout_chunk",
-              terminalId: tid,
-              chunk: chunks.join("")
-            });
-            outputBuffers[tid] = [];
-          }
-        }
-      }, 30);
-    }
-  };
+  // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
+  // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
+  // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
+  // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
+  // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
+  const { onOutput, onIdle } = attachObserve(manager, {
+    broadcast,
+    announcementBus,
+    paneSignalBus,
+    pruneAttention,
+    interactionLog,
+    getLastInteractionId: () => lastInteractionId,
+    setLastInteractionId: (v) => { lastInteractionId = v; },
+    redact: redactSecrets,
+    historyManager: HistoryManager.getInstance(),
+    ai,
+  });
+  manager.onOutput = onOutput;
+  manager.onIdle = onIdle;
 
   function broadcastLedgerUpdate() {
     broadcast({
