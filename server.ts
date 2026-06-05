@@ -1514,6 +1514,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     await new Promise<void>((resolve) => wss.close(() => resolve()));
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    // Tear down the Python synthesizer daemon — stops the orphaned `python ... __main__.py` per instance.
+    pythonSynthClient?.dispose();
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).

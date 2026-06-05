@@ -361,9 +361,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
         // synthesizeAsync owns the race + `source` authority and NEVER rejects.
         const brief = await memory.service.synthesizeAsync(activeId, Date.now());
-        // Latest-wins (invariant I3): if the operator switched panes while we awaited, the active
-        // pane moved on — DROP this brief rather than inject stale context for a backgrounded pane.
-        if (!briefIsForActivePane(brief.activePaneId, coreState.activePaneId)) return;
+        // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
+        // the operator switched panes while we awaited, DROP this brief rather than inject stale
+        // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
+        // with no tier yet (brief.activePaneId null) is still correctly injected.
+        if (!briefIsForActivePane(activeId, coreState.activePaneId)) return;
         if (brief.text.trim()) {
           sess.sendClientContent({
             turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],

@@ -179,7 +179,7 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
       breakerUntil = now + cooldownMs;
       consecutiveFails = 0; firstFailAt = 0; attempt = 0;
       log(`[synth] circuit breaker OPEN for ${cooldownMs}ms (fallback-only)`);
-      respawnTimer = setTimeout(() => { breakerUntil = 0; log("[synth] breaker probe"); spawnDaemon(); }, cooldownMs);
+      respawnTimer = setTimeout(() => { breakerUntil = 0; discovering = true; candIndex = 0; log("[synth] breaker probe (re-discover)"); spawnDaemon(); }, cooldownMs);
     } else {
       const wait = Math.min(backoffMaxMs, backoffBaseMs * Math.pow(2, attempt++));
       respawnTimer = setTimeout(spawnDaemon, wait);
@@ -205,6 +205,9 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
       onDown("spawn-threw");
       return;
     }
+    // Belt-and-suspenders: unref the child so a forgotten dispose() can't pin the event loop.
+    // Optional-chained — the fake child in tests has no unref.
+    child.unref?.();
     child.stdout?.on("data", (d: Buffer) => {
       buf += d.toString("utf-8");
       let nl: number;

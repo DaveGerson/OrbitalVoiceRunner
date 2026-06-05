@@ -10,7 +10,7 @@ async function injectWithGuard(opts: {
   send: (text: string) => void;
 }) {
   const brief = await opts.synthesizeAsync(opts.requestedId);
-  if (!briefIsForActivePane(brief.activePaneId, opts.currentActiveIdAfterAwait)) return; // drop stale
+  if (!briefIsForActivePane(opts.requestedId, opts.currentActiveIdAfterAwait)) return; // drop stale
   if (brief.text.trim()) opts.send(brief.text);
 }
 
@@ -34,4 +34,15 @@ test("a brief for the still-active pane is injected exactly once", async () => {
     send: (t) => sent.push(t),
   });
   assert.deepEqual(sent, ["P1 BRIEF"]);
+});
+
+test("a brief for a still-active pane that has no tier (activePaneId null) is still injected", async () => {
+  const sent: string[] = [];
+  await injectWithGuard({
+    requestedId: "p1",
+    synthesizeAsync: async () => ({ text: "P1 BRIEF", activePaneId: null, source: "fallback" }), // tier missing → null
+    currentActiveIdAfterAwait: "p1",
+    send: (t) => sent.push(t),
+  });
+  assert.deepEqual(sent, ["P1 BRIEF"]); // NOT dropped — compared the requested id, not the null brief id
 });

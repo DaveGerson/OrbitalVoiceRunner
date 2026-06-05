@@ -69,3 +69,11 @@ test("briefIsForActivePane: latest-wins predicate", () => {
   assert.equal(briefIsForActivePane("p1", null), false);
   assert.equal(briefIsForActivePane(null, "p1"), false);
 });
+
+test("synthesizeAsync never rejects even if getTiers throws (I1 floor)", async () => {
+  const throwingWm: any = { getTiers: () => { throw new Error("boom"); } };
+  const svc = new MemoryService(throwingWm, DEFAULT_MEMORY_CONFIG);
+  const b = await svc.synthesizeAsync("p1", 0); // must resolve, not reject
+  assert.equal(b.source, "fallback");
+  assert.equal(b.activePaneId, "p1");
+});

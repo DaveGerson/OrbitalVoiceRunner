@@ -29,11 +29,11 @@ export class MemoryService {
 
   /** P0b: race the Python daemon (≤timeoutMs) against the in-process floor; TS owns `source` (I1/I4). */
   async synthesizeAsync(activePaneId: string | null, now: number): Promise<SynthesizedBrief> {
-    const tiers = this.wm.getTiers(activePaneId, now);
-    const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
-    const client = this.pythonClient;
-    if (!client || !client.available()) return fallback();
     try {
+      const tiers = this.wm.getTiers(activePaneId, now);
+      const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
+      const client = this.pythonClient;
+      if (!client || !client.available()) return fallback();
       const timeout = new Promise<null>((res) => { const t = setTimeout(() => res(null), this.timeoutMs); if (typeof (t as any).unref === "function") (t as any).unref(); });
       const raced = await Promise.race([client.request(tiers, this.cfg, now), timeout]);
       if (raced && raced.ok) {
@@ -44,10 +44,11 @@ export class MemoryService {
           source: "python",
         };
       }
+      return fallback();
     } catch {
-      // never let a client error escape — the floor always answers
+      // Last-resort floor: even if getTiers/assembleBrief throws, never reject.
+      return { text: "", perTierChars: {}, activePaneId, source: "fallback" };
     }
-    return fallback();
   }
 
   synthesizerState(): "python" | "fallback" {
