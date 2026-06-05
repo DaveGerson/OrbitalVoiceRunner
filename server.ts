@@ -621,9 +621,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // builder too — and the def's rest.toHttp emits it TOP-LEVEL, byte-identical to this body. The voice
   // surface still narrates the project/pane TREE (handler is surface-aware: ctx.surface==='rest' -> flat).
 
-  app.get("/api/ledger", (req, res) => {
-    res.json(manager.ledger.workspaces);
-  });
+  // c55.11: GET /api/ledger now served by the registry-derived get_ledger def (mountRestRoutes only-set above).
 
   // c55 Batch D: POST /api/terminals (create_pane) is now served by the registry-derived create_pane
   // def (mountRestRoutes only-set above). coerceArgs aliases the camelCase body (terminalId/projectId/
@@ -1009,9 +1007,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   ];
 
   // 1. Attention alerting queue
-  app.get("/api/attention", (req, res) => {
-    res.json(manager.attentionQueue);
-  });
+  // c55.11: GET /api/attention now served by the registry-derived get_attention_queue def (mountRestRoutes only-set above).
 
   // c55 Batch A: POST /api/attention/:id/dismiss is now served by the registry twin dismiss_attention
   // (mountRestRoutes only-set above) — same attention_updated broadcast. Accepted body delta (client
@@ -1040,9 +1036,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // 400 -> zod 500; inline remove 404 -> 200 ok-narration.
 
   // 3. Multi-step sequenced resumable plans
-  app.get("/api/plans", (req, res) => {
-    res.json(manager.ledger.plans);
-  });
+  // c55.11: GET /api/plans now served by the registry-derived list_orchestrator_plans def (mountRestRoutes only-set above).
 
   // c55 Batch A: POST /api/plans (create) is now served by the registry twin create_orchestrator_plan
   // (mountRestRoutes only-set above) — same plans_updated broadcast and ledger["save"](true) persist.
@@ -1091,9 +1085,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // Accepted delta (client ignores the body): inline 404 "Plan not found." -> 200 ok-narration.
 
   // 4. Recipes and templates
-  app.get("/api/recipes", (req, res) => {
-    res.json(recipes);
-  });
+  // c55.11: GET /api/recipes now served by the registry-derived list_orchestration_recipes def (mountRestRoutes only-set above).
+  //         (The `recipes` const above still feeds ctx.recipes, which the def reads.)
 
   // c55 Batch D: POST /api/recipes/apply (apply_orchestration_recipe) is now served by the registry twin
   // (mountRestRoutes only-set above). coerceArgs aliases the body {recipeId -> recipe_id}; the handler
@@ -1458,6 +1451,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "add_watch_rule",
       "remove_watch_rule",
       "delete_orchestrator_plan",
+      // c55.11 — 4 rest-only structured reads, cut over from the inline app.get(...) routes deleted
+      // below. Each rides rest.toHttp to emit its value TOP-LEVEL, byte-identical to the legacy body.
+      "get_ledger",
+      "get_attention_queue",
+      "list_orchestrator_plans",
+      "list_orchestration_recipes",
     ]),
   });
 

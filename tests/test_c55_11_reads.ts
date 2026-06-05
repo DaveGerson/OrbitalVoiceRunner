@@ -112,3 +112,35 @@ describe("c55.11 — fidelity: toHttp emits the value TOP-LEVEL (byte-identical 
     });
   }
 });
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// cutover guard — server.ts inline GET routes deleted + names added to the only-set
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("c55.11 — server.ts cutover guard (no double-registration)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+
+  const mountIdx = serverSrc.indexOf("mountRestRoutes(");
+  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
+  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
+  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+
+  for (const name of ["get_ledger", "get_attention_queue", "list_orchestrator_plans", "list_orchestration_recipes"]) {
+    it(`mountRestRoutes only-set includes "${name}"`, () => {
+      assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
+      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the c55.11 cutover`);
+    });
+  }
+
+  const goneLiterals: Array<{ label: string; needle: RegExp }> = [
+    { label: "GET /api/ledger", needle: /app\.get\(\s*["']\/api\/ledger["']/ },
+    { label: "GET /api/attention", needle: /app\.get\(\s*["']\/api\/attention["']/ },
+    { label: "GET /api/plans", needle: /app\.get\(\s*["']\/api\/plans["']/ },
+    { label: "GET /api/recipes", needle: /app\.get\(\s*["']\/api\/recipes["']/ },
+  ];
+  for (const { label, needle } of goneLiterals) {
+    it(`inline route is deleted: ${label}`, () => {
+      assert.ok(!needle.test(serverSrc), `inline ${label} must be deleted (converged to the registry)`);
+    });
+  }
+});
