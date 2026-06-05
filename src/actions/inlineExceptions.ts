@@ -45,13 +45,6 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "put", path: "/api/projects/:projectId/panes/:paneId/capability-gates", category: "held", reason: "BULK gate map-write; set_capability_gate def is single-entry tighten-only — needs new set_pane_gates (held)" },
   { method: "post", path: "/api/plans/:id/execute", category: "held", reason: "execute_plan: registry handler's dispatchProposal is a refusing stub on REST — needs a REST pane-write seam (c55.9)" },
   { method: "post", path: "/api/attention/clear", category: "held", reason: "thin shim delegating to runAction('dismiss_attention',{}) — path-alias pending multi-path rest binding" },
-  // ── future-convergence: notes ──
-  { method: "post", path: "/api/projects/:id/notes", category: "future-convergence", reason: "project notes add — future registry def (notes batch)" },
-  { method: "get", path: "/api/projects/:id/notes", category: "future-convergence", reason: "project notes read — future registry def" },
-  { method: "put", path: "/api/notes/:id", category: "future-convergence", reason: "note edit — future registry def" },
-  { method: "delete", path: "/api/notes/:id", category: "future-convergence", reason: "note delete — future registry def" },
-  { method: "post", path: "/api/projects/:projectId/panes/:paneId/notes", category: "future-convergence", reason: "pane notes add — future registry def" },
-  { method: "post", path: "/api/projects/:projectId/panes/:paneId/context", category: "future-convergence", reason: "add model context to pane — future registry def" },
   // ── future-convergence: project/pane lifecycle ──
   { method: "put", path: "/api/projects/:id", category: "future-convergence", reason: "project update — future registry def" },
   { method: "delete", path: "/api/projects/:id", category: "future-convergence", reason: "project delete — future registry def" },

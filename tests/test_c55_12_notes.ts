@@ -124,3 +124,35 @@ describe("c55.12 — fidelity: handlers hit the right ledger method + write defs
     assert.ok(calls.includes("addHumanContext:proj:p1:ctx") && calls.includes("broadcast"));
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// cutover guard — server.ts inline routes deleted + names added to the only-set
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("c55.12 — server.ts cutover guard (no double-registration)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  const mountIdx = serverSrc.indexOf("mountRestRoutes(");
+  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
+  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
+  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+
+  for (const name of ["create_project_note", "read_project_notes", "edit_note", "remove_note", "create_pane_note", "add_pane_context"]) {
+    it(`mountRestRoutes only-set includes "${name}"`, () => {
+      assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
+      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the c55.12 cutover`);
+    });
+  }
+  // The CONVERGED inline route literals must be GONE (double-registration silently masks the cutover).
+  const goneLiterals: Array<{ label: string; needle: RegExp }> = [
+    { label: "POST/GET /api/projects/:id/notes", needle: /app\.(get|post)\(\s*["']\/api\/projects\/:id\/notes["']/ },
+    { label: "PUT /api/notes/:id", needle: /app\.put\(\s*["']\/api\/notes\/:id["']/ },
+    { label: "DELETE /api/notes/:id", needle: /app\.delete\(\s*["']\/api\/notes\/:id["']/ },
+    { label: "POST /api/projects/:projectId/panes/:paneId/notes", needle: /app\.post\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/notes["']/ },
+    { label: "POST /api/projects/:projectId/panes/:paneId/context", needle: /app\.post\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/context["']/ },
+  ];
+  for (const { label, needle } of goneLiterals) {
+    it(`inline route is deleted: ${label}`, () => {
+      assert.ok(!needle.test(serverSrc), `inline ${label} must be deleted (converged to the registry)`);
+    });
+  }
+});
