@@ -10,6 +10,7 @@ import {
   Status as MachineStatus,
   RuntimeType,
 } from "./statusMachine";
+import { AgentAdapter, createAdapter } from "./agents";
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
@@ -162,7 +163,10 @@ export function buildLaunchCommand(
   sessionId: string
 ): string {
   let finalCommand = shellCmd;
-  if (toolPreset !== "Custom" && sessionId) {
+  // Delegate the "is this preset resumable at all?" decision to the adapter (B5):
+  // every agent preset supports resume; Custom does not.
+  const supportsResume = createAdapter(toolPreset).capabilities().supportsResume;
+  if (supportsResume && sessionId) {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
     // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
@@ -172,6 +176,26 @@ export function buildLaunchCommand(
     }
   }
   return finalCommand;
+}
+
+/**
+ * Add or strip the adapter's OWN permission-bypass flag on a command string per the
+ * target mode. The single choke point used by the constructor AND setPermissionsMode,
+ * so the add/remove paths always agree on which flag string to touch. Custom (and any
+ * adapter whose bypassFlag() is null) is left untouched. B2 fix: Codex/agy get their
+ * own flag, NOT Claude's Anthropic-only --dangerously-skip-permissions.
+ */
+function applyBypassFlag(
+  shellCmd: string,
+  adapter: AgentAdapter,
+  mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only"
+): string {
+  const flag = adapter.bypassFlag();
+  if (!flag) return shellCmd;
+  if (mode === "Full Auto") {
+    return shellCmd.includes(flag) ? shellCmd : `${shellCmd} ${flag}`;
+  }
+  return shellCmd.replace(` ${flag}`, "");
 }
 
 
@@ -353,6 +377,11 @@ export class UniversalTerminal {
   public status: "Running" | "Exited" | "Idle" = "Idle";
   public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+  // The per-CLI adapter (multi-cli spec §4). Owns every preset-conditional decision
+  // (bypass flag, launch/resume argv, live mode-switch disposition, capabilities),
+  // retiring the inline `if (toolPreset !== "Custom")` branches (B5) and correcting
+  // B2 (Codex/agy no longer inherit Claude's Anthropic-only skip flag).
+  public adapter: AgentAdapter;
   public sessionId: string;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
@@ -408,27 +437,22 @@ export class UniversalTerminal {
     this.permissionsMode = permissionsMode;
     this.projectId = projectId;
     this.runtimeType = toolPreset === "Custom" ? "shell" : "interactive_cli";
+    // The pane's per-CLI adapter (spec §4). All preset-conditional decisions below
+    // delegate here instead of branching inline on the preset string.
+    this.adapter = createAdapter(toolPreset);
     // Injectable for tests; defaults to the platform-selected probe (design §2.0).
     this.statusProbe = statusProbe ?? selectProbe();
     // G3: injectable spawn seam (optional + last so no existing call site changes).
     if (transportFactory) this.transportFactory = transportFactory;
 
-    let cmd = shellCmd;
-    if (toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (permissionsMode === "Full Auto") {
-        if (!cmd.includes(skipFlag)) {
-          cmd = `${cmd} ${skipFlag}`;
-        }
-      } else {
-        cmd = cmd.replace(` ${skipFlag}`, "");
-      }
-    }
-    this.shellCmd = cmd;
-    
+    // Flag injection: the adapter owns its OWN bypass flag (Claude/agy
+    // --dangerously-skip-permissions; Codex --dangerously-bypass-approvals-and-sandbox;
+    // Custom none). B2 fix: we no longer hardcode Claude's flag for every agent.
+    this.shellCmd = applyBypassFlag(shellCmd, this.adapter, permissionsMode);
+
     if (sessionId) {
       this.sessionId = sessionId;
-    } else if (toolPreset !== "Custom") {
+    } else if (this.adapter.capabilities().supportsResume) {
       // Synthetic "<tool>-session-<hex>" id is for internal tracking/display ONLY.
       // It is intentionally never passed to the CLI --resume flag, which requires a
       // real UUID. Real session UUIDs are captured later by checkForSessionId() once
@@ -443,16 +467,10 @@ export class UniversalTerminal {
 
   public setPermissionsMode(mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only") {
     this.permissionsMode = mode;
-    if (this.toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (mode === "Full Auto") {
-        if (!this.shellCmd.includes(skipFlag)) {
-          this.shellCmd = `${this.shellCmd} ${skipFlag}`;
-        }
-      } else {
-        this.shellCmd = this.shellCmd.replace(` ${skipFlag}`, "");
-      }
-    }
+    // Mutate the NEXT spawn's command string via the adapter's OWN bypass flag.
+    // (This only affects the next launch — bead 1y8/applyPaneMode reaches a LIVE
+    // process; that is P4 and out of this wave's scope.)
+    this.shellCmd = applyBypassFlag(this.shellCmd, this.adapter, mode);
   }
 
   get contextSize(): number {
@@ -460,7 +478,7 @@ export class UniversalTerminal {
   }
 
   private checkForSessionId(text: string) {
-    if (this.sessionId && this.sessionId.includes("-session-") && this.toolPreset !== "Custom") {
+    if (this.sessionId && this.sessionId.includes("-session-") && this.adapter.capabilities().supportsResume) {
       // Keep preset/simulated unless a more granular one is found in output
     }
     const matchers = [

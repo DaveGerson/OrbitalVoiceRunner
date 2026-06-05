@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { buildLaunchCommand } from "../src/terminal";
+import { buildLaunchCommand, UniversalTerminal } from "../src/terminal";
 
 /**
  * BUG-032 regression pins. The launch string Janus hands the PTY must:
@@ -75,5 +75,58 @@ describe("buildLaunchCommand (BUG-032 regression surface)", () => {
       buildLaunchCommand("claude --dangerously-skip-permissions", "Claude Code", UUID),
       `claude --dangerously-skip-permissions --resume ${UUID}`
     );
+  });
+});
+
+/**
+ * B2 BUGFIX — per-preset bypass-flag injection (the point of the AgentAdapter
+ * extraction, spec §5). The constructor now mutates shellCmd via the pane adapter's
+ * OWN bypass flag, NOT a hardcoded Claude flag for every agent:
+ *   - Claude  Full Auto → --dangerously-skip-permissions            (unchanged)
+ *   - agy     Full Auto → --dangerously-skip-permissions            (agy's own flag)
+ *   - Codex   Full Auto → --dangerously-bypass-approvals-and-sandbox (NOT Claude's)
+ *   - Custom  Full Auto → no flag                                   (unchanged)
+ * Promotion via setPermissionsMode add/strips the SAME per-adapter flag.
+ */
+describe("constructor bypass-flag injection (B2 regression)", () => {
+  const CLAUDE_SKIP = "--dangerously-skip-permissions";
+  const CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox";
+  const ctor = (cmd: string, preset: any, mode: any) =>
+    new UniversalTerminal("b2-" + Math.random().toString(16).slice(2), ".", cmd, preset, mode, "", "p");
+
+  it("Claude Full Auto carries --dangerously-skip-permissions (unchanged)", () => {
+    assert.ok(ctor("claude", "Claude Code", "Full Auto").shellCmd.includes(CLAUDE_SKIP));
+  });
+  it("Claude HITL carries no bypass flag (unchanged)", () => {
+    assert.ok(!ctor("claude", "Claude Code", "Human-in-the-Loop").shellCmd.includes(CLAUDE_SKIP));
+  });
+
+  it("Codex Full Auto uses its OWN bypass flag, NOT Claude's Anthropic-only flag", () => {
+    const cmd = ctor("codex", "Codex", "Full Auto").shellCmd;
+    assert.ok(cmd.includes(CODEX_BYPASS), `Codex bypass flag: ${cmd}`);
+    assert.ok(!cmd.includes(CLAUDE_SKIP), `Codex must NOT inherit Claude's flag: ${cmd}`);
+  });
+  it("Codex HITL carries no bypass flag", () => {
+    const cmd = ctor("codex", "Codex", "Human-in-the-Loop").shellCmd;
+    assert.ok(!cmd.includes(CODEX_BYPASS) && !cmd.includes(CLAUDE_SKIP), `no bypass under HITL: ${cmd}`);
+  });
+
+  it("Antigravity Full Auto uses --dangerously-skip-permissions (its own flag)", () => {
+    const cmd = ctor("agy", "Antigravity", "Full Auto").shellCmd;
+    assert.ok(cmd.includes(CLAUDE_SKIP), `agy bypass flag: ${cmd}`);
+    assert.ok(!cmd.includes(CODEX_BYPASS), `agy must not use Codex's flag: ${cmd}`);
+  });
+
+  it("Custom never carries any bypass flag, even under Full Auto", () => {
+    const cmd = ctor("bash", "Custom", "Full Auto").shellCmd;
+    assert.ok(!cmd.includes(CLAUDE_SKIP) && !cmd.includes(CODEX_BYPASS), `Custom stays bare: ${cmd}`);
+  });
+
+  it("setPermissionsMode promotes/demotes the SAME per-adapter flag (Codex)", () => {
+    const t = ctor("codex", "Codex", "Human-in-the-Loop");
+    t.setPermissionsMode("Full Auto");
+    assert.ok(t.shellCmd.includes(CODEX_BYPASS) && !t.shellCmd.includes(CLAUDE_SKIP), `promote: ${t.shellCmd}`);
+    t.setPermissionsMode("Read-Only");
+    assert.ok(!t.shellCmd.includes(CODEX_BYPASS), `demote strips it: ${t.shellCmd}`);
   });
 });
