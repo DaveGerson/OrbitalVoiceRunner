@@ -535,8 +535,15 @@ export class UniversalTerminal {
       if (pinned) this.sessionId = pinned;
       return; // never run the free-form scrape against a pinned-session CLI
     }
-    if (this.sessionId && this.sessionId.includes("-session-") && this.adapter.capabilities().supportsResume) {
-      // Keep preset/simulated unless a more granular one is found in output
+    if (this.adapter.capabilities().supportsResume) {
+      // Codex/agy do NOT print a resumable id in stdout. Route capture through the adapter's
+      // on-disk store instead — agy reads the newest conversations/<uuid>.db that appeared
+      // since spawn (bead 1h0), so a restart-resume promotion re-attaches the SAME conversation
+      // via --conversation=<uuid>. Adopt a real uuid when available; ALWAYS short-circuit the
+      // free-form matchers below (TUI noise would clobber the captured/synthetic id).
+      const captured = this.adapter.captureSessionId({ ptyOutput: text, cwd: this.cwd });
+      if (captured) this.sessionId = captured;
+      return;
     }
     const matchers = [
       /(?:session[_-]?id|session)[ :="']{1,3}([a-zA-Z0-9_\-]{8,})/i,
@@ -1164,7 +1171,10 @@ export class OrchestratorManager {
         voiceStyle: "Creative",
         volume: 80,
         speechSpeed: 1.0,
-        isMicMuted: false
+        isMicMuted: false,
+        // sa4: unset by default => buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT.
+        // This is config (persists to disk via saveSettings), NOT a secret.
+        systemPrompt: undefined
       },
       projects: {
         activeContext: "default_project",

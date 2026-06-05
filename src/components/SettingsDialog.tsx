@@ -8,6 +8,7 @@ import {
   ANNOUNCEMENT_TEMPLATE_FIELDS,
 } from "../announcementKinds";
 import { apiFetch } from "../utils/api";
+import { DEFAULT_SYSTEM_PROMPT } from "../voice/systemPrompt";
 import { 
   X, 
   Settings, 
@@ -130,6 +131,9 @@ export function SettingsDialog({
   const [volume, setVolume] = useState<number>(80);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [model, setModel] = useState<string>("gemini-3.1-flash-live-preview");
+  // sa4: operator-editable Gemini voice system prompt. Empty string => persist undefined =>
+  // buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT (shown as the placeholder hint).
+  const [systemPrompt, setSystemPrompt] = useState<string>("");
 
   // Local states - Project profiles
   const [activeContext, setActiveContext] = useState<string>("default_project");
@@ -190,6 +194,7 @@ export function SettingsDialog({
       setVolume(initialSettings.voiceAi?.volume ?? 80);
       setIsMicMuted(initialSettings.voiceAi?.isMicMuted ?? false);
       setModel(initialSettings.voiceAi?.model ?? "gemini-3.1-flash-live-preview");
+      setSystemPrompt(initialSettings.voiceAi?.systemPrompt ?? "");
 
       setActiveContext(initialSettings.projects?.activeContext ?? "default_project");
       setLocalWorkspacePath(initialSettings.projects?.localWorkspacePath ?? "");
@@ -232,7 +237,10 @@ export function SettingsDialog({
         // kept as a constant so the persisted SystemSettings shape still type-checks.
         speechSpeed: 1.0,
         isMicMuted,
-        model
+        model,
+        // sa4: persist undefined for a blank prompt so the builder falls back to
+        // DEFAULT_SYSTEM_PROMPT (rather than storing a meaningless empty string).
+        systemPrompt: systemPrompt.trim() ? systemPrompt : undefined
       },
       projects: {
         activeContext,
@@ -270,7 +278,7 @@ export function SettingsDialog({
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements, capabilityGates
@@ -307,6 +315,8 @@ export function SettingsDialog({
         if (parsed.voiceAi.volume !== undefined) setVolume(parsed.voiceAi.volume);
         if (parsed.voiceAi.isMicMuted !== undefined) setIsMicMuted(parsed.voiceAi.isMicMuted);
         if (parsed.voiceAi.model !== undefined) setModel(parsed.voiceAi.model);
+        // sa4: round-trip the editable system prompt through the JSON tab too (undefined => blank).
+        if (parsed.voiceAi.systemPrompt !== undefined) setSystemPrompt(parsed.voiceAi.systemPrompt ?? "");
       }
       if (parsed.projects) {
         if (parsed.projects.activeContext !== undefined) setActiveContext(parsed.projects.activeContext);
@@ -574,6 +584,39 @@ export function SettingsDialog({
                         <option value="gemini-2.5-flash">gemini-2.5-flash (Standard Medium-Fast Model)</option>
                       </select>
                       <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
+                    </div>
+
+                    {/* sa4: operator-editable voice system prompt. Blank => DEFAULT_SYSTEM_PROMPT
+                        (shown as the placeholder). {{activeProjectId}} and {{workspaces}} are
+                        substituted with live values at connect time. */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="block text-zinc-400">Voice System Prompt</label>
+                        <button
+                          type="button"
+                          data-testid="settings-voice-system-prompt-reset"
+                          onClick={() => setSystemPrompt("")}
+                          disabled={!systemPrompt.trim()}
+                          className="px-2 py-0.5 rounded text-[10px] tracking-wider font-bold transition-all bg-zinc-500/10 hover:bg-zinc-500/20 text-zinc-300 border border-white/10 hover:border-white/20 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+                          title="Clear the custom prompt and fall back to the built-in default"
+                        >
+                          Reset to default
+                        </button>
+                      </div>
+                      <textarea
+                        value={systemPrompt}
+                        data-testid="settings-voice-system-prompt"
+                        onChange={e => setSystemPrompt(e.target.value)}
+                        rows={8}
+                        spellCheck={false}
+                        placeholder={DEFAULT_SYSTEM_PROMPT}
+                        className="w-full bg-black border border-white/10 rounded px-3 py-2 text-white text-[11px] font-mono leading-relaxed focus:outline-none focus:border-cyan-500 resize-y"
+                      />
+                      <span className="text-[9px] text-zinc-600 mt-1 block">
+                        Leave blank to use the built-in default (shown above). Tokens{" "}
+                        <code className="text-zinc-400">{"{{activeProjectId}}"}</code> and{" "}
+                        <code className="text-zinc-400">{"{{workspaces}}"}</code> are filled with live values. (applies on reconnect)
+                      </span>
                     </div>
 
                     {/* Reconnect button for voice/model/API key changes */}

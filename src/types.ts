@@ -252,6 +252,11 @@ export interface SystemSettings {
     speechSpeed: number;
     isMicMuted: boolean;
     model: string;
+    // sa4: operator-editable Gemini voice system prompt. When unset/blank the builder
+    // (src/voice/systemPrompt.ts) falls back to DEFAULT_SYSTEM_PROMPT. {{activeProjectId}} and
+    // {{workspaces}} placeholders are substituted with live values at connect time. This is
+    // CONFIG (persists to disk), NOT a secret.
+    systemPrompt?: string;
   };
   projects: {
     activeContext: string;
