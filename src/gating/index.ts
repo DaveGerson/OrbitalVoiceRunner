@@ -42,6 +42,7 @@ import {
   type ResolveReason,
 } from "../pendingApprovals";
 import { PendingActionStore } from "../pendingActions";
+import { applyPaneMode, type PaneModeResult } from "../applyPaneMode";
 import { buildActionRun, checkActionVersion } from "../actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
 import { applyHandoffFlipOnResolve, type HandoffResolveReason } from "../handoffFlow";
@@ -106,6 +107,12 @@ export interface Gating {
   killAllPanes: () => Promise<{ killed: string[]; failed: string[] }>;
   releaseStopAll: () => void;
   applyResolution: (messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) => ReturnType<typeof resolveDecision>;
+  /** The LIVE mode-switch choke point (multi-cli spec §6, bead 1y8). set_pane_permissions + restart_pane delegate here. */
+  applyPaneMode: (
+    paneId: string,
+    targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
+    source: "voice" | "ui" | "restart_pane"
+  ) => Promise<PaneModeResult>;
   reannounceSurvivors: (session: any) => void;
   pendingApprovals: PendingApprovalStore;
   pendingActions: PendingActionStore;
@@ -689,7 +696,41 @@ export function createGating(deps: GatingDeps): Gating {
     return approvalSweepTimer;
   }
 
+  // ── applyPaneMode: the LIVE mode-switch choke point (multi-cli adapter spec §6, bead 1y8) ──────
+  // Binds the standalone applyPaneMode core to this server's real terminal + gate + pending stores +
+  // broadcast + ledger persist. set_pane_permissions and the restart_pane voice tool delegate here
+  // (via ctx.applyPaneMode) so a Full-Auto promotion reaches the RUNNING process and drains pending.
+  async function applyPaneModeBound(
+    paneId: string,
+    targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
+    source: "voice" | "ui" | "restart_pane",
+  ): Promise<PaneModeResult> {
+    const term = manager.terminals[paneId];
+    if (!term) {
+      return { ok: false, kind: "unsupported", reason: `Pane ${paneId} is not live; no running process to switch.` };
+    }
+    return applyPaneMode(paneId, targetMode, source, term, {
+      gateOrDefer: (cap, pane, summary, run, params, requestedMode) =>
+        gateOrDefer(cap as CapabilityGate, pane, summary, run, params, requestedMode),
+      pendingApprovals,
+      pendingActions,
+      broadcast,
+      // PERSIST-WINS (sibling of bead gpd): write operator intent to the ledger so a later syncLedger
+      // won't revert it. Mirrors the legacy set_pane_permissions persist (ledger pane mode + save).
+      persistMode: (pid, mode) => {
+        const ws = manager.ledger.getActiveProject() ?? undefined;
+        const pane = ws?.panes?.[pid];
+        if (ws && pane) {
+          pane.permissions_mode = mode;
+          manager.ledger.updatePane(manager.ledger.activeProjectId || "default_project", pane, true);
+        }
+        broadcastLedgerUpdate();
+      },
+    });
+  }
+
   return {
+    applyPaneMode: applyPaneModeBound,
     effectiveModeFor,
     effectiveCapabilityGateFor,
     gateCapability,

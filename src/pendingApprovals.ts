@@ -655,6 +655,23 @@ export class PendingApprovalStore {
     return true;
   }
 
+  /**
+   * Per-pane DRAIN (multi-cli adapter spec §11): on a pane's promotion to Full Auto its staged
+   * approvals become moot (the live agent now self-approves), so every approval bound to that pane
+   * is removed and the drained records are returned for the caller to broadcast `approval_resolved`
+   * on. This is a hard removal (NOT a claim/resolve through resolveDecision): a promotion is not an
+   * approve/reject, it makes the held write irrelevant — the agent will run unattended. Targets by
+   * `terminalId`, the same field forSession/all() carry, so a different pane's pending is untouched.
+   * Returns the records in `order` (oldest first) for deterministic broadcast.
+   */
+  drainForPane(paneId: string): PendingApproval[] {
+    const drained = this.order
+      .filter((id) => this.records[id]?.terminalId === paneId)
+      .map((id) => this.records[id]);
+    for (const rec of drained) this.delete(rec.messageId); // delete() removes the durable row too
+    return drained;
+  }
+
   /** Purge every entry for a closed session. (WS-F TODO: persist + re-announce, not purge.) */
   purgeSession(session: any): string[] {
     const purged = this.order.filter((id) => this.sessions[id] === session);

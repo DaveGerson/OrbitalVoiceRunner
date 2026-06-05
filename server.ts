@@ -530,6 +530,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     stopAll,
     releaseStopAll,
     applyResolution,
+    applyPaneMode,
     pendingApprovals,
     pendingActions,
   } = gating;
@@ -1527,6 +1528,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       pruneAttention,
       pendingApprovals,
       applyResolution,
+      applyPaneMode,
       store,
       sanitizeSettingsForClient,
       recipes: recipes as ActionContext["recipes"],

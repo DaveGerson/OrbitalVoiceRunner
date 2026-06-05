@@ -107,6 +107,81 @@ const SetPanePermissionsParams = z.object({
   permissions_mode: z.string(),
 });
 
+/** The three valid Janus modes (shared by set_pane_permissions + restart_pane). */
+const VALID_MODES = ["Full Auto", "Human-in-the-Loop", "Read-Only"] as const;
+type JanusMode = (typeof VALID_MODES)[number];
+
+/**
+ * The LEGACY (P0–P3) pane-permission path: gate, then mutate only the NEXT spawn's command string +
+ * persist the ledger mode. This is bug B1 — it never reaches the live process. Retained as the
+ * fallback when ctx.applyPaneMode is NOT wired (REST/test contexts). The P4 path (ctx.applyPaneMode)
+ * reaches the LIVE process; see applyPaneModeDelegate below.
+ */
+function legacyApplyPanePerms(
+  ctx: Parameters<ActionDef<typeof SetPanePermissionsParams>["handler"]>[1],
+  project_id: string,
+  pane_id: string,
+  permissions_mode: string,
+): ActionResult {
+  const applyPanePerms = (): string => {
+    if (ctx.manager.terminals[pane_id])
+      ctx.manager.terminals[pane_id].setPermissionsMode(permissions_mode as JanusMode);
+    const ws2 = ctx.manager.ledger.getProject(project_id);
+    if (ws2 && ws2.panes[pane_id]) {
+      ws2.panes[pane_id].permissions_mode = permissions_mode as JanusMode;
+      ctx.manager.ledger["save"]();
+    }
+    ctx.broadcastLedgerUpdate();
+    ctx.broadcastTerminalsUpdated();
+    return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
+  };
+  const g = ctx.gateOrDefer(
+    "set_pane_permissions",
+    pane_id ?? null,
+    `Set pane ${pane_id} permissions to ${permissions_mode}`,
+    applyPanePerms,
+    // kzt: persist the pane-permissions INTENT for restart parity (lockstep w/ actionEffects).
+    { ...(ctx.versionStamp ?? {}), paneId: pane_id, projectId: project_id, permissionsMode: permissions_mode },
+    // rbh: requested mode passed structurally for the dialog divergence rider.
+    permissions_mode,
+  );
+  if (g.disposition === "forbidden") {
+    return {
+      kind: "ok",
+      output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.`,
+    };
+  }
+  if (g.disposition === "deferred") {
+    return {
+      kind: "ok",
+      output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+    };
+  }
+  return { kind: "ok", output: applyPanePerms() };
+}
+
+/**
+ * The P4 delegate: route the mode change through ctx.applyPaneMode (the live choke point, bead 1y8).
+ * The output strings are mapped from PaneModeResult so the voice-tool goldens stay byte-for-byte for
+ * the gate dispositions (forbidden / deferred), and a live success reads the same "updated ...
+ * successfully" shape. Returns null if ctx.applyPaneMode is not wired (caller falls back to legacy).
+ */
+async function applyPaneModeDelegate(
+  ctx: Parameters<ActionDef<typeof SetPanePermissionsParams>["handler"]>[1],
+  pane_id: string,
+  permissions_mode: JanusMode,
+  source: "voice" | "ui" | "restart_pane",
+): Promise<ActionResult | null> {
+  if (!ctx.applyPaneMode) return null;
+  const r = await ctx.applyPaneMode(pane_id, permissions_mode, source);
+  if (r.ok) {
+    return { kind: "ok", output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` };
+  }
+  // forbidden / deferred / unsupported / live-signal-timeout all carry an operator-facing reason
+  // (the forbidden + deferred reasons are byte-for-byte the legacy gate-disposition strings).
+  return { kind: "ok", output: r.reason ?? `Could not set pane ${pane_id} permissions to ${permissions_mode}.` };
+}
+
 export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
   name: "set_pane_permissions",
   description:
@@ -116,17 +191,16 @@ export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "put", path: "/api/projects/:projectId/panes/:paneId/permissions" },
-  handler: (args, ctx): ActionResult => {
+  handler: async (args, ctx): Promise<ActionResult> => {
     const { project_id, pane_id, permissions_mode } = args;
     // Ungated validation pre-checks (cheap reads, no side effect) BEFORE the gate.
-    const validModes = ["Full Auto", "Human-in-the-Loop", "Read-Only"];
     const term = ctx.manager.terminals[pane_id];
     const ws = ctx.manager.ledger.getProject(project_id);
     const paneExists = !!(ws && ws.panes[pane_id]);
-    if (!validModes.includes(permissions_mode)) {
+    if (!VALID_MODES.includes(permissions_mode as JanusMode)) {
       return {
         kind: "ok",
-        output: `Invalid permissions mode "${permissions_mode}". Must be one of: ${validModes.join(", ")}.`,
+        output: `Invalid permissions mode "${permissions_mode}". Must be one of: ${VALID_MODES.join(", ")}.`,
       };
     }
     if (!term && !paneExists) {
@@ -135,46 +209,62 @@ export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
         output: `Pane ${pane_id} not found in project ${project_id}; no permission change applied.`,
       };
     }
-    const applyPanePerms = (): string => {
-      if (ctx.manager.terminals[pane_id])
-        ctx.manager.terminals[pane_id].setPermissionsMode(
-          permissions_mode as "Full Auto" | "Human-in-the-Loop" | "Read-Only",
-        );
-      const ws2 = ctx.manager.ledger.getProject(project_id);
-      if (ws2 && ws2.panes[pane_id]) {
-        ws2.panes[pane_id].permissions_mode = permissions_mode as
-          | "Full Auto"
-          | "Human-in-the-Loop"
-          | "Read-Only";
-        ctx.manager.ledger["save"]();
-      }
-      ctx.broadcastLedgerUpdate();
-      ctx.broadcastTerminalsUpdated();
-      return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
-    };
-    const g = ctx.gateOrDefer(
-      "set_pane_permissions",
-      pane_id ?? null,
-      `Set pane ${pane_id} permissions to ${permissions_mode}`,
-      applyPanePerms,
-      // kzt: persist the pane-permissions INTENT for restart parity (lockstep w/ actionEffects).
-      { ...(ctx.versionStamp ?? {}), paneId: pane_id, projectId: project_id, permissionsMode: permissions_mode },
-      // rbh: requested mode passed structurally for the dialog divergence rider.
-      permissions_mode,
-    );
-    if (g.disposition === "forbidden") {
+    // P4: delegate to the LIVE choke point when wired (reaches the running process + drains on
+    // promotion). A live pane is required for the live mechanics; when there is no live term (a
+    // ledger-only pane), fall back to the legacy next-spawn path so the persisted mode still lands.
+    if (term) {
+      const delegated = await applyPaneModeDelegate(ctx, pane_id, permissions_mode as JanusMode, "ui");
+      if (delegated) return delegated;
+    }
+    return legacyApplyPanePerms(ctx, project_id, pane_id, permissions_mode);
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// restart_pane — the gated voice tool that makes Full-Auto reach the LIVE process (bead 1y8).
+// Mirrors set_pane_permissions (same gate, same intent params); routed through ctx.applyPaneMode so a
+// promotion either live-signals (Claude) or restart-resumes (Codex/agy) and drains pending (§11).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RestartPaneParams = z.object({
+  project_id: z.string(),
+  pane_id: z.string(),
+  permissions_mode: z.string(),
+});
+
+export const restartPane: ActionDef<typeof RestartPaneParams> = {
+  name: "restart_pane",
+  description:
+    "Apply a permission mode to a LIVE terminal pane, reaching the running CLI: promote to Full Auto (or revert) so the change takes effect now, not just on the next launch. Use to make an agent run unattended.",
+  params: RestartPaneParams,
+  capability: "set_pane_permissions", // rides the same lock-change gate (no new matrix row for v1).
+  readOnly: false,
+  surfaces: new Set(["voice"]),
+  handler: async (args, ctx): Promise<ActionResult> => {
+    const { project_id, pane_id, permissions_mode } = args;
+    const term = ctx.manager.terminals[pane_id];
+    const ws = ctx.manager.ledger.getProject(project_id);
+    const paneExists = !!(ws && ws.panes[pane_id]);
+    if (!VALID_MODES.includes(permissions_mode as JanusMode)) {
       return {
         kind: "ok",
-        output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.`,
+        output: `Invalid permissions mode "${permissions_mode}". Must be one of: ${VALID_MODES.join(", ")}.`,
       };
     }
-    if (g.disposition === "deferred") {
+    if (!term && !paneExists) {
       return {
         kind: "ok",
-        output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+        output: `Pane ${pane_id} not found in project ${project_id}; no permission change applied.`,
       };
     }
-    return { kind: "ok", output: applyPanePerms() };
+    // restart_pane is the LIVE tool: it only makes sense on a running pane. When the pane has no live
+    // term (inert / ledger-only), there is no process to reach — fall back to the legacy persist so
+    // the next launch carries the mode.
+    if (term) {
+      const delegated = await applyPaneModeDelegate(ctx, pane_id, permissions_mode as JanusMode, "restart_pane");
+      if (delegated) return delegated;
+    }
+    return legacyApplyPanePerms(ctx, project_id, pane_id, permissions_mode);
   },
 };
 
@@ -286,5 +376,6 @@ export const setCapabilityGate: ActionDef<typeof SetCapabilityGateParams> = {
 export const LOCKS_ACTIONS: ActionDef[] = [
   setGlobalPermissions,
   setPanePermissions,
+  restartPane,
   setCapabilityGate,
 ];
