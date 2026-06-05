@@ -23,6 +23,7 @@ import type {
   ResolveMode,
 } from "../pendingApprovals";
 import type { JanusStore } from "../store/sqliteStore";
+import type { PaneModeResult } from "../applyPaneMode";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -241,6 +242,13 @@ export interface ActionContext {
   /** Read the live active pane id (the single source of truth for where Janus may write).
    *  add_pane_note defaults its pane_id to this when the caller omits one (server.ts:458). */
   getActivePaneId: () => string | null;
+
+  // ── Memory Synthesis P0a freshness trigger (optional/additive) ────────────────────────────────
+  /** Request a FRESH situational brief synthesis + inject it into the live session for the
+   *  now-active pane (anti-rot, spec freshness trigger). switch_context calls it after its live
+   *  ledger sync (the "catch me up" path). Wired by the server's voice context builder; absent on
+   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws. */
+  injectMemoryBrief?: () => void;
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;
@@ -257,6 +265,21 @@ export interface ActionContext {
   /** Broadcast `{type:'terminals_updated', postures: allPanePostures()}` so the chips repaint
    *  without a /api/terminals refetch (server.ts:1844). create_pane + set_pane_permissions emit it. */
   broadcastTerminalsUpdated: () => void;
+
+  // ── Live mode-switch choke point (multi-cli adapter spec §6, bead 1y8) ─────────────────────────
+  /**
+   * The injected applyPaneMode choke point — the ONE path that makes a pane permission change reach
+   * the LIVE process (Claude live-signal / Codex+agy restart-resume), draining pending on a Full-Auto
+   * promotion (§11). The server binds it to the real terminal + gateOrDefer + pending stores +
+   * broadcast + ledger persist. OPTIONAL so test/REST contexts that don't wire it fall back to the
+   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the new `restart_pane`
+   * tool delegate here when present. `source` is the caller surface (audit only).
+   */
+  applyPaneMode?: (
+    paneId: string,
+    targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
+    source: "voice" | "ui" | "restart_pane",
+  ) => Promise<PaneModeResult>;
 
   // ── Gate inspection (server.ts:1711 — the resolver behind gateCapability/gateOrDefer) ─────────
   /** Resolve the EFFECTIVE per-capability gate for a (pane, capability), spotlight + frozen applied

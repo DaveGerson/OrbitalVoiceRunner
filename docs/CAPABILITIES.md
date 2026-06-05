@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**54** actions across **17** gated capabilities, plus the always-allowed group.
+**55** actions across **17** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -177,6 +177,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `restart_pane` | voice | no | Apply a permission mode to a LIVE terminal pane, reaching the running CLI |
 | `set_pane_permissions` | voice / rest | no | Set the safety permission policy mode for a specific terminal pane |
 
 ## Mute or unmute voice

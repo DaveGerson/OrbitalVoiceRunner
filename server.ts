@@ -15,10 +15,13 @@ import {
 } from "./src/pendingApprovals";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
-// c55 Batch D: restGateOutcome (the inline create_pane / recipes REST gate-status mapper) is no longer
-// imported here — those routes are now served by the registry mount, which maps gate dispositions via
-// resultToHttp (status-via-kinds). The pure helper + its unit test (src/restGate.ts / test_rest_gate.ts)
-// remain for any future REST gate mapping that doesn't ride the registry.
+// c55 + concurrent multi-cli merge: c55 dropped restGateOutcome from create_pane/recipes (now registry-
+// served via resultToHttp status-via-kinds), but it is RETAINED because the concurrent /api/terminals/:id/
+// raw-input route below uses it for the gated Shift+Tab disposition. classifyRawKey + isPaneActiveForWrite
+// serve that same raw-input route.
+import { restGateOutcome } from "./src/restGate";
+import { classifyRawKey } from "./src/rawKeyClass";
+import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { CapabilityGate, CapabilityGateMap } from "./src/types";
@@ -30,6 +33,7 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
+import { createMemoryService } from "./src/memory";
 import { createGating } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -339,6 +343,9 @@ export interface RunningServer {
   _testPendingApprovals?: () => PendingApprovalStore;
   /** QW6 test seam: the broadcast client set (for dead-socket pruning assertions). NOT for prod use. */
   _testClients?: () => Set<any>;
+  /** Active-pane-guard test seam: pin coreState.activePaneId (the UI's set_active_pane WS effect)
+   *  so REST suites can assert the single-active-pane refusal without a live socket. NOT for prod use. */
+  _testSetActivePane?: (id: string | null) => void;
 }
 
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
@@ -466,12 +473,43 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttentionQueue(manager.attentionQueue);
   }
 
+  // Memory Synthesis P0a: the in-process, anti-rot working-context layer. WorldModel reads live
+  // manager + store; the FallbackAssembler blends the five redacted tiers into one char-budgeted
+  // brief; the BreadcrumbRing is fed from the ears edges (onBreadcrumb below) and decays by recency.
+  // No new runtime deps, no Python (P0b swaps in behind MemoryService.synthesize). The advanced
+  // knobs are optional/additive — absent ⇒ DEFAULT_MEMORY_CONFIG. (manager/store satisfy the
+  // WorldModel deps structurally; every text field is redacted at the WorldModel boundary.)
+  // store is null under JANUS_LEDGER_BACKEND=legacy (or store-init failure). The WorldModel only
+  // reads getProject/getProjectBriefing; a null-safe shim degrades the Project tier to absent
+  // (the brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8).
+  const memoryStore = store ?? { getProject: () => null, getProjectBriefing: () => null };
+  // The WorldModel reads the gate posture off `settings.globalPermissionsMode`, but the live value
+  // is `manager.globalPermissionsMode` (resolved from advanced.globalPermissionsMode). Adapt the
+  // manager to the WorldModel's narrow dep shape (live getters — every read is current, never a
+  // stale snapshot) so the Janus-frame tier reports the REAL posture instead of the safe default.
+  const memoryManager = {
+    get activeId() { return manager.activeId; },
+    get terminals() { return manager.terminals as any; },
+    get ledger() { return { activeProjectId: manager.ledger.activeProjectId }; },
+    get settings() { return { globalPermissionsMode: manager.globalPermissionsMode }; },
+    listPanes: () => manager.listPanes(),
+  };
+  const memory = createMemoryService(
+    { manager: memoryManager, store: memoryStore, redact: redactSecrets },
+    {
+      totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
+      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+      breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
+      breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
+    },
+  );
+
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
   // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
   // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
-  const { onOutput, onIdle } = attachObserve(manager, {
+  const { onOutput, onIdle, onRunning, onQuiescing } = attachObserve(manager, {
     broadcast,
     announcementBus,
     paneSignalBus,
@@ -481,9 +519,20 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     redact: redactSecrets,
     historyManager: HistoryManager.getInstance(),
     ai,
+    // Memory Synthesis P0a: feed the decaying breadcrumb ring from the ears edges
+    // (onRunning/onIdle/onQuiescing each call this with a redacted one-liner).
+    onBreadcrumb: memory.addBreadcrumb,
   });
   manager.onOutput = onOutput;
   manager.onIdle = onIdle;
+  // Phase 1 "ears": fan the BEGINNING edge (pane_status WS frame + 'running' model signal),
+  // mirroring the onIdle wiring above. The pane_status broadcast is emitted from inside
+  // attachObserve via the injected broadcast — server.ts only binds the handler.
+  manager.onRunning = onRunning;
+  // Conservative Phase 2: fan the HUMBLE pre-idle "cooking…" edge (pane_quiescing WS frame +
+  // 'quiescing' model signal), mirroring the onRunning/onIdle wiring above. The frames are
+  // emitted from inside attachObserve via the injected broadcast/paneSignalBus.
+  manager.onQuiescing = onQuiescing;
 
   function broadcastLedgerUpdate() {
     broadcast({
@@ -509,6 +558,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     store,
     broadcast,
     broadcastLedgerUpdate,
+    broadcastDraft,
     coreState,
     announcementBus,
     pushApprovalNarration,
@@ -532,6 +582,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     stopAll,
     releaseStopAll,
     applyResolution,
+    applyPaneMode,
     pendingApprovals,
     pendingActions,
   } = gating;
@@ -554,12 +605,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     catch (e) { console.error("[onReady] pane-signal publish failed:", e); }
   };
 
-  // c55 Batch F: GET /api/terminals (list_panes) is now served by the registry-derived list_panes def
-  // (mountRestRoutes only-set above). The rest surface builds the SAME flat per-pane array this inline
-  // route did (id/cwd/command/backfill[raw ANSI]/output[getRecentOutput(20)]/status/permissions_mode/
-  // tool_preset/session_id/context_size/effective_gates[16]/posture from posturePayloadForPane), and
-  // the def's rest.toHttp emits it TOP-LEVEL — byte-identical to this body. The voice surface still
-  // narrates the project/pane TREE (the handler is surface-aware: ctx.surface==='rest' -> flat array).
+  // c55 Batch F (+ concurrent multi-cli merge): GET /api/terminals (list_panes) is now served by the
+  // registry-derived list_panes def (mountRestRoutes only-set above). The rest surface builds the SAME flat
+  // per-pane array this inline route did (id/cwd/command/backfill[raw ANSI]/output[getRecentOutput(20)]/
+  // status/quiescing/permissions_mode/tool_preset/session_id/context_size/effective_gates[16]/posture from
+  // posturePayloadForPane) — the concurrent `quiescing` "cooking…" overlay field is carried in the def
+  // builder too — and the def's rest.toHttp emits it TOP-LEVEL, byte-identical to this body. The voice
+  // surface still narrates the project/pane TREE (handler is surface-aware: ctx.surface==='rest' -> flat).
 
   app.get("/api/ledger", (req, res) => {
     res.json(manager.ledger.workspaces);
@@ -606,6 +658,61 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // preserve the inline routes' ungated behavior. send_keys records history + writeInput + ledger_updated;
   // resize_pane validates cols/rows as positive ints via zod (replacing the inline 400) and calls
   // manager.resize. Accepted deltas (client ignores the body): inline 404 -> 200 ok, inline 400 -> zod 500.
+
+  // Raw control-byte path (multi-cli adapter spec §7, §10) — KEPT INLINE (concurrent multi-cli feature; no
+  // c55 registry twin; a future convergence item). Writes literal keystrokes (arrows,
+  // Tab, Esc, Enter, PgUp/PgDn, Ctrl+C, Shift+Tab) into a pane's PTY via writeRaw — NO Enter-append,
+  // NO history (contrast the /input endpoint above, which is SUBMIT semantics). The gate is
+  // BIFURCATED: navigation keys + Ctrl+C (the emergency brake) are always-allowed and run
+  // immediately; the disruptive Shift+Tab (ESC[Z) routes through gateOrDefer("write_to_pane", …)
+  // so it is Ask off-spotlight (202 deferred), Auto on-spotlight (200), or Off (403).
+  app.post("/api/terminals/:id/raw-input", (req, res) => {
+    const { id } = req.params;
+    const { bytes } = req.body;
+    if (typeof bytes !== "string" || bytes.length === 0) {
+      res.status(400).json({ error: "Missing or empty bytes parameter" });
+      return;
+    }
+    const term = manager.terminals[id];
+    if (!term) {
+      res.status(404).json({ error: "Terminal not found or offline" });
+      return;
+    }
+    // 409 when the pane exists but has no live PTY (inert / un-spawned) — writeRaw would no-op.
+    if (!(term as any).transport) {
+      res.status(409).json({ error: "Pane has no live process (not spawned)." });
+      return;
+    }
+    // Active-pane guard (mirrors the voice write path in src/voice/index.ts): raw keystrokes may
+    // only ever reach the SINGLE pane the operator has open (coreState.activePaneId). Refuse a key
+    // aimed at any other pane — in ALL gate modes and for EVERY key, including the always-allowed
+    // nav keys and the Ctrl+C brake — because the guard is about WHICH pane, not which key. This
+    // sits BEFORE the always-allowed/gated branching so nothing reaches a non-active pane's PTY.
+    if (!isPaneActiveForWrite(coreState.activePaneId, id)) {
+      res.status(409).json({
+        error: coreState.activePaneId
+          ? `Raw input refused: pane '${id}' is not the active pane ('${coreState.activePaneId}'). Switch to it first.`
+          : `Raw input refused: no pane is active, so there is nowhere to write. Open the pane first.`,
+      });
+      return;
+    }
+    // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
+    if (classifyRawKey(bytes) === "always-allowed") {
+      term.writeRaw(bytes);
+      res.json({ success: true });
+      return;
+    }
+    // Gated disruptive key (Shift+Tab): defer the writeRaw effect through the capability gate.
+    const rawEffect = (): string => { term.writeRaw(bytes); return "ok"; };
+    const g = gateOrDefer("write_to_pane", id, `Send Shift+Tab (mode cycle) to pane ${id}`, rawEffect);
+    const out = restGateOutcome(g);
+    if (g.disposition === "run") rawEffect(); // Auto: run now
+    res.status(out.status).json(out.body);
+  });
+
+  // c55 Batch C: the inline POST /api/terminals/:id/resize is converged to the registry resize_pane def
+  // (mountRestRoutes only-set above) — removed here to avoid double-registration. The concurrent merge had
+  // kept the inline /resize; resize_pane supersedes it (zod cols/rows positive ints; inline 400 -> zod 500).
 
   // c55 Batch F: GET /api/terminals/:id/history (the RAW history array) is now served by the
   // registry-derived get_terminal_history def (mountRestRoutes only-set above) at GET
@@ -1147,6 +1254,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     boundLiveConnector,
     boundSessionAiFactory,
     gating,
+    memory,
     setLastInteractionId: (v) => { lastInteractionId = v; },
     pushApprovalNarration,
     REGISTRY,
@@ -1195,6 +1303,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       pruneAttention,
       pendingApprovals,
       applyResolution,
+      applyPaneMode,
       store,
       sanitizeSettingsForClient,
       recipes: recipes as ActionContext["recipes"],
@@ -1417,6 +1526,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testActiveLiveSession: () => coreState.activeLiveSession,
     _testPendingApprovals: () => pendingApprovals,
     _testClients: () => coreState.clients,
+    _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
   };
 }
 

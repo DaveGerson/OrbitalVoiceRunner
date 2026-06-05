@@ -111,6 +111,12 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   add_watch_rule: new Set<Surface>(["rest"]),
   remove_watch_rule: new Set<Surface>(["rest"]),
   delete_orchestrator_plan: new Set<Surface>(["rest"]),
+
+  // ── Voice-only by design (multi-cli spec §8, bead 1y8): restart_pane is the SEMANTIC live-promotion
+  // tool. The REST/UI surface for the same intent is set_pane_permissions (which also delegates to the
+  // live applyPaneMode choke point); a separate restart_pane REST twin would be a redundant affordance. ─
+  // (c55: this is the CONCURRENT live-mode voice tool; c55's process-restart is the distinct `respawn_pane` above.)
+  restart_pane: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

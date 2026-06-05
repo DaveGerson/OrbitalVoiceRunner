@@ -105,6 +105,20 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     ctx.manager.settings.projects.localWorkspacePath = wsPath;
     ctx.manager.saveSettings();
     ctx.broadcastLedgerUpdate();
+    // Phase 1 "ears" (fact [E]): getProjectBriefing reads ws.panes, which is only as fresh as
+    // the last syncLedger(). Force a live PTY->ledger sync FIRST so the catch-up briefing
+    // reflects each pane's CURRENT status/is_busy (e.g. a pane that just went Running or Idle)
+    // instead of a stale snapshot. listPanes() already does this on every call; switch_context
+    // now matches. Added AFTER the unconditional settings writes / broadcastLedgerUpdate so the
+    // ordered side effects (the ASYMMETRY HAZARD above) are untouched — only the briefing read
+    // is made non-stale.
+    ctx.manager.refreshLedger();
+    // Memory Synthesis P0a (freshness trigger): the explicit "catch me up" path. After the live
+    // sync, request a FRESH situational brief for the now-active pane so Gemini Live re-focuses on
+    // the switched project instead of drifting on the prior snapshot. Additive + non-blocking — the
+    // server wires injectMemoryBrief on the voice ctx; absent on REST/test paths (safe no-op). The
+    // injector owns its own try/catch, so this never throws into the action path.
+    ctx.injectMemoryBrief?.();
     const briefing = ctx.manager.ledger.getProjectBriefing(projectId) || { error: "Project not found" };
     return { kind: "ok", output: briefing };
   },

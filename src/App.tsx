@@ -15,10 +15,44 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
+import { resolveActivePaneMeta } from "./activePaneMeta";
+
+// Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
+// the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
+const RAW_KEY = {
+  up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
+  enter: "\r", tab: "\t", esc: "\x1b",
+  ctrlC: "\x03", shiftTab: "\x1b[Z",
+} as const;
+
+// Compact control-key strip for a pane (arrows / Tab / Esc / Enter / Ctrl+C / Shift+Tab). Each
+// button POSTs its raw bytes through `onKey` (App.writeControlKey). Reuses the existing icon-button
+// styling; disruptive keys (Ctrl+C, Shift+Tab) carry the warn palette per spec §8.
+function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: string; onKey: (paneId: string, bytes: string) => void; testId?: string }) {
+  const navBtn = "p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all";
+  const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-[9px] font-mono uppercase tracking-wider font-bold";
+  const press = (bytes: string) => onKey(paneId, bytes);
+  return (
+    <div className="flex items-center gap-1 flex-wrap" data-testid={testId} role="group" aria-label="Send control key to pane">
+      {/* Navigation — always-allowed */}
+      <button type="button" onClick={() => press(RAW_KEY.up)} className={navBtn} title="Send Up arrow"><ArrowUp className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.down)} className={navBtn} title="Send Down arrow"><ArrowDown className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.left)} className={navBtn} title="Send Left arrow"><ArrowLeft className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.right)} className={navBtn} title="Send Right arrow"><ArrowRight className="w-3 h-3" /></button>
+      <button type="button" onClick={() => press(RAW_KEY.enter)} className={navBtn} title="Send Enter (commit staged line)"><CornerDownLeft className="w-3 h-3" /></button>
+      {/* Terminal-ops — always-allowed */}
+      <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
+      <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
+      {/* Disruptive — gated (warn tint) */}
+      <button type="button" onClick={() => press(RAW_KEY.ctrlC)} className={warnBtn} title="Send Ctrl+C (interrupt / emergency brake)">^C</button>
+      <button type="button" onClick={() => press(RAW_KEY.shiftTab)} className={warnBtn} title="Send Shift+Tab (cycle agent mode — gated)">⇧Tab</button>
+    </div>
+  );
+}
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -54,6 +88,10 @@ function AppRaw() {
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
+  // Raw control-key outcome toast (multi-cli adapter nit #3): writeControlKey used to swallow non-2xx
+  // silently. Surface the gated/deferred/refused outcomes (403 / 202 / 409) so the operator gets a
+  // visible signal instead of a dead button. `tone` keys the palette; cleared on a timer.
+  const [rawKeyNotification, setRawKeyNotification] = useState<{ tone: "blocked" | "deferred" | "refused"; title: string; detail: string } | null>(null);
   // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
   const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
   // bead 8sq (spec §2.C): two-stage emergency STOP-ALL state. `frozen` = Stage-1 freeze active (Janus
@@ -99,6 +137,15 @@ function AppRaw() {
   // Archive panel states
   const [archive, setArchive] = useState<any[]>([]);
   const [showArchivePanel, setShowArchivePanel] = useState(false);
+  // A-UI (wsm-e2e-pinned-5h0): auto-expand the Pane Archive the first time it gains content, so a
+  // just-exited (terminated + archived, recoverable) pane is immediately discoverable instead of
+  // hidden behind the collapsed-by-default toggle. Only ever auto-OPENS — it never fights a manual
+  // collapse afterward (re-arms only after the archive empties again).
+  const archiveWasEmptyRef = useRef(true);
+  useEffect(() => {
+    if (archive.length > 0 && archiveWasEmptyRef.current) setShowArchivePanel(true);
+    archiveWasEmptyRef.current = archive.length === 0;
+  }, [archive.length]);
 
   // Web Audio Synth Chimes for Hands-Free Feedback
   const playEarcon = (type: EarconType) => {
@@ -421,6 +468,7 @@ function AppRaw() {
     setShowTranscriptPanel,
     setTerminals,
     setActiveTerminalId,
+    setLedger,
     queueStdoutChunk,
     setTranscript,
     setPendingCommands,
@@ -1121,6 +1169,54 @@ function AppRaw() {
     } catch (e) {}
   };
 
+  // Raw control-key bar (multi-cli adapter spec §8): POST literal control bytes to a pane's PTY via
+  // the raw-input endpoint (writeRaw — no Enter-append, no history). Nav keys + Ctrl+C are
+  // always-allowed; Shift+Tab is gated (write_to_pane) and may return 202 (deferred awaiting confirm).
+  const writeControlKey = async (paneId: string, bytes: string) => {
+    try {
+      const res = await apiFetch(`/api/terminals/${paneId}/raw-input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bytes }),
+      });
+      // Nit #3: surface every non-2xx outcome to the operator (no more silent swallow). apiFetch does
+      // NOT throw on non-2xx, so branch on status. 403 = gated Off; 202 = deferred (Ask); 409 = the
+      // pane is not active / not running. Each gets an earcon + a transient toast.
+      if (res.status === 202) {
+        playEarcon("execute"); // queued, awaiting operator confirm
+        showRawKeyToast("deferred", "Key Deferred — Awaiting Confirm", `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.`);
+      } else if (res.status === 403) {
+        playEarcon("alert"); // gated Off (NO "error" earcon token exists)
+        showRawKeyToast("blocked", "Key Blocked by Policy", `Pane ${paneId}: this key is gated Off and was not sent.`);
+      } else if (res.status === 409) {
+        playEarcon("alert");
+        const reason = await res.json().then((b) => (b && typeof b.error === "string" ? b.error : "")).catch(() => "");
+        showRawKeyToast("refused", "Key Not Delivered", reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.`);
+      }
+    } catch (e) {}
+  };
+
+  // Nit #3 helper: raise a transient raw-key outcome toast (auto-dismiss). Mirrors the existing
+  // blocked/auto-approved toast pattern (a one-shot useState cleared on a timer).
+  const showRawKeyToast = (tone: "blocked" | "deferred" | "refused", title: string, detail: string) => {
+    setRawKeyNotification({ tone, title, detail });
+    setTimeout(() => setRawKeyNotification(null), 5000);
+  };
+
+  // Nit #2 helper: grid-view control keys. The server's active-pane guard (nit #1) refuses raw input
+  // to any pane that is not coreState.activePaneId, so a grid pane's key must FIRST activate that pane
+  // — the SAME switch-active-pane path a pane click uses — and THEN send the key, so it lands on the
+  // now-active pane and passes the guard. We push set_active_pane on the WS directly (ordered,
+  // synchronous server-side activation ahead of the raw-input POST) AND set activeTerminalId so the UI
+  // stays in lockstep; then writeControlKey POSTs the bytes (carrying its own 403/202/409 feedback).
+  const writeControlKeyFromGrid = (paneId: string, bytes: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_active_pane", paneId }));
+    }
+    setActiveTerminalId(paneId);
+    writeControlKey(paneId, bytes);
+  };
+
   const handleUpdatePermissions = async (paneId: string, val: string) => {
     try {
       await apiFetch(`/api/projects/${activeProjectId}/panes/${paneId}/permissions`, {
@@ -1286,6 +1382,21 @@ function AppRaw() {
             });
           }
           fetchWipDrafts(msg.projectId);
+        } else if (msg.type === "pane_status") {
+          // Phase 1 "ears" (fact [D]): a real-time pane status push (today: the Running edge).
+          // Patch the matching pane's status IN PLACE — mirroring the in-place setTerminals
+          // patch at handleApprove — so the chip flips immediately, without the 20s poll
+          // round-trip. Deliberately NOT routed through eventBus.effectForEvent (that maps to
+          // fetchTerminals, re-introducing the lag this fix removes). The poll stays as fallback.
+          // Conservative Phase 2: a real status change (Running/Idle) means the pane is no longer
+          // merely "cooking" — clear the humble overlay so a stale label can't linger.
+          setTerminals(prev => prev.map(t => t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t));
+        } else if (msg.type === "pane_quiescing") {
+          // Conservative Phase 2: the pane went quiet inside the pre-idle window. Optimistically
+          // set the humble "cooking…" overlay flag IN PLACE so the label appears instantly,
+          // without a refetch. The pane stays "Running"; the flag only changes the label color/text.
+          // Cleared by the next pane_status (Running/Idle) push or the 20s poll reconcile.
+          setTerminals(prev => prev.map(t => t.id === msg.terminalId ? { ...t, quiescing: true } : t));
         } else if (msg.type === "terminals_updated") {
           fetchTerminals();
         } else if (msg.type === "frozen") {
@@ -1564,19 +1675,13 @@ function AppRaw() {
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
-  let activePaneMeta = null;
-  let activeProjectMeta = null;
   const projectList = Object.values(ledger) as Workspace[];
-
-  if (activeTerminalId) {
-    for (const proj of projectList) {
-      if (proj.panes && proj.panes[activeTerminalId]) {
-        activePaneMeta = proj.panes[activeTerminalId];
-        activeProjectMeta = proj;
-        break;
-      }
-    }
-  }
+  // f06: the context body (name + model/human context, rendered at App.tsx:2031-2034) must track
+  // the active pane in the SAME render that moves the cyan highlight (which keys off activeTerminalId
+  // directly). The data is already local — derive it synchronously from the ledger, no round-trip.
+  // Extracted to a pure, unit-pinned resolver; keys solely off activeTerminalId (stale-active-project safe).
+  const { pane: activePaneMeta, project: activeProjectMeta } =
+    resolveActivePaneMeta(ledger, activeTerminalId);
 
   const handleCreateProject = () => {
     setEditingProject(null);
@@ -1854,6 +1959,13 @@ function AppRaw() {
                   textClass = "text-amber-300 font-extrabold";
                   animateDot = "animate-ping";
                   dotColor = "bg-amber-500";
+                } else if (term.status === "Running" && term.quiescing) {
+                  // Conservative Phase 2: humble "cooking…" — quiet inside the pre-idle window.
+                  // Muted amber, NOT the emerald "executing" pulse and NOT the yellow "idle".
+                  bgClass = "bg-amber-500/5";
+                  borderClass = "border-amber-500/20";
+                  textClass = "text-amber-400/70";
+                  dotColor = "bg-amber-400/70";
                 } else if (term.status === "Running") {
                   bgClass = "bg-emerald-500/10";
                   borderClass = "border-emerald-500/30";
@@ -1945,6 +2057,10 @@ function AppRaw() {
           if (isAlertActive) {
             statusLabel = "AWAITING APPROVAL";
             statusBadgeClass = "bg-amber-500 text-black font-extrabold shadow-[0_0_8px_#f59e0b]";
+          } else if (term.status === "Running" && term.quiescing) {
+            // Conservative Phase 2: humble "cooking…" — quiet inside the pre-idle window, NOT done.
+            statusLabel = "COOKING…";
+            statusBadgeClass = "bg-amber-500/10 text-amber-400/80 border border-amber-500/10";
           } else if (term.status === "Running") {
             statusLabel = "ACTIVE EXECUTING";
             statusBadgeClass = "bg-emerald-500/10 text-emerald-400 border border-emerald-500/10";
@@ -2114,7 +2230,7 @@ function AppRaw() {
 
         {/* Context (C): the layered orientation that shapes this draft. */}
         {activeTerminalId && (
-          <div className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
+          <div data-testid="pane-context-body" className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
             <div className="text-[8px] font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
             {(modelCtx.length > 0 || humanCtx.length > 0) ? (
               <div className="space-y-0.5 mb-1.5">
@@ -2775,6 +2891,24 @@ function AppRaw() {
             <span className="text-[11px] font-mono text-white/90">{wsErrorNotification.message}</span>
           </div>
         )}
+        {/* Nit #3: raw control-key outcome toast — gated (403) / deferred (202) / refused (409). */}
+        {rawKeyNotification && (
+          <div
+            data-testid="raw-key-notification"
+            className={`bg-[#111] p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300 border ${
+              rawKeyNotification.tone === "deferred"
+                ? "border-amber-500/30 text-amber-400"
+                : "border-red-500/30 text-red-400"
+            }`}
+          >
+            <span className={`text-[10px] font-mono uppercase tracking-widest font-bold ${
+              rawKeyNotification.tone === "deferred" ? "text-amber-500" : "text-red-500"
+            }`}>
+              {rawKeyNotification.tone === "deferred" ? "⏳ " : "⛔ "}{rawKeyNotification.title}
+            </span>
+            <span className="text-[11px] font-mono text-white/90">{rawKeyNotification.detail}</span>
+          </div>
+        )}
       </div>
 
       {/* WS-D (BUG-024): proactive completion/error notification stack */}
@@ -3027,6 +3161,10 @@ function AppRaw() {
             colorClass = "border-amber-500 text-amber-400 bg-amber-500/15 animate-pulse font-bold";
           } else if (isActive) {
             colorClass = "border-cyan-500 text-cyan-400 bg-cyan-500/10 font-bold";
+          } else if (term.status === "Running" && term.quiescing) {
+            // Conservative Phase 2: humble "cooking…" overlay — quiet inside the pre-idle window,
+            // NOT the green "executing" and NOT the yellow "idle". A muted amber distinguishes it.
+            colorClass = "border-amber-500/40 text-amber-400/80 bg-amber-500/5";
           } else if (term.status === "Running") {
             colorClass = "border-green-500/50 text-green-400 bg-green-500/5";
           } else if (term.status === "Idle") {
@@ -3043,6 +3181,7 @@ function AppRaw() {
             >
               <span className={`w-1.5 h-1.5 rounded-full ${
                 isAlertActive ? "bg-amber-500 animate-ping2" :
+                term.status === "Running" && term.quiescing ? "bg-amber-400/70" :
                 term.status === "Running" ? "bg-green-500" : "bg-yellow-500"
               }`}></span>
               {(term.id).toUpperCase()}
@@ -3052,9 +3191,9 @@ function AppRaw() {
       </div>
 
       {/* Main Content */}
-      <main className="flex flex-col lg:flex-row flex-1 overflow-hidden">
+      <main className="flex flex-col lg:flex-row flex-1 overflow-hidden min-h-0">
         {/* Sidebar */}
-        <nav className={`w-full lg:w-72 border-b lg:border-b-0 lg:border-r border-white/5 bg-black/40 flex flex-col h-[calc(100vh-14rem)] lg:h-full shrink-0 min-h-0 overflow-hidden ${mobileActiveView === "menu" ? "flex" : "hidden lg:flex"}`}>
+        <nav className={`w-full lg:w-72 border-b lg:border-b-0 lg:border-r border-white/5 bg-black/40 flex flex-col h-full shrink-0 min-h-0 overflow-hidden ${mobileActiveView === "menu" ? "flex" : "hidden lg:flex"}`}>
           <div className="p-4 flex-1 overflow-y-auto scrollbar-thin min-h-0">
             <button
               onClick={() => setActiveTerminalId(null)}
@@ -3245,7 +3384,7 @@ function AppRaw() {
         </nav>
 
         {/* Center Content */}
-        <section className={`flex-1 flex flex-col bg-[#0b0b0b] min-w-0 h-[calc(100vh-14rem)] lg:h-full overflow-hidden ${mobileActiveView === "terminal" ? "flex" : "hidden lg:flex"}`}>
+        <section className={`flex-1 flex flex-col bg-[#0b0b0b] min-w-0 min-h-0 h-full overflow-hidden ${mobileActiveView === "terminal" ? "flex" : "hidden lg:flex"}`}>
           {activeTerminalId && activeTerminal ? (
             /* Terminal View */
             <div className="flex flex-1 flex-row overflow-hidden">
@@ -3297,21 +3436,30 @@ function AppRaw() {
                         mobile where the sidebar grid control is hidden behind the Menu view. */}
                     <button
                       onClick={() => setActiveTerminalId(null)}
-                      className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors text-[10px] font-mono uppercase tracking-wider"
                       title="Back to grid (leave this pane running)"
                     >
                       <Layers className="w-3.5 h-3.5" />
+                      Grid
                     </button>
                     {/* B3: graceful EXIT — terminate this pane's process and archive it (recoverable),
                         the non-destructive middle between Restart and PRUNE (hard delete). */}
                     <button
                       onClick={() => handleStopPane(activeProjectId, activeTerminal.id)}
-                      className="p-1.5 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors text-[10px] font-mono uppercase tracking-wider"
                       title="Exit pane (terminate the process and archive it — recoverable)"
                     >
                       <Square className="w-3.5 h-3.5" />
+                      Exit
                     </button>
                   </div>
+                </div>
+                {/* Raw control-key bar (multi-cli adapter spec §8): send literal keystrokes (arrows,
+                    Tab, Esc, Enter, Ctrl+C, Shift+Tab) straight into the pane's PTY. Independent of
+                    the mode <select>; Ctrl+C/Shift+Tab carry the warn tint (Shift+Tab is gated). */}
+                <div className="px-2 sm:px-4 lg:px-6 py-1.5 border-b border-white/5 bg-black/30 flex items-center gap-2">
+                  <span className="text-[8.5px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                  <ControlKeyBar paneId={activeTerminal.id} onKey={writeControlKey} />
                 </div>
                 <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
                   <TerminalView
@@ -3831,10 +3979,12 @@ function AppRaw() {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -10 }}
                           transition={{ duration: 0.15 }}
-                          className={`bg-[#0d0d0d] border rounded-lg p-3 lg:p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 transition-colors duration-200 ${
+                          className={`bg-[#0d0d0d] border rounded-lg p-3 lg:p-4 flex flex-col gap-3 transition-colors duration-200 ${
                             isAlertActive ? 'border-amber-500 bg-amber-950/[0.04]' : 'border-white/5 bg-black/40'
                           } ${bgHover}`}
                         >
+                          {/* Identity + stats row */}
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
                           {/* Inner element container */}
                           <div className="flex items-center gap-3 flex-1 min-w-0">
                             <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 transition-all duration-1000 ${
@@ -3908,6 +4058,17 @@ function AppRaw() {
                                 CONNECT
                               </button>
                             </div>
+                          </div>
+                          </div>
+                          {/* Nit #2: grid-view raw control-key bar. Mirrors the active-pane control bar
+                              into the grid cluster so panes are controllable without leaving grid view.
+                              Each key FIRST activates this pane (writeControlKeyFromGrid → set_active_pane)
+                              then sends the byte, so it always lands on the now-active pane and passes the
+                              server's active-pane guard (nit #1). Reuses ControlKeyBar (no duplicated byte
+                              map) and carries the raw-key-bar-grid testid. */}
+                          <div className="flex items-center gap-2 pt-2 border-t border-white/[0.04]">
+                            <span className="text-[8px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                            <ControlKeyBar paneId={pane.pane_id} onKey={writeControlKeyFromGrid} testId="raw-key-bar-grid" />
                           </div>
                         </motion.div>
                       );

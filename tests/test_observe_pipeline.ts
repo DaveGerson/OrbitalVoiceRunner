@@ -16,11 +16,11 @@ import type { OrchestratorManager } from "../src/terminal";
  */
 
 /** A throwaway manager that satisfies only the structural surface attachObserve reads. */
-function makeFakeManager(termStatus: string): { manager: OrchestratorManager; attentionQueue: any[] } {
+function makeFakeManager(termStatus: string, lastCommand = ""): { manager: OrchestratorManager; attentionQueue: any[] } {
   const attentionQueue: any[] = [];
   const manager = {
     terminals: {
-      p1: { status: termStatus, runtimeType: "shell" },
+      p1: { status: termStatus, runtimeType: "shell", lastCommand },
     },
     attentionQueue,
     settings: { secrets: {} },
@@ -85,6 +85,72 @@ describe("observe pipeline (dec-2)", () => {
 
     // And the per-pane buffered stdout flushes as a stdout_chunk (after the 30ms coalesce window).
     // We do not advance timers here; asserting the transition frame is the behavioural anchor.
+  });
+
+  it("Phase 1 ears: onRunning publishes a 'running' pane signal AND a pane_status broadcast frame (detail redacted)", () => {
+    const frames: any[] = [];
+    const signals: any[] = [];
+    const { manager } = makeFakeManager("Running", "deploy token AKIA1234567890ABCD99");
+
+    const deps = makeDeps((msg) => frames.push(msg));
+    // Use a redact that actually scrubs, so we can prove detail is redacted at the boundary.
+    deps.redact = (s: string) => s.replace(/AKIA[0-9A-Z]{12,}/g, "[REDACTED_AWS_KEY]");
+    deps.paneSignalBus.subscribe((sig) => signals.push(sig));
+
+    const handlers = attachObserve(manager, deps) as any;
+    assert.strictEqual(typeof handlers.onRunning, "function", "attachObserve returns an onRunning handle");
+
+    handlers.onRunning("p1");
+
+    // (a) a bus 'running' signal fanned to subscribers
+    assert.strictEqual(signals.length, 1, "exactly one 'running' signal published");
+    assert.strictEqual(signals[0].kind, "running");
+    assert.strictEqual(signals[0].paneId, "p1");
+    assert.ok(signals[0].detail, "detail derived from the pane's last command");
+    assert.doesNotMatch(signals[0].detail, /AKIA1234567890ABCD99/, "raw secret must be redacted out of detail");
+    assert.match(signals[0].detail, /REDACTED/, "detail carries the redaction marker");
+
+    // (b) a real-time pane_status broadcast for the UI (fact [D])
+    const statusFrame = frames.find((f) => f.type === "pane_status");
+    assert.ok(statusFrame, "a pane_status frame is broadcast");
+    assert.strictEqual(statusFrame.terminalId, "p1");
+    assert.strictEqual(statusFrame.status, "Running");
+  });
+
+  it("Conservative Phase 2: onQuiescing publishes a 'quiescing' pane signal AND a pane_quiescing frame (detail redacted, no completion announcement)", () => {
+    const frames: any[] = [];
+    const signals: any[] = [];
+    const announced: any[] = [];
+    const { manager } = makeFakeManager("Running", "deploy token AKIA1234567890ABCD99");
+
+    const deps = makeDeps((msg) => frames.push(msg));
+    deps.redact = (s: string) => s.replace(/AKIA[0-9A-Z]{12,}/g, "[REDACTED_AWS_KEY]");
+    deps.paneSignalBus.subscribe((sig) => signals.push(sig));
+    // Spy the announcement bus so we can prove cooking does NOT enqueue a completion.
+    (deps.announcementBus as any).enqueue = (a: any) => { announced.push(a); };
+
+    const handlers = attachObserve(manager, deps) as any;
+    assert.strictEqual(typeof handlers.onQuiescing, "function", "attachObserve returns an onQuiescing handle");
+
+    handlers.onQuiescing("p1");
+
+    // (a) a bus 'quiescing' signal fanned to subscribers (model channel)
+    assert.strictEqual(signals.length, 1, "exactly one 'quiescing' signal published");
+    assert.strictEqual(signals[0].kind, "quiescing");
+    assert.strictEqual(signals[0].paneId, "p1");
+    assert.doesNotMatch(signals[0].detail ?? "", /AKIA1234567890ABCD99/, "raw secret must be redacted out of detail");
+
+    // (b) a lightweight pane_quiescing broadcast for the UI's humble label
+    const frame = frames.find((f) => f.type === "pane_quiescing");
+    assert.ok(frame, "a pane_quiescing frame is broadcast");
+    assert.strictEqual(frame.terminalId, "p1");
+
+    // (c) cooking is NOT 'done' — no completion announcement enqueued on this edge
+    assert.strictEqual(
+      announced.some((a) => a.kind === "completion"),
+      false,
+      "the quiescing edge must NOT enqueue a completion announcement"
+    );
   });
 
   it("dedupes: a second identical error chunk does not re-emit the transition", () => {

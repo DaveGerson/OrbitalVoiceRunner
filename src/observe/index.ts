@@ -68,12 +68,23 @@ export interface ObserveDeps {
   redact: (s: string) => string;
   historyManager: ObserveHistoryManager;
   ai: GoogleGenAI;
+  // P0a memory: optional sink for decaying cross-pane breadcrumbs (redacted one-liners).
+  onBreadcrumb?: (b: { ts: number; paneId: string | null; text: string }) => void;
 }
 
-/** The two handlers wired onto the manager. */
+/** The handlers wired onto the manager. */
 export interface ObserveHandlers {
   onOutput: (terminalId: string, chunk: string) => void;
   onIdle: (terminalId: string) => Promise<void>;
+  // Phase 1 "ears": the symmetric BEGINNING edge to onIdle. Publishes a 'running' pane signal
+  // (model channel, fact [C]) and a pane_status WS frame (operator UI, fact [D]) on the genuine
+  // Running edge. The PaneSignalBus owns the per-(pane,kind) debounce.
+  onRunning: (terminalId: string) => void;
+  // Conservative Phase 2: the HUMBLE pre-idle "cooking…" edge. Publishes a 'quiescing' pane
+  // signal (model channel) and a lightweight pane_quiescing WS frame (operator UI) when the pane
+  // goes quiet inside the pre-idle window — WITHOUT enqueuing a completion announcement (cooking
+  // is not 'done'). The PaneSignalBus owns the per-(pane,kind) debounce.
+  onQuiescing: (terminalId: string) => void;
 }
 
 // VOICE_TRACE is recomputed here from the same env signal server.ts uses, so the high-volume PTY
@@ -97,6 +108,7 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     redact,
     historyManager,
     ai,
+    onBreadcrumb,
   } = deps;
 
   // ── Private observation state (was server-local; moves here as locals scoped to this server) ──
@@ -177,6 +189,50 @@ ${redact(rawOutput.slice(-3000))}`;
       // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
       announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
       paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
+      // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
+      if (onBreadcrumb) {
+        const lc = redact(summaryText).slice(0, 80);
+        onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
+      }
+    }
+  };
+
+  // Phase 1 "ears": the symmetric BEGINNING handle. Fired by the manager on the genuine
+  // Running edge (UniversalTerminal.onRunning). It (a) publishes a 'running' pane signal so
+  // the model hears the pane start (fact [C]) and (b) broadcasts a pane_status WS frame so the
+  // operator UI flips the chip to Running in real time without waiting for the 20s poll
+  // (fact [D]). detail is built ONLY from already-redacted/derived sources (the pane's last
+  // command, redacted + capped) — never raw pane bytes. The bus owns the per-(pane,kind)
+  // debounce, so a chatty Running edge can't spam the model; no second debounce here.
+  const onRunning = (terminalId: string): void => {
+    const term = manager.terminals[terminalId];
+    const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
+    paneSignalBus.publish({ paneId: terminalId, kind: "running", detail });
+    broadcast({ type: "pane_status", terminalId, status: "Running" });
+    // P0a memory: drop a redacted one-liner breadcrumb on the Running edge (cross-pane working memory).
+    if (onBreadcrumb) {
+      const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} started${lc ? `: ${lc}` : ""}` });
+    }
+  };
+
+  // Conservative Phase 2: the HUMBLE pre-idle "cooking…" handle. Fired by the manager when the
+  // pane goes quiet inside the idle-debounce window (UniversalTerminal.onQuiescing). It (a)
+  // publishes a 'quiescing' pane signal so the model hears the pane is wrapping up but NOT done
+  // (the formatter narrates it humbly) and (b) broadcasts a lightweight pane_quiescing WS frame
+  // so the UI can show the humble label without waiting for the 20s poll. It deliberately does
+  // NOT enqueue an announcementBus completion — cooking is not 'done', only the genuine onIdle
+  // edge announces. detail is built ONLY from already-redacted/derived sources (the pane's last
+  // command), never raw pane bytes. The bus owns the per-(pane,kind) debounce.
+  const onQuiescing = (terminalId: string): void => {
+    const term = manager.terminals[terminalId];
+    const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
+    paneSignalBus.publish({ paneId: terminalId, kind: "quiescing", detail });
+    broadcast({ type: "pane_quiescing", terminalId });
+    // P0a memory: drop a redacted one-liner breadcrumb on the pre-idle "wrapping up" edge.
+    if (onBreadcrumb) {
+      const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} wrapping up${lc ? `: ${lc}` : ""}` });
     }
   };
 
@@ -484,7 +540,7 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   };
 
-  return { onOutput, onIdle };
+  return { onOutput, onIdle, onRunning, onQuiescing };
 }
 
 // Re-export the secret redactor's identity for callers that want the same default `redact` the

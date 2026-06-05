@@ -137,6 +137,10 @@ export const listPanes: ActionDef<typeof NoParams> = {
           backfill: term.getRawBackfill(),
           output: term.getRecentOutput(20),
           status: term.status,
+          // Merge (concurrent multi-cli): the "cooking…" overlay flag — true when the pane is still
+          // Running but has gone quiet inside the pre-idle window. Kept field-identical to the inline
+          // GET /api/terminals body (|| undefined so it is omitted, not false, when not quiescing).
+          quiescing: term.quiescing || undefined,
           permissions_mode: term.permissionsMode,
           tool_preset: term.toolPreset,
           session_id: term.sessionId,

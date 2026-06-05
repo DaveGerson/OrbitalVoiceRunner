@@ -10,6 +10,7 @@ import {
   Status as MachineStatus,
   RuntimeType,
 } from "./statusMachine";
+import { AgentAdapter, createAdapter } from "./agents";
 
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
@@ -146,32 +147,62 @@ export function presetCommand(
  * Pure launch-string builder (BUG-032 regression surface). Given a fully-built
  * base command (already carrying any --dangerously-skip-permissions mutation from
  * the constructor — that is NOT this function's concern), decide whether to append
- * a `--resume <id>` flag.
+ * a `--session-id <id>` (fresh pin) or `--resume <id>` (re-attach) flag.
  *
- * Invariants (pinned in tests/test_launch_command.ts):
- *  - Custom panes are never touched (no resume flag ever).
- *  - --resume is appended ONLY when sessionId is a real UUID. A synthetic tracking
- *    id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
- *  - Never double-append: if the command already carries --resume or --session,
+ * Invariants (pinned in tests/test_launch_command.ts + tests/test_session_pinning.ts):
+ *  - Custom panes are never touched (no session flag ever).
+ *  - The flag is appended ONLY when sessionId is a real UUID. A synthetic tracking
+ *    id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+ *  - B3 fix (spec §9): a FRESH pinned session (isFreshPin && supportsSessionPin)
+ *    launches with --session-id <uuid> (the deterministic pin). A resume launches
+ *    with --resume <uuid>. The two are mutually exclusive in one invocation.
+ *  - Never double-append: if the command already carries --resume / --session(-id),
  *    leave it alone.
  *  - The base command is returned verbatim otherwise (no invented flags, no npx).
  */
 export function buildLaunchCommand(
   shellCmd: string,
   toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
-  sessionId: string
+  sessionId: string,
+  isFreshPin = false
 ): string {
   let finalCommand = shellCmd;
-  if (toolPreset !== "Custom" && sessionId) {
+  // Delegate the per-preset session model to the adapter (B5): supportsSessionPin
+  // (Claude → deterministic --session-id) and supportsResume (agents → --resume).
+  const caps = createAdapter(toolPreset).capabilities();
+  if ((caps.supportsResume || caps.supportsSessionPin) && sessionId) {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const alreadyHasResume = /--resume\b|--session\b/.test(finalCommand);
-    // Only resume a genuine prior session: the CLI requires a real UUID. A synthetic
-    // tracking id (e.g. "claude-code-session-<hex>") is NOT resumable — launch fresh.
-    if (!alreadyHasResume && UUID_RE.test(sessionId)) {
-      finalCommand = `${finalCommand} --resume ${sessionId}`;
+    const alreadyHasSession = /--resume\b|--session\b/.test(finalCommand);
+    // Only act on a genuine UUID: the CLI requires a real UUID. A synthetic tracking
+    // id (e.g. "claude-code-session-<hex>") is NOT pinnable/resumable — launch bare.
+    if (!alreadyHasSession && UUID_RE.test(sessionId)) {
+      // FRESH pinned launch (spec §9): pin the orchestrator-generated id via
+      // --session-id. Otherwise re-attach a prior session via --resume.
+      const flag = isFreshPin && caps.supportsSessionPin ? "--session-id" : "--resume";
+      finalCommand = `${finalCommand} ${flag} ${sessionId}`;
     }
   }
   return finalCommand;
+}
+
+/**
+ * Add or strip the adapter's OWN permission-bypass flag on a command string per the
+ * target mode. The single choke point used by the constructor AND setPermissionsMode,
+ * so the add/remove paths always agree on which flag string to touch. Custom (and any
+ * adapter whose bypassFlag() is null) is left untouched. B2 fix: Codex/agy get their
+ * own flag, NOT Claude's Anthropic-only --dangerously-skip-permissions.
+ */
+function applyBypassFlag(
+  shellCmd: string,
+  adapter: AgentAdapter,
+  mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only"
+): string {
+  const flag = adapter.bypassFlag();
+  if (!flag) return shellCmd;
+  if (mode === "Full Auto") {
+    return shellCmd.includes(flag) ? shellCmd : `${shellCmd} ${flag}`;
+  }
+  return shellCmd.replace(` ${flag}`, "");
 }
 
 
@@ -353,9 +384,34 @@ export class UniversalTerminal {
   public status: "Running" | "Exited" | "Idle" = "Idle";
   public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+  // The per-CLI adapter (multi-cli spec §4). Owns every preset-conditional decision
+  // (bypass flag, launch/resume argv, live mode-switch disposition, capabilities),
+  // retiring the inline `if (toolPreset !== "Custom")` branches (B5) and correcting
+  // B2 (Codex/agy no longer inherit Claude's Anthropic-only skip flag).
+  public adapter: AgentAdapter;
   public sessionId: string;
+  // True until the FIRST launch of a freshly-pinned session (spec §9): drives the
+  // start() decision to emit --session-id <uuid> (pin) vs --resume <uuid> (re-attach).
+  // Set by the ctor (fresh-pin true; supplied/resume false) and flipped to false once
+  // start() has launched, so an in-process restart (stop(); start()) resumes correctly.
+  private sessionIsFresh = false;
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
+  // Phase 1 "ears": the symmetric BEGINNING edge to onIdle. Fires once when the pane
+  // transitions INTO Running from a non-Running status (an input kick or an authoritative
+  // busy probe). Unlike onIdle it is NOT gated on sawWorkSinceIdle — a beginning has no
+  // spurious-done concern, and the PaneSignalBus debounce coalesces a chatty edge.
+  public onRunning?: (terminalId: string) => void;
+  // Conservative Phase 2: the HUMBLE pre-idle "cooking…" edge. Fires exactly once when the idle
+  // debounce timer is armed (the existing 'last output -> waiting out quiescence' window) while
+  // the pane is STILL Running — i.e. it OBSERVES a window the state machine already has, adding
+  // NO new idle decision. Cancelled/reset when work resumes (clearIdleTimer / Running edge) or
+  // once true Idle is declared. Distinct from onIdle (which is the authoritative completion edge).
+  public onQuiescing?: (terminalId: string) => void;
+  // True while inside one armed pre-idle window. Drives the once-guard for onQuiescing (fire only
+  // on the false->armed transition; the fallback path re-arms on every output chunk) and the
+  // UI's humble "cooking…" overlay (server snapshot reads this).
+  public quiescing = false;
   // B1 (async spawn): fired ONCE when the child actually attaches its PTY (first onData /
   // markSpawnReady) — the phase-2 "ready" source. A degraded-Exited spawn never reaches
   // markSpawnReady, so it correctly never emits a false "ready".
@@ -366,6 +422,11 @@ export class UniversalTerminal {
   // Silence-to-idle timeout (ms). Honors advanced.idleTimeoutMs; defaults to the
   // documented 2000ms rather than the previously hardcoded 1000ms (BUG-034).
   public idleTimeoutMs = 2000;
+  // Conservative Phase 2 safeguard (fact [F]): a modestly LARGER silence-to-idle timeout used
+  // ONLY for interactive_cli (agent) panes on the fallback/quiescence path, where quiet != done.
+  // Defaults a touch above the shell idleTimeoutMs so a brief agent pause is less likely to read
+  // as premature 'done'. Shell panes ignore this and keep idleTimeoutMs. Setting-overridable.
+  public agentIdleTimeoutMs = 3500;
 
   // WS-C status-detection state (design §5).
   public statusProbe: StatusProbe;
@@ -412,51 +473,51 @@ export class UniversalTerminal {
     this.permissionsMode = permissionsMode;
     this.projectId = projectId;
     this.runtimeType = toolPreset === "Custom" ? "shell" : "interactive_cli";
+    // The pane's per-CLI adapter (spec §4). All preset-conditional decisions below
+    // delegate here instead of branching inline on the preset string.
+    this.adapter = createAdapter(toolPreset);
     // Injectable for tests; defaults to the platform-selected probe (design §2.0).
     this.statusProbe = statusProbe ?? selectProbe();
     // G3: injectable spawn seam (optional + last so no existing call site changes).
     if (transportFactory) this.transportFactory = transportFactory;
 
-    let cmd = shellCmd;
-    if (toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (permissionsMode === "Full Auto") {
-        if (!cmd.includes(skipFlag)) {
-          cmd = `${cmd} ${skipFlag}`;
-        }
-      } else {
-        cmd = cmd.replace(` ${skipFlag}`, "");
-      }
-    }
-    this.shellCmd = cmd;
-    
+    // Flag injection: the adapter owns its OWN bypass flag (Claude/agy
+    // --dangerously-skip-permissions; Codex --dangerously-bypass-approvals-and-sandbox;
+    // Custom none). B2 fix: we no longer hardcode Claude's flag for every agent.
+    this.shellCmd = applyBypassFlag(shellCmd, this.adapter, permissionsMode);
+
     if (sessionId) {
+      // A supplied id means we are RESUMING a prior session (spec §9): the launch
+      // re-attaches via --resume <uuid>, never a fresh --session-id pin.
       this.sessionId = sessionId;
-    } else if (toolPreset !== "Custom") {
-      // Synthetic "<tool>-session-<hex>" id is for internal tracking/display ONLY.
-      // It is intentionally never passed to the CLI --resume flag, which requires a
-      // real UUID. Real session UUIDs are captured later by checkForSessionId() once
-      // the CLI prints them. start() guards on UUID format before appending --resume.
+      this.sessionIsFresh = false;
+    } else if (this.adapter.capabilities().supportsSessionPin) {
+      // B3 fix (spec §9): Claude pins a DETERMINISTIC, orchestrator-generated UUID
+      // and passes it as --session-id at first launch. No stdout scrape — Claude
+      // never prints the id. start() emits --session-id <uuid> while sessionIsFresh.
+      this.sessionId = this.adapter.generateSessionId() ?? "";
+      this.sessionIsFresh = true;
+    } else if (this.adapter.capabilities().supportsResume) {
+      // Codex/agy have no pin flag → capture the id post-spawn. The synthetic
+      // "<tool>-session-<hex>" id is for internal tracking/display ONLY; it is never
+      // passed to --resume (which requires a real UUID). Real ids arrive later via
+      // captureSessionId(); start() guards on UUID format before appending --resume.
       const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
       const randomId = Math.random().toString(16).substring(2, 10);
       this.sessionId = `${toolLower}-session-${randomId}`;
+      this.sessionIsFresh = false;
     } else {
       this.sessionId = "";
+      this.sessionIsFresh = false;
     }
   }
 
   public setPermissionsMode(mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only") {
     this.permissionsMode = mode;
-    if (this.toolPreset !== "Custom") {
-      const skipFlag = "--dangerously-skip-permissions";
-      if (mode === "Full Auto") {
-        if (!this.shellCmd.includes(skipFlag)) {
-          this.shellCmd = `${this.shellCmd} ${skipFlag}`;
-        }
-      } else {
-        this.shellCmd = this.shellCmd.replace(` ${skipFlag}`, "");
-      }
-    }
+    // Mutate the NEXT spawn's command string via the adapter's OWN bypass flag.
+    // (This only affects the next launch — bead 1y8/applyPaneMode reaches a LIVE
+    // process; that is P4 and out of this wave's scope.)
+    this.shellCmd = applyBypassFlag(this.shellCmd, this.adapter, mode);
   }
 
   get contextSize(): number {
@@ -464,7 +525,17 @@ export class UniversalTerminal {
   }
 
   private checkForSessionId(text: string) {
-    if (this.sessionId && this.sessionId.includes("-session-") && this.toolPreset !== "Custom") {
+    // B3 fix (spec §9): route session capture through the adapter. A pinned-session
+    // CLI (Claude) returns its DETERMINISTIC UUID and never scrapes stdout — Claude
+    // never prints the id, so the legacy scrape below would only ever match noise and
+    // CLOBBER the pinned uuid, breaking --resume. captureSessionId(ptyOutput) returns
+    // the pinned id for Claude; we adopt it and short-circuit the scrape.
+    if (this.adapter.capabilities().supportsSessionPin) {
+      const pinned = this.adapter.captureSessionId({ ptyOutput: text, cwd: this.cwd });
+      if (pinned) this.sessionId = pinned;
+      return; // never run the free-form scrape against a pinned-session CLI
+    }
+    if (this.sessionId && this.sessionId.includes("-session-") && this.adapter.capabilities().supportsResume) {
       // Keep preset/simulated unless a more granular one is found in output
     }
     const matchers = [
@@ -545,9 +616,16 @@ export class UniversalTerminal {
       this.sawWorkSinceIdle = true;
     }
 
-    if (result.clearIdleTimer && this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
+    if (result.clearIdleTimer) {
+      if (this.idleTimer) {
+        clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+      }
+      // Conservative Phase 2: work resumed (the state machine cancelled the pre-idle window) —
+      // the pane is no longer "wrapping up". Clear the humble cooking overlay so a stale label
+      // can't linger (self-correcting: the next quiescence honestly re-arms it). No signal is
+      // emitted on cancel; the Running edge (onRunning) / next snapshot already speak for it.
+      this.quiescing = false;
     }
     if (result.armIdleTimer) {
       if (this.idleTimer) clearTimeout(this.idleTimer);
@@ -556,20 +634,43 @@ export class UniversalTerminal {
       // "done" before the next authoritative tick has a chance to re-confirm a
       // reappearing child — a spurious onIdle. Floor the effective debounce at
       // probeIntervalMs there. Fallback mode is pure quiescence, so it keeps the
-      // configured timeout verbatim.
+      // configured timeout verbatim — except interactive_cli (agent) panes, which
+      // use the modestly larger agentIdleTimeoutMs so a brief mid-turn pause is less
+      // likely to read as premature 'done' (Conservative Phase 2 safeguard, fact [F]).
+      const fallbackIdleMs =
+        this.runtimeType === "interactive_cli" ? this.agentIdleTimeoutMs : this.idleTimeoutMs;
       const effectiveIdleMs =
         this.lastConfidence === "authoritative"
           ? Math.max(this.idleTimeoutMs, this.probeIntervalMs)
-          : this.idleTimeoutMs;
+          : fallbackIdleMs;
       this.idleTimer = setTimeout(() => {
         this.idleTimer = null;
         this.applyStatusEvent({ kind: "idleTimer" });
       }, effectiveIdleMs);
+      // Conservative Phase 2: this is the pre-idle "cooking…" edge. The state machine just
+      // armed the debounce while the pane is still Running — fire onQuiescing exactly once on
+      // the false->armed transition (the fallback path re-arms on every chunk, so the once-guard
+      // prevents flapping; the PaneSignalBus 3s debounce is a second backstop on the model leg).
+      // This adds NO new judgement about doneness — it only observes the window idle already owns.
+      if (!this.quiescing) {
+        this.quiescing = true;
+        if (this.onQuiescing) this.onQuiescing(this.terminalId);
+      }
     }
 
     if (result.status !== this.status) {
+      // Phase 1 "ears": capture the PRIOR status so the Running edge is exact. A transition
+      // INTO Running from any non-Running status (Idle or Exited won't reach here — Exited
+      // returns early at the top of applyStatusEvent) is a genuine "beginning" — fire
+      // onRunning exactly once on the edge. Running->Running probe/output ticks never reach
+      // this block (result.status === this.status), so there is no re-fire. NOT gated on
+      // sawWorkSinceIdle (unlike onIdle): a beginning has no spurious-done risk.
+      const prevStatus = this.status;
       this.status = result.status;
       this.lastStatusChangeAt = Date.now();
+      if (result.status === "Running" && prevStatus !== "Running" && this.onRunning) {
+        this.onRunning(this.terminalId);
+      }
     }
     if (result.fireOnIdle) {
       // Only a Running→Idle edge that followed genuine work is a real "done".
@@ -656,7 +757,10 @@ export class UniversalTerminal {
   }
 
   start() {
-    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId);
+    const finalCommand = buildLaunchCommand(this.shellCmd, this.toolPreset, this.sessionId, this.sessionIsFresh);
+    // After the first launch the pinned session EXISTS on disk → a subsequent
+    // in-process restart (stop(); start()) must re-attach via --resume, not re-pin.
+    this.sessionIsFresh = false;
 
     // Populate historical output buffer from persistent scrollback log
     this.loadScrollback();
@@ -899,6 +1003,19 @@ export class UniversalTerminal {
     );
   }
 
+  /**
+   * Raw control-byte passthrough (multi-cli adapter spec §7) — the sole RAW path. Unlike
+   * writeInput/deliverSubmit (SUBMIT semantics: a separate CR, paste-burst split, optimistic
+   * Running, history), writeRaw writes the bytes VERBATIM in a single transport.write with NO
+   * appended \r and no split. It is the ONE primitive behind the raw-input endpoint and the GUI
+   * control-key bar (a Shift+Tab button writes ESC[Z verbatim). No-op on an inert/un-spawned pane
+   * (transport === null) — the REST caller surfaces a 409.
+   */
+  writeRaw(bytes: string): void {
+    if (!this.transport) return;
+    this.transport.write(bytes);
+  }
+
   getRecentOutput(linesCount = 10): string {
     return this.outputBuffer.slice(-linesCount).join('\n');
   }
@@ -1010,6 +1127,12 @@ export class OrchestratorManager {
   public attentionQueue: AttentionItem[] = [];
   public onOutput: ((terminalId: string, chunk: string) => void) | null = null;
   public onIdle?: (terminalId: string) => void;
+  // Phase 1 "ears": the manager-level fan of UniversalTerminal.onRunning (mirrors onIdle).
+  // server.ts assigns this to the observe pipeline's onRunning handler.
+  public onRunning?: (terminalId: string) => void;
+  // Conservative Phase 2: the manager-level fan of UniversalTerminal.onQuiescing (mirrors onIdle).
+  // server.ts assigns this to the observe pipeline's onQuiescing handler.
+  public onQuiescing?: (terminalId: string) => void;
   // B1 (async spawn): fired AFTER the deferred start() returns (transport assigned OR degraded to
   // Exited). NOT the spawn-ready signal — use onReady for that. onSpawned exists for the fast-fail
   // UI repaint (a degraded pane flips Running->Exited here) and the test flush seam.
@@ -1146,6 +1269,13 @@ export class OrchestratorManager {
           term.idleTimeoutMs = newSettings.advanced.idleTimeoutMs;
         }
       }
+      // Conservative Phase 2: propagate the agent idle-timing safeguard to live terminals
+      // (only interactive_cli panes consume it on the fallback arm; shell panes ignore it).
+      if (newSettings.advanced.agentIdleTimeoutMs !== undefined) {
+        for (const term of Object.values(this.terminals)) {
+          term.agentIdleTimeoutMs = newSettings.advanced.agentIdleTimeoutMs;
+        }
+      }
     }
     if (newSettings.secrets) {
       this.settings.secrets = { ...this.settings.secrets, ...newSettings.secrets };
@@ -1200,11 +1330,19 @@ export class OrchestratorManager {
     const realProjId = projectId || this.ledger.activeProjectId || "default_project";
     const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
     term.idleTimeoutMs = this.settings?.advanced?.idleTimeoutMs ?? term.idleTimeoutMs;
+    // Conservative Phase 2: seed the agent (interactive_cli) idle-timing safeguard from settings.
+    term.agentIdleTimeoutMs = this.settings?.advanced?.agentIdleTimeoutMs ?? term.agentIdleTimeoutMs;
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
     };
     term.onIdle = (tid) => {
       if (this.onIdle) this.onIdle(tid);
+    };
+    term.onRunning = (tid) => {
+      if (this.onRunning) this.onRunning(tid);
+    };
+    term.onQuiescing = (tid) => {
+      if (this.onQuiescing) this.onQuiescing(tid);
     };
     // B1 (async spawn): forward the per-pane spawn-ready edge up to the manager-level onReady
     // (the server publishes the phase-2 "ready" pane signal from there).
@@ -1266,6 +1404,14 @@ export class OrchestratorManager {
     const term = this.terminals[terminalId];
     if (!term) return;
     term.resize(cols, rows);
+  }
+
+  /** Phase 1 "ears": force a live PTY->ledger sync without building the listPanes payload.
+   *  switch_context calls this immediately before getProjectBriefing so the catch-up briefing
+   *  reflects the current term.status (fact [E]). syncLedger() is private; this is the public
+   *  seam. (listPanes() also calls syncLedger() — this just avoids the payload allocation.) */
+  refreshLedger() {
+    this.syncLedger();
   }
 
   listPanes() {

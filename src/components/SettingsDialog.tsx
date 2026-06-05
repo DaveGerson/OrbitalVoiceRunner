@@ -147,6 +147,8 @@ export function SettingsDialog({
   // Local states - Advanced plumbing / Connection variables
   const [maxBufferLines, setMaxBufferLines] = useState<number>(100);
   const [idleTimeoutMs, setIdleTimeoutMs] = useState<number>(2000);
+  // Conservative Phase 2: the larger agent (interactive_cli) silence-to-idle timeout safeguard.
+  const [agentIdleTimeoutMs, setAgentIdleTimeoutMs] = useState<number>(3500);
   const [defaultShellCommand, setDefaultShellCommand] = useState<string>("bash");
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [historyMaxCommands, setHistoryMaxCommands] = useState<number>(50);
@@ -200,6 +202,7 @@ export function SettingsDialog({
 
       setMaxBufferLines(initialSettings.advanced?.maxBufferLines ?? 100);
       setIdleTimeoutMs(initialSettings.advanced?.idleTimeoutMs ?? 2000);
+      setAgentIdleTimeoutMs(initialSettings.advanced?.agentIdleTimeoutMs ?? 3500);
       setDefaultShellCommand(initialSettings.advanced?.defaultShellCommand ?? "bash");
       setGlobalPermissionsMode(initialSettings.advanced?.globalPermissionsMode ?? "Inherit");
       setHistoryMaxCommands(initialSettings.advanced?.historyMaxCommands ?? 50);
@@ -249,6 +252,7 @@ export function SettingsDialog({
         rateLimitRequestsPerMin: 60,
         maxBufferLines,
         idleTimeoutMs,
+        agentIdleTimeoutMs,
         defaultShellCommand,
         globalPermissionsMode,
         historyMaxCommands,
@@ -268,7 +272,7 @@ export function SettingsDialog({
   }, [
     activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model,
     activeContext, localWorkspacePath, presets, maxBufferLines,
-    idleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
+    idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements, capabilityGates
   ]);
 
@@ -317,6 +321,7 @@ export function SettingsDialog({
       if (parsed.advanced) {
         if (parsed.advanced.maxBufferLines !== undefined) setMaxBufferLines(parsed.advanced.maxBufferLines);
         if (parsed.advanced.idleTimeoutMs !== undefined) setIdleTimeoutMs(parsed.advanced.idleTimeoutMs);
+        if (parsed.advanced.agentIdleTimeoutMs !== undefined) setAgentIdleTimeoutMs(parsed.advanced.agentIdleTimeoutMs);
         if (parsed.advanced.defaultShellCommand !== undefined) setDefaultShellCommand(parsed.advanced.defaultShellCommand);
         if (parsed.advanced.globalPermissionsMode !== undefined) setGlobalPermissionsMode(parsed.advanced.globalPermissionsMode);
         if (parsed.advanced.historyMaxCommands !== undefined) setHistoryMaxCommands(parsed.advanced.historyMaxCommands);
@@ -982,6 +987,15 @@ export function SettingsDialog({
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={idleTimeoutMs} onChange={e => setIdleTimeoutMs(Number(e.target.value))} placeholder="2000"
                         />
+                      </div>
+                      <div>
+                        <label className="block text-zinc-400 mb-1">Agent (CLI) Idle Timeout (ms)</label>
+                        <input
+                          type="number"
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
+                          value={agentIdleTimeoutMs} onChange={e => setAgentIdleTimeoutMs(Number(e.target.value))} placeholder="3500"
+                        />
+                        <p className="text-[9px] text-zinc-600 mt-0.5">Larger window before an agent pane reads as done (reduces premature "done").</p>
                       </div>
                       <div>
                         <label className="block text-zinc-400 mb-1">Max Console Cache Buffer Lines</label>

@@ -181,6 +181,10 @@ function makeCtx(opts?: {
       saveSettings: (): void => {
         probe.settingsSaves += 1;
       },
+      // Concurrent multi-cli merge: switch_context now calls ctx.manager.refreshLedger() (a live
+      // PTY->ledger sync so the catch-up briefing is not stale). It is a real OrchestratorManager
+      // method (src/terminal.ts); stub as a no-op so the def-level contract test exercises the path.
+      refreshLedger: (): void => {},
     },
   } as unknown as ActionContext;
   // switch_context calls ctx.manager.saveSettings(); rename/switch call ctx.broadcastLedgerUpdate();

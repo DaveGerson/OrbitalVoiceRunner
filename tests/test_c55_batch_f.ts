@@ -146,6 +146,9 @@ function legacyTerminalsBody(
       backfill: (term.getRawBackfill as () => string)(),
       output: (term.getRecentOutput as (n: number) => string)(20),
       status: term.status,
+      // Concurrent multi-cli merge added the "cooking…" overlay flag (term.quiescing || undefined) to the
+      // inline GET /api/terminals body; the converged list_panes builder carries it field-identically.
+      quiescing: term.quiescing || undefined,
       permissions_mode: term.permissionsMode,
       tool_preset: term.toolPreset,
       session_id: term.sessionId,

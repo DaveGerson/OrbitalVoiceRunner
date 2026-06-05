@@ -99,6 +99,12 @@ export interface Terminal {
   /** Raw bytes (escape sequences intact) seeding xterm on (re)open. */
   backfill?: string;
   status: "Running" | "Exited" | "Idle";
+  // Conservative Phase 2: an ADDITIVE overlay flag (not a status-union change, which would
+  // ripple through statusMachine.ts + ~8 App.tsx arms + mocks). When true the pane is STILL
+  // "Running" but has gone quiet inside the pre-idle debounce window — the UI renders a humble
+  // "cooking…" label distinct from green "executing" and yellow "idle". Cleared when the pane
+  // next reports Running or Idle. Optional so older payloads/mocks degrade gracefully.
+  quiescing?: boolean;
   permissions_mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   tool_preset?: "Claude Code" | "Codex" | "Antigravity" | "Custom";
   session_id?: string;
@@ -265,12 +271,25 @@ export interface SystemSettings {
     rateLimitRequestsPerMin: number;
     maxBufferLines: number;
     idleTimeoutMs: number;
+    // Conservative Phase 2: a separate, modestly LARGER silence-to-idle timeout for
+    // interactive_cli (agent) panes. Agents are forced to the fallback/quiescence path
+    // (terminal.ts) where quiet != done, so a brief mid-turn pause can read as a premature
+    // "done". Bumping their effective idle window above a shell pane's reduces that without
+    // any new done-detection heuristic. Optional + env/setting-overridable; defaults to 3500.
+    // Shell panes keep idleTimeoutMs (no regression).
+    agentIdleTimeoutMs?: number;
     defaultShellCommand: string;
     globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
     historyMaxCommands?: number;
     historyMaxOutputLength?: number;
     // Global default capability-gate matrix (design §3/§7). Absent/empty ⇒ all "Auto".
     capabilityGates?: CapabilityGateMap;
+    // Janus Memory Synthesis P0a (advanced, all optional/additive). Tune the in-process
+    // anti-rot brief: total char budget (~4 chars/token), and the decaying breadcrumb ring's
+    // cap + max age. Absent ⇒ DEFAULT_MEMORY_CONFIG (4800 / 12 / 900000ms). See src/memory/types.ts.
+    memoryBudgetChars?: number;   // default 4800
+    breadcrumbMax?: number;       // default 12
+    breadcrumbMaxAgeMs?: number;  // default 900000
   };
   secrets: {
     geminiApiKey: string;
