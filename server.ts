@@ -27,6 +27,7 @@ import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/r
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
+import { createMemoryService } from "./src/memory";
 import { createGating } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -463,6 +464,37 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttentionQueue(manager.attentionQueue);
   }
 
+  // Memory Synthesis P0a: the in-process, anti-rot working-context layer. WorldModel reads live
+  // manager + store; the FallbackAssembler blends the five redacted tiers into one char-budgeted
+  // brief; the BreadcrumbRing is fed from the ears edges (onBreadcrumb below) and decays by recency.
+  // No new runtime deps, no Python (P0b swaps in behind MemoryService.synthesize). The advanced
+  // knobs are optional/additive — absent ⇒ DEFAULT_MEMORY_CONFIG. (manager/store satisfy the
+  // WorldModel deps structurally; every text field is redacted at the WorldModel boundary.)
+  // store is null under JANUS_LEDGER_BACKEND=legacy (or store-init failure). The WorldModel only
+  // reads getProject/getProjectBriefing; a null-safe shim degrades the Project tier to absent
+  // (the brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8).
+  const memoryStore = store ?? { getProject: () => null, getProjectBriefing: () => null };
+  // The WorldModel reads the gate posture off `settings.globalPermissionsMode`, but the live value
+  // is `manager.globalPermissionsMode` (resolved from advanced.globalPermissionsMode). Adapt the
+  // manager to the WorldModel's narrow dep shape (live getters — every read is current, never a
+  // stale snapshot) so the Janus-frame tier reports the REAL posture instead of the safe default.
+  const memoryManager = {
+    get activeId() { return manager.activeId; },
+    get terminals() { return manager.terminals as any; },
+    get ledger() { return { activeProjectId: manager.ledger.activeProjectId }; },
+    get settings() { return { globalPermissionsMode: manager.globalPermissionsMode }; },
+    listPanes: () => manager.listPanes(),
+  };
+  const memory = createMemoryService(
+    { manager: memoryManager, store: memoryStore, redact: redactSecrets },
+    {
+      totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
+      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+      breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
+      breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
+    },
+  );
+
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
@@ -478,6 +510,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     redact: redactSecrets,
     historyManager: HistoryManager.getInstance(),
     ai,
+    // Memory Synthesis P0a: feed the decaying breadcrumb ring from the ears edges
+    // (onRunning/onIdle/onQuiescing each call this with a redacted one-liner).
+    onBreadcrumb: memory.addBreadcrumb,
   });
   manager.onOutput = onOutput;
   manager.onIdle = onIdle;
@@ -1472,6 +1507,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     boundLiveConnector,
     boundSessionAiFactory,
     gating,
+    memory,
     setLastInteractionId: (v) => { lastInteractionId = v; },
     pushApprovalNarration,
     REGISTRY,

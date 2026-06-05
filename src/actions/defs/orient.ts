@@ -110,6 +110,12 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     // ordered side effects (the ASYMMETRY HAZARD above) are untouched — only the briefing read
     // is made non-stale.
     ctx.manager.refreshLedger();
+    // Memory Synthesis P0a (freshness trigger): the explicit "catch me up" path. After the live
+    // sync, request a FRESH situational brief for the now-active pane so Gemini Live re-focuses on
+    // the switched project instead of drifting on the prior snapshot. Additive + non-blocking — the
+    // server wires injectMemoryBrief on the voice ctx; absent on REST/test paths (safe no-op). The
+    // injector owns its own try/catch, so this never throws into the action path.
+    ctx.injectMemoryBrief?.();
     const briefing = ctx.manager.ledger.getProjectBriefing(projectId) || { error: "Project not found" };
     return { kind: "ok", output: briefing };
   },

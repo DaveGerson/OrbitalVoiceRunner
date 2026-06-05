@@ -49,6 +49,7 @@ import type { CapabilityGate } from "../types";
 import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
 import type { Gating } from "../gating";
+import type { CreatedMemory } from "../memory";
 
 /**
  * narrate a SYSTEM EVENT into the live session so the model speaks it to the operator. Pure (no
@@ -118,6 +119,10 @@ export interface VoiceDeps {
   boundSessionAiFactory: (key: string, fallback: GoogleGenAI) => GoogleGenAI;
   /** The shared gating/safety core (dec-4). The voice path consumes the SAME pending stores + resolver. */
   gating: Gating;
+  /** Memory Synthesis P0a: the in-process anti-rot memory service (synthesize + breadcrumb feed).
+   *  The voice path injects a fresh situational brief on (a) session start and (b) pane switch via
+   *  the existing sendClientContent channel. */
+  memory: CreatedMemory;
   /** mirror the active turn's id to server module scope so manager.onOutput can tag PTY output. */
   setLastInteractionId: (v: string | null) => void;
   /** narrate a system event into the live session (the pure export above; injected for symmetry / overridability). */
@@ -188,6 +193,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     boundLiveConnector,
     boundSessionAiFactory,
     gating,
+    memory,
     setLastInteractionId,
     pushApprovalNarration: pushApprovalNarrationDep,
     REGISTRY,
@@ -340,6 +346,26 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // also clears a stale barge-in latch (a barge-in is consumed once the model is talking again).
     const setModelTurn = () => { state.lastSpeaker = "model"; state.lastInterrupted = false; };
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
+
+    // Memory Synthesis P0a (anti-rot injection): synthesize a FRESH situational brief for the
+    // now-active pane and inject it into the live session via the SAME sendClientContent channel the
+    // ears use. Wrapped in try/catch and fully NON-BLOCKING — a synthesis/inject failure must NEVER
+    // throw into the live loop (the brief is best-effort context, not a turn the model owes a reply).
+    // `now` is the Node runtime epoch-ms clock. Called on (a) session start and (b) pane switch.
+    const injectMemoryBrief = (sess: any, activeId: string | null): void => {
+      try {
+        if (!sess) return;
+        const brief = memory.service.synthesize(activeId, Date.now());
+        if (brief.text.trim()) {
+          sess.sendClientContent({
+            turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
+            turnComplete: true,
+          });
+        }
+      } catch (e) {
+        console.error("[memory] brief injection failed:", e);
+      }
+    };
 
     // PLM4 (2): AUTO-RECONNECT with BOUNDED exponential backoff. On a Gemini Live session loss we
     // schedule connectLiveSession() again with a capped attempt count AND a capped delay — NO storm.
@@ -579,7 +605,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           gateCapability,
           redact: redactSecrets,
           getActivePaneId: () => coreState.activePaneId,
-          setActivePane: (id) => { coreState.activePaneId = id; },
+          setActivePane: (id) => {
+            coreState.activePaneId = id;
+            // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the active pane just
+            // changed — re-focus the live brief on the new pane (the previous pane's detail demotes
+            // to a breadcrumb). Non-blocking + self-guarded.
+            injectMemoryBrief(state.session, id);
+          },
+          // Memory Synthesis P0a: the "catch me up" path — switch_context calls this AFTER its live
+          // ledger sync to inject a fresh brief for the now-active pane (orient.ts).
+          injectMemoryBrief: () => injectMemoryBrief(state.session, coreState.activePaneId),
           activeDraftTarget,
           broadcastDraft,
           broadcastTerminalsUpdated,
@@ -915,6 +950,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // path), so the surviving approvals are re-attached + re-announced for free on every (re)connect.
       reannounceSurvivors(justConnected);
 
+      // Memory Synthesis P0a (freshness trigger #2): never hand a fresh/resumed live client a stale
+      // brief — synthesize + inject the current situational context once, right after the hoist.
+      // Non-blocking + self-guarded (injectMemoryBrief owns its try/catch).
+      injectMemoryBrief(justConnected, coreState.activePaneId);
+
       // Push-observation: bridge global pane signals into THIS live session. The bus owns
       // debounce; we forward each signal as a user-role nudge (same convention as approval
       // narration the model already speaks). Unsubscribed on socket close.
@@ -1078,6 +1118,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
           // open (or null if nothing is open) is recorded here and gates every Janus write.
           coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
+          // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the operator switched
+          // the open pane — re-focus the live brief on it (the prior pane demotes to a breadcrumb).
+          // Non-blocking + self-guarded.
+          injectMemoryBrief(state.session, coreState.activePaneId);
         } else if (msg.type === "stop_all") {
           // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated.
           // Stage 1 (default / kill=false): freeze + cancel in-flight; panes keep running.

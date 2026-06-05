@@ -284,6 +284,12 @@ export interface SystemSettings {
     historyMaxOutputLength?: number;
     // Global default capability-gate matrix (design §3/§7). Absent/empty ⇒ all "Auto".
     capabilityGates?: CapabilityGateMap;
+    // Janus Memory Synthesis P0a (advanced, all optional/additive). Tune the in-process
+    // anti-rot brief: total char budget (~4 chars/token), and the decaying breadcrumb ring's
+    // cap + max age. Absent ⇒ DEFAULT_MEMORY_CONFIG (4800 / 12 / 900000ms). See src/memory/types.ts.
+    memoryBudgetChars?: number;   // default 4800
+    breadcrumbMax?: number;       // default 12
+    breadcrumbMaxAgeMs?: number;  // default 900000
   };
   secrets: {
     geminiApiKey: string;

@@ -241,6 +241,13 @@ export interface ActionContext {
   /** Read the live active pane id (the single source of truth for where Janus may write).
    *  add_pane_note defaults its pane_id to this when the caller omits one (server.ts:458). */
   getActivePaneId: () => string | null;
+
+  // ── Memory Synthesis P0a freshness trigger (optional/additive) ────────────────────────────────
+  /** Request a FRESH situational brief synthesis + inject it into the live session for the
+   *  now-active pane (anti-rot, spec freshness trigger). switch_context calls it after its live
+   *  ledger sync (the "catch me up" path). Wired by the server's voice context builder; absent on
+   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws. */
+  injectMemoryBrief?: () => void;
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;
