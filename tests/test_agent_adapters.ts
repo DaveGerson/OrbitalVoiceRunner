@@ -207,11 +207,17 @@ describe("AntigravityAdapter (agy v1.0.4, LOW — §5)", () => {
     assert.ok(r.argv.includes(CLAUDE_SKIP), "agy bypass re-armed on resume");
   });
 
-  it("planModeChange is restart-resume (unverified cycle axis)", () => {
+  // P5 live probe (bead 8sw, 2026-06-05 via scripts/verify-live-modeswitch-agy.ts):
+  // a real agy v1.0.4 pane over ConPTY reaches only the "Select login method" screen —
+  // agy requires interactive Google OAuth before ANY session, so no permission-cycle
+  // axis is reachable (neither ESC[1;2B nor ESC[Z moved the marker). The conservative
+  // floor below is therefore EVIDENCE-BACKED, not a guess: restart-resume +
+  // readyForLiveCycle=false is correct until agy is signed in and re-verified.
+  it("planModeChange is restart-resume (cycle axis unreachable pre-auth — P5 confirmed)", () => {
     assert.strictEqual(a.planModeChange("Read-Only", "Full Auto").kind, "restart-resume");
   });
 
-  it("capabilities: NOT ready for live cycle, no session pin", () => {
+  it("capabilities: NOT ready for live cycle, no session pin (P5 evidence-backed floor)", () => {
     const c = a.capabilities();
     assert.strictEqual(c.readyForLiveCycle, false);
     assert.strictEqual(c.supportsSessionPin, false);
