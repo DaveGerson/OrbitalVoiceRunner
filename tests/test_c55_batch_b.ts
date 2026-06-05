@@ -539,9 +539,10 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
   // NOTE: POST /api/projects/:id/notes was a Batch-B out-of-scope neighbor, but c55.12 CONVERGED it
   // (create_project_note, snake_case :project_id rest.path), so it is no longer asserted-preserved here —
   // c55.12's own contract suite (test_c55_12_notes.ts) pins the converged def + asserts the inline twin is GONE.
-  const keptLiterals: Array<{ label: string; needle: RegExp }> = [
-    { label: "DELETE /api/projects/:id", needle: /app\.delete\(\s*["']\/api\/projects\/:id["']/ },
-  ];
+  // NOTE: DELETE /api/projects/:id was a Batch-B out-of-scope neighbor, but c55.14 CONVERGED it
+  // (delete_project, now GATED Destructive/Ask) — so it is no longer asserted-preserved here; c55.14's
+  // own cutover guard (test_c55_14_lifecycle.ts) asserts that inline twin is GONE.
+  const keptLiterals: Array<{ label: string; needle: RegExp }> = [];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {
       assert.ok(needle.test(serverSrc), `${label} must remain inline this batch (out of scope)`);
