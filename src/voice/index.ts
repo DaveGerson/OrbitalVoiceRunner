@@ -44,6 +44,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts } from "../liveTranscripts";
+import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
@@ -818,6 +819,25 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               if (cleanUtter.length > 2) {
                 appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
               }
+            }
+
+            // BEAD aqx (build-out): when grounded web search informed this turn, Gemini returns the
+            // queries it ran + the web sources on serverContent.groundingMetadata. Surface them so a
+            // grounded answer SHOWS where it came from (transcript chip + interaction log). This is a
+            // strict no-op when grounding is OFF: the model never populates groundingMetadata, so
+            // extractGrounding() returns empty and nothing is sent. Pure reader; never throws.
+            const grounding = extractGrounding(message);
+            if (hasGrounding(grounding)) {
+              interactionLog.log({
+                interactionId: turnId(),
+                kind: "system",
+                data: { tag: "grounding", queries: grounding.queries, sources: grounding.sources },
+              });
+              clientWs.send(JSON.stringify({
+                type: "grounding",
+                queries: grounding.queries,
+                sources: grounding.sources,
+              }));
             }
 
             // Pass audio back to client. This is the SINGLE spoken-output choke point — the only

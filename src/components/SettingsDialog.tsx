@@ -134,6 +134,8 @@ export function SettingsDialog({
   // sa4: operator-editable Gemini voice system prompt. Empty string => persist undefined =>
   // buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT (shown as the placeholder hint).
   const [systemPrompt, setSystemPrompt] = useState<string>("");
+  // aqx (build-out): grounded web search (Google) toggle. Off by default; config (not a secret).
+  const [groundingEnabled, setGroundingEnabled] = useState<boolean>(false);
 
   // Local states - Project profiles
   const [activeContext, setActiveContext] = useState<string>("default_project");
@@ -195,6 +197,7 @@ export function SettingsDialog({
       setIsMicMuted(initialSettings.voiceAi?.isMicMuted ?? false);
       setModel(initialSettings.voiceAi?.model ?? "gemini-3.1-flash-live-preview");
       setSystemPrompt(initialSettings.voiceAi?.systemPrompt ?? "");
+      setGroundingEnabled(initialSettings.voiceAi?.groundingEnabled ?? false);
 
       setActiveContext(initialSettings.projects?.activeContext ?? "default_project");
       setLocalWorkspacePath(initialSettings.projects?.localWorkspacePath ?? "");
@@ -240,7 +243,9 @@ export function SettingsDialog({
         model,
         // sa4: persist undefined for a blank prompt so the builder falls back to
         // DEFAULT_SYSTEM_PROMPT (rather than storing a meaningless empty string).
-        systemPrompt: systemPrompt.trim() ? systemPrompt : undefined
+        systemPrompt: systemPrompt.trim() ? systemPrompt : undefined,
+        // aqx (build-out): persist undefined when off so "off" stays the implicit default in settings files.
+        groundingEnabled: groundingEnabled || undefined
       },
       projects: {
         activeContext,
@@ -278,7 +283,7 @@ export function SettingsDialog({
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements, capabilityGates
@@ -317,6 +322,7 @@ export function SettingsDialog({
         if (parsed.voiceAi.model !== undefined) setModel(parsed.voiceAi.model);
         // sa4: round-trip the editable system prompt through the JSON tab too (undefined => blank).
         if (parsed.voiceAi.systemPrompt !== undefined) setSystemPrompt(parsed.voiceAi.systemPrompt ?? "");
+        if (parsed.voiceAi.groundingEnabled !== undefined) setGroundingEnabled(!!parsed.voiceAi.groundingEnabled);
       }
       if (parsed.projects) {
         if (parsed.projects.activeContext !== undefined) setActiveContext(parsed.projects.activeContext);
@@ -618,6 +624,27 @@ export function SettingsDialog({
                         <code className="text-zinc-400">{"{{workspaces}}"}</code> are filled with live values. (applies on reconnect)
                       </span>
                     </div>
+
+                    {/* aqx (build-out): grounded web search toggle. OFF by default; when on, Janus may use
+                        Google Search to inform answers and grounded turns show their sources in the
+                        transcript. Built-in Gemini tool (no per-search approval). (applies on reconnect) */}
+                    <label className="flex items-start gap-2.5 p-3 bg-black/30 border border-white/10 rounded-lg cursor-pointer hover:border-white/20 transition-colors">
+                      <input
+                        type="checkbox"
+                        data-testid="settings-voice-grounding"
+                        checked={groundingEnabled}
+                        onChange={e => setGroundingEnabled(e.target.checked)}
+                        className="mt-0.5 accent-cyan-500 cursor-pointer"
+                      />
+                      <span className="min-w-0">
+                        <span className="text-zinc-300 font-bold block text-[11px]">Grounded web search (Google)</span>
+                        <span className="text-[10px] text-zinc-500 leading-relaxed block">
+                          Off by default. When on, Janus may search the web to inform its answers; grounded
+                          turns show their sources in the transcript. Built-in Gemini tool — individual searches
+                          are not separately approved. (applies on reconnect)
+                        </span>
+                      </span>
+                    </label>
 
                     {/* Reconnect button for voice/model/API key changes */}
                     <div className="p-3 bg-cyan-950/20 border border-cyan-500/20 rounded-lg flex items-center justify-between gap-3">
