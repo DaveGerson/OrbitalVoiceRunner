@@ -42,6 +42,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts } from "../liveTranscripts";
+import { buildSystemInstruction } from "./systemPrompt";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext } from "../actions/types";
@@ -894,7 +895,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName } },
         },
-        systemInstruction: `You are Project Janus, a voice helper controlling active terminal panes.\n\nCURRENT ROUTING CONTEXT (System State):\n- Active Project/Workspace ID: ${manager.ledger.activeProjectId || "None"}\n- Available Workspaces: ${Object.keys(manager.ledger.workspaces).map((pId: string) => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", ")}\n\nPane status (busy/idle), elapsed time, and last command are LIVE and change constantly. NEVER assume a pane's status from memory or this prompt — it is not listed here because it would be stale. ALWAYS call list_panes to read current per-pane status before reporting whether anything is running or done.\n\nYou DIRECT; the agent panes (Claude Code / Codex / Antigravity) do the heavy lifting. Your job is to route the operator's request to the RIGHT agent pane and report back — you must NOT author and run raw working shell yourself. When the operator dictates a goal, do NOT relay it verbatim: COMPRESS it into a short, targeted instruction for the agent, CONFIRM that distilled version by voice, then call propose_command with kind='agent_instruction' (the default). When the operator is composing a prompt to review before sending (the Prompt Draft / Workbench), keep that draft SYNTHESIZED: call update_draft_prompt(mode='replace') with your distilled, ready-to-send instruction — do NOT leave the draft as the operator's raw dictation — and refine it as the conversation evolves so the draft is always a clean instruction the operator can review and send. If a goal spans multiple panes, decompose it and propose per pane (or build a plan). Use kind='shell' only for your OWN small read-only/observe commands (git status, ls, cat, pwd); never run heavy/mutating shell yourself.\n\nWhen a command is awaiting approval (Human-in-the-Loop), you are NOT muted: SPEAK the distilled instruction and target pane and ASK the operator to approve or reject BEFORE it runs. Use list_pending_approvals to recall what is queued. You can list panes, get pane summaries, switch project contexts, add notes, and rename things. Remain token-light. Always use switch_context to get the full project briefing when starting.\n\nEMERGENCY BRAKE (two stages, always allowed): if the operator says "stop", "halt", "abort", "freeze", or "stop everything", call stop_all IMMEDIATELY — it freezes you (every capability becomes Off) and cancels everything in flight, but the panes KEEP RUNNING. After it freezes, tell the operator how many panes are still running and ASK whether to also kill them (that is irreversible). If they confirm the kill ("kill them", "yes"), call confirm_stop_all. When they say "release"/"resume", call release_stop_all to un-freeze (your gates restore exactly; killed panes stay killed).`,
+        // sa4: the system prompt is now operator-editable (voiceAi.systemPrompt, Settings UI). Read it
+        // at connect time so an edited prompt is picked up on the next session (the existing Apply &
+        // Reconnect path). Behavior-preserving: with no custom template, buildSystemInstruction()
+        // renders DEFAULT_SYSTEM_PROMPT — byte-identical to the former inline literal — substituting
+        // the SAME two live values this block used before.
+        systemInstruction: buildSystemInstruction({
+          template: manager.settings.voiceAi?.systemPrompt,
+          activeProjectId: manager.ledger.activeProjectId || "None",
+          workspaces: Object.keys(manager.ledger.workspaces).map((pId: string) => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", "),
+        }),
         ...({
           // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The
           // @google/genai `SessionResumptionConfig` field is `handle` (node.d.ts:10236-10243), NOT

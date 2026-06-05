@@ -1171,7 +1171,10 @@ export class OrchestratorManager {
         voiceStyle: "Creative",
         volume: 80,
         speechSpeed: 1.0,
-        isMicMuted: false
+        isMicMuted: false,
+        // sa4: unset by default => buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT.
+        // This is config (persists to disk via saveSettings), NOT a secret.
+        systemPrompt: undefined
       },
       projects: {
         activeContext: "default_project",

@@ -43,6 +43,30 @@ test("saveSettings keeps the Gemini key in memory but NEVER writes it to .janus_
   }
 });
 
+test("sa4: voiceAi.systemPrompt survives updateSettings AND persists to disk (it is config, not a secret)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-sysprompt-"));
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const m = new OrchestratorManager();
+    const customPrompt = "custom voice prompt {{activeProjectId}}";
+    // Set both a secret AND the system prompt in the same update.
+    m.updateSettings({
+      secrets: { geminiApiKey: FAKE_KEY },
+      voiceAi: { systemPrompt: customPrompt } as any,
+    });
+    // In-memory merge keeps the system prompt (updateSettings merges voiceAi).
+    assert.strictEqual(m.settings.voiceAi.systemPrompt, customPrompt, "systemPrompt is merged into in-memory settings");
+    // On disk: the secret is blanked but the system prompt PERSISTS (unlike geminiApiKey).
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, ".janus_settings.json"), "utf8"));
+    assert.strictEqual(onDisk.secrets?.geminiApiKey ?? "", "", "the Gemini key must NOT persist");
+    assert.strictEqual(onDisk.voiceAi?.systemPrompt, customPrompt, "voiceAi.systemPrompt MUST persist to disk — it is config, not a secret");
+  } finally {
+    process.chdir(prevCwd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the JSON->SQLite migration imports config but NEVER stores secrets in settings_kv", () => {
   const store = new JanusStore(":memory:");
   store.init();
