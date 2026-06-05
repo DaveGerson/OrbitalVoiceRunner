@@ -131,6 +131,8 @@ node scripts/check-deps.mjs                     # verify node_modules is in sync
 >   add) leaves `node_modules` stale and `tsc` fails with a cryptic "cannot find module". The
 >   `post-merge`/`post-checkout` hooks warn about this automatically once installed via
 >   `sh scripts/install-wt-lock.sh` (they run `node scripts/check-deps.mjs --warn`, fail-open).
+> - The catalog drift guard (`scripts/catalog.ts`) normalizes CRLF→LF before comparing, so it
+>   won't false-fail on Windows; a real drift means the registry changed — run `npm run catalog`.
 
 ## Architecture Overview
 
@@ -145,6 +147,11 @@ Auto/Ask/Off, global + per-pane), the choke-point every pane-mutating action rou
 
 - **Task tracking & memory: use `bd` (beads)** — `bd ready` / `bd create` / `bd update --claim`
   / `bd close`; `bd remember` for persistent knowledge. Run `bd prime` for full workflow context.
+- **`TaskCreate` / `TaskUpdate` / `TodoWrite` are PROHIBITED here.** They appear in the tool/skill
+  list (and the `superpowers:using-superpowers` flowchart says "Create TodoWrite todo per item"),
+  but they do **not** persist across sessions and they bypass `bd`, so task state is lost at every
+  session boundary. Use `bd create` / `bd update --claim` / `bd close` instead — when a skill
+  diagram calls for a todo list, satisfy it with `bd`.
 - **Priority order is LOCKED**: see `docs/roadmap/RECONCILIATION.md` §4 (P0a → P0b → P1 → P2).
 - **Panes boot INERT** (no auto-spawn) — start one explicitly via `/restart` or the UI.
 - TDD for features/fixes; verify with the battery above before claiming done.

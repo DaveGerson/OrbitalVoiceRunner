@@ -65,6 +65,18 @@ This binds **every** session — orchestrated, background, scheduled, and intera
 
 **Enforcement — worktree-mutex lock (opt-in).** A committed `pre-commit` hook makes "one committer per tree/branch" a mechanism, not just a rule. It runs **only on `git commit`** — reads (`diff`/`status`/`log`/file reads against any tree) are never intercepted. It is **advisory by default** (warns on contention, never blocks) and **blocks only** when you opt in with `JANUS_WT_LOCK=strict`. Stale locks auto-expire and a dead session can never permanently block commits. Enable it per clone (it does **not** touch shared `core.hooksPath`): `sh scripts/install-wt-lock.sh` — or `pwsh scripts/install-wt-lock.ps1` on Windows. Clear a stale lock with `node scripts/wt-lock.mjs release --force`. Because it's a plain git hook it binds Claude, Codex, and humans alike. Full design + commands: [`docs/process/WORKTREE_LOCK.md`](docs/process/WORKTREE_LOCK.md).
 
+## Multi-Wave Execution Authority
+
+When executing a grounded, spec-driven **multi-wave plan** under a **team-maintainer** profile in
+an **isolated worktree**, the user delegates integration:
+
+- Proceed **wave-by-wave without per-wave approval** — self-review each wave, then merge its branch
+  into local `main` and roll into the next wave.
+- **Hold `git push`** until the user explicitly approves.
+- **Surface** product decisions, design ambiguities, and deviations as notes — do not block on them.
+- Applies only when (a) a written plan is in place, (b) work is isolated (`dev <task>`), and (c) the
+  session has team-maintainer authority. Absent these, fall back to the Conservative profile.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 
