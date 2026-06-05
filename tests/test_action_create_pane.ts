@@ -58,6 +58,9 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
   // The addTerminal spy: captures every call and returns a fake id WITHOUT spawning.
   let realAddTerminal: typeof running.manager.addTerminal;
   let captured: AddTerminalCall[];
+  // B1 guard (#8): collect server->client WS broadcasts so we can prove the synchronous active-pane
+  // view-switch (switch_active_pane) still fires AT DISPATCH TIME even though the PTY boot now defers.
+  let wsMessages: any[] = [];
 
   const api = (pathname: string, init: RequestInit = {}): Promise<Response> =>
     fetch(`${base}${pathname}`, {
@@ -125,6 +128,10 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
       client.on("open", () => resolve());
       client.on("error", reject);
     });
+    // B1 guard (#8): record every server->client frame for the view-switch ordering assertion.
+    client.on("message", (raw) => {
+      try { wsMessages.push(JSON.parse(raw.toString())); } catch { /* non-JSON frame */ }
+    });
     session = await waitFor(() => mock.latest());
 
     // Register the shared project with a real directory and pin it active so both the
@@ -156,6 +163,10 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
   });
 
   // Drive voice create_pane and wait for the tool response; returns the captured call.
+  // NOTE (B1): the two waitFor ordering here is LOAD-BEARING — the tool response (mock.responseFor)
+  // resolves first, THEN the addTerminal capture. The spy fully REPLACES addTerminal with a synchronous
+  // fake (no PTY, no deferred start), so B1's async-spawn split is invisible to this surface; both
+  // waitFors stay correct and no inversion is needed.
   async function voiceCreatePane(args: Record<string, any>): Promise<AddTerminalCall> {
     const before = captured.length;
     const call = session.emitToolCall("create_pane", args);
@@ -397,5 +408,114 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
       `supplying command for a non-Custom preset is a schema rejection: ${bogusOut}`,
     );
     assert.strictEqual(captured.length, beforeBogus, "rejected non-Custom-with-command never reached addTerminal");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #8 (B1) — async create keeps active-pane + view-switch SYNCHRONOUS.
+  // CHARACTERIZATION GUARD: B1 defers only the PTY boot INSIDE addTerminal; createPaneEffect's
+  // create -> setActivePane -> switch_active_pane broadcast ordering must still complete AT DISPATCH
+  // TIME. This goes RED only if someone defers the whole createPaneEffect (breaking the operator's
+  // immediate create-then-command flow). The switch_active_pane frame for the new pane proves the
+  // server made it the active WRITE target and told the browser to remount — synchronously.
+  // ──────────────────────────────────────────────────────────────────────────
+  it("8 async create keeps active-pane + view-switch synchronous", async () => {
+    const beforeMsgs = wsMessages.length;
+    const call = await voiceCreatePane({
+      project_id: "cp_proj",
+      pane_id: "cp-voice-8",
+      tool_preset: "Claude Code",
+      permissions_mode: "Human-in-the-Loop",
+    });
+    assert.strictEqual(call.terminalId, "cp-voice-8", "the create dispatched to addTerminal");
+
+    // The synchronous view-switch broadcast for THIS new pane must have gone out at dispatch time.
+    const switched = await waitFor(() =>
+      wsMessages
+        .slice(beforeMsgs)
+        .find((m) => m?.type === "switch_active_pane" && m?.paneId === "cp-voice-8"),
+    );
+    assert.ok(switched, "switch_active_pane broadcast fired synchronously for the newly created pane");
+
+    // B1 phase-1: the operator was idle (no transcript this turn), so the Auto-created pane gets an
+    // immediate "opening" ack pushed to the live session — proving the turn-gated phase-1 hook is wired
+    // to the real Auto-created success path (not the gated/forbidden strings).
+    const openingAck = await waitFor(() =>
+      session.clientContents.find((c) =>
+        c?.turns?.[0]?.parts?.[0]?.text?.includes("Opening the pane"),
+      ),
+    );
+    assert.ok(openingAck, "phase-1 'opening' ack pushed to the live session for the Auto-created pane");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #8b (B1) — phase-1 ack is TURN-GATED: a barge-in SUPPRESSES the "opening" ack.
+  // Drives the real serverContent.interrupted -> create_pane sequence through the voice onmessage
+  // dispatch. The barge-in latches lastInterrupted + stamps lastOperatorSpeechAt=now; the toolCall
+  // loop's setModelTurn() clears the latch but NOT the recency stamp, so shouldSpeakOpeningAck still
+  // suppresses (operator just spoke). This is the suppress arm the clear-turn #8 case cannot cover —
+  // it proves the gate is actually consulted (not an unconditional push), against the real wiring.
+  // ──────────────────────────────────────────────────────────────────────────
+  it("8b phase-1 'opening' ack is SUPPRESSED when the operator barged in (turn-gated)", async () => {
+    const seenContents = session.clientContents.length;
+    // Operator seized the turn an instant before the tool call lands.
+    session.emit({ serverContent: { interrupted: true } });
+    const call = await voiceCreatePane({
+      project_id: "cp_proj",
+      pane_id: "cp-voice-8b",
+      tool_preset: "Claude Code",
+      permissions_mode: "Human-in-the-Loop",
+    });
+    assert.strictEqual(call.terminalId, "cp-voice-8b", "the create still dispatched (only the ack is gated)");
+
+    // The tool response resolved (awaited in voiceCreatePane), so the dispatch loop — including the
+    // post-resultToToolResponse ack gate — has fully run. No "Opening the pane" ack may have been pushed.
+    const suppressed = !session.clientContents
+      .slice(seenContents)
+      .some((c) => c?.turns?.[0]?.parts?.[0]?.text?.includes("Opening the pane"));
+    assert.ok(suppressed, "barge-in suppresses the phase-1 ack — Janus must not speak over the operator");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #8c (B1) — the startsWith("Pane ") discriminator: a NON-success create gets NO false phase-1 ack.
+  // All THREE create_pane outputs are kind:"ok", so kind==="ok" ALONE is insufficient to gate the ack;
+  // the startsWith("Pane ") check is the ONLY discriminator between the Auto-success string and the
+  // forbidden/deferred strings. Force the gate Off (a forbidden disposition voice cannot loosen) so the
+  // handler returns "Error: the 'create_pane' capability is gated Off…" (does NOT start with "Pane ")
+  // and NO pane is created — the ack must be suppressed (dropping the check would falsely narrate).
+  // ──────────────────────────────────────────────────────────────────────────
+  it("8c forbidden create produces NO phase-1 ack (startsWith('Pane ') discriminator)", async () => {
+    // Force the forbidden path: set create_pane = Off directly in the matrix (voice cannot loosen, and
+    // a forbidden gate returns kind:"ok" with an "Error: …gated Off" string, NOT "Pane …").
+    const prevGate = (running.manager.settings.advanced.capabilityGates as any)?.create_pane;
+    if (!running.manager.settings.advanced.capabilityGates) {
+      running.manager.settings.advanced.capabilityGates = {} as any;
+    }
+    (running.manager.settings.advanced.capabilityGates as any).create_pane = "Off";
+    try {
+      const seenContents = session.clientContents.length;
+      const beforeCaptured = captured.length;
+      const callId = session.emitToolCall("create_pane", {
+        project_id: "cp_proj",
+        pane_id: "cp-voice-8c",
+        tool_preset: "Claude Code",
+        permissions_mode: "Human-in-the-Loop",
+      });
+      const out = String(await waitFor(() => mock.responseFor(callId)));
+      assert.match(out, /gated Off|forbidden/i, `forbidden output (not a "Pane …" success): ${out}`);
+      assert.ok(!out.startsWith("Pane "), `forbidden output must NOT start with "Pane ": ${out}`);
+      assert.strictEqual(captured.length, beforeCaptured, "forbidden create never reached addTerminal (no pane)");
+
+      const noAck = !session.clientContents
+        .slice(seenContents)
+        .some((c) => c?.turns?.[0]?.parts?.[0]?.text?.includes("Opening the pane"));
+      assert.ok(noAck, "a forbidden create must NOT get a false 'opening' ack");
+    } finally {
+      // Restore the prior gate state for later cases / suite hygiene.
+      if (prevGate === undefined) {
+        delete (running.manager.settings.advanced.capabilityGates as any).create_pane;
+      } else {
+        (running.manager.settings.advanced.capabilityGates as any).create_pane = prevGate;
+      }
+    }
   });
 });

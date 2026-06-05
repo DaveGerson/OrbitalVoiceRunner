@@ -542,6 +542,24 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pendingActions,
   } = gating;
 
+  // B1 (async spawn): the manager now boots panes on a deferred tick. Two distinct edges:
+  //  - onSpawned: start() returned (transport assigned OR degraded to Exited). Re-paint the UI so a
+  //    fast-failing pane flips Running->Exited promptly instead of showing stale "Running" until the
+  //    next probe. A degraded pane never reaches markSpawnReady, so it emits NO false "ready".
+  //  - onReady: the child actually attached its PTY (first onData / markSpawnReady). This is the
+  //    phase-2 "ready" source — publish a `created` pane signal so the live session can speak a
+  //    turn-gated "pane is up" ack (the gate lives in the subscriber, src/voiceAckGate.ts).
+  // Manager-level singletons assigned ONCE here (not per-connection): broadcastTerminalsUpdated (just
+  // destructured from gating) and paneSignalBus (server.ts:401, the full bus with .publish) are both
+  // in scope. Own try/catch each — a failed repaint/publish must NEVER escape the manager callback.
+  manager.onSpawned = (terminalId) => {
+    try { broadcastTerminalsUpdated(); } catch (e) { console.error("[onSpawned] repaint failed:", e); }
+  };
+  manager.onReady = (terminalId) => {
+    try { paneSignalBus.publish({ paneId: terminalId, kind: "created" }); }
+    catch (e) { console.error("[onReady] pane-signal publish failed:", e); }
+  };
+
   // Web API to get terminals state
   app.get("/api/terminals", (req, res) => {
     const list = Object.keys(manager.terminals).map((id) => {

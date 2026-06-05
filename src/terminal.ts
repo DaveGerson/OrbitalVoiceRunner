@@ -371,6 +371,10 @@ export class UniversalTerminal {
   // on the false->armed transition; the fallback path re-arms on every output chunk) and the
   // UI's humble "cooking…" overlay (server snapshot reads this).
   public quiescing = false;
+  // B1 (async spawn): fired ONCE when the child actually attaches its PTY (first onData /
+  // markSpawnReady) — the phase-2 "ready" source. A degraded-Exited spawn never reaches
+  // markSpawnReady, so it correctly never emits a false "ready".
+  public onReady?: (terminalId: string) => void;
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
@@ -754,12 +758,27 @@ export class UniversalTerminal {
       }
       return;
     }
+    // B1 (async spawn): on a FIRST async spawn the operator may have already issued a follow-up
+    // command (writeInput) BEFORE the deferred start() ran — it sits in pendingInput. Snapshot it so
+    // the reset below preserves it instead of dropping it on the floor.
+    //
+    // The `transport === null` test does NOT distinguish first-spawn from /restart — stop() nulls
+    // this.transport before restart calls start(), so BOTH paths enter here with transport === null.
+    // That is fine: this carve-out is safe in both cases because pendingInput is only ever non-empty
+    // in the genuine first-spawn-before-start window. After ANY successful boot, markSpawnReady
+    // drains pendingInput to []; so on /restart the slice is [] (nothing stale carried), while a
+    // command typed during a stop→start gap is legitimately preserved and delivered to the new
+    // process. (Empirically confirmed: transport===null, spawnReady===true, pendingInput===[] at
+    // restart entry.) If you ever need to truly branch on first-spawn, key on an explicit flag — not
+    // on transport.
+    const preSpawn = this.transport ? [] : this.pendingInput.slice();
     this.transport = transport;
     this.usingNodePty = usingNodePty;
     // G3: re-enter the gated state for THIS (re)spawn — a /restart must not inherit
-    // a stale spawnReady===true or a queue from the prior process.
+    // a stale spawnReady===true or a queue from the prior process. B1: re-append the
+    // first-spawn pre-spawn snapshot so live follow-up input is preserved (respawn: empty).
     this.spawnReady = false;
-    this.pendingInput = [];
+    this.pendingInput = preSpawn;
     this.armReadyFallback();
     // C2: the legacy (non-node-pty) transport roots the process tree at `script`
     // (Linux/macOS) or a separate `cmd.exe` (Windows), whose tree shape is NOT what
@@ -865,6 +884,14 @@ export class UniversalTerminal {
     for (const command of queued) {
       this.deliverSubmit(command);
     }
+    // B1 (async spawn): the child has attached its PTY — emit the phase-2 "ready" edge. Guarded by
+    // the early `if (this.spawnReady) return` above, so this fires AT MOST ONCE per (re)spawn. Wrapped
+    // so a faulty subscriber can never break the input-flush / never-throw contract.
+    try {
+      this.onReady?.(this.terminalId);
+    } catch (e) {
+      console.warn(`[terminal] onReady subscriber threw (ignored):`, e);
+    }
   }
 
   writeInput(command: string) {
@@ -872,7 +899,10 @@ export class UniversalTerminal {
     // means a turn is starting (Tier A kick, design §5).
     this.lastCommand = command;
     this.applyStatusEvent({ kind: "input" });
-    if (!this.transport) return;
+    // B1 (async spawn): the PTY now boots on a deferred tick, so writeInput can land BEFORE start()
+    // assigns a transport (an "open a pane then run X" follow-up). Buffer it onto the SAME
+    // pendingInput queue markSpawnReady drains in order, instead of dropping it on the floor.
+    if (!this.transport) { this.pendingInput.push(command); return; }
     // G3: a freshly spawned ConPTY child has not attached its stdin reader yet, so
     // a synchronous write here is dropped on the floor. Queue the RAW command until
     // spawn-ready (first onData / fallback timer), then flush in submission order
@@ -1036,6 +1066,16 @@ export class OrchestratorManager {
   // Conservative Phase 2: the manager-level fan of UniversalTerminal.onQuiescing (mirrors onIdle).
   // server.ts assigns this to the observe pipeline's onQuiescing handler.
   public onQuiescing?: (terminalId: string) => void;
+  // B1 (async spawn): fired AFTER the deferred start() returns (transport assigned OR degraded to
+  // Exited). NOT the spawn-ready signal — use onReady for that. onSpawned exists for the fast-fail
+  // UI repaint (a degraded pane flips Running->Exited here) and the test flush seam.
+  public onSpawned?: (terminalId: string) => void;
+  // B1 (async spawn): forwarded from UniversalTerminal.onReady — fires once when the child attaches
+  // its PTY (markSpawnReady). The phase-2 "ready" publish source.
+  public onReady?: (terminalId: string) => void;
+  // B1 (async spawn): in-flight deferred starts (one per scheduleStart). flushPendingSpawns() awaits
+  // them — the mandatory test/teardown seam so a real ConPTY spawn never outlives the test.
+  private pendingStarts = new Set<Promise<void>>();
   public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
   public settings!: SystemSettings;
   private settingsFilePath = ".janus_settings.json";
@@ -1126,7 +1166,13 @@ export class OrchestratorManager {
 
   public saveSettings() {
     try {
-      fs.writeFileSync(this.settingsFilePath, JSON.stringify(this.settings, null, 2), "utf-8");
+      // Secrets-at-rest hardening (director decision 2026-06-05): the Gemini API key is an
+      // IN-MEMORY-ONLY secret. It stays in this.settings.secrets for the running session (so voice
+      // works once the operator enters it in the UI) but is NEVER written to disk — a restart drops
+      // it and the operator re-enters it. Persist a copy with the live secret blanked; everything
+      // else (gates, presets, voiceAi, etc.) persists unchanged.
+      const persisted = { ...this.settings, secrets: { ...this.settings.secrets, geminiApiKey: "" } };
+      fs.writeFileSync(this.settingsFilePath, JSON.stringify(persisted, null, 2), "utf-8");
     } catch (e) {
       console.error("Failed to save settings:", e);
     }
@@ -1231,13 +1277,58 @@ export class OrchestratorManager {
     term.onQuiescing = (tid) => {
       if (this.onQuiescing) this.onQuiescing(tid);
     };
-    term.start();
+    // B1 (async spawn): forward the per-pane spawn-ready edge up to the manager-level onReady
+    // (the server publishes the phase-2 "ready" pane signal from there).
+    term.onReady = (tid) => {
+      if (this.onReady) this.onReady(tid);
+    };
+    // B1 (async spawn): REGISTER SYNCHRONOUSLY, then DEFER the blocking start(). The slot insert,
+    // active-pane election, and ledger sync ALL stay synchronous so (a) the dup/replay guard above
+    // still fires on a rapid replay BEFORE any double-spawn can occur, and (b) create -> active ->
+    // follow-up-command ordering is preserved by callers. Only the PTY boot moves off this tick.
     this.terminals[terminalId] = term;
     if (!this.activeId) {
       this.activeId = terminalId;
     }
     this.syncLedger();
+    this.scheduleStart(term);
     return `Created terminal '${terminalId}' executing '${command}' at '${cwd}'.`;
+  }
+
+  /**
+   * B1 (async spawn): defer the blocking term.start() (PTY/ConPTY spawn) off the current tick so the
+   * Gemini voice onmessage handler is NEVER frozen during pane creation. start() never-throws
+   * internally; the try/catch here is belt-and-suspenders so a deferred throw can't escape into an
+   * unhandled rejection. onSpawned fires after start() returns (transport assigned OR degraded-Exited)
+   * for the fast-fail UI repaint; the spawn-READY edge (phase-2) is the separate onReady path.
+   */
+  private scheduleStart(term: UniversalTerminal): void {
+    const p = new Promise<void>((resolve) => {
+      const t = setImmediate(() => {
+        try {
+          term.start();
+        } catch (e) {
+          console.warn(`[terminal] deferred start threw (pane degraded, not a crash):`, e);
+        } finally {
+          try {
+            if (this.onSpawned) this.onSpawned(term.terminalId);
+          } catch (e) {
+            console.warn(`[terminal] onSpawned subscriber threw (ignored):`, e);
+          }
+          this.pendingStarts.delete(p);
+          resolve();
+        }
+      });
+      // Force-exit hygiene: the deferred-start handle must never hold the loop open on its own.
+      if (typeof (t as any)?.unref === "function") (t as any).unref();
+    });
+    this.pendingStarts.add(p);
+  }
+
+  /** TEST/TEARDOWN SEAM: await every scheduled deferred spawn so a real ConPTY spawn never
+   *  outlives the test (Windows --test-force-exit / uv_close-on-CLOSING hazard). */
+  async flushPendingSpawns(): Promise<void> {
+    await Promise.all([...this.pendingStarts]);
   }
 
   /** Resize a pane's PTY grid to match the operator's xterm viewport. Unknown
