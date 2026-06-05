@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**66** actions across **18** gated capabilities, plus the always-allowed group.
+**69** actions across **18** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -23,12 +23,14 @@ These bypass the capability gate entirely — they work even while the system is
 | `confirm_stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 2 (always allowed) |
 | `create_pane_note` | rest | no | Operator-UI |
 | `create_project_note` | rest | no | Operator-UI |
+| `delete_archived_pane` | rest | no | Permanently delete an archived pane record from the restore tray (operator-UI, ungated) |
 | `delete_orchestrator_plan` | rest | no | Delete a multi-step orchestrator plan by its id, removing it from the plan board |
 | `deliver_handoff` | voice | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 | `edit_note` | rest | no | Operator-UI |
 | `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
 | `get_ledger` | rest | no | Read the full workspaces ledger (project/pane tree the UI loads on page open) |
 | `get_stop_all_status` | rest | no | Read the live STOP-ALL freeze state {frozen, running} so a fresh page load can restore the FROZEN banner |
+| `list_archived_panes` | rest | no | List archived (exited+cleared) panes for the UI restore tray (pane_id/name/project/preset/last_command/archived_at) |
 | `list_orchestration_recipes` | rest | no | Read the orchestration recipe templates (suggested multi-pane suites the UI offers) |
 | `list_orchestrator_plans` | rest | no | Read the multi-step orchestrator plans board (id/status/steps per plan) |
 | `list_watch_rules` | rest | no | List all configured watch-automation rules |
@@ -37,6 +39,7 @@ These bypass the capability gate entirely — they work even while the system is
 | `remove_note` | rest | no | Operator-UI |
 | `remove_watch_rule` | rest | no | Delete a watch-automation rule by its id |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
+| `restore_archived_pane` | rest | no | Restore an archived pane back into its project (operator-UI, ungated) |
 | `send_keys` | rest | no | Write a command directly to a terminal pane's input |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 
