@@ -103,6 +103,12 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
   const pingTimeoutMs = opts.pingTimeoutMs ?? 1500;
   const backoffBaseMs = opts.backoffBaseMs ?? 250;
   const backoffMaxMs = opts.backoffMaxMs ?? 2000;
+  const breakerThreshold = opts.breakerThreshold ?? 3;
+  const breakerWindowMs = opts.breakerWindowMs ?? 10_000;
+  const cooldownMs = opts.cooldownMs ?? 60_000;
+  let consecutiveFails = 0;
+  let firstFailAt = 0;
+  let breakerUntil = 0;          // epoch ms; 0 = breaker closed
 
   const synthDir = resolveSynthDir(
     { override: opts.synthDirOverride ?? env.JANUS_PYTHON_SYNTH_DIR, moduleDir: opts.moduleDir, repoRoot: opts.repoRoot },
@@ -136,7 +142,7 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     const id = obj?.id;
     if (id === "__ping__") {
       if (PingResponseSchema.safeParse(obj).success) {
-        ready = true; discovering = false; attempt = 0; clearPingTimer();
+        ready = true; discovering = false; attempt = 0; consecutiveFails = 0; firstFailAt = 0; clearPingTimer();
         log(`[synth] ping ok (synthVersion=${obj?.synthVersion ?? "?"})`);
       } else {
         log(`[synth] ping rejected (v/shape mismatch)`); // the ping-timeout drives the candidate advance
@@ -152,8 +158,7 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     else p.resolve({ ok: false });
   }
 
-  // Task 5 overrides this to veto a (re)spawn while the breaker is OPEN. Default: always allowed.
-  function spawnBlocked(): boolean { return false; }
+  function spawnBlocked(): boolean { return Date.now() < breakerUntil; } // breaker OPEN ⇒ fallback-only
 
   function onDown(reason: string) {
     clearPingTimer();
@@ -167,8 +172,18 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
 
   function scheduleRespawn() {
     if (disposed || !synthDir || cands.length === 0) return;
-    const wait = Math.min(backoffMaxMs, backoffBaseMs * Math.pow(2, attempt++));
-    respawnTimer = setTimeout(spawnDaemon, wait);
+    const now = Date.now();
+    if (firstFailAt === 0 || now - firstFailAt > breakerWindowMs) { firstFailAt = now; consecutiveFails = 0; }
+    consecutiveFails++;
+    if (consecutiveFails >= breakerThreshold) {
+      breakerUntil = now + cooldownMs;
+      consecutiveFails = 0; firstFailAt = 0; attempt = 0;
+      log(`[synth] circuit breaker OPEN for ${cooldownMs}ms (fallback-only)`);
+      respawnTimer = setTimeout(() => { breakerUntil = 0; log("[synth] breaker probe"); spawnDaemon(); }, cooldownMs);
+    } else {
+      const wait = Math.min(backoffMaxMs, backoffBaseMs * Math.pow(2, attempt++));
+      respawnTimer = setTimeout(spawnDaemon, wait);
+    }
     if (respawnTimer && typeof (respawnTimer as any).unref === "function") (respawnTimer as any).unref();
   }
 
