@@ -137,6 +137,15 @@ function AppRaw() {
   // Archive panel states
   const [archive, setArchive] = useState<any[]>([]);
   const [showArchivePanel, setShowArchivePanel] = useState(false);
+  // A-UI (wsm-e2e-pinned-5h0): auto-expand the Pane Archive the first time it gains content, so a
+  // just-exited (terminated + archived, recoverable) pane is immediately discoverable instead of
+  // hidden behind the collapsed-by-default toggle. Only ever auto-OPENS — it never fights a manual
+  // collapse afterward (re-arms only after the archive empties again).
+  const archiveWasEmptyRef = useRef(true);
+  useEffect(() => {
+    if (archive.length > 0 && archiveWasEmptyRef.current) setShowArchivePanel(true);
+    archiveWasEmptyRef.current = archive.length === 0;
+  }, [archive.length]);
 
   // Web Audio Synth Chimes for Hands-Free Feedback
   const playEarcon = (type: EarconType) => {
@@ -3182,9 +3191,9 @@ function AppRaw() {
       </div>
 
       {/* Main Content */}
-      <main className="flex flex-col lg:flex-row flex-1 overflow-hidden">
+      <main className="flex flex-col lg:flex-row flex-1 overflow-hidden min-h-0">
         {/* Sidebar */}
-        <nav className={`w-full lg:w-72 border-b lg:border-b-0 lg:border-r border-white/5 bg-black/40 flex flex-col h-[calc(100vh-14rem)] lg:h-full shrink-0 min-h-0 overflow-hidden ${mobileActiveView === "menu" ? "flex" : "hidden lg:flex"}`}>
+        <nav className={`w-full lg:w-72 border-b lg:border-b-0 lg:border-r border-white/5 bg-black/40 flex flex-col h-full shrink-0 min-h-0 overflow-hidden ${mobileActiveView === "menu" ? "flex" : "hidden lg:flex"}`}>
           <div className="p-4 flex-1 overflow-y-auto scrollbar-thin min-h-0">
             <button
               onClick={() => setActiveTerminalId(null)}
@@ -3375,7 +3384,7 @@ function AppRaw() {
         </nav>
 
         {/* Center Content */}
-        <section className={`flex-1 flex flex-col bg-[#0b0b0b] min-w-0 h-[calc(100vh-14rem)] lg:h-full overflow-hidden ${mobileActiveView === "terminal" ? "flex" : "hidden lg:flex"}`}>
+        <section className={`flex-1 flex flex-col bg-[#0b0b0b] min-w-0 min-h-0 h-full overflow-hidden ${mobileActiveView === "terminal" ? "flex" : "hidden lg:flex"}`}>
           {activeTerminalId && activeTerminal ? (
             /* Terminal View */
             <div className="flex flex-1 flex-row overflow-hidden">
@@ -3427,19 +3436,21 @@ function AppRaw() {
                         mobile where the sidebar grid control is hidden behind the Menu view. */}
                     <button
                       onClick={() => setActiveTerminalId(null)}
-                      className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors text-[10px] font-mono uppercase tracking-wider"
                       title="Back to grid (leave this pane running)"
                     >
                       <Layers className="w-3.5 h-3.5" />
+                      Grid
                     </button>
                     {/* B3: graceful EXIT — terminate this pane's process and archive it (recoverable),
                         the non-destructive middle between Restart and PRUNE (hard delete). */}
                     <button
                       onClick={() => handleStopPane(activeProjectId, activeTerminal.id)}
-                      className="p-1.5 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors text-[10px] font-mono uppercase tracking-wider"
                       title="Exit pane (terminate the process and archive it — recoverable)"
                     >
                       <Square className="w-3.5 h-3.5" />
+                      Exit
                     </button>
                   </div>
                 </div>

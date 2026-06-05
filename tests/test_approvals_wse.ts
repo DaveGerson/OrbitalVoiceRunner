@@ -94,6 +94,40 @@ describe("parseApprovalIntent (BUG-008)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// voice-ux-round4 (Issue C): the approve lexicon must recognize the past-tense
+// "confirmed" — the literal label on the Confirm button and the word an operator
+// actually says to clear it. The reject side already carries past-tense pairs
+// (reject/rejected, deny/denied); the approve side was missing accepted/confirmed/
+// authorized, so a lone "Confirmed." parsed to "none", the utterance was dropped,
+// no action_resolved was broadcast, and the Confirm Action dialog lingered.
+// ---------------------------------------------------------------------------
+describe("parseApprovalIntent — confirmed/accepted/authorized lexicon (voice-ux-round4 C)", () => {
+  // These all resolve to "none" before the fix (the exact bug) and must become "approve".
+  const approveCases: string[] = [
+    "Confirmed.",      // the precise symptom: bare, capitalized, trailing period
+    "confirmed",
+    "I confirmed it",  // isolates "confirmed" without a co-occurring bare "yes"
+    "accepted",        // symmetry with the reject side's rejected/denied
+    "authorized",
+  ];
+  for (const utter of approveCases) {
+    it(`"${utter}" -> approve`, () => {
+      assert.strictEqual(parseApprovalIntent(utter).intent, "approve");
+    });
+  }
+
+  // Regression guards: a NEGATED approve-domain verb stays conservative (-> none) and
+  // must NEVER infer a reject — mirrors the existing "dont approve"/"do not approve" rule.
+  // (line 162 spreads APPROVE_STRONG into NON_DIRECTIVE_AFTER_NEGATOR, so adding "confirmed"
+  // there auto-protects "dont confirmed" from becoming a false reject directive.)
+  for (const utter of ["dont confirm", "dont confirmed", "do not confirm"]) {
+    it(`"${utter}" -> none (negated approve is never a reject)`, () => {
+      assert.strictEqual(parseApprovalIntent(utter).intent, "none");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // WS-E.2 — targeting (BUG-007): 3 pending, fragment/ordinal, ambiguity -> clarify
 // ---------------------------------------------------------------------------
 describe("selectApprovalTarget (BUG-007)", () => {
