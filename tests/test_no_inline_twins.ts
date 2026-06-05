@@ -14,6 +14,11 @@ const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
 //   app.get('/api/x', …)  app.post("/api/y/:id", …)  app.use('/api', …)  app.get('*', …)
 // app.use(express.json()), app.use(fn), app.use(vite.middlewares), app.use(express.static(…)) have NO
 // string path → not matched → not required in the catalog (they are not addressable routes).
+// NOTE (known limitation, by design): this is a raw-text scan, not a TS parser, so a
+// COMMENTED-OUT app.<verb>('<path>') line is also matched. Today the only commented route
+// (server.ts ~646, `// app.use("/api", …)`) dedups into the live "use /api" key, so it's a
+// no-op. If you comment OUT a live route and this guard flips red ("undeclared"/"stale"),
+// that's why — uncomment it, or remove its catalog entry in src/actions/inlineExceptions.ts.
 const ROUTE_RE = /\bapp\.(get|post|put|delete|use)\(\s*(['"`])([^'"`]+)\2/g;
 
 function scanInlineRoutes(src: string): Set<string> {
