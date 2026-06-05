@@ -1,28 +1,18 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
 import { PaneSignalBus } from "./src/paneSignalBus";
-import { formatPaneSignal } from "./src/paneSignals";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
-  decideProposal,
-  isLoosening,
-  isStagedStale,
-  inferKind,
   serializePending,
-  type ApprovalKind,
-  type PendingApproval,
 } from "./src/pendingApprovals";
-import { parseApprovalIntent, selectApprovalTarget } from "./src/approvalIntent";
-import { shouldRouteUtterance, resolvePendingActionByVoice } from "./src/voiceApprovalRouting";
-import { isPaneActiveForWrite, inactivePaneClarify } from "./src/activePane";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 import { restGateOutcome } from "./src/restGate";
@@ -35,8 +25,6 @@ import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/act
 import type { ActionContext } from "./src/actions/types";
 import { mountRestRoutes, type RestApp, type RestRequest } from "./src/actions/rest";
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
-import { resolveResumeHandleTtlMs, shouldClearHandleOnClose, wrapHandleForPersist, readFreshHandle, isInvalidKeyClose, isBlankApiKey } from "./src/voiceResumption";
-import { extractTranscripts } from "./src/liveTranscripts";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createGating } from "./src/gating";
@@ -487,7 +475,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttention,
     interactionLog,
     getLastInteractionId: () => lastInteractionId,
-    setLastInteractionId: (v) => { lastInteractionId = v; },
     redact: redactSecrets,
     historyManager: HistoryManager.getInstance(),
     ai,
@@ -522,7 +509,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     coreState,
     announcementBus,
     pushApprovalNarration,
-    redact: redactSecrets,
     sanitizeSettingsForClient,
     addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
   });
@@ -1450,7 +1436,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttention,
     interactionLog,
     recipes,
-    redact: redactSecrets,
     addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
     ai,
     boundLiveConnector,

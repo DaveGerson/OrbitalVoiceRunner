@@ -66,7 +66,6 @@ import type { CoreState } from "../core/coreState";
  *  - coreState:                 the shared mutable state (frozen / activePaneId / activeLiveSession / lastStopAllFailed).
  *  - announcementBus:           the proactive-feedback sink (earcons + on-screen stack).
  *  - pushApprovalNarration:     INJECTED — narrates a system event into the live session (voice owns it; dec-5 moves the def into voice).
- *  - redact:                    redactSecrets, applied before any instruction/summary is narrated/broadcast.
  *  - sanitizeSettingsForClient: passed through to buildActionRun's deps for the rehydrated set_*_permissions effects.
  *  - addCommand:                the HistoryManager singleton's addCommand (server.ts HistoryManager is not importable);
  *                               the approved-write path records the command in command history exactly as before.
@@ -79,7 +78,6 @@ export interface GatingDeps {
   coreState: CoreState;
   announcementBus: AnnouncementBus;
   pushApprovalNarration: (session: any, text: string) => void;
-  redact: (s: string) => string;
   sanitizeSettingsForClient: (settings: any) => any;
   addCommand: (terminalId: string, command: string) => void;
 }
@@ -136,14 +134,9 @@ export function createGating(deps: GatingDeps): Gating {
     coreState,
     announcementBus,
     pushApprovalNarration,
-    redact,
     sanitizeSettingsForClient,
     addCommand,
   } = deps;
-  // `redact` is part of the canonical deps bag for symmetry with the other module carves; the moved
-  // code calls the imported `redactSecrets` directly (server passes `redact: redactSecrets`, so they
-  // are the same identity). Reference it so an unused-binding lint stays quiet without changing behavior.
-  void redact;
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
   // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can

@@ -95,7 +95,6 @@ export interface VoiceDeps {
     log: (entry: any) => void;
   };
   recipes: any;
-  redact: (s: string) => string;
   /** record a command in the HistoryManager singleton (server.ts-internal; passed in, not imported) —
    *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was. */
   addCommand: (terminalId: string, command: string) => void;
@@ -159,7 +158,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     pruneAttention,
     interactionLog,
     recipes,
-    redact,
     addCommand,
     ai,
     boundLiveConnector,
@@ -174,9 +172,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     API_AUTH_TOKEN,
     getCookie,
   } = deps;
-  // `redact` is part of the canonical bag for symmetry with the other module carves; the moved code
-  // calls the imported `redactSecrets` directly (server passes `redact: redactSecrets`, same identity).
-  void redact;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
   // shared object by reference — the pending stores + the posture surface read coreState.frozen /

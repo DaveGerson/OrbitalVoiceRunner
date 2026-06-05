@@ -53,7 +53,7 @@ export interface ObserveHistoryManager {
  * `startServer()` scope, threaded explicitly so the SAME shared cells are mutated across the boundary.
  *
  *  - broadcast / announcementBus / paneSignalBus / pruneAttention: the notification + attention sinks.
- *  - interactionLog + get/setLastInteractionId: the best-effort correlated PTY leg (module-mutable id).
+ *  - interactionLog + getLastInteractionId: the best-effort correlated PTY leg (module-mutable id; read-only here).
  *  - redact: redactSecrets, applied before any pane text is announced/displayed/summarized.
  *  - historyManager: the server's HistoryManager singleton (passed in, not imported).
  *  - ai: the server-scoped GoogleGenAI fallback client used by the idle-edge outcome summarizer.
@@ -65,7 +65,6 @@ export interface ObserveDeps {
   pruneAttention: () => void;
   interactionLog: InteractionLogger;
   getLastInteractionId: () => string | null;
-  setLastInteractionId: (v: string | null) => void;
   redact: (s: string) => string;
   historyManager: ObserveHistoryManager;
   ai: GoogleGenAI;
@@ -95,14 +94,10 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     pruneAttention,
     interactionLog,
     getLastInteractionId,
-    setLastInteractionId,
     redact,
     historyManager,
     ai,
   } = deps;
-  // `setLastInteractionId` is part of the bag for symmetry with the other module carves (the PTY leg
-  // only reads the id here); reference it so an unused-binding lint stays quiet without changing behavior.
-  void setLastInteractionId;
 
   // ── Private observation state (was server-local; moves here as locals scoped to this server) ──
   const lastStates: Record<string, string> = {};
