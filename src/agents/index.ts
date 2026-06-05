@@ -66,8 +66,15 @@ export interface AgentAdapter {
 
 export type PresetUnion = AgentAdapter["preset"];
 
+/** One entry in an on-disk conversation store (agy: conversations/<id>.db). */
+export type ConvEntry = { id: string; mtimeMs: number };
+
 /** Optional per-adapter config (e.g. agy bin path is a deploy concern). */
-export type AdapterConfig = { bin?: string };
+export type AdapterConfig = {
+  bin?: string;
+  /** Injectable conversation-store reader (agy session capture); tests stub this. */
+  convLister?: () => ConvEntry[];
+};
 
 import { ClaudeAdapter } from "./claude";
 import { CodexAdapter } from "./codex";
