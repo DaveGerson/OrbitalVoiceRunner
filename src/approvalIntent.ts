@@ -30,13 +30,21 @@ export interface ParsedApproval {
 const NEGATORS = new Set(["not", "no", "dont", "never", "cant", "cannot", "wont", "nope"]);
 
 /** Standalone short affirmations/denials (the whole utterance is essentially this word). */
+// NOTE: "confirmed" is deliberately NOT here. It lives only in APPROVE_STRONG, whose path
+// honors negation (isNegated) — the bare block below does not, so a "confirmed" in BARE_YES
+// would make "dont confirmed" wrongly approve. The strong-verb path resolves a lone
+// "Confirmed." to approve correctly without that hazard.
 const BARE_YES = new Set(["yes", "yep", "yeah", "approved", "ok", "okay", "affirmative"]);
 const BARE_NO = new Set(["no", "nope", "nah", "negative"]);
 
 // STRONG verbs live in the approval domain and trigger WITHOUT a nearby object token
 // ("approve" / "reject" are unambiguous). WEAK verbs are ambient ("run", "go", "stop") and
 // require explicit pairing with an object token so incidental speech does not resolve a vote.
-const APPROVE_STRONG = new Set(["approve", "approved", "accept", "confirm", "authorize"]);
+// Past-tense forms (accepted/confirmed/authorized) mirror the reject side's reject/rejected,
+// deny/denied pairs — an operator says the tense the UI shows ("Confirm" button -> "Confirmed.").
+// Because line 162 spreads APPROVE_STRONG into NON_DIRECTIVE_AFTER_NEGATOR, these are also
+// auto-protected from the leading-negator reject directive (so "dont confirmed" stays "none").
+const APPROVE_STRONG = new Set(["approve", "approved", "accept", "accepted", "confirm", "confirmed", "authorize", "authorized"]);
 const APPROVE_WEAK = new Set(["ok", "okay", "yes", "go", "run", "execute", "proceed", "dispatch", "send"]);
 const REJECT_STRONG = new Set(["reject", "rejected", "deny", "denied", "decline", "discard"]);
 const REJECT_WEAK = new Set(["cancel", "stop", "abort", "skip", "nevermind"]);
