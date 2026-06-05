@@ -1693,6 +1693,19 @@ function AppRaw() {
     fetchTerminals();
   };
 
+  // Graceful per-pane EXIT: terminate the PTY and archive the pane (recoverable),
+  // preserving the ledger record — the non-destructive middle between PRUNE (hard
+  // delete) and the reactive "Clear Exited". On success the pane leaves the active
+  // list (into the recoverable archive), so drop the terminal view back to the grid.
+  const handleStopPane = async (projId: string, paneId: string) => {
+    await apiFetch(`/api/projects/${projId}/panes/${paneId}/stop`, { method: "POST" });
+    if (activeTerminalId === paneId) setActiveTerminalId(null);
+    fetchLedger();
+    fetchTerminals();
+    fetchArchive();
+    playEarcon("execute");
+  };
+
   const handleRenameProject = (id: string, current: string) => {
     setPromptDialog({
       title: "Rename Project", placeholder: current,
@@ -3278,6 +3291,25 @@ function AppRaw() {
                       title="Restart Node Engine"
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                    {/* B4: back-to-grid — leave the pane view without killing it. Auto-activation
+                        (voice create_pane) drops you into a pane with no header way out; acute on
+                        mobile where the sidebar grid control is hidden behind the Menu view. */}
+                    <button
+                      onClick={() => setActiveTerminalId(null)}
+                      className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
+                      title="Back to grid (leave this pane running)"
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                    </button>
+                    {/* B3: graceful EXIT — terminate this pane's process and archive it (recoverable),
+                        the non-destructive middle between Restart and PRUNE (hard delete). */}
+                    <button
+                      onClick={() => handleStopPane(activeProjectId, activeTerminal.id)}
+                      className="p-1.5 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors"
+                      title="Exit pane (terminate the process and archive it — recoverable)"
+                    >
+                      <Square className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
