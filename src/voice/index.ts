@@ -27,7 +27,7 @@
 
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import type { WebSocketServer } from "ws";
-import { redactSecrets } from "../terminal";
+import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal } from "../paneSignals";
 import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
 import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
@@ -78,7 +78,7 @@ type DispatchOutcome =
  * scope, threaded explicitly so the SAME shared cells are mutated across the boundary.
  */
 export interface VoiceDeps {
-  manager: any;
+  manager: OrchestratorManager;
   store: JanusStore | null;
   broadcast: (msg: any) => void;
   broadcastLedgerUpdate: () => void;

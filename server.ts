@@ -427,17 +427,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // ONLY via coreState.setFrozen so persistence stays coupled. See src/core/coreState.ts.
   const coreState = createCoreState(store);
 
-  // `DispatchOutcome` is the single-sourced result shape returned by `dispatchProposal` (below).
-  // Prompt-composer refactor: there is no longer an `activePlanGate`. Plans never auto-advance by
-  // writing into a pane (architecture §5), so the outer-scope step engine no longer needs a handle
-  // back into the live session's dispatch path.
-  type DispatchOutcome =
-    | { kind: "executed"; text: string }
-    | { kind: "blocked"; text: string }
-    | { kind: "error"; text: string }
-    | { kind: "clarify"; text: string }
-    | { kind: "pending"; text: string };
-
   function broadcast(msg: any) {
     const data = JSON.stringify(msg);
     for (const client of coreState.clients) {
