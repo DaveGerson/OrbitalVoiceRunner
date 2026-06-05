@@ -916,42 +916,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   });
 
   // 2. Watch automation rules
-  app.get("/api/watch-rules", (req, res) => {
-    res.json(manager.ledger.watchRules);
-  });
-
-  app.post("/api/watch-rules", (req, res) => {
-    const { triggerTerminalId, triggerTransition, actionTerminalId, actionCommand, oneShot } = req.body;
-    if (!triggerTerminalId || !triggerTransition || !actionTerminalId || !actionCommand) {
-      res.status(400).json({ error: "Missing required rule parameters." });
-      return;
-    }
-    const newRule = {
-      id: "rule_" + Math.random().toString(36).substring(2, 11),
-      triggerTerminalId,
-      triggerTransition,
-      actionTerminalId,
-      actionCommand,
-      enabled: true,
-      oneShot: oneShot !== undefined ? oneShot : true
-    };
-    manager.ledger.watchRules.push(newRule);
-    manager.ledger["save"](true);
-    broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-    res.json({ success: true, rule: newRule });
-  });
-
-  app.delete("/api/watch-rules/:id", (req, res) => {
-    const idx = manager.ledger.watchRules.findIndex(r => r.id === req.params.id);
-    if (idx !== -1) {
-      manager.ledger.watchRules.splice(idx, 1);
-      manager.ledger["save"](true);
-      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Rule not found." });
-    }
-  });
+  // c55 Batch G: GET/POST /api/watch-rules and DELETE /api/watch-rules/:id are now served by the
+  // registry-derived rest-only defs list_watch_rules / add_watch_rule / remove_watch_rule
+  // (mountRestRoutes only-set above), all ALWAYS_ALLOWED (preserving the inline routes' ungated behavior).
+  // list_watch_rules' rest.toHttp emits the RAW WatchRule[] array TOP-LEVEL (byte-identical to the inline
+  // res.json(watchRules) body the client's setWatchRules() consumes). add/remove force-save + broadcast
+  // watch_rules_updated identically. Accepted deltas (client ignores the body): inline add missing-field
+  // 400 -> zod 500; inline remove 404 -> 200 ok-narration.
 
   // 3. Multi-step sequenced resumable plans
   app.get("/api/plans", (req, res) => {
@@ -998,17 +969,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     }
   });
 
-  app.delete("/api/plans/:id", (req, res) => {
-    const idx = manager.ledger.plans.findIndex(p => p.id === req.params.id);
-    if (idx !== -1) {
-      manager.ledger.plans.splice(idx, 1);
-      manager.ledger["save"](true);
-      broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Plan not found." });
-    }
-  });
+  // c55 Batch G: DELETE /api/plans/:id is now served by the registry-derived rest-only def
+  // delete_orchestrator_plan (mountRestRoutes only-set above), ALWAYS_ALLOWED (preserving the inline
+  // route's ungated behavior). The def's rest.path uses :plan_id (snake_case) so Express injects the path
+  // param directly onto the snake_case zod key. Same splice + force-save + plans_updated broadcast.
+  // Accepted delta (client ignores the body): inline 404 "Plan not found." -> 200 ok-narration.
 
   // 4. Recipes and templates
   app.get("/api/recipes", (req, res) => {
@@ -1355,6 +1320,25 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "list_panes",
       "get_stop_all_status",
       "get_terminal_history",
+      // c55 Batch G — net-new rest-only watch-rule / plan-delete defs (NO voice twin today). Each inline
+      // app.{get,post,delete}(...) twin is deleted below in the SAME change (Express keeps the
+      // first-registered handler, so a stale inline route would silently mask the cutover). All four are
+      // ALWAYS_ALLOWED (the safe default — preserves the current ungated/instant behavior); the matrix can
+      // later tighten add_watch_rule (row exists, default Ask, reserved) and mint gate rows for
+      // remove_watch_rule / delete_orchestrator_plan (DEFERRED for ratification, with a voice yes/no).
+      //   list_watch_rules         GET    /api/watch-rules    — toHttp emits the RAW WatchRule[] array
+      //                            TOP-LEVEL (the shape setWatchRules() consumes on initial load).
+      //   add_watch_rule           POST   /api/watch-rules    — push + force-save + watch_rules_updated.
+      //                            The inline presence-check 400 becomes a zod-500 (valid clients always
+      //                            send the full body).
+      //   remove_watch_rule        DELETE /api/watch-rules/:id — splice + force-save + watch_rules_updated.
+      //                            Accepted delta: inline 404 -> 200 ok-narration (client ignores the body).
+      //   delete_orchestrator_plan DELETE /api/plans/:plan_id   — splice off the board + force-save +
+      //                            plans_updated. Accepted delta: inline 404 -> 200 ok-narration.
+      "list_watch_rules",
+      "add_watch_rule",
+      "remove_watch_rule",
+      "delete_orchestrator_plan",
     ]),
   });
 

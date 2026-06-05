@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**50** actions across **17** gated capabilities, plus the always-allowed group.
+**54** actions across **17** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -16,12 +16,16 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `add_watch_rule` | rest | no | Create a watch-automation rule that fires a command on another pane when a trigger pane transitions |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
 | `clear_history` | rest | no | Clear a terminal pane's recorded command history |
 | `confirm_stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 2 (always allowed) |
+| `delete_orchestrator_plan` | rest | no | Delete a multi-step orchestrator plan by its id, removing it from the plan board |
 | `deliver_handoff` | voice | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 | `get_stop_all_status` | rest | no | Read the live STOP-ALL freeze state {frozen, running} so a fresh page load can restore the FROZEN banner |
+| `list_watch_rules` | rest | no | List all configured watch-automation rules |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
+| `remove_watch_rule` | rest | no | Delete a watch-automation rule by its id |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
 | `send_keys` | rest | no | Write a command directly to a terminal pane's input |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |

@@ -544,10 +544,13 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
   // Guard out-of-scope neighbors stayed inline (this batch must NOT touch them). NOTE: GET
   // /api/terminals/:id/history was a Batch-D out-of-scope neighbor, but c55 Batch F intentionally
   // converges it (get_terminal_history) — so it is no longer asserted here; the Batch F cutover guard
-  // (test_c55_batch_f.ts) now asserts that inline route is DELETED.
+  // (test_c55_batch_f.ts) now asserts that inline route is DELETED. NOTE: POST /api/watch-rules was
+  // likewise a Batch-D out-of-scope neighbor, but c55 Batch G CONVERGED the whole watch-rules family
+  // (add_watch_rule) — so it is no longer asserted here; the Batch G contract suite
+  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. The bulk
+  // capability-gates route stays inline (the set_pane_gates carve-out is HELD for Batch H ratification).
   const keptLiterals: Array<{ label: string; needle: RegExp }> = [
     { label: "PUT /api/projects/:projectId/panes/:paneId/capability-gates", needle: /app\.put\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/capability-gates["']/ },
-    { label: "POST /api/watch-rules", needle: /app\.post\(\s*["']\/api\/watch-rules["']/ },
   ];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {

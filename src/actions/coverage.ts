@@ -101,6 +101,16 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // PROSE, so it is a separate def — not reused). No voice tool is planned for either.
   get_stop_all_status: new Set<Surface>(["rest"]),
   get_terminal_history: new Set<Surface>(["rest"]),
+
+  // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
+  // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
+  // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for
+  // remove_watch_rule / delete_orchestrator_plan (+ a dedicated gate row) is DEFERRED for ratification;
+  // add_watch_rule's matrix row exists (default Ask) but stays reserved until that voice tool lands.
+  list_watch_rules: new Set<Surface>(["rest"]),
+  add_watch_rule: new Set<Surface>(["rest"]),
+  remove_watch_rule: new Set<Surface>(["rest"]),
+  delete_orchestrator_plan: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

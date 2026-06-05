@@ -31,6 +31,7 @@ import { LOCKS_ACTIONS } from "./defs/locks";
 import { ORCH_ACTIONS } from "./defs/orchestration";
 import { HANDOFF_ACTIONS } from "./defs/handoff";
 import { OBSERVABILITY_ACTIONS } from "./defs/observability";
+import { WATCH_RULES_ACTIONS } from "./defs/watch_rules";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -304,6 +305,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...HANDOFF_ACTIONS,
   // ── Wave D observability defs (2) ──
   ...OBSERVABILITY_ACTIONS,
+  // ── c55 Batch G net-new rest-only watch-rule / plan-delete defs (4) ──
+  ...WATCH_RULES_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
