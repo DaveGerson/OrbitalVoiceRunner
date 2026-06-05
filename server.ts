@@ -790,12 +790,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     }
   });
 
-  app.put("/api/projects/:id/rename", (req, res) => {
-    const { name } = req.body;
-    manager.ledger.renameProject(req.params.id, name);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55 Batch B: PUT /api/projects/:project_id/rename is now served by the registry twin
+  // rename_project (mountRestRoutes only-set above) — same renameProject + ledger_updated broadcast.
+  // Accepted body delta (client ignores it): { success:true } -> 200 { output:"Project renamed to …" }.
 
   app.post("/api/projects/:id/notes", (req, res) => {
     const { note } = req.body;
@@ -829,12 +826,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json({ success: true });
   });
 
-  app.put("/api/projects/:projectId/panes/:paneId/rename", (req, res) => {
-    const { name } = req.body;
-    manager.ledger.renamePane(req.params.projectId, req.params.paneId, name);
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55 Batch B: PUT /api/projects/:project_id/panes/:pane_id/rename is now served by the registry
+  // twin rename_pane (mountRestRoutes only-set above) — same renamePane + ledger_updated broadcast.
+  // Accepted body delta (client ignores it): { success:true } -> 200 { output:"Pane renamed to …" }.
 
   app.post("/api/projects/:projectId/panes/:paneId/notes", (req, res) => {
     const { note } = req.body;
@@ -919,16 +913,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json({ success: true, capabilityGates: pane.capabilityGates ?? null });
   });
 
-  app.post("/api/projects/:id/switch", (req, res) => {
-    const { id } = req.params;
-    manager.ledger.switchContext(id);
-    manager.settings.projects.activeContext = id;
-    const wsPath = manager.ledger.workspaces[id]?.directory || process.cwd();
-    manager.settings.projects.localWorkspacePath = wsPath;
-    manager.saveSettings();
-    broadcastLedgerUpdate();
-    res.json({ success: true, activeProjectId: manager.ledger.activeProjectId });
-  });
+  // c55 Batch B: POST /api/projects/:project_id/switch is now served by the registry twin
+  // switch_context (mountRestRoutes only-set above) — same switchContext + activeContext/
+  // localWorkspacePath writes + saveSettings + ledger_updated broadcast. Accepted body delta (client
+  // ignores it, repaints off the WS frame): { success:true, activeProjectId } -> 200 { output:<project
+  // briefing> } (the briefing object the voice path already returns).
 
   app.delete("/api/projects/:id", (req, res) => {
     const { id } = req.params;
@@ -1128,6 +1117,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // validation 500 (no valid client sends an empty payload). GET /api/plans, POST /api/plans/:id/execute,
   // and DELETE /api/plans/:id stay inline (out of scope — later batches).
 
+  // c55 Batch B: POST /api/plans/:id/execute stays INLINE — HELD from the registry cutover. The
+  // registry twin execute_plan routes step 1 through ctx.dispatchProposal (the connection-scoped
+  // pane-WRITE choke-point). buildRestActionContext injects a REFUSING STUB for dispatchProposal
+  // ("pane-write is not available on the REST surface"), so converging this route would make the UI
+  // "Run plan" button (App.tsx handleExecutePlan) always refuse instead of dispatching step 1. That is
+  // a real functional regression, not a client-invisible body delta — it needs a REST-capable
+  // pane-write path (architectural decision). HELD for ratification (c55 spec Open Decisions).
   app.post("/api/plans/:id/execute", (req, res) => {
     const plan = manager.ledger.plans.find(p => p.id === req.params.id);
     if (plan) {
@@ -1135,7 +1131,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       plan.currentStepIndex = 0;
       plan.steps.forEach((s, idx) => s.status = idx === 0 ? "running" : "pending");
       const currentStep = plan.steps[0];
-      
+
       const targetTerm = manager.terminals[currentStep.terminalId];
       if (targetTerm) {
         HistoryManager.getInstance().addCommand(currentStep.terminalId, currentStep.command);
@@ -1516,6 +1512,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "release_stop_all",
       "dismiss_attention",
       "create_orchestrator_plan",
+      // c55 Batch B — free twins with ROUTE PARAMS. Each def's rest.path was rewritten to snake_case
+      // segments (:project_id / :pane_id) so Express injects the path param directly onto the
+      // snake_case zod key; the inline camelCase-segment twins (:id / :projectId / :paneId) are
+      // deleted below. The client ignores the HTTP body and repaints off the ledger_updated WS frame.
+      //
+      // execute_plan is DELIBERATELY HELD from this cutover (see the inline note at POST
+      // /api/plans/:id/execute below): its registry handler routes step 1 through ctx.dispatchProposal,
+      // which is a connection-scoped REFUSING STUB in buildRestActionContext (pane-write is not
+      // available on the REST surface). Converging it would break the UI "Run plan" button (App.tsx).
+      // This needs a REST-capable pane-write path (architectural decision) — held for ratification.
+      "rename_project",
+      "rename_pane",
+      "switch_context",
     ]),
   });
 

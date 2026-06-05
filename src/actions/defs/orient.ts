@@ -39,7 +39,8 @@ export const renameProject: ActionDef<typeof RenameProjectParams> = {
   capability: "update_metadata",
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "put", path: "/api/projects/:id/rename" },
+  // c55 Batch B: snake_case route param so Express injects :project_id onto the snake_case zod key.
+  rest: { method: "put", path: "/api/projects/:project_id/rename" },
   handler: (args, ctx: ActionContext): ActionResult => {
     ctx.manager.ledger.renameProject(args.project_id, args.name);
     ctx.broadcastLedgerUpdate();
@@ -65,7 +66,8 @@ export const renamePane: ActionDef<typeof RenamePaneParams> = {
   capability: "update_metadata",
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "put", path: "/api/projects/:projectId/panes/:paneId/rename" },
+  // c55 Batch B: snake_case route params so Express injects :project_id / :pane_id onto the zod keys.
+  rest: { method: "put", path: "/api/projects/:project_id/panes/:pane_id/rename" },
   handler: (args, ctx: ActionContext): ActionResult => {
     ctx.manager.ledger.renamePane(args.project_id, args.pane_id, args.name);
     ctx.broadcastLedgerUpdate();
@@ -93,7 +95,8 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
   capability: "switch_context",
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "post", path: "/api/projects/:id/switch" },
+  // c55 Batch B: snake_case route param so Express injects :project_id onto the snake_case zod key.
+  rest: { method: "post", path: "/api/projects/:project_id/switch" },
   handler: (args, ctx: ActionContext): ActionResult => {
     const projectId = args.project_id;
     ctx.manager.ledger.switchContext(projectId);
