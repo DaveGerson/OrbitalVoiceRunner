@@ -23,9 +23,15 @@ import { resolveActivePaneMeta } from "./activePaneMeta";
 
 // Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
 // the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
+// NOTE (bead 6q5): every value here MUST also exist in the SERVER allowlist RAW_KEY_TABLE
+// (src/rawKeyClass.ts) — the /raw-input route 400s any sequence not in that table. There is no
+// shared import across the client/server build boundary, so the invariant is pinned by the drift
+// guard in tests/test_rawkey_allowlist.ts ("every frontend RAW_KEY value is a member of
+// RAW_KEY_TABLE"). Adding a key here that the server lacks fails that test RED.
 const RAW_KEY = {
   up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
   enter: "\r", tab: "\t", esc: "\x1b",
+  pageUp: "\x1b[5~", pageDown: "\x1b[6~",
   ctrlC: "\x03", shiftTab: "\x1b[Z",
 } as const;
 
@@ -47,6 +53,9 @@ function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: 
       {/* Terminal-ops — always-allowed */}
       <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
       <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
+      {/* Paging — always-allowed */}
+      <button type="button" onClick={() => press(RAW_KEY.pageUp)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Page Up">PgUp</button>
+      <button type="button" onClick={() => press(RAW_KEY.pageDown)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Page Down">PgDn</button>
       {/* Disruptive — gated (warn tint) */}
       <button type="button" onClick={() => press(RAW_KEY.ctrlC)} className={warnBtn} title="Send Ctrl+C (interrupt / emergency brake)">^C</button>
       <button type="button" onClick={() => press(RAW_KEY.shiftTab)} className={warnBtn} title="Send Shift+Tab (cycle agent mode — gated)">⇧Tab</button>

@@ -13,6 +13,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { isKnownRawKey, RAW_KEY_TABLE, SHIFT_TAB_BYTES, classifyRawKey } from "../src/rawKeyClass";
 
 // The 11 vetted canonical sequences (multi-cli adapter spec §8/§10). Spelled out here BYTE-EXACT so a
@@ -69,5 +72,70 @@ test("RAW_KEY_TABLE: exposes exactly the 11 vetted byte sequences (canonical sou
   assert.strictEqual(values.length, 11, "the canonical table has exactly 11 entries");
   for (const [label, bytes] of CANONICAL) {
     assert.ok(values.includes(bytes), `${label} (${JSON.stringify(bytes)}) must appear in RAW_KEY_TABLE`);
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+// bead 6q5 — FRONTEND↔SERVER raw-key DRIFT GUARD.
+//
+// There are TWO hand-built raw-key tables: the SERVER allowlist RAW_KEY_TABLE here (src/rawKeyClass.ts,
+// the route's 400-gate) and the FRONTEND control-key-bar table `RAW_KEY` in src/App.tsx. They have no
+// shared source of truth (a shared import would pull a server module into the Vite browser bundle —
+// higher churn, riskier build-graph change), so we pin the invariant instead: EVERY frontend RAW_KEY
+// value must be a MEMBER of the server RAW_KEY_TABLE. If a future frontend-only key add slips in, the
+// server allowlist would 400 it at runtime — this guard turns that latent 400 into a RED unit test.
+//
+// We scan App.tsx AS TEXT (same source-as-text pattern as tests/test_no_inline_twins.ts) rather than
+// importing it: App.tsx pulls React/motion/audio/the whole UI tree, none of which a node test can boot.
+const here = path.dirname(fileURLToPath(import.meta.url));
+const appSrc = readFileSync(path.join(here, "..", "src", "App.tsx"), "utf8");
+
+/**
+ * Decode a JS double-quoted string-literal BODY (the chars between the quotes) into its runtime bytes.
+ * Handles the escapes that appear in these control-key tables — \xHH, \r, \n, \t, \0, \\, \" — so the
+ * parsed values compare equal to the runtime RAW_KEY_TABLE values. (JSON.parse can't be used: JSON has
+ * no \xHH escape, only \uHHHH, and these literals use \x1b.)
+ */
+function decodeJsStringBody(body: string): string {
+  return body.replace(/\\x([0-9A-Fa-f]{2})|\\(.)/g, (_all, hex, ch) => {
+    if (hex !== undefined) return String.fromCharCode(parseInt(hex, 16));
+    switch (ch) {
+      case "r": return "\r";
+      case "n": return "\n";
+      case "t": return "\t";
+      case "0": return "\0";
+      default: return ch; // \\ , \" , and any other escaped literal char
+    }
+  });
+}
+
+/**
+ * Extract the string VALUES from the `const RAW_KEY = { … } as const;` object literal in App.tsx.
+ * Returns [name, decodedBytes] pairs. Throws if the literal can't be located (so a rename also fails RED).
+ */
+function extractFrontendRawKeyValues(src: string): Array<[string, string]> {
+  const block = /const\s+RAW_KEY\s*=\s*\{([\s\S]*?)\}\s*as const;/.exec(src);
+  assert.ok(block, "could not locate `const RAW_KEY = { … } as const;` in src/App.tsx (renamed?)");
+  // Match `name: "….."` pairs; the value is a double-quoted JS string literal (may contain \x.. escapes).
+  const pairRe = /(\w+)\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  const out: Array<[string, string]> = [];
+  let m: RegExpExecArray | null;
+  while ((m = pairRe.exec(block[1])) !== null) {
+    out.push([m[1], decodeJsStringBody(m[2])]);
+  }
+  assert.ok(out.length > 0, "parsed zero entries from the frontend RAW_KEY literal — parser/source drift");
+  return out;
+}
+
+test("drift guard (6q5): every frontend RAW_KEY value is a member of the server RAW_KEY_TABLE", () => {
+  const serverValues: readonly string[] = Object.values(RAW_KEY_TABLE);
+  const frontend = extractFrontendRawKeyValues(appSrc);
+  for (const [name, bytes] of frontend) {
+    assert.ok(
+      serverValues.includes(bytes) && isKnownRawKey(bytes),
+      `frontend RAW_KEY.${name} = ${JSON.stringify(bytes)} is NOT in the server RAW_KEY_TABLE allowlist. ` +
+        `The server /raw-input route will 400 it. Add it to RAW_KEY_TABLE in src/rawKeyClass.ts ` +
+        `(and tests/test_rawkey_allowlist.ts CANONICAL) before shipping the frontend key.`,
+    );
   }
 });
