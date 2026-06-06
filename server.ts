@@ -33,7 +33,7 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
-import type { CapabilityGate, CapabilityGateMap } from "./src/types";
+import type { CapabilityGate } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
@@ -859,47 +859,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // applied unconditionally + skipped the invalid-mode/pane-not-found pre-checks). Same setPermissionsMode
   // + ledger write + ledger_updated/terminals_updated broadcasts on the Auto path. Client ignores the body.
 
-  // bead 8sq (spec §2.B / §5): set the per-pane capability-gate OVERRIDE map from the matrix editor's
-  // per-pane scope. This is the UI sibling of the voice `set_capability_gate` tool, but the UI is the
-  // deliberate place where LOOSENING is allowed (voice may only tighten — see the tool handler), so
-  // this endpoint writes the operator-chosen map verbatim. Body: { capabilityGates: CapabilityGateMap }
-  // (a full or partial override map; keys absent fall through to global). Persists to the ledger pane
-  // and re-broadcasts so chips repaint from the new server-resolved posture.
-  app.put("/api/projects/:projectId/panes/:paneId/capability-gates", (req, res) => {
-    const { projectId, paneId } = req.params;
-    const incoming = req.body?.capabilityGates;
-    const ws = manager.ledger.getProject(projectId);
-    const pane = ws?.panes?.[paneId];
-    if (!pane) { res.status(404).json({ error: "Pane not found" }); return; }
-    // Normalize: only valid {Auto|Ask|Off} entries survive; an empty map clears the override
-    // (so the pane falls back to the global default rather than persisting a masking `{}`).
-    const clean: CapabilityGateMap = {};
-    let any = false;
-    if (incoming && typeof incoming === "object") {
-      for (const [k, v] of Object.entries(incoming)) {
-        if (v === "Auto" || v === "Ask" || v === "Off") { (clean as any)[k] = v; any = true; }
-      }
-    }
-    pane.capabilityGates = any ? clean : undefined;
-    // Persist via updatePane (the durable path for BOTH backends): legacy Ledger keeps the full
-    // PaneMeta in its JSON-backed map; the SQLite store writes the capability_gates column (schema
-    // v4). A bare ledger.save() would be a SQLite no-op and silently drop the override.
-    manager.ledger.updatePane(projectId, pane, true);
-    if (store) {
-      try {
-        store.recordActivity({
-          type: "permission_changed",
-          project_id: projectId,
-          pane_id: paneId,
-          summary: `UI set per-pane gates for ${paneId} (${any ? Object.keys(clean).length : 0} override(s))`,
-          payload: { action: "set_pane_gates", capabilityGates: any ? clean : null },
-        });
-      } catch { /* store optional */ }
-    }
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, capabilityGates: pane.capabilityGates ?? null });
-  });
+  // c55.16: the BULK per-pane capability-gate OVERRIDE write (the matrix editor's per-pane "Save",
+  // PUT /api/projects/:project_id/panes/:pane_id/capability-gates) is now served by the registry twin
+  // set_pane_gates (mountRestRoutes only-set below). It is the rest-only, UNGATED, VERBATIM operator
+  // loosening surface (the voice set_capability_gate tool stays single-entry tighten-only and is now
+  // voice-only). The def's rest.path uses snake_case segments, coerceArgs aliases the body
+  // {capabilityGates -> capability_gates}, and rest.toHttp reproduces the exact 200 {success,
+  // capabilityGates} / 404 {error:"Pane not found"} contract (incl. empty-clears-to-null) byte-for-byte.
+  // The handler faithfully ports the inline (A)-(H): notFound sentinel before any mutation, the
+  // Auto|Ask|Off silent-drop normalize, updatePane(.,.,true) on both set+clear, the if(store) audit, and
+  // both broadcasts on both paths. tests/test_pane_gates_rest.ts pins the round-trip unchanged.
 
   // c55 Batch B: POST /api/projects/:project_id/switch is now served by the registry twin
   // switch_context (mountRestRoutes only-set above) — same switchContext + activeContext/
@@ -1448,6 +1417,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "confirm_pending_action",
       "cancel_pending_action",
       "approve_pending_command",
+      // c55.16 — set_pane_gates: the BULK whole-map per-pane gate-override writer (the operator
+      // matrix-editor's "Save"). Converges the inline PUT /api/projects/:projectId/panes/:paneId/
+      // capability-gates (deleted below in the SAME change). rest-only, UNGATED, VERBATIM (the
+      // deliberate UI loosening surface — voice's set_capability_gate is single-entry tighten-only and
+      // is now voice-only). Rides rest.toHttp to reproduce the exact 200 {success,capabilityGates} /
+      // 404 {error} contract; coerceArgs aliases the body {capabilityGates -> capability_gates}.
+      "set_pane_gates",
     ]),
   });
 

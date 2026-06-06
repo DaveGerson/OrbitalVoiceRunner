@@ -306,8 +306,13 @@ export const setCapabilityGate: ActionDef<typeof SetCapabilityGateParams> = {
   params: SetCapabilityGateParams,
   capability: "set_capability_gate",
   readOnly: false,
-  surfaces: new Set(["voice", "rest"]),
-  rest: { method: "put", path: "/api/projects/:projectId/panes/:paneId/capability-gates" },
+  // c55.16 (set_pane_gates convergence): set_capability_gate is now VOICE-ONLY. Its dormant `rest`
+  // binding (never in the mountRestRoutes only-set) has been REMOVED and the capability-gates path is
+  // re-homed onto the new bulk-write `setPaneGates` def below. The voice meta-tool keeps its
+  // single-entry, tighten-only, self-gating contract unchanged. The §8.4 coverage guard reads
+  // def.surfaces.has('rest') (the SET, not the binding), so flipping surfaces to {voice} is what makes
+  // it single-surface — it MUST be added to INTENTIONAL_ASYMMETRY as ['voice'] (done in coverage.ts).
+  surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
     // META self-gate (design §6, director posture 2026-06-01): "changing the locks" is the one
     // deliberate exception to defaults-are-overridable. TIGHTENING a gate by voice (e.g. Auto->Ask,
@@ -388,10 +393,124 @@ export const setCapabilityGate: ActionDef<typeof SetCapabilityGateParams> = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// set_pane_gates — server.ts:868 (the BULK whole-map per-pane override writer; the operator
+// matrix-editor's "Save". REST-ONLY, UNGATED, VERBATIM — the deliberate UI loosening surface).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The WHOLE per-pane override map (full replacement, not a single entry — that is set_capability_gate).
+ * Values are validated/normalized IN-HANDLER (Auto|Ask|Off filter), NOT via z.enum, to reproduce the
+ * inline route's SILENT-DROP of invalid entries: a z.enum would 500 on a bad value; the inline route
+ * quietly skips it (regression bar #3 in tests/test_pane_gates_rest.ts). An empty / all-invalid /
+ * absent map CLEARS the override (the pane falls back to the global default — no masking `{}`).
+ */
+const SetPaneGatesParams = z.object({
+  project_id: z.string(),
+  pane_id: z.string(),
+  capability_gates: z.record(z.string(), z.string()).optional(),
+});
+
+export const setPaneGates: ActionDef<typeof SetPaneGatesParams> = {
+  name: "set_pane_gates",
+  description:
+    "Set the per-pane capability-gate OVERRIDE map from the matrix editor (bulk, whole-map, loosening allowed — the deliberate operator-direct UI sibling of the voice set_capability_gate tool). Operator UI, rest-only.",
+  params: SetPaneGatesParams,
+  // Reuses the EXISTING set_capability_gate capability row (for matrix projection + audit attribution).
+  // deriveCapabilities de-dupes on def.capability (restart_pane/set_pane_permissions already share a
+  // cap), so this adds ZERO matrix rows — the §8.1b subset invariant holds with no matrix-file edits.
+  // Declaring the capability is NOT a promise runAction enforces it (handler-owned gate model,
+  // types.ts:200-213): this handler is UNGATED by design (see below).
+  capability: "set_capability_gate",
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  // c55.16: snake_case route segments so Express injects :project_id/:pane_id directly onto the snake
+  // zod keys (the Batch-B/-D param-skew pattern). The inline twin read camelCase :projectId/:paneId and
+  // a `capabilityGates` BODY key; coerceArgs below aliases body {capabilityGates -> capability_gates}.
+  rest: {
+    method: "put",
+    path: "/api/projects/:project_id/panes/:pane_id/capability-gates",
+    // Reproduce the inline route's exact status+body contract (the flat {output} default cannot carry a
+    // structured body, and resultToHttp has no 404 path). The 404 is an ok-shaped {notFound:true}
+    // sentinel (NOT kind:"blocked"/"error", which would change the status the live suite asserts).
+    toHttp: (result): { status: number; body: unknown } => {
+      const out =
+        result.kind === "ok"
+          ? (result.output as { notFound?: boolean; capabilityGates?: CapabilityGateMap | null })
+          : undefined;
+      if (out && out.notFound) {
+        return { status: 404, body: { error: "Pane not found" } };
+      }
+      const gates = (out && out.capabilityGates) ?? null;
+      return { status: 200, body: { success: true, capabilityGates: gates } };
+    },
+  },
+  // REST body alias: the matrix editor PUTs { capabilityGates: {...} }; the snake zod key is
+  // `capability_gates`. Alias it ONLY when the snake key is absent, so a snake-keyed call is never
+  // clobbered (mirrors set_pane_permissions coerceArgs).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.capability_gates == null && out.capabilityGates != null) out.capability_gates = out.capabilityGates;
+    delete out.capabilityGates;
+    return out;
+  },
+  // UNGATED / VERBATIM / IMMEDIATE — a faithful port of the inline route (server.ts:868-902). This is
+  // the deliberate UI place where LOOSENING is allowed (voice may only tighten — see setCapabilityGate
+  // above); it does NOT route through gateOrDefer and does NOT apply the tighten-only isLoosening
+  // refusal. Per the handler-owned gate model, declaring capability:'set_capability_gate' is purely for
+  // matrix projection/audit, not an enforcement promise.
+  handler: (args, ctx): ActionResult => {
+    const { project_id, pane_id, capability_gates } = args;
+    // (A) pane-existence pre-check — returns the ok-shaped {notFound:true} sentinel BEFORE any mutation
+    // or broadcast (faithful to the inline early-return).
+    const ws = ctx.manager.ledger.getProject(project_id);
+    const pane = ws?.panes?.[pane_id];
+    if (!pane) {
+      return { kind: "ok", output: { notFound: true } };
+    }
+    // (B) normalize: only valid {Auto|Ask|Off} entries survive; (C) an empty / all-invalid map clears
+    // the override (so the pane falls back to the global default rather than persisting a masking `{}`).
+    const clean: CapabilityGateMap = {};
+    let any = false;
+    if (capability_gates && typeof capability_gates === "object") {
+      for (const [k, v] of Object.entries(capability_gates)) {
+        if (v === "Auto" || v === "Ask" || v === "Off") {
+          (clean as Record<string, GateValue>)[k] = v as GateValue;
+          any = true;
+        }
+      }
+    }
+    pane.capabilityGates = any ? clean : undefined;
+    // (D) Persist via updatePane (the durable path for BOTH backends): the SQLite store writes the
+    // capability_gates column (schema v4); a bare ledger.save() would be a SQLite no-op and silently
+    // drop the override. Fires on BOTH the set and clear paths.
+    ctx.manager.ledger.updatePane(project_id, pane, true);
+    // (E) audit — guarded by if(ctx.store) + try/catch (store is null under JANUS_LEDGER_BACKEND=legacy).
+    if (ctx.store) {
+      try {
+        ctx.store.recordActivity({
+          type: "permission_changed",
+          project_id,
+          pane_id,
+          summary: `UI set per-pane gates for ${pane_id} (${any ? Object.keys(clean).length : 0} override(s))`,
+          payload: { action: "set_pane_gates", capabilityGates: any ? clean : null },
+        });
+      } catch { /* store optional */ }
+    }
+    // (F)+(G) re-broadcast on BOTH set and clear so the chips repaint from the new server-resolved
+    // posture (the clear path repaints back to the global default — R7).
+    ctx.broadcastLedgerUpdate();
+    ctx.broadcastTerminalsUpdated();
+    // (H) success: the ok-shaped output the toHttp re-projects into 200 {success,capabilityGates}.
+    return { kind: "ok", output: { capabilityGates: pane.capabilityGates ?? null } };
+  },
+};
+
 /** The "Changing the locks" group, in dispatch order. */
 export const LOCKS_ACTIONS: ActionDef[] = [
   setGlobalPermissions,
   setPanePermissions,
   restartPane,
   setCapabilityGate,
+  setPaneGates,
 ];

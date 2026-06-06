@@ -42,7 +42,9 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "post", path: "/api/terminals/:id/raw-input", category: "exception", reason: "multi-cli raw-keystroke path; bifurcated gate inline; future converge" },
   // ── held (open c55 decisions) ──
   { method: "post", path: "/api/projects", category: "held", reason: "create_project: inline does a post-create rename (2nd mutation) the def lacks — held" },
-  { method: "put", path: "/api/projects/:projectId/panes/:paneId/capability-gates", category: "held", reason: "BULK gate map-write; set_capability_gate def is single-entry tighten-only — needs new set_pane_gates (held)" },
+  // c55.16: PUT /api/projects/:projectId/panes/:paneId/capability-gates (the BULK per-pane gate-map
+  // write) was CONVERGED to the new rest-only set_pane_gates def — the inline route + this held row are
+  // deleted together (no-twin guard). The voice set_capability_gate def is now voice-only.
   // c55.9: POST /api/plans/:id/execute (execute_plan) was CONVERGED — buildRestActionContext now
   // injects a gated REST pane-write seam (restDispatchProposal -> applyDispatchDecision), so the inline
   // route + this held row are deleted together (no-twin guard). BUG-040 closed.

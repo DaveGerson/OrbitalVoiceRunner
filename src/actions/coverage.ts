@@ -85,6 +85,16 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
   set_global_permissions: new Set<Surface>(["voice"]),
 
+  // ── c55.16: set_capability_gate is now VOICE-ONLY (the bulk REST/UI gate-map write is the separate
+  // rest-only set_pane_gates def below). set_capability_gate is the single-entry, tighten-only voice
+  // meta-tool; its dormant rest binding (the capability-gates path) was removed and re-homed onto
+  // set_pane_gates, making set_capability_gate single-surface → it MUST be allow-listed here. ──
+  set_capability_gate: new Set<Surface>(["voice"]),
+  // ── c55.16: set_pane_gates — NEW rest-only BULK per-pane gate-map writer (operator matrix-editor's
+  // "Save"; no voice twin BY DESIGN — voice uses set_capability_gate). Converges the inline PUT
+  // /api/projects/:projectId/panes/:paneId/capability-gates. ──
+  set_pane_gates: new Set<Surface>(["rest"]),
+
   // ── c55 Batch C: NEW rest-only pane/UI defs (no voice twin BY DESIGN — pure UI/operator-direct) ──
   // These converge inline app.post(...) routes that never had a Gemini voice tool. They are rest-only
   // (surfaces = {'rest'}) so they don't force a voice-tool description; a voice twin is not planned.

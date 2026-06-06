@@ -547,11 +547,12 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
   // (test_c55_batch_f.ts) now asserts that inline route is DELETED. NOTE: POST /api/watch-rules was
   // likewise a Batch-D out-of-scope neighbor, but c55 Batch G CONVERGED the whole watch-rules family
   // (add_watch_rule) — so it is no longer asserted here; the Batch G contract suite
-  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. The bulk
-  // capability-gates route stays inline (the set_pane_gates carve-out is HELD for Batch H ratification).
-  const keptLiterals: Array<{ label: string; needle: RegExp }> = [
-    { label: "PUT /api/projects/:projectId/panes/:paneId/capability-gates", needle: /app\.put\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/capability-gates["']/ },
-  ];
+  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. NOTE: the bulk
+  // PUT /api/projects/:projectId/panes/:paneId/capability-gates route was a Batch-D out-of-scope
+  // neighbor (the set_pane_gates carve-out was HELD), but c55.16 CONVERGED it (the new rest-only
+  // set_pane_gates def + rest.toHttp), so it is no longer asserted-preserved here — c55.16's own
+  // contract suite (test_c55_16_set_pane_gates.ts) pins the converged def + asserts the inline twin is GONE.
+  const keptLiterals: Array<{ label: string; needle: RegExp }> = [];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {
       assert.ok(needle.test(serverSrc), `${label} must remain inline this batch (out of scope)`);
