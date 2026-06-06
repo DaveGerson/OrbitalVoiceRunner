@@ -22,6 +22,7 @@ import type {
   ResolveAction,
   ResolveMode,
 } from "../pendingApprovals";
+import type { PendingActionStore } from "../pendingActions";
 import type { JanusStore } from "../store/sqliteStore";
 import type { PaneModeResult } from "../applyPaneMode";
 
@@ -301,8 +302,13 @@ export interface ActionContext {
 
   // ── Pending-approval store (server.ts:1645 — the live PendingApprovalStore instance) ──────────
   /** The per-session pending-approval store, injected by reference (server.ts:1645). Handlers use
-   *  forSession / setLastAnnounced / has — list_pending_approvals, get_attention_digest, reject_handoff. */
+   *  forSession / setLastAnnounced / has — list_pending_approvals, get_attention_digest, reject_handoff —
+   *  and `all()` (the REST view, pendingApprovals.ts:623) for the c55.15 `list_pending_commands` def. */
   pendingApprovals: PendingApprovalsSurface;
+  /** The non-PTY deferred-action store (gated-Ask staging), injected (server.ts pendingActions, line
+   *  602). Used by the c55.15 approvals/pending REST defs: list (`all()`) / confirm / cancel — plus the
+   *  `has(id)` 404 guard. GLOBAL (not session-scoped, unlike pendingApprovals). */
+  pendingActions: PendingActionStore;
   /** The single resolve choke-point (server.ts:2054): claim+delete, narrate, broadcast, flip handoff.
    *  reject_handoff calls it to cancel a pending delivery; returns the ResolveAction to branch on. */
   applyResolution: ApplyResolution;

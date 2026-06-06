@@ -45,10 +45,7 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "put", path: "/api/projects/:projectId/panes/:paneId/capability-gates", category: "held", reason: "BULK gate map-write; set_capability_gate def is single-entry tighten-only — needs new set_pane_gates (held)" },
   { method: "post", path: "/api/plans/:id/execute", category: "held", reason: "execute_plan: registry handler's dispatchProposal is a refusing stub on REST — needs a REST pane-write seam (c55.9)" },
   { method: "post", path: "/api/attention/clear", category: "held", reason: "thin shim delegating to runAction('dismiss_attention',{}) — path-alias pending multi-path rest binding" },
-  // ── future-convergence: approvals / pending (HiTL) ──
-  { method: "get", path: "/api/commands/pending", category: "future-convergence", reason: "pending commands read — future rest-only def" },
-  { method: "get", path: "/api/actions/pending", category: "future-convergence", reason: "pending actions read — future rest-only def" },
-  { method: "post", path: "/api/actions/:id/confirm", category: "future-convergence", reason: "confirm a deferred action (HiTL) — future registry def" },
-  { method: "post", path: "/api/actions/:id/cancel", category: "future-convergence", reason: "cancel a deferred action — future registry def" },
-  { method: "post", path: "/api/commands/approve", category: "future-convergence", reason: "approve a proposed command (HiTL) — future registry def" },
+  // c55.15: the 5 approvals/pending (HiTL) future-convergence rows were converged to rest-only
+  // ALWAYS_ALLOWED registry defs (list_pending_commands / list_pending_actions / confirm_pending_action /
+  // cancel_pending_action / approve_pending_command) — their inline routes are deleted from server.ts.
 ];
