@@ -60,11 +60,22 @@ const ADDRESS_PHRASES = ["can you", "could you", "would you", "will you", "show 
  * IMPERATIVE / command: a first-token action verb, or an emergency-brake word ANYWHERE. Any hit forces
  * SPEAK (never mute a command). This deliberately overlaps approvalIntent's directive spirit, but here
  * it ONLY ever forces SPEAK — so a false positive is harmless (it can only keep the voice ON).
+ *
+ * q4l widening: the concrete dev-action verbs below (ship/deploy/merge/fix/pull/push/commit/rebase/
+ * build/test/look/review/investigate) were added so deliberation-phrased COMMANDS speak. Before this,
+ * a command embedded after a musing leader ("i think we should ship this", "what if we just deploy")
+ * missed the embedded-imperative check (rule 4) and the musing-leader mute (rule 5) wrongly won.
+ * Adding a verb can ONLY force SPEAK (rule 4 only returns SPEAK), so this cannot introduce a new mute
+ * nor break the flag-OFF short-circuit. NB: deliberately a concrete-verb set, NOT a generic
+ * "we should <X>" => speak construction — that would regress genuine deliberation ("lets circle back").
  */
 const IMPERATIVE_VERBS = new Set([
   "open", "close", "run", "stop", "start", "switch", "show", "tell", "list", "approve", "reject",
   "cancel", "restart", "spawn", "kill", "create", "archive", "send", "execute", "go", "proceed",
   "pause", "resume", "check", "read", "focus", "select", "dispatch", "deny", "accept",
+  // q4l: dev-action verbs (deliberation-phrased commands like "we should ship" must speak).
+  "ship", "deploy", "merge", "fix", "pull", "push", "commit", "rebase", "build", "test", "look",
+  "review", "investigate",
 ]);
 // Emergency brakes: if any of these appears ANYWHERE, force SPEAK (safety — never swallow a "stop").
 const EMERGENCY_BRAKES = new Set(["stop", "halt", "abort", "freeze", "kill"]);
