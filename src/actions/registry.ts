@@ -26,6 +26,7 @@ import { READS_ACTIONS } from "./defs/reads";
 import { NOTES_ACTIONS } from "./defs/notes";
 import { ARCHIVE_ACTIONS } from "./defs/archive";
 import { LIFECYCLE_REST_ACTIONS } from "./defs/lifecycle_rest";
+import { APPROVALS_REST_ACTIONS } from "./defs/approvals_rest";
 import { PANES_WRITE_ACTIONS } from "./defs/panes_write";
 import { PANES_REST_ACTIONS } from "./defs/panes_rest";
 import { ORIENT_ACTIONS } from "./defs/orient";
@@ -316,6 +317,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...WATCH_RULES_ACTIONS,
   // ── c55.14 net-new rest-only lifecycle defs (4: update/stop ungated; delete project/pane gated Ask) ──
   ...LIFECYCLE_REST_ACTIONS,
+  // ── c55.15 net-new rest-only approvals/pending HiTL defs (5: ALWAYS_ALLOWED operator-resolver surface) ──
+  ...APPROVALS_REST_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

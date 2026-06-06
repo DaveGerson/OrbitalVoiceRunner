@@ -132,6 +132,14 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   delete_project: new Set<Surface>(["rest"]),
   delete_pane: new Set<Surface>(["rest"]),
 
+  // ── c55.15: NEW rest-only approvals/pending HiTL defs (operator surface that RESOLVES gated actions;
+  // ALWAYS_ALLOWED — above-the-gate). No voice twin (voice has list_pending_approvals / the live approval path). ──
+  list_pending_commands: new Set<Surface>(["rest"]),
+  list_pending_actions:  new Set<Surface>(["rest"]),
+  confirm_pending_action: new Set<Surface>(["rest"]),
+  cancel_pending_action:  new Set<Surface>(["rest"]),
+  approve_pending_command: new Set<Surface>(["rest"]),
+
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
   // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for
