@@ -13,7 +13,7 @@ developer personas (Maya — power user; Devon — security/platform; Sam — vo
 
 Provenance: salvaged from the retired `claude/relaxed-gates-LI27l` branch (archived at tag
 `archive/relaxed-gates`). Line anchors were written against `main @16c62da` (2026-05-28) and are now
-stale — current main is **`dd87e9d` (2026-06-06)**, several hundred commits of prompt-composer/WS/
+stale — current main is **`7efcaee` (2026-06-06)**, several hundred commits of prompt-composer/WS/
 ledger/voice-UX work past that baseline. The SHA/date headers here and in `NEXT-LEVEL-ROADMAP.md` are
 refreshed, but the inline `server.ts:NNN` / `App.tsx:NNN` citations are NOT — re-anchor each before
 acting on any single item.

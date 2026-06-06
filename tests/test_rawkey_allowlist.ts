@@ -128,11 +128,10 @@ function extractFrontendRawKeyValues(src: string): Array<[string, string]> {
 }
 
 test("drift guard (6q5): every frontend RAW_KEY value is a member of the server RAW_KEY_TABLE", () => {
-  const serverValues: readonly string[] = Object.values(RAW_KEY_TABLE);
   const frontend = extractFrontendRawKeyValues(appSrc);
   for (const [name, bytes] of frontend) {
     assert.ok(
-      serverValues.includes(bytes) && isKnownRawKey(bytes),
+      isKnownRawKey(bytes),
       `frontend RAW_KEY.${name} = ${JSON.stringify(bytes)} is NOT in the server RAW_KEY_TABLE allowlist. ` +
         `The server /raw-input route will 400 it. Add it to RAW_KEY_TABLE in src/rawKeyClass.ts ` +
         `(and tests/test_rawkey_allowlist.ts CANONICAL) before shipping the frontend key.`,

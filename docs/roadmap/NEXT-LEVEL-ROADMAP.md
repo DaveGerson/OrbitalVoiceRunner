@@ -24,7 +24,7 @@ ordered highest to lowest priority; cross-persona convergence is the strongest p
 ## Validation against `main` (snapshot taken at commit `16c62da`, 2026-05-28)
 
 > ⚠️ **STALE — re-anchor before acting.** This validation snapshot was taken against `main @16c62da`
-> (2026-05-28). Current main is **`dd87e9d` (2026-06-06)** — many commits past that baseline
+> (2026-05-28). Current main is **`7efcaee` (2026-06-06)** — many commits past that baseline
 > (prompt-composer refactor, WS hardening, the SQLite ledger cutover, capability-gate + handoff build,
 > round-3/4 voice-UX). Every per-item status label and inline `server.ts:NNN` / `App.tsx:NNN` citation
 > below dates to the `16c62da` snapshot and needs INDIVIDUAL re-verification against current main; only
