@@ -136,6 +136,8 @@ export function SettingsDialog({
   const [systemPrompt, setSystemPrompt] = useState<string>("");
   // aqx (build-out): grounded web search (Google) toggle. Off by default; config (not a secret).
   const [groundingEnabled, setGroundingEnabled] = useState<boolean>(false);
+  // tkd: should-I-speak (silence) gate toggle. Off by default; config (not a secret). Experimental.
+  const [silenceGate, setSilenceGate] = useState<boolean>(false);
 
   // Local states - Project profiles
   const [activeContext, setActiveContext] = useState<string>("default_project");
@@ -198,6 +200,7 @@ export function SettingsDialog({
       setModel(initialSettings.voiceAi?.model ?? "gemini-3.1-flash-live-preview");
       setSystemPrompt(initialSettings.voiceAi?.systemPrompt ?? "");
       setGroundingEnabled(initialSettings.voiceAi?.groundingEnabled ?? false);
+      setSilenceGate(initialSettings.voiceAi?.silenceGate ?? false);
 
       setActiveContext(initialSettings.projects?.activeContext ?? "default_project");
       setLocalWorkspacePath(initialSettings.projects?.localWorkspacePath ?? "");
@@ -245,7 +248,9 @@ export function SettingsDialog({
         // DEFAULT_SYSTEM_PROMPT (rather than storing a meaningless empty string).
         systemPrompt: systemPrompt.trim() ? systemPrompt : undefined,
         // aqx (build-out): persist undefined when off so "off" stays the implicit default in settings files.
-        groundingEnabled: groundingEnabled || undefined
+        groundingEnabled: groundingEnabled || undefined,
+        // tkd: persist undefined when off so "off" stays the implicit default in settings files.
+        silenceGate: silenceGate || undefined
       },
       projects: {
         activeContext,
@@ -283,7 +288,7 @@ export function SettingsDialog({
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements, capabilityGates
@@ -323,6 +328,7 @@ export function SettingsDialog({
         // sa4: round-trip the editable system prompt through the JSON tab too (undefined => blank).
         if (parsed.voiceAi.systemPrompt !== undefined) setSystemPrompt(parsed.voiceAi.systemPrompt ?? "");
         if (parsed.voiceAi.groundingEnabled !== undefined) setGroundingEnabled(!!parsed.voiceAi.groundingEnabled);
+        if (parsed.voiceAi.silenceGate !== undefined) setSilenceGate(!!parsed.voiceAi.silenceGate);
       }
       if (parsed.projects) {
         if (parsed.projects.activeContext !== undefined) setActiveContext(parsed.projects.activeContext);
@@ -642,6 +648,30 @@ export function SettingsDialog({
                           Off by default. When on, Janus may search the web to inform its answers; grounded
                           turns show their sources in the transcript. Built-in Gemini tool — individual searches
                           are not separately approved. (applies on reconnect)
+                        </span>
+                      </span>
+                    </label>
+
+                    {/* tkd: should-I-speak (silence) gate toggle. OFF by default; EXPERIMENTAL. When on,
+                        Janus holds its voice while you think aloud/discuss and speaks when addressed; it errs
+                        toward speaking but may over-mute commands phrased as deliberation (bead q4l). */}
+                    <label className="flex items-start gap-2.5 p-3 bg-black/30 border border-white/10 rounded-lg cursor-pointer hover:border-white/20 transition-colors">
+                      <input
+                        type="checkbox"
+                        data-testid="settings-voice-silence-gate"
+                        checked={silenceGate}
+                        onChange={e => setSilenceGate(e.target.checked)}
+                        className="mt-0.5 accent-cyan-500 cursor-pointer"
+                      />
+                      <span className="min-w-0">
+                        <span className="text-zinc-300 font-bold block text-[11px]">
+                          Stay silent while I think{" "}
+                          <span className="text-amber-400/70 font-mono text-[9px] tracking-wider">EXPERIMENTAL</span>
+                        </span>
+                        <span className="text-[10px] text-zinc-500 leading-relaxed block">
+                          Off by default. When on, Janus holds its voice while you think aloud or discuss, and
+                          speaks when addressed. It errs toward speaking, but may over-mute commands phrased as
+                          deliberation. (applies on reconnect)
                         </span>
                       </span>
                     </label>
