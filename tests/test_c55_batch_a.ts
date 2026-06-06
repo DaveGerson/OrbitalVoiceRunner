@@ -238,23 +238,21 @@ describe("c55 Batch A — server.ts cutover guard (no double-registration)", () 
     "dismiss_attention",
     "create_orchestrator_plan",
   ];
-  // Isolate the mountRestRoutes(...) call so we assert membership in ITS `only` set specifically
-  // (not just anywhere in the 3k-line file).
+  // c55.16: the mountRestRoutes(...) `only:` allow-filter was RETIRED — the registry now auto-serves
+  // every rest-surface def. The cutover proof is no longer "the name is in the only-set text" but
+  // "the def is rest-mounted in the REGISTRY" (surfaces:rest && def.rest). Server.ts still calls
+  // mountRestRoutes (filterless); registry membership is the durable membership oracle.
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  // Slice from the call to the closing `});` of the only-set so membership is asserted against THIS
-  // call's allow-set, not anywhere in the 3k-line file. Bound generously (the set + its comments are
-  // well over a kilobyte) and clamp at the first `});` after the `only: new Set([` opener.
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock =
-    onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
   for (const name of onlyNames) {
-    it(`mountRestRoutes only-set includes "${name}"`, () => {
+    it(`mountRestRoutes auto-serves "${name}" (rest-surfaced in REGISTRY)`, () => {
       assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
       assert.ok(
-        new RegExp(`["']${name}["']`).test(mountBlock),
-        `mountRestRoutes only-set must include "${name}" after the Batch-A cutover`
+        mountedNames.has(name),
+        `"${name}" must be a rest-mounted REGISTRY def (surfaces:rest && def.rest) after the Batch-A cutover`
       );
     });
   }

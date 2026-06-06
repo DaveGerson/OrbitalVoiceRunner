@@ -309,14 +309,16 @@ describe("c55.16 — store:null (legacy backend) is guarded", () => {
 describe("c55.16 — server.ts cutover guard (no double-registration)", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  // c55.16: the `only:` allow-filter was RETIRED; registry auto-serves every rest-surface def.
+  // Cutover proof = registry membership (surfaces:rest && def.rest), not only-set text.
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
-  it('mountRestRoutes only-set includes "set_pane_gates"', () => {
+  it('mountRestRoutes auto-serves "set_pane_gates" (rest-surfaced in REGISTRY)', () => {
     assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
-    assert.ok(/["']set_pane_gates["']/.test(mountBlock), "only-set must include set_pane_gates after the cutover");
+    assert.ok(mountedNames.has("set_pane_gates"), "set_pane_gates must be a rest-mounted REGISTRY def after the cutover");
   });
 
   it("inline PUT /api/projects/:projectId/panes/:paneId/capability-gates is deleted (incl. commented form)", () => {

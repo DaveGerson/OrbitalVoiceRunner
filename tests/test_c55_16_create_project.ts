@@ -334,17 +334,18 @@ describe("c55.16 create_project — server.ts cutover guard (no double-registrat
   const here = path.dirname(fileURLToPath(import.meta.url));
   const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
 
+  // c55.16: the `only:` allow-filter was RETIRED; registry auto-serves every rest-surface def.
+  // Cutover proof = registry membership (surfaces:rest && def.rest), not only-set text.
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock =
-    onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
-  it('mountRestRoutes only-set includes "create_project"', () => {
+  it('mountRestRoutes auto-serves "create_project" (rest-surfaced in REGISTRY)', () => {
     assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
     assert.ok(
-      /["']create_project["']/.test(mountBlock),
-      'mountRestRoutes only-set must include "create_project" after the c55.16 cutover'
+      mountedNames.has("create_project"),
+      '"create_project" must be a rest-mounted REGISTRY def after the c55.16 cutover'
     );
   });
 

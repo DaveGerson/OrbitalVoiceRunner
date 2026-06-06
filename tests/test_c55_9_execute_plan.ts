@@ -425,14 +425,16 @@ import path from "node:path";
 describe("c55.9 (D) — server.ts cutover guard (no double-registration)", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  // c55.16: the `only:` allow-filter was RETIRED; registry auto-serves every rest-surface def.
+  // Cutover proof = registry membership (surfaces:rest && def.rest), not only-set text.
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
-  it('mountRestRoutes only-set includes "execute_plan"', () => {
+  it('mountRestRoutes auto-serves "execute_plan" (rest-surfaced in REGISTRY)', () => {
     assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
-    assert.ok(/["']execute_plan["']/.test(mountBlock), "only-set must include execute_plan after the c55.9 cutover");
+    assert.ok(mountedNames.has("execute_plan"), "execute_plan must be a rest-mounted REGISTRY def after the c55.9 cutover");
   });
 
   it("inline route is deleted: POST /api/plans/:id/execute", () => {
