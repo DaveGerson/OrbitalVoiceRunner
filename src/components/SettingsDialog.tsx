@@ -1203,7 +1203,7 @@ export function SettingsDialog({
                           type="number"
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={memorySynthTimeoutMs}
-                          onChange={e => setMemorySynthTimeoutMs(Number(e.target.value))}
+                          onChange={e => { const n = Number(e.target.value); setMemorySynthTimeoutMs(Number.isFinite(n) && n > 0 ? n : 150); }}
                           placeholder="150"
                         />
                         <p className="text-[9px] text-zinc-600 mt-0.5">Per-call race deadline before fallback (default 150 ms). Increase on high-latency hosts.</p>

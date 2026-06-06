@@ -7,6 +7,7 @@ on:
       - "python/**"
       - "scripts/**"
       - "src/memory/**"
+      - "tests/test_memory_*.ts"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/linux-verify.yml"
@@ -16,6 +17,7 @@ on:
       - "python/**"
       - "scripts/**"
       - "src/memory/**"
+      - "tests/test_memory_*.ts"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/linux-verify.yml"
@@ -60,3 +62,6 @@ jobs:
 
       - name: Real-daemon spawn smoke (memory-python seam round-trip)
         run: npx tsx --test tests/test_memory_python_seam.ts
+
+      - name: Memory live-verify harness (A1/A2/A3 automated checks)
+        run: npx tsx --test tests/test_memory_live_verify.ts

@@ -33,22 +33,22 @@ Wait until the console prints `Janus server listening on :3000` (or your configu
 Confirm the health endpoint shows the synthesizer state:
 
 ```
-curl http://localhost:3000/api/health
+curl -s http://localhost:3000/api/health | jq .output.memory.synthesizer
 ```
 
 Expected (python available):
 
 ```json
-{ "status": "ok", "memory": { "synthesizer": "python" }, ... }
+{ "output": { "memory": { "synthesizer": "python" }, "frozen": false, "panes": {}, "pending_approvals": 0, "recent": {} } }
 ```
 
 Expected (python absent / fallback):
 
 ```json
-{ "status": "ok", "memory": { "synthesizer": "fallback" }, ... }
+{ "output": { "memory": { "synthesizer": "fallback" }, "frozen": false, "panes": {}, "pending_approvals": 0, "recent": {} } }
 ```
 
-**Pass criterion:** the `memory.synthesizer` field is present. Note its current value.
+**Pass criterion:** `output.memory.synthesizer` is present. Note its current value (`"python"` or `"fallback"`).
 
 ---
 
@@ -93,22 +93,29 @@ injected after the switch.
 ## Step 5 — verify the health endpoint again
 
 ```
-curl http://localhost:3000/api/health
+curl -s http://localhost:3000/api/health | jq .output.memory.synthesizer
 ```
 
-If the Python daemon is running, `memory.synthesizer` must still be `"python"`.
+If the Python daemon is running, the value must still be `"python"`.
 
-**Pass criterion 3:** `memory.synthesizer` matches the value observed in Step 1.
+**Pass criterion 3:** `output.memory.synthesizer` matches the value observed in Step 1.
 
 ---
 
 ## Step 6 — test the silent fallback path
 
+> **Note:** `memoryPythonEnabled` and `memorySynthTimeoutMs` are **boot-time settings**. The Python
+> synthesizer client is constructed once at server start and is not torn down by a live Settings
+> change. You must restart the server after saving the toggle for the health endpoint to reflect the
+> new value.
+
 1. Open **Settings** in the Janus UI (gear icon or `/settings`).
 2. Locate **Memory** > **Python synthesizer** (toggle labeled `memoryPythonEnabled` or similar).
 3. **Disable** it and save.
-4. Switch the active pane back to **Pane A**.
-5. Wait 1-2 seconds.
+4. **Stop the server** (Ctrl+C in the terminal running `npm start`).
+5. **Restart the server:** `npm start` — wait for `Janus server listening on :3000`.
+6. Switch the active pane back to **Pane A**.
+7. Wait 1-2 seconds.
 
 **Pass criterion 4:** a memory note still appears for Pane A — the in-process fallback synthesizer
 is producing briefs silently. No error toast, no missing note.
@@ -116,10 +123,10 @@ is producing briefs silently. No error toast, no missing note.
 Re-check health:
 
 ```
-curl http://localhost:3000/api/health
+curl -s http://localhost:3000/api/health | jq .output.memory.synthesizer
 ```
 
-**Pass criterion 5:** `memory.synthesizer` is now `"fallback"`.
+**Pass criterion 5:** `output.memory.synthesizer` is now `"fallback"`.
 
 ---
 
@@ -127,13 +134,13 @@ curl http://localhost:3000/api/health
 
 | # | Criterion | Pass | Fail |
 |---|-----------|------|------|
-| 1 | `/api/health` shows `memory.synthesizer` field on start | | |
+| 1 | `/api/health` shows `output.memory.synthesizer` field on start | | |
 | 2 | Memory note appears for Pane A after first voice interaction | | |
 | 3 | Switching to Pane B produces a fresh note for Pane B | | |
 | 4 | No stale Pane A note reinjected after pane switch | | |
-| 5 | `memory.synthesizer` still `"python"` after pane switch (when Python available) | | |
-| 6 | Note still appears for Pane A after disabling `memoryPythonEnabled` (fallback) | | |
-| 7 | `memory.synthesizer` is `"fallback"` after disabling Python synthesizer | | |
+| 5 | `output.memory.synthesizer` still `"python"` after pane switch (when Python available) | | |
+| 6 | Note still appears for Pane A after server restart with `memoryPythonEnabled` disabled (fallback) | | |
+| 7 | `output.memory.synthesizer` is `"fallback"` after server restart with Python synthesizer disabled | | |
 
 All seven criteria must be marked **Pass** to declare P0b verified in a live session.
 
@@ -141,8 +148,9 @@ All seven criteria must be marked **Pass** to declare P0b verified in a live ses
 
 ## Notes
 
-- If the Python daemon is not on PATH, criteria 1/2/3/5 switch to the fallback variants — that is
-  still a valid verification of the fallback path, but Python synthesis itself remains unverified.
+- If the Python daemon is not on PATH, criteria 1/2/3/5 switch to the fallback variants (verify
+  `output.memory.synthesizer === "fallback"` instead of `"python"`) — that is still a valid
+  verification of the fallback path, but Python synthesis itself remains unverified.
 - The automated harness (`test_memory_live_verify.ts`) covers A1 (real daemon round-trip), A2
   (latest-wins predicate), and A3 (silent fallback) without a mic or live session. This runbook
   covers only the residual human observation step.
