@@ -228,6 +228,10 @@ const DEFAULT_MOCK_GATES: CapabilityGateMap = {
   switch_context: "Auto",
   set_voice_mute: "Auto",
   dismiss_attention: "Auto",
+  // c55.10: rest-only writes tightened to Ask (parity with the matrix).
+  send_keys: "Ask",
+  remove_watch_rule: "Ask",
+  delete_orchestrator_plan: "Ask",
 };
 
 /**

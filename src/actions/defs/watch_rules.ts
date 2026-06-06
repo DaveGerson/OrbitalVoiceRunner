@@ -14,17 +14,21 @@
  *   - remove_watch_rule        DELETE /api/watch-rules/:id     (server.ts ~944)
  *   - delete_orchestrator_plan DELETE /api/plans/:id           (server.ts ~1001)
  *
- * GATING / SAFE DEFAULTS (Decision 3 + the c55 safe-default policy — preserve current behavior):
+ * GATING (Decision 3 + the c55.10 gate-tightening of the cutover ALWAYS_ALLOWED defs per the P2 taxonomy):
  *   - list_watch_rules: a READ. ALWAYS_ALLOWED, readOnly:false — the inline route returned the RAW,
  *     UN-redacted array; the registry's readOnly-redaction would scrub string leaves and also requires a
  *     read_* capability (§8.1), so we keep it ungated/unredacted to stay byte-identical to the legacy body.
- *   - add_watch_rule: the inline route was UNGATED — creation was instant. The `add_watch_rule` capability
- *     LABEL exists in the matrix (default Ask) but is RESERVED for a future voice tool (Decision 8). To
- *     PRESERVE the current instant behavior we register ALWAYS_ALLOWED (recorded in appliedDefaults: the
- *     matrix could later tighten this to Ask + expose a voice yes/no — DEFERRED for ratification).
- *   - remove_watch_rule: NO capability exists -> ALWAYS_ALLOWED to preserve the ungated behavior (a
- *     dedicated gate row + voice exposure are DEFERRED).
- *   - delete_orchestrator_plan: NO twin/capability -> ALWAYS_ALLOWED, rest-only (gate row + voice DEFERRED).
+ *   - add_watch_rule: GATED (add_watch_rule, default Ask) via ctx.gateOrDefer — c55.10 UN-RESERVES the
+ *     EXISTING matrix row (it was reserved for a future voice tool, Decision 8) and wires this def to it.
+ *     Creating an autonomous rule that fires a command on a pane transition is a safety-config/automation
+ *     change. No new cap id (reuses the existing row). Off->blocked->403, Ask->pending->202, Auto->200.
+ *   - remove_watch_rule: GATED (remove_watch_rule, NEW row, default Ask) — the mirror safety-config change
+ *     to add_watch_rule (symmetry). Unknown id -> 200 ok narration resolved BEFORE the gate.
+ *   - delete_orchestrator_plan: GATED (delete_orchestrator_plan, NEW row, default Ask) — destructive
+ *     (permanently removes a plan; mirrors c55.14's gating of delete_pane/delete_project). Unknown id ->
+ *     200 ok narration resolved BEFORE the gate.
+ *   All three gated defs stay rest-only (surfaces:{rest}); a voice yes/no twin remains DEFERRED. Durable
+ *   cross-restart Ask-replay is out of scope (no buildActionRun case) — in-process Ask->confirm is correct.
  *
  * STATUS-CODE DELTAS (Decision 2 — the client ignores the body / does not status-branch on these):
  *   - inline 404 "Rule not found." (remove_watch_rule) -> 200 ok-narration.
@@ -77,7 +81,7 @@ export const listWatchRules: ActionDef<typeof ListWatchRulesParams> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// add_watch_rule — POST /api/watch-rules (ALWAYS_ALLOWED; was ungated/instant).
+// add_watch_rule — POST /api/watch-rules (GATED add_watch_rule, default Ask — c55.10; was ungated).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -96,39 +100,59 @@ const AddWatchRuleParams = z.object({
 /**
  * add_watch_rule — FAITHFUL PORT of inline app.post("/api/watch-rules") (server.ts ~923): build a new
  * rule (generated id, enabled:true, oneShot defaulting to true when omitted), push it onto the ledger,
- * force-persist, and broadcast watch_rules_updated with the CURRENT list. SAFE DEFAULT ALWAYS_ALLOWED
- * (was ungated — creation stays instant; the add_watch_rule matrix row stays reserved). The inline
- * presence-check 400 is replaced by the zod-required fields (a missing field -> 500). The {created.id …}
- * detail rides in the ok output; the client only needs res.ok and repaints off the WS frame.
+ * force-persist, and broadcast watch_rules_updated with the CURRENT list — now ROUTED THROUGH
+ * ctx.gateOrDefer("add_watch_rule", ...). c55.10 UN-RESERVES the EXISTING `add_watch_rule` matrix row
+ * (default Ask): creating an autonomous rule is a safety-config/automation change. The side effects are
+ * wrapped in ONE synchronous effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+ * The gate is keyed on the trigger terminal id (the rule's natural scope). The inline presence-check 400
+ * is replaced by the zod-required fields (a missing field -> 500). Off->blocked->403, Ask->pending->202,
+ * Auto->run-now->200.
  */
 export const addWatchRule: ActionDef<typeof AddWatchRuleParams> = {
   name: "add_watch_rule",
-  description: "Create a watch-automation rule that fires a command on another pane when a trigger pane transitions. REST/UI surface only.",
+  description: "Create a watch-automation rule that fires a command on another pane when a trigger pane transitions. GATED (add_watch_rule, default Ask). REST/UI surface only.",
   params: AddWatchRuleParams,
-  capability: "ALWAYS_ALLOWED",
+  capability: "add_watch_rule",
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/watch-rules" },
   handler: (args, ctx): ActionResult => {
-    const newRule: WatchRule = {
-      id: "rule_" + Math.random().toString(36).substring(2, 11),
-      triggerTerminalId: args.triggerTerminalId,
-      triggerTransition: args.triggerTransition,
-      actionTerminalId: args.actionTerminalId,
-      actionCommand: args.actionCommand,
-      enabled: true,
-      // Inline: `oneShot !== undefined ? oneShot : true` — an omitted oneShot defaults to true.
-      oneShot: args.oneShot !== undefined ? args.oneShot : true,
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    const addEffect = (): string => {
+      const newRule: WatchRule = {
+        id: "rule_" + Math.random().toString(36).substring(2, 11),
+        triggerTerminalId: args.triggerTerminalId,
+        triggerTransition: args.triggerTransition,
+        actionTerminalId: args.actionTerminalId,
+        actionCommand: args.actionCommand,
+        enabled: true,
+        // Inline: `oneShot !== undefined ? oneShot : true` — an omitted oneShot defaults to true.
+        oneShot: args.oneShot !== undefined ? args.oneShot : true,
+      };
+      ctx.manager.ledger.watchRules.push(newRule);
+      ctx.manager.ledger["save"](true);
+      ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
+      return `Watch rule ${newRule.id} created.`;
     };
-    ctx.manager.ledger.watchRules.push(newRule);
-    ctx.manager.ledger["save"](true);
-    ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
-    return { kind: "ok", output: `Watch rule ${newRule.id} created.` };
+    const g = ctx.gateOrDefer(
+      "add_watch_rule",
+      args.triggerTerminalId,
+      `Add watch rule on pane ${args.triggerTerminalId}`,
+      addEffect,
+      { ...(ctx.versionStamp ?? {}), origin: "rest", paneId: args.triggerTerminalId }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'add_watch_rule' capability is gated Off; creating automation rules is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    return { kind: "ok", output: addEffect() };
   },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// remove_watch_rule — DELETE /api/watch-rules/:id (ALWAYS_ALLOWED; was ungated).
+// remove_watch_rule — DELETE /api/watch-rules/:id (GATED remove_watch_rule, default Ask — c55.10).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RemoveWatchRuleParams = z.object({
@@ -137,34 +161,57 @@ const RemoveWatchRuleParams = z.object({
 
 /**
  * remove_watch_rule — FAITHFUL PORT of inline app.delete("/api/watch-rules/:id") (server.ts ~944): find
- * the rule by id, splice it, force-persist, broadcast watch_rules_updated. Unknown id -> ok narration
- * (inline 404 -> 200, Decision 2): NO mutation, NO persist, NO broadcast (a stale client deleting an
- * already-gone rule must not error or spuriously repaint). SAFE DEFAULT ALWAYS_ALLOWED (no capability
- * exists; a dedicated gate row + voice exposure are DEFERRED for ratification).
+ * the rule by id, splice it, force-persist, broadcast watch_rules_updated — now ROUTED THROUGH
+ * ctx.gateOrDefer("remove_watch_rule", ...). c55.10 adds a NEW matrix row (default Ask): the mirror
+ * safety-config change to add_watch_rule. Unknown id -> ok narration resolved BEFORE the gate (inline 404
+ * -> 200, Decision 2): NO mutation, NO persist, NO broadcast, gate NOT consulted (a stale client deleting
+ * an already-gone rule must not error, spuriously repaint, OR stage/forbid a no-op). The side effects are
+ * wrapped in ONE synchronous effect closure. Off->blocked->403, Ask->pending->202, Auto->run-now->200.
  */
 export const removeWatchRule: ActionDef<typeof RemoveWatchRuleParams> = {
   name: "remove_watch_rule",
-  description: "Delete a watch-automation rule by its id. REST/UI surface only.",
+  description: "Delete a watch-automation rule by its id. GATED (remove_watch_rule, default Ask). REST/UI surface only.",
   params: RemoveWatchRuleParams,
-  capability: "ALWAYS_ALLOWED",
+  capability: "remove_watch_rule",
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "delete", path: "/api/watch-rules/:id" },
   handler: (args, ctx): ActionResult => {
     const idx = ctx.manager.ledger.watchRules.findIndex((r) => r.id === args.id);
     if (idx === -1) {
-      // Inline 404 -> 200 ok narration (Decision 2). No persist / no repaint when nothing changed.
+      // Inline 404 -> 200 ok narration (Decision 2), resolved BEFORE the gate. No persist / no repaint /
+      // no stage/forbid when nothing changed.
       return { kind: "ok", output: `Watch rule ${args.id} not found.` };
     }
-    ctx.manager.ledger.watchRules.splice(idx, 1);
-    ctx.manager.ledger["save"](true);
-    ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
-    return { kind: "ok", output: `Watch rule ${args.id} removed.` };
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    const removeEffect = (): string => {
+      const i = ctx.manager.ledger.watchRules.findIndex((r) => r.id === args.id);
+      if (i !== -1) {
+        ctx.manager.ledger.watchRules.splice(i, 1);
+        ctx.manager.ledger["save"](true);
+        ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
+      }
+      return `Watch rule ${args.id} removed.`;
+    };
+    const g = ctx.gateOrDefer(
+      "remove_watch_rule",
+      null,
+      `Remove watch rule ${args.id}`,
+      removeEffect,
+      { ...(ctx.versionStamp ?? {}), origin: "rest" }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'remove_watch_rule' capability is gated Off; removing automation rules is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    return { kind: "ok", output: removeEffect() };
   },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// delete_orchestrator_plan — DELETE /api/plans/:plan_id (ALWAYS_ALLOWED; was ungated, no twin).
+// delete_orchestrator_plan — DELETE /api/plans/:plan_id (GATED delete_orchestrator_plan, Ask — c55.10).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Route param is snake_case (:plan_id) so Express injects it directly onto the snake_case zod key. */
@@ -174,29 +221,53 @@ const DeleteOrchestratorPlanParams = z.object({
 
 /**
  * delete_orchestrator_plan — FAITHFUL PORT of inline app.delete("/api/plans/:id") (server.ts ~1001):
- * find the plan by id, splice it off the board, force-persist, broadcast plans_updated. Unknown id ->
- * ok narration (inline 404 -> 200, Decision 2): NO mutation, NO persist, NO broadcast. SAFE DEFAULT
- * ALWAYS_ALLOWED, rest-only — no twin/capability exists today; a gate row + a voice yes/no are DEFERRED
- * for ratification. The rest.path uses :plan_id (snake_case) so it lands directly on the zod key.
+ * find the plan by id, splice it off the board, force-persist, broadcast plans_updated — now ROUTED
+ * THROUGH ctx.gateOrDefer("delete_orchestrator_plan", ...). c55.10 adds a NEW matrix row (default Ask):
+ * permanently removing a plan is DESTRUCTIVE (mirrors c55.14's gating of delete_pane/delete_project).
+ * Unknown id -> ok narration resolved BEFORE the gate (inline 404 -> 200, Decision 2): NO mutation, NO
+ * persist, NO broadcast, gate NOT consulted. The side effects are wrapped in ONE synchronous effect
+ * closure. The rest.path uses :plan_id (snake_case) so it lands directly on the zod key.
+ * Off->blocked->403, Ask->pending->202, Auto->run-now->200.
  */
 export const deleteOrchestratorPlan: ActionDef<typeof DeleteOrchestratorPlanParams> = {
   name: "delete_orchestrator_plan",
-  description: "Delete a multi-step orchestrator plan by its id, removing it from the plan board. REST/UI surface only.",
+  description: "Delete a multi-step orchestrator plan by its id, removing it from the plan board. GATED (delete_orchestrator_plan, default Ask). REST/UI surface only.",
   params: DeleteOrchestratorPlanParams,
-  capability: "ALWAYS_ALLOWED",
+  capability: "delete_orchestrator_plan",
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "delete", path: "/api/plans/:plan_id" },
   handler: (args, ctx): ActionResult => {
     const idx = ctx.manager.ledger.plans.findIndex((p) => p.id === args.plan_id);
     if (idx === -1) {
-      // Inline 404 -> 200 ok narration (Decision 2). No persist / no repaint when nothing changed.
+      // Inline 404 -> 200 ok narration (Decision 2), resolved BEFORE the gate. No persist / no repaint /
+      // no stage/forbid when nothing changed.
       return { kind: "ok", output: `Plan ${args.plan_id} not found.` };
     }
-    ctx.manager.ledger.plans.splice(idx, 1);
-    ctx.manager.ledger["save"](true);
-    ctx.broadcast({ type: "plans_updated", plans: ctx.manager.ledger.plans });
-    return { kind: "ok", output: `Plan ${args.plan_id} deleted.` };
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    const deleteEffect = (): string => {
+      const i = ctx.manager.ledger.plans.findIndex((p) => p.id === args.plan_id);
+      if (i !== -1) {
+        ctx.manager.ledger.plans.splice(i, 1);
+        ctx.manager.ledger["save"](true);
+        ctx.broadcast({ type: "plans_updated", plans: ctx.manager.ledger.plans });
+      }
+      return `Plan ${args.plan_id} deleted.`;
+    };
+    const g = ctx.gateOrDefer(
+      "delete_orchestrator_plan",
+      null,
+      `Delete plan ${args.plan_id}`,
+      deleteEffect,
+      { ...(ctx.versionStamp ?? {}), origin: "rest" }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'delete_orchestrator_plan' capability is gated Off; deleting plans is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    return { kind: "ok", output: deleteEffect() };
   },
 };
 

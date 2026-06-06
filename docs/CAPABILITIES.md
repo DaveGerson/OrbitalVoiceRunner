@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**78** actions across **20** gated capabilities, plus the always-allowed group.
+**78** actions across **24** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -17,7 +17,6 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `add_pane_context` | rest | no | Operator-UI |
-| `add_watch_rule` | rest | no | Create a watch-automation rule that fires a command on another pane when a trigger pane transitions |
 | `approve_pending_command` | rest | no | Approve or reject a pending spoken-command approval by messageId (approved=true approves, false rejects) |
 | `cancel_pending_action` | rest | no | Cancel (discard, no side effect) a pending NON-PTY deferred action by id |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
@@ -27,7 +26,6 @@ These bypass the capability gate entirely — they work even while the system is
 | `create_pane_note` | rest | no | Operator-UI |
 | `create_project_note` | rest | no | Operator-UI |
 | `delete_archived_pane` | rest | no | Permanently delete an archived pane record from the restore tray (operator-UI, ungated) |
-| `delete_orchestrator_plan` | rest | no | Delete a multi-step orchestrator plan by its id, removing it from the plan board |
 | `deliver_handoff` | voice | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 | `edit_note` | rest | no | Operator-UI |
 | `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
@@ -42,13 +40,21 @@ These bypass the capability gate entirely — they work even while the system is
 | `read_project_notes` | rest | no | Operator-UI |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
 | `remove_note` | rest | no | Operator-UI |
-| `remove_watch_rule` | rest | no | Delete a watch-automation rule by its id |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
 | `restore_archived_pane` | rest | no | Restore an archived pane back into its project (operator-UI, ungated) |
-| `send_keys` | rest | no | Write a command directly to a terminal pane's input |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 | `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
 | `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
+
+## Add an automation rule
+
+- **Capability:** `add_watch_rule`
+- **Default gate:** Ask
+- **Category:** Spawning work
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `add_watch_rule` | rest | no | Create a watch-automation rule that fires a command on another pane when a trigger pane transitions |
 
 ## Apply a workspace recipe
 
@@ -104,6 +110,16 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `create_project` | voice / rest | no | Create a new project workspace directory context block |
+
+## Delete an orchestrator plan
+
+- **Capability:** `delete_orchestrator_plan`
+- **Default gate:** Ask
+- **Category:** Destructive
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `delete_orchestrator_plan` | rest | no | Delete a multi-step orchestrator plan by its id, removing it from the plan board |
 
 ## Delete a pane permanently
 
@@ -189,6 +205,16 @@ These bypass the capability gate entirely — they work even while the system is
 | `get_terminal_history` | rest | yes | Return the RAW recorded command history array for one pane (full command + timestamp + output + finalResponse per entry) for the UI history panel |
 | `list_panes` | voice / rest | yes | List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing |
 
+## Remove an automation rule
+
+- **Capability:** `remove_watch_rule`
+- **Default gate:** Ask
+- **Category:** Spawning work
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `remove_watch_rule` | rest | no | Delete a watch-automation rule by its id |
+
 ## Restart a pane
 
 - **Capability:** `restart_pane`
@@ -198,6 +224,16 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `respawn_pane` | rest | no | Respawn a terminal pane (stop its process and start it again) |
+
+## Send keystrokes to a pane
+
+- **Capability:** `send_keys`
+- **Default gate:** Ask
+- **Category:** Acting in a pane
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `send_keys` | rest | no | Write a command directly to a terminal pane's input |
 
 ## Change these safety gates
 
@@ -281,7 +317,6 @@ These capability rows exist in the matrix (so they are tunable and reserved) but
 
 | Capability | Label | Default gate | Category |
 | --- | --- | --- | --- |
-| `add_watch_rule` | Add an automation rule | Ask | Spawning work |
 | `archive_pane` | Archive an exited pane | Auto | Orientation (low-risk) |
 | `clear_history` | Clear a pane's history | Ask | Destructive |
 | `deliver_handoff` | Hand a prompt to another pane | Ask | Acting in a pane |

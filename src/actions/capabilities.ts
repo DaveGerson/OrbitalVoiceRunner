@@ -25,12 +25,14 @@ const CATEGORY: Record<string, string> = {
   // Acting in a pane
   write_to_pane: "Acting in a pane",
   deliver_handoff: "Acting in a pane",
+  send_keys: "Acting in a pane", // c55.10 (Ask) — raw-PTY keystroke write, twin of write_to_pane
   // Destructive
   close_pane: "Destructive",
   delete_pane: "Destructive",
   delete_project: "Destructive",
   restart_pane: "Destructive",
   clear_history: "Destructive", // NEW (Ask) — destructive, joins this group
+  delete_orchestrator_plan: "Destructive", // c55.10 (Ask) — permanently deletes a plan
   // Changing the locks
   set_pane_permissions: "Changing the locks",
   set_global_permissions: "Changing the locks",
@@ -40,6 +42,7 @@ const CATEGORY: Record<string, string> = {
   execute_plan: "Spawning work",
   apply_recipe: "Spawning work",
   add_watch_rule: "Spawning work",
+  remove_watch_rule: "Spawning work", // c55.10 (Ask) — mirror safety-config change to add_watch_rule
   // Orientation (low-risk)
   create_project: "Orientation (low-risk)",
   update_metadata: "Orientation (low-risk)",
@@ -90,6 +93,13 @@ export const CAPABILITY_DEFS: readonly CapabilityDef[] = [
   { id: "switch_context", label: CAPABILITY_LABELS.switch_context, category: CATEGORY.switch_context, defaultGate: "Auto" },
   { id: "set_voice_mute", label: CAPABILITY_LABELS.set_voice_mute, category: CATEGORY.set_voice_mute, defaultGate: "Auto" },
   { id: "dismiss_attention", label: CAPABILITY_LABELS.dismiss_attention, category: CATEGORY.dismiss_attention, defaultGate: "Auto" },
+
+  // ── c55.10: rest-only writes tightened ALWAYS_ALLOWED → Ask (gate-tightening only; strictly more
+  //    restrictive). send_keys is the raw-PTY keystroke twin of write_to_pane; remove_watch_rule mirrors
+  //    add_watch_rule; delete_orchestrator_plan is a destructive plan delete. ──
+  { id: "send_keys", label: CAPABILITY_LABELS.send_keys, category: CATEGORY.send_keys, defaultGate: "Ask" },
+  { id: "remove_watch_rule", label: CAPABILITY_LABELS.remove_watch_rule, category: CATEGORY.remove_watch_rule, defaultGate: "Ask" },
+  { id: "delete_orchestrator_plan", label: CAPABILITY_LABELS.delete_orchestrator_plan, category: CATEGORY.delete_orchestrator_plan, defaultGate: "Ask" },
 ] as const;
 
 /** Fast id -> CapabilityDef lookup over the table. */
