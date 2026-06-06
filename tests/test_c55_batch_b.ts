@@ -392,19 +392,18 @@ describe("c55 Batch B — route-param flow through mountRestRoutes (snake_case s
 
 });
 
-// ── (3) REST-STUB BLOCKER — pins WHY execute_plan is held inline this batch ──────────────────────────
-// execute_plan's handler routes step 1 through ctx.dispatchProposal. buildRestActionContext injects a
-// REFUSING STUB for dispatchProposal on the REST surface (pane-write is connection-scoped — see
-// voice/index.ts:21-22). Drive execute_plan through the SAME refusing stub and assert the route does
-// NOT actually dispatch the pane write: the handler narrates the pane-write-unavailable error and
-// never runs the step. This is the regression that would break the UI "Run plan" button if we
-// converged the route — it justifies holding execute_plan inline until a REST-capable pane-write path
-// is authored (an architectural decision, surfaced for ratification).
-describe("c55 Batch B — execute_plan held: the REST dispatchProposal stub refuses the pane write", () => {
-  // The EXACT stub buildRestActionContext (server.ts) injects for the REST surface.
+// ── (3) execute_plan error-dispatch narration (HISTORICAL: this WAS the Batch-B "held" blocker) ───────
+// In Batch B, buildRestActionContext injected a REFUSING STUB for dispatchProposal on the REST surface,
+// and this test pinned that the handler faithfully NARRATES whatever error the dispatch returns (it does
+// not crash / silently swallow). c55.9 REPLACED that stub with a gated pane-write seam, so the refusal
+// string no longer occurs in production — but the handler's error-branch contract (narrate the dispatch
+// error text + still attempt the dispatch exactly once) is UNCHANGED and is what this test pins. Driven
+// with a synthetic error-returning dispatch (no server boot), so it is independent of the stub removal.
+describe("c55 Batch B — execute_plan narrates a dispatch error (historical REST-stub blocker contract)", () => {
+  // The literal Batch-B refusal string — now used only as a synthetic error payload to drive the branch.
   const REST_DISPATCH_REFUSAL = "pane-write is not available on the REST surface";
 
-  it("execute_plan via the REST refusing-stub dispatchProposal narrates the refusal, never dispatches", async () => {
+  it("execute_plan with an error-returning dispatch narrates the error, still attempts dispatch once", async () => {
     const { ctx, probe } = makeCtx({
       plans: [
         {
@@ -451,14 +450,16 @@ describe("c55 Batch B — registry rest bindings (snake_case route params)", () 
     });
   }
 
-  // execute_plan is HELD: its rest.path keeps the LEGACY camelCase `:id` segment (NOT rewritten),
-  // because the route stays inline this batch. Pin that so a future batch that converges it must
-  // ALSO flip this expectation deliberately (and author the snake_case path + a REST-capable
-  // dispatchProposal at the same time).
-  it("execute_plan rest binding is UNCHANGED (held inline; legacy :id segment)", () => {
+  // c55.9: execute_plan KEEPS the legacy `:id` segment (the inline route used it; the def is now the
+  // sole server of that path, so no rename was needed). c55.9 ADDED a rest.toHttp for the §6 status map
+  // (executed 200 / pending 202 / blocked 403 / pane-offline 400 / plan-not-found 404 / clarify 409),
+  // so the binding now carries method + path + toHttp.
+  it("execute_plan rest binding keeps :id and now declares toHttp (converged in c55.9)", () => {
     const def = REGISTRY.find((d) => d.name === "execute_plan");
     assert.ok(def, "registry must contain execute_plan");
-    assert.deepStrictEqual(def!.rest, { method: "post", path: "/api/plans/:id/execute" });
+    assert.strictEqual(def!.rest!.method, "post");
+    assert.strictEqual(def!.rest!.path, "/api/plans/:id/execute");
+    assert.strictEqual(typeof def!.rest!.toHttp, "function", "c55.9 added the §6 toHttp status map");
   });
 });
 
@@ -486,13 +487,15 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
     });
   }
 
-  // execute_plan must NOT be in the only-set (held inline). If a future batch adds it, this test must
-  // be flipped deliberately together with the REST-capable pane-write fix.
-  it("mountRestRoutes only-set does NOT include execute_plan (held inline this batch)", () => {
+  // c55.9 FLIP: execute_plan was HELD out of the only-set in Batch B (the REST dispatchProposal was a
+  // refusing stub). c55.9 authored the REST-capable gated pane-write seam (restDispatchProposal ->
+  // applyDispatchDecision), so execute_plan is NOW converged INTO the only-set. (The full c55.9 cutover
+  // guard — only-set membership + inline-route deletion + stub removal — lives in test_c55_9_execute_plan.ts.)
+  it("mountRestRoutes only-set INCLUDES execute_plan (converged in c55.9)", () => {
     assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
     assert.ok(
-      !/["']execute_plan["']/.test(mountBlock),
-      "execute_plan must stay OUT of the only-set until the REST dispatchProposal stub is replaced"
+      /["']execute_plan["']/.test(mountBlock),
+      "execute_plan must be IN the only-set after the c55.9 REST pane-write convergence"
     );
   });
 
@@ -520,11 +523,13 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
     });
   }
 
-  // execute_plan's inline route is HELD (preserved) this batch — assert it is STILL present.
-  it("inline route is PRESERVED (held): POST /api/plans/:id/execute (execute_plan)", () => {
+  // c55.9 FLIP: execute_plan's inline route was HELD (preserved) in Batch B; c55.9 DELETED it (the def
+  // now serves POST /api/plans/:id/execute via its rest binding + rest.toHttp). Assert it is GONE
+  // (a stale inline twin would mask the cutover — Express keeps the first-registered handler).
+  it("inline route is DELETED (converged in c55.9): POST /api/plans/:id/execute (execute_plan)", () => {
     assert.ok(
-      /app\.post\(\s*["']\/api\/plans\/:id\/execute["']/.test(serverSrc),
-      "execute_plan inline route must remain inline until a REST-capable dispatchProposal is authored"
+      !/app\.post\(\s*["']\/api\/plans\/:id\/execute["']/.test(serverSrc),
+      "execute_plan inline route must be deleted after the c55.9 REST pane-write convergence"
     );
   });
 
