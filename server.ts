@@ -114,9 +114,31 @@ export function getLiveConnector(): LiveConnector {
 // reconnect closure here (via attachVoiceSession's registerReconnectNudge dep); the settings handler
 // invokes it. Module-scoped (one active operator connection at a time, same model as activeFrontendWs).
 let voiceReconnectNudge: (() => void) | null = null;
-/** Register/clear the live voice session's reconnect closure (called by attachVoiceSession). */
-export function setVoiceReconnectNudge(fn: (() => void) | null) {
+// bead 53q: the registry is single-slot but two voice WS connections can briefly overlap (the new one
+// connects before the old one's close fires). Without an owner token, the LATER connection's close
+// (which calls setVoiceReconnectNudge(null)) would clear the SURVIVING connection's nudge. We tag the
+// nudge with its owner; a clear only takes effect when the caller IS the current owner, so a stale/
+// foreign connection's close can never poke the live one's nudge. YAGNI: still one active slot — this
+// is just defensive identity, NOT multi-session fan-out.
+let voiceReconnectNudgeOwner: unknown = null;
+/**
+ * Register/clear the live voice session's reconnect closure (called by attachVoiceSession).
+ * Registering a non-null fn takes ownership. Clearing (fn === null) only takes effect when `owner`
+ * matches the CURRENT owner — a stale connection clearing its own nudge after a newer one registered
+ * is a no-op. `owner` is optional for back-compat (single-connection test seams pass none, which still
+ * register/clear the same undefined-owned slot).
+ */
+export function setVoiceReconnectNudge(fn: (() => void) | null, owner?: unknown) {
+  if (fn === null) {
+    // Identity-guarded clear: only the current owner may clear the active nudge.
+    if (owner === voiceReconnectNudgeOwner) {
+      voiceReconnectNudge = null;
+      voiceReconnectNudgeOwner = null;
+    }
+    return;
+  }
   voiceReconnectNudge = fn;
+  voiceReconnectNudgeOwner = owner;
 }
 /** Nudge the live voice session to (re)connect, if one is wired. Never throws. */
 export function requestVoiceReconnect() {

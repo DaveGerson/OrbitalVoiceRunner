@@ -73,6 +73,21 @@ export function pushApprovalNarration(session: any, text: string): void {
   }
 }
 
+/** A PaneSignal queued on the phase-2 "ready" defer path, tagged with the wall-clock time it was
+ *  deferred so the drain can age it out (READY_DEFER_MAX_MS). The tag lives on a CLONE, never the
+ *  shared bus payload — see stampDeferred. */
+export type DeferredPaneSignal = PaneSignal & { __deferredAt: number };
+
+/**
+ * bead ykr: the PaneSignalBus hands the SAME PaneSignal object reference to every observer. Stamping
+ * the defer timestamp in-place would mutate the shared payload that every other observer (and the bus
+ * caller) holds. Clone first, then stamp — the queue gets its own tagged copy, the shared signal is
+ * left untouched. Pure (exported for unit coverage).
+ */
+export function stampDeferred(sig: PaneSignal, now: number): DeferredPaneSignal {
+  return { ...sig, __deferredAt: now };
+}
+
 /**
  * B1 (async spawn): a lighter sibling of pushApprovalNarration for the two-phase spawn acks. No
  * "SYSTEM EVENT" framing — these are natural-cadence confirmations ("Opening the pane now.") the
@@ -143,8 +158,10 @@ export interface VoiceDeps {
   getCookie: (cookieHeader: string | undefined, name: string) => string | null;
   /** bead 9fz: register THIS connection's reconnect-nudge closure with server module scope so the
    *  settings PUT (which sets a real Gemini key) can ask the live session to (re)connect. Optional so
-   *  existing test harnesses that build deps inline need not supply it. */
-  registerReconnectNudge?: (fn: (() => void) | null) => void;
+   *  existing test harnesses that build deps inline need not supply it.
+   *  bead 53q: pass an `owner` token (this connection's state object) on BOTH register and clear so a
+   *  stale/foreign connection's close cannot clear the SURVIVING connection's nudge (identity guard). */
+  registerReconnectNudge?: (fn: (() => void) | null, owner?: unknown) => void;
 }
 
 /**
@@ -174,7 +191,7 @@ interface VoiceSessionState {
   // B1 (phase-2 defer): a "ready" pane signal arriving mid-utterance is QUEUED here and re-tried at
   // the next safe gap (armReadyDrain) instead of speaking over the operator. The drain timer is
   // unref'd (force-exit hygiene) and cleared on socket close.
-  deferredReady: PaneSignal[];
+  deferredReady: DeferredPaneSignal[];
   readyDrainTimer: ReturnType<typeof setTimeout> | null;
   reconnectAttempts: number;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
@@ -1070,9 +1087,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         state.readyDrainTimer = setTimeout(() => {
           state.readyDrainTimer = null;
           const now = Date.now();
-          const still: PaneSignal[] = [];
+          const still: DeferredPaneSignal[] = [];
           for (const sig of state.deferredReady) {
-            const age = now - ((sig as any).__deferredAt ?? now);
+            const age = now - (sig.__deferredAt ?? now);
             if (age > READY_DEFER_MAX_MS) continue; // stale -> drop (UI already reflects the pane).
             const d = shouldSpeakReadyAck(ackState());
             if (d === "speak") { pushSignal(sig); }
@@ -1094,8 +1111,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           const d = shouldSpeakReadyAck(ackState());
           if (d === "suppress") return;                       // barge-in -> drop the "ready".
           if (d === "defer") {                                // mid-utterance -> queue + re-arm.
-            (sig as any).__deferredAt = Date.now();
-            state.deferredReady.push(sig);
+            // bead ykr: clone before stamping — the bus shares ONE signal object across all observers,
+            // so we must NOT mutate the shared payload. The queue owns its tagged copy.
+            state.deferredReady.push(stampDeferred(sig, Date.now()));
             armReadyDrain();
             return;
           }
@@ -1185,9 +1203,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       if (state.wsClosed) return;
       if (coreState.activeLiveSession) return; // already connected — no nudge needed.
       state.reconnectAttempts = 0;
+      // (53q owner token = this connection's `state`, supplied below as the 2nd arg.)
       if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
       scheduleReconnect();
-    });
+    }, state); // bead 53q: this connection's state object is the owner token (guards the clear path).
 
     clientWs.on("message", async (data) => {
       try {
@@ -1250,7 +1269,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
       // bead 9fz: the operator left — unregister this connection's reconnect-nudge so a later settings
       // PUT can't poke a dead connection's scheduler. (A fresh connection re-registers its own.)
-      registerReconnectNudge?.(null);
+      // bead 53q: pass THIS connection's `state` as the owner token. The module guards the clear so a
+      // stale connection (already overwritten by a newer one) is a no-op here — it cannot clear the
+      // SURVIVING connection's active nudge.
+      registerReconnectNudge?.(null, state);
       // PLM4 (2): the operator left — cancel any pending reconnect attempt (no reconnect storm after
       // the WS closes). scheduleReconnect also re-checks wsClosed, so this is belt-and-suspenders.
       clearReconnectTimer();

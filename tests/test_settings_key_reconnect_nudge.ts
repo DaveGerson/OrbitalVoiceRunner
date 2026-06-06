@@ -89,3 +89,47 @@ describe("PUT /api/settings reconnect-nudge on a non-empty Gemini key (headless 
     assert.strictEqual(nudgeCalls, before, "an unrelated settings change must NOT nudge a reconnect");
   });
 });
+
+// bead 53q: reconnect-nudge IDENTITY guard (single-connection hardening). The nudge registry is
+// module-scoped: if two voice WS connections overlap, the second registration takes ownership, and the
+// CLOSE of either connection used to call setVoiceReconnectNudge(null) unconditionally — so a stale/
+// foreign connection's close could clear the SURVIVING connection's nudge. The fix makes register/clear
+// identity-aware (an owner token). A connection may only clear the nudge when it is the CURRENT owner.
+describe("setVoiceReconnectNudge identity guard (bead 53q)", () => {
+  let setVoiceReconnectNudge: (fn: (() => void) | null, owner?: unknown) => void;
+  let requestVoiceReconnect: () => void;
+
+  before(async () => {
+    const mod = await import("../server");
+    setVoiceReconnectNudge = mod.setVoiceReconnectNudge;
+    requestVoiceReconnect = mod.requestVoiceReconnect;
+  });
+
+  after(() => {
+    // leave module scope clean for any later import of this server module in the same run.
+    setVoiceReconnectNudge(null);
+  });
+
+  it("closing a STALE connection (A) does NOT clear the SURVIVING connection's (B) nudge", () => {
+    const ownerA = { id: "A" };
+    const ownerB = { id: "B" };
+    let aCalls = 0;
+    let bCalls = 0;
+
+    // A registers, then B registers (overlap) — B is now the current owner.
+    setVoiceReconnectNudge(() => { aCalls++; }, ownerA);
+    setVoiceReconnectNudge(() => { bCalls++; }, ownerB);
+
+    // A closes: a NON-owner clear must be a no-op (must NOT clear B's nudge).
+    setVoiceReconnectNudge(null, ownerA);
+
+    requestVoiceReconnect();
+    assert.strictEqual(bCalls, 1, "B (current owner) still receives the nudge after A's stale close");
+    assert.strictEqual(aCalls, 0, "A's overwritten nudge never fires");
+
+    // B closes (it IS the owner): now the nudge is cleared.
+    setVoiceReconnectNudge(null, ownerB);
+    requestVoiceReconnect();
+    assert.strictEqual(bCalls, 1, "after the owner (B) closes, the nudge is cleared — no further calls");
+  });
+});
