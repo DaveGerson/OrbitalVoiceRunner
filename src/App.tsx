@@ -763,7 +763,10 @@ function AppRaw() {
   const handleCreateWatchRule = async () => {
     if (!watchTriggerTermId || !watchActionTermId || !watchActionCommand) return;
     try {
-      await apiFetch("/api/watch-rules", {
+      // i0r: add_watch_rule is c55.10 default-Ask → off-context this POST returns 202 (deferred), not
+      // 200. surfaceWriteOutcome plays the deferred toast/earcon on 202; the success refetch + input
+      // clear run ONLY on a real 200 (otherwise the operator would hear success on an unchanged list).
+      const res = await apiFetch("/api/watch-rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -774,17 +777,30 @@ function AppRaw() {
           oneShot: true
         })
       });
-      fetchWatchRules();
-      playEarcon("success");
-      setWatchActionCommand("");
+      surfaceWriteOutcome(res, {
+        successEarcon: "success",
+        deferredTitle: "Rule Deferred — Awaiting Confirm",
+        deferredDetail: "Creating this watch rule is queued behind a permission check. Confirm it in the pending tray.",
+        onSuccess: () => {
+          fetchWatchRules();
+          setWatchActionCommand("");
+        },
+      });
     } catch (e) {}
   };
 
   const handleDeleteWatchRule = async (id: string) => {
     try {
-      await apiFetch(`/api/watch-rules/${id}`, { method: "DELETE" });
-      fetchWatchRules();
-      playEarcon("execute");
+      // i0r: remove_watch_rule is c55.10 default-Ask → off-context this DELETE returns 202 (deferred),
+      // not 200. surfaceWriteOutcome surfaces the deferred toast/earcon on 202; the execute earcon +
+      // refetch run ONLY on a real 200 (stale-id deletes resolve to 200 ok-narration before the gate).
+      const res = await apiFetch(`/api/watch-rules/${id}`, { method: "DELETE" });
+      surfaceWriteOutcome(res, {
+        successEarcon: "execute",
+        deferredTitle: "Delete Deferred — Awaiting Confirm",
+        deferredDetail: `Removing rule ${id} is queued behind a permission check; confirm in the pending tray.`,
+        onSuccess: fetchWatchRules,
+      });
     } catch (e) {}
   };
 
@@ -798,9 +814,16 @@ function AppRaw() {
 
   const handleDeletePlan = async (id: string) => {
     try {
-      await apiFetch(`/api/plans/${id}`, { method: "DELETE" });
-      fetchPlans();
-      playEarcon("execute");
+      // i0r: delete_orchestrator_plan is c55.10 default-Ask → off-context this DELETE returns 202
+      // (deferred), not 200. surfaceWriteOutcome surfaces the deferred toast/earcon on 202; the execute
+      // earcon + refetch run ONLY on a real 200 (stale-id deletes resolve to 200 ok-narration pre-gate).
+      const res = await apiFetch(`/api/plans/${id}`, { method: "DELETE" });
+      surfaceWriteOutcome(res, {
+        successEarcon: "execute",
+        deferredTitle: "Delete Deferred — Awaiting Confirm",
+        deferredDetail: `Removing plan ${id} is queued behind a permission check; confirm in the pending tray.`,
+        onSuccess: fetchPlans,
+      });
     } catch (e) {}
   };
 
@@ -850,7 +873,11 @@ function AppRaw() {
   const handleExecuteBroadcast = async () => {
     if (!broadcastCmd.trim() || broadcastTargetIds.length === 0) return;
     setIsBroadcastRunning(true);
-    let successCount = 0;
+    // i0r: send_keys is c55.10 default-Ask → off-context each /input POST returns 202 (deferred), not
+    // 200. 202 IS res.ok (2xx), so the old `if (res.ok) successCount++` counted a DEFERRED keystroke as
+    // sent and played the success earcon on an unchanged pane. Bucket by explicit res.status instead.
+    let sentCount = 0;
+    let deferredCount = 0;
     try {
       for (const targetId of broadcastTargetIds) {
         const res = await apiFetch(`/api/terminals/${targetId}/input`, {
@@ -858,13 +885,25 @@ function AppRaw() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ command: broadcastCmd })
         });
-        if (res.ok) {
-          successCount++;
+        if (res.status === 200) {
+          sentCount++;
+        } else if (res.status === 202) {
+          deferredCount++;
         }
       }
-      if (successCount > 0) {
+      if (sentCount > 0) {
         playEarcon("execute");
         setBroadcastCmd("");
+      }
+      if (deferredCount > 0) {
+        // Deferred targets get the existing amber ⏳ toast + "execute" (queued) earcon. When EVERY
+        // target deferred (nothing sent), leave the input intact so the operator can retry/confirm.
+        if (sentCount === 0) playEarcon("execute");
+        showRawKeyToast(
+          "deferred",
+          "Keystrokes Deferred — Awaiting Confirm",
+          `${deferredCount} pane(s) queued behind a permission check; confirm in the pending tray.`,
+        );
       }
     } catch (e) {
       console.error(e);
@@ -1201,6 +1240,43 @@ function AppRaw() {
   const showRawKeyToast = (tone: "blocked" | "deferred" | "refused", title: string, detail: string) => {
     setRawKeyNotification({ tone, title, detail });
     setTimeout(() => setRawKeyNotification(null), 5000);
+  };
+
+  // i0r (c55.10): shared status-ladder for the rest-only gated writes (send_keys, add/remove watch
+  // rule, delete plan). c55.10 made these default-Ask, so OFF-CONTEXT their REST write returns 202
+  // {status:"pending_approval"} (deferred) — NOT 200. apiFetch does NOT throw on non-2xx and 202 IS
+  // 2xx, so the caller MUST branch on res.status, not res.ok. This mirrors writeControlKey's ladder:
+  //   202 deferred -> "execute" earcon (queued, NOT "success") + amber ⏳ deferred toast; returns false.
+  //   403 blocked  -> "alert" earcon + red ⛔ blocked toast; returns false.
+  //   200 ok       -> the caller's success earcon + onSuccess() (refetch / clear input); returns true.
+  // In PROD the gateOrDefer Ask arm independently broadcasts an action_pending WS frame that raises the
+  // c55.15 confirm dialog — this local toast is the immediate transient signal, consistent with the dual
+  // surface writeControlKey/handleCreateTerminal already establish.
+  const surfaceWriteOutcome = (
+    res: Response,
+    opts: {
+      successEarcon: EarconType;
+      deferredTitle: string;
+      deferredDetail: string;
+      onSuccess: () => void;
+    },
+  ): boolean => {
+    if (res.status === 202) {
+      playEarcon("execute"); // queued, awaiting operator confirm
+      showRawKeyToast("deferred", opts.deferredTitle, opts.deferredDetail);
+      return false;
+    }
+    if (res.status === 403) {
+      playEarcon("alert"); // gated Off (NO "error" earcon token exists)
+      showRawKeyToast("blocked", "Action Blocked by Policy", "This action is gated Off and was not performed.");
+      return false;
+    }
+    if (res.ok) {
+      playEarcon(opts.successEarcon);
+      opts.onSuccess();
+      return true;
+    }
+    return false;
   };
 
   // Nit #2 helper: grid-view control keys. The server's active-pane guard (nit #1) refuses raw input
