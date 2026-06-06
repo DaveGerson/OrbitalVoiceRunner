@@ -27,8 +27,12 @@
  *   - delete_orchestrator_plan: GATED (delete_orchestrator_plan, NEW row, default Ask) — destructive
  *     (permanently removes a plan; mirrors c55.14's gating of delete_pane/delete_project). Unknown id ->
  *     200 ok narration resolved BEFORE the gate.
- *   All three gated defs stay rest-only (surfaces:{rest}); a voice yes/no twin remains DEFERRED. Durable
- *   cross-restart Ask-replay is out of scope (no buildActionRun case) — in-process Ask->confirm is correct.
+ *   All three gated defs stay rest-only (surfaces:{rest}); a voice yes/no twin remains DEFERRED.
+ *   DURABLE cross-restart Ask-replay (c55.16 tech_debt_buildactionrun): remove_watch_rule and
+ *   delete_orchestrator_plan ARE now replayable — the intent bag is WIDENED with ruleId/planId and
+ *   src/actionEffects.ts carries a byte-identical rebuild case (in LOCKSTEP with removeEffect/
+ *   deleteEffect). A confirm-after-restart now splices the correct rule/plan, not a no-op. (send_keys
+ *   in panes_rest.ts remains the one accepted scope-out — it re-fires the live PTY; see its header.)
  *
  * STATUS-CODE DELTAS (Decision 2 — the client ignores the body / does not status-branch on these):
  *   - inline 404 "Rule not found." (remove_watch_rule) -> 200 ok-narration.
@@ -198,7 +202,10 @@ export const removeWatchRule: ActionDef<typeof RemoveWatchRuleParams> = {
       null,
       `Remove watch rule ${args.id}`,
       removeEffect,
-      { ...(ctx.versionStamp ?? {}), origin: "rest" }
+      // c55.16 tech_debt_buildactionrun: WIDEN the persisted intent with `ruleId` so a confirm-AFTER-
+      // restart can rebuild removeEffect via buildActionRun (it splices exactly this rule). Keep this
+      // key in LOCKSTEP with RemoveWatchRuleParams in src/actionEffects.ts (the durable-replay header).
+      { ...(ctx.versionStamp ?? {}), origin: "rest", ruleId: args.id }
     );
     if (g.disposition === "forbidden") {
       return { kind: "blocked", reason: "Error: the 'remove_watch_rule' capability is gated Off; removing automation rules is forbidden by policy." };
@@ -259,7 +266,10 @@ export const deleteOrchestratorPlan: ActionDef<typeof DeleteOrchestratorPlanPara
       null,
       `Delete plan ${args.plan_id}`,
       deleteEffect,
-      { ...(ctx.versionStamp ?? {}), origin: "rest" }
+      // c55.16 tech_debt_buildactionrun: WIDEN the persisted intent with `planId` so a confirm-AFTER-
+      // restart can rebuild deleteEffect via buildActionRun. Keep this key in LOCKSTEP with
+      // DeleteOrchestratorPlanParams in src/actionEffects.ts (the durable-replay header).
+      { ...(ctx.versionStamp ?? {}), origin: "rest", planId: args.plan_id }
     );
     if (g.disposition === "forbidden") {
       return { kind: "blocked", reason: "Error: the 'delete_orchestrator_plan' capability is gated Off; deleting plans is forbidden by policy." };

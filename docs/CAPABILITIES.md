@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**78** actions across **24** gated capabilities, plus the always-allowed group.
+**79** actions across **24** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -243,7 +243,8 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
-| `set_capability_gate` | voice / rest | no | Set a capability gate to Auto, Ask, or Off — globally or for one pane (meta capability) |
+| `set_capability_gate` | voice | no | Set a capability gate to Auto, Ask, or Off — globally or for one pane (meta capability) |
+| `set_pane_gates` | rest | no | Set the per-pane capability-gate OVERRIDE map from the matrix editor (bulk, whole-map, loosening allowed — the deliberate operator-direct UI sibling of the voi… |
 
 ## Change the global autonomy mode
 

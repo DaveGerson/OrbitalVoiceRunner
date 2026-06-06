@@ -22,6 +22,11 @@ function fakeDeps() {
   const calls: any = {
     added: [], notes: [], broadcasts: [], ledgerBroadcasts: 0, perms: null,
     projectsAdded: [], saved: 0, amended: [], deleted: [],
+    // c55.16 tech_debt_buildactionrun: durable-replay of the c55.10 gated rest-only caps.
+    // save(force) calls (the def force-persists via ledger.save(true)), live PTY writes, and the
+    // live mutable ledger arrays the replay cases splice.
+    savedForce: [] as boolean[], writes: [] as Array<[string, string]>,
+    watchRules: [] as Array<{ id: string }>, plans: [] as Array<{ id: string }>,
   };
   const projects: Record<string, any> = {};
   const manager: any = {
@@ -31,8 +36,16 @@ function fakeDeps() {
       addPaneNote(...a: any[]) { calls.notes.push(a); },
       amendNote(id: string, text: string) { calls.amended.push([id, text]); },
       deleteNote(id: string) { calls.deleted.push(id); },
-      save() { calls.saved++; },
+      // save() tracks the legacy no-arg path; save(true) (force-persist) records the flag so the
+      // watch-rule / plan replay cases can be pinned byte-for-byte against the def's `save(true)`.
+      save(force?: boolean) { calls.saved++; calls.savedForce.push(force === true); },
+      // Live mutable arrays the remove_watch_rule / delete_orchestrator_plan replay cases splice
+      // (the SAME references the def handlers mutate in production via manager.ledger.watchRules/plans).
+      watchRules: calls.watchRules,
+      plans: calls.plans,
     },
+    // terminals[id].writeInput is the live PTY write the send_keys effect would re-fire on replay;
+    // present so the scope-out pin can prove the rebuilt send_keys intent does NOT touch it.
     terminals: {} as Record<string, any>,
     addTerminal(...a: any[]) { calls.added.push(a); return "OK"; },
     saveSettings() { calls.saved++; },
@@ -166,6 +179,82 @@ describe("kzt — buildActionRun rebuilds deferred effects from intent", () => {
     const out = buildActionRun({ capability: "update_metadata", params: { op: "amend", noteId: "n2" } }, deps as any)();
     assert.deepStrictEqual(calls.amended, [["n2", ""]], "absent text amends to empty string");
     assert.strictEqual(out, "Note n2 updated.");
+  });
+
+  // ---------------------------------------------------------------------------
+  // c55.16 tech_debt_buildactionrun: the c55.10 gated rest-only caps. Each STAGES a pending action
+  // on Ask (gateOrDefer), so a confirm-AFTER-restart must rebuild the SAME side effect from the
+  // persisted intent. These pin the rebuild reproduces the def's effect closure (watch_rules.ts /
+  // panes_rest.ts) BYTE-IDENTICALLY: the ledger array splice, the FORCE-persist (save(true)), the
+  // *_updated broadcast, and the exact confirm string (the Risk-1 drift guard).
+  //
+  // The intent params are the WIDENED bag the def now persists: remove_watch_rule carries `ruleId`,
+  // delete_orchestrator_plan carries `planId` — the payload the rebuilt effect needs (the original
+  // bag held only { origin, versionStamp } and could not be replayed).
+  // ---------------------------------------------------------------------------
+  it("remove_watch_rule intent -> splices the rule + save(true) + watch_rules_updated + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    calls.watchRules.push({ id: "rule_a" }, { id: "rule_b" }, { id: "rule_c" });
+    const out = buildActionRun({ capability: "remove_watch_rule", params: { origin: "rest", ruleId: "rule_b" } }, deps as any)();
+    assert.deepStrictEqual(calls.watchRules.map((r: any) => r.id), ["rule_a", "rule_c"], "the matching rule is spliced");
+    assert.deepStrictEqual(calls.savedForce, [true], "force-persist (save(true)) fired exactly once");
+    const frame = calls.broadcasts.find((b: any) => b.type === "watch_rules_updated");
+    assert.ok(frame, "watch_rules_updated broadcast fired");
+    assert.strictEqual(frame.watchRules, calls.watchRules, "broadcast carries the live array (post-splice)");
+    // EXACT — matches removeEffect (watch_rules.ts:194).
+    assert.strictEqual(out, "Watch rule rule_b removed.");
+  });
+
+  it("remove_watch_rule intent for an already-gone rule -> no splice / no persist / no broadcast, still confirms", () => {
+    const { calls, deps } = fakeDeps();
+    calls.watchRules.push({ id: "rule_a" });
+    const out = buildActionRun({ capability: "remove_watch_rule", params: { origin: "rest", ruleId: "rule_gone" } }, deps as any)();
+    // Mirrors removeEffect's idempotent re-find guard: a rule deleted between stage and confirm is a
+    // no-op mutation (no double-splice, no spurious repaint) but still narrates success.
+    assert.deepStrictEqual(calls.watchRules.map((r: any) => r.id), ["rule_a"], "nothing spliced for a missing rule");
+    assert.deepStrictEqual(calls.savedForce, [], "no persist when nothing changed");
+    assert.strictEqual(calls.broadcasts.length, 0, "no broadcast when nothing changed");
+    assert.strictEqual(out, "Watch rule rule_gone removed.");
+  });
+
+  it("delete_orchestrator_plan intent -> splices the plan + save(true) + plans_updated + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    calls.plans.push({ id: "plan_a" }, { id: "plan_b" });
+    const out = buildActionRun({ capability: "delete_orchestrator_plan", params: { origin: "rest", planId: "plan_a" } }, deps as any)();
+    assert.deepStrictEqual(calls.plans.map((p: any) => p.id), ["plan_b"], "the matching plan is spliced");
+    assert.deepStrictEqual(calls.savedForce, [true], "force-persist (save(true)) fired exactly once");
+    const frame = calls.broadcasts.find((b: any) => b.type === "plans_updated");
+    assert.ok(frame, "plans_updated broadcast fired");
+    assert.strictEqual(frame.plans, calls.plans, "broadcast carries the live array (post-splice)");
+    // EXACT — matches deleteEffect (watch_rules.ts:255).
+    assert.strictEqual(out, "Plan plan_a deleted.");
+  });
+
+  it("delete_orchestrator_plan intent for an already-gone plan -> no splice / no persist / no broadcast, still confirms", () => {
+    const { calls, deps } = fakeDeps();
+    calls.plans.push({ id: "plan_a" });
+    const out = buildActionRun({ capability: "delete_orchestrator_plan", params: { origin: "rest", planId: "plan_gone" } }, deps as any)();
+    assert.deepStrictEqual(calls.plans.map((p: any) => p.id), ["plan_a"], "nothing spliced for a missing plan");
+    assert.deepStrictEqual(calls.savedForce, [], "no persist when nothing changed");
+    assert.strictEqual(calls.broadcasts.length, 0, "no broadcast when nothing changed");
+    assert.strictEqual(out, "Plan plan_gone deleted.");
+  });
+
+  // ---------------------------------------------------------------------------
+  // send_keys is DELIBERATELY NOT replayable across a restart (panes_rest.ts:222-225 accepted
+  // scope-out). Its effect re-fires term.writeInput straight to the LIVE PTY — a confirm-after-
+  // restart would re-send a keystroke to a possibly-different pane process, which is a product
+  // question, not a mechanical port. This pin DURABLY records that decision: a rebuilt send_keys
+  // intent must fall through to the safe no-op string and NEVER touch the live PTY. If a future
+  // change adds a send_keys case, this test goes RED and forces the product decision to be ratified.
+  // ---------------------------------------------------------------------------
+  it("send_keys intent -> NOT replayable (safe no-op string, never touches the live PTY)", () => {
+    const { calls, manager, deps } = fakeDeps();
+    manager.terminals["x"] = { writeInput: (cmd: string) => { calls.writes.push(["x", cmd]); } };
+    const out = buildActionRun({ capability: "send_keys", params: { origin: "rest", paneId: "x", command: "ls -la" } }, deps as any)();
+    assert.strictEqual(calls.writes.length, 0, "send_keys replay must NOT write to the live PTY");
+    assert.strictEqual(calls.ledgerBroadcasts, 0, "no ledger broadcast on the no-op path");
+    assert.match(out, /unknown capability/i);
   });
 
   it("unknown capability -> safe no-op run (never throws on hydrate)", () => {

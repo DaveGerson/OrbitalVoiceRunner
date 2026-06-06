@@ -504,17 +504,18 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
   const here = path.dirname(fileURLToPath(import.meta.url));
   const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
 
+  // c55.16: the mountRestRoutes(...) `only:` allow-filter was RETIRED — the registry auto-serves every
+  // rest-surface def. Cutover proof = registry membership (surfaces:rest && def.rest), not only-set text.
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock =
-    onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
   const onlyNames = ["set_pane_permissions", "handoff_context_between_panes", "apply_orchestration_recipe", "create_pane"];
   for (const name of onlyNames) {
-    it(`mountRestRoutes only-set includes "${name}"`, () => {
+    it(`mountRestRoutes auto-serves "${name}" (rest-surfaced in REGISTRY)`, () => {
       assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
-      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the Batch-D cutover`);
+      assert.ok(mountedNames.has(name), `"${name}" must be a rest-mounted REGISTRY def after the Batch-D cutover`);
     });
   }
 
@@ -547,11 +548,12 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
   // (test_c55_batch_f.ts) now asserts that inline route is DELETED. NOTE: POST /api/watch-rules was
   // likewise a Batch-D out-of-scope neighbor, but c55 Batch G CONVERGED the whole watch-rules family
   // (add_watch_rule) — so it is no longer asserted here; the Batch G contract suite
-  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. The bulk
-  // capability-gates route stays inline (the set_pane_gates carve-out is HELD for Batch H ratification).
-  const keptLiterals: Array<{ label: string; needle: RegExp }> = [
-    { label: "PUT /api/projects/:projectId/panes/:paneId/capability-gates", needle: /app\.put\(\s*["']\/api\/projects\/:projectId\/panes\/:paneId\/capability-gates["']/ },
-  ];
+  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. NOTE: the bulk
+  // PUT /api/projects/:projectId/panes/:paneId/capability-gates route was a Batch-D out-of-scope
+  // neighbor (the set_pane_gates carve-out was HELD), but c55.16 CONVERGED it (the new rest-only
+  // set_pane_gates def + rest.toHttp), so it is no longer asserted-preserved here — c55.16's own
+  // contract suite (test_c55_16_set_pane_gates.ts) pins the converged def + asserts the inline twin is GONE.
+  const keptLiterals: Array<{ label: string; needle: RegExp }> = [];
   for (const { label, needle } of keptLiterals) {
     it(`out-of-scope inline route is preserved: ${label}`, () => {
       assert.ok(needle.test(serverSrc), `${label} must remain inline this batch (out of scope)`);

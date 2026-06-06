@@ -474,31 +474,33 @@ describe("c55 Batch B — server.ts cutover guard (no double-registration)", () 
   // The 3 CONVERGED twins must be in the only-set.
   const onlyNames = ["rename_project", "rename_pane", "switch_context"];
 
+  // c55.16: the mountRestRoutes(...) `only:` allow-filter was RETIRED — the registry auto-serves every
+  // rest-surface def. The cutover proof is now registry membership (surfaces:rest && def.rest), not
+  // only-set text. Server.ts still calls mountRestRoutes (filterless).
   const mountIdx = serverSrc.indexOf("mountRestRoutes(");
-  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
-  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
-  const mountBlock =
-    onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+  const mountedNames = new Set(
+    REGISTRY.filter((d) => d.surfaces.has("rest") && !!d.rest).map((d) => d.name),
+  );
 
   for (const name of onlyNames) {
-    it(`mountRestRoutes only-set includes "${name}"`, () => {
+    it(`mountRestRoutes auto-serves "${name}" (rest-surfaced in REGISTRY)`, () => {
       assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
       assert.ok(
-        new RegExp(`["']${name}["']`).test(mountBlock),
-        `mountRestRoutes only-set must include "${name}" after the Batch-B cutover`
+        mountedNames.has(name),
+        `"${name}" must be a rest-mounted REGISTRY def (surfaces:rest && def.rest) after the Batch-B cutover`
       );
     });
   }
 
-  // c55.9 FLIP: execute_plan was HELD out of the only-set in Batch B (the REST dispatchProposal was a
+  // c55.9 FLIP: execute_plan was HELD out of the cutover in Batch B (the REST dispatchProposal was a
   // refusing stub). c55.9 authored the REST-capable gated pane-write seam (restDispatchProposal ->
-  // applyDispatchDecision), so execute_plan is NOW converged INTO the only-set. (The full c55.9 cutover
-  // guard — only-set membership + inline-route deletion + stub removal — lives in test_c55_9_execute_plan.ts.)
-  it("mountRestRoutes only-set INCLUDES execute_plan (converged in c55.9)", () => {
+  // applyDispatchDecision), so execute_plan is NOW converged and rest-mounted. (The full c55.9 cutover
+  // guard — registry membership + inline-route deletion + stub removal — lives in test_c55_9_execute_plan.ts.)
+  it("mountRestRoutes auto-serves execute_plan (converged in c55.9)", () => {
     assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
     assert.ok(
-      /["']execute_plan["']/.test(mountBlock),
-      "execute_plan must be IN the only-set after the c55.9 REST pane-write convergence"
+      mountedNames.has("execute_plan"),
+      "execute_plan must be a rest-mounted REGISTRY def after the c55.9 REST pane-write convergence"
     );
   });
 

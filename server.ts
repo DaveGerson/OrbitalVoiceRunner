@@ -33,7 +33,7 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
-import type { CapabilityGate, CapabilityGateMap } from "./src/types";
+import type { CapabilityGate } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
@@ -833,28 +833,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // ungated behavior). Same HistoryManager.saveHistory(id, []) effect; client ignores the body.
 
   // Project and Pane management endpoints
-  app.post("/api/projects", (req, res) => {
-    const { id, directory, summary, keyTerms, name } = req.body;
-    if (!id) {
-      res.status(400).json({ error: "Missing required field: id" });
-      return;
-    }
-    // G5: validate the caller-supplied directory before persisting it. A non-blank
-    // dir that does not exist (or is a file) is rejected — storing it would later
-    // taint a child pane's cwd and make node-pty throw "path not found". Blank/"."
-    // resolves to the server cwd (valid intent preserved), never the literal ".".
-    if (isBadProjectDir(directory)) {
-      res.status(400).json({ error: `Project directory does not exist: ${String(directory).trim()}` });
-      return;
-    }
-    const terms = Array.isArray(keyTerms) ? keyTerms : [];
-    manager.ledger.addProject(id, resolveProjectDir(directory), summary || "", terms);
-    if (name) {
-      manager.ledger.renameProject(id, name);
-    }
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55.16: POST /api/projects is now served by the registry-derived create_project def
+  // (mountRestRoutes only-set above). The def gained an optional `name` param + a coerceArgs shim
+  // (aliases the UI body id->project_id / keyTerms->key_terms only when the snake key is absent) and
+  // ports the inline post-create RENAME as a 2nd in-handler ledger mutation — addProject then, iff a
+  // truthy name, renameProject — before the single ledger_updated broadcast (both are pure ledger ops,
+  // no connection scope). Accepted client-invisible body deltas: 200 {success:true} -> 200 {output:"…"};
+  // malformed no-id 400 -> zod 500 (same class as create_pane). The client (App.tsx) reads no response
+  // field; it repaints off the ledger_updated WS frame + a follow-on fetchLedger/fetchTerminals.
 
   // c55.14: PUT /api/projects/:id now served by the registry-derived update_project def (mountRestRoutes only-set above).
 
@@ -881,47 +867,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // applied unconditionally + skipped the invalid-mode/pane-not-found pre-checks). Same setPermissionsMode
   // + ledger write + ledger_updated/terminals_updated broadcasts on the Auto path. Client ignores the body.
 
-  // bead 8sq (spec §2.B / §5): set the per-pane capability-gate OVERRIDE map from the matrix editor's
-  // per-pane scope. This is the UI sibling of the voice `set_capability_gate` tool, but the UI is the
-  // deliberate place where LOOSENING is allowed (voice may only tighten — see the tool handler), so
-  // this endpoint writes the operator-chosen map verbatim. Body: { capabilityGates: CapabilityGateMap }
-  // (a full or partial override map; keys absent fall through to global). Persists to the ledger pane
-  // and re-broadcasts so chips repaint from the new server-resolved posture.
-  app.put("/api/projects/:projectId/panes/:paneId/capability-gates", (req, res) => {
-    const { projectId, paneId } = req.params;
-    const incoming = req.body?.capabilityGates;
-    const ws = manager.ledger.getProject(projectId);
-    const pane = ws?.panes?.[paneId];
-    if (!pane) { res.status(404).json({ error: "Pane not found" }); return; }
-    // Normalize: only valid {Auto|Ask|Off} entries survive; an empty map clears the override
-    // (so the pane falls back to the global default rather than persisting a masking `{}`).
-    const clean: CapabilityGateMap = {};
-    let any = false;
-    if (incoming && typeof incoming === "object") {
-      for (const [k, v] of Object.entries(incoming)) {
-        if (v === "Auto" || v === "Ask" || v === "Off") { (clean as any)[k] = v; any = true; }
-      }
-    }
-    pane.capabilityGates = any ? clean : undefined;
-    // Persist via updatePane (the durable path for BOTH backends): legacy Ledger keeps the full
-    // PaneMeta in its JSON-backed map; the SQLite store writes the capability_gates column (schema
-    // v4). A bare ledger.save() would be a SQLite no-op and silently drop the override.
-    manager.ledger.updatePane(projectId, pane, true);
-    if (store) {
-      try {
-        store.recordActivity({
-          type: "permission_changed",
-          project_id: projectId,
-          pane_id: paneId,
-          summary: `UI set per-pane gates for ${paneId} (${any ? Object.keys(clean).length : 0} override(s))`,
-          payload: { action: "set_pane_gates", capabilityGates: any ? clean : null },
-        });
-      } catch { /* store optional */ }
-    }
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, capabilityGates: pane.capabilityGates ?? null });
-  });
+  // c55.16: the BULK per-pane capability-gate OVERRIDE write (the matrix editor's per-pane "Save",
+  // PUT /api/projects/:project_id/panes/:pane_id/capability-gates) is now served by the registry twin
+  // set_pane_gates (mountRestRoutes only-set below). It is the rest-only, UNGATED, VERBATIM operator
+  // loosening surface (the voice set_capability_gate tool stays single-entry tighten-only and is now
+  // voice-only). The def's rest.path uses snake_case segments, coerceArgs aliases the body
+  // {capabilityGates -> capability_gates}, and rest.toHttp reproduces the exact 200 {success,
+  // capabilityGates} / 404 {error:"Pane not found"} contract (incl. empty-clears-to-null) byte-for-byte.
+  // The handler faithfully ports the inline (A)-(H): notFound sentinel before any mutation, the
+  // Auto|Ask|Off silent-drop normalize, updatePane(.,.,true) on both set+clear, the if(store) audit, and
+  // both broadcasts on both paths. tests/test_pane_gates_rest.ts pins the round-trip unchanged.
 
   // c55 Batch B: POST /api/projects/:project_id/switch is now served by the registry twin
   // switch_context (mountRestRoutes only-set above) — same switchContext + activeContext/
@@ -1315,163 +1270,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   //   list_capabilities -> GET /api/capabilities
   //   list_handoffs -> GET /api/handoffs
   //   read_handoff -> GET /api/handoffs/:handoff_id
-  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext, {
-    only: new Set([
-      "get_action_log",
-      "get_health",
-      "get_pane_summary",
-      "get_pane_command_history",
-      "get_pane_gates",
-      "list_capabilities",
-      "list_handoffs",
-      "read_handoff",
-      // c55 Batch A — emergency-brake trio + dismiss + plan-create, cut over from the inline
-      // app.post(...) twins deleted below. The client ignores the HTTP body; the registry handlers
-      // broadcast the same WS frames the inline routes did (frozen / stop_all kill / unfreeze /
-      // attention_updated / plans_updated), so the live feed repaints identically.
-      "stop_all",
-      "confirm_stop_all",
-      "release_stop_all",
-      "dismiss_attention",
-      "create_orchestrator_plan",
-      // c55 Batch B — free twins with ROUTE PARAMS. Each def's rest.path was rewritten to snake_case
-      // segments (:project_id / :pane_id) so Express injects the path param directly onto the
-      // snake_case zod key; the inline camelCase-segment twins (:id / :projectId / :paneId) are
-      // deleted below. The client ignores the HTTP body and repaints off the ledger_updated WS frame.
-      //
-      // c55.9: execute_plan is now CONVERGED (was HELD). buildRestActionContext's dispatchProposal is a
-      // gated pane-write seam (restDispatchProposal -> applyDispatchDecision), so POST /api/plans/:id/execute
-      // is served by the registry def + its rest.toHttp (§6 status map: executed 200 / pending 202 /
-      // blocked 403 / pane-offline 400 / plan-not-found 404 / clarify 409). The inline route is deleted
-      // below in the SAME change (no-twin guard). BUG-040 closed (REST Run-plan now respects the gate).
-      "execute_plan",
-      "rename_project",
-      "rename_pane",
-      "switch_context",
-      // c55 Batch C — five NEW rest-only defs for inline pane/UI routes with no voice twin. The inline
-      // app.post(...) twins are deleted below in the SAME change. Clients read only res.ok and repaint
-      // off the terminals_updated / ledger_updated WS frames the handlers fan out.
-      //   respawn_pane  POST /api/terminals/:pane_id/restart       — NOW GATED via gateOrDefer
-      //                 (capability restart_pane, default Ask): the inline route skipped the gate, so this
-      //                 ENFORCES it (a deliberate safety improvement — behaviorDelta). 403 Off / 202 Ask.
-      //                 (action renamed restart_pane -> respawn_pane to avoid colliding with the
-      //                 concurrent voice-only restart_pane live-mode action; capability row unchanged.)
-      //   send_keys     POST /api/terminals/:pane_id/input         — ALWAYS_ALLOWED (was ungated).
-      //   resize_pane   POST /api/terminals/:pane_id/resize        — ALWAYS_ALLOWED; zod cols/rows int>0
-      //                 replaces the inline 400 (zod-500 on bad input).
-      //   clear_history POST /api/terminals/:pane_id/history/clear — ALWAYS_ALLOWED (was ungated).
-      //   clear_exited  POST /api/terminals/clear-exited            — ALWAYS_ALLOWED (was ungated).
-      // Accepted status deltas (client ignores the body): inline 404 not-found -> 200 ok-narration.
-      "respawn_pane",
-      "send_keys",
-      "resize_pane",
-      "clear_history",
-      "clear_exited",
-      // c55 Batch D — Easy aliasing + status-via-kinds. The inline app.* twins are deleted below in
-      // the SAME change. Param skew is resolved at the registry (snake_case rest.path / coerceArgs):
-      //   set_pane_permissions  PUT /api/projects/:project_id/panes/:pane_id/permissions
-      //     coerceArgs aliases body {permissions -> permissions_mode}. behaviorDelta: the registry twin
-      //     is GATED (gateOrDefer) — on Ask it STAGES a pending action instead of applying (the inline
-      //     route was ungated + applied unconditionally + skipped the invalid-mode/not-found checks).
-      //   handoff_context_between_panes  POST /api/handoff
-      //     coerceArgs aliases camel->snake {sourcePaneId,targetPaneId,contextNotes}. behaviorDelta:
-      //     inline 400 (both-panes-required) -> 200 ok-narration (client ignores the body).
-      //   apply_orchestration_recipe  POST /api/recipes/apply
-      //     coerceArgs aliases {recipeId -> recipe_id}. STATUS-VIA-KINDS: layout apply_recipe=Off now
-      //     returns kind:"blocked" -> 403 (the inline route already 403'd; preserved). behaviorDelta:
-      //     inline 404 (no active project / unknown recipe) -> 200 ok-narration.
-      //   create_pane  POST /api/terminals
-      //     coerceArgs aliases camel->snake + drops a client command for a non-Custom preset (the
-      //     superRefine forbids it; the inline route ignored it). STATUS-VIA-KINDS: Off -> kind:"blocked"
-      //     (403), Ask -> kind:"pending" (202), Auto -> kind:"ok" (200) — the 403/202/200 status branches
-      //     SURVIVE. behaviorDelta: the 403/202/200 BODY shape is now the registry shape (was
-      //     restGateOutcome's {error,capability}/{deferred,actionId,summary}/{success}); inline 400
-      //     (missing terminalId) -> zod 500. The voice handler also sets the active pane + broadcasts
-      //     switch_active_pane (the inline route did not) — a benign redundant broadcast on REST.
-      "set_pane_permissions",
-      "handoff_context_between_panes",
-      "apply_orchestration_recipe",
-      "create_pane",
-      // c55 Batch F — hard structured page-load READS. Each rides the Batch-E rest.toHttp primitive to
-      // emit a structured body the flat {output:string} cannot carry, and each inline GET twin is
-      // deleted below in the SAME change (Express keeps the first-registered handler, so a stale inline
-      // route would silently mask the cutover).
-      //   list_panes           GET /api/terminals               — the FLAT per-pane array setTerminals()
-      //     consumes (id/cwd/command/backfill[raw ANSI]/output[stripped tail]/status/permissions_mode/
-      //     tool_preset/session_id/context_size/effective_gates[16]/posture). Field-for-field identical
-      //     to the legacy inline body. The handler is SURFACE-AWARE: voice still narrates the project/
-      //     pane TREE (manager.listPanes()); only the rest surface builds the flat array, emitted
-      //     top-level by toHttp (NOT wrapped in {output}).
-      //   get_stop_all_status  GET /api/stop-all/status         — the boot-restore snapshot {frozen,
-      //     running}; running = runningPaneIds() iff frozen. ALWAYS_ALLOWED, rest-only. Read once on
-      //     load to restore the FROZEN banner before any WS frame ({type:'frozen'} only fires on change).
-      //   get_terminal_history GET /api/terminals/:pane_id/history — the RAW HistoryManager array
-      //     (full output per entry; NOT the concise/redacted get_pane_command_history prose). rest-only.
-      "list_panes",
-      "get_stop_all_status",
-      "get_terminal_history",
-      // c55 Batch G — net-new rest-only watch-rule / plan-delete defs (NO voice twin today). Each inline
-      // app.{get,post,delete}(...) twin is deleted below in the SAME change (Express keeps the
-      // first-registered handler, so a stale inline route would silently mask the cutover). All four are
-      // ALWAYS_ALLOWED (the safe default — preserves the current ungated/instant behavior); the matrix can
-      // later tighten add_watch_rule (row exists, default Ask, reserved) and mint gate rows for
-      // remove_watch_rule / delete_orchestrator_plan (DEFERRED for ratification, with a voice yes/no).
-      //   list_watch_rules         GET    /api/watch-rules    — toHttp emits the RAW WatchRule[] array
-      //                            TOP-LEVEL (the shape setWatchRules() consumes on initial load).
-      //   add_watch_rule           POST   /api/watch-rules    — push + force-save + watch_rules_updated.
-      //                            The inline presence-check 400 becomes a zod-500 (valid clients always
-      //                            send the full body).
-      //   remove_watch_rule        DELETE /api/watch-rules/:id — splice + force-save + watch_rules_updated.
-      //                            Accepted delta: inline 404 -> 200 ok-narration (client ignores the body).
-      //   delete_orchestrator_plan DELETE /api/plans/:plan_id   — splice off the board + force-save +
-      //                            plans_updated. Accepted delta: inline 404 -> 200 ok-narration.
-      "list_watch_rules",
-      "add_watch_rule",
-      "remove_watch_rule",
-      "delete_orchestrator_plan",
-      // c55.11 — 4 rest-only structured reads, cut over from the inline app.get(...) routes deleted
-      // below. Each rides rest.toHttp to emit its value TOP-LEVEL, byte-identical to the legacy body.
-      "get_ledger",
-      "get_attention_queue",
-      "list_orchestrator_plans",
-      "list_orchestration_recipes",
-      // c55.12 — 6 rest-only operator-UI note/context defs, cut over from the inline app.* routes
-      // deleted below. Ungated operator-direct; the UI repaints off the ledger_updated broadcast.
-      "create_project_note",
-      "read_project_notes",
-      "edit_note",
-      "remove_note",
-      "create_pane_note",
-      "add_pane_context",
-      // c55.13 — 3 rest-only operator-UI archive defs, cut over from the inline app.* routes deleted
-      // below. Ungated operator-direct; the UI repaints off ledger_updated/terminals_updated.
-      "list_archived_panes",
-      "restore_archived_pane",
-      "delete_archived_pane",
-      // c55.14 — project/pane lifecycle. The 4 inline app.{put,delete,post}(...) twins are deleted below
-      // in the SAME change (Express keeps the first-registered handler, so a stale inline route would
-      // silently mask the cutover). update_project/stop_pane are ALWAYS_ALLOWED (preserve ungated inline
-      // behavior); delete_project/delete_pane are NOW GATED (new Destructive caps, default Ask) via
-      // gateOrDefer + status-via-kinds (403 Off / 202 Ask / 200 Auto) — a deliberate behaviorDelta from
-      // the ungated inline deletes. Client ignores the body; repaints off ledger_updated/terminals_updated.
-      "update_project",
-      "stop_pane",
-      "delete_project",
-      "delete_pane",
-      // c55.15 — approvals/pending HiTL. The 5 inline app.{get,post}(...) twins are deleted below in the
-      // SAME change (Express keeps the first-registered handler, so a stale inline route would silently
-      // mask the cutover). All 5 are ALWAYS_ALLOWED — above-the-gate: this is the operator surface that
-      // RESOLVES gated actions (the gate already fired when the action was STAGED; confirming/cancelling/
-      // approving is the human answer, not a new gated act). Each rides rest.toHttp to PRESERVE the exact
-      // 404/422/200/500 status contract the default kind->status map cannot express. The client ignores
-      // the body and repaints off the action_resolved / action_pending WS frames (+ refetch on load).
-      "list_pending_commands",
-      "list_pending_actions",
-      "confirm_pending_action",
-      "cancel_pending_action",
-      "approve_pending_command",
-    ]),
-  });
+  // c55.16 (Batch H terminal step): the registry now auto-serves EVERY rest-surface def. The
+  // `only:` allow-filter is RETIRED — collision-freedom is no longer enforced by an allow-list but
+  // PROVEN by the no-twin shadow guard (tests/test_no_inline_twins.ts): no surviving inline route
+  // shares verb+normalized-path with a mounted def, and no two mounted defs collide either. The
+  // surviving inline exceptions (drafts, settings, raw-input, attention/clear path-alias) all live
+  // on paths no registry def claims (set_capability_gate is voice-only; set_pane_gates / create_project
+  // / execute_plan are converged with their inline twins deleted). See the design at
+  // docs/superpowers/specs/2026-06-05-c55-16-opts-only-drop-guard-design.md.
+  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext);
 
   // Vite middleware for development (dynamically imported so tests / production
   // bundles that disable it don't need vite resolvable at module load).

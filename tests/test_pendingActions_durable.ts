@@ -155,6 +155,51 @@ test("durable e2e: update_metadata amend rebuilds + applies the bound text acros
 });
 
 // ---------------------------------------------------------------------------
+// c55.16 tech_debt_buildactionrun: a c55.10 gated rest-only cap (remove_watch_rule) survives a
+// reopen and the rebuilt confirm splices the ENQUEUE-BOUND rule (NOT a no-op). This is the durable
+// round-trip half of the drift guard — the pure rebuild is pinned in tests/test_actionEffects.ts.
+// The persisted intent carries the WIDENED `ruleId` payload the def now stages.
+// ---------------------------------------------------------------------------
+test("durable e2e: remove_watch_rule rebuilds + splices the bound rule across a reopen", () => {
+  const path = tmpDbPath();
+  const store1 = new JanusStore(path); store1.init();
+  const s1 = new PendingActionStore(store1);
+  s1.add({
+    id: "act-rmrule", capability: "remove_watch_rule", summary: "Remove watch rule rule_b",
+    params: { origin: "rest", ruleId: "rule_b" }, timestamp: Date.now(), ttlMs: TTL,
+    run: () => { throw new Error("original run must NOT be used after restart"); },
+  });
+  store1.close();
+
+  const store2 = new JanusStore(path); store2.init();
+  const s2 = new PendingActionStore(store2);
+  // The live ledger array the rebuilt effect splices (the SAME shape manager.ledger.watchRules holds).
+  const watchRules: Array<{ id: string }> = [{ id: "rule_a" }, { id: "rule_b" }, { id: "rule_c" }];
+  const broadcasts: any[] = [];
+  let savedForce: boolean | null = null;
+  const deps = {
+    manager: { ledger: { watchRules, plans: [], save: (force?: boolean) => { savedForce = force === true; } } },
+    broadcast: (m: any) => broadcasts.push(m),
+    broadcastLedgerUpdate: () => {},
+    sanitizeSettingsForClient: (s: any) => s,
+  };
+  for (const row of s2.hydrateIntents()) {
+    const params = JSON.parse(row.params);
+    s2.add({
+      id: row.id, capability: row.capability, summary: row.summary, params, timestamp: row.timestamp,
+      run: buildActionRun({ capability: row.capability, params }, deps as any), ttlMs: TTL,
+    });
+  }
+  const r = s2.confirm("act-rmrule");
+  assert.strictEqual(r.reason, "confirmed");
+  assert.deepStrictEqual(watchRules.map((rr) => rr.id), ["rule_a", "rule_c"], "the bound rule is spliced across the reopen");
+  assert.strictEqual(savedForce, true, "force-persist fired");
+  assert.ok(broadcasts.some((b) => b.type === "watch_rules_updated"), "repaint broadcast fired");
+  assert.strictEqual(r.output, "Watch rule rule_b removed.");
+  store2.close();
+});
+
+// ---------------------------------------------------------------------------
 // CLAIM survives reopen: a claimed-but-undeleted row is NOT re-hydrated (no double-run).
 // ---------------------------------------------------------------------------
 test("durable: a claimed-but-undeleted action row stays claimed across reopen (no double-run)", () => {
