@@ -1,5 +1,6 @@
 import { Ledger, PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
+import path from "path";
 import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
@@ -1156,7 +1157,31 @@ export class OrchestratorManager {
   private pendingStarts = new Set<Promise<void>>();
   public globalPermissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit" = "Inherit";
   public settings!: SystemSettings;
-  private settingsFilePath = ".janus_settings.json";
+  // BEAD kqy — settings-path anchor. The settings file used to be a BARE relative
+  // string (".janus_settings.json"), so loadSettings/saveSettings resolved it against
+  // process.cwd(). Launching the server from a cwd other than the repo root therefore
+  // silently read a DIFFERENT/missing file -> no Gemini key -> voice dead (CONFIRMED
+  // 2026-06-04). Resolve it ONCE at construction via resolveSettingsPath(): honor the
+  // JANUS_SETTINGS_PATH env override (a stable, portable anchor that works under both
+  // tsx-dev and the bundled dist/server.cjs, where __dirname differs), else fall back
+  // to the cwd-relative default for back-compat.
+  private settingsFilePath: string = OrchestratorManager.resolveSettingsPath();
+
+  /** Resolve the settings file to an absolute, stable path. JANUS_SETTINGS_PATH wins
+   *  (resolved to absolute); otherwise the legacy cwd-relative ".janus_settings.json"
+   *  is preserved so a server started from the repo root behaves exactly as before. */
+  private static resolveSettingsPath(): string {
+    const override = process.env.JANUS_SETTINGS_PATH;
+    if (override && override.trim()) {
+      return path.resolve(override.trim());
+    }
+    return ".janus_settings.json";
+  }
+
+  /** Public read accessor for the resolved settings file path (test/observability seam). */
+  public getSettingsFilePath(): string {
+    return this.settingsFilePath;
+  }
 
   private getDefaultSettings(): SystemSettings {
     return {
@@ -1307,6 +1332,11 @@ export class OrchestratorManager {
   }
 
   constructor(opts?: { ledger?: LedgerLike }) {
+    // BEAD kqy — log the RESOLVED ABSOLUTE settings path once at boot so a cwd
+    // mismatch is obvious in the logs (the file that silently held NO Gemini key
+    // was indistinguishable from the right one before this line). SECRET INVARIANT:
+    // we log only the PATH — never the key (secrets stay in-memory, strip-on-save).
+    console.log(`[settings] resolved settings file: ${path.resolve(this.settingsFilePath)}`);
     this.loadSettings();
     // WS-M cutover seam: a LedgerLike backend may be injected (e.g. JanusStore for
     // durable SQLite state). Default stays the legacy JSON Ledger so existing
@@ -1491,10 +1521,17 @@ export class OrchestratorManager {
           is_busy: term.status === "Running",
           alive: term.status !== "Exited",
           notes: existingPane?.notes || [],
-          permissions_mode: term.permissionsMode,
+          // BEAD gpd — PERSIST-WINS: a sync reflects only the LIVE FACTS (status / busy /
+          // alive / session). Operator INTENT — the permission mode and the per-pane
+          // capability-gate override — is authoritative in the ledger and must NOT be
+          // clobbered by whatever the live process happens to hold. Prefer the persisted
+          // value; fall back to the live term only on first registration (no existing
+          // record yet). Covers BOTH permissions_mode AND capabilityGates.
+          permissions_mode: existingPane?.permissions_mode ?? term.permissionsMode,
           tool_preset: term.toolPreset,
           session_id: term.sessionId || existingPane?.session_id || "",
           context_size: term.contextSize,
+          capabilityGates: existingPane?.capabilityGates,
           // WS-C status-detection fields (design §4.2).
           last_status_change_at: new Date(term.lastStatusChangeAt).toISOString(),
           last_command: term.lastCommand || existingPane?.last_command || "",

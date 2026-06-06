@@ -120,7 +120,7 @@ export interface VoiceDeps {
    *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was. */
   addCommand: (terminalId: string, command: string) => void;
   ai: GoogleGenAI;
-  boundLiveConnector: (ai: GoogleGenAI, params: any) => Promise<any>;
+  boundLiveConnector: (ai: GoogleGenAI, params: any, key?: string | null) => Promise<any>;
   boundSessionAiFactory: (key: string, fallback: GoogleGenAI) => GoogleGenAI;
   /** The shared gating/safety core (dec-4). The voice path consumes the SAME pending stores + resolver. */
   gating: Gating;
@@ -140,6 +140,10 @@ export interface VoiceDeps {
   // ── Auth seam (the WS connection guard) ──
   API_AUTH_TOKEN: string;
   getCookie: (cookieHeader: string | undefined, name: string) => string | null;
+  /** bead 9fz: register THIS connection's reconnect-nudge closure with server module scope so the
+   *  settings PUT (which sets a real Gemini key) can ask the live session to (re)connect. Optional so
+   *  existing test harnesses that build deps inline need not supply it. */
+  registerReconnectNudge?: (fn: (() => void) | null) => void;
 }
 
 /**
@@ -213,6 +217,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     toGeminiDeclarations,
     API_AUTH_TOKEN,
     getCookie,
+    registerReconnectNudge,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -689,6 +694,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // Initialize Gemini Live session (through the injectable seam so tests /
       // the offline simulator can substitute a fake session). Uses the per-server snapshot
       // (boundLiveConnector) so a sibling test server's setLiveConnector cannot redirect us.
+      // bead 9fz: pass the RESOLVED sessionKey so the REAL connector can pre-validate a blank key and
+      // short-circuit BEFORE a keyless ai.live.connect() (1007). The mock connector ignores this arg.
       state.session = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
@@ -1004,7 +1011,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           declarations: toGeminiDeclarations(REGISTRY),
         }),
       },
-    });
+    }, sessionKey); // bead 9fz: 3rd arg = resolved key; the REAL connector short-circuits if blank.
 
       // PLM4 (2): IDENTITY GUARD on the just-resolved connect. The async connect could have raced the
       // operator leaving (wsClosed) or a newer session winning the hoist. If so, this freshly-minted
@@ -1191,6 +1198,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       } catch { /* client gone */ }
     }
 
+    // bead 9fz (part 2): register THIS connection's reconnect-nudge so a settings PUT that sets a real
+    // Gemini key can resume voice WITHOUT a page reload. Recovery only — if a session is already live
+    // there is nothing to do. Otherwise reset the bounded-retry budget (a fresh key is a fresh chance,
+    // not a continuation of the failed attempts) and schedule one immediate connect. No-op if the
+    // operator already left (scheduleReconnect re-checks wsClosed).
+    registerReconnectNudge?.(() => {
+      if (state.wsClosed) return;
+      if (coreState.activeLiveSession) return; // already connected — no nudge needed.
+      state.reconnectAttempts = 0;
+      if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+      scheduleReconnect();
+    });
+
     clientWs.on("message", async (data) => {
       try {
         const msg = JSON.parse(data.toString());
@@ -1250,6 +1270,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
     clientWs.on("close", () => {
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
+      // bead 9fz: the operator left — unregister this connection's reconnect-nudge so a later settings
+      // PUT can't poke a dead connection's scheduler. (A fresh connection re-registers its own.)
+      registerReconnectNudge?.(null);
       // PLM4 (2): the operator left — cancel any pending reconnect attempt (no reconnect storm after
       // the WS closes). scheduleReconnect also re-checks wsClosed, so this is belt-and-suspenders.
       clearReconnectTimer();
