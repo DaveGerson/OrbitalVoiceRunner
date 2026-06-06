@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
-import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, AttentionItem, WatchRule, Plan } from "./types";
+import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, Plan } from "./types";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
@@ -15,7 +15,7 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Bell, BellOff, Play, Square, Activity, Tv, Flame, Zap, Send, Pencil, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
@@ -108,31 +108,13 @@ function AppRaw() {
   const [selectedHistoryEntry, setSelectedHistoryEntry] = useState<{ command: string; timestamp: string; output: string } | null>(null);
   const [hoveredTermId, setHoveredTermId] = useState<string | null>(null);
 
-  // --- Advanced Orchestration & Alerts States ---
-  const [attentionQueue, setAttentionQueue] = useState<AttentionItem[]>([]);
-  const [watchRules, setWatchRules] = useState<WatchRule[]>([]);
+  // --- Plans state (voice/backend path; the Orchestrate & Alerts GUI tabs were removed) ---
   const [plans, setPlans] = useState<Plan[]>([]);
-  const [recipes, setRecipes] = useState<any[]>([]);
+  // browserNotificationsEnabled gates triggerDesktopNotification(), which still fires for the
+  // surviving approval / action-pending / auto-approve / blocked notifications. Auto-enabled at
+  // boot when Notification.permission is already "granted". The manual toggle lived in the removed
+  // Alerts tab; desktop notifications now follow the browser's existing permission grant.
   const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = useState(false);
-  const [activeRightHelperTab, setActiveRightHelperTab] = useState<"buffer" | "orchestration" | "alerts">("buffer");
-  const prevUnreadCountRef = useRef(0);
-
-  // Form states for Watch Rules
-  const [watchTriggerTermId, setWatchTriggerTermId] = useState("");
-  const [watchTriggerTransition, setWatchTriggerTransition] = useState<"idle" | "prompt" | "error" | "build-failed" | "exited">("idle");
-  const [watchActionTermId, setWatchActionTermId] = useState("");
-  const [watchActionCommand, setWatchActionCommand] = useState("");
-
-  // Context handoff tool states
-  const [handoffSourceTermId, setHandoffSourceTermId] = useState("");
-  const [handoffTargetTermId, setHandoffTargetTermId] = useState("");
-  const [handoffNotes, setHandoffNotes] = useState("");
-  const [isHandoffRunning, setIsHandoffRunning] = useState(false);
-
-  // CLI Multi-Surface Broadcast States
-  const [broadcastCmd, setBroadcastCmd] = useState("");
-  const [broadcastTargetIds, setBroadcastTargetIds] = useState<string[]>([]);
-  const [isBroadcastRunning, setIsBroadcastRunning] = useState(false);
 
   // Archive panel states
   const [archive, setArchive] = useState<any[]>([]);
@@ -254,22 +236,6 @@ function AppRaw() {
       try {
         new Notification(title, { body });
       } catch (e) {}
-    }
-  };
-
-  const handleToggleNotifications = async () => {
-    if (typeof window !== "undefined" && "Notification" in window) {
-      if (Notification.permission !== "granted") {
-        const res = await Notification.requestPermission();
-        if (res === "granted") {
-          setBrowserNotificationsEnabled(true);
-          playEarcon("success");
-        } else {
-          setBrowserNotificationsEnabled(false);
-        }
-      } else {
-        setBrowserNotificationsEnabled(prev => !prev);
-      }
     }
   };
 
@@ -645,28 +611,6 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const fetchAttentionQueue = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/attention");
-      if (res.ok) {
-        const data = await res.json();
-        setAttentionQueue(data);
-      }
-    } catch (e) {}
-  };
-
-  const fetchWatchRules = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/watch-rules");
-      if (res.ok) {
-        const data = await res.json();
-        setWatchRules(data);
-      }
-    } catch (e) {}
-  };
-
   const fetchPlans = async () => {
     if (isMockModeRef.current) return;
     try {
@@ -674,17 +618,6 @@ function AppRaw() {
       if (res.ok) {
         const data = await res.json();
         setPlans(data);
-      }
-    } catch (e) {}
-  };
-
-  const fetchRecipes = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/recipes");
-      if (res.ok) {
-        const data = await res.json();
-        setRecipes(data);
       }
     } catch (e) {}
   };
@@ -744,50 +677,6 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const handleDismissAttention = async (id: string) => {
-    try {
-      await apiFetch(`/api/attention/${id}/dismiss`, { method: "POST" });
-      fetchAttentionQueue();
-      playEarcon("execute");
-    } catch (e) {}
-  };
-
-  const handleClearAllAttention = async () => {
-    try {
-      await apiFetch("/api/attention/clear", { method: "POST" });
-      fetchAttentionQueue();
-      playEarcon("success");
-    } catch (e) {}
-  };
-
-  const handleCreateWatchRule = async () => {
-    if (!watchTriggerTermId || !watchActionTermId || !watchActionCommand) return;
-    try {
-      await apiFetch("/api/watch-rules", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          triggerTerminalId: watchTriggerTermId,
-          triggerTransition: watchTriggerTransition,
-          actionTerminalId: watchActionTermId,
-          actionCommand: watchActionCommand,
-          oneShot: true
-        })
-      });
-      fetchWatchRules();
-      playEarcon("success");
-      setWatchActionCommand("");
-    } catch (e) {}
-  };
-
-  const handleDeleteWatchRule = async (id: string) => {
-    try {
-      await apiFetch(`/api/watch-rules/${id}`, { method: "DELETE" });
-      fetchWatchRules();
-      playEarcon("execute");
-    } catch (e) {}
-  };
-
   const handleExecutePlan = async (id: string) => {
     try {
       await apiFetch(`/api/plans/${id}/execute`, { method: "POST" });
@@ -804,116 +693,12 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const handleApplyRecipe = async (recipeId: string) => {
-    try {
-      // G6: /api/recipes/apply is now gated. A whole-layout apply_recipe=Off returns 403 (no panes
-      // spawned). A 200 may still carry blocked/deferred panes in its body — that is a success render
-      // (some panes spawned, deferred ones surface via the existing action_pending chip path).
-      const res = await apiFetch("/api/recipes/apply", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ recipeId })
-      });
-      if (res.status === 403) {
-        playEarcon("alert"); // whole-layout gated Off (NO "error" earcon token exists)
-        return;
-      }
-      fetchTerminals();
-      fetchLedger();
-      playEarcon("success");
-    } catch (e) {}
-  };
-
-  const handleExecuteHandoff = async () => {
-    if (!handoffSourceTermId || !handoffTargetTermId) return;
-    setIsHandoffRunning(true);
-    try {
-      const res = await apiFetch("/api/handoff", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sourcePaneId: handoffSourceTermId,
-          targetPaneId: handoffTargetTermId,
-          contextNotes: handoffNotes || "Aggregate summary context handoff"
-        })
-      });
-      if (res.ok) {
-        playEarcon("success");
-        setHandoffNotes("");
-      }
-    } catch (e) {
-    } finally {
-      setIsHandoffRunning(false);
-    }
-  };
-
-  const handleExecuteBroadcast = async () => {
-    if (!broadcastCmd.trim() || broadcastTargetIds.length === 0) return;
-    setIsBroadcastRunning(true);
-    let successCount = 0;
-    try {
-      for (const targetId of broadcastTargetIds) {
-        const res = await apiFetch(`/api/terminals/${targetId}/input`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: broadcastCmd })
-        });
-        if (res.ok) {
-          successCount++;
-        }
-      }
-      if (successCount > 0) {
-        playEarcon("execute");
-        setBroadcastCmd("");
-      }
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsBroadcastRunning(false);
-    }
-  };
-
-  const handleTriggerSpokenDigest = () => {
-    const unread = attentionQueue.filter(item => !item.dismissed);
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-      let text = "";
-      if (unread.length === 0) {
-        text = "All systems reporting clear. There are no pending alerts in the attention queue.";
-      } else {
-        text = `Attention operator. There are ${unread.length} pending items requiring triage. `;
-        unread.forEach((item, index) => {
-          text += `Item ${index + 1}: Node ${item.terminalId} has experienced an attention trigger with message ${item.message}. `;
-        });
-      }
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.05;
-      window.speechSynthesis.speak(utterance);
-      playEarcon("chime");
-    }
-  };
-
-  // Earcon Alert Trigger sound effect monitor
-  useEffect(() => {
-    const unread = attentionQueue.filter(item => !item.dismissed);
-    const prev = prevUnreadCountRef.current;
-    if (unread.length > prev) {
-      playEarcon("alert");
-      const latest = unread[unread.length - 1];
-      triggerDesktopNotification("⚠️ Attention Queue Action Needed", `${latest.terminalId.toUpperCase()}: ${latest.message}`);
-    }
-    prevUnreadCountRef.current = unread.length;
-  }, [attentionQueue]);
-
   useEffect(() => {
     fetchTerminals();
     fetchLedger();
     fetchSettings();
     fetchPendingCommands();
-    fetchAttentionQueue();
-    fetchWatchRules();
     fetchPlans();
-    fetchRecipes();
     fetchActiveDraft(); // Step 6: load the active pane's WIP draft (no-op until a pane is open)
     fetchWipDrafts();
     fetchArchive(); // feat/local-testing: load the recoverable pane archive
@@ -932,8 +717,6 @@ function AppRaw() {
     const interval = setInterval(() => {
       fetchTerminals();
       fetchPendingCommands();
-      fetchAttentionQueue();
-      fetchWatchRules();
       fetchPlans();
     }, 20000);
     return () => clearInterval(interval);
@@ -1492,9 +1275,10 @@ function AppRaw() {
           const effect = effectForEvent(msg);
           if (effect) {
             switch (effect.setter) {
-              case "setAttentionQueue": setAttentionQueue(msg.queue); break;
+              // setAttentionQueue / setWatchRules cases removed with the Alerts & Orchestrate GUI
+              // tabs (those states no longer exist in the client); the server still emits the
+              // events, they are simply no-ops here now.
               case "setPlans": setPlans(msg.plans); break;
-              case "setWatchRules": setWatchRules(msg.watchRules); break;
               case "fetchTerminals": fetchTerminals(); break;
               case "fetchPlans": fetchPlans(); break;
               case "noop": break;
@@ -2310,22 +2094,18 @@ function AppRaw() {
     );
   };
 
+  // Single-surface helper header. The Orchestrate & Alerts tabs were removed, leaving Sync Spec as
+  // the sole right-panel surface, so the tab-bar chrome collapses to a plain titled header (a
+  // one-tab tab bar is an anti-pattern). The draft-pending badge (sync-spec-draft-badge) is
+  // preserved — it is asserted by e2e/draft_badge.spec.ts and reflects real composer/WIP state.
   const renderHelperPanelTabs = () => {
-    const unreadCount = attentionQueue.filter(item => !item.dismissed).length;
     // U3: a draft is pending if the active-pane buffer holds non-whitespace text OR any pane has a
     // staged WIP draft. Mirrors the composer-send enable gate (.trim()), unlike the legacy mobile
     // nav dot which gates on raw promptBuffer.length and ignores wipDrafts.
     const draftPending = promptBuffer.trim().length > 0 || wipDrafts.length > 0;
     return (
       <div className="flex bg-black/60 p-1 rounded-t border-t border-l border-r border-white/5 shrink-0 select-none">
-        <button
-          onClick={() => setActiveRightHelperTab("buffer")}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 relative uppercase ${
-            activeRightHelperTab === "buffer"
-              ? "border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04]"
-              : "border-transparent text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
+        <div className="flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider border-b-2 border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04] relative uppercase">
           <CheckSquare className="w-3.5 h-3.5" />
           <span>Sync Spec</span>
           {draftPending && (
@@ -2335,482 +2115,14 @@ function AppRaw() {
               className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse shrink-0"
             ></span>
           )}
-        </button>
-        <button
-          onClick={() => setActiveRightHelperTab("orchestration")}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 uppercase ${
-            activeRightHelperTab === "orchestration"
-              ? "border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04]"
-              : "border-transparent text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
-          <Zap className="w-3.5 h-3.5" />
-          <span>Orchestrate</span>
-        </button>
-        <button
-          onClick={() => setActiveRightHelperTab("alerts")}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider transition-colors border-b-2 relative uppercase ${
-            activeRightHelperTab === "alerts"
-              ? "border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04]"
-              : "border-transparent text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
-          <Bell className="w-3.5 h-3.5" />
-          <span>Alerts</span>
-          {unreadCount > 0 && (
-            <span className="bg-red-500 text-black font-sans font-black text-[8px] h-4 min-w-4 px-1 rounded-full flex items-center justify-center animate-pulse">
-              {unreadCount}
-            </span>
-          )}
-        </button>
+        </div>
       </div>
     );
   };
 
   const renderHelperPanelContent = () => {
-    if (activeRightHelperTab === "buffer") {
-      return renderPromptSynchronizerPanel();
-    }
-
-    if (activeRightHelperTab === "alerts") {
-      const unreadAlerts = attentionQueue.filter(item => !item.dismissed);
-      return (
-        <div className="flex-1 flex flex-col bg-[#060606] border border-white/5 rounded-b-lg overflow-hidden h-full">
-          {/* Header Controls */}
-          <div className="p-3 bg-white/[0.02] border-b border-white/5 flex items-center justify-between shrink-0 select-none">
-            <span className="text-[10px] font-mono font-bold tracking-widest text-zinc-400 uppercase">Attention Triage Console</span>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleToggleNotifications}
-                className={`p-1 hover:bg-white/5 rounded transition-all flex items-center justify-center border ${
-                  browserNotificationsEnabled ? "border-cyan-500/20 text-cyan-400 bg-cyan-500/5" : "border-white/5 text-zinc-500"
-                }`}
-                title={browserNotificationsEnabled ? "Mute desktop notifications" : "Allow browser notifications"}
-              >
-                {browserNotificationsEnabled ? <Bell className="w-3.5 h-3.5 text-cyan-400" /> : <BellOff className="w-3.5 h-3.5 text-zinc-500" />}
-              </button>
-              {unreadAlerts.length > 0 && (
-                <button
-                  onClick={handleClearAllAttention}
-                  className="text-[8.5px] font-mono uppercase bg-red-500/10 hover:bg-red-500/15 text-red-400 border border-red-500/20 hover:border-red-500/30 px-2 py-1 rounded transition-colors"
-                >
-                  Clear All
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Helper Explanation strip */}
-          <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-[8.5px] text-zinc-400 font-mono leading-relaxed">
-            <span className="text-cyan-400 font-extrabold uppercase">Guardrails Hub:</span> View and authorize proposed agent actions. Gated by your effective permissions policy. Janus proposes, you authorize.
-          </div>
-
-          {/* Actionable Spoken Digest */}
-          <div className="p-3 bg-cyan-500/[0.02] border-b border-white/5">
-            <button
-              onClick={handleTriggerSpokenDigest}
-              className="w-full py-2 bg-cyan-500/10 hover:bg-cyan-500/15 border border-cyan-500/20 text-cyan-400 rounded text-[9.5px] font-mono uppercase tracking-[0.15em] font-extrabold flex items-center justify-center gap-2 active:scale-95 transition-all"
-            >
-              <Mic className="w-3.5 h-3.5 shrink-0 animate-pulse text-cyan-400" />
-              Podcast Spoken Advisor Summary
-            </button>
-            <p className="text-[8.5px] text-zinc-150 font-mono mt-1 px-1 text-center font-bold">
-              Audibly reads out all outstanding alerts needing human verification.
-            </p>
-          </div>
-
-          {/* Alert list - oldest first triage list */}
-          <div className="flex-1 p-3 overflow-y-auto space-y-2 max-h-[500px] scrollbar-thin">
-            {unreadAlerts.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center p-6 text-center select-none mt-12">
-                <div className="w-8 h-8 rounded-full border border-dashed border-zinc-700 text-zinc-650 flex items-center justify-center font-mono font-bold text-xs mb-3">✓</div>
-                <div className="text-[9.5px] font-mono bg-green-500/10 text-green-400 border border-green-500/20 px-3 py-1.5 rounded uppercase tracking-wider font-extrabold animate-bounce">
-                  System Guard Normal. No Alerts.
-                </div>
-                <p className="text-[8.5px] text-zinc-555 font-mono mt-2 leading-relaxed">
-                  Automatic state transition watch-signals are active on all panes.
-                </p>
-              </div>
-            ) : (
-              unreadAlerts.map((item) => {
-                const ageSec = Math.floor((Date.now() - new Date(item.timestamp).getTime()) / 1000);
-                const ageText = ageSec < 60 ? `${ageSec}s ago` : `${Math.floor(ageSec / 60)}m ago`;
-                let badgeClass = "bg-zinc-800 text-zinc-400 border-zinc-750";
-                if (item.type === "error" || item.type === "build-failed") badgeClass = "bg-red-500/10 text-red-500 border-red-500/20";
-                if (item.type === "approval") badgeClass = "bg-amber-500/10 text-amber-500 border-amber-500/20";
-                if (item.type === "exited") badgeClass = "bg-orange-500/10 text-orange-400 border-orange-500/20";
-
-                return (
-                  <div key={item.id} className="p-3 bg-black/60 border border-white/5 rounded-md font-mono text-[10.5px] flex flex-col justify-between hover:border-white/10 transition-colors animate-in slide-in-from-bottom-2 duration-200">
-                    <div className="flex justify-between items-start gap-2">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-[9px] bg-cyan-950 border border-cyan-400/30 text-cyan-400 px-1.5 py-0.2 rounded font-bold uppercase select-none font-sans">
-                          {item.terminalId}
-                        </span>
-                        <span className={`text-[8.5px] border px-1.5 py-0.2 rounded font-bold uppercase select-none font-sans ${badgeClass}`}>
-                          {item.type}
-                        </span>
-                      </div>
-                      <span className="text-[8.5px] text-zinc-650 select-none shrink-0">{ageText}</span>
-                    </div>
-
-                    <p className="text-zinc-300 text-[10.5px] mt-2 bg-black/40 p-2 border border-white/5 rounded break-words leading-relaxed selection:bg-cyan-500/30 font-bold">
-                      {item.message}
-                    </p>
-
-                    <div className="flex justify-end pt-2 mt-2 border-t border-white/[0.04]">
-                      <button
-                        onClick={() => handleDismissAttention(item.id)}
-                        className="text-[8.5px] text-cyan-400/80 hover:text-cyan-400 px-2.5 py-1 border border-cyan-400/20 rounded hover:bg-cyan-500/[0.05] cursor-pointer font-extrabold"
-                      >
-                        [TRIAGED / DISMISS]
-                      </button>
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </div>
-      );
-    }
-
-    if (activeRightHelperTab === "orchestration") {
-      const activeTermNames = terminals.map(t => t.id);
-
-      const toggleBroadcastTarget = (id: string) => {
-        setBroadcastTargetIds(prev => 
-          prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
-        );
-      };
-
-      const selectAllBroadcastTargets = () => {
-        setBroadcastTargetIds(activeTermNames);
-      };
-
-      const deselectAllBroadcastTargets = () => {
-        setBroadcastTargetIds([]);
-      };
-
-      return (
-        <div className="flex-1 flex flex-col bg-[#060606] border border-white/5 rounded-b-lg overflow-hidden h-full max-h-[80vh] overflow-y-auto scrollbar-thin p-3.5 space-y-6">
-          
-          {/* Helper Explanation strip */}
-          <div className="p-3 bg-cyan-950/10 border border-cyan-500/10 rounded text-[9px] text-[#e4e4e7] font-mono leading-relaxed select-none">
-            <span className="text-cyan-400 font-extrabold uppercase font-bold">Synergy Console:</span> Align workspace templates, bridge contexts, and broadcast real-time terminal inputs across multiple active CLI surfaces concurrently.
-          </div>
-
-          {/* SECTION 1: Unified Multi-Surface Broadcaster */}
-          <div className="bg-black/30 border border-white/5 p-3 rounded-lg space-y-3">
-            <div className="flex items-center gap-2 border-b border-white/5 pb-1.5 select-none">
-              <TermIcon className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-              <h4 className="text-[10px] tracking-widest text-[#d4d4d8] font-bold uppercase font-mono">Multi-Pane CLI Broadcaster</h4>
-            </div>
-
-            <p className="text-[8.5px] text-zinc-500 font-mono leading-normal font-bold">
-              Broadcast standard command lines to multiple selected terminals simultaneously. Perfect for rapid dependency installs or global testing.
-            </p>
-
-            <div className="flex flex-col gap-2">
-              <input
-                type="text"
-                placeholder="Type command (e.g. npm run test)..."
-                value={broadcastCmd}
-                onChange={(e) => setBroadcastCmd(e.target.value)}
-                className="bg-black border border-white/10 rounded px-2.5 py-1.5 text-[9.5px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 selection:bg-cyan-500/30 font-bold"
-              />
-
-              {/* Quick CLI Presets */}
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="text-[8px] text-zinc-550 uppercase mr-1 select-none">Presets:</span>
-                {[
-                  "npm run test",
-                  "git status",
-                  "npm run lint",
-                  "npm run dev",
-                  "npm install",
-                  "node -v"
-                ].map((preset) => (
-                  <button
-                    key={preset}
-                    onClick={() => setBroadcastCmd(preset)}
-                    className="text-[8.5px] font-mono text-zinc-400 bg-white/5 border border-white/5 hover:border-cyan-500/35 hover:bg-cyan-500/5 px-1.5 py-0.5 rounded cursor-pointer transition-colors"
-                  >
-                    {preset}
-                  </button>
-                ))}
-              </div>
-
-              {/* Selectors */}
-              <div className="bg-black/50 border border-white/5 rounded-md p-2 space-y-1.5">
-                <div className="flex justify-between items-center border-b border-white/[0.04] pb-1 select-none">
-                  <span className="text-[8px] text-zinc-500 uppercase font-bold">Target Workspace Panes</span>
-                  <div className="flex gap-2">
-                    <button onClick={selectAllBroadcastTargets} className="text-[8px] text-cyan-400 hover:text-cyan-300 uppercase cursor-pointer">All</button>
-                    <button onClick={deselectAllBroadcastTargets} className="text-[8px] text-zinc-500 hover:text-zinc-400 uppercase cursor-pointer">None</button>
-                  </div>
-                </div>
-
-                {activeTermNames.length === 0 ? (
-                  <div className="text-[8.5px] text-zinc-650 italic py-1 text-center font-mono select-none">No active terminal panes to broadcast to.</div>
-                ) : (
-                  <div className="flex flex-wrap gap-1.5 pt-1">
-                    {activeTermNames.map(tid => {
-                      const isSelected = broadcastTargetIds.includes(tid);
-                      return (
-                        <button
-                          key={tid}
-                          onClick={() => toggleBroadcastTarget(tid)}
-                          className={`text-[8.5px] font-mono px-2 py-0.5 border rounded cursor-pointer uppercase transition-all flex items-center gap-1 font-bold select-none ${
-                            isSelected
-                              ? "bg-cyan-500/10 border-cyan-400 text-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.15)]"
-                              : "bg-black border-white/5 text-zinc-500 hover:text-zinc-300 hover:border-white/10"
-                          }`}
-                        >
-                          <span className={`w-1 h-1 rounded-full ${isSelected ? "bg-cyan-400 animate-ping" : "bg-zinc-600"}`} />
-                          {tid.toUpperCase()}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <button
-                onClick={handleExecuteBroadcast}
-                disabled={isBroadcastRunning || !broadcastCmd.trim() || broadcastTargetIds.length === 0}
-                className="w-full mt-1.5 py-1.5 bg-cyan-500 text-black font-mono font-extrabold text-[9px] uppercase tracking-wider rounded cursor-pointer hover:bg-cyan-400 disabled:opacity-[0.25] transition-all flex items-center justify-center gap-1.5"
-              >
-                {isBroadcastRunning ? (
-                  <>
-                    <RefreshCw className="w-3 h-3 animate-spin" />
-                    Broadcasting CLI Payload...
-                  </>
-                ) : (
-                  <>
-                    <Send className="w-3 h-3" />
-                    Execute Broadcast to Selected [{broadcastTargetIds.length}] Terminals
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-
-          {/* SECTION 2: 1-Click Workspace Align Templates */}
-          <div className="bg-black/30 border border-white/5 p-3 rounded-lg space-y-3">
-            <div className="flex items-center gap-2 border-b border-white/5 pb-1.5 select-none">
-              <Sparkles className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-              <h4 className="text-[10px] tracking-widest text-[#d4d4d8] font-bold uppercase font-mono">Workspace Prep Templates</h4>
-            </div>
-
-            <p className="text-[8.5px] text-zinc-500 font-mono leading-normal font-bold">
-              Instantly layout, spawn, and align specialized console environments with single clicks.
-            </p>
-
-            <div className="grid grid-cols-1 gap-2">
-              {recipes.length === 0 ? (
-                <div className="text-[8.5px] text-zinc-650 italic py-1 font-mono">No suites registered in config workspace.</div>
-              ) : (
-                recipes.map(rec => (
-                  <div key={rec.id} className="p-2.5 bg-black/40 border border-white/5 rounded-md hover:border-cyan-500/20 transition-all group">
-                    <div className="flex justify-between items-center">
-                      <div className="flex flex-col">
-                        <span className="text-[10px] font-bold text-white font-mono uppercase tracking-wide">{rec.name}</span>
-                        <p className="text-[8.5px] text-[#b4b4b4] mt-0.5 leading-normal font-sans">{rec.description}</p>
-                      </div>
-                      <button
-                        onClick={() => handleApplyRecipe(rec.id)}
-                        className="text-[8.5px] font-mono text-cyan-400 group-hover:text-black group-hover:bg-cyan-400 border border-cyan-400/25 px-2 py-1 rounded transition-all font-extrabold uppercase shrink-0 cursor-pointer"
-                      >
-                        ALIGN
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* SECTION 3: Terminal-To-Terminal Context Bridge */}
-          <div className="bg-black/30 border border-white/5 p-3 rounded-lg space-y-3">
-            <div className="flex items-center gap-2 border-b border-white/5 pb-1.5 select-none">
-              <Layers className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-              <h4 className="text-[10px] tracking-widest text-[#d4d4d8] font-bold uppercase font-mono">Terminal-To-Terminal Context Bridge</h4>
-            </div>
-
-            {activeTermNames.length < 2 ? (
-              <div className="p-2.5 border border-[#f59e0b]/10 bg-[#f59e0b]/[0.02] rounded text-[8.5px] text-amber-300 font-mono leading-normal select-none">
-                ⚠️ Requirement: Requires at least 2 active node panes to perform context transfer. Launch more node processes to unlock.
-              </div>
-            ) : (
-              <div className="space-y-2 select-none">
-                <p className="text-[8.5px] text-zinc-500 font-mono leading-normal font-bold">
-                  Extract and synthesize terminal history landmarks from a source surface, package its state, and bridge/inject into a target terminal process.
-                </p>
-                <div className="grid grid-cols-2 gap-2 mt-1">
-                  <div className="flex flex-col">
-                    <label className="text-[8px] text-zinc-555 uppercase mb-1 font-bold">Source Pane</label>
-                    <select
-                      value={handoffSourceTermId}
-                      onChange={(e) => setHandoffSourceTermId(e.target.value)}
-                      className="bg-black border border-white/10 rounded px-1.5 py-1 text-[9.5px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 cursor-pointer font-bold"
-                    >
-                      <option value="">Source</option>
-                      {activeTermNames.map(tid => <option key={tid} value={tid}>{tid.toUpperCase()}</option>)}
-                    </select>
-                  </div>
-                  <div className="flex flex-col">
-                    <label className="text-[8px] text-zinc-555 uppercase mb-1 font-bold">Target Pane</label>
-                    <select
-                      value={handoffTargetTermId}
-                      onChange={(e) => setHandoffTargetTermId(e.target.value)}
-                      className="bg-black border border-white/10 rounded px-1.5 py-1 text-[9.5px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 cursor-pointer font-mono font-bold"
-                    >
-                      <option value="">Target</option>
-                      {activeTermNames.filter(tid => tid !== handoffSourceTermId).map(tid => <option key={tid} value={tid}>{tid.toUpperCase()}</option>)}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex flex-col">
-                  <label className="text-[8px] text-zinc-555 uppercase mb-1 font-bold">Focus Instructions or Context Goals</label>
-                  <textarea
-                    placeholder="Prime targets with current test error logs and summarize code dependencies..."
-                    value={handoffNotes}
-                    onChange={(e) => setHandoffNotes(e.target.value)}
-                    className="bg-black border border-white/10 rounded px-2.5 py-1.5 text-[9.5px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 h-14 resize-none leading-relaxed overflow-y-auto selection:bg-cyan-500/30 font-bold"
-                  />
-                </div>
-
-                <button
-                  onClick={handleExecuteHandoff}
-                  disabled={isHandoffRunning || !handoffSourceTermId || !handoffTargetTermId}
-                  className="w-full mt-1 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[8.5px] font-mono uppercase tracking-wider font-bold disabled:opacity-[0.25] transition-all flex items-center justify-center gap-1 cursor-pointer"
-                >
-                  {isHandoffRunning ? "Compressing Context..." : "Inject Bridge Context Data"}
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* SECTION 4: Autonomous Watch Guardians */}
-          <div className="bg-black/30 border border-white/5 p-3 rounded-lg space-y-3">
-            <div className="flex items-center gap-2 border-b border-white/5 pb-1.5 select-none">
-              <Tv className="w-3.5 h-3.5 text-cyan-400" />
-              <h4 className="text-[10px] tracking-widest text-[#d4d4d8] font-bold uppercase font-mono">Autonomous Watch Guardians</h4>
-            </div>
-
-            <div className="space-y-2">
-              {watchRules.length === 0 ? (
-                <div className="p-2.5 text-center border border-dashed border-white/5 rounded text-zinc-650 text-[9px] italic font-mono font-bold select-none">
-                  No active autonomous watch rules registered.
-                </div>
-              ) : (
-                watchRules.map(rule => (
-                  <div key={rule.id} className="p-2 bg-black/40 border border-white/5 rounded font-mono text-[9px] flex justify-between items-center transition-all hover:bg-black/60 hover:border-white/10 select-none">
-                    <div className="flex-1 min-w-0 pr-2">
-                      <div className="flex flex-wrap items-center gap-1">
-                        <span className="text-[8px] font-bold text-zinc-400 uppercase">IF Node [</span>
-                        <span className="text-cyan-400 uppercase font-bold">{rule.triggerTerminalId}</span>
-                        <span className="text-[8px] text-zinc-400 uppercase">] gets</span>
-                        <span className="bg-amber-500/10 text-amber-400 px-1 py-0.2 rounded text-[7px] uppercase font-bold border border-amber-500/10 animate-pulse">
-                          {rule.triggerTransition}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1 mt-1 font-mono text-[8.5px] text-zinc-500">
-                        <span>▶ THEN run inside [</span>
-                        <span className="text-zinc-300 font-bold uppercase">{rule.actionTerminalId}</span>
-                        <span>]:</span>
-                        <span className="text-zinc-400 italic truncate max-w-[120px] ml-1 select-all">{rule.actionCommand}</span>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => handleDeleteWatchRule(rule.id)}
-                      className="text-zinc-600 hover:text-red-400 p-1 cursor-pointer shrink-0"
-                      title="De-register listener watch rule"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                ))
-              )}
-
-              {/* Creator Wizard Form widget */}
-              {activeTermNames.length > 0 && (
-                <div className="bg-[#0b0b0b] border border-white/5 rounded-md p-3 space-y-2 mt-2 select-none">
-                  <span className="text-[8px] font-bold uppercase tracking-wider text-zinc-400 block border-b border-white/5 pb-1">Register Watch-Trigger Guardian</span>
-                  
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="flex flex-col">
-                      <label className="text-[8px] text-zinc-550 uppercase mb-0.5 font-bold">Trigger Node</label>
-                      <select
-                        value={watchTriggerTermId}
-                        onChange={(e) => setWatchTriggerTermId(e.target.value)}
-                        className="bg-black border border-white/10 rounded px-1.5 py-1 text-[9px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 cursor-pointer font-bold"
-                      >
-                        <option value="">Select Trigger</option>
-                        {activeTermNames.map(tid => <option key={tid} value={tid}>{tid.toUpperCase()}</option>)}
-                      </select>
-                    </div>
-
-                    <div className="flex flex-col">
-                      <label className="text-[8px] text-zinc-555 uppercase mb-0.5 font-bold">Condition</label>
-                      <select
-                        value={watchTriggerTransition}
-                        onChange={(e) => setWatchTriggerTransition(e.target.value as any)}
-                        className="bg-black border border-white/10 rounded px-1.5 py-1 text-[9px] text-zinc-400 font-mono focus:outline-none focus:border-cyan-500 cursor-pointer font-bold"
-                      >
-                        <option value="idle">idle</option>
-                        <option value="prompt">prompt</option>
-                        <option value="error">error</option>
-                        <option value="build-failed">build-failed</option>
-                        <option value="exited">exited</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="flex flex-col col-span-2">
-                      <label className="text-[8px] text-zinc-555 uppercase mb-0.5 font-bold">Execute Node</label>
-                      <select
-                        value={watchActionTermId}
-                        onChange={(e) => setWatchActionTermId(e.target.value)}
-                        className="bg-black border border-white/10 rounded px-1.5 py-1 text-[9px] text-zinc-300 font-mono focus:outline-none focus:border-cyan-500 cursor-pointer font-bold"
-                      >
-                        <option value="">Select Target</option>
-                        {activeTermNames.map(tid => <option key={tid} value={tid}>{tid.toUpperCase()}</option>)}
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col">
-                    <label className="text-[8px] text-zinc-555 uppercase mb-0.5 font-bold">Command Payload</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. npm run build"
-                      value={watchActionCommand}
-                      onChange={(e) => setWatchActionCommand(e.target.value)}
-                      className="bg-black border border-white/10 rounded px-2 py-1 text-[9px] text-zinc-305 font-mono focus:outline-none focus:border-cyan-500 selection:bg-cyan-500/30 font-bold"
-                    />
-                  </div>
-
-                  <button
-                    onClick={handleCreateWatchRule}
-                    disabled={!watchTriggerTermId || !watchActionTermId || !watchActionCommand}
-                    className="w-full mt-1 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[8.5px] font-mono uppercase tracking-wider font-bold disabled:opacity-[0.25] transition-all cursor-pointer"
-                  >
-                    + Register Watch Rule
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-        </div>
-      );
-    }
-
-    return null;
+    // Sync Spec is the sole remaining right-panel surface (Orchestrate & Alerts removed).
+    return renderPromptSynchronizerPanel();
   };
 
   return (
@@ -2964,7 +2276,7 @@ function AppRaw() {
           </div>
 
           {/* Glowing Header Telemetry Strip - simplified in simple mode unless alarms are active */}
-          {(!isSimpleMode || pendingCommands.length > 0 || attentionQueue.filter(item => !item.dismissed).length > 0) && (
+          {(!isSimpleMode || pendingCommands.length > 0) && (
             <div className="flex items-center gap-3 bg-black/60 px-3 py-1.5 rounded-lg border border-white/15 select-none font-mono">
               {/* Active workers indicator */}
               <div className="flex items-center gap-1.5">
@@ -2976,35 +2288,13 @@ function AppRaw() {
 
               <div className="w-px h-3 bg-white/10"></div>
 
-              {/* Verification trigger alerts */}
-              <div 
-                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
-                onClick={() => {
-                  setActiveRightHelperTab("alerts");
-                  playEarcon("chime");
-                }}
-                title="Click to view pending verification commands in Alerts queue"
-              >
+              {/* Verification pending count — passive indicator. The Alerts tab was removed, so this
+                  no longer navigates; it still reflects the live ApprovalDialog queue (pendingCommands),
+                  which renders independently. */}
+              <div className="flex items-center gap-1.5" title="Pending verification commands (approval queue)">
                 <span className={`w-1.5 h-1.5 rounded-full ${pendingCommands.length > 0 ? "bg-amber-500 shadow-[0_0_6px_#f59e0b] animate-ping" : "bg-zinc-700"}`}></span>
                 <span className={`text-[10px] font-extrabold uppercase ${pendingCommands.length > 0 ? "text-amber-400 font-black animate-pulse" : "text-zinc-500"}`}>
                   {pendingCommands.length} VERIFY
-                </span>
-              </div>
-
-              <div className="w-px h-3 bg-white/10"></div>
-
-              {/* Unread Alerts count */}
-              <div 
-                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all"
-                onClick={() => {
-                  setActiveRightHelperTab("alerts");
-                  playEarcon("chime");
-                }}
-                title="Click to view and triage live system attention alarms"
-              >
-                <span className={`w-1.5 h-1.5 rounded-full ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "bg-red-500 shadow-[0_0_6px_#ef4444] animate-pulse" : "bg-zinc-700"}`}></span>
-                <span className={`text-[10px] font-extrabold uppercase ${attentionQueue.filter(item => !item.dismissed).length > 0 ? "text-red-400 font-black animate-pulse" : "text-zinc-500"}`}>
-                  {attentionQueue.filter(item => !item.dismissed).length} ALERTS
                 </span>
               </div>
             </div>
@@ -3759,13 +3049,13 @@ function AppRaw() {
                 {/* Right Side: Synergy Surfaces Map */}
                 <div className="border-t xl:border-t-0 xl:border-l border-white/5 pt-4 xl:pt-0 xl:pl-6 flex flex-col justify-between gap-3">
                   <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 select-none">SYNERGY SURFACES DIRECTORY</span>
-                  
-                  {/* Three planes logic */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-1 gap-2.5">
+
+                  {/* Single surface: the Spec Buffer. The Orchestration & Alerts planes were removed
+                      along with their helper-panel tabs. */}
+                  <div className="grid grid-cols-1 gap-2.5">
                     {/* Plane 1: Spec Buffer */}
-                    <div 
+                    <div
                       onClick={() => {
-                        setActiveRightHelperTab("buffer");
                         if (window.innerWidth < 1024) setMobileActiveView("buffer");
                       }}
                       className="p-2.5 bg-black/40 border border-white/5 hover:border-cyan-500/20 hover:bg-cyan-500/[0.01] rounded-lg transition-all cursor-pointer flex items-center justify-between group select-none"
@@ -3781,56 +3071,6 @@ function AppRaw() {
                       </div>
                       <span className="text-[9px] font-mono px-1.5 py-0.5 bg-white/5 text-zinc-400 rounded uppercase">
                         {promptBuffer.length > 0 ? `${promptBuffer.length} Chars` : "Empty"}
-                      </span>
-                    </div>
-
-                    {/* Plane 2: Orchestration */}
-                    <div 
-                      onClick={() => {
-                        setActiveRightHelperTab("orchestration");
-                        if (window.innerWidth < 1024) setMobileActiveView("buffer");
-                      }}
-                      className="p-2.5 bg-black/40 border border-white/5 hover:border-cyan-500/20 hover:bg-cyan-500/[0.01] rounded-lg transition-all cursor-pointer flex items-center justify-between group select-none"
-                    >
-                      <div className="flex gap-2.5 items-center">
-                        <div className="p-1 rounded bg-[#121212] text-cyan-400 group-hover:text-white font-bold flex items-center justify-center">
-                          <Zap className="w-3.5 h-3.5" />
-                        </div>
-                        <div className="flex flex-col">
-                          <span className="text-[11px] font-mono text-zinc-200 font-bold leading-normal">Multi-Pane Orchestrate</span>
-                          <span className="text-[9px] text-zinc-500 leading-none">Apply Recipes & Step Sequences</span>
-                        </div>
-                      </div>
-                      <div className="flex gap-1">
-                        <span className="text-[9px] font-mono px-1.5 py-0.5 bg-white/5 text-zinc-400 rounded uppercase">
-                          {recipes.length} Presets
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Plane 3: Alerts Approval Gate */}
-                    <div 
-                      onClick={() => {
-                        setActiveRightHelperTab("alerts");
-                        if (window.innerWidth < 1024) setMobileActiveView("buffer");
-                      }}
-                      className={`p-2.5 bg-black/40 border hover:bg-cyan-500/[0.01] rounded-lg transition-all cursor-pointer flex items-center justify-between group select-none ${
-                        pendingCommands.length > 0 ? "border-amber-500 bg-amber-950/[0.04] hover:border-amber-400" : "border-white/5 hover:border-cyan-500/20"
-                      }`}
-                    >
-                      <div className="flex gap-2.5 items-center">
-                        <div className={`p-1 rounded bg-[#121212] flex items-center justify-center ${pendingCommands.length > 0 ? "text-amber-400" : "text-cyan-400 group-hover:text-white"}`}>
-                          <Bell className={`w-3.5 h-3.5 ${pendingCommands.length > 0 ? "animate-bounce" : ""}`} />
-                        </div>
-                        <div className="flex flex-col">
-                          <span className={`text-[11px] font-mono font-bold leading-normal ${pendingCommands.length > 0 ? "text-amber-400 animate-pulse" : "text-zinc-200"}`}>Guardrail Verify Desk</span>
-                          <span className="text-[9px] text-zinc-500 leading-none">Human-in-the-Loop Approval Queue</span>
-                        </div>
-                      </div>
-                      <span className={`text-[9.5px] font-mono font-bold px-1.5 py-0.5 rounded uppercase ${
-                        pendingCommands.length > 0 ? "bg-amber-500/20 text-amber-400 animate-pulse" : "bg-white/5 text-zinc-500"
-                      }`}>
-                        {pendingCommands.length} Pending
                       </span>
                     </div>
                   </div>
