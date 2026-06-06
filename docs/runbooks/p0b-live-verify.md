@@ -28,7 +28,7 @@ npx tsx --test tests/test_memory_live_verify.ts
 npm start
 ```
 
-Wait until the console prints `Janus server listening on :3000` (or your configured port).
+Wait until the console prints `Server running on http://localhost:3000` (or your configured port).
 
 Confirm the health endpoint shows the synthesizer state:
 
@@ -113,7 +113,7 @@ If the Python daemon is running, the value must still be `"python"`.
 2. Locate **Memory** > **Python synthesizer** (toggle labeled `memoryPythonEnabled` or similar).
 3. **Disable** it and save.
 4. **Stop the server** (Ctrl+C in the terminal running `npm start`).
-5. **Restart the server:** `npm start` — wait for `Janus server listening on :3000`.
+5. **Restart the server:** `npm start` — wait for `Server running on http://localhost:3000`.
 6. Switch the active pane back to **Pane A**.
 7. Wait 1-2 seconds.
 

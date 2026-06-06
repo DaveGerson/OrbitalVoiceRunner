@@ -371,7 +371,12 @@ export function SettingsDialog({
         if (parsed.advanced.capabilityGates !== undefined) setCapabilityGates(normalizeGateMap(parsed.advanced.capabilityGates));
         // P0b memory synthesizer settings round-trip.
         if (parsed.advanced.memoryPythonEnabled !== undefined) setMemoryPythonEnabled(!!parsed.advanced.memoryPythonEnabled);
-        if (parsed.advanced.memorySynthTimeoutMs !== undefined) setMemorySynthTimeoutMs(Number(parsed.advanced.memorySynthTimeoutMs));
+        if (parsed.advanced.memorySynthTimeoutMs !== undefined) {
+          // Clamp the JSON-tab path the same way the number input does (n > 0), so a raw 0/negative/NaN
+          // never round-trips into settings (a 0/NaN deadline would make synthesizeAsync fall back forever).
+          const n = Number(parsed.advanced.memorySynthTimeoutMs);
+          setMemorySynthTimeoutMs(Number.isFinite(n) && n > 0 ? n : 150);
+        }
       }
       if (parsed.secrets) {
         if (parsed.secrets.geminiApiKey !== undefined) setGeminiApiKey(parsed.secrets.geminiApiKey);
