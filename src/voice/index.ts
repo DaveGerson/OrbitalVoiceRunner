@@ -49,7 +49,7 @@ import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
-import type { ActionContext } from "../actions/types";
+import type { ActionContext, DispatchOutcome } from "../actions/types";
 import type { CapabilityGate } from "../types";
 import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
@@ -87,13 +87,9 @@ function pushAck(session: any, text: string): void {
   }
 }
 
-/** The single-sourced result shape returned by `dispatchProposal` (was a server-local `type`). */
-type DispatchOutcome =
-  | { kind: "executed"; text: string }
-  | { kind: "blocked"; text: string }
-  | { kind: "error"; text: string }
-  | { kind: "clarify"; text: string }
-  | { kind: "pending"; text: string };
+// DispatchOutcome (the result shape returned by `dispatchProposal`) is the single canonical type in
+// ../actions/types — imported above. The byte-identical local duplicate that used to live here was
+// removed in c55.16 (tech_debt_dispatchoutcome_dedup); both arms were always kept in lockstep by hand.
 
 /**
  * The voice session's injected dependency bag — everything the moved closures used from `startServer()`

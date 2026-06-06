@@ -74,6 +74,20 @@ export interface SetPanePermissionsParams { paneId: string; projectId: string; p
 export interface UpdateMetadataParams { op: "amend" | "delete"; noteId: string; text?: string; }
 /** Params captured by the close_pane closure (terminate + recoverable archive). */
 export interface ClosePaneParams { paneId: string; projectId?: string; }
+/**
+ * Params captured by the c55.10 remove_watch_rule closure (src/actions/defs/watch_rules.ts).
+ * `ruleId` is the WIDENED payload (the staging bag formerly carried only { origin, versionStamp }, so a
+ * confirm-after-restart could not reconstruct WHICH rule to splice). The id is bound at enqueue and the
+ * rebuilt effect splices exactly that rule across a restart (the idempotent re-find guard mirrors the
+ * def: a rule deleted between stage and confirm is a no-op, still narrates success).
+ */
+export interface RemoveWatchRuleParams { ruleId: string; }
+/**
+ * Params captured by the c55.10 delete_orchestrator_plan closure (src/actions/defs/watch_rules.ts).
+ * `planId` is the WIDENED payload (see RemoveWatchRuleParams). The rebuilt effect splices exactly that
+ * plan off the board across a restart (idempotent re-find guard mirrors the def).
+ */
+export interface DeleteOrchestratorPlanParams { planId: string; }
 
 /**
  * The serializable intent of a deferred action: capability + a capability-specific param bag, plus
@@ -247,6 +261,43 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
         return `Exiting and archiving pane ${p.paneId}. It's recoverable from the archive.`;
       };
     }
+    case "remove_watch_rule": {
+      // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
+      // removeEffect (src/actions/defs/watch_rules.ts:187-195) BYTE-IDENTICALLY — re-find by id (the
+      // idempotent guard: a rule deleted between stage and confirm is a no-op), splice, force-persist
+      // via ledger.save(true), broadcast watch_rules_updated with the CURRENT live array, return the
+      // EXACT confirm string. CRITICAL LOCKSTEP RULE (header §): keep in step with the def closure.
+      const p = intent.params as unknown as RemoveWatchRuleParams;
+      return () => {
+        const i = deps.manager.ledger.watchRules.findIndex((r: { id: string }) => r.id === p.ruleId);
+        if (i !== -1) {
+          deps.manager.ledger.watchRules.splice(i, 1);
+          deps.manager.ledger["save"](true);
+          deps.broadcast({ type: "watch_rules_updated", watchRules: deps.manager.ledger.watchRules });
+        }
+        return `Watch rule ${p.ruleId} removed.`;  // EXACT — matches watch_rules.ts:194
+      };
+    }
+    case "delete_orchestrator_plan": {
+      // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
+      // deleteEffect (src/actions/defs/watch_rules.ts:248-256) BYTE-IDENTICALLY — re-find by id
+      // (idempotent guard), splice off the board, force-persist via ledger.save(true), broadcast
+      // plans_updated with the CURRENT live array, return the EXACT confirm string.
+      const p = intent.params as unknown as DeleteOrchestratorPlanParams;
+      return () => {
+        const i = deps.manager.ledger.plans.findIndex((pl: { id: string }) => pl.id === p.planId);
+        if (i !== -1) {
+          deps.manager.ledger.plans.splice(i, 1);
+          deps.manager.ledger["save"](true);
+          deps.broadcast({ type: "plans_updated", plans: deps.manager.ledger.plans });
+        }
+        return `Plan ${p.planId} deleted.`;  // EXACT — matches watch_rules.ts:255
+      };
+    }
+    // NOTE: send_keys is DELIBERATELY absent (panes_rest.ts:222-225 accepted scope-out). Its effect
+    // re-fires term.writeInput straight to the LIVE PTY — a confirm-after-restart would re-send a
+    // keystroke to a possibly-different pane process, a product question, not a mechanical port. The
+    // rebuilt intent falls through to the no-op default below; tests/test_actionEffects.ts pins that.
     default:
       return () => `Cannot replay deferred action: unknown capability "${intent.capability}".`;
   }
