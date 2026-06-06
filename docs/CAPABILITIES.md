@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**73** actions across **20** gated capabilities, plus the always-allowed group.
+**78** actions across **20** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -18,8 +18,11 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `add_pane_context` | rest | no | Operator-UI |
 | `add_watch_rule` | rest | no | Create a watch-automation rule that fires a command on another pane when a trigger pane transitions |
+| `approve_pending_command` | rest | no | Approve or reject a pending spoken-command approval by messageId (approved=true approves, false rejects) |
+| `cancel_pending_action` | rest | no | Cancel (discard, no side effect) a pending NON-PTY deferred action by id |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
 | `clear_history` | rest | no | Clear a terminal pane's recorded command history |
+| `confirm_pending_action` | rest | no | Confirm (run) a pending NON-PTY deferred action by id |
 | `confirm_stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 2 (always allowed) |
 | `create_pane_note` | rest | no | Operator-UI |
 | `create_project_note` | rest | no | Operator-UI |
@@ -33,6 +36,8 @@ These bypass the capability gate entirely — they work even while the system is
 | `list_archived_panes` | rest | no | List archived (exited+cleared) panes for the UI restore tray (pane_id/name/project/preset/last_command/archived_at) |
 | `list_orchestration_recipes` | rest | no | Read the orchestration recipe templates (suggested multi-pane suites the UI offers) |
 | `list_orchestrator_plans` | rest | no | Read the multi-step orchestrator plans board (id/status/steps per plan) |
+| `list_pending_actions` | rest | no | List the pending NON-PTY deferred actions (gated-Ask staging) with their age |
+| `list_pending_commands` | rest | no | List the pending spoken-command approvals (the HiTL queue the ApprovalDialog renders) |
 | `list_watch_rules` | rest | no | List all configured watch-automation rules |
 | `read_project_notes` | rest | no | Operator-UI |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
