@@ -120,3 +120,41 @@ test("address/imperative overrides thinking-aloud marker => speak", () => {
   assert.strictEqual(shouldSpeak("so i'm thinking, run the tests now", ON).speak, true);
   assert.strictEqual(shouldSpeak("actually maybe stop everything", ON).speak, true);
 });
+
+// #8 (q4l) — DELIBERATION-PHRASED COMMANDS must SPEAK. A dev-action verb embedded after a musing
+// leader ("i think we should ship this") is STILL a command — the embedded-imperative check must hit
+// the concrete dev-action verb BEFORE the musing-leader mute fires. These over-muted before the q4l
+// IMPERATIVE_VERBS widening (ship/deploy/merge/fix/pull/push/commit/rebase/build/test/look/...).
+test("q4l: deliberation-phrased commands speak (over-mute fix)", () => {
+  for (const utter of [
+    "i think we should ship this",
+    "maybe we should look at pane two",
+    "actually maybe fix the bug",
+    "what if we just deploy",
+    "i guess we could merge it",
+    "what if we just rebase onto main",
+  ]) {
+    const d = shouldSpeak(utter, ON);
+    assert.strictEqual(d.speak, true, `deliberation-phrased command must speak: "${utter}" (got reason=${d.reason})`);
+    // Must speak via an EMBEDDED-IMPERATIVE hit (the safe path), not a new construction.
+    assert.ok(
+      d.reason.startsWith("imperative"),
+      `must speak via embedded imperative, not a broad construction: "${utter}" (reason=${d.reason})`,
+    );
+  }
+});
+
+// #9 (q4l guard) — GENUINE deliberation must STAY muted. Proves the q4l widening did NOT over-broaden
+// into a generic "we should <X>" / "lets <X>" => speak rule that would regress legitimate musings.
+test("q4l guard: genuine deliberation still mutes", () => {
+  assert.strictEqual(
+    shouldSpeak("yeah I agree, lets circle back with the team on that", ON).speak,
+    false,
+    "genuine deliberation 'circle back' must stay muted",
+  );
+  assert.strictEqual(
+    shouldSpeak("actually maybe we should reconsider the whole roadmap", ON).speak,
+    false,
+    "genuine deliberation 'reconsider the whole roadmap' must stay muted",
+  );
+});
