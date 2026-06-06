@@ -164,4 +164,61 @@ describe("POST /api/terminals/:id/raw-input (headless real server)", () => {
     running._testSetActivePane?.(null);
     delete running.manager.terminals["ri-shifttab"];
   });
+
+  // ── bead ym3: the raw-input ALLOWLIST (close the denylist-of-one) ──────────────────────────────
+  // A payload that is NOT one of the 11 vetted canonical keys must be REJECTED with 400 BEFORE any
+  // writeRaw — nothing reaches the transport. This is asserted AFTER the 400/404/409 checks: the
+  // pane is active + spawned, so the only thing stopping the write is the unrecognized-sequence guard.
+  for (const [label, bytes] of [
+    ["leading-space Ctrl+C (NOT canonical)", " \x03"],
+    ["doubled Ctrl+C", "\x03\x03"],
+    ["a full shell line", "rm -rf ~\r"],
+    ["Shift+Tab with trailing junk", "\x1b[Z "],
+  ] as Array<[string, string]>) {
+    it(`400 + NOTHING written for an unrecognized raw-key sequence: ${label}`, async () => {
+      const { term, writes } = spawnedPane("ri-unknown");
+      running.manager.terminals["ri-unknown"] = term;
+      running._testSetActivePane?.("ri-unknown"); // active + spawned: only the allowlist guard can stop it
+      const res = await api("/api/terminals/ri-unknown/raw-input", {
+        method: "POST",
+        body: JSON.stringify({ bytes }),
+      });
+      assert.strictEqual(res.status, 400, `${label} => 400 (unrecognized sequence)`);
+      const body = await res.json();
+      assert.strictEqual(body.error, "Unrecognized raw-key sequence", "exact error message");
+      assert.deepStrictEqual(writes, [], "the transport received NOTHING — the gate was never reached");
+      running._testSetActivePane?.(null);
+      delete running.manager.terminals["ri-unknown"];
+    });
+  }
+
+  // The flip side of the allowlist: each of the 11 canonical keys is still ACCEPTED. The always-
+  // allowed ones (everything but Shift+Tab) write verbatim and 200; Shift+Tab is gated (Auto on the
+  // active pane) and is exercised separately above. CRITICAL: the EXACT \x03 Ctrl+C must still pass.
+  for (const [label, bytes] of [
+    ["Up arrow", "\x1b[A"],
+    ["Down arrow", "\x1b[B"],
+    ["Right arrow", "\x1b[C"],
+    ["Left arrow", "\x1b[D"],
+    ["Enter", "\r"],
+    ["Tab", "\t"],
+    ["Esc", "\x1b"],
+    ["PgUp", "\x1b[5~"],
+    ["PgDn", "\x1b[6~"],
+    ["Ctrl+C (emergency brake — must STILL pass)", "\x03"],
+  ] as Array<[string, string]>) {
+    it(`canonical always-allowed key still passes verbatim (200): ${label}`, async () => {
+      const { term, writes } = spawnedPane("ri-canon");
+      running.manager.terminals["ri-canon"] = term;
+      running._testSetActivePane?.("ri-canon");
+      const res = await api("/api/terminals/ri-canon/raw-input", {
+        method: "POST",
+        body: JSON.stringify({ bytes }),
+      });
+      assert.strictEqual(res.status, 200, `${label} => 200 (still allowlisted)`);
+      assert.deepStrictEqual(writes, [bytes], `${label} bytes written verbatim, exactly once`);
+      running._testSetActivePane?.(null);
+      delete running.manager.terminals["ri-canon"];
+    });
+  }
 });

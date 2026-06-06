@@ -46,6 +46,24 @@ export function isBlankApiKey(key: string | null | undefined): boolean {
 }
 
 /**
+ * bead 9fz: whether a settings-PUT geminiApiKey value warrants nudging the live voice session to
+ * (re)connect. TRUE only for a real, usable key — so the operator who just pasted a key in Settings
+ * gets voice back WITHOUT a reload. We must NOT nudge on:
+ *   - a blank/whitespace key (isBlankApiKey) — there is nothing to connect with;
+ *   - the masked round-trip value the client echoes back (contains the "••••" bullet mask) — the PUT
+ *     handler already substitutes the stored key for it, so it is NOT a new credential;
+ *   - the "CONFIGURED_IN_ENV" sentinel — the env key is unchanged, no new connect intent.
+ * SECRET INVARIANT: this is a pure boolean decision; the key is never logged or persisted here.
+ */
+export function shouldNudgeReconnectOnSettingsKey(key: string | null | undefined): boolean {
+  if (isBlankApiKey(key)) return false;
+  const k = key as string;
+  if (k.includes("••••")) return false;        // the masked echo from GET /api/settings — not a new key
+  if (k === "CONFIGURED_IN_ENV") return false; // env-provided sentinel — nothing changed
+  return true;
+}
+
+/**
  * Default max age of a persisted resume handle before it is treated as expired and refused. Generous
  * on purpose — the onclose self-heal is the real recovery; this only spares the one wasted 1008
  * attempt at boot. A handle from the same conversation is always seconds old; one from a prior
