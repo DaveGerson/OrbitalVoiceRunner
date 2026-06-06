@@ -13,8 +13,9 @@ export const LEDGER_MIGRATED_KEY = "ledgerMigratedAt";
 
 /**
  * Boot-time, gated, idempotent migration. Imports the legacy JSON ledger into
- * `store` and renames the originals to `.bak` — but only once, and only if a
- * legacy ledger file actually exists. Returns true iff it performed the import.
+ * `store` and archives the ledger + history originals to `.bak` (the settings JSON
+ * is preserved in place — bug ahm) — but only once, and only if a legacy ledger
+ * file actually exists. Returns true iff it performed the import.
  *
  * The gate is the in-DB `LEDGER_MIGRATED_KEY` marker, so re-running the server
  * (or a stray reappearance of the .json) never re-imports stale data over the
@@ -83,13 +84,21 @@ function flatten(obj: any, prefix: string): [string, any][] {
   return out;
 }
 
-/** File-driven entry point: read JSON, import, then rename originals to .bak. */
+/** File-driven entry point: read JSON, import, then rename the LEDGER + HISTORY originals to .bak.
+ *  The settings JSON is left in place — see the rename loop below (bug ahm). */
 export function migrateFromJson(store: JanusStore, paths: MigrationPaths): void {
   const read = (p: string) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return undefined; } };
   migrateFromObjects(store, {
     ledger: read(paths.ledgerPath), settings: read(paths.settingsPath), history: read(paths.historyPath),
   });
-  for (const p of [paths.ledgerPath, paths.settingsPath, paths.historyPath]) {
+  // ahm fix: rename ONLY the ledger + history originals — they now live authoritatively in SQLite.
+  // The settings JSON is DELIBERATELY NOT renamed: OrchestratorManager.loadSettings reads
+  // .janus_settings.json as its source of truth post-migration, so archiving it to .bak dropped the
+  // operator's config (gates/presets/model) AND the legacy Gemini key on the first-migration boot
+  // (voice silently died). Non-secret settings are also imported into settings_kv above
+  // (redundant-but-harmless); the JSON stays authoritative for loadSettings. secrets.* is never
+  // imported into the store (in-memory-only hardening), so the key lives only in the JSON.
+  for (const p of [paths.ledgerPath, paths.historyPath]) {
     try { if (fs.existsSync(p)) fs.renameSync(p, `${p}.bak`); } catch {}
   }
 }

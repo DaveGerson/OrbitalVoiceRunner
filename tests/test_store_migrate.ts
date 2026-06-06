@@ -1,8 +1,11 @@
 // tests/test_store_migrate.ts
 import { test } from "node:test";
 import assert from "node:assert";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { JanusStore } from "../src/store/sqliteStore";
-import { migrateFromObjects } from "../src/store/migrate";
+import { migrateFromObjects, migrateFromJson } from "../src/store/migrate";
 
 test("migrateFromObjects is atomic: a mid-import failure leaves the DB empty", () => {
   const s = new JanusStore(":memory:"); s.init();
@@ -72,4 +75,37 @@ test("migrateFromObjects imports ledger + settings + history with no data loss",
   assert.equal(s.getKV("activeProjectId"), "p1");
   assert.equal(JSON.parse(s.getKV("watchRules")!).length, 1);
   s.close();
+});
+
+test("migrateFromJson preserves the settings JSON in place (ahm regression) — config + Gemini key survive", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-ahm-"));
+  const ledgerPath = path.join(dir, ".janus_ledger.json");
+  const settingsPath = path.join(dir, ".janus_settings.json");
+  const historyPath = path.join(dir, ".janus_history.json");
+  fs.writeFileSync(ledgerPath, JSON.stringify({ activeProjectId: "p1", workspaces: {} }), "utf8");
+  // Legacy settings file holds the operator's config AND the Gemini key (the pre-hardening shape).
+  fs.writeFileSync(settingsPath, JSON.stringify({ secrets: { geminiApiKey: "LEGACY-KEY-123" }, advanced: { idleTimeoutMs: 1500 } }), "utf8");
+  fs.writeFileSync(historyPath, JSON.stringify({}), "utf8");
+
+  const s = new JanusStore(":memory:"); s.init();
+  migrateFromJson(s, { ledgerPath, settingsPath, historyPath });
+
+  // ahm fix: the settings JSON is NOT renamed, so OrchestratorManager.loadSettings still reads it
+  // post-migration — the operator's config + the legacy Gemini key survive the first-migration boot.
+  assert.ok(fs.existsSync(settingsPath), "settings JSON must remain in place (ahm regression)");
+  assert.ok(!fs.existsSync(`${settingsPath}.bak`), "settings JSON must NOT be archived to .bak");
+  const preserved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(preserved.secrets.geminiApiKey, "LEGACY-KEY-123", "the legacy Gemini key must survive the migration");
+  assert.equal(preserved.advanced.idleTimeoutMs, 1500, "operator config must survive the migration");
+
+  // ledger + history ARE migrated into SQLite, so their JSON originals are archived to .bak.
+  assert.ok(fs.existsSync(`${ledgerPath}.bak`), "ledger JSON migrated → archived to .bak");
+  assert.ok(!fs.existsSync(ledgerPath), "ledger JSON original removed after migration");
+  assert.ok(fs.existsSync(`${historyPath}.bak`), "history JSON migrated → archived to .bak");
+
+  // secrets.* must never leak into the durable store (in-memory-only hardening).
+  assert.ok(s.getSettings("secrets.geminiApiKey") == null, "the Gemini key must NOT be imported into the store");
+
+  s.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });
