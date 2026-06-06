@@ -249,7 +249,9 @@ function doCheck({ existing, self, mode, staleMs, lockPath, lockDir, logic }) {
   switch (outcome.action) {
     case "acquire":
       writeLock(lockPath, lockDir, self, logic);
-      if (existing) warn(outcome.reason); // reclaim worth noting
+      // A foreign-stale RECLAIM is worth surfacing; a self-owned REFRESH (bead 5rq) is a
+      // silent timestamp bump on our own lock — don't spam the hook output on every commit.
+      if (existing && !logic.isSelf(existing, self)) warn(outcome.reason);
       return 0;
     case "none":
       return 0;
