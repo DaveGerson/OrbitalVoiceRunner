@@ -134,7 +134,11 @@ export const executePlan: ActionDef<typeof ExecutePlanParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: {
     method: "post",
-    path: "/api/plans/:id/execute",
+    // Route param is snake_case (:plan_id) so Express injects it directly onto the snake_case zod key
+    // (ExecutePlanParams.plan_id) — matching the delete_orchestrator_plan precedent (DELETE
+    // /api/plans/:plan_id). The client URL (POST /api/plans/<id>/execute) is unchanged (Express matches
+    // :plan_id against the same URL position), and the no-twin guard scans server.ts text, not this path.
+    path: "/api/plans/:plan_id/execute",
     // c55.9 §6: map the stamped dispatch outcome to the inline route's status contract WITHOUT
     // touching `result.output` (the spoken read-back). The default kind->status map cannot express
     // this (every branch is kind:"ok"), so toHttp re-projects the structured `meta.outcome`. The

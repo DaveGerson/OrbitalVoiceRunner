@@ -940,8 +940,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // c55 Batch A: POST /api/plans (create) is now served by the registry twin create_orchestrator_plan
   // (mountRestRoutes only-set above) — same plans_updated broadcast and ledger["save"](true) persist.
   // Accepted body delta (client ignores the body): the inline missing-name/steps 400 becomes a zod
-  // validation 500 (no valid client sends an empty payload). GET /api/plans, POST /api/plans/:id/execute,
-  // and DELETE /api/plans/:id stay inline (out of scope — later batches).
+  // validation 500 (no valid client sends an empty payload). GET /api/plans (c55.11),
+  // POST /api/plans/:id/execute (c55.9), and DELETE /api/plans/:id (c55 Batch G) are now ALL converged
+  // to registry defs (see the notes just below) — none stay inline.
 
   // c55.9: POST /api/plans/:id/execute is now served by the registry-derived execute_plan def
   // (mountRestRoutes only-set above) — the inline route here is DELETED (converged). Step 1's pane

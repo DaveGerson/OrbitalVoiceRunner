@@ -34,7 +34,14 @@ import { isPaneActiveForWrite } from "../src/activePane";
 import type { CapabilityGate, GateValue } from "../src/types";
 import { REGISTRY } from "../src/actions/registry";
 import { runAction } from "../src/actions/gemini";
-import { applyResultToHttp, type RestResponse } from "../src/actions/rest";
+import {
+  applyResultToHttp,
+  mountRestRoutes,
+  type RestApp,
+  type RestHandler,
+  type RestRequest,
+  type RestResponse,
+} from "../src/actions/rest";
 import type { ActionContext, ActionDef, ActionResult, DispatchOutcome } from "../src/actions/types";
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -354,7 +361,9 @@ describe("c55.9 (B) — execute_plan rest.toHttp status map (direct)", () => {
     assert.strictEqual(typeof d.rest?.toHttp, "function", "execute_plan must declare rest.toHttp");
     assert.deepStrictEqual([...d.surfaces].sort(), ["rest", "voice"], "execute_plan stays voice+rest");
     assert.strictEqual(d.rest!.method, "post");
-    assert.strictEqual(d.rest!.path, "/api/plans/:id/execute");
+    // c55.9 fix: snake_case route param so Express injects :plan_id directly onto the zod key
+    // (delete_orchestrator_plan precedent). The CLIENT URL /api/plans/<id>/execute is unchanged.
+    assert.strictEqual(d.rest!.path, "/api/plans/:plan_id/execute");
   });
 });
 
@@ -438,5 +447,65 @@ describe("c55.9 (D) — server.ts cutover guard (no double-registration)", () =>
       !serverSrc.includes("pane-write is not available on the REST surface"),
       "the refusing stub string must be removed (REST now has a gated pane-write seam)",
     );
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// (E) param-name regression — the REAL Express-delivered arg shape lands on the snake_case zod key.
+//
+//   The §B/§C tests pass BOTH keys ({ plan_id, id }) so they cannot catch a path-param-name regression:
+//   if rest.path were the camel-ish :id (not :plan_id), Express would deliver req.params = { id } only —
+//   NO plan_id — and ExecutePlanParams.parse({ id }) FAILS validation, so dispatchProposal is NEVER
+//   called and the Run-plan button silently 500s instead of writing step 1. These tests exercise the
+//   ACTUAL arg shape Express produces for the chosen :plan_id route (and prove the :id shape would fail).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+// A one-route fake Express app: mountRestRoutes registers the handler; we capture it to drive a request.
+function captureExecutePlanHandler(ctx: ActionContext): RestHandler {
+  let captured: RestHandler | null = null;
+  const app: RestApp = {
+    get() { return undefined; },
+    put() { return undefined; },
+    delete() { return undefined; },
+    post(path: string, handler: RestHandler) {
+      // Bind only the execute_plan route (its rest.path is the snake_case :plan_id form).
+      if (path === "/api/plans/:plan_id/execute") captured = handler;
+      return undefined;
+    },
+  };
+  mountRestRoutes(app, REGISTRY, () => ctx, { only: new Set(["execute_plan"]) });
+  assert.ok(captured, "mountRestRoutes must register execute_plan at /api/plans/:plan_id/execute");
+  return captured!;
+}
+
+describe("c55.9 (E) — param-name regression: Express :plan_id param lands on the zod key", () => {
+  it("runAction with ONLY the route-param key { plan_id } (no body, no id) -> dispatch fires, executed", async () => {
+    // This is the exact rawArgs mountRestRoutes builds for the :plan_id route: { ...query, ...params }
+    // with params = { plan_id } and an empty body. The §B tests masked this by also passing `id`.
+    const { ctx, rec } = makePlanCtx({ kind: "executed", text: "ran" });
+    const result = await runAction(REGISTRY, "execute_plan", { plan_id: "plan_1" }, ctx);
+    assert.strictEqual(result.kind, "ok", "the params-only arg shape parses (plan_id present)");
+    assert.strictEqual(rec.dispatched, 1, "dispatchProposal IS called (step 1 routed through the gate)");
+    assert.strictEqual((result as { meta?: { outcome?: string } }).meta?.outcome, "executed");
+  });
+
+  it("the OLD :id route shape { id } (no plan_id) FAILS validation -> dispatch NEVER fires (the bug)", async () => {
+    // Proves WHY the path must be :plan_id, not :id: an :id route delivers { id } only, which the zod
+    // schema (plan_id required, no coerceArgs) rejects -> runAction returns kind:'error', no dispatch.
+    const { ctx, rec } = makePlanCtx({ kind: "executed", text: "ran" });
+    const result = await runAction(REGISTRY, "execute_plan", { id: "plan_1" }, ctx);
+    assert.strictEqual(result.kind, "error", "{ id } alone fails zod validation (plan_id required)");
+    assert.strictEqual(rec.dispatched, 0, "dispatchProposal never runs on the failed-validation shape");
+  });
+
+  it("end-to-end via mountRestRoutes: a request whose params={plan_id} writes step 1 (200)", async () => {
+    const { ctx, rec } = makePlanCtx({ kind: "executed", text: "ran" });
+    const handler = captureExecutePlanHandler(ctx);
+    // Simulate Express delivering the :plan_id route param for URL POST /api/plans/plan_1/execute.
+    const req: RestRequest = { params: { plan_id: "plan_1" }, body: {}, query: {} };
+    const { res, sent } = makeFakeRes();
+    await handler(req, res as RestResponse);
+    assert.strictEqual(rec.dispatched, 1, "the mounted route dispatched step 1 (param landed on the zod key)");
+    assert.strictEqual(sent.status, 200, "executed -> 200 (the inline Run-plan write is preserved)");
   });
 });
