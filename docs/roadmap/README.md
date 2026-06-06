@@ -12,8 +12,11 @@ developer personas (Maya — power user; Devon — security/platform; Sam — vo
 | `next-level/{maya,devon,sam}.md` | Per-persona forward wishlists feeding the headline roadmap |
 
 Provenance: salvaged from the retired `claude/relaxed-gates-LI27l` branch (archived at tag
-`archive/relaxed-gates`). Line anchors validate against `main @16c62da` (2026-05-28) and predate the
-prompt-composer/WS work now on the trunk — re-anchor before acting on any single item.
+`archive/relaxed-gates`). Line anchors were written against `main @16c62da` (2026-05-28) and are now
+stale — current main is **`7efcaee` (2026-06-06)**, several hundred commits of prompt-composer/WS/
+ledger/voice-UX work past that baseline. The SHA/date headers here and in `NEXT-LEVEL-ROADMAP.md` are
+refreshed, but the inline `server.ts:NNN` / `App.tsx:NNN` citations are NOT — re-anchor each before
+acting on any single item.
 
 ## ✅ Reconciled with the capability-gate vision
 

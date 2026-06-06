@@ -21,7 +21,15 @@ ordered highest to lowest priority; cross-persona convergence is the strongest p
 
 ---
 
-## Validation against `main` (as of commit `16c62da`, 2026-05-28)
+## Validation against `main` (snapshot taken at commit `16c62da`, 2026-05-28)
+
+> ⚠️ **STALE — re-anchor before acting.** This validation snapshot was taken against `main @16c62da`
+> (2026-05-28). Current main is **`7efcaee` (2026-06-06)** — many commits past that baseline
+> (prompt-composer refactor, WS hardening, the SQLite ledger cutover, capability-gate + handoff build,
+> round-3/4 voice-UX). Every per-item status label and inline `server.ts:NNN` / `App.tsx:NNN` citation
+> below dates to the `16c62da` snapshot and needs INDIVIDUAL re-verification against current main; only
+> this header's SHA/date has been refreshed. Per `RECONCILIATION.md §5`, do that re-anchoring before
+> acting on any single item.
 
 Main advanced one commit past this branch's base — `16c62da refactor(terminal): update history
 persistence and UI`. That commit landed several round-one dependencies these items rest on and

@@ -8,7 +8,8 @@
 > **Director decisions are LOCKED (2026-06-01, §6); the priority stack in §4 is now authoritative.**
 
 Anchored to the trunk as of the matrix v1 build on `claude/prompt-composer-refactor`. The roadmap's own
-line anchors (`main @16c62da`) predate this and are stale — see §5.
+line anchors (`main @16c62da`, 2026-05-28) predate this and are stale — current main is **`7efcaee`
+(2026-06-06)**; re-anchor before acting (see §5).
 
 ---
 
@@ -73,9 +74,13 @@ alongside P0a if there's capacity — but the matrix surface waits on hardened g
 ## 5. Re-anchoring debt
 
 The roadmap's evidence anchors reference `main @16c62da` (2026-05-28). The trunk has since absorbed the
-terminal-fidelity coalesce, the e2e harness module, and the capability-gate + handoff build. Before acting
-on any single item, re-anchor its `server.ts` / `App.tsx` / `terminal.ts` line refs against the current
-trunk, and re-check each "❌ open / ⚠️ partial" status — several (5, 7, 9) moved toward done via the matrix.
+terminal-fidelity coalesce, the e2e harness module, the capability-gate + handoff build, the SQLite
+ledger cutover (WS-M), and the round-3/4 voice-UX work — current main is **`7efcaee` (2026-06-06)**.
+Before acting on any single item, re-anchor its `server.ts` / `App.tsx` / `terminal.ts` line refs
+against current main (server.ts is now ~3,200 lines and App.tsx has grown substantially since the
+`16c62da` baseline, so EVERY per-line citation below still needs individual re-verification — the
+SHA/date headers are refreshed, the inline `server.ts:NNN` / `App.tsx:NNN` anchors are NOT), and
+re-check each "❌ open / ⚠️ partial" status — several (5, 7, 9) moved toward done via the matrix.
 
 ## 6. Decisions (LOCKED — 2026-06-01)
 
