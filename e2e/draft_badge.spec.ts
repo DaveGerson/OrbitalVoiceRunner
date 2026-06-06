@@ -1,10 +1,10 @@
 import { test, expect, gotoMockedApp, injectWipDraft } from "./fixtures";
 
 /**
- * U3 (bead wsm-e2e-pinned-dlj): the desktop Sync Spec tab gets a cyan animate-pulse
- * draft-pending badge gated on `promptBuffer.trim().length > 0 || wipDrafts.length > 0`.
- * Without it, an operator on the Orchestrate/Alerts tab cannot tell a command is being
- * drafted one tab over. The composer's `→ {activePaneName}` target chip is pinned with a
+ * U3 (bead wsm-e2e-pinned-dlj): the desktop Sync Spec helper-panel header gets a cyan
+ * animate-pulse draft-pending badge gated on `promptBuffer.trim().length > 0 || wipDrafts.length > 0`.
+ * Without it, an operator whose attention is elsewhere in the app cannot tell a command is being
+ * drafted in the helper panel. The composer's `→ {activePaneName}` target chip is pinned with a
  * testid so the "which pane does this draft target" half stays asserted.
  */
 test.describe("sync-spec draft badge (U3)", () => {

@@ -28,7 +28,8 @@ import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 // raw-input route below uses it for the gated Shift+Tab disposition. classifyRawKey + isPaneActiveForWrite
 // serve that same raw-input route.
 import { restGateOutcome } from "./src/restGate";
-import { classifyRawKey } from "./src/rawKeyClass";
+import { classifyRawKey, isKnownRawKey } from "./src/rawKeyClass";
+import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceResumption";
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
@@ -79,10 +80,47 @@ export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(3
 // The Gemini Live session is created through this seam so tests and the offline
 // simulator can swap in a fake session (no API key, no microphone) that still
 // drives the real tool-dispatch / approval code paths in this file.
-export type LiveConnector = (ai: GoogleGenAI, params: any) => Promise<any>;
-let liveConnector: LiveConnector = (ai, params) => ai.live.connect(params);
+//
+// The optional `key` is the RESOLVED operator API key for this attempt, threaded so the REAL
+// connector can pre-validate it (bead 9fz). Test/mock connectors installed via setLiveConnector
+// ignore it — that is HOW installMockLive() keeps connecting keylessly while the real path
+// short-circuits a blank key (see realLiveConnector below).
+export type LiveConnector = (ai: GoogleGenAI, params: any, key?: string | null) => Promise<any>;
+
+// bead 9fz: the DEFAULT (real) connector. Pre-validate a BLANK key HERE — at the real-connector
+// boundary — so we never fire a keyless ai.live.connect() that can only close with 1007 ("API key
+// not valid"), wasting a handshake and a bounded reconnect-budget slot. This deliberately lives in
+// the connector, NOT in connectLiveSession: installMockLive() replaces this connector wholesale and
+// connects with NO key, so the mock harness stays functional while only the real path short-circuits.
+export const realLiveConnector: LiveConnector = (ai, params, key) => {
+  if (isBlankApiKey(key)) {
+    // Reject WITHOUT touching ai.live.connect — connectLiveSession's catch turns this into a clean
+    // "set a key in Settings" error frame instead of a 1007 round-trip. (Never log the key.)
+    return Promise.reject(new Error("No Gemini API key is configured — set one in Settings to start voice."));
+  }
+  return ai.live.connect(params);
+};
+let liveConnector: LiveConnector = realLiveConnector;
 export function setLiveConnector(fn: LiveConnector) {
   liveConnector = fn;
+}
+/** Read the currently-installed connector (tests assert the mock path stays functional). */
+export function getLiveConnector(): LiveConnector {
+  return liveConnector;
+}
+
+// bead 9fz (part 2): the settings PUT nudges the live voice session to (re)connect when the operator
+// sets a NON-EMPTY Gemini key, so they need not reload. The current voice connection registers its
+// reconnect closure here (via attachVoiceSession's registerReconnectNudge dep); the settings handler
+// invokes it. Module-scoped (one active operator connection at a time, same model as activeFrontendWs).
+let voiceReconnectNudge: (() => void) | null = null;
+/** Register/clear the live voice session's reconnect closure (called by attachVoiceSession). */
+export function setVoiceReconnectNudge(fn: (() => void) | null) {
+  voiceReconnectNudge = fn;
+}
+/** Nudge the live voice session to (re)connect, if one is wired. Never throws. */
+export function requestVoiceReconnect() {
+  try { voiceReconnectNudge?.(); } catch (e) { console.warn("[VOICE] reconnect nudge threw (ignored):", e); }
 }
 
 // PLM4 (Finding A): the per-session GoogleGenAI client (built from the operator's key) is constructed
@@ -354,6 +392,9 @@ export interface RunningServer {
   /** Active-pane-guard test seam: pin coreState.activePaneId (the UI's set_active_pane WS effect)
    *  so REST suites can assert the single-active-pane refusal without a live socket. NOT for prod use. */
   _testSetActivePane?: (id: string | null) => void;
+  /** bead 9fz test seam: register/clear a spy reconnect-nudge so a settings-PUT suite can assert the
+   *  non-empty-key trigger without a live Gemini socket. NOT for prod use. */
+  _testSetReconnectNudge?: (fn: (() => void) | null) => void;
 }
 
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
@@ -731,6 +772,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       });
       return;
     }
+    // bead ym3: raw-input is an ALLOWLIST, not a denylist-of-one. Reject ANY payload that is not one
+    // of the 11 vetted canonical control-key sequences (isKnownRawKey) BEFORE writeRaw — this is what
+    // stops an arbitrary shell line ("rm -rf ~\r") from being written verbatim to the PTY, bypassing
+    // the write_to_pane gate. Sits AFTER the 400/404/409 checks and BEFORE classifyRawKey, so
+    // classifyRawKey only ever runs on a vetted key. (Ctrl+C \x03 IS in the table — §13.1 preserved.)
+    if (!isKnownRawKey(bytes)) {
+      res.status(400).json({ error: "Unrecognized raw-key sequence" });
+      return;
+    }
     // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
     if (classifyRawKey(bytes) === "always-allowed") {
       term.writeRaw(bytes);
@@ -1023,6 +1073,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 
   app.put("/api/settings", (req, res) => {
     const newSettings = req.body;
+    // bead 9fz (part 2): capture the RAW incoming key BEFORE the masked/sentinel substitution below
+    // mutates it, so we can tell a genuinely-new credential from a masked round-trip echo. NEVER logged.
+    const incomingGeminiKey: string | null | undefined = newSettings.secrets?.geminiApiKey;
     if (newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey)) {
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
@@ -1032,6 +1085,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       globalPermissionsMode: manager.globalPermissionsMode,
       settings: sanitizeSettingsForClient(manager.settings)
     });
+    // bead 9fz (part 2): the operator just set a REAL (non-blank, non-masked, non-env-sentinel) Gemini
+    // key — nudge the live voice session to (re)connect so they need not reload the page. The blank-key
+    // short-circuit (realLiveConnector) means a prior keyless connect failed cleanly; this resumes it.
+    if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
+      requestVoiceReconnect();
+    }
     res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
   });
 
@@ -1097,6 +1156,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     toGeminiDeclarations,
     API_AUTH_TOKEN,
     getCookie,
+    // bead 9fz: the live voice connection registers its reconnect-nudge here; the settings PUT invokes
+    // it (via requestVoiceReconnect) when the operator sets a real Gemini key — voice resumes, no reload.
+    registerReconnectNudge: setVoiceReconnectNudge,
   });
 
   // ── REST surface, DERIVED from the registry (cv/PLM2). One ActionContext per request, session:null
@@ -1465,6 +1527,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testPendingApprovals: () => pendingApprovals,
     _testClients: () => coreState.clients,
     _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
+    _testSetReconnectNudge: (fn: (() => void) | null) => { setVoiceReconnectNudge(fn); },
   };
 }
 

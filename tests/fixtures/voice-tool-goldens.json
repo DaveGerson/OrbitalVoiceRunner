@@ -52,6 +52,7 @@
         "compose_draft": "Auto",
         "create_pane": "Ask",
         "create_project": "Auto",
+        "delete_orchestrator_plan": "Ask",
         "delete_pane": "Ask",
         "delete_project": "Ask",
         "deliver_handoff": "Ask",
@@ -60,7 +61,9 @@
         "focus_pane": "Auto",
         "read_notes": "Auto",
         "read_pane": "Auto",
+        "remove_watch_rule": "Ask",
         "restart_pane": "Ask",
+        "send_keys": "Ask",
         "set_capability_gate": "Ask",
         "set_global_permissions": "Ask",
         "set_pane_permissions": "Ask",
@@ -118,7 +121,10 @@
       "focus_pane",
       "compose_draft",
       "archive_pane",
-      "clear_history"
+      "clear_history",
+      "send_keys",
+      "remove_watch_rule",
+      "delete_orchestrator_plan"
     ]
   },
   "list_handoffs": {

@@ -203,11 +203,12 @@ describe("§8.1 registry totality & shape", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe("§8.1b matrix derived from registry", () => {
   it("deriveCapabilities(REGISTRY) ⊆ ALL_CAPABILITIES, and ALL_CAPABILITIES === CAPABILITY_DEFS id set", () => {
-    // F4 (wsm-e2e-pinned-lqb): the matrix authority is now the WHOLE 24-row matrix
-    // (16 original + 6 promoted). Two invariants pin it:
+    // F4 (wsm-e2e-pinned-lqb): the matrix authority is now the WHOLE 27-row matrix
+    // (16 original + 6 promoted + 2 deletes + 3 c55.10 rest-write caps). Two invariants pin it:
     //   (1) SUBSET — every capability a registry tool actually USES is a matrix row. (Strict equality
-    //       registry === matrix is NOT yet true: close_pane / restart_pane / add_watch_rule are matrix
-    //       rows RESERVED for future voice tools per Decision 8, so the registry uses a subset.)
+    //       registry === matrix is NOT yet true: close_pane / restart_pane are matrix rows RESERVED for
+    //       future voice tools per Decision 8, so the registry uses a subset. c55.10 WIRED add_watch_rule
+    //       to its rest def, so it is no longer reserved.)
     //   (2) MATRIX === DEFS — ALL_CAPABILITIES is exactly the CAPABILITY_DEFS id set, so the hand-list
     //       in gateSurface.ts (kept as a list to dodge the capabilities↔gateSurface value-import cycle)
     //       can never drift from the table that owns label/category/defaultGate.
@@ -265,6 +266,10 @@ describe("§8.1b matrix derived from registry", () => {
       switch_context: "Auto",
       set_voice_mute: "Auto",
       dismiss_attention: "Auto",
+      // c55.10 — rest-only writes tightened ALWAYS_ALLOWED → Ask (gate-tightening only).
+      send_keys: "Ask",
+      remove_watch_rule: "Ask",
+      delete_orchestrator_plan: "Ask",
     };
     for (const [capId, gate] of Object.entries(golden)) {
       assert.strictEqual(byId.get(capId), gate, `defaultGate mismatch for ${capId}: expected ${gate}, got ${byId.get(capId)}`);

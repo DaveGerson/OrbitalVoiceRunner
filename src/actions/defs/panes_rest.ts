@@ -23,10 +23,16 @@
  *     (pendingActions keeps it), while a confirm-AFTER-process-restart would degrade to the "unknown
  *     capability" no-op string — an accepted limitation for this batch (durable restart-intent replay for
  *     respawn_pane is out of scope here).
- *   - send_keys / resize_pane / clear_history / clear_exited were UNGATED inline → registered
- *     ALWAYS_ALLOWED to preserve current instant behavior (recorded in appliedDefaults). A clear_history
- *     capability row exists in the matrix (default Ask), but the inline route was ungated, so the c55
- *     safe-default policy (preserve current behavior) wins: ALWAYS_ALLOWED, flagged for later tightening.
+ *   - send_keys was UNGATED inline → registered ALWAYS_ALLOWED at cutover; c55.10 TIGHTENS it to its OWN
+ *     matrix row `send_keys` (default Ask) + ctx.gateOrDefer — it is term.writeInput straight to the live
+ *     PTY, the most consequential CLI keystroke act (the rest-only twin of the gated voice write).
+ *     Off->blocked->403, Ask->pending->202, Auto->run-now->200.
+ *   - resize_pane / clear_history / clear_exited STAY UNGATED (ALWAYS_ALLOWED) per c55.10 + the P2
+ *     taxonomy: resize is viewport plumbing (Janus-of-Janus); clear_history clears the LOCAL
+ *     .janus_history.json display/metadata buffer (neither a result read nor a CLI act); clear_exited
+ *     archives already-exited panes (reversible, not a hard delete). A clear_history capability row
+ *     EXISTS in the matrix (default Ask) but stays RESERVED/unwired — the c55.10 decision is to keep the
+ *     rest def ALWAYS_ALLOWED (display-buffer vs result-loss); flipping it later needs no new cap id.
  *
  * STATUS-CODE DELTAS (Decision 2 — the client ignores the body / does not status-branch on these):
  *   - inline 404 "Terminal not found" (restart/send_keys) → 200 ok-narration.
@@ -207,7 +213,16 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// send_keys — POST /api/terminals/:pane_id/input (ALWAYS_ALLOWED; was ungated).
+// send_keys — POST /api/terminals/:pane_id/input (GATED send_keys, default Ask — c55.10).
+//   send_keys is term.writeInput(command) straight to the live PTY — the most direct, most
+//   consequential CLI keystroke act there is, the rest-only twin of the gated voice write path
+//   (propose_command -> write_to_pane). c55.10 tightens it from ALWAYS_ALLOWED to its OWN matrix row
+//   `send_keys` (default Ask) so the operator can tune the raw-REST keystroke channel independently of
+//   write_to_pane's voice spotlight semantics. Off->blocked->403, Ask->pending->202, Auto->run-now->200.
+//   NOTE (durable replay): like respawn_pane, buildActionRun (src/actionEffects.ts) has no send_keys
+//   case, so an IN-PROCESS Ask->confirm replays the real closure correctly (pendingActions holds it),
+//   while a confirm-AFTER-process-restart degrades to the "unknown capability" no-op string — an
+//   accepted out-of-scope limitation for these rest-only caps (matches the c55 batch precedent).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SendKeysParams = z.object({
@@ -218,15 +233,17 @@ const SendKeysParams = z.object({
 /**
  * send_keys — FAITHFUL PORT of inline app.post("/api/terminals/:id/input") (server.ts ~700). Records the
  * command in pane history (HistoryManager.addCommand re-derived inline) THEN writes it to the live PTY,
- * THEN broadcasts the ledger update. Unknown pane -> ok narration (inline 404 -> 200, Decision 2). The
- * inline route 400'd a missing command body; here the zod-required `command` makes that a 500 error
- * (Decision 2 — replaces inline 400). SAFE DEFAULT ALWAYS_ALLOWED (was ungated).
+ * THEN broadcasts the ledger update — now ROUTED THROUGH ctx.gateOrDefer("send_keys", ...). Unknown pane
+ * -> ok narration resolved BEFORE the gate (inline 404 -> 200, Decision 2): we never stage/forbid a write
+ * to a pane that does not exist. The inline route 400'd a missing command body; here the zod-required
+ * `command` makes that a 500 error (Decision 2). The side effects are wrapped in ONE synchronous effect
+ * closure (serves Auto-run-now AND the in-process Ask->confirm replay).
  */
 export const sendKeys: ActionDef<typeof SendKeysParams> = {
   name: "send_keys",
-  description: "Write a command directly to a terminal pane's input. REST/UI surface only.",
+  description: "Write a command directly to a terminal pane's input. GATED (send_keys, default Ask). REST/UI surface only.",
   params: SendKeysParams,
-  capability: "ALWAYS_ALLOWED",
+  capability: "send_keys",
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/terminals/:pane_id/input" },
@@ -234,13 +251,34 @@ export const sendKeys: ActionDef<typeof SendKeysParams> = {
     const id = args.pane_id;
     const command = args.command;
     const term = ctx.manager.terminals[id];
+    // Unknown pane: resolve to ok-narration BEFORE the gate (inline 404 -> 200, Decision 2). No
+    // stage/forbid of a write to a non-existent pane.
     if (!term) {
       return { kind: "ok", output: `Terminal ${id} not found or offline.` };
     }
-    addCommand(ctx, id, command);
-    term.writeInput(command);
-    ctx.broadcastLedgerUpdate();
-    return { kind: "ok", output: `Command successfully dispatched to terminal ${id}.` };
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    const sendEffect = (): string => {
+      addCommand(ctx, id, command);
+      term.writeInput(command);
+      ctx.broadcastLedgerUpdate();
+      return `Command successfully dispatched to terminal ${id}.`;
+    };
+    const g = ctx.gateOrDefer(
+      "send_keys",
+      id,
+      `Send keystrokes to pane ${id}`,
+      sendEffect,
+      { ...(ctx.versionStamp ?? {}), origin: "rest", paneId: id }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'send_keys' capability is gated Off; writing keystrokes to panes is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    // Auto: gateOrDefer does NOT invoke `run` on the "run" disposition (it stages run only on Ask). The
+    // caller runs the effect now (mirrors respawn_pane: `output: restartEffect()`).
+    return { kind: "ok", output: sendEffect() };
   },
 };
 
