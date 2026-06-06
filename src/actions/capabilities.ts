@@ -27,6 +27,8 @@ const CATEGORY: Record<string, string> = {
   deliver_handoff: "Acting in a pane",
   // Destructive
   close_pane: "Destructive",
+  delete_pane: "Destructive",
+  delete_project: "Destructive",
   restart_pane: "Destructive",
   clear_history: "Destructive", // NEW (Ask) — destructive, joins this group
   // Changing the locks
@@ -61,7 +63,7 @@ const CATEGORY: Record<string, string> = {
  */
 export const CAPABILITY_DEFS: readonly CapabilityDef[] = [
   // ── NEW promotions (Decision 6/7) — default to today's effective behavior. Labels come from
-  //    CAPABILITY_LABELS (gateSurface) — the SINGLE label source for all 22 caps, so no drift (F4). ──
+  //    CAPABILITY_LABELS (gateSurface) — the SINGLE label source for all 24 caps, so no drift (F4). ──
   { id: "read_pane", label: CAPABILITY_LABELS.read_pane, category: CATEGORY.read_pane, defaultGate: "Auto" },
   { id: "read_notes", label: CAPABILITY_LABELS.read_notes, category: CATEGORY.read_notes, defaultGate: "Auto" },
   { id: "focus_pane", label: CAPABILITY_LABELS.focus_pane, category: CATEGORY.focus_pane, defaultGate: "Auto" },
@@ -74,6 +76,8 @@ export const CAPABILITY_DEFS: readonly CapabilityDef[] = [
   { id: "deliver_handoff", label: CAPABILITY_LABELS.deliver_handoff, category: CATEGORY.deliver_handoff, defaultGate: "Ask", spotlightEligible: true },
   { id: "create_pane", label: CAPABILITY_LABELS.create_pane, category: CATEGORY.create_pane, defaultGate: "Ask" },
   { id: "close_pane", label: CAPABILITY_LABELS.close_pane, category: CATEGORY.close_pane, defaultGate: "Ask" },
+  { id: "delete_pane", label: CAPABILITY_LABELS.delete_pane, category: CATEGORY.delete_pane, defaultGate: "Ask" },
+  { id: "delete_project", label: CAPABILITY_LABELS.delete_project, category: CATEGORY.delete_project, defaultGate: "Ask" },
   { id: "restart_pane", label: CAPABILITY_LABELS.restart_pane, category: CATEGORY.restart_pane, defaultGate: "Ask" },
   { id: "set_pane_permissions", label: CAPABILITY_LABELS.set_pane_permissions, category: CATEGORY.set_pane_permissions, defaultGate: "Ask" },
   { id: "set_global_permissions", label: CAPABILITY_LABELS.set_global_permissions, category: CATEGORY.set_global_permissions, defaultGate: "Ask" },

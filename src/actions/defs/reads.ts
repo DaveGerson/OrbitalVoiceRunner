@@ -61,7 +61,7 @@ interface HistoryEntry {
 }
 
 // get_pane_gates + list_capabilities report the WHOLE gate matrix (gateSurface.ALL_CAPABILITIES — the
-// single source widened to 22 by the matrix-convergence work). Reporting the full matrix (incl the
+// single source widened to 24 by the matrix-convergence work). Reporting the full matrix (incl the
 // promoted read/focus/draft/archive/clear caps) is what lets the model + UI discover the read-gating
 // lever (Decision 9). The two get_pane_gates / list_capabilities goldens are regenerated accordingly.
 

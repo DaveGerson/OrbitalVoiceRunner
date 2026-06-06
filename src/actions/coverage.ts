@@ -125,6 +125,13 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   restore_archived_pane: new Set<Surface>(["rest"]),
   delete_archived_pane: new Set<Surface>(["rest"]),
 
+  // ── c55.14: NEW rest-only lifecycle defs. update_project/stop_pane ungated; delete_project/delete_pane
+  // GATED (new Destructive caps, default Ask). No voice twin. ──
+  update_project: new Set<Surface>(["rest"]),
+  stop_pane: new Set<Surface>(["rest"]),
+  delete_project: new Set<Surface>(["rest"]),
+  delete_pane: new Set<Surface>(["rest"]),
+
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
   // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for

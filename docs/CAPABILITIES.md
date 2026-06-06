@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**69** actions across **18** gated capabilities, plus the always-allowed group.
+**73** actions across **20** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -42,6 +42,8 @@ These bypass the capability gate entirely — they work even while the system is
 | `restore_archived_pane` | rest | no | Restore an archived pane back into its project (operator-UI, ungated) |
 | `send_keys` | rest | no | Write a command directly to a terminal pane's input |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
+| `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
+| `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
 
 ## Apply a workspace recipe
 
@@ -97,6 +99,26 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `create_project` | voice / rest | no | Create a new project workspace directory context block |
+
+## Delete a pane permanently
+
+- **Capability:** `delete_pane`
+- **Default gate:** Ask
+- **Category:** Destructive
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `delete_pane` | rest | no | Permanently delete a pane record (hard delete; not the recoverable stop_pane) |
+
+## Delete a project
+
+- **Capability:** `delete_project`
+- **Default gate:** Ask
+- **Category:** Destructive
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `delete_project` | rest | no | Permanently delete a project workspace |
 
 ## Dismiss an alert
 

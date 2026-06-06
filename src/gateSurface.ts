@@ -28,17 +28,19 @@ export type PostureWord = "OPEN" | "GUARDED" | "LOCKED";
  * The CapabilityGate union as a runtime array — the MATRIX AUTHORITY the surface iterates
  * (deriveEffectiveGates fills all of them; the totality tests assert against it).
  *
- * F4 (wsm-e2e-pinned-lqb): this is now the WHOLE matrix (22 rows): the 16 original gates PLUS the 6
- * promoted capabilities. It MUST equal the CAPABILITY_DEFS id set in src/actions/capabilities.ts.
+ * F4 (wsm-e2e-pinned-lqb): this is now the WHOLE matrix (24 rows): the 16 original gates PLUS the 6
+ * promoted capabilities PLUS the 2 destructive deletes (delete_pane/delete_project). It MUST equal
+ * the CAPABILITY_DEFS id set in src/actions/capabilities.ts.
  * We keep it a hand-list (rather than DERIVING it via `CAPABILITY_DEFS.map(d => d.id)`) ON PURPOSE:
  * capabilities.ts imports CAPABILITY_LABELS from THIS module and reads it EAGERLY inside the
  * CAPABILITY_DEFS array literal, so a back-import of CAPABILITY_DEFS here would be a value-level
  * circular dependency (whichever module loads first sees the other half-initialized). Per the F4
- * spec's escape hatch we keep the list widened to the 22 and PIN it with a test
+ * spec's escape hatch we keep the list widened to the 24 and PIN it with a test
  * (test_action_registry.ts §8.1b: ALL_CAPABILITIES === CAPABILITY_DEFS id set) so it can never drift.
  */
 export const ALL_CAPABILITIES: readonly CapabilityGate[] = [
   "write_to_pane", "deliver_handoff", "create_pane", "close_pane",
+  "delete_pane", "delete_project",
   "restart_pane", "set_pane_permissions", "set_global_permissions",
   "set_capability_gate", "add_watch_rule", "execute_plan",
   "apply_recipe", "create_project", "update_metadata",
@@ -188,6 +190,8 @@ export const CAPABILITY_LABELS: Record<CapabilityGate, string> = {
   write_to_pane: "Type a command into a pane",
   deliver_handoff: "Hand a prompt to another pane",
   close_pane: "Close a pane",
+  delete_pane: "Delete a pane permanently",
+  delete_project: "Delete a project",
   restart_pane: "Restart a pane",
   set_pane_permissions: "Change a pane's autonomy mode",
   set_global_permissions: "Change the global autonomy mode",
@@ -213,7 +217,7 @@ export const CAPABILITY_LABELS: Record<CapabilityGate, string> = {
 
 /**
  * The matrix editor's grouped sections (spec §6) — sections by intent, each listing its plain-
- * labeled capabilities. Covers all 22 capabilities EXACTLY ONCE (a unit test asserts this), so the
+ * labeled capabilities. Covers all 24 capabilities EXACTLY ONCE (a unit test asserts this), so the
  * grouped-toggle editor can render every capability with no orphans or duplicates. Category NAMES
  * are themselves plain language (NO PRODUCT JARGON).
  *
@@ -223,7 +227,7 @@ export const CAPABILITY_LABELS: Record<CapabilityGate, string> = {
  */
 export const CAPABILITY_CATEGORIES: Record<string, readonly CapabilityGate[]> = {
   "Acting in a pane": ["write_to_pane", "deliver_handoff"],
-  "Destructive": ["close_pane", "restart_pane", "clear_history"],
+  "Destructive": ["close_pane", "delete_pane", "delete_project", "restart_pane", "clear_history"],
   "Changing the locks": ["set_pane_permissions", "set_global_permissions", "set_capability_gate"],
   "Spawning work": ["create_pane", "execute_plan", "apply_recipe", "add_watch_rule"],
   "Orientation (low-risk)": ["create_project", "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention", "archive_pane", "focus_pane", "compose_draft"],

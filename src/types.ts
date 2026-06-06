@@ -5,13 +5,14 @@ import type { AnnouncementTemplates } from "./announcementKinds";
 // loosen, the pane's effectiveMode (AND-veto). Absent matrix ⇒ all "Auto"
 // (back-compat: today's implicit behavior).
 // ─────────────────────────────────────────────────────────────────────────────
-// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (22 rows) — the 16 original
+// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (24 rows) — the 16 original
 // gates PLUS the 6 promoted capabilities (read_pane / read_notes / focus_pane / compose_draft /
 // archive_pane / clear_history). Promotions default to today's effective behavior (Auto, except
 // clear_history=Ask) so widening the type is behavior-preserving. Kept in lockstep with
 // CAPABILITY_DEFS (src/actions/capabilities.ts) — a test asserts ALL_CAPABILITIES === that id set.
 export type CapabilityGate =
   | "write_to_pane" | "deliver_handoff" | "create_pane" | "close_pane"
+  | "delete_pane" | "delete_project"
   | "restart_pane" | "set_pane_permissions" | "set_global_permissions"
   | "set_capability_gate" | "add_watch_rule" | "execute_plan"
   | "apply_recipe" | "create_project" | "update_metadata"
@@ -43,6 +44,8 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   deliver_handoff: "Ask",
   create_pane: "Ask",
   close_pane: "Ask",
+  delete_pane: "Ask",
+  delete_project: "Ask",
   restart_pane: "Ask",
   set_pane_permissions: "Ask",
   set_global_permissions: "Ask",

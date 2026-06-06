@@ -770,22 +770,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     res.json({ success: true });
   });
 
-  app.put("/api/projects/:id", (req, res) => {
-    const { id } = req.params;
-    const { directory, summary, keyTerms, name } = req.body;
-    const ws = manager.ledger.getProject(id);
-    if (ws) {
-      if (directory !== undefined) ws.directory = directory;
-      if (summary !== undefined) ws.summary = summary;
-      if (keyTerms !== undefined) ws.keyTerms = Array.isArray(keyTerms) ? keyTerms : [];
-      if (name !== undefined) ws.name = name;
-      manager.ledger["save"](true);
-      broadcastLedgerUpdate();
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Project context not found" });
-    }
-  });
+  // c55.14: PUT /api/projects/:id now served by the registry-derived update_project def (mountRestRoutes only-set above).
 
   // c55 Batch B: PUT /api/projects/:project_id/rename is now served by the registry twin
   // rename_project (mountRestRoutes only-set above) — same renameProject + ledger_updated broadcast.
@@ -858,56 +843,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // ignores it, repaints off the WS frame): { success:true, activeProjectId } -> 200 { output:<project
   // briefing> } (the briefing object the voice path already returns).
 
-  app.delete("/api/projects/:id", (req, res) => {
-    const { id } = req.params;
-    if (manager.ledger.workspaces[id]) {
-      delete manager.ledger.workspaces[id];
-      const remainingIds = Object.keys(manager.ledger.workspaces);
-      if (manager.ledger.activeProjectId === id) {
-        const nextId = remainingIds[0] || "default_project";
-        if (!manager.ledger.workspaces[nextId]) {
-          manager.ledger.addProject(nextId, process.cwd(), "Default workspace");
-        }
-        manager.ledger.switchContext(nextId);
-        manager.settings.projects.activeContext = nextId;
-        manager.settings.projects.localWorkspacePath = manager.ledger.workspaces[nextId]?.directory || process.cwd();
-        manager.saveSettings();
-      }
-      manager.ledger["save"]();
-      broadcastLedgerUpdate();
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Project workspace not found" });
-    }
-  });
-
-  app.delete("/api/projects/:projectId/panes/:paneId", (req, res) => {
-    const { projectId, paneId } = req.params;
-    const term = manager.terminals[paneId];
-    if (term) {
-      term.stop();
-      delete manager.terminals[paneId];
-    }
-    const ws = manager.ledger.getProject(projectId);
-    if (ws && ws.panes[paneId]) {
-      delete ws.panes[paneId];
-      manager.ledger["save"]();
-    }
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true });
-  });
-
-  // Graceful per-pane EXIT: terminate the PTY and archive the pane (recoverable),
-  // PRESERVING the ledger record — the non-destructive middle between the DELETE
-  // hard-delete above (which erases the record) and the reactive clear-exited below.
-  app.post("/api/projects/:projectId/panes/:paneId/stop", async (req, res) => {
-    const { projectId, paneId } = req.params;
-    const archived = await manager.stopAndArchivePane(projectId, paneId);
-    broadcastLedgerUpdate();
-    broadcastTerminalsUpdated();
-    res.json({ success: true, archived });
-  });
+  // c55.14: DELETE /api/projects/:id now served by the registry-derived delete_project def (mountRestRoutes
+  // only-set above) — NOW GATED (delete_project cap, default Ask) via gateOrDefer; behaviorDelta from the
+  // ungated inline delete. Same workspace removal + active-context reassignment + ledger_updated broadcast.
+  // c55.14: DELETE /api/projects/:projectId/panes/:paneId now served by the registry-derived delete_pane def
+  // (only-set above) — NOW GATED (delete_pane cap, default Ask). Same stop+drop terminal + pane removal +
+  // ledger_updated/terminals_updated broadcasts. The Graceful per-pane EXIT (stop+archive) is below.
+  // c55.14: POST /api/projects/:projectId/panes/:paneId/stop (graceful per-pane EXIT — terminate the PTY and
+  // archive the pane, PRESERVING the ledger record) now served by the registry-derived stop_pane def
+  // (only-set above), ALWAYS_ALLOWED (preserving the inline route's ungated behavior). Same stopAndArchivePane
+  // + ledger_updated/terminals_updated broadcasts; the {archived} payload rides in the ok output body.
 
   // --- Terminal archive (recoverable "clear exited") ---
 
@@ -1411,6 +1356,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "list_archived_panes",
       "restore_archived_pane",
       "delete_archived_pane",
+      // c55.14 — project/pane lifecycle. The 4 inline app.{put,delete,post}(...) twins are deleted below
+      // in the SAME change (Express keeps the first-registered handler, so a stale inline route would
+      // silently mask the cutover). update_project/stop_pane are ALWAYS_ALLOWED (preserve ungated inline
+      // behavior); delete_project/delete_pane are NOW GATED (new Destructive caps, default Ask) via
+      // gateOrDefer + status-via-kinds (403 Off / 202 Ask / 200 Auto) — a deliberate behaviorDelta from
+      // the ungated inline deletes. Client ignores the body; repaints off ledger_updated/terminals_updated.
+      "update_project",
+      "stop_pane",
+      "delete_project",
+      "delete_pane",
     ]),
   });
 

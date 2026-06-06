@@ -201,7 +201,7 @@ describe("§8.1 registry totality & shape", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe("§8.1b matrix derived from registry", () => {
   it("deriveCapabilities(REGISTRY) ⊆ ALL_CAPABILITIES, and ALL_CAPABILITIES === CAPABILITY_DEFS id set", () => {
-    // F4 (wsm-e2e-pinned-lqb): the matrix authority is now the WHOLE 22-row matrix
+    // F4 (wsm-e2e-pinned-lqb): the matrix authority is now the WHOLE 24-row matrix
     // (16 original + 6 promoted). Two invariants pin it:
     //   (1) SUBSET — every capability a registry tool actually USES is a matrix row. (Strict equality
     //       registry === matrix is NOT yet true: close_pane / restart_pane / add_watch_rule are matrix
@@ -249,6 +249,8 @@ describe("§8.1b matrix derived from registry", () => {
       deliver_handoff: "Ask",
       create_pane: "Ask",
       close_pane: "Ask",
+      delete_pane: "Ask",
+      delete_project: "Ask",
       restart_pane: "Ask",
       set_pane_permissions: "Ask",
       set_global_permissions: "Ask",
