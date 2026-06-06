@@ -11,6 +11,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import type { ActionContext, ActionDef } from "../src/actions/types";
 import { ALWAYS_ALLOWED } from "../src/actions/types";
@@ -344,4 +347,39 @@ describe("c55.15 — approve_pending_command status matrix", () => {
     assert.strictEqual(sent.status, 200);
     assert.deepStrictEqual(sent.json, { success: true });
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// Task 3 — cutover guard. (Clone of the c55.14 guard in tests/test_c55_14_lifecycle.ts.) Slices the
+// mountRestRoutes only:new Set([...]) block from server.ts-as-text and asserts the 5 approvals/pending
+// names are NOW in the only-set AND the 5 inline route literals are GONE (method-anchored + quote-
+// terminated regexes so a longer path that CONTAINS one of these prefixes can never false-match).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("c55.15 — server.ts cutover guard (no double-registration)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const serverSrc = readFileSync(path.join(here, "..", "server.ts"), "utf8");
+  const mountIdx = serverSrc.indexOf("mountRestRoutes(");
+  const onlyOpenIdx = mountIdx >= 0 ? serverSrc.indexOf("only: new Set([", mountIdx) : -1;
+  const onlyCloseIdx = onlyOpenIdx >= 0 ? serverSrc.indexOf("])", onlyOpenIdx) : -1;
+  const mountBlock = onlyOpenIdx >= 0 && onlyCloseIdx >= 0 ? serverSrc.slice(onlyOpenIdx, onlyCloseIdx + 2) : "";
+
+  for (const name of ["list_pending_commands", "list_pending_actions", "confirm_pending_action", "cancel_pending_action", "approve_pending_command"]) {
+    it(`mountRestRoutes only-set includes "${name}"`, () => {
+      assert.ok(mountIdx >= 0, "server.ts must call mountRestRoutes");
+      assert.ok(new RegExp(`["']${name}["']`).test(mountBlock), `only-set must include "${name}" after the c55.15 cutover`);
+    });
+  }
+
+  const goneLiterals: Array<{ label: string; needle: RegExp }> = [
+    { label: "GET /api/commands/pending", needle: /app\.get\(\s*["']\/api\/commands\/pending["']/ },
+    { label: "GET /api/actions/pending", needle: /app\.get\(\s*["']\/api\/actions\/pending["']/ },
+    { label: "POST /api/actions/:id/confirm", needle: /app\.post\(\s*["']\/api\/actions\/:id\/confirm["']/ },
+    { label: "POST /api/actions/:id/cancel", needle: /app\.post\(\s*["']\/api\/actions\/:id\/cancel["']/ },
+    { label: "POST /api/commands/approve", needle: /app\.post\(\s*["']\/api\/commands\/approve["']/ },
+  ];
+  for (const { label, needle } of goneLiterals) {
+    it(`inline route is deleted: ${label}`, () => {
+      assert.ok(!needle.test(serverSrc), `inline ${label} must be deleted (converged to the registry)`);
+    });
+  }
 });

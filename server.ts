@@ -11,7 +11,7 @@ import { PaneSignalBus } from "./src/paneSignalBus";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
-  serializePending,
+  // c55.15: serializePending moved into the list_pending_commands registry def (its toHttp maps the array).
 } from "./src/pendingApprovals";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
@@ -1054,58 +1054,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // above; the bindings are destructured there). The REST approval/action routes below consume the
   // SAME pending stores via those destructured bindings.
 
-  app.get("/api/commands/pending", (req, res) => {
-    res.json(pendingApprovals.all().map((p) => serializePending(p)));
-  });
-
-  // G1: pending NON-PTY deferred actions (gated Ask) — list / confirm / cancel.
-  app.get("/api/actions/pending", (_req, res) => {
-    res.json(pendingActions.all().map((a) => ({ id: a.id, capability: a.capability, summary: a.summary, ageSeconds: Math.max(0, Math.floor((Date.now() - a.timestamp) / 1000)) })));
-  });
-
-  app.post("/api/actions/:id/confirm", (req, res) => {
-    const { id } = req.params;
-    if (!pendingActions.has(id)) { res.status(404).json({ error: "Pending action not found" }); return; }
-    try {
-      const result = pendingActions.confirm(id);
-      if (result.reason === "lost_race") { res.json({ success: true, already: true }); return; }
-      if (result.reason === "not_found") { res.status(404).json({ error: "Pending action not found" }); return; }
-      broadcast({ type: "action_resolved", actionId: id, outcome: "confirmed" });
-      res.json({ success: true, output: result.output });
-    } catch (e) {
-      res.status(500).json({ success: false, error: e instanceof Error ? e.message : String(e) });
-    }
-  });
-
-  app.post("/api/actions/:id/cancel", (req, res) => {
-    const { id } = req.params;
-    if (!pendingActions.has(id)) { res.status(404).json({ error: "Pending action not found" }); return; }
-    const result = pendingActions.cancel(id);
-    broadcast({ type: "action_resolved", actionId: id, outcome: "cancelled" });
-    res.json({ success: true, already: result.reason === "lost_race" });
-  });
-
-  app.post("/api/commands/approve", (req, res) => {
-    const { messageId, approved } = req.body;
-    if (!pendingApprovals.has(messageId)) {
-      res.status(404).json({ error: "Pending command not found" });
-      return;
-    }
-    const action = applyResolution(messageId, approved ? "approve" : "reject");
-    switch (action.reason) {
-      case "not_found":
-        res.status(404).json({ error: "Pending command not found" });
-        return;
-      case "dead_pane":
-        res.status(422).json({ success: false, error: "target pane missing" });
-        return;
-      case "lost_race":
-        res.json({ success: true, already: true });
-        return;
-      default:
-        res.json({ success: true });
-    }
-  });
+  // c55.15: GET /api/commands/pending is now served by the registry-derived list_pending_commands def
+  // (mountRestRoutes only-set above) — toHttp emits pendingApprovals.all().map(serializePending) top-level.
+  // c55.15: GET /api/actions/pending is now served by the registry-derived list_pending_actions def — toHttp
+  // emits the {id,capability,summary,ageSeconds} array top-level (ageSeconds computed in-handler via Date.now()).
+  // c55.15: POST /api/actions/:id/confirm is now served by the registry-derived confirm_pending_action def —
+  // toHttp preserves 404 (missing) / 200 (already|output) / 500 (throw); broadcasts action_resolved/confirmed.
+  // c55.15: POST /api/actions/:id/cancel is now served by the registry-derived cancel_pending_action def —
+  // toHttp preserves 404 (missing) / 200 (already=lost_race); broadcasts action_resolved/cancelled.
+  // c55.15: POST /api/commands/approve is now served by the registry-derived approve_pending_command def —
+  // toHttp preserves 404 (missing) / 422 (dead_pane) / 200 (already|ok) via applyResolution.
 
   // dec-4 (DBT5): sweepExpiredApprovals moved to src/gating/index.ts. Arm its TTL sweep interval here
   // (the inline `setInterval(sweepExpiredApprovals, APPROVAL_SWEEP_MS)` + .unref() this replaces) and
@@ -1367,6 +1325,18 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "stop_pane",
       "delete_project",
       "delete_pane",
+      // c55.15 — approvals/pending HiTL. The 5 inline app.{get,post}(...) twins are deleted below in the
+      // SAME change (Express keeps the first-registered handler, so a stale inline route would silently
+      // mask the cutover). All 5 are ALWAYS_ALLOWED — above-the-gate: this is the operator surface that
+      // RESOLVES gated actions (the gate already fired when the action was STAGED; confirming/cancelling/
+      // approving is the human answer, not a new gated act). Each rides rest.toHttp to PRESERVE the exact
+      // 404/422/200/500 status contract the default kind->status map cannot express. The client ignores
+      // the body and repaints off the action_resolved / action_pending WS frames (+ refetch on load).
+      "list_pending_commands",
+      "list_pending_actions",
+      "confirm_pending_action",
+      "cancel_pending_action",
+      "approve_pending_command",
     ]),
   });
 
