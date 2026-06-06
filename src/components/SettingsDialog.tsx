@@ -137,6 +137,12 @@ export function SettingsDialog({
   // aqx (build-out): grounded web search (Google) toggle. Off by default; config (not a secret).
   const [groundingEnabled, setGroundingEnabled] = useState<boolean>(false);
 
+  // P0b memory synthesizer settings. Surfaces the existing backend-only keys.
+  const [memoryPythonEnabled, setMemoryPythonEnabled] = useState<boolean>(true);
+  const [memorySynthTimeoutMs, setMemorySynthTimeoutMs] = useState<number>(150);
+  // Live status pill: fetched once on mount via GET /api/health.
+  const [memorySynthStatus, setMemorySynthStatus] = useState<"python" | "fallback" | "unknown">("unknown");
+
   // Local states - Project profiles
   const [activeContext, setActiveContext] = useState<string>("default_project");
   const [localWorkspacePath, setLocalWorkspacePath] = useState<string>("");
@@ -185,6 +191,21 @@ export function SettingsDialog({
       .catch(err => console.error("Error fetching pending approvals settings modal", err));
   }, []);
 
+  // P0b: fetch live memory synthesizer status once on mount. REST envelope: { output: { memory: { synthesizer } } }.
+  useEffect(() => {
+    apiFetch("/api/health")
+      .then(res => res.json())
+      .then((data: any) => {
+        const synth = data?.output?.memory?.synthesizer;
+        if (synth === "python" || synth === "fallback") {
+          setMemorySynthStatus(synth);
+        } else {
+          setMemorySynthStatus("unknown");
+        }
+      })
+      .catch(() => setMemorySynthStatus("unknown"));
+  }, []);
+
   useEffect(() => {
     if (initialSettings) {
       setPort(initialSettings.server?.port ?? 3000);
@@ -216,6 +237,8 @@ export function SettingsDialog({
       setHistoryMaxCommands(initialSettings.advanced?.historyMaxCommands ?? 50);
       setHistoryMaxOutputLength(initialSettings.advanced?.historyMaxOutputLength ?? 5000);
       setCapabilityGates(normalizeGateMap(initialSettings.advanced?.capabilityGates));
+      setMemoryPythonEnabled(initialSettings.advanced?.memoryPythonEnabled ?? true);
+      setMemorySynthTimeoutMs(initialSettings.advanced?.memorySynthTimeoutMs ?? 150);
 
       setGeminiApiKey(initialSettings.secrets?.geminiApiKey ?? "");
 
@@ -269,7 +292,9 @@ export function SettingsDialog({
         defaultShellCommand,
         globalPermissionsMode,
         historyMaxCommands,
-        historyMaxOutputLength
+        historyMaxOutputLength,
+        memoryPythonEnabled,
+        memorySynthTimeoutMs
       }, capabilityGates) as SystemSettings["advanced"],
       secrets: {
         geminiApiKey
@@ -286,7 +311,7 @@ export function SettingsDialog({
     activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
-    announcements, capabilityGates
+    announcements, capabilityGates, memoryPythonEnabled, memorySynthTimeoutMs
   ]);
 
   // Handle Saving
@@ -344,6 +369,9 @@ export function SettingsDialog({
         if (parsed.advanced.historyMaxOutputLength !== undefined) setHistoryMaxOutputLength(parsed.advanced.historyMaxOutputLength);
         // bead 8sq: round-trip the global capability-gate matrix through the JSON tab too.
         if (parsed.advanced.capabilityGates !== undefined) setCapabilityGates(normalizeGateMap(parsed.advanced.capabilityGates));
+        // P0b memory synthesizer settings round-trip.
+        if (parsed.advanced.memoryPythonEnabled !== undefined) setMemoryPythonEnabled(!!parsed.advanced.memoryPythonEnabled);
+        if (parsed.advanced.memorySynthTimeoutMs !== undefined) setMemorySynthTimeoutMs(Number(parsed.advanced.memorySynthTimeoutMs));
       }
       if (parsed.secrets) {
         if (parsed.secrets.geminiApiKey !== undefined) setGeminiApiKey(parsed.secrets.geminiApiKey);
@@ -1117,6 +1145,68 @@ export function SettingsDialog({
                           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
                           value={historyMaxOutputLength} onChange={e => setHistoryMaxOutputLength(Number(e.target.value))} placeholder="5000"
                         />
+                      </div>
+                    </div>
+
+                    {/* P0b: Memory Synthesizer section */}
+                    <div className="border border-white/10 rounded-lg p-3 space-y-3 mt-2">
+                      <div className="border-b border-white/5 pb-2">
+                        <h4 className="text-zinc-300 uppercase text-[10px] tracking-widest font-bold">Memory Synthesizer</h4>
+                        <p className="text-[10px] text-zinc-500 mt-0.5">Python context synthesizer settings and live health</p>
+                      </div>
+
+                      {/* Live status pill */}
+                      <div className="flex items-center gap-2">
+                        <span className="text-zinc-400 text-[10px]">Live status:</span>
+                        {memorySynthStatus === "python" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
+                            python
+                          </span>
+                        )}
+                        {memorySynthStatus === "fallback" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                            fallback
+                          </span>
+                        )}
+                        {memorySynthStatus === "unknown" && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+                            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 inline-block" />
+                            unknown
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Python synthesizer toggle */}
+                      <label className="flex items-start gap-2.5 p-3 bg-black/30 border border-white/10 rounded-lg cursor-pointer hover:border-white/20 transition-colors">
+                        <input
+                          type="checkbox"
+                          checked={memoryPythonEnabled}
+                          onChange={e => setMemoryPythonEnabled(e.target.checked)}
+                          className="mt-0.5 accent-cyan-500 cursor-pointer"
+                        />
+                        <span className="min-w-0">
+                          <span className="text-zinc-300 font-bold block text-[11px]">Python Context Synthesizer</span>
+                          <span className="text-[10px] text-zinc-500 leading-relaxed block">
+                            On by default. Strict upgrade — when disabled the system falls back to the
+                            in-process synthesizer silently. Never a hard dependency; disabling does not
+                            break memory reads.
+                          </span>
+                        </span>
+                      </label>
+
+                      {/* Synthesizer timeout input */}
+                      <div>
+                        <label className="block text-zinc-400 mb-1">Synthesizer Race Deadline (ms)</label>
+                        <input
+                          type="number"
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
+                          value={memorySynthTimeoutMs}
+                          onChange={e => setMemorySynthTimeoutMs(Number(e.target.value))}
+                          placeholder="150"
+                        />
+                        <p className="text-[9px] text-zinc-600 mt-0.5">Per-call race deadline before fallback (default 150 ms). Increase on high-latency hosts.</p>
                       </div>
                     </div>
 
