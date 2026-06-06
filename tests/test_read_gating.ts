@@ -32,6 +32,7 @@ import { ALL_CAPABILITIES } from "../src/gateSurface";
 import type { ActionContext } from "../src/actions/types";
 import type { CapabilityGate, GateValue } from "../src/types";
 import { PendingApprovalStore } from "../src/pendingApprovals";
+import { PendingActionStore } from "../src/pendingActions";
 
 const FORBID_PANE =
   "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy.";
@@ -180,6 +181,7 @@ function makeCtx(
       gates[capability] ?? "Auto",
     pruneAttention: () => {},
     pendingApprovals: new PendingApprovalStore(null),
+    pendingActions: new PendingActionStore(null), // c55.15: deferred-action store (approvals/pending defs)
     applyResolution: () => ({ reason: "not_found", doWrite: false }),
     store,
     sanitizeSettingsForClient: (settings) => settings,

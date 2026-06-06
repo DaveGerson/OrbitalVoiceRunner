@@ -30,6 +30,7 @@ import { ALL_CAPABILITIES } from "../src/gateSurface";
 import { toGeminiDeclarations, runAction, resultToToolResponse, zodToGeminiSchema } from "../src/actions/gemini";
 import { redactSecrets } from "../src/terminal";
 import { PendingApprovalStore } from "../src/pendingApprovals";
+import { PendingActionStore } from "../src/pendingActions";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test doubles: a stubbed ActionContext whose gateOrDefer disposition is configurable per test.
@@ -136,6 +137,7 @@ function makeCtx(opts: {
     effectiveCapabilityGateFor: (_pane, _cap) => "Auto",
     pruneAttention: () => { if (opts.pruneAttentionCalls) opts.pruneAttentionCalls.count += 1; },
     pendingApprovals: new PendingApprovalStore(null),
+    pendingActions: new PendingActionStore(null), // c55.15: deferred-action store (approvals/pending defs)
     applyResolution: (_id, _mode, _opts) => ({ reason: "not_found", doWrite: false }),
     store: opts.store ?? null,
     sanitizeSettingsForClient: (settings) => settings, // passthrough (no masking needed in tests)

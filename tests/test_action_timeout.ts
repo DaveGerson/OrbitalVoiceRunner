@@ -23,6 +23,7 @@ import type {
   ActionResult,
 } from "../src/actions/types";
 import { PendingApprovalStore } from "../src/pendingApprovals";
+import { PendingActionStore } from "../src/pendingActions";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test double: a stubbed ActionContext. Mirrors makeCtx() from test_action_registry.ts but only
@@ -56,6 +57,7 @@ function makeCtx(opts: {
     effectiveCapabilityGateFor: () => "Auto",
     pruneAttention: () => {},
     pendingApprovals: new PendingApprovalStore(null),
+    pendingActions: new PendingActionStore(null), // c55.15: deferred-action store (approvals/pending defs)
     applyResolution: () => ({ reason: "not_found", doWrite: false }),
     store: null,
     sanitizeSettingsForClient: (settings) => settings,

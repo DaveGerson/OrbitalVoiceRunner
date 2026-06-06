@@ -634,6 +634,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           effectiveCapabilityGateFor,
           pruneAttention,
           pendingApprovals,
+          pendingActions,                       // c55.15: the converged approvals/pending REST defs read it
           applyResolution,
           applyPaneMode,
           store,

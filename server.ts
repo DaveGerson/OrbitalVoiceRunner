@@ -1188,6 +1188,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       effectiveCapabilityGateFor,
       pruneAttention,
       pendingApprovals,
+      pendingActions,                           // c55.15: the converged approvals/pending REST defs read it
       applyResolution,
       applyPaneMode,
       store,
