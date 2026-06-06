@@ -114,9 +114,9 @@ export interface DecideInput {
  * Invariants:
  *  - mode "off"            => always allow, action "none".
  *  - no existing lock      => acquire + allow.
- *  - existing is self      => allow (refresh handled by caller via "acquire"
- *                              when it wants to update the timestamp; here we
- *                              report "none" so a no-op is valid).
+ *  - existing is self      => acquire (REFRESH): rewrite the record so acquiredAt
+ *                              bumps to `now` and an active session never lets its
+ *                              own lock go stale (bead 5rq).
  *  - existing is stale     => reclaim (acquire) + allow.
  *  - existing is foreign &
  *      live & advisory     => warn + allow.
@@ -142,10 +142,16 @@ export function decide(input: DecideInput): WtLockOutcome {
   }
 
   if (isSelf(existing, self)) {
+    // BEAD 5rq: REFRESH our own lock on every self-commit. Returning "acquire" makes the
+    // I/O shell rewrite the record with acquiredAt=now (via makeLockRecord), so an ACTIVE
+    // session that commits at least once per stale window keeps its lock — otherwise a
+    // long-idle-then-commit session could have its OWN live lock reclaimed as stale by
+    // another worktree (weakening mutual exclusion under strict mode). The write is a
+    // self-owned no-op apart from the bumped timestamp, so this is always safe.
     return {
-      action: "none",
+      action: "acquire",
       verdict: "allow",
-      reason: `lock on '${existing.branch}' already held by this worktree`,
+      reason: `lock on '${existing.branch}' already held by this worktree — refreshing`,
     };
   }
 

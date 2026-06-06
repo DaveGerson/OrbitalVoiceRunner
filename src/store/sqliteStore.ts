@@ -283,6 +283,12 @@ export class JanusStore {
     return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
       .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
   }
+  /** Total pending_actions rows REGARDLESS of claimed/expiry — the boot-prune (bead 1qs) target
+   *  surface. getPendingActions/getExpiredActions both filter claimed=0, so a leaked claimed=1 row
+   *  is invisible to them; this counts the raw table for retention assertions/observability. */
+  countPendingActions(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM pending_actions").get() as any).n as number;
+  }
 
   // ── unified action log (schema v6, PLM2) ────────────────────────────────────────────────────────
   // Append-only observability spine for the action registry: one row per runAction() invocation. `ts`

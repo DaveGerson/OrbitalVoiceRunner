@@ -110,11 +110,35 @@ test("decide: no existing lock -> acquire + allow", () => {
   assert.equal(o.verdict, "allow");
 });
 
-test("decide: own lock -> allow (action none), even in strict", () => {
+test("decide: own lock -> allow + REFRESH (acquire), even in strict", () => {
+  // BEAD 5rq: a self-owned lock must REFRESH acquiredAt so an active session keeps its
+  // lock. The decision is "acquire" (the script's acquire path rewrites the record with a
+  // bumped timestamp); it must never be "none" (which would let the lock go stale and be
+  // reclaimed by another worktree after JANUS_WT_LOCK_STALE_MS).
   const own = foreignLock({ worktree: SELF.worktree, session: SELF.session });
   const o = decide({ existing: own, self: SELF, mode: "strict", now: Date.now() });
   assert.equal(o.verdict, "allow");
-  assert.equal(o.action, "none");
+  assert.equal(o.action, "acquire");
+});
+
+test("decide: self-owned lock REFRESHES acquiredAt (does not let its own lock go stale)", () => {
+  // The exact hazard: a session idle longer than the stale window has its OWN live lock.
+  // On its next self-commit the decision must yield "acquire" so the script rewrites the
+  // record at `now` — a NEWER acquiredAt than the original — keeping mutual exclusion intact.
+  const now = 10_000_000;
+  const staleOriginal = now - (DEFAULT_STALE_MS - 1); // still self-owned, near-stale
+  const own = foreignLock({
+    worktree: SELF.worktree,
+    session: SELF.session,
+    acquiredAt: staleOriginal,
+  });
+  const o = decide({ existing: own, self: SELF, mode: "strict", now });
+  assert.equal(o.action, "acquire", "self-owned lock refreshes via acquire");
+
+  // The record the acquire path will write bumps acquiredAt to `now` (> the original).
+  const refreshed = makeLockRecord(SELF, now);
+  assert.equal(refreshed.acquiredAt, now);
+  assert.ok(refreshed.acquiredAt > staleOriginal, "refreshed acquiredAt is bumped past the original");
 });
 
 test("decide: foreign + STALE lock is reclaimed and allowed (no permanent brick)", () => {
