@@ -811,28 +811,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // ungated behavior). Same HistoryManager.saveHistory(id, []) effect; client ignores the body.
 
   // Project and Pane management endpoints
-  app.post("/api/projects", (req, res) => {
-    const { id, directory, summary, keyTerms, name } = req.body;
-    if (!id) {
-      res.status(400).json({ error: "Missing required field: id" });
-      return;
-    }
-    // G5: validate the caller-supplied directory before persisting it. A non-blank
-    // dir that does not exist (or is a file) is rejected — storing it would later
-    // taint a child pane's cwd and make node-pty throw "path not found". Blank/"."
-    // resolves to the server cwd (valid intent preserved), never the literal ".".
-    if (isBadProjectDir(directory)) {
-      res.status(400).json({ error: `Project directory does not exist: ${String(directory).trim()}` });
-      return;
-    }
-    const terms = Array.isArray(keyTerms) ? keyTerms : [];
-    manager.ledger.addProject(id, resolveProjectDir(directory), summary || "", terms);
-    if (name) {
-      manager.ledger.renameProject(id, name);
-    }
-    broadcastLedgerUpdate();
-    res.json({ success: true });
-  });
+  // c55.16: POST /api/projects is now served by the registry-derived create_project def
+  // (mountRestRoutes only-set above). The def gained an optional `name` param + a coerceArgs shim
+  // (aliases the UI body id->project_id / keyTerms->key_terms only when the snake key is absent) and
+  // ports the inline post-create RENAME as a 2nd in-handler ledger mutation — addProject then, iff a
+  // truthy name, renameProject — before the single ledger_updated broadcast (both are pure ledger ops,
+  // no connection scope). Accepted client-invisible body deltas: 200 {success:true} -> 200 {output:"…"};
+  // malformed no-id 400 -> zod 500 (same class as create_pane). The client (App.tsx) reads no response
+  // field; it repaints off the ledger_updated WS frame + a follow-on fetchLedger/fetchTerminals.
 
   // c55.14: PUT /api/projects/:id now served by the registry-derived update_project def (mountRestRoutes only-set above).
 
@@ -1295,6 +1281,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       "rename_project",
       "rename_pane",
       "switch_context",
+      // c55.16 — create_project converged. The def gained an optional `name` param + a coerceArgs
+      // shim aliasing the UI body {id->project_id, keyTerms->key_terms} (only when the snake key is
+      // absent, so voice/goldens are untouched), and ports the inline post-create RENAME as a 2nd
+      // in-handler ledger mutation (addProject then, iff name, renameProject) before the single
+      // ledger_updated broadcast. The inline POST /api/projects twin is deleted below in the
+      // SAME change (no-twin lockstep). Accepted client-invisible body deltas: 200 {success:true} ->
+      // 200 {output:"Project context <id> created…"}; malformed no-id 400 -> zod 500 (same class as
+      // create_pane). Client (App.tsx) reads no response field; repaints off ledger_updated.
+      "create_project",
       // c55 Batch C — five NEW rest-only defs for inline pane/UI routes with no voice twin. The inline
       // app.post(...) twins are deleted below in the SAME change. Clients read only res.ok and repaint
       // off the terminals_updated / ledger_updated WS frames the handlers fan out.

@@ -41,7 +41,10 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   // ── exception: raw keystrokes (multi-cli; gated inline via write_to_pane) ──
   { method: "post", path: "/api/terminals/:id/raw-input", category: "exception", reason: "multi-cli raw-keystroke path; bifurcated gate inline; future converge" },
   // ── held (open c55 decisions) ──
-  { method: "post", path: "/api/projects", category: "held", reason: "create_project: inline does a post-create rename (2nd mutation) the def lacks — held" },
+  // c55.16: POST /api/projects (create_project) was CONVERGED — the def gained an optional `name`
+  // param + a coerceArgs shim and now ports the inline post-create RENAME as a 2nd in-handler ledger
+  // mutation (both pure ledger ops, no connection scope). The inline route + this held row are deleted
+  // together (no-twin lockstep). The {success:true}->{output} body delta is client-invisible.
   // c55.16: PUT /api/projects/:projectId/panes/:paneId/capability-gates (the BULK per-pane gate-map
   // write) was CONVERGED to the new rest-only set_pane_gates def — the inline route + this held row are
   // deleted together (no-twin guard). The voice set_capability_gate def is now voice-only.

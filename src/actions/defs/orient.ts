@@ -135,12 +135,31 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
 // Else: addProject(resolveProjectDir(directory), summary||"", key_terms||[]) [no-op if
 // id exists]; broadcastLedgerUpdate(); ok with the created-successfully string.
 // isBadProjectDir/resolveProjectDir are MODULE imports (src/projectDir), NOT ctx closures.
+//
+// c55.16 — converges the inline app.post("/api/projects", …) so it can be deleted. Two additions:
+//   (1) optional `name` param + a SECOND ledger mutation: after addProject, iff a truthy `name` was
+//       supplied, ledger.renameProject(project_id, name). addProject initializes name=id and has no
+//       name param, and is a no-op when the id exists, so the display name can ONLY be set by the
+//       separate renameProject — genuinely a 2nd op, but PURE ledger (no connection scope), so the
+//       registry handler runs both, then broadcasts ONE ledger_updated frame (identical to inline).
+//   (2) coerceArgs — the UI POSTs { id, name, directory, summary, keyTerms } (camelCase `id`/`keyTerms`
+//       + `name`). The strict-strip zod schema would DROP an un-aliased `id`, leaving project_id
+//       undefined -> zod 500. coerceArgs (runs BEFORE params.parse) aliases id->project_id /
+//       keyTerms->key_terms ONLY WHEN the snake key is absent, so a voice call carrying
+//       project_id/key_terms is never clobbered (preserves the create_project / .bad_dir goldens,
+//       which send snake_case and never name/id). `name` passes straight through (now a schema field).
+// Accepted, client-invisible body deltas (App.tsx:1762-1773 reads NO response field, repaints via
+//   handleSwitchProject -> fetchLedger/fetchTerminals + the ledger_updated WS frame):
+//   - happy path: inline 200 { success:true } -> 200 { output:"Project context <id> created…" };
+//   - malformed direct call (no id): inline 400 -> zod 500 (project_id Required) — same accepted
+//     class as create_pane's inline-400 -> zod-500 delta.
 // ─────────────────────────────────────────────────────────────────────────────
 const CreateProjectParams = z.object({
   project_id: z.string(),
   directory: z.string().optional(),
   summary: z.string().optional(),
   key_terms: z.array(z.string()).optional(),
+  name: z.string().optional(), // c55.16: optional display name -> post-create rename (2nd mutation)
 });
 
 export const createProject: ActionDef<typeof CreateProjectParams> = {
@@ -151,8 +170,19 @@ export const createProject: ActionDef<typeof CreateProjectParams> = {
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/projects" },
+  // c55.16: alias the UI's camelCase body onto the snake_case zod keys, but ONLY when the snake key
+  // is absent so a voice call (project_id / key_terms) is never clobbered. `name` passes straight
+  // through. Mirrors the Batch-D apply_orchestration_recipe coerceArgs precedent (orchestration.ts).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.project_id == null && out.id != null) out.project_id = out.id;
+    if (out.key_terms == null && out.keyTerms != null) out.key_terms = out.keyTerms;
+    delete out.id;
+    delete out.keyTerms;
+    return out;
+  },
   handler: (args, ctx: ActionContext): ActionResult => {
-    const { project_id, directory, summary, key_terms } = args;
+    const { project_id, directory, summary, key_terms, name } = args;
     // G5: reject a non-existent caller-supplied directory before persisting it
     // (a bad dir later taints every child pane's cwd). Blank/"." resolves to the
     // server cwd. The rejection is a spoken-friendly tool response so the model
@@ -163,8 +193,11 @@ export const createProject: ActionDef<typeof CreateProjectParams> = {
         output: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`,
       };
     }
-    ctx.manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []);
-    ctx.broadcastLedgerUpdate();
+    ctx.manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []); // MUTATION 1
+    if (name) {
+      ctx.manager.ledger.renameProject(project_id, name); // MUTATION 2 (conditional) — c55.16 post-create rename
+    }
+    ctx.broadcastLedgerUpdate(); // ONE ledger_updated frame after BOTH mutations
     return { kind: "ok", output: `Project context ${project_id} created successfully.` };
   },
 };
