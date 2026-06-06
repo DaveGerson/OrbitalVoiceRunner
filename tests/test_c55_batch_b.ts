@@ -450,15 +450,18 @@ describe("c55 Batch B — registry rest bindings (snake_case route params)", () 
     });
   }
 
-  // c55.9: execute_plan KEEPS the legacy `:id` segment (the inline route used it; the def is now the
-  // sole server of that path, so no rename was needed). c55.9 ADDED a rest.toHttp for the §6 status map
+  // c55.9: execute_plan binds the snake_case `:plan_id` segment so Express injects the path param
+  // directly onto the snake_case zod key (ExecutePlanParams.plan_id) — matching the
+  // delete_orchestrator_plan precedent (DELETE /api/plans/:plan_id). With the legacy `:id` form
+  // req.params = { id } only, parse fails, and dispatchProposal never fires; the client URL
+  // (POST /api/plans/<id>/execute) is unchanged. c55.9 ADDED a rest.toHttp for the §6 status map
   // (executed 200 / pending 202 / blocked 403 / pane-offline 400 / plan-not-found 404 / clarify 409),
   // so the binding now carries method + path + toHttp.
-  it("execute_plan rest binding keeps :id and now declares toHttp (converged in c55.9)", () => {
+  it("execute_plan rest binding uses :plan_id and now declares toHttp (converged in c55.9)", () => {
     const def = REGISTRY.find((d) => d.name === "execute_plan");
     assert.ok(def, "registry must contain execute_plan");
     assert.strictEqual(def!.rest!.method, "post");
-    assert.strictEqual(def!.rest!.path, "/api/plans/:id/execute");
+    assert.strictEqual(def!.rest!.path, "/api/plans/:plan_id/execute");
     assert.strictEqual(typeof def!.rest!.toHttp, "function", "c55.9 added the §6 toHttp status map");
   });
 });
