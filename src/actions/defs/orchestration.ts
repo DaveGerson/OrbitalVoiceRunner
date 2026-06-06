@@ -109,7 +109,22 @@ const ExecutePlanParams = z.object({
  * mutation + a spoken read-back STRING; EVERY branch answers via response.output, so every branch
  * maps to ActionResult kind:"ok" (the live wire shape is { output: resp }). Mapping pending/clarify
  * to ActionResult kind:"pending"/"clarify" would change the wire shape — do NOT.
+ *
+ * c55.9 REST CONVERGENCE: the inline `POST /api/plans/:id/execute` route is deleted; this def now
+ * serves it. The §6 status map (executed->200 / pending->202 / blocked->403 / pane-offline->400 /
+ * plan-not-found->404 / clarify->409) is expressed via `rest.toHttp` reading the OUTCOME stamped on the
+ * `ok` result's OPTIONAL `meta` channel — NOT on `output` (which stays the unchanged spoken read-back,
+ * per spec §9.2). `meta` is invisible to the voice path (voiceResponse reads only `output`), so the
+ * voice wire shape is byte-identical.
  */
+/** The dispatch outcome the handler stamps on `result.meta` for execute_plan's rest.toHttp (c55.9 §6). */
+type ExecutePlanOutcome =
+  | "executed"        // auto write landed       -> 200
+  | "pending"         // Ask staged a pending    -> 202
+  | "blocked"         // gate Off / read-only    -> 403
+  | "pane_offline"    // no live term / no pane  -> 400 (parity with inline "node offline")
+  | "plan_not_found"  // unknown plan id         -> 404
+  | "clarify";        // shell re-route          -> 409
 export const executePlan: ActionDef<typeof ExecutePlanParams> = {
   name: "execute_plan",
   description: "Starts running a synthesized multi-step plan recipe.",
@@ -117,11 +132,41 @@ export const executePlan: ActionDef<typeof ExecutePlanParams> = {
   capability: "execute_plan",
   readOnly: false,
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "post", path: "/api/plans/:id/execute" },
+  rest: {
+    method: "post",
+    // Route param is snake_case (:plan_id) so Express injects it directly onto the snake_case zod key
+    // (ExecutePlanParams.plan_id) — matching the delete_orchestrator_plan precedent (DELETE
+    // /api/plans/:plan_id). The client URL (POST /api/plans/<id>/execute) is unchanged (Express matches
+    // :plan_id against the same URL position), and the no-twin guard scans server.ts text, not this path.
+    path: "/api/plans/:plan_id/execute",
+    // c55.9 §6: map the stamped dispatch outcome to the inline route's status contract WITHOUT
+    // touching `result.output` (the spoken read-back). The default kind->status map cannot express
+    // this (every branch is kind:"ok"), so toHttp re-projects the structured `meta.outcome`. The
+    // body is not load-bearing — the React client repaints off the plans_updated/approval_pending WS
+    // frames — so we echo the output string for parity/debuggability.
+    toHttp: (result): { status: number; body: unknown } => {
+      const outcome = (result.kind === "ok"
+        ? (result.meta as { outcome?: ExecutePlanOutcome } | undefined)?.outcome
+        : undefined) as ExecutePlanOutcome | undefined;
+      const status =
+        outcome === "executed" ? 200 :
+        outcome === "pending" ? 202 :
+        outcome === "blocked" ? 403 :
+        outcome === "pane_offline" ? 400 :
+        outcome === "plan_not_found" ? 404 :
+        outcome === "clarify" ? 409 :
+        200; // defensive default (an un-stamped ok)
+      const body = result.kind === "ok" ? { output: result.output } : { error: "execute_plan failed" };
+      return { status, body };
+    },
+  },
   handler: (args, ctx): ActionResult => {
     const { plan_id } = args;
     const plan = ctx.manager.ledger.plans.find((p) => p.id === plan_id);
     let resp = "";
+    // c55.9: the dispatch outcome stamped on `meta` for execute_plan's rest.toHttp (§6). NEVER read on
+    // voice (voiceResponse reads only `output`) — the spoken `resp` string below is UNCHANGED.
+    let outcome: ExecutePlanOutcome = "plan_not_found";
     if (plan) {
       plan.status = "running";
       plan.currentStepIndex = 0;
@@ -143,24 +188,31 @@ export const executePlan: ActionDef<typeof ExecutePlanParams> = {
       });
       if (stepOutcome.kind === "executed") {
         resp = `Started execution of plan '${plan.name}'! Running step 1 on '${currentStep.terminalId}'.`;
+        outcome = "executed";
       } else if (stepOutcome.kind === "pending") {
         resp = `Plan '${plan.name}' step 1 needs approval: ${stepOutcome.text}`;
+        outcome = "pending";
       } else if (stepOutcome.kind === "clarify") {
         plan.status = "paused";
         currentStep.status = "failed";
         resp = `Plan '${plan.name}' step 1 paused: ${stepOutcome.text}`;
+        outcome = "clarify";
       } else {
         plan.status = "paused";
         currentStep.status = "failed";
         resp = `Could not start plan '${plan.name}': ${stepOutcome.text}`;
+        // §6: a "blocked" dispatch (gate Off / read-only) -> 403; an "error" dispatch is the no-live-
+        // term / inert-pane case -> 400 (preserves the inline route's "node offline" status).
+        outcome = stepOutcome.kind === "blocked" ? "blocked" : "pane_offline";
       }
       // Persist + broadcast ONCE, inside the plan-found block only (server.ts:2984-2985).
       ctx.manager.ledger["save"](true);
       ctx.broadcast({ type: "plans_updated", plans: ctx.manager.ledger.plans });
     } else {
       resp = `Error: Plan '${plan_id}' not found.`;
+      outcome = "plan_not_found";
     }
-    return { kind: "ok", output: resp };
+    return { kind: "ok", output: resp, meta: { outcome } };
   },
 };
 

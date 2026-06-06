@@ -12,7 +12,15 @@ import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } 
 import {
   PendingApprovalStore,
   // c55.15: serializePending moved into the list_pending_commands registry def (its toHttp maps the array).
+  // c55.9: the PURE [decide] half of the pane-write pipe — the SAME resolver the voice wrapper calls
+  // (src/voice/index.ts) — so the REST dispatchProposal wrapper shares ONE decision, no duplication.
+  decideProposal,
+  inferKind,
 } from "./src/pendingApprovals";
+// c55.9: the SHARED [apply effect] dispatch core (extracted in step 1). The REST dispatchProposal
+// wrapper below binds the three connection-bound values (sess:null, notify=broadcast, guard:false,
+// origin:"rest") — byte-identical engine to the voice wrapper, two bindings.
+import { applyDispatchDecision } from "./src/dispatch/paneWrite";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 // c55 + concurrent multi-cli merge: c55 dropped restGateOutcome from create_pane/recipes (now registry-
@@ -982,42 +990,18 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // c55 Batch A: POST /api/plans (create) is now served by the registry twin create_orchestrator_plan
   // (mountRestRoutes only-set above) — same plans_updated broadcast and ledger["save"](true) persist.
   // Accepted body delta (client ignores the body): the inline missing-name/steps 400 becomes a zod
-  // validation 500 (no valid client sends an empty payload). GET /api/plans, POST /api/plans/:id/execute,
-  // and DELETE /api/plans/:id stay inline (out of scope — later batches).
+  // validation 500 (no valid client sends an empty payload). GET /api/plans (c55.11),
+  // POST /api/plans/:id/execute (c55.9), and DELETE /api/plans/:id (c55 Batch G) are now ALL converged
+  // to registry defs (see the notes just below) — none stay inline.
 
-  // c55 Batch B: POST /api/plans/:id/execute stays INLINE — HELD from the registry cutover. The
-  // registry twin execute_plan routes step 1 through ctx.dispatchProposal (the connection-scoped
-  // pane-WRITE choke-point). buildRestActionContext injects a REFUSING STUB for dispatchProposal
-  // ("pane-write is not available on the REST surface"), so converging this route would make the UI
-  // "Run plan" button (App.tsx handleExecutePlan) always refuse instead of dispatching step 1. That is
-  // a real functional regression, not a client-invisible body delta — it needs a REST-capable
-  // pane-write path (architectural decision). HELD for ratification (c55 spec Open Decisions).
-  app.post("/api/plans/:id/execute", (req, res) => {
-    const plan = manager.ledger.plans.find(p => p.id === req.params.id);
-    if (plan) {
-      plan.status = "running";
-      plan.currentStepIndex = 0;
-      plan.steps.forEach((s, idx) => s.status = idx === 0 ? "running" : "pending");
-      const currentStep = plan.steps[0];
-
-      const targetTerm = manager.terminals[currentStep.terminalId];
-      if (targetTerm) {
-        HistoryManager.getInstance().addCommand(currentStep.terminalId, currentStep.command);
-        targetTerm.writeInput(currentStep.command);
-        manager.ledger["save"](true);
-        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-        res.json({ success: true, message: `Running step 1 command on '${currentStep.terminalId}'.` });
-      } else {
-        plan.status = "paused";
-        currentStep.status = "failed";
-        manager.ledger["save"](true);
-        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-        res.status(400).json({ error: `Selected node '${currentStep.terminalId}' is currently offline.` });
-      }
-    } else {
-      res.status(404).json({ error: "Plan not found." });
-    }
-  });
+  // c55.9: POST /api/plans/:id/execute is now served by the registry-derived execute_plan def
+  // (mountRestRoutes only-set above) — the inline route here is DELETED (converged). Step 1's pane
+  // write rides the SAME gated choke-point (restDispatchProposal -> applyDispatchDecision), so the
+  // REST Run-plan button respects capabilityGates.execute_plan (Auto/Ask/Off) at parity with voice
+  // (BUG-040 closed — the inline route wrote step 1 UN-gated). The def's rest.toHttp preserves the
+  // inline status contract: pane-offline 400 / plan-not-found 404 (+ executed 200 / pending 202 /
+  // blocked 403 / clarify 409). The client ignores the body and repaints off plans_updated /
+  // approval_pending WS frames. The inlineExceptions held row is removed in the SAME change (no-twin guard).
 
   // c55 Batch G: DELETE /api/plans/:id is now served by the registry-derived rest-only def
   // delete_orchestrator_plan (mountRestRoutes only-set above), ALWAYS_ALLOWED (preserving the inline
@@ -1178,10 +1162,68 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   });
 
   // ── REST surface, DERIVED from the registry (cv/PLM2). One ActionContext per request, session:null
-  // (the result maps to HTTP, not a Gemini sendToolResponse). The pane-WRITE choke-point
-  // (dispatchProposal) is connection-scoped and intentionally a refusing stub here — the only routes
-  // we mount are read-only observability tools, which never call it. The `only` allow-set scopes the
-  // mount so it never collides with the existing hand-written routes; it grows as cv1 converges reads.
+  // (the result maps to HTTP, not a Gemini sendToolResponse). The `only` allow-set scopes the mount so
+  // it never collides with the existing hand-written routes; it grows as cv1 converges reads.
+  //
+  // c55.9: the pane-WRITE choke-point (dispatchProposal) is no longer a refusing stub — it is the REST
+  // binding of the SHARED dispatch core (applyDispatchDecision). It resolves the SAME pure gate the
+  // voice wrapper resolves (effectiveModeFor + effectiveCapabilityGateFor + decideProposal) and binds
+  // the THREE connection-bound values for REST: sess=null (no Gemini session; PLM4 detachSession
+  // survivors already keep+resolve session-less pendings), notifyPending=broadcast (all operator UIs,
+  // not one socket), enforceActivePaneGuard=false (an operator Run-plan click is operator-DIRECTED, not
+  // a Janus proposal — design §5 row 3), origin="rest". This closes BUG-040: REST Run-plan now respects
+  // capabilityGates.execute_plan (Auto->write / Ask->HiTL pending / Off->block) at PARITY with voice.
+  const restDispatchProposal: ActionContext["dispatchProposal"] = (opts) => {
+    const { sess: _sess, callId, targetId, instruction } = opts;
+    const pendingId = opts.pendingId ?? callId;
+    const capability: CapabilityGate = opts.capability ?? "write_to_pane";
+    const term = manager.terminals[targetId];
+    const wsProj = manager.ledger.getActiveProject();
+    const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+    const runtimeType = term?.runtimeType;
+    const kind = inferKind(opts.explicitKind, runtimeType);
+
+    // The SAME pure [decide] half the voice wrapper runs (src/voice/index.ts) — global-first effective
+    // mode, AND-composed with the per-capability gate, then the pure decision. No duplication.
+    const effectiveMode = gating.effectiveModeFor(targetId);
+    const gate = effectiveCapabilityGateFor(targetId, capability);
+    const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: gating.shellAllowlist, capability, gate });
+
+    return applyDispatchDecision(
+      decision,
+      {
+        manager,
+        pendingApprovals,
+        broadcast,
+        addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
+        redactSecrets,
+        getPaneSummary: (paneId, lines) => manager.getPaneSummary(paneId, lines),
+        posturePayloadForPane,
+        announcementBus,
+        approvalTtlMs: gating.APPROVAL_TTL_MS,
+        getActivePaneId: () => coreState.activePaneId,
+        isPaneActiveForWrite,
+        targetId,
+        instruction,
+        capability,
+        kind,
+        trigger: opts.trigger,
+        effectiveMode,
+        pendingId,
+        callId,
+        term,
+      },
+      {
+        // REST binds the THREE connection-bound values: null session, broadcast as the pending-notify
+        // sink (all operator UIs), the active-pane guard SKIPPED (operator-directed click), origin rest.
+        sess: null,
+        notifyPending: (frame) => broadcast(frame),
+        enforceActivePaneGuard: false,
+        origin: "rest",
+      }
+    );
+  };
+
   function buildRestActionContext(req: RestRequest): ActionContext {
     // PLM4 (3): synthesize a STABLE per-request idempotency key for the REST surface (REST has no
     // Gemini call.id). The key is a hash of the action name + the request shape (params/query/body),
@@ -1203,7 +1245,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       broadcast,
       broadcastLedgerUpdate,
       gateOrDefer,
-      dispatchProposal: (() => ({ kind: "error", text: "pane-write is not available on the REST surface" })) as ActionContext["dispatchProposal"],
+      dispatchProposal: restDispatchProposal,  // c55.9: shared gated pane-write seam (was a refusing stub)
       gateCapability,
       redact: redactSecrets,
       getActivePaneId: () => coreState.activePaneId,
@@ -1275,11 +1317,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       // snake_case zod key; the inline camelCase-segment twins (:id / :projectId / :paneId) are
       // deleted below. The client ignores the HTTP body and repaints off the ledger_updated WS frame.
       //
-      // execute_plan is DELIBERATELY HELD from this cutover (see the inline note at POST
-      // /api/plans/:id/execute below): its registry handler routes step 1 through ctx.dispatchProposal,
-      // which is a connection-scoped REFUSING STUB in buildRestActionContext (pane-write is not
-      // available on the REST surface). Converging it would break the UI "Run plan" button (App.tsx).
-      // This needs a REST-capable pane-write path (architectural decision) — held for ratification.
+      // c55.9: execute_plan is now CONVERGED (was HELD). buildRestActionContext's dispatchProposal is a
+      // gated pane-write seam (restDispatchProposal -> applyDispatchDecision), so POST /api/plans/:id/execute
+      // is served by the registry def + its rest.toHttp (§6 status map: executed 200 / pending 202 /
+      // blocked 403 / pane-offline 400 / plan-not-found 404 / clarify 409). The inline route is deleted
+      // below in the SAME change (no-twin guard). BUG-040 closed (REST Run-plan now respects the gate).
+      "execute_plan",
       "rename_project",
       "rename_pane",
       "switch_context",

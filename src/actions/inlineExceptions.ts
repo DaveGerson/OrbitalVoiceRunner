@@ -43,7 +43,9 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   // ── held (open c55 decisions) ──
   { method: "post", path: "/api/projects", category: "held", reason: "create_project: inline does a post-create rename (2nd mutation) the def lacks — held" },
   { method: "put", path: "/api/projects/:projectId/panes/:paneId/capability-gates", category: "held", reason: "BULK gate map-write; set_capability_gate def is single-entry tighten-only — needs new set_pane_gates (held)" },
-  { method: "post", path: "/api/plans/:id/execute", category: "held", reason: "execute_plan: registry handler's dispatchProposal is a refusing stub on REST — needs a REST pane-write seam (c55.9)" },
+  // c55.9: POST /api/plans/:id/execute (execute_plan) was CONVERGED — buildRestActionContext now
+  // injects a gated REST pane-write seam (restDispatchProposal -> applyDispatchDecision), so the inline
+  // route + this held row are deleted together (no-twin guard). BUG-040 closed.
   { method: "post", path: "/api/attention/clear", category: "held", reason: "thin shim delegating to runAction('dismiss_attention',{}) — path-alias pending multi-path rest binding" },
   // c55.15: the 5 approvals/pending (HiTL) future-convergence rows were converged to rest-only
   // ALWAYS_ALLOWED registry defs (list_pending_commands / list_pending_actions / confirm_pending_action /

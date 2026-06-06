@@ -43,7 +43,12 @@ export interface CapabilityDef {
 
 /** Discriminated result so one handler can express every existing response shape (§9 wire map). */
 export type ActionResult =
-  | { kind: "ok"; output: unknown }                                  // normal read/write success
+  // `meta` (c55.9) is an OPTIONAL out-of-band channel for a `rest.toHttp` hook to read facts the voice
+  // wire shape must NOT carry. The voice projection (resultToToolResponse -> voiceResponse) reads ONLY
+  // `output`, so `meta` is invisible to voice; a def that must vary its HTTP status WITHOUT mutating the
+  // spoken `output` string (e.g. execute_plan, whose handler narrates the SAME read-back on every dispatch
+  // outcome) stamps the outcome here and reads it back in toHttp. Absent on every other def (no behavior change).
+  | { kind: "ok"; output: unknown; meta?: Record<string, unknown> }  // normal read/write success
   | { kind: "pending"; messageId: string; summary: string; extra?: Record<string, unknown> } // HiTL / deferred
   | { kind: "clarify"; text: string }                                // re-route / disambiguate (e.g. non-allowlisted shell)
   | { kind: "blocked"; reason: string }                              // gate Off / forbidden

@@ -33,8 +33,9 @@ import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
-import { isPaneActiveForWrite, inactivePaneClarify } from "../activePane";
-import { decideProposal, inferKind, type ApprovalKind, type PendingApproval } from "../pendingApprovals";
+import { isPaneActiveForWrite } from "../activePane";
+import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
+import { applyDispatchDecision } from "../dispatch/paneWrite";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -445,6 +446,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
        *  delivery path passes "deliver_handoff". The gate AND-composes with effectiveMode. */
       capability?: CapabilityGate;
     }): DispatchOutcome {
+      // c55.9 (A3-min): dispatchProposal is now a THIN WRAPPER over the shared dispatch core
+      // (applyDispatchDecision, src/dispatch/paneWrite.ts). It resolves the gate EXACTLY as before
+      // (the pure [decide] half) and binds the THREE connection-bound values: the live session, the
+      // pending-notify sink = clientWs.send (the one originating socket), the active-pane guard ON
+      // (Janus may only propose into the operator's open pane), and origin "voice". Behavior is
+      // BYTE-IDENTICAL to the pre-extraction inline switch (pinned by tests/test_approvals_wse.ts).
       const { sess, callId, targetId, instruction } = opts;
       const pendingId = opts.pendingId ?? callId;
       const capability: CapabilityGate = opts.capability ?? "write_to_pane";
@@ -452,13 +459,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       const wsProj = manager.ledger.getActiveProject();
       const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
 
-      // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so
-      // the operator can SEE and improve the command before it lands (HiTL). A proposal for any
-      // other pane is refused here — never written, in ANY policy mode — and Janus is told to ask
-      // for a switch. This sits ABOVE the effective-mode gate on purpose. (architecture step 5.)
-      if (!isPaneActiveForWrite(coreState.activePaneId, targetId)) {
-        return { kind: "clarify", text: inactivePaneClarify(coreState.activePaneId, targetId) };
-      }
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
 
@@ -468,62 +468,40 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       const gate = effectiveCapabilityGateFor(targetId, capability);
 
       const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist, capability, gate });
-      const safeInstr = redactSecrets(instruction);
 
-      switch (decision.type) {
-        case "error_no_pane":
-          return { kind: "error", text: `Error: pane ${targetId} not found.` };
-        case "error_kind_mismatch":
-          return { kind: "error", text: decision.reason };
-        case "clarify_shell":
-          // Non-blocking re-route (never a dead-end, never execution).
-          return { kind: "clarify", text: decision.reason };
-        case "capability_forbidden":
-          broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: `Capability '${capability}' is set to Off.` });
-          return { kind: "blocked", text: `Error: the '${capability}' capability is gated Off for pane ${targetId}; this action is forbidden by policy.` };
-        case "blocked_read_only":
-          broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
-          return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
-        case "auto_execute":
-          // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live
-          // process until it is restarted. `paneExists` is true for such a pane, so guard the
-          // immediate Full-Auto write: if there is no live terminal, refuse instead of crashing on
-          // `term!.writeInput`. (The pending-approval path re-checks liveness at resolve time.)
-          if (!term) {
-            return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
-          }
-          addCommand(targetId, instruction);
-          term.writeInput(instruction);
-          broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
-          return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
-        case "pending_approval": {
-          // WS-E.1 two-phase: store a serializable pending entry + the session in the side-map,
-          // mark it announced for targeting, and let the caller answer call.id NON-BLOCKINGLY.
-          const pSummary = redactSecrets(manager.getPaneSummary(targetId, 5));
-          const rationale = { trigger: redactSecrets(opts.trigger), summary: pSummary };
-          const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now(), capability };
-          pendingApprovals.add(record, sess, {
-            workspaceId: manager.ledger.activeProjectId || "default_project",
-            ttlMs: APPROVAL_TTL_MS,
-          });
-          // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
-          announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
-          // rbh: enrich the approval frame with the TARGET pane's EFFECTIVE posture so the dialog can
-          // show "into what posture am I approving this write?". posturePayloadForPane is frozen-aware
-          // on main, so the approval path needs no separate frozen fix (only the action path did).
-          // All additive optional fields — older clients ignore them; the harness-fed e2e specs degrade.
-          const approvalPosture = posturePayloadForPane(targetId);
-          clientWs.send(JSON.stringify({
-            type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale,
-            effective_gates: approvalPosture.effective_gates,
-            posture: approvalPosture.posture,
-            effective_mode: effectiveMode,
-            capability,
-          }));
-          const verb = kind === "agent_instruction" ? "direct pane" : "run on pane";
-          return { kind: "pending", text: `Pending approval: ${verb} ${targetId} — "${safeInstr}". Read it back to the operator and ask them to approve or reject.` };
+      return applyDispatchDecision(
+        decision,
+        {
+          manager,
+          pendingApprovals,
+          broadcast,
+          addCommand,
+          redactSecrets,
+          getPaneSummary: (paneId, lines) => manager.getPaneSummary(paneId, lines),
+          posturePayloadForPane,
+          announcementBus,
+          approvalTtlMs: APPROVAL_TTL_MS,
+          getActivePaneId: () => coreState.activePaneId,
+          isPaneActiveForWrite,
+          targetId,
+          instruction,
+          capability,
+          kind,
+          trigger: opts.trigger,
+          effectiveMode,
+          pendingId,
+          callId,
+          term,
+        },
+        {
+          // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so
+          // the operator can SEE and improve the command before it lands (HiTL). Enforced on voice.
+          sess,
+          notifyPending: (frame) => clientWs.send(JSON.stringify(frame)),
+          enforceActivePaneGuard: true,
+          origin: "voice",
         }
-      }
+      );
     }
 
     // PLM4 (2): the session-establish logic, extracted into a reusable closure callable on BOTH the
