@@ -497,7 +497,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // P0b: the optional warm Python synthesizer. A STRICT UPGRADE — gated by the master switch, eagerly
   // pre-warmed and non-fatal. Absent/broken interpreter ⇒ permanent fallback; Janus stays fully functional.
   const memoryPythonEnabled = manager.settings.advanced?.memoryPythonEnabled !== false; // default true
-  const memorySynthTimeoutMs = manager.settings.advanced?.memorySynthTimeoutMs ?? 150;
+  // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
+  // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
+  const _synthTimeoutRaw = manager.settings.advanced?.memorySynthTimeoutMs;
+  const memorySynthTimeoutMs =
+    typeof _synthTimeoutRaw === "number" && Number.isFinite(_synthTimeoutRaw) && _synthTimeoutRaw > 0
+      ? _synthTimeoutRaw
+      : 150;
   let pythonSynthClient: PythonSynthClient | undefined;
   if (memoryPythonEnabled) {
     try {

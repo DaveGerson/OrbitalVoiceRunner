@@ -1,0 +1,67 @@
+name: "Linux runtime verify (P0b memory synth)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "src/memory/**"
+      - "tests/test_memory_*.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/linux-verify.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "src/memory/**"
+      - "tests/test_memory_*.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/linux-verify.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: "python${{ matrix.python-version }} / node22 / ubuntu"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (vite + server bundle + copy-python)
+        run: npm run build
+
+      - name: Assert dist/python delivery
+        run: test -f dist/python/synthesizer/synth.py
+
+      - name: Python unit tests (exercises python3 discovery + spawn)
+        run: npm run test:py
+
+      - name: Real-daemon spawn smoke (memory-python seam round-trip)
+        run: npx tsx --test tests/test_memory_python_seam.ts
+
+      - name: Memory live-verify harness (A1/A2/A3 automated checks)
+        run: npx tsx --test tests/test_memory_live_verify.ts
