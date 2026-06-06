@@ -101,7 +101,7 @@ function AppRaw() {
   const [frozen, setFrozen] = useState(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
   const [isReconnecting, setIsReconnecting] = useState(false);
-  const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date }[]>([]);
+  const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
   const [showHistoryPanel, setShowHistoryPanel] = useState<boolean>(false);
   const [historyList, setHistoryList] = useState<{ command: string; timestamp: string; output: string }[]>([]);
@@ -1445,6 +1445,21 @@ function AppRaw() {
             ...prev,
             { sender: msg.sender, text: msg.text, timestamp: new Date() }
           ].slice(-50));
+        } else if (msg.type === "grounding") {
+          // BEAD aqx (build-out): attach the grounded sources/queries to the most recent Janus turn so
+          // a grounded answer shows where it came from. No-op if there is no Janus turn yet or nothing
+          // to show (grounding is off => the server never sends this frame).
+          setTranscript((prev) => {
+            const sources = Array.isArray(msg.sources) ? msg.sources : [];
+            const queries = Array.isArray(msg.queries) ? msg.queries : [];
+            if (sources.length === 0 && queries.length === 0) return prev;
+            let lastJanus = -1;
+            for (let i = prev.length - 1; i >= 0; i--) { if (prev[i].sender === "Janus") { lastJanus = i; break; } }
+            if (lastJanus === -1) return prev;
+            const next = prev.slice();
+            next[lastJanus] = { ...next[lastJanus], grounding: { queries, sources } };
+            return next;
+          });
         } else if (msg.type === "error") {
           playEarcon("alert");
           setWsErrorNotification({ message: msg.message || "An unexpected error occurred during raw liveness communication." });
@@ -4576,6 +4591,32 @@ function AppRaw() {
                       }`}>
                         {item.text}
                       </div>
+                      {!isUser && item.grounding && (item.grounding.sources.length > 0 || item.grounding.queries.length > 0) && (
+                        <div
+                          data-testid="transcript-grounding"
+                          className="mt-1 max-w-full text-[9px] font-mono text-cyan-400/60 leading-relaxed break-words"
+                        >
+                          <span className="opacity-70 uppercase tracking-wider">grounded via </span>
+                          {item.grounding.sources.length > 0 ? (
+                            item.grounding.sources.map((s, i) => (
+                              <span key={i}>
+                                <a
+                                  href={s.uri}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={s.uri}
+                                  className="underline decoration-dotted hover:text-cyan-300"
+                                >
+                                  {s.title || s.uri.replace(/^https?:\/\//, "").replace(/\/.*$/, "")}
+                                </a>
+                                {i < item.grounding!.sources.length - 1 ? ", " : ""}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="italic opacity-70">{item.grounding.queries.join("; ")}</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })

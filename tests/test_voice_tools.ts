@@ -327,6 +327,29 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
         `stop_all description flags it as emergency/always-allowed: ${decl.description}`
       );
     });
+
+    // BEAD aqx: grounding (googleSearch) is OFF BY DEFAULT. With the default settings the server boots
+    // with voiceAi.groundingEnabled=false, so buildVoiceTools() emits ONLY the function-declarations
+    // entry — the live tools array carries NO googleSearch built-in. This asserts the bead's hard
+    // "must keep the function-calling path unchanged when off" invariant END-TO-END through the real
+    // session boot (not just the buildVoiceTools unit), and pins that tools[0] is still the
+    // functionDeclarations entry (so the golden above reads the right slot).
+    it("GROUNDING off-by-default: live tools carry functionDeclarations and NO googleSearch", () => {
+      const tools = session.params?.config?.tools;
+      assert.ok(Array.isArray(tools), "config.tools is an array");
+      // tools[0] is the function-declarations entry (the golden above depends on this slot).
+      assert.ok(
+        Array.isArray(tools[0]?.functionDeclarations) && tools[0].functionDeclarations.length > 0,
+        "tools[0] is the non-empty functionDeclarations entry"
+      );
+      // No entry enables the googleSearch built-in when grounding is off (the default).
+      const hasSearch = tools.some((t: any) => t && t.googleSearch !== undefined);
+      assert.strictEqual(
+        hasSearch,
+        false,
+        "with grounding off (default) the live tools array contains NO googleSearch entry"
+      );
+    });
   });
 
   // REG1 phase-C: the "voice tool surface parity guard" describe block was REMOVED here. It

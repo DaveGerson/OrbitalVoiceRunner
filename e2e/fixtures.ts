@@ -12,6 +12,7 @@ declare global {
     __ORBITAL_E2E__?: {
       injectStdoutChunk: (terminalId: string, chunk: string) => void;
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
+      injectGrounding: (queries: string[], sources: { uri: string; title: string }[]) => void;
       injectPendingApproval: (cmd: string, terminalId?: string) => void;
       injectPendingAction: (capability: string, summary: string) => void;
       injectWipDraft: (paneId: string, text: string) => void;
@@ -45,6 +46,18 @@ export async function injectTranscript(page: Page, sender: "User" | "Janus", tex
   await page.evaluate(
     ([s, t]) => window.__ORBITAL_E2E__?.injectTranscript(s as "User" | "Janus", t),
     [sender, text] as const,
+  );
+}
+
+/** aqx (build-out): attach grounded queries/sources to the most recent Janus turn (drives the chip). */
+export async function injectGrounding(
+  page: Page,
+  queries: string[],
+  sources: { uri: string; title: string }[],
+): Promise<void> {
+  await page.evaluate(
+    ([q, s]) => window.__ORBITAL_E2E__?.injectGrounding(q as string[], s as { uri: string; title: string }[]),
+    [queries, sources] as const,
   );
 }
 

@@ -16,12 +16,14 @@ export const MOCK_TERMINAL_ID = "mock_pane_1";
 // model/human context — the felt bug is "highlight moves, context body lags."
 export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
-export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date };
+export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } };
 
 /** Injection surface exposed on `window.__ORBITAL_E2E__` for Playwright to drive. */
 export interface OrbitalE2EHooks {
   injectStdoutChunk: (terminalId: string, chunk: string) => void;
   injectTranscript: (sender: "User" | "Janus", text: string) => void;
+  /** aqx (build-out): attach grounded queries/sources to the most recent Janus turn (drives the chip). */
+  injectGrounding: (queries: string[], sources: { uri: string; title: string }[]) => void;
   injectPendingApproval: (cmd: string, terminalId?: string) => void;
   injectPendingAction: (capability: string, summary: string) => void;
   /**
@@ -270,6 +272,15 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       injectStdoutChunk: (terminalId, chunk) => deps.queueStdoutChunk(terminalId, chunk),
       injectTranscript: (sender, text) =>
         deps.setTranscript((prev) => [...prev, { sender, text, timestamp: new Date() }]),
+      injectGrounding: (queries, sources) =>
+        deps.setTranscript((prev) => {
+          let lastJanus = -1;
+          for (let i = prev.length - 1; i >= 0; i--) { if (prev[i].sender === "Janus") { lastJanus = i; break; } }
+          if (lastJanus === -1) return prev;
+          const next = prev.slice();
+          next[lastJanus] = { ...next[lastJanus], grounding: { queries, sources } };
+          return next;
+        }),
       injectPendingApproval: (cmd, terminalId = MOCK_TERMINAL_ID) => {
         const record: PendingCommand = {
           messageId: `mock_${stagedApprovals.length + 1}`,
