@@ -11,6 +11,20 @@ function deleteScrollback(id: string): void {
   try { fs.unlinkSync(p); } catch { /* already gone */ }
 }
 
+// BEAD 0gt — condition-based waiting helper. Real ConPTY echo-capture latency is
+// non-deterministic under parallel-suite machine load (a flat `await sleep(500)`
+// race-flaked: isolated re-runs alternated pass/fail on the SAME commit). Poll the
+// predicate on a short interval until it holds OR a generous deadline elapses, so the
+// assert fires on the actual condition, not on an arbitrary fixed timer.
+async function waitFor(predicate: () => boolean, deadlineMs = 5000, intervalMs = 100): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return predicate();
+}
+
 describe("Orchestrator Terminal Logic Test Suite", () => {
   const TEST_LEDGER = ".janus_ledger.json";
 
@@ -105,17 +119,13 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
 
     it("should get pane summary", async () => {
       manager.addTerminal("pane_1", process.cwd(), process.platform === "win32" ? "echo 'summary test'" : "echo 'summary test'");
-      // Poll for the captured echo instead of a single fixed sleep: under full-suite
-      // parallel ConPTY load the PTY-capture latency can exceed any fixed wait (this step
-      // has been observed taking ~3s), so a hard `setTimeout(500)` race-flakes. Poll
-      // getPaneSummary until the echoed line lands, with a generous ceiling.
-      let summary = manager.getPaneSummary("pane_1");
-      const deadline = Date.now() + 15000;
-      while (!summary.includes("summary test") && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        summary = manager.getPaneSummary("pane_1");
-      }
-      assert.ok(summary.includes("summary test"));
+      // BEAD 0gt — condition-based waiting (was a flat `setTimeout(500)` that race-flaked
+      // under parallel ConPTY load; PTY-capture latency for this echo has been observed at
+      // ~3s). Poll getPaneSummary via waitFor() until the echoed marker lands, with a
+      // generous ceiling, instead of an arbitrary fixed timer.
+      await waitFor(() => manager.getPaneSummary("pane_1").includes("summary test"), 15000);
+      const summary = manager.getPaneSummary("pane_1");
+      assert.ok(summary.includes("summary test"), `summary should contain marker, got: ${summary}`);
       assert.ok(summary.startsWith("```"));
 
       await manager.terminals["pane_1"].stop();
