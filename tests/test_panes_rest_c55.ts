@@ -2,7 +2,7 @@
 //
 // Five NEW rest-only defs that converge inline pane/UI routes with NO voice twin today:
 //   respawn_pane   POST /api/terminals/:pane_id/restart   (GATED via restart_pane capability — behaviorDelta)
-//   send_keys      POST /api/terminals/:pane_id/input      (ALWAYS_ALLOWED — was ungated)
+//   send_keys      POST /api/terminals/:pane_id/input      (GATED via send_keys capability — c55.10; was ungated)
 //   resize_pane    POST /api/terminals/:pane_id/resize      (ALWAYS_ALLOWED; zod rejects bad cols/rows)
 //   clear_history  POST /api/terminals/:pane_id/history/clear (ALWAYS_ALLOWED)
 //   clear_exited   POST /api/terminals/clear-exited          (ALWAYS_ALLOWED)
@@ -163,8 +163,11 @@ describe("c55 Batch C — registry shape", () => {
     assert.strictEqual(findDef("clear_exited").rest!.path, "/api/terminals/clear-exited");
   });
 
-  it("safe-default gates: send_keys/resize_pane/clear_history/clear_exited are ALWAYS_ALLOWED; respawn_pane enforces", () => {
-    assert.strictEqual(findDef("send_keys").capability, "ALWAYS_ALLOWED");
+  it("gates (c55.10): send_keys is GATED (send_keys); resize_pane/clear_history/clear_exited stay ALWAYS_ALLOWED; respawn_pane enforces", () => {
+    // c55.10 tightened send_keys (term.writeInput to the live PTY — a consequential CLI keystroke act)
+    // from ALWAYS_ALLOWED to its OWN matrix row `send_keys` (default Ask). resize/clear_history/clear_exited
+    // stay ungated per the P2 taxonomy (viewport plumbing / display-buffer clear / reversible archive).
+    assert.strictEqual(findDef("send_keys").capability, "send_keys");
     assert.strictEqual(findDef("resize_pane").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("clear_history").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("clear_exited").capability, "ALWAYS_ALLOWED");

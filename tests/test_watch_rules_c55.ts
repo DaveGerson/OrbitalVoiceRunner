@@ -1,11 +1,13 @@
 // c55 Batch G — net-new gated ActionDefs contract suite (wsm-e2e-pinned-c55.7).
 //
-// Four NEW rest-only defs that converge inline watch-rule / plan-delete routes with NO voice twin:
+// Four NEW rest-only defs that converge inline watch-rule / plan-delete routes with NO voice twin.
+// c55.10 TIGHTENED the 3 mutators from ALWAYS_ALLOWED to GATED (default Ask) — this suite exercises
+// the Auto (run) path by default (gateOrDefer stub returns {disposition:"run"}); the deferred/forbidden
+// arms are pinned in tests/test_c55_10_gating.ts.
 //   list_watch_rules        GET    /api/watch-rules        (readOnly ALWAYS_ALLOWED; toHttp -> raw array)
-//   add_watch_rule          POST   /api/watch-rules        (ALWAYS_ALLOWED — preserves ungated instant
-//                                                           creation; matrix add_watch_rule=Ask reserved)
-//   remove_watch_rule       DELETE /api/watch-rules/:id     (ALWAYS_ALLOWED — was ungated)
-//   delete_orchestrator_plan DELETE /api/plans/:plan_id      (ALWAYS_ALLOWED — was ungated, no twin today)
+//   add_watch_rule          POST   /api/watch-rules        (GATED add_watch_rule, default Ask — c55.10)
+//   remove_watch_rule       DELETE /api/watch-rules/:id     (GATED remove_watch_rule, default Ask — c55.10)
+//   delete_orchestrator_plan DELETE /api/plans/:plan_id      (GATED delete_orchestrator_plan, Ask — c55.10)
 //
 // DOCTRINE (def-level deterministic): call runAction with a fake ctx (a fake manager.ledger holding
 // watchRules[]/plans[] + a save spy + a broadcast capture), assert the ActionResult kind/output, then
@@ -25,7 +27,7 @@ import assert from "node:assert";
 import { REGISTRY } from "../src/actions/registry";
 import { runAction } from "../src/actions/gemini";
 import { applyResultToHttp, resultToHttp, type RestResponse } from "../src/actions/rest";
-import type { ActionContext, ActionDef, ActionResult } from "../src/actions/types";
+import type { ActionContext, ActionDef, ActionResult, GateDisposition } from "../src/actions/types";
 import type { WatchRule, Plan } from "../src/types";
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────────
@@ -48,15 +50,20 @@ function makeFakeRes(): { res: RestResponse; sent: { status?: number; json?: unk
 interface Recorded {
   saves: boolean[];                 // each ledger.save(force) call's force arg
   broadcasts: Array<Record<string, unknown>>;
+  gateCalls: Array<{ capability: string; paneId: string | null; summary: string; params?: Record<string, unknown> }>;
 }
 
 interface CtxOpts {
   watchRules?: WatchRule[];
   plans?: Plan[];
+  // c55.10: add_watch_rule / remove_watch_rule / delete_orchestrator_plan are now GATED via
+  // ctx.gateOrDefer. Default disposition is "run" (Auto) so the existing fidelity assertions still
+  // exercise the real effect; pass a disposition to test the deferred/forbidden arms.
+  gateDisposition?: GateDisposition;
 }
 
 function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; watchRules: WatchRule[]; plans: Plan[] } {
-  const rec: Recorded = { saves: [], broadcasts: [] };
+  const rec: Recorded = { saves: [], broadcasts: [], gateCalls: [] };
   const watchRules: WatchRule[] = opts.watchRules ?? [];
   const plans: Plan[] = opts.plans ?? [];
   const manager: any = {
@@ -72,6 +79,14 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; watch
     session: null,
     redact: (s: string) => s,
     broadcast: (msg: unknown) => { rec.broadcasts.push(msg as Record<string, unknown>); },
+    // Mirrors the REAL gateOrDefer: STAGES `run` only on the deferred (Ask) path; on the "run" (Auto)
+    // path it returns {disposition:"run"} WITHOUT invoking run — the CALLER runs the effect.
+    gateOrDefer: (capability: string, paneId: string | null, summary: string, run: () => string, params?: Record<string, unknown>): GateDisposition => {
+      rec.gateCalls.push({ capability, paneId, summary, params });
+      const d = opts.gateDisposition ?? { disposition: "run" as const };
+      void run;
+      return d;
+    },
   } as unknown as ActionContext;
   return { ctx, rec, watchRules, plans };
 }
@@ -127,10 +142,13 @@ describe("c55 Batch G — registry shape", () => {
     assert.deepStrictEqual([findDef("delete_orchestrator_plan").rest!.method, findDef("delete_orchestrator_plan").rest!.path], ["delete", "/api/plans/:plan_id"]);
   });
 
-  it("safe-default gates: all four are ALWAYS_ALLOWED (preserve current ungated/instant behavior)", () => {
-    for (const name of names) {
-      assert.strictEqual(findDef(name).capability, "ALWAYS_ALLOWED", `${name} must register ALWAYS_ALLOWED (safe default)`);
-    }
+  it("gates: list_watch_rules stays ALWAYS_ALLOWED (a read); the 3 mutators are GATED (c55.10, default Ask)", () => {
+    // c55.10 tightened the 3 mutating defs from ALWAYS_ALLOWED to their own/reused matrix rows (Ask).
+    // list_watch_rules is a read and stays ungated (readOnly:false to preserve the raw un-redacted body).
+    assert.strictEqual(findDef("list_watch_rules").capability, "ALWAYS_ALLOWED", "list_watch_rules stays ALWAYS_ALLOWED (read)");
+    assert.strictEqual(findDef("add_watch_rule").capability, "add_watch_rule", "add_watch_rule rides its (un-reserved) matrix row");
+    assert.strictEqual(findDef("remove_watch_rule").capability, "remove_watch_rule", "remove_watch_rule rides its NEW matrix row");
+    assert.strictEqual(findDef("delete_orchestrator_plan").capability, "delete_orchestrator_plan", "delete_orchestrator_plan rides its NEW matrix row");
   });
 
   it("list_watch_rules declares a toHttp translator (its body is a raw array, not {output})", () => {

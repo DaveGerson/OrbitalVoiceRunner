@@ -5,11 +5,14 @@ import type { AnnouncementTemplates } from "./announcementKinds";
 // loosen, the pane's effectiveMode (AND-veto). Absent matrix ⇒ all "Auto"
 // (back-compat: today's implicit behavior).
 // ─────────────────────────────────────────────────────────────────────────────
-// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (24 rows) — the 16 original
+// F4 (wsm-e2e-pinned-lqb): the union is the WHOLE capability matrix (27 rows) — the 16 original
 // gates PLUS the 6 promoted capabilities (read_pane / read_notes / focus_pane / compose_draft /
-// archive_pane / clear_history). Promotions default to today's effective behavior (Auto, except
-// clear_history=Ask) so widening the type is behavior-preserving. Kept in lockstep with
-// CAPABILITY_DEFS (src/actions/capabilities.ts) — a test asserts ALL_CAPABILITIES === that id set.
+// archive_pane / clear_history) PLUS the 2 destructive deletes (delete_pane / delete_project) PLUS
+// the 3 c55.10 tightened rest-write caps (send_keys / remove_watch_rule / delete_orchestrator_plan).
+// Promotions default to today's effective behavior (Auto, except clear_history=Ask) so widening the
+// type is behavior-preserving; the c55.10 caps default Ask (gate-tightening, strictly more
+// restrictive). Kept in lockstep with CAPABILITY_DEFS (src/actions/capabilities.ts) — a test asserts
+// ALL_CAPABILITIES === that id set.
 export type CapabilityGate =
   | "write_to_pane" | "deliver_handoff" | "create_pane" | "close_pane"
   | "delete_pane" | "delete_project"
@@ -19,7 +22,11 @@ export type CapabilityGate =
   | "switch_context" | "set_voice_mute" | "dismiss_attention"
   // ── promoted capabilities (Decision 6/9) — surfaced as individually-tunable matrix rows ──
   | "read_pane" | "read_notes" | "focus_pane"
-  | "compose_draft" | "archive_pane" | "clear_history";
+  | "compose_draft" | "archive_pane" | "clear_history"
+  // ── c55.10: rest-only writes tightened from ALWAYS_ALLOWED → Ask (send_keys is the raw-PTY
+  //    keystroke twin of write_to_pane; remove_watch_rule mirrors add_watch_rule; delete_orchestrator_plan
+  //    is destructive) ──
+  | "send_keys" | "remove_watch_rule" | "delete_orchestrator_plan";
 
 export type GateValue = "Auto" | "Ask" | "Off";
 
@@ -58,6 +65,10 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   switch_context: "Auto",
   set_voice_mute: "Auto",
   dismiss_attention: "Auto",
+  // c55.10: rest-only writes tightened from ungated → Ask (gate-tightening only).
+  send_keys: "Ask",
+  remove_watch_rule: "Ask",
+  delete_orchestrator_plan: "Ask",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
