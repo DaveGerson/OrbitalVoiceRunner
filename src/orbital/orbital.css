@@ -113,5 +113,11 @@
 .orb-listening-dot { width: 9px; height: 9px; border-radius: 50%; background: #4db892; border: 1.5px solid var(--ink); display: inline-block; animation: orb-pulse 1s var(--ease-bounce) infinite; }
 
 @media (prefers-reduced-motion: reduce) {
-  .orbital-kitchen * { animation: none !important; }
+  /* Kill BOTH @keyframes animations AND the inline lift/flatten/untilt transitions, so the signature
+     sticker motion snaps instantly for users who asked for reduced motion (brief §6.8). Static resting
+     tilts/shadows still apply — only the animated transition between states is removed. */
+  .orbital-kitchen *, .orbital-kitchen *::before, .orbital-kitchen *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }

@@ -55,17 +55,24 @@ function Bubble({ m, dark }: { m: TranscriptEntry; dark: boolean }) {
   );
 }
 
-const CALLS: { group: string; color: string; lines: string[] }[] = [
-  { group: "The Line", color: "#a8151a", lines: ["open auth refactor", "switch to search indexer", "what's on the line, Chef?"] },
-  { group: "The Pass", color: "#c98a16", lines: ["fire it, Chef", "86 that one", "what's at the pass?"] },
-  { group: "Service mode", color: "#4b3bb3", lines: ["let 'em cook", "taste every plate", "hands off — read only"] },
-  { group: "The Order Pad", color: "#2f7a5e", lines: ["tell auth refactor to rerun the tests", "send it to the line", "scrap that draft"] },
-  { group: "Emergency", color: "#e23a3a", lines: ["ALL HANDS — stop the line", "kill the burners", "back to service"] },
-];
+// The call sheet mirrors the LIVE line: "The Line" / "Order Pad" groups are built from the actual
+// stations so a real pane "Webhook retries" surfaces "open webhook retries" (voice parity, brief §2.1).
+// The static groups (Service mode / The Pass / Emergency) are stable global calls.
+function buildCalls(stations: { name: string }[]): { group: string; color: string; lines: string[] }[] {
+  const lineCalls = stations.slice(0, 6).map((s) => `open ${s.name.toLowerCase()}`);
+  const first = stations[0]?.name?.toLowerCase();
+  return [
+    { group: "The Line", color: "#a8151a", lines: [...lineCalls, "what's on the line, Chef?"] },
+    { group: "The Pass", color: "#c98a16", lines: ["fire it, Chef", "86 that one", "what's at the pass?"] },
+    { group: "Service mode", color: "#4b3bb3", lines: ["let 'em cook", "taste every plate", "hands off — read only"] },
+    { group: "The Order Pad", color: "#2f7a5e", lines: [first ? `tell ${first} to rerun the tests` : "send the order to the line", "send it to the line", "scrap that draft"] },
+    { group: "Emergency", color: "#e23a3a", lines: ["ALL HANDS — stop the line", "kill the burners", "back to service"] },
+  ];
+}
 
-export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voiceCues, onGoLive, onToggleMute }: {
+export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voiceCues, stations, onGoLive, onToggleMute, onCall }: {
   dark: boolean; live: boolean; muted: boolean; reconnecting: boolean; transcript: TranscriptEntry[];
-  voiceCues: boolean; onGoLive: () => void; onToggleMute: () => void;
+  voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [calls, setCalls] = useState(false);
@@ -134,18 +141,19 @@ export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voic
             <button onClick={() => setCalls(false)} aria-label="Close" style={{ width: 30, height: 30, border: "2px solid " + INK, borderRadius: 8, background: "#fff4de", cursor: "pointer", fontWeight: 800, color: INK }}>✕</button>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 14 }}>
-            {CALLS.map((g) => (
+            {buildCalls(stations).map((g) => (
               <Fragment key={g.group}>
                 <div>
                   <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: g.color, marginBottom: 6 }}>{g.group}</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                     {g.lines.map((l, i) => (
                       <Fragment key={i}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: dark ? "#2f1d12" : "#fff9ec", border: "1.5px solid " + INK, borderRadius: 8, boxShadow: "1.5px 1.5px 0 0 " + INK }}>
+                        <button data-testid="radio-call" onClick={() => { onCall(l); setCalls(false); }}
+                          style={{ all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: dark ? "#2f1d12" : "#fff9ec", border: "1.5px solid " + INK, borderRadius: 8, boxShadow: "1.5px 1.5px 0 0 " + INK, boxSizing: "border-box" }}>
                           <VoiceCue phrase={l} dark={dark} tone="live" style={{ fontSize: 11.5 }} />
                           <div style={{ flex: 1 }} />
                           <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".06em", textTransform: "uppercase", color: "#8a6a4f" }}>say it ›</span>
-                        </div>
+                        </button>
                       </Fragment>
                     ))}
                   </div>

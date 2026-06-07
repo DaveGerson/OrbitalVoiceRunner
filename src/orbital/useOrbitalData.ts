@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRe
 import { apiFetch } from "../utils/api";
 import { publishChunk } from "../terminalStream";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "../utils/audio";
+import { playEarcon } from "../utils/earcon";
 import { useE2EHarness, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
 import type {
@@ -101,7 +102,7 @@ export interface OrbitalData {
   setFrozenRunning: Dispatch<SetStateAction<string[]>>;
 }
 
-export function useOrbitalData(): OrbitalData {
+export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
   const [ledger, setLedger] = useState<Record<string, Workspace>>({});
   const [settings, setSettings] = useState<SystemSettings | null>(null);
@@ -128,6 +129,11 @@ export function useOrbitalData(): OrbitalData {
   const wsRef = useRef<WebSocket | null>(null);
   const activeTerminalIdRef = useRef<string | null>(null);
   activeTerminalIdRef.current = activeTerminalId;
+  // Hands-free earcons are gated behind the "Voice cues" tweak; the ref lets the long-lived WS closure
+  // read the latest value. Default on (the brief forbids silent state changes for an eyes-off chef).
+  const voiceCuesRef = useRef<boolean>(true);
+  voiceCuesRef.current = opts?.voiceCues ?? true;
+  const earcon = useCallback((type: Parameters<typeof playEarcon>[0]) => { if (voiceCuesRef.current) playEarcon(type); }, []);
   // Voice session audio plumbing (ported from App.tsx connectLive). All per-session; torn down on stop.
   const desiredVoiceRef = useRef<boolean>(false);
   const micMutedRef = useRef<boolean>(false);
@@ -252,12 +258,13 @@ export function useOrbitalData(): OrbitalData {
     refetchAll();
     const iv = setInterval(() => {
       refetchTerminals();
+      refetchLedger(); // re-derive elapsed_ms / last_command so running cards don't read frozen at a glance
       refetchPending();
       refetchActions();
       refetchPlans();
     }, POLL_MS);
     return () => clearInterval(iv);
-  }, [refetchAll, refetchTerminals, refetchPending, refetchActions, refetchPlans]);
+  }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans]);
 
   // Tear down all per-session voice audio (mic capture chain + both AudioContexts). Idempotent.
   const teardownAudio = useCallback(() => {
@@ -372,12 +379,14 @@ export function useOrbitalData(): OrbitalData {
             break;
           case "frozen":
           case "stop_all":
+            if (msg.type === "frozen") earcon("alert"); // the All Hands brake — never silent
             refetchFrozen();
             refetchTerminals();
             break;
           case "approval_pending":
             // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload
             // (immediate — same shape the classic app builds) so the ApprovalDialog renders at once.
+            earcon("alert"); // the bell: a pane needs you (eyes-off)
             setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, {
               messageId: msg.messageId, cmd: msg.cmd, terminalId: msg.terminalId, rationale: msg.rationale,
               effective_gates: msg.effective_gates, posture: msg.posture, effective_mode: msg.effective_mode, capability: msg.capability,
@@ -390,6 +399,7 @@ export function useOrbitalData(): OrbitalData {
           case "action_pending":
             // A gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier — carry
             // the SERVER-resolved effective posture so the confirm dialog can render the rider + divergence.
+            earcon("alert"); // needs a taste at the pass
             setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, {
               actionId: msg.actionId, capability: msg.capability, summary: msg.summary,
               effective_gate: msg.effective_gate, effective_mode: msg.effective_mode, posture: msg.posture,
@@ -400,7 +410,11 @@ export function useOrbitalData(): OrbitalData {
             if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
             break;
           case "command_auto_executed":
+            earcon("execute"); // it fired on its own (Full Auto)
+            refetchPending();
+            break;
           case "command_blocked":
+            earcon("alert");
             refetchPending();
             break;
           // ── voice-only frames (Kitchen Radio) ──
@@ -463,7 +477,7 @@ export function useOrbitalData(): OrbitalData {
       if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
       if (voice) teardownAudio();
     };
-  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, teardownAudio]);
+  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, teardownAudio, earcon]);
 
   // The UI is the source of truth for the single active pane. Echo it to the
   // server whenever it changes and the socket is open (the WS wave relies on this).
@@ -478,7 +492,11 @@ export function useOrbitalData(): OrbitalData {
   const showToast = useCallback((msg: string, kind: "fire" | "warn" = "fire") => {
     setToast({ msg, kind });
     setTimeout(() => setToast(null), 2400);
-  }, []);
+    // Narrate every ack into the Kitchen Radio — the brief's "source of truth" — so an eyes-off chef
+    // keeps a durable, scrollable record even when off-air. Renders as a Chef de Cuisine bubble.
+    setTranscript((prev) => [...prev, { sender: "Janus" as const, text: msg, timestamp: new Date() }].slice(-50));
+    earcon(kind === "fire" ? "success" : "alert"); // audible + visible ack (gated by Voice cues)
+  }, [earcon]);
 
   // ── Kitchen Radio: tune in / off-air / mute ─────────────────────────────
   // Tuning in flips the wsRef socket to a full Gemini voice session (the effect above re-runs on
@@ -491,6 +509,7 @@ export function useOrbitalData(): OrbitalData {
   // ── mutations (the real backend writes; gated routes may 202/403) ───────
   const setGlobalMode = useCallback(async (mode: GlobalMode) => {
     setGlobalPermissionsMode(mode); // optimistic
+    showToast(mode === "Full Auto" ? "Lettin' 'em cook 🔥" : mode === "Read-Only" ? "Hands off — watchin' the line" : "Tastin' every plate 🛎");
     if (isMockModeRef.current) return;
     try {
       const body = { ...(settings ?? {}), advanced: { ...(settings?.advanced ?? {}), globalPermissionsMode: mode } };
@@ -501,7 +520,7 @@ export function useOrbitalData(): OrbitalData {
         if (data.globalPermissionsMode) setGlobalPermissionsMode(data.globalPermissionsMode);
       }
     } catch { /* silent */ }
-  }, [settings]);
+  }, [settings, showToast]);
 
   // Generic settings write (Back of House rooms). Caller builds the full next SystemSettings from the
   // current one; server preserves a masked/blank geminiApiKey, so echoing it back is safe. Optimistic.
@@ -662,37 +681,41 @@ export function useOrbitalData(): OrbitalData {
   // the operator-above-the-gate REST choke-points. Optimistic-only in mock (the e2e asserts the wire).
   const approveCommand = useCallback(async (messageId: string) => {
     setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
+    showToast("Order up! 🍽"); // the most consequential operator action must never be silent (eyes-off)
     if (isMockModeRef.current) return;
     try {
       await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: true }) });
       setTimeout(refetchTerminals, 500);
     } catch { /* silent */ }
-  }, [refetchTerminals]);
+  }, [refetchTerminals, showToast]);
 
   const rejectCommand = useCallback(async (messageId: string) => {
     setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
+    showToast("86'd it — held back", "warn");
     if (isMockModeRef.current) return;
     try {
       await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: false }) });
     } catch { /* silent */ }
-  }, []);
+  }, [showToast]);
 
   const confirmAction = useCallback(async (actionId: string) => {
     setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
+    showToast("Fired it 🔥");
     if (isMockModeRef.current) return;
     try {
       await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
       setTimeout(refetchTerminals, 500);
     } catch { /* silent */ }
-  }, [refetchTerminals]);
+  }, [refetchTerminals, showToast]);
 
   const cancelAction = useCallback(async (actionId: string) => {
     setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
+    showToast("Scrapped it", "warn");
     if (isMockModeRef.current) return;
     try {
       await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
     } catch { /* silent */ }
-  }, []);
+  }, [showToast]);
 
   const stopAllFreeze = useCallback(async () => {
     if (isMockModeRef.current) { setFrozen(true); return; }

@@ -120,7 +120,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
 
       {/* room body */}
       <div data-testid="boh-body" style={{ flex: 1, overflowY: "auto", padding: 24, minWidth: 0 }}>
-        {!settings && <div style={{ fontFamily: "Caveat, cursive", fontSize: 18, color: "#8a6a4f" }}>loading the house…</div>}
+        {!settings && <div style={{ fontFamily: "DM Sans", fontSize: 14, fontWeight: 600, color: "#8a6a4f" }}>loading the house…</div>}
 
         {settings && room === "rulebook" && (
           <Room emoji="📋" title="The Rulebook" sub={`"Auto" fires on its own · "Ask" brings it to the pass · "Off" — not in my kitchen`} color="#ffc94a">

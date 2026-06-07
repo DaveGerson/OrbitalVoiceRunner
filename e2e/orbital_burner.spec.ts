@@ -101,6 +101,18 @@ test.describe("Orbital Kitchen — The Burner", () => {
     expect(body.rows).toBeGreaterThan(0);
   });
 
+  test("the Notes tab jots a real per-pane note", async ({ page }) => {
+    await page.route(/\/api\/projects\/.+\/panes\/.+\/notes$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
+    await openBurner(page);
+    await page.getByTestId("burner-tab-notes").click();
+    const postReq = page.waitForRequest((r) => /\/api\/projects\/.+\/panes\/.+\/notes$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
+    await page.getByTestId("burner-note-input").fill("watch the retry backoff");
+    await page.getByTestId("burner-note-add").click();
+    await postReq;
+    await expect(page.getByTestId("burner-note").first()).toContainText("watch the retry backoff");
+  });
+
   test("the burner closes from the red light", async ({ page }) => {
     await openBurner(page);
     await page.getByTestId("burner-close").click();

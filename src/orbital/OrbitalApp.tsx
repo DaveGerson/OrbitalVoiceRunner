@@ -64,8 +64,9 @@ function useKitchenChrome() {
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running, mode, setMode, onPanic }: {
+function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
+  needsCount: number; onJumpToNeeds: () => void;
   mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
@@ -95,6 +96,12 @@ function TopNav({ accentHex, accentOn, view, setView, running, mode, setMode, on
       </div>
       <div style={{ flex: 1 }} />
       <ServiceMode mode={mode} setMode={setMode} />
+      {needsCount > 0 && (
+        <button data-testid="needs-you" onClick={onJumpToNeeds} title="Jump to the station that needs you"
+          style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, background: "#ff8a3d", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12, whiteSpace: "nowrap", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
+          🛎 Needs you · {needsCount}
+        </button>
+      )}
       <div data-testid="kitchen-status" style={{ display: "flex", alignItems: "center", gap: 8, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
         <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>Kitchen open · {running} on the burner</span>
@@ -160,13 +167,15 @@ export default function OrbitalApp() {
   const [burnerId, setBurnerId] = useState<string | null>(null);
   const pageBg: CSSProperties["background"] = t.dark ? "#1a0f08" : "var(--cream)";
 
-  const data = useOrbitalData();
+  const data = useOrbitalData({ voiceCues: t.voiceCues });
   const stations = useMemo(
     () => deriveStations(data.terminals, data.ledger, data.pendingCommands),
     [data.terminals, data.ledger, data.pendingCommands],
   );
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
   const running = stations.filter((s) => s.status === "Running").length;
+  const needsList = stations.filter((s) => s.status === "Needs Input");
+  const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
   const serviceId = modeToServiceId(data.globalPermissionsMode === "Inherit" ? "Human-in-the-Loop" : data.globalPermissionsMode);
 
   // The Burner: the station whose live terminal is open. Resolved from the live board so it tracks
@@ -194,6 +203,7 @@ export default function OrbitalApp() {
     <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
       <IconSprite />
       <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running}
+        needsCount={needsList.length} onJumpToNeeds={jumpToNeeds}
         mode={serviceId} setMode={(id) => data.setGlobalMode(serviceIdToMode(id))}
         onPanic={() => { data.stopAllFreeze(); setPanic(true); }} />
 
@@ -202,13 +212,16 @@ export default function OrbitalApp() {
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
             <ThePass notes={data.notes} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
-              onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)} />
+              onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
+              onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }} />
             <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
           </div>
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
           <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
             <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
-              transcript={data.transcript} voiceCues={t.voiceCues} onGoLive={data.goLive} onToggleMute={data.toggleMute} />
+              transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
+              onGoLive={data.goLive} onToggleMute={data.toggleMute}
+              onCall={(phrase) => data.showToast(`🎙 "${phrase}" — heard, Chef!`)} />
           </aside>
         </div>
       )}
@@ -237,6 +250,9 @@ export default function OrbitalApp() {
       {burnerStation && (
         <TerminalWindow st={burnerStation} backfill={burnerBackfill} accentHex={acc.hex} dark={t.dark}
           isMockRef={data.isMockModeRef} wsRef={data.wsRef} voiceCues={t.voiceCues}
+          paneNotes={data.notes.filter((n) => n.pane_id === burnerStation.id)}
+          onAddNote={(text) => data.addNote(burnerStation.project, text, burnerStation.id)}
+          onDeleteNote={(id) => data.deleteNote(id, burnerStation.project)}
           onClose={() => setBurnerId(null)} onRestart={() => data.restartPane(burnerStation.id)}
           writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}

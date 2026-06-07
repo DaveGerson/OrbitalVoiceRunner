@@ -25,7 +25,7 @@ function ago(ms: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-function TicketCard({ n, dark, onEdit, onDelete }: { n: StoredNote; dark: boolean; onEdit: (id: string, text: string) => void; onDelete: (id: string) => void }) {
+function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n: StoredNote; dark: boolean; onEdit: (id: string, text: string) => void; onDelete: (id: string) => void; onFirePane: (projectId: string) => void; onJumpToPane: (paneId: string) => void }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(n.text);
   const k = TICKET_KINDS[kindFor(n.type)];
@@ -34,7 +34,10 @@ function TicketCard({ n, dark, onEdit, onDelete }: { n: StoredNote; dark: boolea
     <div data-testid="pass-ticket" style={{ width: 230, flexShrink: 0, padding: 11, border: "2px solid " + INK, borderRadius: 11, background: dark ? "#241409" : "#fff9ec", boxShadow: "2px 2px 0 0 " + INK, display: "flex", flexDirection: "column", gap: 7 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
-        {n.pane_id && <Chip bg={dark ? "#2f1d12" : "#fff4de"} color="#8a6a4f" style={{ fontFamily: "JetBrains Mono", textTransform: "none" }}>#{n.pane_id}</Chip>}
+        {n.pane_id && (
+          <button data-testid="pass-ticket-jump" onClick={() => onJumpToPane(n.pane_id!)} title="Jump to this station"
+            style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#2f1d12" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", cursor: "pointer", fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700 }}>#{n.pane_id} ›</button>
+        )}
         <div style={{ flex: 1 }} />
         <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{ago(n.created_at)}</span>
       </div>
@@ -54,6 +57,7 @@ function TicketCard({ n, dark, onEdit, onDelete }: { n: StoredNote; dark: boolea
           </>
         ) : (
           <>
+            {!n.pane_id && <button data-testid="pass-ticket-fire" onClick={() => onFirePane(n.project_id)} title="Fire a pane on this ticket" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Fire a pane</span></button>}
             <button data-testid="pass-ticket-edit-btn" onClick={() => setEditing(true)} title="Amend the ticket" style={miniBtn(dark)}><Icon name="ticket" size={12} /></button>
             <button data-testid="pass-ticket-delete" onClick={() => onDelete(n.id)} title="86 this one" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
           </>
@@ -94,9 +98,10 @@ function BeadsExplorer({ dark, onClose }: { dark: boolean; onClose: () => void }
   );
 }
 
-export function ThePass({ notes, jotProjectId, jotProjectName, dark, voiceCues, onAdd, onEdit, onDelete }: {
+export function ThePass({ notes, jotProjectId, jotProjectName, dark, voiceCues, onAdd, onEdit, onDelete, onFirePane, onJumpToPane }: {
   notes: StoredNote[]; jotProjectId: string | null; jotProjectName: string; dark: boolean; voiceCues: boolean;
   onAdd: (projectId: string, text: string) => void; onEdit: (id: string, text: string) => void; onDelete: (id: string) => void;
+  onFirePane: (projectId: string) => void; onJumpToPane: (paneId: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [jar, setJar] = useState(false);
@@ -125,7 +130,7 @@ export function ThePass({ notes, jotProjectId, jotProjectName, dark, voiceCues, 
         expanded && <div data-testid="pass-empty" style={{ padding: "4px 16px 14px", fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f" }}>nothin' on the pass — clean board, Chef 😌</div>
       ) : (
         <div style={{ display: "flex", gap: 10, padding: "2px 16px 14px", overflowX: expanded ? "visible" : "auto", flexWrap: expanded ? "wrap" : "nowrap" }}>
-          {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} /></Fragment>)}
+          {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
         </div>
       )}
 

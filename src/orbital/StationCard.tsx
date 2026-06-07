@@ -73,6 +73,19 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         }}>"{st.scribble}"</div>
       )}
 
+      {/* live burner peek — real moving output at a glance, only while the pane is cooking */}
+      {isRun && !compact && !list && st.outputTail.length > 0 && (
+        <div data-testid="station-peek" style={{ marginTop: 10, background: INK, borderRadius: 8, padding: "7px 10px", overflow: "hidden", maxHeight: 62 }}>
+          {st.outputTail.slice(-3).map((l, i) => (
+            <div key={i} style={{
+              fontFamily: "JetBrains Mono, monospace", fontSize: 10.5, lineHeight: 1.5,
+              color: l.startsWith("$") ? "#ffc94a" : l.startsWith("✓") ? "#9be3c0" : l.startsWith("⚠") ? "#ff8a3d" : "#e9d9c0",
+              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+            }}>{l}</div>
+          ))}
+        </div>
+      )}
+
       <div style={{
         display: "flex", alignItems: "center", gap: 8, marginTop: list ? 0 : 10, paddingTop: list ? 0 : 9, paddingLeft: 4,
         borderTop: list ? "none" : "1.5px dashed " + (dark ? "#5b3a23" : "#c9a97a"), flex: list ? 1 : "none",

@@ -16,8 +16,10 @@ import { TerminalView } from "../components/TerminalView";
 import { apiFetch } from "../utils/api";
 import { RAW_KEY_TABLE } from "../rawKeyClass";
 import { INK, RUNTIMES } from "./theme";
-import { Button, Icon, Mascot, StatusBadge, VoiceCue } from "./primitives";
+import { Button, Chip, Icon, StatusBadge, VoiceCue } from "./primitives";
+import { TICKET_KINDS } from "./theme";
 import type { Station } from "./station";
+import type { StoredNote } from "../store/types";
 
 // The control-key strip. Bytes come straight from the SERVER allowlist (RAW_KEY_TABLE in
 // src/rawKeyClass.ts) — importing it (a pure, dep-free table) is the single source of truth, so a
@@ -95,7 +97,7 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
   return { text, onChange, send, scrap: () => onChange("") };
 }
 
-export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, onClose, onRestart, writeControlKey, resizeTerminal, showToast }: {
+export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, onAddNote, onDeleteNote, onClose, onRestart, writeControlKey, resizeTerminal, showToast }: {
   st: Station;
   backfill?: string;
   accentHex: string;
@@ -103,12 +105,16 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   isMockRef: MutableRefObject<boolean>;
   wsRef: MutableRefObject<WebSocket | null>;
   voiceCues: boolean;
+  paneNotes: StoredNote[];
+  onAddNote: (text: string) => void;
+  onDeleteNote: (id: string) => void;
   onClose: () => void;
   onRestart: () => void;
   writeControlKey: (paneId: string, bytes: string) => void;
   resizeTerminal: (paneId: string, cols: number, rows: number) => void;
   showToast: (msg: string, kind?: "fire" | "warn") => void;
 }) {
+  const [note, setNote] = useState("");
   const [tab, setTab] = useState<"pad" | "notes">("pad");
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
   const live = st.status === "Running";
@@ -191,11 +197,30 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
                 </div>
               </div>
             ) : (
-              <div style={{ flex: 1, minHeight: 0, display: "grid", placeItems: "center", padding: 20, background: dark ? "#2f1d12" : "#fff9ec", textAlign: "center" }}>
-                <div>
-                  <Mascot variant="default" size={56} style={{ margin: "0 auto 8px" }} />
-                  <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 17, color: fg }}>Notes &amp; beads</div>
-                  <div style={{ fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f", marginTop: 2 }}>stitched up at the Pass — opening soon, Chef</div>
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
+                <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+                  {paneNotes.length === 0 ? (
+                    <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>nothin' stitched to this pane yet, Chef</div>
+                  ) : paneNotes.map((n) => {
+                    const k = TICKET_KINDS[n.type === "warning" ? "bug" : n.type === "todo" ? "todo" : "note"];
+                    return (
+                      <Fragment key={n.id}>
+                        <div data-testid="burner-note" style={{ padding: 9, border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                            <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
+                            <div style={{ flex: 1 }} />
+                            <button data-testid="burner-note-delete" onClick={() => onDeleteNote(n.id)} title="86 this note" style={{ width: 22, height: 20, display: "grid", placeItems: "center", border: "1.5px solid " + INK, borderRadius: 6, background: dark ? "#1a0f08" : "#fff9ec", color: "#e23a3a", cursor: "pointer", padding: 0 }}><Icon name="x" size={11} /></button>
+                          </div>
+                          <div style={{ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{n.text}</div>
+                        </div>
+                      </Fragment>
+                    );
+                  })}
+                </div>
+                <div style={{ display: "flex", gap: 7, flexShrink: 0 }}>
+                  <input data-testid="burner-note-input" value={note} onChange={(e) => setNote(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && note.trim()) { onAddNote(note); setNote(""); } }}
+                    placeholder="jot a note for this pane…" style={{ flex: 1, padding: "8px 10px", border: "2px solid " + INK, borderRadius: 8, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, outline: "none" }} />
+                  <Button testId="burner-note-add" variant="blueberry" size="sm" icon="plus" disabled={!note.trim()} onClick={() => { onAddNote(note); setNote(""); }}>Bead</Button>
                 </div>
               </div>
             )}
