@@ -313,6 +313,50 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     coreState.clients.add(clientWs);
     console.log("Client connected to WebSocket");
 
+    // ── Read-only OBSERVE socket (the Orbital Kitchen burner) ───────────────
+    // The kitchen streams live PTY output + board updates over /live WITHOUT a
+    // voice session: connect with `?observe=1` and the socket joins the broadcast
+    // set (so stdout_chunk / ledger_updated / settings_updated / frozen / pane_status
+    // reach it) and may set the active pane (so operator raw-input + draft writes
+    // target the right pane through the gate). Crucially it RETURNS before any of
+    // the per-connection voice machinery below — NO Gemini Live session is started
+    // (no mic, no model, no token cost, no auto-reconnect). This is the mic-free
+    // read lane the classic app's connectLive() never had: connecting there always
+    // eagerly opened a live session. The cookie auth above still applies.
+    let observeOnly = false;
+    try {
+      observeOnly = new URLSearchParams((req.url || "").split("?")[1] || "").get("observe") === "1";
+    } catch { observeOnly = false; }
+    if (observeOnly) {
+      console.log("Client connected to WebSocket (observe-only — no voice session)");
+      clientWs.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "set_active_pane") {
+            // The kitchen is the source of truth for the open pane (mirrors the voice handler). Recording
+            // it lets operator raw-input / draft writes target the correct pane through the gate.
+            coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
+          } else if (msg.type === "draft_edit" && msg.text !== undefined) {
+            // Per-pane WIP draft edit (ungated — composing is not a CLI write). Defaults to the active pane.
+            const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
+            const paneId = msg.paneId || coreState.activePaneId;
+            if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) broadcastDraft(projectId, paneId);
+          }
+        } catch (err) {
+          console.warn("Received malformed observe-socket frame, skipping:", err);
+        }
+      });
+      clientWs.on("close", () => {
+        coreState.clients.delete(clientWs);
+        if (coreState.activeFrontendWs === clientWs) {
+          coreState.activeFrontendWs = null;
+          coreState.activePaneId = null; // no UI connected -> no source of truth -> no write permitted.
+        }
+        console.log("Client WS closed (observe-only)");
+      });
+      return;
+    }
+
     // Step 6: drafts are per-pane now; the client fetches the active pane's draft once it has told
     // us which pane is open (set_active_pane). No global buffer to push on connect.
 

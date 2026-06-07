@@ -12,6 +12,7 @@ import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
+import { TerminalWindow } from "./TerminalWindow";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
 
@@ -162,6 +163,7 @@ export default function OrbitalApp() {
   const [panic, setPanic] = useState(false);
   const [newPaneProj, setNewPaneProj] = useState<string | null>(null);
   const [newProjOpen, setNewProjOpen] = useState(false);
+  const [burnerId, setBurnerId] = useState<string | null>(null);
   const pageBg: CSSProperties["background"] = t.dark ? "#1a0f08" : "var(--cream)";
 
   const data = useOrbitalData();
@@ -172,6 +174,14 @@ export default function OrbitalApp() {
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
   const running = stations.filter((s) => s.status === "Running").length;
   const serviceId = modeToServiceId(data.globalPermissionsMode === "Inherit" ? "Human-in-the-Loop" : data.globalPermissionsMode);
+
+  // The Burner: the station whose live terminal is open. Resolved from the live board so it tracks
+  // status; if the pane disappears (closed/archived) the modal self-closes on the next render.
+  const burnerStation = burnerId ? stations.find((s) => s.id === burnerId) : undefined;
+  const burnerBackfill = burnerId ? data.terminals.find((t) => t.id === burnerId)?.backfill : undefined;
+  useEffect(() => {
+    if (burnerId && stations.length > 0 && !stations.some((s) => s.id === burnerId)) setBurnerId(null);
+  }, [burnerId, stations]);
 
   return (
     <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
@@ -185,7 +195,7 @@ export default function OrbitalApp() {
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
             {/* ThePass (P7) and RightRail (P5) slot in here */}
-            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => data.selectActivePane(st.id)} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
+            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
           </div>
         </div>
       )}
@@ -199,6 +209,12 @@ export default function OrbitalApp() {
       {newProjOpen && (
         <NewProjectModal dark={t.dark} onClose={() => setNewProjOpen(false)}
           onCreate={(o) => { data.createProject(o); setNewProjOpen(false); }} />
+      )}
+      {burnerStation && (
+        <TerminalWindow st={burnerStation} backfill={burnerBackfill} accentHex={acc.hex} dark={t.dark}
+          isMockRef={data.isMockModeRef} wsRef={data.wsRef} voiceCues={t.voiceCues}
+          onClose={() => setBurnerId(null)} onRestart={() => data.restartPane(burnerStation.id)}
+          writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}
       {panic && (
         <EmergencyStop runningCount={data.frozenRunning.length || running} onKill={data.stopAllKill}

@@ -37,6 +37,7 @@ export interface OrbitalData {
   activeTerminalId: string | null;
   isMock: boolean;
   isLive: boolean;
+  streamConnected: boolean;
   toast: { msg: string; kind: "fire" | "warn" } | null;
   // setters / actions
   selectActivePane: (paneId: string | null) => void;
@@ -46,6 +47,8 @@ export interface OrbitalData {
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
   restartPane: (id: string) => void;
+  writeControlKey: (paneId: string, bytes: string) => void;
+  resizeTerminal: (paneId: string, cols: number, rows: number) => void;
   stopAllFreeze: () => void;
   stopAllKill: () => void;
   stopAllRelease: () => void;
@@ -77,12 +80,17 @@ export function useOrbitalData(): OrbitalData {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [isMock, setIsMock] = useState<boolean>(false);
+  const [streamConnected, setStreamConnected] = useState<boolean>(false);
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn" } | null>(null);
 
   const isMockModeRef = useRef<boolean>(false);
   const wsRef = useRef<WebSocket | null>(null);
   const activeTerminalIdRef = useRef<string | null>(null);
   activeTerminalIdRef.current = activeTerminalId;
+  // The burner's PTY-grid resize is debounced per-pane (same shape as App.tsx): coalesce a
+  // viewport reflow burst into one POST, and skip a no-op repeat of the last grid.
+  const lastGridRef = useRef<Record<string, string>>({});
+  const resizeDebounceRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Display lane only (P4 xterm subscribes via subscribeChunks). The preview
   // tail / byte-count come straight off Terminal.output, so no React buffer here.
@@ -182,6 +190,98 @@ export function useOrbitalData(): OrbitalData {
     return () => clearInterval(iv);
   }, [refetchAll, refetchTerminals, refetchPending, refetchPlans]);
 
+  // ── live stream + realtime board, mic-free (P4 The Burner) ──────────────
+  // A read-only `/live?observe=1` socket: it joins the server broadcast set so
+  // stdout_chunk streams straight into the xterm (publishChunk) and board/ledger/
+  // freeze updates arrive in realtime — WITHOUT opening a Gemini voice session
+  // (no mic, no model, no cost; P5 layers audio on top via the same wsRef). The
+  // 20s poll above stays as a safety net. Skipped entirely in mock mode (the e2e
+  // harness drives queueStdoutChunk directly through window.__ORBITAL_E2E__).
+  useEffect(() => {
+    if (isMockModeRef.current) return;
+    let closedByUs = false;
+    let attempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleReconnect = () => {
+      if (closedByUs || reconnectTimer) return;
+      attempt = Math.min(attempt + 1, 6);
+      const delay = Math.min(500 * 2 ** (attempt - 1), 15000); // bounded backoff, 0.5s→15s
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    };
+
+    const connect = () => {
+      if (closedByUs) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      let ws: WebSocket;
+      try { ws = new WebSocket(`${protocol}//${window.location.host}/live?observe=1`); }
+      catch { scheduleReconnect(); return; }
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        attempt = 0;
+        setStreamConnected(true);
+        // Re-assert the open pane so operator raw-input / draft writes target it through the gate.
+        if (activeTerminalIdRef.current && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
+        }
+      };
+      ws.onmessage = (event) => {
+        let msg: { type?: string; [k: string]: unknown };
+        try { msg = JSON.parse(event.data); } catch { return; }
+        switch (msg.type) {
+          case "stdout_chunk":
+            if (typeof msg.terminalId === "string" && typeof msg.chunk === "string") queueStdoutChunk(msg.terminalId, msg.chunk);
+            break;
+          case "terminals_updated":
+          case "pane_status":
+          case "pane_quiescing":
+            refetchTerminals();
+            break;
+          case "ledger_updated":
+            refetchLedger();
+            break;
+          case "settings_updated":
+            if (msg.settings) setSettings(msg.settings as SystemSettings);
+            if (typeof msg.globalPermissionsMode === "string") setGlobalPermissionsMode(msg.globalPermissionsMode as GlobalMode);
+            break;
+          case "switch_active_pane":
+            if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId);
+            break;
+          case "frozen":
+          case "stop_all":
+            refetchFrozen();
+            refetchTerminals();
+            break;
+          case "approval_pending":
+          case "approval_resolved":
+          case "action_pending":
+          case "action_resolved":
+          case "command_auto_executed":
+          case "command_blocked":
+            refetchPending();
+            break;
+          default:
+            break;
+        }
+      };
+      ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
+      ws.onclose = () => {
+        setStreamConnected(false);
+        if (wsRef.current === ws) wsRef.current = null;
+        scheduleReconnect();
+      };
+    };
+
+    connect();
+    return () => {
+      closedByUs = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      const ws = wsRef.current;
+      if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
+    };
+  }, [queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending]);
+
   // The UI is the source of truth for the single active pane. Echo it to the
   // server whenever it changes and the socket is open (the WS wave relies on this).
   const selectActivePane = useCallback((paneId: string | null) => {
@@ -244,13 +344,46 @@ export function useOrbitalData(): OrbitalData {
     } catch { /* silent */ }
   }, [showToast, refetchLedger]);
 
+  // Re-fire a station (restart its process). Like the other burner wires (writeControlKey/resize), this
+  // targets a real pane id, so it fires the real POST even under ?mock=1 (the e2e intercepts + asserts).
   const restartPane = useCallback(async (id: string) => {
-    if (isMockModeRef.current) return;
     try {
-      await apiFetch(`/api/terminals/${id}/restart`, { method: "POST" });
-      refetchTerminals(); refetchLedger();
+      const res = await apiFetch(`/api/terminals/${id}/restart`, { method: "POST" });
+      if (res.status === 403) { showToast("Re-fire is gated off", "warn"); return; }
+      if (res.status === 202) { showToast("Re-fire queued — needs your ok 🛎", "warn"); return; }
+      refetchTerminals(); refetchLedger(); showToast("Re-firing the station 🔥");
     } catch { /* silent */ }
-  }, [refetchTerminals, refetchLedger]);
+  }, [refetchTerminals, refetchLedger, showToast]);
+
+  // Send a literal control-key sequence into a pane's PTY (the raw-input route — arrows / Tab / Esc /
+  // Enter / PgUp/PgDn / Ctrl+C always-allowed; Shift+Tab gated → may 202-defer). Fires the REAL POST
+  // even under the ?mock=1 harness so the e2e can intercept + assert the wire (there are no real mock
+  // users). 403/202/409 surface as a toast instead of a dead button.
+  const writeControlKey = useCallback(async (paneId: string, bytes: string) => {
+    try {
+      const res = await apiFetch(`/api/terminals/${paneId}/raw-input`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bytes }),
+      });
+      if (res.status === 403) showToast("That key's gated off", "warn");
+      else if (res.status === 202) showToast("Key queued — needs your ok 🛎", "warn");
+      else if (res.status === 409) showToast("Open the pane first", "warn");
+    } catch { /* pane may have exited — best-effort */ }
+  }, [showToast]);
+
+  // Sync the backend PTY grid to the xterm grid (debounced per-pane). Fires the real POST even in mock
+  // so the e2e can assert the round-trip (mirrors App.tsx's e2e-active resize seam).
+  const resizeTerminal = useCallback((paneId: string, cols: number, rows: number) => {
+    if (!cols || !rows) return;
+    const key = `${cols}x${rows}`;
+    if (lastGridRef.current[paneId] === key) return;
+    lastGridRef.current[paneId] = key;
+    clearTimeout(resizeDebounceRef.current[paneId]);
+    resizeDebounceRef.current[paneId] = setTimeout(() => {
+      apiFetch(`/api/terminals/${paneId}/resize`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cols, rows }),
+      }).catch(() => { /* pane may have exited; resize is best-effort */ });
+    }, 120);
+  }, []);
 
   const stopAllFreeze = useCallback(async () => {
     if (isMockModeRef.current) { setFrozen(true); return; }
@@ -277,9 +410,10 @@ export function useOrbitalData(): OrbitalData {
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
-    activeTerminalId, isMock, isLive: false, toast,
+    activeTerminalId, isMock, isLive: false, streamConnected, toast,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, showToast,
-    createPane, createProject, restartPane, stopAllFreeze, stopAllKill, stopAllRelease,
+    createPane, createProject, restartPane, writeControlKey, resizeTerminal,
+    stopAllFreeze, stopAllKill, stopAllRelease,
     refetchTerminals, refetchLedger, refetchSettings, refetchAll,
     wsRef, isMockModeRef,
     setTerminals, setTranscript, setPendingCommands, setPendingActions, setFrozen, setFrozenRunning,
