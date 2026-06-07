@@ -68,6 +68,7 @@ export interface OrbitalData {
   showToast: (msg: string, kind?: "fire" | "warn") => void;
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
+  updateProjectSummary: (projectId: string, summary: string) => void;
   restartPane: (id: string) => void;
   refetchNotes: (projectIds: string[]) => void;
   addNote: (projectId: string, text: string, paneId?: string | null) => void;
@@ -553,6 +554,17 @@ export function useOrbitalData(): OrbitalData {
 
   // Re-fire a station (restart its process). Like the other burner wires (writeControlKey/resize), this
   // targets a real pane id, so it fires the real POST even under ?mock=1 (the e2e intercepts + asserts).
+  // Edit a project's About (summary). PUT /api/projects/:id {summary} (ungated). Optimistic; fires in
+  // mock so the Pantry e2e can assert the wire. Summary-only — touches no other project field.
+  const updateProjectSummary = useCallback(async (projectId: string, summary: string) => {
+    setLedger((prev) => (prev[projectId] ? { ...prev, [projectId]: { ...prev[projectId], summary } } : prev));
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ summary }) });
+      if (res.ok) { if (!isMockModeRef.current) refetchLedger(); }
+      else showToast("Couldn't save the About", "warn");
+    } catch { /* silent */ }
+  }, [refetchLedger, showToast]);
+
   const restartPane = useCallback(async (id: string) => {
     try {
       const res = await apiFetch(`/api/terminals/${id}/restart`, { method: "POST" });
@@ -709,7 +721,7 @@ export function useOrbitalData(): OrbitalData {
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast, notes,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
-    createPane, createProject, restartPane, refetchNotes, addNote, editNote, deleteNote,
+    createPane, createProject, updateProjectSummary, restartPane, refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,

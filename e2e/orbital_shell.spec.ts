@@ -18,7 +18,7 @@ test.describe("Orbital Kitchen — shell", () => {
     // default = The Line → the projects sidebar is its stable marker
     await expect(page.getByText("Projects", { exact: true })).toBeVisible();
     await page.getByTestId("tab-pantry").click();
-    await expect(page.getByRole("heading", { name: "The Pantry" })).toBeVisible();
+    await expect(page.getByTestId("pantry")).toBeVisible();
     await page.getByTestId("tab-boh").click();
     await expect(page.getByTestId("boh-room-rulebook")).toBeVisible(); // Back of House room nav
     await page.getByTestId("tab-line").click();

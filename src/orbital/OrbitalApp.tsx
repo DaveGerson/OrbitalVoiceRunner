@@ -16,6 +16,7 @@ import { KitchenRadio } from "./KitchenRadio";
 import { TerminalWindow } from "./TerminalWindow";
 import { BackOfHouse } from "./views/BackOfHouse";
 import { ThePass } from "./views/Pass";
+import { ThePantry } from "./views/Pantry";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
 import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
@@ -145,18 +146,6 @@ function DanceTroupe({ show }: { show: boolean }) {
   );
 }
 
-function Placeholder({ title, blurb, dark }: { title: string; blurb: string; dark: boolean }) {
-  return (
-    <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 24, backgroundImage: dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-      <div style={{ textAlign: "center", maxWidth: 460 }}>
-        <Mascot variant="default" size={84} style={{ margin: "0 auto 10px" }} />
-        <h2 style={{ margin: 0, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 30, color: dark ? "#ffe9c7" : INK }}>{title}</h2>
-        <div style={{ fontFamily: "Caveat, cursive", fontSize: 19, color: "#8a6a4f", marginTop: 4 }}>{blurb}</div>
-      </div>
-    </div>
-  );
-}
-
 export default function OrbitalApp() {
   useKitchenChrome();
   const params = typeof location !== "undefined" ? new URLSearchParams(location.search) : new URLSearchParams();
@@ -223,7 +212,13 @@ export default function OrbitalApp() {
           </aside>
         </div>
       )}
-      {view === "pantry" && <Placeholder dark={t.dark} title="The Pantry" blurb="project tracker, plating soon" />}
+      {view === "pantry" && (
+        <ThePantry dark={t.dark} projects={projects} stations={stations}
+          summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
+          selectedProject={selectedProject}
+          onUpdateSummary={data.updateProjectSummary}
+          onOpenStation={(id) => { data.selectActivePane(id); setBurnerId(id); }} />
+      )}
       {view === "boh" && (
         <BackOfHouse dark={t.dark} settings={data.settings}
           globalMode={data.globalPermissionsMode}
