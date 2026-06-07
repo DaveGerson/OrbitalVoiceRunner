@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="display:none" aria-hidden="true">
+  <defs>
+    
+    <symbol id="i-pie" viewBox="0 0 24 24">
+      <ellipse cx="12" cy="16" rx="9" ry="3" fill="none" stroke="currentColor" stroke-width="2"></ellipse>
+      <path d="M3 16 Q12 4 21 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M6 14 L18 14 M8 11 L16 11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".55"></path>
+      <circle cx="12" cy="8" r="1.6" fill="currentColor"></circle>
+    </symbol>
+    <symbol id="i-chef-hat" viewBox="0 0 24 24">
+      <path d="M6 15 Q3 6 9 7 Q11 2 13 7 Q19 6 18 15 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M5 15 L19 15 M5 18 L19 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-whisk" viewBox="0 0 24 24">
+      <path d="M12 3 L12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+      <path d="M8 12 Q12 22 16 12 M9 12 Q12 20 15 12 M12 12 L12 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-timer" viewBox="0 0 24 24">
+      <circle cx="12" cy="13" r="8" fill="none" stroke="currentColor" stroke-width="2"></circle>
+      <path d="M9 2 L15 2 M12 7 L12 13 L16 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24">
+      <path d="M5 17 Q5 9 12 8 Q19 9 19 17 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M3 17 L21 17" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+      <path d="M11 8 L13 8 L12 5 Z" fill="currentColor"></path>
+      <circle cx="12" cy="21" r="1.5" fill="currentColor"></circle>
+    </symbol>
+    <symbol id="i-fire" viewBox="0 0 24 24">
+      <path d="M12 3 Q8 8 9 12 Q6 11 6 15 Q6 20 12 21 Q18 20 18 15 Q18 11 16 10 Q15 6 12 3 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M12 11 Q10 14 11 17 Q14 17 14 14 Q13 12 12 11 Z" fill="currentColor" opacity=".4"></path>
+    </symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24">
+      <path d="M12 5 L12 19 M5 12 L19 12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <path d="M4 13 L10 18 L20 6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <path d="M6 6 L18 18 M18 6 L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24">
+      <path d="M4 12 L20 12 M14 6 L20 12 L14 18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24">
+      <circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="2"></circle>
+      <path d="M16 16 L21 21" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24">
+      <path d="M4 5 L20 5 L14 12 L14 20 L10 18 L10 12 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24">
+      <path d="M12 3 L14 10 L21 12 L14 14 L12 21 L10 14 L3 12 L10 10 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-cherry" viewBox="0 0 24 24">
+      <circle cx="8" cy="17" r="4" fill="none" stroke="currentColor" stroke-width="2"></circle>
+      <circle cx="16" cy="17" r="4" fill="none" stroke="currentColor" stroke-width="2"></circle>
+      <path d="M8 13 Q12 4 20 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+      <path d="M16 13 Q14 8 20 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-rolling-pin" viewBox="0 0 24 24">
+      <rect x="5" y="9" width="14" height="6" rx="3" fill="none" stroke="currentColor" stroke-width="2"></rect>
+      <path d="M2 12 L5 12 M19 12 L22 12" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-salt" viewBox="0 0 24 24">
+      <path d="M8 9 L16 9 L15 20 Q12 22 9 20 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M8 9 L8 6 L16 6 L16 9" fill="none" stroke="currentColor" stroke-width="2"></path>
+      <circle cx="10" cy="4" r=".7" fill="currentColor"></circle>
+      <circle cx="13" cy="3" r=".7" fill="currentColor"></circle>
+      <circle cx="15" cy="5" r=".7" fill="currentColor"></circle>
+    </symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24">
+      <path d="M4 7 L20 7 M4 12 L20 12 M4 17 L20 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+    </symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24">
+      <path d="M6 9 L12 15 L18 9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-play" viewBox="0 0 24 24">
+      <path d="M7 5 L20 12 L7 19 Z" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+    </symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24">
+      <rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"></rect>
+      <rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"></rect>
+    </symbol>
+    <symbol id="i-ticket" viewBox="0 0 24 24">
+      <path d="M4 8 Q4 6 6 6 L18 6 Q20 6 20 8 L20 10 Q18 11 18 12 Q18 13 20 14 L20 16 Q20 18 18 18 L6 18 Q4 18 4 16 L4 14 Q6 13 6 12 Q6 11 4 10 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M10 9 L10 15" stroke="currentColor" stroke-width="1.6" stroke-dasharray="1.5 1.5"></path>
+    </symbol>
+    <symbol id="i-user" viewBox="0 0 24 24">
+      <circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="2"></circle>
+      <path d="M4 21 Q4 14 12 14 Q20 14 20 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+    </symbol>
+  </defs>
+</svg>

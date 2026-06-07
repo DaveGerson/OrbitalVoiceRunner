@@ -18,6 +18,7 @@
     "catalog": "tsx scripts/catalog.ts",
     "smoke:claude": "tsx scripts/smoke-claude-pane.ts",
     "smoke:handoff": "tsx scripts/smoke-handoff.ts",
+    "smoke:kitchen": "node scripts/live-smoke-kitchen.mjs",
     "verify:modeswitch": "tsx scripts/verify-live-modeswitch.ts",
     "verify:modeswitch:agy": "tsx scripts/verify-live-modeswitch-agy.ts",
     "verify:agy-resume": "tsx scripts/verify-agy-resume.ts",
