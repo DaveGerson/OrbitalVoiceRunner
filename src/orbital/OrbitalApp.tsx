@@ -10,6 +10,10 @@ import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
 import { useOrbitalData } from "./useOrbitalData";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
+import { ServiceMode } from "./ServiceMode";
+import { EmergencyStop } from "./EmergencyStop";
+import { NewPaneModal, NewProjectModal } from "./modals";
+import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
 
 type View = "line" | "pantry" | "boh";
 
@@ -53,8 +57,9 @@ function useKitchenChrome() {
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running }: {
+function TopNav({ accentHex, accentOn, view, setView, running, mode, setMode, onPanic }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
+  mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -82,10 +87,14 @@ function TopNav({ accentHex, accentOn, view, setView, running }: {
         })}
       </div>
       <div style={{ flex: 1 }} />
+      <ServiceMode mode={mode} setMode={setMode} />
       <div data-testid="kitchen-status" style={{ display: "flex", alignItems: "center", gap: 8, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
         <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>Kitchen open · {running} on the burner</span>
       </div>
+      <button data-testid="all-hands" onClick={onPanic} title="Emergency brake" style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 10, border: "2px solid " + INK, background: "#2a1a10", color: "#ffc94a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5, letterSpacing: ".04em", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0, textTransform: "uppercase" }}>
+        <Icon name="fire" size={16} color="#e23a3a" /> All Hands
+      </button>
     </nav>
   );
 }
@@ -150,6 +159,9 @@ export default function OrbitalApp() {
   const startView = (["boh", "pantry"].includes(params.get("view") || "") ? params.get("view") : "line") as View;
   const [view, setView] = useState<View>(startView);
   const [selectedProject, setSelectedProject] = useState<string>(params.get("project") || "all");
+  const [panic, setPanic] = useState(false);
+  const [newPaneProj, setNewPaneProj] = useState<string | null>(null);
+  const [newProjOpen, setNewProjOpen] = useState(false);
   const pageBg: CSSProperties["background"] = t.dark ? "#1a0f08" : "var(--cream)";
 
   const data = useOrbitalData();
@@ -159,26 +171,54 @@ export default function OrbitalApp() {
   );
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
   const running = stations.filter((s) => s.status === "Running").length;
+  const serviceId = modeToServiceId(data.globalPermissionsMode === "Inherit" ? "Human-in-the-Loop" : data.globalPermissionsMode);
 
   return (
     <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
       <IconSprite />
-      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running} />
+      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running}
+        mode={serviceId} setMode={(id) => data.setGlobalMode(serviceIdToMode(id))}
+        onPanic={() => { data.stopAllFreeze(); setPanic(true); }} />
 
       {view === "line" && (
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
-          <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} />
+          <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
             {/* ThePass (P7) and RightRail (P5) slot in here */}
-            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => data.selectActivePane(st.id)} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} />
+            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => data.selectActivePane(st.id)} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
           </div>
         </div>
       )}
       {view === "pantry" && <Placeholder dark={t.dark} title="The Pantry" blurb="project tracker, plating soon" />}
       {view === "boh" && <Placeholder dark={t.dark} title="Back of House" blurb="house rules & settings, out back" />}
 
-      <CornerChef show={t.mascot && view === "line"} chatter={t.mascot} />
-      <DanceTroupe show={t.danceParty && view === "line"} />
+      {newPaneProj !== null && (
+        <NewPaneModal projectId={newPaneProj} projects={projects} dark={t.dark} onClose={() => setNewPaneProj(null)}
+          onCreate={(o) => { data.createPane(o); setNewPaneProj(null); if (o.projectId) setSelectedProject(o.projectId); }} />
+      )}
+      {newProjOpen && (
+        <NewProjectModal dark={t.dark} onClose={() => setNewProjOpen(false)}
+          onCreate={(o) => { data.createProject(o); setNewProjOpen(false); }} />
+      )}
+      {panic && (
+        <EmergencyStop runningCount={data.frozenRunning.length || running} onKill={data.stopAllKill}
+          onClose={() => { data.stopAllRelease(); setPanic(false); }} />
+      )}
+
+      {data.frozen && !panic && (
+        <div data-testid="frozen-banner" onClick={() => setPanic(true)} style={{ position: "fixed", top: 64, left: "50%", transform: "translateX(-50%)", zIndex: 110, background: "#e23a3a", color: "#fff4de", border: "2px solid " + INK, borderRadius: 10, padding: "7px 14px", boxShadow: "3px 3px 0 0 " + INK, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5, cursor: "pointer" }}>
+          ❄ Line frozen — Janus paused. Click to manage.
+        </div>
+      )}
+
+      <CornerChef show={t.mascot && view === "line" && !panic} chatter={t.mascot} />
+      <DanceTroupe show={t.danceParty && view === "line" && !panic} />
+
+      {data.toast && (
+        <div data-testid="toast" className="orb-pop-in" style={{ position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", zIndex: 130, background: data.toast.kind === "fire" ? "#4db892" : "#ffc94a", color: INK, border: "2px solid " + INK, borderRadius: 12, padding: "10px 18px", boxShadow: "4px 4px 0 0 " + INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16 }}>
+          {data.toast.msg}
+        </div>
+      )}
 
       <TweaksPanel title="Tweaks">
         <TweakSection label="The board" />

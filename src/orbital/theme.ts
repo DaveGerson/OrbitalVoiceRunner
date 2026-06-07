@@ -84,7 +84,25 @@ export const TILTS = [-1.4, 0.9, -0.7, 1.2, -1.1, 0.6];
 // persisted client-side keyed by project id; see useProjectSkins).
 export const PROJECT_COLORS = ["#e23a3a", "#4db892", "#ff8a3d", "#ffc94a", "#4b3bb3", "#d6336c"];
 export const PROJECT_EMOJIS = ["🍳", "🔐", "💳", "🖥", "📚", "⚙️", "🧪", "🚀"];
+
+// User-picked project "signs" (emoji + accent) persist client-side (no backend
+// column — G4). skinForProject prefers a stored override, else a stable hash.
+const SKIN_LS = "orbital-project-skins";
+let _skinCache: Record<string, { color: string; emoji: string }> | null = null;
+function skinOverrides(): Record<string, { color: string; emoji: string }> {
+  if (_skinCache) return _skinCache;
+  try { _skinCache = JSON.parse((typeof localStorage !== "undefined" && localStorage.getItem(SKIN_LS)) || "{}"); }
+  catch { _skinCache = {}; }
+  return _skinCache!;
+}
+export function setProjectSkin(id: string, skin: { color: string; emoji: string }): void {
+  const o = skinOverrides();
+  o[id] = skin;
+  try { localStorage.setItem(SKIN_LS, JSON.stringify(o)); } catch { /* quota */ }
+}
 export function skinForProject(id: string): { color: string; emoji: string } {
+  const override = skinOverrides()[id];
+  if (override) return override;
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
   return { color: PROJECT_COLORS[h % PROJECT_COLORS.length], emoji: PROJECT_EMOJIS[h % PROJECT_EMOJIS.length] };
