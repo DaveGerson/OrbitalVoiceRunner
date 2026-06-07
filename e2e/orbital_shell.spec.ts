@@ -1,0 +1,48 @@
+import { expect, test } from "@playwright/test";
+
+// Wave P0 — the Orbital Kitchen shell: chrome, view routing, tweaks.
+// The reskin lives behind ?ui=kitchen until the migration completes.
+
+test.describe("Orbital Kitchen — shell", () => {
+  test("renders the kitchen chrome with three tabs", async ({ page }) => {
+    await page.goto("/?ui=kitchen");
+    await expect(page.getByText("ORBITAL", { exact: true })).toBeVisible();
+    await expect(page.getByText("the kitchen pass")).toBeVisible();
+    await expect(page.getByTestId("tab-line")).toBeVisible();
+    await expect(page.getByTestId("tab-pantry")).toBeVisible();
+    await expect(page.getByTestId("tab-boh")).toBeVisible();
+  });
+
+  test("routes between the three views", async ({ page }) => {
+    await page.goto("/?ui=kitchen");
+    // default = The Line
+    await expect(page.getByRole("heading", { name: "The Line" })).toBeVisible();
+    await page.getByTestId("tab-pantry").click();
+    await expect(page.getByRole("heading", { name: "The Pantry" })).toBeVisible();
+    await page.getByTestId("tab-boh").click();
+    await expect(page.getByRole("heading", { name: "Back of House" })).toBeVisible();
+    await page.getByTestId("tab-line").click();
+    await expect(page.getByRole("heading", { name: "The Line" })).toBeVisible();
+  });
+
+  test("deep-links a view via ?view=", async ({ page }) => {
+    await page.goto("/?ui=kitchen&view=boh");
+    await expect(page.getByRole("heading", { name: "Back of House" })).toBeVisible();
+  });
+
+  test("tweaks panel opens and toggles persist to localStorage", async ({ page }) => {
+    await page.goto("/?ui=kitchen");
+    await page.getByTestId("tweaks-toggle").click();
+    await expect(page.getByTestId("tweaks-panel")).toBeVisible();
+    // flip dark mode → it should write the tweaks blob
+    await page.getByRole("switch", { name: "Dinner-service (dark)" }).click();
+    const stored = await page.evaluate(() => localStorage.getItem("orbital-tweaks"));
+    expect(stored).toContain("\"dark\":true");
+  });
+
+  test("classic app still default without the flag", async ({ page }) => {
+    await page.goto("/");
+    // kitchen-only chrome must be ABSENT on the classic default
+    await expect(page.getByTestId("tab-line")).toHaveCount(0);
+  });
+});

@@ -1,0 +1,117 @@
+/* ============================================================
+   ORBITAL KITCHEN — design tokens, fonts, motion.
+   Ported from the Claude Design handoff (colors_and_type.css +
+   the keyframes inlined in "Orbital Kitchen.html").
+   Fonts are loaded via <link> in index.html to avoid @import
+   ordering issues with Tailwind.
+   ============================================================ */
+
+:root {
+  /* ---------- CORE PALETTE (the pantry) ---------- */
+  --cream:        #fff4de;
+  --cream-soft:   #fff9ec;
+  --cream-deep:   #f3e4c2;
+  --crust:        #d4a15a;
+  --crust-dark:   #a4691a;
+  --ink:          #2a1a10;
+  --ink-soft:     #5b3a23;
+  --ink-faint:    #8a6a4f;
+
+  /* ---------- JAM JAR ---------- */
+  --cherry:       #e23a3a;
+  --cherry-dark:  #a8151a;
+  --cherry-soft:  #ffd3ce;
+  --raspberry:    #d6336c;
+
+  /* ---------- ICEBOX ---------- */
+  --blueberry:    #4b3bb3;
+  --blueberry-soft:#d6cfff;
+  --sky:          #6db9ff;
+
+  /* ---------- KITCHEN GARDEN ---------- */
+  --mint:         #4db892;
+  --mint-dark:    #2f7a5e;
+  --mint-soft:    #c3e8d2;
+  --lime:         #c9d94a;
+
+  /* ---------- FROM THE OVEN ---------- */
+  --butter:       #ffc94a;
+  --butter-soft:  #fff0b8;
+  --tangerine:    #ff8a3d;
+  --tangerine-soft:#ffd7b0;
+  --peach:        #ffb0a1;
+
+  /* ---------- SEMANTIC ROLES ---------- */
+  --fg:           var(--ink);
+  --fg-muted:     var(--ink-soft);
+  --fg-faint:     var(--ink-faint);
+  --fg-inverse:   var(--cream);
+  --bg:           var(--cream);
+  --bg-card:      var(--cream-soft);
+  --bg-sunken:    var(--cream-deep);
+  --bg-inverse:   var(--ink);
+  --border:       var(--ink);
+  --border-soft:  #c9a97a;
+
+  /* ---------- RADII ---------- */
+  --r-sm:  6px;  --r-md: 10px; --r-lg: 14px; --r-xl: 20px; --r-pill: 999px;
+
+  /* ---------- STICKER SHADOWS ---------- */
+  --sticker-sm: 2px 2px 0 0 var(--ink);
+  --sticker-md: 3px 3px 0 0 var(--ink);
+  --sticker-lg: 5px 5px 0 0 var(--ink);
+  --sticker-xl: 8px 8px 0 0 var(--ink);
+  --soft-shadow: 0 6px 24px -12px rgba(42, 26, 16, 0.35);
+
+  /* ---------- TYPE ---------- */
+  --font-display: 'Fraunces', 'Playfair Display', Georgia, serif;
+  --font-body:    'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-hand:    'Caveat', 'Comic Sans MS', cursive;
+  --font-mono:    'JetBrains Mono', 'Courier New', monospace;
+
+  /* ---------- MOTION ---------- */
+  --ease-bounce: cubic-bezier(.34, 1.56, .64, 1);
+  --ease-out:    cubic-bezier(.2, .8, .2, 1);
+  --dur-fast:    120ms;
+  --dur-med:     220ms;
+  --dur-slow:    420ms;
+}
+
+/* ============================================================
+   THE KITCHEN ROOT — owns its surface + scrollbars so the
+   classic app is untouched while both UIs coexist.
+   ============================================================ */
+.orbital-kitchen {
+  height: 100%;
+  font-family: var(--font-body);
+  color: var(--fg);
+  background: var(--cream);
+}
+.orbital-kitchen ::-webkit-scrollbar { width: 10px; height: 10px; }
+.orbital-kitchen ::-webkit-scrollbar-thumb { background: #c9a97a; border-radius: 999px; border: 2px solid var(--cream); }
+.orbital-kitchen ::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   MOTION — keyframes + helper classes (from the HTML shell).
+   ============================================================ */
+@keyframes orb-pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: .5; } }
+@keyframes orb-wave  { 0%,100% { transform: scaleY(.25); } 50% { transform: scaleY(1); } }
+@keyframes orb-spine { to { background-position: 14px 0; } }
+@keyframes orb-dance  { 0%,100%{transform:translateY(0) rotate(-5deg)} 25%{transform:translateY(-9px) rotate(4deg)} 50%{transform:translateY(0) rotate(-4deg)} 75%{transform:translateY(-7px) rotate(5deg)} }
+@keyframes orb-dance2 { 0%,100%{transform:translateY(0) rotate(5deg) scaleY(1)} 25%{transform:translateY(-6px) rotate(-4deg) scaleY(1.05)} 50%{transform:translateY(0) rotate(4deg) scaleY(.96)} 75%{transform:translateY(-9px) rotate(-5deg) scaleY(1.05)} }
+@keyframes orb-confetti { 0%{transform:translateY(0) rotate(0)} 100%{transform:translateY(-14px) rotate(180deg)} }
+@keyframes orb-jiggle { 0%,100% { transform: rotate(-5deg); } 50% { transform: rotate(5deg); } }
+@keyframes orb-shake  { 0%,100%{transform:translate(0,0)} 20%{transform:translate(-3px,2px)} 40%{transform:translate(3px,-2px)} 60%{transform:translate(-2px,-2px)} 80%{transform:translate(2px,2px)} }
+@keyframes orb-siren  { 0%,100%{background:rgba(226,58,58,.45)} 50%{background:rgba(42,26,16,.72)} }
+@keyframes orb-drawer { from { transform: translateX(40px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes orb-pop    { from { transform: scale(.9) translateY(8px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
+
+.orb-shake { animation: orb-shake .4s linear infinite; }
+.orb-siren { animation: orb-siren .7s steps(2,end) infinite; }
+.orb-drawer-in { animation: orb-drawer .28s cubic-bezier(.34,1.56,.64,1); }
+.orb-pop-in { animation: orb-pop .3s cubic-bezier(.34,1.56,.64,1); }
+.orb-listening-dot { width: 9px; height: 9px; border-radius: 50%; background: #4db892; border: 1.5px solid var(--ink); display: inline-block; animation: orb-pulse 1s var(--ease-bounce) infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .orbital-kitchen * { animation: none !important; }
+}
