@@ -12,6 +12,7 @@ import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
+import { KitchenRadio } from "./KitchenRadio";
 import { TerminalWindow } from "./TerminalWindow";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
@@ -196,9 +197,14 @@ export default function OrbitalApp() {
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-            {/* ThePass (P7) and RightRail (P5) slot in here */}
+            {/* ThePass (P7) slots in above the board here */}
             <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
           </div>
+          {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
+          <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
+            <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
+              transcript={data.transcript} voiceCues={t.voiceCues} onGoLive={data.goLive} onToggleMute={data.toggleMute} />
+          </aside>
         </div>
       )}
       {view === "pantry" && <Placeholder dark={t.dark} title="The Pantry" blurb="project tracker, plating soon" />}

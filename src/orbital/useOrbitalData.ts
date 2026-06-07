@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { apiFetch } from "../utils/api";
 import { publishChunk } from "../terminalStream";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "../utils/audio";
 import { useE2EHarness, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
 import type {
@@ -37,6 +38,8 @@ export interface OrbitalData {
   activeTerminalId: string | null;
   isMock: boolean;
   isLive: boolean;
+  voiceReconnecting: boolean;
+  micMuted: boolean;
   streamConnected: boolean;
   toast: { msg: string; kind: "fire" | "warn" } | null;
   // setters / actions
@@ -47,6 +50,9 @@ export interface OrbitalData {
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
   restartPane: (id: string) => void;
+  goLive: () => void;
+  stopLive: () => void;
+  toggleMute: () => void;
   writeControlKey: (paneId: string, bytes: string) => void;
   resizeTerminal: (paneId: string, cols: number, rows: number) => void;
   approveCommand: (messageId: string) => void;
@@ -85,12 +91,27 @@ export function useOrbitalData(): OrbitalData {
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [isMock, setIsMock] = useState<boolean>(false);
   const [streamConnected, setStreamConnected] = useState<boolean>(false);
+  // Kitchen Radio (voice). `voiceLive` flips the wsRef socket from the mic-free observe lane to a full
+  // Gemini /live session; `voiceReconnecting` covers the bounded auto-reconnect window; `micMuted` gates
+  // the outbound mic frames without tearing the session down.
+  const [voiceLive, setVoiceLive] = useState<boolean>(false);
+  const [voiceReconnecting, setVoiceReconnecting] = useState<boolean>(false);
+  const [micMuted, setMicMuted] = useState<boolean>(false);
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn" } | null>(null);
 
   const isMockModeRef = useRef<boolean>(false);
   const wsRef = useRef<WebSocket | null>(null);
   const activeTerminalIdRef = useRef<string | null>(null);
   activeTerminalIdRef.current = activeTerminalId;
+  // Voice session audio plumbing (ported from App.tsx connectLive). All per-session; torn down on stop.
+  const desiredVoiceRef = useRef<boolean>(false);
+  const micMutedRef = useRef<boolean>(false);
+  micMutedRef.current = micMuted;
+  const captureCtxRef = useRef<AudioContext | null>(null);
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   // The burner's PTY-grid resize is debounced per-pane (same shape as App.tsx): coalesce a
   // viewport reflow burst into one POST, and skip a no-op repeat of the last grid.
   const lastGridRef = useRef<Record<string, string>>({});
@@ -208,41 +229,92 @@ export function useOrbitalData(): OrbitalData {
     return () => clearInterval(iv);
   }, [refetchAll, refetchTerminals, refetchPending, refetchActions, refetchPlans]);
 
-  // ── live stream + realtime board, mic-free (P4 The Burner) ──────────────
-  // A read-only `/live?observe=1` socket: it joins the server broadcast set so
-  // stdout_chunk streams straight into the xterm (publishChunk) and board/ledger/
-  // freeze updates arrive in realtime — WITHOUT opening a Gemini voice session
-  // (no mic, no model, no cost; P5 layers audio on top via the same wsRef). The
-  // 20s poll above stays as a safety net. Skipped entirely in mock mode (the e2e
-  // harness drives queueStdoutChunk directly through window.__ORBITAL_E2E__).
+  // Tear down all per-session voice audio (mic capture chain + both AudioContexts). Idempotent.
+  const teardownAudio = useCallback(() => {
+    try { micProcessorRef.current?.disconnect(); } catch { /* */ }
+    micProcessorRef.current = null;
+    try { micSourceRef.current?.disconnect(); } catch { /* */ }
+    micSourceRef.current = null;
+    micStreamRef.current?.getTracks().forEach((t) => { try { t.stop(); } catch { /* */ } });
+    micStreamRef.current = null;
+    try { captureCtxRef.current?.close(); } catch { /* */ }
+    captureCtxRef.current = null;
+    try { playbackCtxRef.current?.close(); } catch { /* */ }
+    playbackCtxRef.current = null;
+    resetAudioPlayback();
+  }, []);
+
+  // ── live socket: mic-free observe lane ⇄ full Gemini voice session ───────
+  // ONE wsRef socket, two modes keyed on `voiceLive`:
+  //   • observe (default): /live?observe=1 — joins the broadcast set (stdout_chunk → xterm, board/
+  //     ledger/freeze realtime, approval/action chips) with NO Gemini session, no mic, no cost.
+  //   • voice (operator tuned in): /live — the full Gemini Live session: mic capture out, model
+  //     audio in, operator + Janus transcripts, grounded sources. Flipping the mode tears the old
+  //     socket down and opens the new one. Skipped in mock (the harness drives setters directly);
+  //     the 20s poll stays as a safety net under both modes.
   useEffect(() => {
     if (isMockModeRef.current) return;
+    const voice = voiceLive;
     let closedByUs = false;
     let attempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const scheduleReconnect = () => {
       if (closedByUs || reconnectTimer) return;
+      if (voice && !desiredVoiceRef.current) return; // voice only reconnects while the operator wants it
       attempt = Math.min(attempt + 1, 6);
       const delay = Math.min(500 * 2 ** (attempt - 1), 15000); // bounded backoff, 0.5s→15s
+      if (voice) setVoiceReconnecting(true);
       reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    };
+
+    const startMic = async (ws: WebSocket, captureCtx: AudioContext) => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        micStreamRef.current = stream;
+        const source = captureCtx.createMediaStreamSource(stream);
+        micSourceRef.current = source;
+        const processor = captureCtx.createScriptProcessor(4096, 1, 1);
+        micProcessorRef.current = processor;
+        source.connect(processor);
+        processor.connect(captureCtx.destination);
+        processor.onaudioprocess = (e) => {
+          if (ws.readyState === WebSocket.OPEN && !micMutedRef.current) {
+            ws.send(JSON.stringify({ type: "audio", audio: pcmToBase64(e.inputBuffer.getChannelData(0)) }));
+          }
+        };
+      } catch (err) {
+        console.error("Mic capture failed to start:", err);
+      }
     };
 
     const connect = () => {
       if (closedByUs) return;
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       let ws: WebSocket;
-      try { ws = new WebSocket(`${protocol}//${window.location.host}/live?observe=1`); }
+      try { ws = new WebSocket(`${protocol}//${window.location.host}/live${voice ? "" : "?observe=1"}`); }
       catch { scheduleReconnect(); return; }
       wsRef.current = ws;
 
+      let captureCtx: AudioContext | null = null;
+      let playbackCtx: AudioContext | null = null;
+      if (voice) {
+        captureCtx = new AudioContext({ sampleRate: 16000 });
+        playbackCtx = new AudioContext({ sampleRate: 24000 });
+        captureCtxRef.current = captureCtx;
+        playbackCtxRef.current = playbackCtx;
+        resetAudioPlayback();
+      }
+
       ws.onopen = () => {
         attempt = 0;
-        setStreamConnected(true);
+        if (voice) { setVoiceLive(true); setVoiceReconnecting(false); }
+        else setStreamConnected(true);
         // Re-assert the open pane so operator raw-input / draft writes target it through the gate.
         if (activeTerminalIdRef.current && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         }
+        if (voice && captureCtx) startMic(ws, captureCtx);
       };
       ws.onmessage = (event) => {
         // The /live frame is an untyped JSON blob (same as the classic app's ws.onmessage). Field
@@ -301,15 +373,55 @@ export function useOrbitalData(): OrbitalData {
           case "command_blocked":
             refetchPending();
             break;
+          // ── voice-only frames (Kitchen Radio) ──
+          case "audio":
+            if (playbackCtx && typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
+            break;
+          case "interrupted":
+            resetAudioPlayback();
+            break;
+          case "transcript_text":
+            if ((msg.sender === "User" || msg.sender === "Janus") && typeof msg.text === "string") {
+              setTranscript((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50));
+            }
+            break;
+          case "grounding":
+            // Attach grounded sources/queries to the most recent Janus turn (no-op if none yet).
+            setTranscript((prev) => {
+              const sources = Array.isArray(msg.sources) ? msg.sources : [];
+              const queries = Array.isArray(msg.queries) ? msg.queries : [];
+              if (sources.length === 0 && queries.length === 0) return prev;
+              let lastJanus = -1;
+              for (let i = prev.length - 1; i >= 0; i--) { if (prev[i].sender === "Janus") { lastJanus = i; break; } }
+              if (lastJanus === -1) return prev;
+              const next = prev.slice();
+              next[lastJanus] = { ...next[lastJanus], grounding: { queries, sources } };
+              return next;
+            });
+            break;
+          case "voice_channel_lost":
+            setVoiceReconnecting(true);
+            break;
+          case "error":
+            setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
+            setTimeout(() => setToast(null), 4000);
+            resetAudioPlayback();
+            break;
           default:
             break;
         }
       };
       ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
       ws.onclose = () => {
-        setStreamConnected(false);
         if (wsRef.current === ws) wsRef.current = null;
-        scheduleReconnect();
+        if (voice) {
+          teardownAudio();
+          if (!closedByUs && desiredVoiceRef.current) scheduleReconnect();
+          else { setVoiceLive(false); setVoiceReconnecting(false); }
+        } else {
+          setStreamConnected(false);
+          scheduleReconnect();
+        }
       };
     };
 
@@ -319,8 +431,9 @@ export function useOrbitalData(): OrbitalData {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       const ws = wsRef.current;
       if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
+      if (voice) teardownAudio();
     };
-  }, [queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending]);
+  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, teardownAudio]);
 
   // The UI is the source of truth for the single active pane. Echo it to the
   // server whenever it changes and the socket is open (the WS wave relies on this).
@@ -336,6 +449,14 @@ export function useOrbitalData(): OrbitalData {
     setToast({ msg, kind });
     setTimeout(() => setToast(null), 2400);
   }, []);
+
+  // ── Kitchen Radio: tune in / off-air / mute ─────────────────────────────
+  // Tuning in flips the wsRef socket to a full Gemini voice session (the effect above re-runs on
+  // voiceLive). desiredVoiceRef is the reconnect kill-switch: a dropped session only auto-reconnects
+  // while the operator still wants to be live. Mute gates outbound mic frames without a teardown.
+  const goLive = useCallback(() => { desiredVoiceRef.current = true; setMicMuted(false); setVoiceLive(true); }, []);
+  const stopLive = useCallback(() => { desiredVoiceRef.current = false; setVoiceLive(false); }, []);
+  const toggleMute = useCallback(() => setMicMuted((m) => !m), []);
 
   // ── mutations (the real backend writes; gated routes may 202/403) ───────
   const setGlobalMode = useCallback(async (mode: GlobalMode) => {
@@ -488,9 +609,9 @@ export function useOrbitalData(): OrbitalData {
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
-    activeTerminalId, isMock, isLive: false, streamConnected, toast,
+    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, showToast,
-    createPane, createProject, restartPane, writeControlKey, resizeTerminal,
+    createPane, createProject, restartPane, goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
     refetchTerminals, refetchLedger, refetchSettings, refetchAll,
