@@ -30,7 +30,8 @@ const MASCOT_SRC: Record<MascotVariant, string> = {
 export function Mascot({ variant = "default", size = 80, style = {} }: {
   variant?: MascotVariant; size?: number; style?: CSSProperties;
 }) {
-  return <img src={MASCOT_SRC[variant]} width={size} alt="" style={{ display: "block", ...style }} />;
+  // Inline width/height beat Tailwind preflight's `img { height: auto; max-width: 100% }`.
+  return <img src={MASCOT_SRC[variant]} alt="" style={{ display: "block", width: size, height: "auto", maxWidth: "none", ...style }} />;
 }
 
 export function Chip({ children, color = INK, bg = "#fff9ec", border = INK, style = {} }: {
@@ -97,8 +98,9 @@ export function ChefAvatar({ chefKey, size = 24 }: { chefKey: ChefKey; size?: nu
   );
 }
 
-// progress pips → little pie-crust squares
-export function Pips({ steps, done, color }: { steps: number; done: number; color: string }) {
+// progress pips → little pie-crust squares. `label` overrides the default
+// "done/steps" caption (used to relabel the real context-budget fill).
+export function Pips({ steps, done, color, label }: { steps: number; done: number; color: string; label?: string }) {
   const n = Math.max(0, Math.min(steps, 40));
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -107,7 +109,7 @@ export function Pips({ steps, done, color }: { steps: number; done: number; colo
           <div key={i} style={{ width: 9, height: 9, borderRadius: 2, background: i < done ? color : "#f3e4c2", border: "1.5px solid " + INK }} />
         ))}
       </div>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: "#5b3a23" }}>{done}/{steps}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: "#5b3a23" }}>{label ?? `${done}/${steps}`}</span>
     </div>
   );
 }

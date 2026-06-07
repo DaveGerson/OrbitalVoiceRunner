@@ -15,14 +15,14 @@ test.describe("Orbital Kitchen — shell", () => {
 
   test("routes between the three views", async ({ page }) => {
     await page.goto("/?ui=kitchen");
-    // default = The Line
-    await expect(page.getByRole("heading", { name: "The Line" })).toBeVisible();
+    // default = The Line → the projects sidebar is its stable marker
+    await expect(page.getByText("Projects", { exact: true })).toBeVisible();
     await page.getByTestId("tab-pantry").click();
     await expect(page.getByRole("heading", { name: "The Pantry" })).toBeVisible();
     await page.getByTestId("tab-boh").click();
     await expect(page.getByRole("heading", { name: "Back of House" })).toBeVisible();
     await page.getByTestId("tab-line").click();
-    await expect(page.getByRole("heading", { name: "The Line" })).toBeVisible();
+    await expect(page.getByText("Projects", { exact: true })).toBeVisible();
   });
 
   test("deep-links a view via ?view=", async ({ page }) => {

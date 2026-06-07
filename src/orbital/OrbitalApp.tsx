@@ -1,12 +1,15 @@
 // ── ORBITAL KITCHEN — app shell + view router ───────────────────────────
 // Wave P0: chrome + routing + tweaks (all genuinely working, client-side).
 // Live data, board, burner, radio, settings, the pass land in later waves.
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import "./orbital.css";
 import { ACCENTS, INK } from "./theme";
 import { Icon, IconSprite, Mascot } from "./primitives";
 import { TweaksPanel, TweakSection, TweakRadio, TweakToggle, TweakColor } from "./TweaksPanel";
 import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
+import { useOrbitalData } from "./useOrbitalData";
+import { deriveProjects, deriveStations } from "./station";
+import { Board, ProjectsSidebar } from "./views/Line";
 
 type View = "line" | "pantry" | "boh";
 
@@ -32,16 +35,26 @@ function useKitchenChrome() {
       document.head.appendChild(link);
     }
     const prevMargin = document.body.style.margin;
+    const prevHtmlH = document.documentElement.style.height;
+    const prevBodyH = document.body.style.height;
     document.body.style.margin = "0";
+    document.documentElement.style.height = "100%";
+    document.body.style.height = "100%";
+    const root = document.getElementById("root");
+    const prevRootH = root?.style.height ?? "";
+    if (root) root.style.height = "100%";
     return () => {
       document.body.style.margin = prevMargin;
+      document.documentElement.style.height = prevHtmlH;
+      document.body.style.height = prevBodyH;
+      if (root) root.style.height = prevRootH;
       link?.remove();
     };
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView }: {
-  accentHex: string; accentOn: string; view: View; setView: (v: View) => void;
+function TopNav({ accentHex, accentOn, view, setView, running }: {
+  accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -51,7 +64,7 @@ function TopNav({ accentHex, accentOn, view, setView }: {
   return (
     <nav style={{ position: "relative", display: "flex", alignItems: "center", gap: 16, padding: "11px 20px", background: accentHex, borderBottom: "3px solid " + INK, color: accentOn, flexShrink: 0, zIndex: 5 }}>
       <div style={{ position: "absolute", left: 0, right: 0, bottom: -3, height: 6, backgroundImage: "repeating-linear-gradient(90deg, #fff4de 0 12px, #2a1a10 12px 24px)" }} />
-      <img src="/orbital/logo-mark.svg" height={42} alt="" style={{ flexShrink: 0 }} />
+      <img src="/orbital/logo-mark.svg" alt="" style={{ height: 42, width: "auto", flexShrink: 0 }} />
       <div style={{ lineHeight: 1, flexShrink: 0 }}>
         <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 22, color: accentOn, letterSpacing: ".02em" }}>ORBITAL</div>
         <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: accentOn, opacity: .9, marginTop: -1, transform: "rotate(-1.5deg)", whiteSpace: "nowrap" }}>the kitchen pass</div>
@@ -69,6 +82,10 @@ function TopNav({ accentHex, accentOn, view, setView }: {
         })}
       </div>
       <div style={{ flex: 1 }} />
+      <div data-testid="kitchen-status" style={{ display: "flex", alignItems: "center", gap: 8, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
+        <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>Kitchen open · {running} on the burner</span>
+      </div>
     </nav>
   );
 }
@@ -132,14 +149,31 @@ export default function OrbitalApp() {
   const acc = ACCENTS[t.accent] || ACCENTS.cherry;
   const startView = (["boh", "pantry"].includes(params.get("view") || "") ? params.get("view") : "line") as View;
   const [view, setView] = useState<View>(startView);
+  const [selectedProject, setSelectedProject] = useState<string>(params.get("project") || "all");
   const pageBg: CSSProperties["background"] = t.dark ? "#1a0f08" : "var(--cream)";
 
-  return (
-    <div className="orbital-kitchen" style={{ height: "100dvh", display: "flex", flexDirection: "column", background: pageBg }}>
-      <IconSprite />
-      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} />
+  const data = useOrbitalData();
+  const stations = useMemo(
+    () => deriveStations(data.terminals, data.ledger, data.pendingCommands),
+    [data.terminals, data.ledger, data.pendingCommands],
+  );
+  const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
+  const running = stations.filter((s) => s.status === "Running").length;
 
-      {view === "line" && <Placeholder dark={t.dark} title="The Line" blurb="the board comes online next wave — fire's warming up" />}
+  return (
+    <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
+      <IconSprite />
+      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running} />
+
+      {view === "line" && (
+        <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
+          <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} />
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
+            {/* ThePass (P7) and RightRail (P5) slot in here */}
+            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => data.selectActivePane(st.id)} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} />
+          </div>
+        </div>
+      )}
       {view === "pantry" && <Placeholder dark={t.dark} title="The Pantry" blurb="project tracker, plating soon" />}
       {view === "boh" && <Placeholder dark={t.dark} title="Back of House" blurb="house rules & settings, out back" />}
 
