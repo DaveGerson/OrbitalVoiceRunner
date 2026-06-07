@@ -29,7 +29,9 @@ export const MOCK_TERMINAL_ID = "mock_pane_1";
 export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
 export async function gotoMockedApp(page: Page): Promise<void> {
-  await page.goto("/?mock=1");
+  // The kitchen is now the default app; the classic app (which this suite exercises) is pinned via
+  // ?ui=classic so the classic coverage stays green alongside the kitchen's own e2e suite.
+  await page.goto("/?ui=classic&mock=1");
   // The harness sets this attribute once mock data is seeded and hooks installed.
   await page.waitForSelector("html[data-e2e-ready='1']", { timeout: 15_000 });
   await expect(page.getByTestId("terminal-pane")).toBeVisible();

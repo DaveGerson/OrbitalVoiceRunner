@@ -40,9 +40,15 @@ test.describe("Orbital Kitchen — shell", () => {
     expect(stored).toContain("\"dark\":true");
   });
 
-  test("classic app still default without the flag", async ({ page }) => {
+  test("the kitchen is the default app", async ({ page }) => {
     await page.goto("/");
-    // kitchen-only chrome must be ABSENT on the classic default
+    // kitchen chrome is present without any flag (the cutover default)
+    await expect(page.getByTestId("tab-line")).toBeVisible();
+  });
+
+  test("the classic app is still reachable via ?ui=classic", async ({ page }) => {
+    await page.goto("/?ui=classic");
+    // kitchen-only chrome must be ABSENT on the classic fallback
     await expect(page.getByTestId("tab-line")).toHaveCount(0);
   });
 });
