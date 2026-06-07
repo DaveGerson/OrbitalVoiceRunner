@@ -24,6 +24,22 @@ export type { TranscriptEntry };
 
 const POLL_MS = 20000;
 
+// Mock settings seeded under ?mock=1 so the Back of House rooms (and any settings-driven surface)
+// render deterministically in the e2e harness, which is client-only (no real GET /api/settings).
+const MOCK_SETTINGS: SystemSettings = {
+  server: { port: 3000, host: "localhost", appUrl: "http://localhost:3000" },
+  voiceAi: { voice: "Zephyr", voiceStyle: "Direct", volume: 1, speechSpeed: 1, isMicMuted: false, model: "gemini-2.0-flash-live", groundingEnabled: false },
+  projects: { activeContext: "mock_project", localWorkspacePath: "." },
+  presets: [],
+  advanced: {
+    webSocketUrl: "ws://localhost:3000/live", latencyMode: "Balanced", throughputBps: 0, audioBufferSize: 4096,
+    debugLogging: false, connectionTimeoutMs: 10000, rateLimitRequestsPerMin: 60,
+    maxBufferLines: 10000, idleTimeoutMs: 2000, agentIdleTimeoutMs: 3500, defaultShellCommand: "bash",
+    globalPermissionsMode: "Human-in-the-Loop", historyMaxCommands: 100,
+  },
+  secrets: { geminiApiKey: "••••••••" },
+};
+
 export interface OrbitalData {
   terminals: Terminal[];
   ledger: Record<string, Workspace>;
@@ -46,6 +62,7 @@ export interface OrbitalData {
   selectActivePane: (paneId: string | null) => void;
   setGlobalPermissionsMode: (m: GlobalMode) => void;
   setGlobalMode: (m: GlobalMode) => void;
+  saveSettings: (next: SystemSettings) => void;
   showToast: (msg: string, kind?: "fire" | "warn") => void;
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
@@ -216,6 +233,11 @@ export function useOrbitalData(): OrbitalData {
     setFrozenRunning,
     setWipDrafts: () => {},
   });
+
+  // Under the ?mock=1 harness there is no real server, so seed settings once so Back of House renders.
+  useEffect(() => {
+    if (isMock && !settings) setSettings(MOCK_SETTINGS);
+  }, [isMock, settings]);
 
   // Mount: initial fetch + slow safety-net poll (the realtime push wave is P5).
   useEffect(() => {
@@ -473,6 +495,23 @@ export function useOrbitalData(): OrbitalData {
     } catch { /* silent */ }
   }, [settings]);
 
+  // Generic settings write (Back of House rooms). Caller builds the full next SystemSettings from the
+  // current one; server preserves a masked/blank geminiApiKey, so echoing it back is safe. Optimistic.
+  const saveSettings = useCallback(async (next: SystemSettings) => {
+    setSettings(next); // optimistic
+    if (typeof next.advanced?.globalPermissionsMode === "string") setGlobalPermissionsMode(next.advanced.globalPermissionsMode);
+    // Fires the real PUT even under ?mock=1 (the e2e intercepts + asserts the wire). Only adopts the
+    // server echo when it actually returns a settings object, so a thin ack can't wipe optimistic state.
+    try {
+      const res = await apiFetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next) });
+      if (res.ok) {
+        const d = await res.json().catch(() => ({}));
+        if (d && d.settings && typeof d.settings === "object" && Object.keys(d.settings).length > 0) setSettings(d.settings);
+        if (d && typeof d.globalPermissionsMode === "string") setGlobalPermissionsMode(d.globalPermissionsMode);
+      }
+    } catch { /* silent */ }
+  }, []);
+
   const createPane = useCallback(async (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => {
     const ws = (Object.values(ledger) as Workspace[]).find((w) => w.id === opts.projectId);
     const cwd = ws?.directory || "~";
@@ -610,7 +649,7 @@ export function useOrbitalData(): OrbitalData {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast,
-    selectActivePane, setGlobalPermissionsMode, setGlobalMode, showToast,
+    selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, restartPane, goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,

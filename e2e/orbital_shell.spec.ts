@@ -20,14 +20,14 @@ test.describe("Orbital Kitchen — shell", () => {
     await page.getByTestId("tab-pantry").click();
     await expect(page.getByRole("heading", { name: "The Pantry" })).toBeVisible();
     await page.getByTestId("tab-boh").click();
-    await expect(page.getByRole("heading", { name: "Back of House" })).toBeVisible();
+    await expect(page.getByTestId("boh-room-rulebook")).toBeVisible(); // Back of House room nav
     await page.getByTestId("tab-line").click();
     await expect(page.getByText("Projects", { exact: true })).toBeVisible();
   });
 
   test("deep-links a view via ?view=", async ({ page }) => {
     await page.goto("/?ui=kitchen&view=boh");
-    await expect(page.getByRole("heading", { name: "Back of House" })).toBeVisible();
+    await expect(page.getByTestId("boh-room-rulebook")).toBeVisible();
   });
 
   test("tweaks panel opens and toggles persist to localStorage", async ({ page }) => {

@@ -14,6 +14,7 @@ import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
 import { TerminalWindow } from "./TerminalWindow";
+import { BackOfHouse } from "./views/BackOfHouse";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
 import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
@@ -208,7 +209,12 @@ export default function OrbitalApp() {
         </div>
       )}
       {view === "pantry" && <Placeholder dark={t.dark} title="The Pantry" blurb="project tracker, plating soon" />}
-      {view === "boh" && <Placeholder dark={t.dark} title="Back of House" blurb="house rules & settings, out back" />}
+      {view === "boh" && (
+        <BackOfHouse dark={t.dark} settings={data.settings}
+          globalMode={data.globalPermissionsMode}
+          setGlobalMode={(m) => data.setGlobalMode(m)}
+          saveSettings={data.saveSettings} />
+      )}
 
       {newPaneProj !== null && (
         <NewPaneModal projectId={newPaneProj} projects={projects} dark={t.dark} onClose={() => setNewPaneProj(null)}
