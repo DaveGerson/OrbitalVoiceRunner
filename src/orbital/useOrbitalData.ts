@@ -18,6 +18,7 @@ import type {
   PendingActionView,
   SystemSettings,
 } from "../types";
+import type { StoredNote } from "../store/types";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
 export type { TranscriptEntry };
@@ -51,6 +52,7 @@ export interface OrbitalData {
   frozen: boolean;
   frozenRunning: string[];
   transcript: TranscriptEntry[];
+  notes: StoredNote[];
   activeTerminalId: string | null;
   isMock: boolean;
   isLive: boolean;
@@ -67,6 +69,10 @@ export interface OrbitalData {
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
   restartPane: (id: string) => void;
+  refetchNotes: (projectIds: string[]) => void;
+  addNote: (projectId: string, text: string, paneId?: string | null) => void;
+  editNote: (id: string, text: string, projectId?: string) => void;
+  deleteNote: (id: string, projectId?: string) => void;
   goLive: () => void;
   stopLive: () => void;
   toggleMute: () => void;
@@ -105,6 +111,7 @@ export function useOrbitalData(): OrbitalData {
   const [frozen, setFrozen] = useState<boolean>(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [notes, setNotes] = useState<StoredNote[]>([]);
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [isMock, setIsMock] = useState<boolean>(false);
   const [streamConnected, setStreamConnected] = useState<boolean>(false);
@@ -555,6 +562,58 @@ export function useOrbitalData(): OrbitalData {
     } catch { /* silent */ }
   }, [refetchTerminals, refetchLedger, showToast]);
 
+  // ── The Pass: per-project notes (the expediter's tickets) ───────────────
+  // Notes are the real backend for The Pass (there is no beads REST surface — BeadsExplorer stays a
+  // disabled placeholder). refetchNotes merges the id-bearing feed across the given projects.
+  const refetchNotes = useCallback(async (projectIds: string[]) => {
+    if (isMockModeRef.current) return;
+    try {
+      const all: StoredNote[] = [];
+      for (const pid of projectIds) {
+        if (!pid || pid === "all") continue;
+        const res = await apiFetch(`/api/projects/${pid}/notes`);
+        if (res.ok) { const d = await res.json(); if (Array.isArray(d.notes)) all.push(...d.notes); }
+      }
+      setNotes(all);
+    } catch { /* silent */ }
+  }, []);
+
+  // Jot a note → POST (project- or pane-scoped). Optimistic so The Pass updates instantly; the POST
+  // fires even in mock (e2e intercepts). POST body key is `note` (server contract).
+  const addNote = useCallback(async (projectId: string, text: string, paneId?: string | null) => {
+    const t = text.trim();
+    if (!t || !projectId || projectId === "all") return;
+    const optimistic: StoredNote = {
+      id: `tmp-${Math.random().toString(36).slice(2, 8)}`, project_id: projectId, pane_id: paneId ?? null,
+      text: t, type: "note", author: "user", created_at: Date.now(), updated_at: Date.now(),
+    };
+    setNotes((prev) => [optimistic, ...prev]);
+    showToast("Jotted it down 🎫");
+    try {
+      const path = paneId ? `/api/projects/${projectId}/panes/${paneId}/notes` : `/api/projects/${projectId}/notes`;
+      const res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: t }) });
+      if (res.ok && !isMockModeRef.current) { refetchNotes([projectId]); refetchLedger(); }
+    } catch { /* silent */ }
+  }, [showToast, refetchNotes, refetchLedger]);
+
+  const editNote = useCallback(async (id: string, text: string, projectId?: string) => {
+    const t = text.trim();
+    setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, text: t, updated_at: Date.now() } : n)));
+    try {
+      const res = await apiFetch(`/api/notes/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t }) });
+      if (res.ok && projectId && !isMockModeRef.current) refetchNotes([projectId]);
+    } catch { /* silent */ }
+  }, [refetchNotes]);
+
+  const deleteNote = useCallback(async (id: string, projectId?: string) => {
+    setNotes((prev) => prev.filter((n) => n.id !== id));
+    showToast("86'd that one");
+    try {
+      const res = await apiFetch(`/api/notes/${id}`, { method: "DELETE" });
+      if (res.ok && projectId && !isMockModeRef.current) refetchNotes([projectId]);
+    } catch { /* silent */ }
+  }, [showToast, refetchNotes]);
+
   // Send a literal control-key sequence into a pane's PTY (the raw-input route — arrows / Tab / Esc /
   // Enter / PgUp/PgDn / Ctrl+C always-allowed; Shift+Tab gated → may 202-defer). Fires the REAL POST
   // even under the ?mock=1 harness so the e2e can intercept + assert the wire (there are no real mock
@@ -648,9 +707,10 @@ export function useOrbitalData(): OrbitalData {
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
-    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast,
+    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast, notes,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
-    createPane, createProject, restartPane, goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
+    createPane, createProject, restartPane, refetchNotes, addNote, editNote, deleteNote,
+    goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
     refetchTerminals, refetchLedger, refetchSettings, refetchAll,

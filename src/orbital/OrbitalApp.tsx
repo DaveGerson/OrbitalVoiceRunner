@@ -15,6 +15,7 @@ import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
 import { TerminalWindow } from "./TerminalWindow";
 import { BackOfHouse } from "./views/BackOfHouse";
+import { ThePass } from "./views/Pass";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
 import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
@@ -187,6 +188,19 @@ export default function OrbitalApp() {
     if (burnerId && stations.length > 0 && !stations.some((s) => s.id === burnerId)) setBurnerId(null);
   }, [burnerId, stations]);
 
+  // The Pass jots into one concrete project: the selected one, else the active station's, else the first.
+  const passProjectId = selectedProject !== "all"
+    ? selectedProject
+    : (stations.find((s) => s.id === data.activeTerminalId)?.project || projects[0]?.id || null);
+  const passProjectName = projects.find((p) => p.id === passProjectId)?.name || "a kitchen";
+  // Keep The Pass's tickets fresh for the in-view project(s): the selected one, or all when unfiltered.
+  const projectIdsKey = projects.map((p) => p.id).join(",");
+  const refetchNotes = data.refetchNotes;
+  useEffect(() => {
+    const ids = selectedProject !== "all" ? [selectedProject] : projectIdsKey.split(",").filter(Boolean);
+    if (ids.length) refetchNotes(ids);
+  }, [selectedProject, projectIdsKey, refetchNotes]);
+
   return (
     <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
       <IconSprite />
@@ -198,7 +212,8 @@ export default function OrbitalApp() {
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-            {/* ThePass (P7) slots in above the board here */}
+            <ThePass notes={data.notes} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
+              onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)} />
             <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
           </div>
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}

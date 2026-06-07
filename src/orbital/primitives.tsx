@@ -48,9 +48,9 @@ export function Chip({ children, color = INK, bg = "#fff9ec", border = INK, styl
 }
 
 export type ButtonVariant = "default" | "primary" | "butter" | "mint" | "blueberry" | "ghost";
-export function Button({ children, variant = "default", size = "md", onClick, style = {}, icon, title, disabled }: {
+export function Button({ children, variant = "default", size = "md", onClick, style = {}, icon, title, disabled, testId }: {
   children?: ReactNode; variant?: ButtonVariant; size?: "sm" | "md" | "lg";
-  onClick?: () => void; style?: CSSProperties; icon?: string; title?: string; disabled?: boolean;
+  onClick?: () => void; style?: CSSProperties; icon?: string; title?: string; disabled?: boolean; testId?: string;
 }) {
   const palettes: Record<ButtonVariant, { bg: string; fg: string }> = {
     default:   { bg: "#fff9ec", fg: INK },
@@ -68,7 +68,7 @@ export function Button({ children, variant = "default", size = "md", onClick, st
   const shadow = variant === "ghost" ? "none" : press ? "none" : hover ? "4px 4px 0 0 " + INK : "2px 2px 0 0 " + INK;
   const translate = press ? "translate(2px,2px)" : hover ? "translate(-1px,-1px)" : "translate(0,0)";
   return (
-    <button onClick={disabled ? undefined : onClick} title={title} disabled={disabled}
+    <button onClick={disabled ? undefined : onClick} title={title} disabled={disabled} data-testid={testId}
       onMouseEnter={() => setHover(true)} onMouseLeave={() => { setHover(false); setPress(false); }}
       onMouseDown={() => setPress(true)} onMouseUp={() => setPress(false)}
       style={{
