@@ -444,7 +444,18 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
             });
             break;
           case "voice_channel_lost":
-            setVoiceReconnecting(true);
+            // The Gemini channel died while our browser WS stayed open. Eyes-off must HEAR it, and a
+            // PERMANENT loss must stop the rail lying "● LIVE" (UX_BRIEF §4: no quiet state changes).
+            earcon("alert");
+            if (msg.permanent === true) {
+              setToast({ msg: "Radio's down — tune back in, Chef", kind: "warn" });
+              setTimeout(() => setToast(null), 4000);
+              desiredVoiceRef.current = false;
+              setVoiceLive(false);
+              setVoiceReconnecting(false);
+            } else {
+              setVoiceReconnecting(true); // server is still retrying a transient drop
+            }
             break;
           case "error":
             setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });

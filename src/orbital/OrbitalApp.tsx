@@ -176,6 +176,24 @@ export default function OrbitalApp() {
   const running = stations.filter((s) => s.status === "Running").length;
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
+
+  // A clicked call must DO the thing it names — never fake a "heard!" receipt for a no-op (that's
+  // the costume-over-machine anti-pattern, dangerous on "ALL HANDS"). Deterministic calls dispatch to
+  // the real handler; genuinely voice-only lines (free-form orders, queries the model answers) get an
+  // honest "say it out loud" coaching hint instead of a false success ack.
+  const handleCall = (phrase: string) => {
+    const p = phrase.toLowerCase().trim();
+    if (p.startsWith("open ")) {
+      const st = stations.find((s) => s.name.toLowerCase() === p.slice(5).trim());
+      if (st) { data.selectActivePane(st.id); setBurnerId(st.id); return; }
+    }
+    if (p === "let 'em cook") { data.setGlobalMode("Full Auto"); return; }
+    if (p === "taste every plate") { data.setGlobalMode("Human-in-the-Loop"); return; }
+    if (p === "hands off — read only") { data.setGlobalMode("Read-Only"); return; }
+    if (p === "all hands — stop the line" || p === "kill the burners") { data.stopAllFreeze(); setPanic(true); return; }
+    if (p === "back to service") { data.stopAllRelease(); setPanic(false); return; }
+    data.showToast(`🎙 Say "${phrase}" out loud to fire it`); // honest coaching — not a receipt
+  };
   const serviceId = modeToServiceId(data.globalPermissionsMode === "Inherit" ? "Human-in-the-Loop" : data.globalPermissionsMode);
 
   // The Burner: the station whose live terminal is open. Resolved from the live board so it tracks
@@ -220,8 +238,7 @@ export default function OrbitalApp() {
           <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
             <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
               transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
-              onGoLive={data.goLive} onToggleMute={data.toggleMute}
-              onCall={(phrase) => data.showToast(`🎙 "${phrase}" — heard, Chef!`)} />
+              onGoLive={data.goLive} onToggleMute={data.toggleMute} onCall={handleCall} />
           </aside>
         </div>
       )}

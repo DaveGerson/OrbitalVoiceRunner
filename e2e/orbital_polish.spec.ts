@@ -34,13 +34,22 @@ test.describe("Orbital Kitchen — feels-good polish", () => {
     await expect(page.getByTestId("radio-transcript")).toContainText("Order up");
   });
 
-  test("the call sheet is live and clickable — voice parity", async ({ page }) => {
+  test("a call sheet row really executes — not a fake 'heard!' ack", async ({ page }) => {
     await gotoKitchen(page);
     await page.getByRole("button", { name: "🎙 calls" }).click();
     // a dynamic call built from the live board (mock pane "React Frontend")
     await expect(page.getByTestId("radio-calls")).toContainText("open react frontend");
+    // clicking "open react frontend" must actually open that station's burner (real effect, no fake receipt)
     await page.getByTestId("radio-call").first().click();
-    await expect(page.getByTestId("toast")).toContainText("heard, Chef");
+    await expect(page.getByTestId("burner")).toBeVisible();
+  });
+
+  test("a service-mode call really flips the autonomy posture", async ({ page }) => {
+    await gotoKitchen(page);
+    await page.getByRole("button", { name: "🎙 calls" }).click();
+    await page.getByTestId("radio-call").filter({ hasText: "let 'em cook" }).first().click();
+    // setGlobalMode ran for real → its own kitchen ack (not a generic "heard, Chef!")
+    await expect(page.getByTestId("toast")).toContainText("Lettin' 'em cook");
   });
 
   test("a ticket becomes live work — Fire a pane", async ({ page }) => {
