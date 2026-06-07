@@ -49,6 +49,10 @@ export interface OrbitalData {
   restartPane: (id: string) => void;
   writeControlKey: (paneId: string, bytes: string) => void;
   resizeTerminal: (paneId: string, cols: number, rows: number) => void;
+  approveCommand: (messageId: string) => void;
+  rejectCommand: (messageId: string) => void;
+  confirmAction: (actionId: string) => void;
+  cancelAction: (actionId: string) => void;
   stopAllFreeze: () => void;
   stopAllKill: () => void;
   stopAllRelease: () => void;
@@ -142,6 +146,18 @@ export function useOrbitalData(): OrbitalData {
     } catch { /* silent */ }
   }, []);
 
+  // Boot/poll durability for deferred ACTIONS (the WS broadcast carries the rich rider; this minimal
+  // shape — id/capability/summary — keeps chips after a reload, degrade-safe in the confirm dialog).
+  const refetchActions = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/actions/pending");
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setPendingActions(rows.map((a: { id: string; capability: string; summary: string }) => ({ actionId: a.id, capability: a.capability, summary: a.summary })));
+    } catch { /* silent */ }
+  }, []);
+
   const refetchFrozen = useCallback(async () => {
     if (isMockModeRef.current) return;
     try {
@@ -158,9 +174,10 @@ export function useOrbitalData(): OrbitalData {
     refetchLedger();
     refetchSettings();
     refetchPending();
+    refetchActions();
     refetchPlans();
     refetchFrozen();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchPlans, refetchFrozen]);
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -185,10 +202,11 @@ export function useOrbitalData(): OrbitalData {
     const iv = setInterval(() => {
       refetchTerminals();
       refetchPending();
+      refetchActions();
       refetchPlans();
     }, POLL_MS);
     return () => clearInterval(iv);
-  }, [refetchAll, refetchTerminals, refetchPending, refetchPlans]);
+  }, [refetchAll, refetchTerminals, refetchPending, refetchActions, refetchPlans]);
 
   // ── live stream + realtime board, mic-free (P4 The Burner) ──────────────
   // A read-only `/live?observe=1` socket: it joins the server broadcast set so
@@ -227,7 +245,9 @@ export function useOrbitalData(): OrbitalData {
         }
       };
       ws.onmessage = (event) => {
-        let msg: { type?: string; [k: string]: unknown };
+        // The /live frame is an untyped JSON blob (same as the classic app's ws.onmessage). Field
+        // access is guarded per-case before use.
+        let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
         try { msg = JSON.parse(event.data); } catch { return; }
         switch (msg.type) {
           case "stdout_chunk":
@@ -254,9 +274,29 @@ export function useOrbitalData(): OrbitalData {
             refetchTerminals();
             break;
           case "approval_pending":
+            // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload
+            // (immediate — same shape the classic app builds) so the ApprovalDialog renders at once.
+            setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, {
+              messageId: msg.messageId, cmd: msg.cmd, terminalId: msg.terminalId, rationale: msg.rationale,
+              effective_gates: msg.effective_gates, posture: msg.posture, effective_mode: msg.effective_mode, capability: msg.capability,
+            }]);
+            break;
           case "approval_resolved":
+            if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+            refetchPending();
+            break;
           case "action_pending":
+            // A gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier — carry
+            // the SERVER-resolved effective posture so the confirm dialog can render the rider + divergence.
+            setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, {
+              actionId: msg.actionId, capability: msg.capability, summary: msg.summary,
+              effective_gate: msg.effective_gate, effective_mode: msg.effective_mode, posture: msg.posture,
+              effective_gates: msg.effective_gates, pane_id: msg.pane_id, requested_mode: msg.requested_mode, global_override: msg.global_override,
+            }]);
+            break;
           case "action_resolved":
+            if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
+            break;
           case "command_auto_executed":
           case "command_blocked":
             refetchPending();
@@ -385,6 +425,44 @@ export function useOrbitalData(): OrbitalData {
     }, 120);
   }, []);
 
+  // ── HiTL gating resolves (the safety dial actually fires) ────────────────
+  // Approve / reject a staged PTY write; confirm / cancel a gated deferred action. Each drops the chip
+  // optimistically (the server emits approval_resolved/action_resolved to confirm) and routes through
+  // the operator-above-the-gate REST choke-points. Optimistic-only in mock (the e2e asserts the wire).
+  const approveCommand = useCallback(async (messageId: string) => {
+    setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: true }) });
+      setTimeout(refetchTerminals, 500);
+    } catch { /* silent */ }
+  }, [refetchTerminals]);
+
+  const rejectCommand = useCallback(async (messageId: string) => {
+    setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: false }) });
+    } catch { /* silent */ }
+  }, []);
+
+  const confirmAction = useCallback(async (actionId: string) => {
+    setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
+      setTimeout(refetchTerminals, 500);
+    } catch { /* silent */ }
+  }, [refetchTerminals]);
+
+  const cancelAction = useCallback(async (actionId: string) => {
+    setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
+    if (isMockModeRef.current) return;
+    try {
+      await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
+    } catch { /* silent */ }
+  }, []);
+
   const stopAllFreeze = useCallback(async () => {
     if (isMockModeRef.current) { setFrozen(true); return; }
     try {
@@ -413,6 +491,7 @@ export function useOrbitalData(): OrbitalData {
     activeTerminalId, isMock, isLive: false, streamConnected, toast,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, showToast,
     createPane, createProject, restartPane, writeControlKey, resizeTerminal,
+    approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
     refetchTerminals, refetchLedger, refetchSettings, refetchAll,
     wsRef, isMockModeRef,

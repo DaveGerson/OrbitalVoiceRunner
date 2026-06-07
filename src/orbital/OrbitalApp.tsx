@@ -14,6 +14,8 @@ import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { TerminalWindow } from "./TerminalWindow";
 import { NewPaneModal, NewProjectModal } from "./modals";
+import { ApprovalDialog } from "../components/ApprovalDialog";
+import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
 import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
 
 type View = "line" | "pantry" | "boh";
@@ -216,6 +218,25 @@ export default function OrbitalApp() {
           onClose={() => setBurnerId(null)} onRestart={() => data.restartPane(burnerStation.id)}
           writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}
+      {/* HiTL gating prompts — reuse the shared dialogs verbatim (server-truth posture). Wrapped in a
+          high-z stacking context so a write/action confirm sits above the burner + board modals. */}
+      {data.pendingActions.map((a) => (
+        <div key={a.actionId} style={{ position: "relative", zIndex: 260 }}>
+          <ActionConfirmDialog actionId={a.actionId} capability={a.capability} summary={a.summary}
+            posture={a.posture} effectiveGate={a.effective_gate} effectiveMode={a.effective_mode}
+            requestedMode={a.requested_mode} globalOverride={a.global_override} paneId={a.pane_id}
+            onConfirm={data.confirmAction} onCancel={data.cancelAction} />
+        </div>
+      ))}
+      {data.pendingCommands.map((c) => (
+        <div key={c.messageId} style={{ position: "relative", zIndex: 260 }}>
+          <ApprovalDialog messageId={c.messageId} terminalId={c.terminalId} cmd={c.cmd}
+            rationale={c.rationale ? { trigger: c.rationale.trigger ?? "", summary: c.rationale.summary } : undefined}
+            posture={c.posture} effectiveGates={c.effective_gates} effectiveMode={c.effective_mode} capability={c.capability}
+            onApprove={data.approveCommand} onReject={data.rejectCommand} />
+        </div>
+      ))}
+
       {panic && (
         <EmergencyStop runningCount={data.frozenRunning.length || running} onKill={data.stopAllKill}
           onClose={() => { data.stopAllRelease(); setPanic(false); }} />
