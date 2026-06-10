@@ -17,14 +17,15 @@ export const MOCK_TERMINAL_ID = "mock_pane_1";
 export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
 // 3C.3: TRUE only when the page was PRE-ARMED by the Playwright fixtures — armE2EWire() runs an
-// addInitScript that sets `window.__ORBITAL_E2E__` BEFORE the bundle executes, and useE2EHarness
-// snapshots that here before installing the real hooks. A human typing ?mock=1 into a real
-// deployment has no init script, so mock-mode mutations stay fully client-side for them instead
-// of firing real PUTs/POSTs at a live server (the old behavior let ?mock=1 clobber prod settings).
-let e2eWireArmed = false;
+// addInitScript that sets `window.__ORBITAL_E2E_WIRE__` BEFORE the bundle executes. A human typing
+// ?mock=1 into a real deployment has no init script, so mock-mode mutations stay fully client-side
+// for them instead of firing real PUTs/POSTs at a live server (the old behavior let ?mock=1
+// clobber prod settings). The marker is a DEDICATED property (not the hooks object itself):
+// StrictMode re-runs the harness effect, which would otherwise see its own installed hooks.
 /** Mock-mode call sites consult this before firing a REAL request "so the e2e can assert the wire". */
 export function isE2EWireArmed(): boolean {
-  return e2eWireArmed;
+  return typeof window !== "undefined"
+    && (window as unknown as { __ORBITAL_E2E_WIRE__?: unknown }).__ORBITAL_E2E_WIRE__ === true;
 }
 
 export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } };
@@ -301,11 +302,6 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (new URLSearchParams(window.location.search).get("mock") !== "1") return;
-
-    // 3C.3: snapshot the wire-arm marker BEFORE the hooks below overwrite window.__ORBITAL_E2E__.
-    // Only the Playwright fixtures set it pre-bundle (armE2EWire's addInitScript); a human's manual
-    // ?mock=1 leaves it undefined → mock mutations stay client-side (no real wire).
-    e2eWireArmed = (window as unknown as { __ORBITAL_E2E__?: unknown }).__ORBITAL_E2E__ !== undefined;
 
     e2eActiveRef.current = true;
     deps.isMockModeRef.current = true;

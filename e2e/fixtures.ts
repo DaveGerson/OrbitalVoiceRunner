@@ -37,14 +37,14 @@ declare global {
 
 /**
  * 3C.3b: pre-arm the mock-mode REAL wire. Mock-mode mutations (settings PUT, pane lifecycle POSTs,
- * raw-input, resize, drafts, notes) only hit the network when `window.__ORBITAL_E2E__` existed
- * BEFORE the bundle ran — i.e. when this init script set it. Specs that intercept + assert the
- * wire must call this BEFORE their page.goto; a human's manual ?mock=1 (no init script) stays
- * fully client-side and can never clobber a live deployment.
+ * raw-input, resize, drafts, notes) only hit the network when `window.__ORBITAL_E2E_WIRE__` was
+ * set by this init script BEFORE the bundle ran. Specs that intercept + assert the wire must call
+ * this BEFORE their page.goto; a human's manual ?mock=1 (no init script) stays fully client-side
+ * and can never clobber a live deployment.
  */
 export async function armE2EWire(page: Page): Promise<void> {
   await page.addInitScript(() => {
-    (window as unknown as { __ORBITAL_E2E__?: unknown }).__ORBITAL_E2E__ = {};
+    (window as unknown as { __ORBITAL_E2E_WIRE__?: boolean }).__ORBITAL_E2E_WIRE__ = true;
   });
 }
 
