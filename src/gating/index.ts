@@ -54,6 +54,7 @@ import {
 } from "../gateSurface";
 import { MAX_DEFERRALS } from "../approvalIntent";
 import type { GateValue, CapabilityGate, PaneMeta } from "../types";
+import { findPaneOwningProject } from "../paneOwnership";
 import type { JanusStore } from "../store/sqliteStore";
 import type { AnnouncementBus } from "../announcementBus";
 import type { CoreState } from "../core/coreState";
@@ -144,41 +145,11 @@ export interface Gating {
 /**
  * findPaneOwningProject — resolve the ledger project that OWNS a pane, NOT the active project.
  *
- * BUG FIX (surfaced by e2e/live_gates.spec.ts): the gate resolver used to read the per-pane
- * override via `ledger.getActiveProject()?.panes?.[paneId]`, so an override on a pane in a
- * NON-active project was written fine but never consulted — the operator's "lock down that pane"
- * edit silently fell through to the global default until something switched server context.
- * Per-pane policy must follow the pane's OWNING project, independent of the server spotlight.
- *
- * Resolution order:
- *   (1) LIVE pane: manager.terminals[paneId].projectId → ledger.getProject (every UniversalTerminal
- *       carries its owning project id from spawn — src/terminal.ts).
- *   (2) The active project (covers ledger panes whose live terminal is gone AND structural test
- *       fakes that only stub getActiveProject — the legacy lookup, now a fallback).
- *   (3) Scan every ledger project for the pane id (ledger-only panes in non-active projects).
- * Every access is defensive (`?.` / `?? {}`) because test fakes commonly inject partial ledgers.
- *
- * Exported for the server-owned consumers that mirror this lookup (restDispatchProposal's
- * paneExists check in server.ts) — keep any new pane-policy lookup routed through here.
+ * The lookup itself lives in src/paneOwnership.ts (zero runtime deps) so action defs and the
+ * restart replay can share it without closing the gating → actionEffects → registry → defs
+ * import cycle; re-exported here for the established consumers (server.ts, tests).
  */
-export function findPaneOwningProject(
-  manager: Pick<OrchestratorManager, "terminals" | "ledger">,
-  paneId: string,
-): { projectId: string; pane: PaneMeta } | null {
-  const liveProjectId = manager.terminals[paneId]?.projectId;
-  if (liveProjectId) {
-    const pane = manager.ledger.getProject?.(liveProjectId)?.panes?.[paneId];
-    if (pane) return { projectId: liveProjectId, pane };
-  }
-  const active = manager.ledger.getActiveProject?.();
-  const activePane = active?.panes?.[paneId];
-  if (active && activePane) return { projectId: active.id, pane: activePane };
-  for (const ws of Object.values(manager.ledger.workspaces ?? {})) {
-    const pane = ws?.panes?.[paneId];
-    if (pane) return { projectId: ws.id, pane };
-  }
-  return null;
-}
+export { findPaneOwningProject } from "../paneOwnership";
 
 /**
  * createGating(deps) — build the shared gating/safety core plus its private, per-server pending state.

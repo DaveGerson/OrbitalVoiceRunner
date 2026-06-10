@@ -19,6 +19,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { createGating, type GatingDeps, type Gating } from "../src/gating";
+import { setCapabilityGate } from "../src/actions/defs/locks";
+import { buildActionRun } from "../src/actionEffects";
 import type { CapabilityGateMap } from "../src/types";
 
 type Fixture = {
@@ -30,6 +32,8 @@ type Fixture = {
   frontPane: any;
   backLive: any;
   backCold: any;
+  /** Every ledger.updatePane call: [projectId, pane] — pins WHICH project a write landed in. */
+  updatePaneCalls: Array<[string, any]>;
 };
 
 /**
@@ -40,6 +44,7 @@ type Fixture = {
  */
 function makeFixture(globalGates: CapabilityGateMap = { restart_pane: "Ask" }): Fixture {
   const broadcasts: Array<Record<string, unknown>> = [];
+  const updatePaneCalls: Array<[string, any]> = [];
   const frontPane: any = { pane_id: "front-1", permissions_mode: "Human-in-the-Loop", capabilityGates: {} };
   const backLive: any = { pane_id: "back-live", permissions_mode: "Human-in-the-Loop", capabilityGates: {} };
   const backCold: any = { pane_id: "back-cold", permissions_mode: "Human-in-the-Loop", capabilityGates: {} };
@@ -59,7 +64,7 @@ function makeFixture(globalGates: CapabilityGateMap = { restart_pane: "Ask" }): 
       workspaces,
       getActiveProject: () => front,
       getProject: (id: string) => workspaces[id] ?? null,
-      updatePane: () => {},
+      updatePane: (projId: string, pane: any) => { updatePaneCalls.push([projId, pane]); },
       save: () => {},
       plans: [],
       watchRules: [],
@@ -86,7 +91,7 @@ function makeFixture(globalGates: CapabilityGateMap = { restart_pane: "Ask" }): 
     sanitizeSettingsForClient: (s: any) => s,
     addCommand: () => {},
   };
-  return { gating: createGating(deps), manager, coreState, broadcasts, frontPane, backLive, backCold };
+  return { gating: createGating(deps), manager, coreState, broadcasts, frontPane, backLive, backCold, updatePaneCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -187,5 +192,72 @@ describe("owning-project gate resolution — lockstep mirrors", () => {
     const effectiveGates = evt!.effective_gates as Record<string, string>;
     assert.strictEqual(effectiveGates.write_to_pane, "Off",
       "the dialog's effective_gates map must reflect the owning project's override");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The WRITE side: gate edits and mode persists must land in the OWNING project
+// too — resolving correctly is useless if the write path can't find the pane.
+// ---------------------------------------------------------------------------
+describe("owning-project gate WRITES — voice set_capability_gate + restart replay persist", () => {
+  /** Drive the real voice-only set_capability_gate def handler with the fixture's gating core. */
+  function runSetCapabilityGate(f: Fixture, args: Record<string, unknown>) {
+    const ctx: any = {
+      manager: f.manager,
+      store: null,
+      broadcast: (m: any) => f.broadcasts.push(m),
+      sanitizeSettingsForClient: (s: any) => s,
+      effectiveCapabilityGateFor: f.gating.effectiveCapabilityGateFor,
+    };
+    return (setCapabilityGate.handler as any)(args, ctx);
+  }
+
+  it("voice 'lock down that pane' (tighten to Off) WRITES to a pane in a non-active project", () => {
+    const f = makeFixture({ write_to_pane: "Ask" });
+    const res = runSetCapabilityGate(f, { pane_id: "back-live", capability: "write_to_pane", gate: "Off" });
+    assert.match(String(res.output), /Set per-pane gate 'write_to_pane' = Off/,
+      `the write must succeed, not report not-found: ${res.output}`);
+    assert.strictEqual(f.backLive.capabilityGates.write_to_pane, "Off", "the override landed on the pane");
+    const persist = f.updatePaneCalls.find(([, pane]) => pane === f.backLive);
+    assert.ok(persist, "updatePane persisted the override");
+    assert.strictEqual(persist![0], "back", "…into the OWNING project, not the active one");
+    // And the now-written override immediately governs resolution (read+write round trip).
+    assert.strictEqual(f.gating.effectiveCapabilityGateFor("back-live", "write_to_pane"), "Off");
+  });
+
+  it("a LEDGER-ONLY pane in a non-active project is writable too (project-scan fallback)", () => {
+    const f = makeFixture({ write_to_pane: "Ask" });
+    const res = runSetCapabilityGate(f, { pane_id: "back-cold", capability: "write_to_pane", gate: "Off" });
+    assert.match(String(res.output), /Set per-pane gate/);
+    assert.strictEqual(f.backCold.capabilityGates.write_to_pane, "Off");
+    assert.strictEqual(f.updatePaneCalls.find(([, pane]) => pane === f.backCold)?.[0], "back");
+  });
+
+  it("a genuinely unknown pane still reports not-found (no phantom writes)", () => {
+    const f = makeFixture({ write_to_pane: "Ask" });
+    const res = runSetCapabilityGate(f, { pane_id: "ghost", capability: "write_to_pane", gate: "Off" });
+    assert.match(String(res.output), /not found/i);
+    assert.strictEqual(f.updatePaneCalls.length, 0, "nothing was persisted");
+  });
+
+  it("restart-rehydrated set_pane_permissions replay persists into the OWNING project", () => {
+    const f = makeFixture({});
+    const setModeCalls: string[] = [];
+    f.manager.terminals["back-live"].setPermissionsMode = (m: string) => setModeCalls.push(m);
+    const deps: any = {
+      manager: f.manager,
+      broadcast: (m: any) => f.broadcasts.push(m),
+      broadcastLedgerUpdate: () => {},
+      sanitizeSettingsForClient: (s: any) => s,
+    };
+    const run = buildActionRun(
+      { capability: "set_pane_permissions", params: { paneId: "back-live", permissionsMode: "Full Auto", source: "voice" } } as any,
+      deps,
+    );
+    run();
+    assert.deepStrictEqual(setModeCalls, ["Full Auto"], "the live terminal's mode was switched");
+    assert.strictEqual(f.backLive.permissions_mode, "Full Auto", "the ledger pane mode was persisted");
+    assert.strictEqual(f.updatePaneCalls.find(([, pane]) => pane === f.backLive)?.[0], "back",
+      "…into the OWNING project (the replay used to silently no-op for non-active panes)");
   });
 });

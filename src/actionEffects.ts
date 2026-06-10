@@ -33,6 +33,7 @@
 // imports only zod + the static ActionDef groups (NO server boot), so this keeps actionEffects PURE
 // (importable directly by the unit tests, no listener spun up).
 import { actionSchemaHash } from "./actions/registry";
+import { findPaneOwningProject } from "./paneOwnership";
 
 /**
  * Which staging site produced a create_pane intent. The three sites run the SAME side effects
@@ -239,12 +240,11 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
         return () => {
           const term = deps.manager.terminals[p.paneId];
           if (term) term.setPermissionsMode(p.permissionsMode);
-          // PERSIST-WINS: mirror gating's persistMode (active project, forced updatePane).
-          const ws = deps.manager.ledger.getActiveProject?.();
-          const pane = ws?.panes?.[p.paneId];
-          if (ws && pane) {
-            pane.permissions_mode = p.permissionsMode;
-            deps.manager.ledger.updatePane(deps.manager.ledger.activeProjectId || "default_project", pane, true);
+          // PERSIST-WINS: mirror gating's persistMode (OWNING project, forced updatePane).
+          const owned = findPaneOwningProject(deps.manager, p.paneId);
+          if (owned) {
+            owned.pane.permissions_mode = p.permissionsMode as typeof owned.pane.permissions_mode;
+            deps.manager.ledger.updatePane(owned.projectId, owned.pane, true);
           }
           deps.broadcastLedgerUpdate();
           deps.broadcast({ type: "settings_updated", paneId: p.paneId, permissionsMode: p.permissionsMode });

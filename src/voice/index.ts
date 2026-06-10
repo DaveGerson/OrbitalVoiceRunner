@@ -54,6 +54,7 @@ import type { CapabilityGate } from "../types";
 import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
 import type { Gating } from "../gating";
+import { findPaneOwningProject } from "../paneOwnership";
 import type { CreatedMemory } from "../memory";
 import { briefIsForActivePane } from "../memory";
 
@@ -587,8 +588,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       const pendingId = opts.pendingId ?? callId;
       const capability: CapabilityGate = opts.capability ?? "write_to_pane";
       const term = manager.terminals[targetId];
-      const wsProj = manager.ledger.getActiveProject();
-      const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+      // Owning-project lookup (paneOwnership.ts), in lockstep with restDispatchProposal: a
+      // ledger pane in a NON-active project must not resolve to "pane not found".
+      const paneExists = !!term || !!findPaneOwningProject(manager, targetId);
 
       const runtimeType = term?.runtimeType;
       const kind = inferKind(opts.explicitKind, runtimeType);
