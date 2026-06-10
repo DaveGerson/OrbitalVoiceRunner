@@ -7,7 +7,10 @@ import { expect, test, type Page } from "@playwright/test";
  *
  * Journey: the operator tunes ONE station's rules in Back of House → Rulebook (pane scope),
  * the override persists across a full reload (ledger truth via PUT
- * /api/projects/:p/panes/:id/capability-gates), and it actually GOVERNS the gate engine:
+ * /api/projects/:p/panes/:id/capability-gates), and it actually GOVERNS the gate engine —
+ * WITHOUT the server's active project ever pointing at the pane's project (the engine resolves
+ * the pane's OWNING project, findPaneOwningProject in src/gating/index.ts; the server context is
+ * deliberately parked on a decoy project for the whole lane to pin that decoupling):
  *   - restart_pane override = Auto  → the burner's "Re-fire" runs immediately (200, no dialog)
  *   - restart_pane override = Ask   → the same click DEFERS (202 → action_pending → the
  *     action-dialog at the pass), and confirming it fires the real restart.
@@ -84,13 +87,20 @@ test("a per-pane gate override set in the Rulebook persists across reload (serve
   await expect(paneCard(page)).toHaveCount(1, { timeout: 60_000 });
   paneId = (await paneCard(page).first().getAttribute("data-pane-id"))!;
 
-  // SERVER-SIDE COUPLING this lane surfaced (reported, not papered over): the gate engine
-  // resolves per-pane overrides from the ACTIVE project only (effectiveCapabilityGateFor →
-  // ledger.getActiveProject(), src/gating/index.ts) — an override on a pane in a non-active
-  // project is written fine but never consulted. The kitchen UI has NO affordance that
-  // switches the server context (project rows are a client-side board filter), so we switch
-  // via the same REST route a real operator action rides (live_kitchen's precedent).
-  const switched = await page.request.post(`/api/projects/${projectId}/switch`);
+  // SERVER-SIDE COUPLING this lane surfaced — NOW FIXED: the gate engine used to resolve
+  // per-pane overrides from the ACTIVE project only (effectiveCapabilityGateFor →
+  // ledger.getActiveProject()), so an override on a pane in a non-active project was written
+  // fine but never consulted until something switched server context. The resolver now finds
+  // the pane's OWNING project (findPaneOwningProject, src/gating/index.ts). To prove the
+  // DECOUPLING live — not just that the happy path works — we deliberately park the server's
+  // active context on a DECOY project (same REST routes a real operator action rides,
+  // live_kitchen's precedent) and NEVER switch back: every gate edit and gated click below
+  // must govern our pane while its project is NOT the active one.
+  const decoyId = `gates-decoy-${RUN}`;
+  expect(decoyId, "the decoy must be a DIFFERENT project, or this lane proves nothing").not.toBe(projectId);
+  const decoy = await page.request.post(`/api/projects`, { data: { id: decoyId, directory: "." } });
+  expect(decoy.ok()).toBeTruthy();
+  const switched = await page.request.post(`/api/projects/${decoyId}/switch`);
   expect(switched.ok()).toBeTruthy();
 
   // ── Rulebook, pane scope: loosen restart_pane to Auto for THIS station only ──
@@ -111,6 +121,9 @@ test("a per-pane gate override set in the Rulebook persists across reload (serve
 test("the override governs the live gate: Auto re-fires immediately, Ask defers to the action dialog", async ({ page }) => {
   expect(paneId, "the persistence test must have created the pane").toBeTruthy();
   await boot(page);
+  // NOTE: the server's active project is STILL the decoy from the first test (server state
+  // persists across this serial file) — every gated click below resolves our pane's override
+  // from its OWNING, non-active project. That is the decoupled behavior under test.
   const actionDialog = page.getByTestId("action-dialog");
 
   // ── Auto: the burner's Re-fire runs straight through (200) — no dialog, success ack ──

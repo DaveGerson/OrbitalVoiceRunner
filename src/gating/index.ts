@@ -53,7 +53,7 @@ import {
   type EffectiveMode as GateSurfaceMode,
 } from "../gateSurface";
 import { MAX_DEFERRALS } from "../approvalIntent";
-import type { GateValue, CapabilityGate } from "../types";
+import type { GateValue, CapabilityGate, PaneMeta } from "../types";
 import type { JanusStore } from "../store/sqliteStore";
 import type { AnnouncementBus } from "../announcementBus";
 import type { CoreState } from "../core/coreState";
@@ -139,6 +139,45 @@ export interface Gating {
   APPROVAL_TTL_MS: number;
   /** Sweep cadence — exposed for symmetry; the timer is armed via startSweepTimer. */
   APPROVAL_SWEEP_MS: number;
+}
+
+/**
+ * findPaneOwningProject — resolve the ledger project that OWNS a pane, NOT the active project.
+ *
+ * BUG FIX (surfaced by e2e/live_gates.spec.ts): the gate resolver used to read the per-pane
+ * override via `ledger.getActiveProject()?.panes?.[paneId]`, so an override on a pane in a
+ * NON-active project was written fine but never consulted — the operator's "lock down that pane"
+ * edit silently fell through to the global default until something switched server context.
+ * Per-pane policy must follow the pane's OWNING project, independent of the server spotlight.
+ *
+ * Resolution order:
+ *   (1) LIVE pane: manager.terminals[paneId].projectId → ledger.getProject (every UniversalTerminal
+ *       carries its owning project id from spawn — src/terminal.ts).
+ *   (2) The active project (covers ledger panes whose live terminal is gone AND structural test
+ *       fakes that only stub getActiveProject — the legacy lookup, now a fallback).
+ *   (3) Scan every ledger project for the pane id (ledger-only panes in non-active projects).
+ * Every access is defensive (`?.` / `?? {}`) because test fakes commonly inject partial ledgers.
+ *
+ * Exported for the server-owned consumers that mirror this lookup (restDispatchProposal's
+ * paneExists check in server.ts) — keep any new pane-policy lookup routed through here.
+ */
+export function findPaneOwningProject(
+  manager: Pick<OrchestratorManager, "terminals" | "ledger">,
+  paneId: string,
+): { projectId: string; pane: PaneMeta } | null {
+  const liveProjectId = manager.terminals[paneId]?.projectId;
+  if (liveProjectId) {
+    const pane = manager.ledger.getProject?.(liveProjectId)?.panes?.[paneId];
+    if (pane) return { projectId: liveProjectId, pane };
+  }
+  const active = manager.ledger.getActiveProject?.();
+  const activePane = active?.panes?.[paneId];
+  if (active && activePane) return { projectId: active.id, pane: activePane };
+  for (const ws of Object.values(manager.ledger.workspaces ?? {})) {
+    const pane = ws?.panes?.[paneId];
+    if (pane) return { projectId: ws.id, pane };
+  }
+  return null;
 }
 
 /**
@@ -384,12 +423,14 @@ export function createGating(deps: GatingDeps): Gating {
   // productive capability => Auto) > global default > Auto. The gate is AND-composed with
   // effectiveMode inside decideProposal (a gate only TIGHTENS the mode). Resolution itself is the
   // pure, unit-tested resolveCapabilityGateWithContext — keep this in lockstep with that function.
+  // The pane override is read from the pane's OWNING project (findPaneOwningProject), NOT the
+  // active project — an operator's override must govern without a context switch
+  // (tests/test_gate_owning_project.ts). Only the SPOTLIGHT keys on coreState.activePaneId.
   function effectiveCapabilityGateFor(paneId: string | null | undefined, capability: CapabilityGate): GateValue {
     const globalGates = manager.settings.advanced?.capabilityGates;
     let paneGate: GateValue | undefined;
     if (paneId) {
-      const proj = manager.ledger.getActiveProject();
-      paneGate = proj?.panes?.[paneId]?.capabilityGates?.[capability];
+      paneGate = findPaneOwningProject(manager, paneId)?.pane.capabilityGates?.[capability];
     }
     const isActivePane = !!paneId && coreState.activePaneId === paneId;
     const resolved = resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
@@ -460,14 +501,16 @@ export function createGating(deps: GatingDeps): Gating {
       // matches the chip while STOP-ALL is engaged. It is extracted so the divergence truth (global
       // Read-Only + pane Full Auto ⇒ LOCKED/Read-Only) is asserted at its SOURCE in
       // tests/test_action_pending_payload.ts, not just rendered from a hand-fed mock.
-      const proj = manager.ledger.getActiveProject();
+      // LOCKSTEP with effectiveCapabilityGateFor: the pane gates come from the pane's OWNING
+      // project (findPaneOwningProject), not the active project, so the dialog's posture matches
+      // the gate the engine will actually enforce for a non-active-project pane.
       const targetTerm = paneId ? manager.terminals[paneId] : undefined;
       const posture = resolveActionPendingPosture({
         paneId,
         capability,
         globalMode: manager.globalPermissionsMode as GlobalMode,
         paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
-        paneGates: paneId ? proj?.panes?.[paneId]?.capabilityGates : undefined,
+        paneGates: paneId ? findPaneOwningProject(manager, paneId)?.pane.capabilityGates : undefined,
         globalGates: manager.settings.advanced?.capabilityGates,
         isActivePane: !!paneId && coreState.activePaneId === paneId,
         frozen: coreState.frozen,
@@ -497,8 +540,8 @@ export function createGating(deps: GatingDeps): Gating {
   // overlay the same applyFrozenShortCircuit here to keep the surface in lockstep with the resolver.
   function effectiveGatesForPane(paneId: string): Record<CapabilityGate, GateValue> {
     const globalGates = manager.settings.advanced?.capabilityGates;
-    const proj = manager.ledger.getActiveProject();
-    const paneGates = proj?.panes?.[paneId]?.capabilityGates;
+    // LOCKSTEP with effectiveCapabilityGateFor: the OWNING project's overrides, not the active one's.
+    const paneGates = findPaneOwningProject(manager, paneId)?.pane.capabilityGates;
     const isActivePane = coreState.activePaneId === paneId;
     const base = deriveEffectiveGates(paneGates, globalGates, isActivePane);
     if (!coreState.frozen) return base;
@@ -1026,12 +1069,13 @@ export function createGating(deps: GatingDeps): Gating {
       broadcast,
       // PERSIST-WINS (sibling of bead gpd): write operator intent to the ledger so a later syncLedger
       // won't revert it. Mirrors the legacy set_pane_permissions persist (ledger pane mode + save).
+      // The persist targets the pane's OWNING project (findPaneOwningProject) — the active-project
+      // lookup this replaces silently no-opped for a live pane in a non-active project.
       persistMode: (pid, mode) => {
-        const ws = manager.ledger.getActiveProject() ?? undefined;
-        const pane = ws?.panes?.[pid];
-        if (ws && pane) {
-          pane.permissions_mode = mode;
-          manager.ledger.updatePane(manager.ledger.activeProjectId || "default_project", pane, true);
+        const owner = findPaneOwningProject(manager, pid);
+        if (owner) {
+          owner.pane.permissions_mode = mode;
+          manager.ledger.updatePane(owner.projectId, owner.pane, true);
         }
         broadcastLedgerUpdate();
       },
