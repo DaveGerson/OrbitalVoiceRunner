@@ -11,7 +11,7 @@ import { publishChunk } from "../terminalStream";
 import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "../utils/audio";
 import { isEarconType, playEarcon } from "../utils/earcon";
 import { notifyDesktop, requestNotifyPermission } from "../utils/notify";
-import { useE2EHarness, type TranscriptEntry } from "../e2e/harness";
+import { useE2EHarness, isE2EWireArmed, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
 import type {
   Terminal,
@@ -40,6 +40,10 @@ export interface ArchivedPane {
 export interface ToastAction { label: string; run: () => void }
 
 const POLL_MS = 20000;
+
+// 3C.3: the one-shot reload guard for a 4001 (unauthorized) WS close. sessionStorage-scoped so a
+// fresh tab can re-key again, but a reload that STILL 4001s can never loop — it toasts instead.
+const UNAUTH_RELOAD_KEY = "orbital_4001_reloaded";
 
 // 1B.7: long auto-executed/blocked commands are toasted — keep the chip glanceable (~80 chars).
 function truncateCmd(cmd: unknown): string {
@@ -85,6 +89,10 @@ export interface OrbitalData {
   micBlocked: boolean;
   micMuted: boolean;
   streamConnected: boolean;
+  /** 3C.2: bumps each time the observe socket RE-opens after a drop — mounted terminals resync on it. */
+  streamGeneration: number;
+  /** 3C.2: the pane's freshest raw backfill (server truth; mock: current harness state). */
+  fetchPaneBackfill: (paneId: string) => Promise<string | null>;
   toast: { msg: string; kind: "fire" | "warn"; action?: ToastAction } | null;
   /** 2K.1: the freezer — archived (recoverable) panes from GET /api/archive. */
   archived: ArchivedPane[];
@@ -176,15 +184,30 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [archived, setArchived] = useState<ArchivedPane[]>([]);
   const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number }>>({});
 
+  // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
+  // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
+  const [streamGeneration, setStreamGeneration] = useState<number>(0);
+
   const isMockModeRef = useRef<boolean>(false);
+  // 3C.3: under plain ?mock=1 (a human exploring the harness against a REAL deployment) mutations
+  // must stay fully client-side. Only Playwright-armed pages (armE2EWire's init script, snapshotted
+  // by the harness) get the real wire, so the e2e suite keeps intercepting + asserting it.
+  const mockClientOnly = useCallback(() => isMockModeRef.current && !isE2EWireArmed(), []);
   // 2K.4: a render-fresh mirror of `notes` so deleteNote can capture the doomed note SYNCHRONOUSLY
   // (a setState updater is NOT guaranteed to run before the next statement in React 18 — the
   // undo action must be built from the note's data at click time, not after a re-render).
   const notesRef = useRef<StoredNote[]>([]);
   notesRef.current = notes;
+  // wsRef = the always-on OBSERVE socket (data lane; TerminalWindow's draft_edit rides it).
+  // voiceWsRef = the separate, voice-session socket (3C.2a) — opened/closed by the radio only,
+  // so tuning in/out can never tear down the terminal stream.
   const wsRef = useRef<WebSocket | null>(null);
+  const voiceWsRef = useRef<WebSocket | null>(null);
   const activeTerminalIdRef = useRef<string | null>(null);
   activeTerminalIdRef.current = activeTerminalId;
+  // 3C.2: render-fresh mirror so the mock fetchPaneBackfill can read synchronously.
+  const terminalsRef = useRef<Terminal[]>([]);
+  terminalsRef.current = terminals;
   // Hands-free earcons are gated behind the "Voice cues" tweak; the ref lets the long-lived WS closure
   // read the latest value. Default on (the brief forbids silent state changes for an eyes-off chef).
   const voiceCuesRef = useRef<boolean>(true);
@@ -233,20 +256,52 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   }, []);
 
   // ── fetchers (no-op in mock mode; the harness owns state then) ──────────
+  // 3C.1: monotonic in-flight sequencing. Two overlapping /api/terminals fetches can resolve out
+  // of order (the payload is heavy — every pane's output+backfill), letting a STALE list overwrite
+  // a fresher one (the status flap). Capture the seq at request START; apply only if no newer
+  // request has started by resolve time. Same guard on the ledger (cheap, same failure mode).
+  const terminalsReqSeq = useRef(0);
+  const ledgerReqSeq = useRef(0);
+
   const refetchTerminals = useCallback(async () => {
     if (isMockModeRef.current) return;
+    const seq = ++terminalsReqSeq.current;
     try {
       const res = await apiFetch("/api/terminals");
-      if (res.ok) setTerminals(await res.json());
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (seq === terminalsReqSeq.current) setTerminals(rows);
     } catch { /* server restart — silent */ }
   }, []);
 
   const refetchLedger = useCallback(async () => {
     if (isMockModeRef.current) return;
+    const seq = ++ledgerReqSeq.current;
     try {
       const res = await apiFetch("/api/ledger");
-      if (res.ok) setLedger(await res.json());
+      if (!res.ok) return;
+      const data = await res.json();
+      if (seq === ledgerReqSeq.current) setLedger(data);
     } catch { /* silent */ }
+  }, []);
+
+  // 3C.2: the pane's FRESHEST raw backfill, for the burner's resync-from-truth. There is no
+  // single-pane GET, so this rides /api/terminals (whose payload already carries backfill) and —
+  // since it paid for the round-trip — also freshens the board through the same seq guard.
+  // Mock: the harness owns state; answer from the current seeded terminals synchronously.
+  const fetchPaneBackfill = useCallback(async (paneId: string): Promise<string | null> => {
+    if (isMockModeRef.current) {
+      return terminalsRef.current.find((t) => t.id === paneId)?.backfill ?? null;
+    }
+    const seq = ++terminalsReqSeq.current;
+    try {
+      const res = await apiFetch("/api/terminals");
+      if (!res.ok) return null;
+      const rows = await res.json();
+      if (!Array.isArray(rows)) return null;
+      if (seq === terminalsReqSeq.current) setTerminals(rows);
+      return (rows as Terminal[]).find((t) => t.id === paneId)?.backfill ?? null;
+    } catch { return null; }
   }, []);
 
   const refetchSettings = useCallback(async () => {
@@ -322,6 +377,136 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchArchive();
   }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive]);
 
+  // ── observe-lane frame handler ───────────────────────────────────────────
+  // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
+  // e2e harness (injectWsFrame) drive the SAME switch, and (b) the voice socket can ignore these
+  // broadcast frames entirely — both sockets are in the server's broadcast set while the radio is
+  // live, and double-handling would double the refetches and duplicate xterm writes.
+  // Voice-only frames (audio/transcripts/grounding/channel state) live in the voice effect below.
+  const handleObserveFrame = useCallback((msg: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+    switch (msg?.type) {
+      case "stdout_chunk":
+        if (typeof msg.terminalId === "string" && typeof msg.chunk === "string") queueStdoutChunk(msg.terminalId, msg.chunk);
+        break;
+      case "terminals_updated":
+        refetchTerminals();
+        refetchArchive(); // 2K.1: a stop/clear/restore elsewhere must repaint the freezer too
+        break;
+      case "pane_status":
+        // 3C.1: patch the matching pane IN PLACE from the frame's own fields (the classic app's
+        // deliberate pattern, App.tsx:1177-1185) instead of a full refetchTerminals round-trip —
+        // the heavy payload + out-of-order resolution caused the status flap this removes. A real
+        // status change also clears the humble "cooking…" overlay so a stale label can't linger.
+        if (typeof msg.terminalId === "string" && typeof msg.status === "string") {
+          setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t)));
+        }
+        break;
+      case "pane_quiescing":
+        // 3C.1: the pre-idle "cooking…" overlay flag, set in place (frame carries terminalId only).
+        // Cleared by the next pane_status push or the 20s poll reconcile.
+        if (typeof msg.terminalId === "string") {
+          setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, quiescing: true } : t)));
+        }
+        break;
+      case "draft_updated":
+        // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit).
+        // Stash the latest text per pane; the Order Pad applies it ONLY while the textarea
+        // isn't focused (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
+        if (typeof msg.paneId === "string") {
+          const text = typeof msg.draft?.text === "string" ? msg.draft.text : "";
+          setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text, at: Date.now() } }));
+        }
+        break;
+      case "ledger_updated":
+        refetchLedger();
+        break;
+      case "settings_updated":
+        if (msg.settings) {
+          setSettings(msg.settings as SystemSettings);
+          // 1B.4: propagate the authoritative mute state so a model-driven set_voice_mute
+          // actually gates mic capture (the processor reads micMutedRef) — mirrors classic
+          // App.tsx. The !== guard keeps our own optimistic toggle echo from bouncing it.
+          const wireMuted = msg.settings.voiceAi?.isMicMuted;
+          if (typeof wireMuted === "boolean" && wireMuted !== micMutedRef.current) setMicMuted(wireMuted);
+        }
+        if (typeof msg.globalPermissionsMode === "string") setGlobalPermissionsMode(msg.globalPermissionsMode as GlobalMode);
+        break;
+      case "switch_active_pane":
+        if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId);
+        break;
+      case "frozen":
+      case "stop_all":
+        if (msg.type === "frozen") earcon("alert"); // the All Hands brake — never silent
+        refetchFrozen();
+        refetchTerminals();
+        break;
+      case "approval_pending":
+        // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload
+        // (immediate — same shape the classic app builds) so the ApprovalDialog renders at once.
+        earcon("alert"); // the bell: a pane needs you (eyes-off)
+        desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
+        setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, {
+          messageId: msg.messageId, cmd: msg.cmd, terminalId: msg.terminalId, rationale: msg.rationale,
+          effective_gates: msg.effective_gates, posture: msg.posture, effective_mode: msg.effective_mode, capability: msg.capability,
+        }]);
+        break;
+      case "approval_resolved":
+        if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+        refetchPending();
+        break;
+      case "action_pending":
+        // A gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier — carry
+        // the SERVER-resolved effective posture so the confirm dialog can render the rider + divergence.
+        earcon("alert"); // needs a taste at the pass
+        desktopNote("🛎 Needs a taste", typeof msg.summary === "string" ? msg.summary : "An action is waiting at the pass"); // 2K.6
+        setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, {
+          actionId: msg.actionId, capability: msg.capability, summary: msg.summary,
+          effective_gate: msg.effective_gate, effective_mode: msg.effective_mode, posture: msg.posture,
+          effective_gates: msg.effective_gates, pane_id: msg.pane_id, requested_mode: msg.requested_mode, global_override: msg.global_override,
+        }]);
+        break;
+      case "action_resolved":
+        if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
+        break;
+      case "command_auto_executed":
+        // 1B.7: end silent autonomy — the kitchen says WHAT fired where, not just a blip.
+        // showToast carries the "execute" earcon itself (no doubled tone) + the transcript line.
+        showToast(`Fired on its own — ${msg.terminalId}: ${truncateCmd(msg.cmd)}`, "fire", "execute");
+        desktopNote("▶ Fired on its own", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
+        refetchPending();
+        break;
+      case "command_blocked":
+        // 1B.7: a blocked command names the pane, the command and the server's reason.
+        showToast(
+          `Held back on ${msg.terminalId}: ${truncateCmd(msg.cmd)}${typeof msg.reason === "string" && msg.reason ? ` — ${msg.reason}` : ""}`,
+          "warn",
+        );
+        desktopNote("⛔ Held back", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
+        refetchPending();
+        break;
+      case "proactive_notification":
+        // 1B.7: the orchestrator's proactive announcements reach the kitchen too (toast +
+        // durable transcript line — coalescing niceties live in the classic app only).
+        // earcon: null — the bus already fired its own proactive_earcon for this event.
+        if (typeof msg.message === "string" && msg.message) {
+          showToast(msg.message, msg.severity === "high" ? "warn" : "fire", null);
+          desktopNote("👨‍🍳 From the kitchen", msg.message); // 2K.6
+        }
+        break;
+      case "proactive_earcon":
+        // 1B.7: immediate non-verbal feedback for a proactive event (fires before the
+        // notification frame). The union now includes "completion" (announcementKinds.ts).
+        if (isEarconType(msg.earcon)) earcon(msg.earcon);
+        break;
+      case "error":
+        setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
+        setTimeout(() => setToast(null), 4000);
+        break;
+      default:
+        break;
+    }
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
     isMockModeRef,
@@ -348,6 +533,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     // driving the same per-pane mirror state the live socket writes.
     setPaneDraftMock: (paneId, text) => {
       setPaneDrafts((prev) => ({ ...prev, [paneId]: { text, at: Date.now() } }));
+    },
+    // 3C.1 e2e seam: feed a frame through the REAL observe-lane switch (no real WS under ?mock=1),
+    // so the in-place pane_status/pane_quiescing patch is pinned through the production path.
+    onWsFrame: (frame) => handleObserveFrame(frame),
+    // 3C.2 e2e seam: model the observe socket dropping + reopening — the same generation bump a
+    // real reconnect makes, which drives the mounted TerminalView's resync-with-marker.
+    bumpStreamGeneration: () => {
+      setStreamConnected(true);
+      setStreamGeneration((g) => g + 1);
     },
   });
 
@@ -397,27 +591,122 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     resetAudioPlayback();
   }, []);
 
-  // ── live socket: mic-free observe lane ⇄ full Gemini voice session ───────
-  // ONE wsRef socket, two modes keyed on `voiceLive`:
-  //   • observe (default): /live?observe=1 — joins the broadcast set (stdout_chunk → xterm, board/
-  //     ledger/freeze realtime, approval/action chips) with NO Gemini session, no mic, no cost.
-  //   • voice (operator tuned in): /live — the full Gemini Live session: mic capture out, model
-  //     audio in, operator + Janus transcripts, grounded sources. Flipping the mode tears the old
-  //     socket down and opens the new one. Skipped in mock (the harness drives setters directly);
-  //     the 20s poll stays as a safety net under both modes.
+  // ── 3C.3a: a 4001 close is TERMINAL (the server's unauthorized close — src/voice/index.ts
+  // rejects a bad/missing auth cookie with close(4001)). Retrying can never re-key a cookie —
+  // reload ONCE to pick up fresh auth; a sessionStorage flag makes a reload loop impossible
+  // (a second 4001 only toasts). The flag is cleared on any authorized open.
+  const handleUnauthorizedClose = useCallback(() => {
+    let alreadyReloaded = false;
+    try { alreadyReloaded = sessionStorage.getItem(UNAUTH_RELOAD_KEY) === "1"; } catch { /* sandboxed storage */ }
+    if (alreadyReloaded) {
+      showToast("Session expired — reload to re-key.", "warn");
+      return;
+    }
+    try { sessionStorage.setItem(UNAUTH_RELOAD_KEY, "1"); } catch { /* sandboxed storage */ }
+    showToast("Session expired — re-keying the kitchen…", "warn");
+    setTimeout(() => window.location.reload(), 800); // let the toast paint before the reload
+  }, [showToast]);
+  const clearUnauthorizedFlag = useCallback(() => {
+    try { sessionStorage.removeItem(UNAUTH_RELOAD_KEY); } catch { /* sandboxed storage */ }
+  }, []);
+
+  // ── 3C.2a: TWO sockets, decoupled lifetimes ──────────────────────────────
+  // The old design keyed ONE socket on `voiceLive`, so tuning the radio in/out tore down and
+  // rebuilt the data lane — every toggle silently dropped PTY chunks. Now:
+  //   • OBSERVE (this effect, mounted once): /live?observe=1 — the always-on data lane
+  //     (stdout_chunk → xterm, board/ledger/freeze realtime, approval/action chips,
+  //     set_active_pane/draft_edit out). wsRef points here. The radio never touches it.
+  //   • VOICE (next effect, keyed on voiceLive): /live — the Gemini session lane (mic out, model
+  //     audio in, transcripts, grounding, channel state). voiceWsRef points here.
+  // Both sockets join the server's broadcast set, so the voice lane IGNORES broadcast frames
+  // (handleObserveFrame owns them) — otherwise refetches would double-fire and chunks would be
+  // written into xterm twice. Skipped in mock (the harness drives the setters directly); the 20s
+  // poll stays as a safety net.
   useEffect(() => {
     if (isMockModeRef.current) return;
-    const voice = voiceLive;
+    let closedByUs = false;
+    let attempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // TRUE once we've lost (or failed to make) the stream — the next open is then a RECONNECT,
+    // which bumps streamGeneration so mounted terminals rebuild from a fresh snapshot (3C.2b).
+    let droppedSinceOpen = false;
+
+    const scheduleReconnect = () => {
+      if (closedByUs || reconnectTimer) return;
+      attempt = Math.min(attempt + 1, 6);
+      const delay = Math.min(500 * 2 ** (attempt - 1), 15000); // bounded backoff, 0.5s→15s
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    };
+
+    const connect = () => {
+      if (closedByUs) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      let ws: WebSocket;
+      try { ws = new WebSocket(`${protocol}//${window.location.host}/live?observe=1`); }
+      catch { droppedSinceOpen = true; scheduleReconnect(); return; }
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        attempt = 0;
+        setStreamConnected(true);
+        clearUnauthorizedFlag(); // an authorized open re-arms the one-shot 4001 reload
+        // Re-assert the open pane so operator raw-input / draft writes target it through the gate.
+        if (activeTerminalIdRef.current && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
+        }
+        // 1B.1: a reconnect must RESYNC, not just re-arm — anything missed while dark (board,
+        // pending chips, freeze state, settings) is refetched the moment the socket is back.
+        refetchAll();
+        if (droppedSinceOpen) {
+          droppedSinceOpen = false;
+          setStreamGeneration((g) => g + 1); // 3C.2b: mounted terminals resync from snapshot truth
+        }
+      };
+      ws.onmessage = (event) => {
+        // The /live frame is an untyped JSON blob (same as the classic app's ws.onmessage). Field
+        // access is guarded per-case inside handleObserveFrame.
+        let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+        try { msg = JSON.parse(event.data); } catch { return; }
+        handleObserveFrame(msg);
+      };
+      ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
+      ws.onclose = (ev) => {
+        if (wsRef.current === ws) wsRef.current = null;
+        setStreamConnected(false);
+        droppedSinceOpen = true;
+        if (closedByUs) return;
+        if (ev.code === 4001) { handleUnauthorizedClose(); return; } // terminal — never retry into a dead key
+        scheduleReconnect();
+      };
+    };
+
+    connect();
+    return () => {
+      closedByUs = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      const ws = wsRef.current;
+      if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
+    };
+  }, [handleObserveFrame, refetchAll, handleUnauthorizedClose, clearUnauthorizedFlag]);
+
+  // ── voice lane: the Gemini Live session socket (radio only) ──────────────
+  // Opened when the operator tunes in, closed when they tune out — WITHOUT touching the observe
+  // socket above (3C.2a: tuning the radio must never drop terminal output). Handles ONLY the
+  // per-session voice frames; broadcast frames that also reach this socket fall through to the
+  // default arm (the observe lane owns them — no double refetch, no double xterm write).
+  useEffect(() => {
+    if (isMockModeRef.current) return;
+    if (!voiceLive) return;
     let closedByUs = false;
     let attempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const scheduleReconnect = () => {
       if (closedByUs || reconnectTimer) return;
-      if (voice && !desiredVoiceRef.current) return; // voice only reconnects while the operator wants it
+      if (!desiredVoiceRef.current) return; // voice only reconnects while the operator wants it
       attempt = Math.min(attempt + 1, 6);
       const delay = Math.min(500 * 2 ** (attempt - 1), 15000); // bounded backoff, 0.5s→15s
-      if (voice) setVoiceReconnecting(true);
+      setVoiceReconnecting(true);
       reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
     };
 
@@ -449,143 +738,34 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (closedByUs) return;
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       let ws: WebSocket;
-      try { ws = new WebSocket(`${protocol}//${window.location.host}/live${voice ? "" : "?observe=1"}`); }
+      try { ws = new WebSocket(`${protocol}//${window.location.host}/live`); }
       catch { scheduleReconnect(); return; }
-      wsRef.current = ws;
+      voiceWsRef.current = ws;
 
-      let captureCtx: AudioContext | null = null;
-      let playbackCtx: AudioContext | null = null;
-      if (voice) {
-        captureCtx = new AudioContext({ sampleRate: 16000 });
-        playbackCtx = new AudioContext({ sampleRate: 24000 });
-        captureCtxRef.current = captureCtx;
-        playbackCtxRef.current = playbackCtx;
-        resetAudioPlayback();
-      }
+      const captureCtx = new AudioContext({ sampleRate: 16000 });
+      const playbackCtx = new AudioContext({ sampleRate: 24000 });
+      captureCtxRef.current = captureCtx;
+      playbackCtxRef.current = playbackCtx;
+      resetAudioPlayback();
 
       ws.onopen = () => {
         attempt = 0;
-        if (voice) { setVoiceLive(true); setVoiceConnected(true); setVoiceReconnecting(false); }
-        else setStreamConnected(true);
-        // Re-assert the open pane so operator raw-input / draft writes target it through the gate.
+        setVoiceConnected(true);
+        setVoiceReconnecting(false);
+        clearUnauthorizedFlag();
+        // Tell the session which pane is open so model writes are gated against the right target.
         if (activeTerminalIdRef.current && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         }
-        // 1B.1: a reconnect must RESYNC, not just re-arm — anything missed while dark (board,
-        // pending chips, freeze state, settings) is refetched the moment the socket is back.
-        refetchAll();
-        if (voice && captureCtx) startMic(ws, captureCtx);
+        startMic(ws, captureCtx);
       };
       ws.onmessage = (event) => {
-        // The /live frame is an untyped JSON blob (same as the classic app's ws.onmessage). Field
-        // access is guarded per-case before use.
         let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
         try { msg = JSON.parse(event.data); } catch { return; }
         switch (msg.type) {
-          case "stdout_chunk":
-            if (typeof msg.terminalId === "string" && typeof msg.chunk === "string") queueStdoutChunk(msg.terminalId, msg.chunk);
-            break;
-          case "terminals_updated":
-            refetchTerminals();
-            refetchArchive(); // 2K.1: a stop/clear/restore elsewhere must repaint the freezer too
-            break;
-          case "pane_status":
-          case "pane_quiescing":
-            refetchTerminals();
-            break;
-          case "draft_updated":
-            // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit).
-            // Stash the latest text per pane; the Order Pad applies it ONLY while the textarea
-            // isn't focused (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
-            if (typeof msg.paneId === "string") {
-              const text = typeof msg.draft?.text === "string" ? msg.draft.text : "";
-              setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text, at: Date.now() } }));
-            }
-            break;
-          case "ledger_updated":
-            refetchLedger();
-            break;
-          case "settings_updated":
-            if (msg.settings) {
-              setSettings(msg.settings as SystemSettings);
-              // 1B.4: propagate the authoritative mute state so a model-driven set_voice_mute
-              // actually gates mic capture (the processor reads micMutedRef) — mirrors classic
-              // App.tsx. The !== guard keeps our own optimistic toggle echo from bouncing it.
-              const wireMuted = msg.settings.voiceAi?.isMicMuted;
-              if (typeof wireMuted === "boolean" && wireMuted !== micMutedRef.current) setMicMuted(wireMuted);
-            }
-            if (typeof msg.globalPermissionsMode === "string") setGlobalPermissionsMode(msg.globalPermissionsMode as GlobalMode);
-            break;
-          case "switch_active_pane":
-            if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId);
-            break;
-          case "frozen":
-          case "stop_all":
-            if (msg.type === "frozen") earcon("alert"); // the All Hands brake — never silent
-            refetchFrozen();
-            refetchTerminals();
-            break;
-          case "approval_pending":
-            // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload
-            // (immediate — same shape the classic app builds) so the ApprovalDialog renders at once.
-            earcon("alert"); // the bell: a pane needs you (eyes-off)
-            desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
-            setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, {
-              messageId: msg.messageId, cmd: msg.cmd, terminalId: msg.terminalId, rationale: msg.rationale,
-              effective_gates: msg.effective_gates, posture: msg.posture, effective_mode: msg.effective_mode, capability: msg.capability,
-            }]);
-            break;
-          case "approval_resolved":
-            if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
-            refetchPending();
-            break;
-          case "action_pending":
-            // A gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier — carry
-            // the SERVER-resolved effective posture so the confirm dialog can render the rider + divergence.
-            earcon("alert"); // needs a taste at the pass
-            desktopNote("🛎 Needs a taste", typeof msg.summary === "string" ? msg.summary : "An action is waiting at the pass"); // 2K.6
-            setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, {
-              actionId: msg.actionId, capability: msg.capability, summary: msg.summary,
-              effective_gate: msg.effective_gate, effective_mode: msg.effective_mode, posture: msg.posture,
-              effective_gates: msg.effective_gates, pane_id: msg.pane_id, requested_mode: msg.requested_mode, global_override: msg.global_override,
-            }]);
-            break;
-          case "action_resolved":
-            if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
-            break;
-          case "command_auto_executed":
-            // 1B.7: end silent autonomy — the kitchen says WHAT fired where, not just a blip.
-            // showToast carries the "execute" earcon itself (no doubled tone) + the transcript line.
-            showToast(`Fired on its own — ${msg.terminalId}: ${truncateCmd(msg.cmd)}`, "fire", "execute");
-            desktopNote("▶ Fired on its own", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
-            refetchPending();
-            break;
-          case "command_blocked":
-            // 1B.7: a blocked command names the pane, the command and the server's reason.
-            showToast(
-              `Held back on ${msg.terminalId}: ${truncateCmd(msg.cmd)}${typeof msg.reason === "string" && msg.reason ? ` — ${msg.reason}` : ""}`,
-              "warn",
-            );
-            desktopNote("⛔ Held back", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
-            refetchPending();
-            break;
-          case "proactive_notification":
-            // 1B.7: the orchestrator's proactive announcements reach the kitchen too (toast +
-            // durable transcript line — coalescing niceties live in the classic app only).
-            // earcon: null — the bus already fired its own proactive_earcon for this event.
-            if (typeof msg.message === "string" && msg.message) {
-              showToast(msg.message, msg.severity === "high" ? "warn" : "fire", null);
-              desktopNote("👨‍🍳 From the kitchen", msg.message); // 2K.6
-            }
-            break;
-          case "proactive_earcon":
-            // 1B.7: immediate non-verbal feedback for a proactive event (fires before the
-            // notification frame). The union now includes "completion" (announcementKinds.ts).
-            if (isEarconType(msg.earcon)) earcon(msg.earcon);
-            break;
           // ── voice-only frames (Kitchen Radio) ──
           case "audio":
-            if (playbackCtx && typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
+            if (typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
             break;
           case "interrupted":
             resetAudioPlayback();
@@ -636,21 +816,26 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
             resetAudioPlayback();
             break;
           default:
+            // Broadcast/board frames also reach this socket — the observe lane owns them.
             break;
         }
       };
       ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
-      ws.onclose = () => {
-        if (wsRef.current === ws) wsRef.current = null;
-        if (voice) {
-          setVoiceConnected(false); // 1B.5: the chip must stop saying LIVE the moment the channel drops
-          teardownAudio();
-          if (!closedByUs && desiredVoiceRef.current) scheduleReconnect();
-          else { setVoiceLive(false); setVoiceReconnecting(false); }
-        } else {
-          setStreamConnected(false);
-          scheduleReconnect();
+      ws.onclose = (ev) => {
+        if (voiceWsRef.current === ws) voiceWsRef.current = null;
+        setVoiceConnected(false); // 1B.5: the chip must stop saying LIVE the moment the channel drops
+        teardownAudio();
+        if (closedByUs) return;
+        if (ev.code === 4001) {
+          // 3C.3a: terminal — retrying can't re-key. Stand the radio down, then the one-shot reload.
+          desiredVoiceRef.current = false;
+          setVoiceLive(false);
+          setVoiceReconnecting(false);
+          handleUnauthorizedClose();
+          return;
         }
+        if (desiredVoiceRef.current) scheduleReconnect();
+        else { setVoiceLive(false); setVoiceReconnecting(false); }
       };
     };
 
@@ -658,26 +843,29 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     return () => {
       closedByUs = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      const ws = wsRef.current;
-      if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
-      if (voice) teardownAudio();
+      const ws = voiceWsRef.current;
+      if (ws) { try { ws.close(); } catch { /* noop */ } voiceWsRef.current = null; }
+      teardownAudio();
     };
-  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, refetchAll, teardownAudio, earcon, showToast]);
+  }, [voiceLive, teardownAudio, earcon, showToast, handleUnauthorizedClose, clearUnauthorizedFlag]);
 
-  // The UI is the source of truth for the single active pane. Echo it to the
-  // server whenever it changes and the socket is open (the WS wave relies on this).
+  // The UI is the source of truth for the single active pane. Echo it whenever it changes and a
+  // socket is open — BOTH lanes accept set_active_pane (3C.2a), so the voice session and the
+  // observe gate stay in agreement about the open pane.
   const selectActivePane = useCallback((paneId: string | null) => {
     setActiveTerminalId(paneId);
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "set_active_pane", paneId }));
+    for (const ws of [wsRef.current, voiceWsRef.current]) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "set_active_pane", paneId }));
+      }
     }
   }, []);
 
   // ── Kitchen Radio: tune in / off-air / mute ─────────────────────────────
-  // Tuning in flips the wsRef socket to a full Gemini voice session (the effect above re-runs on
-  // voiceLive). desiredVoiceRef is the reconnect kill-switch: a dropped session only auto-reconnects
-  // while the operator still wants to be live. Mute gates outbound mic frames without a teardown.
+  // Tuning in opens the SEPARATE voice socket (the voice effect above keys on voiceLive); the
+  // observe data lane is untouched either way (3C.2a). desiredVoiceRef is the reconnect
+  // kill-switch: a dropped session only auto-reconnects while the operator still wants to be
+  // live. Mute gates outbound mic frames without a teardown.
   const goLive = useCallback(() => {
     desiredVoiceRef.current = true;
     // 2K.6: the first tune-in is the user gesture that may ask for desktop-notification
@@ -714,8 +902,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const saveSettings = useCallback(async (next: SystemSettings) => {
     setSettings(next); // optimistic
     if (typeof next.advanced?.globalPermissionsMode === "string") setGlobalPermissionsMode(next.advanced.globalPermissionsMode);
-    // Fires the real PUT even under ?mock=1 (the e2e intercepts + asserts the wire). Only adopts the
-    // server echo when it actually returns a settings object, so a thin ack can't wipe optimistic state.
+    // 3C.3b: the PUT fires under ?mock=1 ONLY on a Playwright-armed page (the e2e intercepts +
+    // asserts the wire). A human's manual ?mock=1 stays client-side — the old unconditional PUT
+    // let the mock fixture overwrite a real deployment's live settings. Only adopts the server
+    // echo when it actually returns a settings object, so a thin ack can't wipe optimistic state.
+    if (mockClientOnly()) { showToast("Rulebook updated."); return; }
     try {
       const res = await apiFetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next) });
       if (res.ok) {
@@ -732,7 +923,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       showToast("That didn't save, Chef — try again.", "warn");
       refetchSettings();
     }
-  }, [showToast, refetchSettings]);
+  }, [showToast, refetchSettings, mockClientOnly]);
 
   const createPane = useCallback(async (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => {
     const ws = (Object.values(ledger) as Workspace[]).find((w) => w.id === opts.projectId);
@@ -768,20 +959,23 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't open that kitchen, Chef — try again.", "warn"); }
   }, [showToast, refetchLedger]);
 
-  // Re-fire a station (restart its process). Like the other burner wires (writeControlKey/resize), this
-  // targets a real pane id, so it fires the real POST even under ?mock=1 (the e2e intercepts + asserts).
-  // Edit a project's About (summary). PUT /api/projects/:id {summary} (ungated). Optimistic; fires in
-  // mock so the Pantry e2e can assert the wire. Summary-only — touches no other project field.
+  // Edit a project's About (summary). PUT /api/projects/:id {summary} (ungated). Optimistic; under
+  // ?mock=1 the wire fires only on a Playwright-armed page (3C.3b) so the Pantry e2e can assert it
+  // while a human's manual mock stays client-side. Summary-only — touches no other project field.
   const updateProjectSummary = useCallback(async (projectId: string, summary: string) => {
     setLedger((prev) => (prev[projectId] ? { ...prev, [projectId]: { ...prev[projectId], summary } } : prev));
+    if (mockClientOnly()) return;
     try {
       const res = await apiFetch(`/api/projects/${projectId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ summary }) });
       if (res.ok) { if (!isMockModeRef.current) refetchLedger(); }
       else showToast("Couldn't save the About", "warn");
     } catch { /* silent */ }
-  }, [refetchLedger, showToast]);
+  }, [refetchLedger, showToast, mockClientOnly]);
 
+  // Re-fire a station (restart its process). Targets a real pane id; under ?mock=1 the wire fires
+  // only on a Playwright-armed page (3C.3b — the e2e intercepts + asserts the POST).
   const restartPane = useCallback(async (id: string) => {
+    if (mockClientOnly()) { showToast("Re-firing the station 🔥"); return; }
     try {
       const res = await apiFetch(`/api/terminals/${id}/restart`, { method: "POST" });
       if (res.status === 403) { showToast("Re-fire is gated off", "warn"); return; }
@@ -790,27 +984,30 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (!res.ok) { showToast("Re-fire didn't go through, Chef — try again.", "warn"); return; }
       refetchTerminals(); refetchLedger(); showToast("Re-firing the station 🔥");
     } catch { showToast("Re-fire didn't go through, Chef — try again.", "warn"); }
-  }, [refetchTerminals, refetchLedger, showToast]);
+  }, [refetchTerminals, refetchLedger, showToast, mockClientOnly]);
 
   // ── 2K.1: pane lifecycle (the classic app's routes, kitchen-toned) ───────
-  // Like restartPane, these target real ids and fire the REAL request even under ?mock=1 (the e2e
-  // intercepts + asserts the wire); only the refetches are mock-guarded. Honest-feedback pattern:
-  // the success ack fires only after the server said ok; failures warn, never a false ack.
+  // Like restartPane, these target real ids; under ?mock=1 the REAL request fires only on a
+  // Playwright-armed page (3C.3b — the e2e intercepts + asserts the wire; a human's manual mock
+  // keeps the optimistic ack, client-side). Honest-feedback pattern: against a real server the
+  // success ack fires only after the server said ok; failures warn, never a false ack.
 
   // "86 this station" — graceful stop + archive (recoverable). Classic: handleStopPane (App.tsx:1613).
   const stopPane = useCallback(async (projectId: string, paneId: string) => {
+    if (mockClientOnly()) { showToast(`86'd ${paneId} — it's in the freezer if you need it back`, "fire", "execute"); return; }
     try {
       const res = await apiFetch(`/api/projects/${projectId || "default_project"}/panes/${paneId}/stop`, { method: "POST" });
       if (!res.ok) { showToast("Couldn't 86 that station, Chef — try again.", "warn"); return; }
       showToast(`86'd ${paneId} — it's in the freezer if you need it back`, "fire", "execute");
       if (!isMockModeRef.current) { refetchTerminals(); refetchLedger(); refetchArchive(); }
     } catch { showToast("Couldn't 86 that station, Chef — try again.", "warn"); }
-  }, [refetchTerminals, refetchLedger, refetchArchive, showToast]);
+  }, [refetchTerminals, refetchLedger, refetchArchive, showToast, mockClientOnly]);
 
   // Rename a station — PUT …/rename {name}. Classic: handleRenamePane (App.tsx:1646).
   const renamePane = useCallback(async (projectId: string, paneId: string, name: string) => {
     const n = name.trim();
     if (!n) return;
+    if (mockClientOnly()) { showToast(`Station's now "${n}"`); return; }
     try {
       const res = await apiFetch(`/api/projects/${projectId || "default_project"}/panes/${paneId}/rename`, {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n }),
@@ -819,21 +1016,27 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       showToast(`Station's now "${n}"`);
       if (!isMockModeRef.current) refetchLedger();
     } catch { showToast("That rename didn't stick, Chef — try again.", "warn"); }
-  }, [refetchLedger, showToast]);
+  }, [refetchLedger, showToast, mockClientOnly]);
 
   // Clear exited — archive every Exited pane in the active project. Classic: handleClearExited
   // (App.tsx:645, POST /api/terminals/clear-exited).
   const clearExited = useCallback(async () => {
+    if (mockClientOnly()) { showToast("Cleared the exited stations into the freezer 🧊", "fire", "execute"); return; }
     try {
       const res = await apiFetch("/api/terminals/clear-exited", { method: "POST" });
       if (!res.ok) { showToast("Couldn't clear the line, Chef — try again.", "warn"); return; }
       showToast("Cleared the exited stations into the freezer 🧊", "fire", "execute");
       if (!isMockModeRef.current) { refetchTerminals(); refetchLedger(); refetchArchive(); }
     } catch { showToast("Couldn't clear the line, Chef — try again.", "warn"); }
-  }, [refetchTerminals, refetchLedger, refetchArchive, showToast]);
+  }, [refetchTerminals, refetchLedger, refetchArchive, showToast, mockClientOnly]);
 
   // Restore from the freezer. Classic: handleRestoreArchived (App.tsx:671).
   const restoreArchived = useCallback(async (paneId: string) => {
+    if (mockClientOnly()) {
+      setArchived((prev) => prev.filter((a) => a.pane_id !== paneId)); // keep the tray honest
+      showToast(`${paneId} is back on the line`, "fire", "success");
+      return;
+    }
     try {
       const res = await apiFetch(`/api/archive/${paneId}/restore`, { method: "POST" });
       if (!res.ok) { showToast("Couldn't thaw that one, Chef — try again.", "warn"); return; }
@@ -841,10 +1044,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (!isMockModeRef.current) { refetchArchive(); refetchLedger(); refetchTerminals(); }
       else setArchived((prev) => prev.filter((a) => a.pane_id !== paneId)); // mock: keep the tray honest
     } catch { showToast("Couldn't thaw that one, Chef — try again.", "warn"); }
-  }, [refetchArchive, refetchLedger, refetchTerminals, showToast]);
+  }, [refetchArchive, refetchLedger, refetchTerminals, showToast, mockClientOnly]);
 
   // Permanently delete an archived pane. Classic: handleDeleteArchived (App.tsx:681).
   const deleteArchived = useCallback(async (paneId: string) => {
+    if (mockClientOnly()) {
+      setArchived((prev) => prev.filter((a) => a.pane_id !== paneId));
+      showToast(`Tossed ${paneId} for good`, "fire", "execute");
+      return;
+    }
     try {
       const res = await apiFetch(`/api/archive/${paneId}`, { method: "DELETE" });
       if (!res.ok) { showToast("Couldn't toss that one, Chef — try again.", "warn"); return; }
@@ -852,12 +1060,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (!isMockModeRef.current) refetchArchive();
       else setArchived((prev) => prev.filter((a) => a.pane_id !== paneId));
     } catch { showToast("Couldn't toss that one, Chef — try again.", "warn"); }
-  }, [refetchArchive, showToast]);
+  }, [refetchArchive, showToast, mockClientOnly]);
 
   // ── 2K.2: per-pane gate override (the Rulebook's pane scope) ─────────────
   // PUT the pane's whole override map (the bulk matrix-editor route, src/actions/defs/locks.ts
   // setPaneGates). res.ok-checked; on failure the ledger is refetched so the segs snap back to truth.
   const setPaneGates = useCallback(async (projectId: string, paneId: string, gates: Record<string, string>) => {
+    if (mockClientOnly()) { showToast("Rulebook updated for that station."); return; }
     try {
       const res = await apiFetch(`/api/projects/${projectId || "default_project"}/panes/${paneId}/capability-gates`, {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityGates: gates }),
@@ -866,7 +1075,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       showToast("Rulebook updated for that station.");
       if (!isMockModeRef.current) { refetchLedger(); refetchTerminals(); } // terminals carry the re-resolved posture
     } catch { showToast("That didn't save, Chef — try again.", "warn"); }
-  }, [refetchLedger, refetchTerminals, showToast]);
+  }, [refetchLedger, refetchTerminals, showToast, mockClientOnly]);
 
   // ── The Pass: per-project notes (the expediter's tickets) ───────────────
   // Notes are the real backend for The Pass (there is no beads REST surface — BeadsExplorer stays a
@@ -884,8 +1093,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
-  // Jot a note → POST (project- or pane-scoped). Optimistic so The Pass updates instantly; the POST
-  // fires even in mock (e2e intercepts). POST body key is `note` (server contract).
+  // Jot a note → POST (project- or pane-scoped). Optimistic so The Pass updates instantly; under
+  // ?mock=1 the POST fires only on a Playwright-armed page (3C.3b). POST body key is `note`.
   const addNote = useCallback(async (projectId: string, text: string, paneId?: string | null) => {
     const t = text.trim();
     if (!t || !projectId || projectId === "all") return;
@@ -895,22 +1104,24 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     };
     setNotes((prev) => [optimistic, ...prev]);
     showToast("Jotted it down 🎫");
+    if (mockClientOnly()) return;
     try {
       const path = paneId ? `/api/projects/${projectId}/panes/${paneId}/notes` : `/api/projects/${projectId}/notes`;
       const res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: t }) });
       if (res.ok && !isMockModeRef.current) { refetchNotes([projectId]); refetchLedger(); }
     } catch { /* silent */ }
-  }, [showToast, refetchNotes, refetchLedger]);
+  }, [showToast, refetchNotes, refetchLedger, mockClientOnly]);
 
   const editNote = useCallback(async (id: string, text: string, projectId?: string) => {
     const t = text.trim();
     setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, text: t, updated_at: Date.now() } : n)));
+    if (mockClientOnly()) return;
     try {
       const res = await apiFetch(`/api/notes/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t }) });
       if (res.ok && projectId && !isMockModeRef.current) refetchNotes([projectId]);
       else if (!res.ok) showToast("That edit didn't stick, Chef — try again.", "warn"); // 1B.3
     } catch { showToast("That edit didn't stick, Chef — try again.", "warn"); }
-  }, [refetchNotes, showToast]);
+  }, [refetchNotes, showToast, mockClientOnly]);
 
   const deleteNote = useCallback(async (id: string, projectId?: string) => {
     // 2K.4: undo-in-toast for the destructive delete. The deleted note's text/scope are captured
@@ -922,17 +1133,19 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       label: "Undo",
       run: () => addNote(r.project_id, r.text, r.pane_id ?? undefined),
     } : undefined);
+    if (mockClientOnly()) return;
     try {
       const res = await apiFetch(`/api/notes/${id}`, { method: "DELETE" });
       if (res.ok && projectId && !isMockModeRef.current) refetchNotes([projectId]);
     } catch { /* silent */ }
-  }, [showToast, refetchNotes, addNote]);
+  }, [showToast, refetchNotes, addNote, mockClientOnly]);
 
   // Send a literal control-key sequence into a pane's PTY (the raw-input route — arrows / Tab / Esc /
-  // Enter / PgUp/PgDn / Ctrl+C always-allowed; Shift+Tab gated → may 202-defer). Fires the REAL POST
-  // even under the ?mock=1 harness so the e2e can intercept + assert the wire (there are no real mock
-  // users). 403/202/409 surface as a toast instead of a dead button.
+  // Enter / PgUp/PgDn / Ctrl+C always-allowed; Shift+Tab gated → may 202-defer). Under ?mock=1 the
+  // REAL POST fires only on a Playwright-armed page (3C.3b — the e2e intercepts + asserts the wire).
+  // 403/202/409 surface as a toast instead of a dead button.
   const writeControlKey = useCallback(async (paneId: string, bytes: string) => {
+    if (mockClientOnly()) return;
     try {
       const res = await apiFetch(`/api/terminals/${paneId}/raw-input`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bytes }),
@@ -941,12 +1154,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       else if (res.status === 202) showToast("Key queued — needs your ok 🛎", "warn");
       else if (res.status === 409) showToast("Open the pane first", "warn");
     } catch { /* pane may have exited — best-effort */ }
-  }, [showToast]);
+  }, [showToast, mockClientOnly]);
 
-  // Sync the backend PTY grid to the xterm grid (debounced per-pane). Fires the real POST even in mock
-  // so the e2e can assert the round-trip (mirrors App.tsx's e2e-active resize seam).
+  // Sync the backend PTY grid to the xterm grid (debounced per-pane). Under ?mock=1 the POST fires
+  // only on a Playwright-armed page (3C.3b) — mirrors App.tsx's e2e-active resize seam.
   const resizeTerminal = useCallback((paneId: string, cols: number, rows: number) => {
     if (!cols || !rows) return;
+    if (mockClientOnly()) return;
     const key = `${cols}x${rows}`;
     if (lastGridRef.current[paneId] === key) return;
     lastGridRef.current[paneId] = key;
@@ -956,7 +1170,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cols, rows }),
       }).catch(() => { /* pane may have exited; resize is best-effort */ });
     }, 120);
-  }, []);
+  }, [mockClientOnly]);
 
   // ── HiTL gating resolves (the safety dial actually fires) ────────────────
   // Approve / reject a staged PTY write; confirm / cancel a gated deferred action. Each drops the chip
@@ -1054,6 +1268,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
+    streamGeneration, fetchPaneBackfill,
     archived, paneDrafts,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,

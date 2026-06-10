@@ -21,12 +21,31 @@ declare global {
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
       setFrozenMock: (frozen: boolean, running: string[]) => void;
       switchActivePane: (paneId: string) => void;
+      /** 1B.1/1B.5: stage the kitchen's connection truth-states (no real sockets under ?mock=1). */
+      setConnMock: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
       /** 2K.3: stage a server-pushed draft_updated for a pane (kitchen Order Pad mirror). */
       injectDraftUpdate: (paneId: string, text: string) => void;
       /** 2K.1: flip a seeded mock pane's status (drives Clear-exited / confirm-free 86). */
       setPaneStatusMock: (paneId: string, status: "Running" | "Idle" | "Exited") => void;
+      /** 3C.1: feed a frame through the REAL observe-lane WS switch (kitchen only). */
+      injectWsFrame: (frame: unknown) => void;
+      /** 3C.2: model an observe-socket drop/reopen → TerminalView resync-with-marker (kitchen only). */
+      simulateStreamReconnect: () => void;
     };
   }
+}
+
+/**
+ * 3C.3b: pre-arm the mock-mode REAL wire. Mock-mode mutations (settings PUT, pane lifecycle POSTs,
+ * raw-input, resize, drafts, notes) only hit the network when `window.__ORBITAL_E2E__` existed
+ * BEFORE the bundle ran — i.e. when this init script set it. Specs that intercept + assert the
+ * wire must call this BEFORE their page.goto; a human's manual ?mock=1 (no init script) stays
+ * fully client-side and can never clobber a live deployment.
+ */
+export async function armE2EWire(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    (window as unknown as { __ORBITAL_E2E__?: unknown }).__ORBITAL_E2E__ = {};
+  });
 }
 
 export const MOCK_TERMINAL_ID = "mock_pane_1";
@@ -35,6 +54,7 @@ export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 export async function gotoMockedApp(page: Page): Promise<void> {
   // The kitchen is now the default app; the classic app (which this suite exercises) is pinned via
   // ?ui=classic so the classic coverage stays green alongside the kitchen's own e2e suite.
+  await armE2EWire(page); // 3C.3b: classic specs assert real wires under mock too
   await page.goto("/?ui=classic&mock=1");
   // The harness sets this attribute once mock data is seeded and hooks installed.
   await page.waitForSelector("html[data-e2e-ready='1']", { timeout: 15_000 });

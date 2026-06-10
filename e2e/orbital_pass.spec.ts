@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P7 — The Pass (notes-backed tickets). A loose note becomes live work: jot → it lands on the
 // pass instantly (optimistic) and POSTs to /api/projects/:id/notes for real; amend → PUT /api/notes/:id;
@@ -6,6 +7,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoKitchen(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
   await expect(page.getByTestId("the-pass")).toBeVisible();

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P3 — operating the line: ServiceMode (globalPermissionsMode), All Hands
 // (stop-all 2-stage), New Pane / New Project modals. Driven via the ?mock=1
@@ -8,6 +9,7 @@ async function gotoKitchen(page: Page) {
   // The emergency-stop modal shakes/sirens (orb-shake/orb-siren); reduced-motion
   // (which the kitchen honors) stills it so clicks register deterministically.
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

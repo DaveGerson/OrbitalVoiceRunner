@@ -9,12 +9,13 @@ import { expect, test, type Page } from "@playwright/test";
 // Driven through the ?mock=1 harness; lifecycle wires fire the REAL fetches so the
 // specs intercept + assert them (the established kitchen pattern).
 
-import "./fixtures"; // the shared window.__ORBITAL_E2E__ declaration (incl. the 2K hooks)
+import { armE2EWire } from "./fixtures"; // also pulls the shared window.__ORBITAL_E2E__ declaration
 
 const PANE = "mock_pane_1";
 
 async function gotoKitchen(page: Page, params = "") {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto(`/?ui=kitchen&mock=1${params}`);
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

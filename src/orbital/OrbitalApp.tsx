@@ -283,6 +283,8 @@ export default function OrbitalApp() {
       )}
       {burnerStation && (
         <TerminalWindow st={burnerStation} backfill={burnerBackfill} accentHex={acc.hex} dark={t.dark}
+          streamGeneration={data.streamGeneration}
+          fetchBackfill={() => data.fetchPaneBackfill(burnerStation.id)}
           isMockRef={data.isMockModeRef} wsRef={data.wsRef} voiceCues={t.voiceCues}
           paneNotes={data.notes.filter((n) => n.pane_id === burnerStation.id)}
           incomingDraft={data.paneDrafts[burnerStation.id]}
