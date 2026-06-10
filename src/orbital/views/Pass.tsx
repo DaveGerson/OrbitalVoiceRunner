@@ -6,6 +6,7 @@
 import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
 import { INK, TICKET_KINDS, type TicketKind } from "../theme";
 import { Button, Chip, Icon, VoiceCue } from "../primitives";
+import { useDialog } from "../useFocusTrap";
 import type { StationProject } from "../station";
 import type { StoredNote } from "../../store/types";
 
@@ -84,9 +85,12 @@ function JotNote({ dark, projectName, disabled, onAdd }: { dark: boolean; projec
 }
 
 function BeadsExplorer({ dark, onClose }: { dark: boolean; onClose: () => void }) {
+  // 2K.5: dialog semantics — initial focus, focus trap, Escape closes (top-most only).
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(42,26,16,.6)", zIndex: 220, display: "grid", placeItems: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} data-testid="beads-explorer" style={{ width: "min(440px, 94vw)", background: dark ? "#241409" : "#fff9ec", border: "3px solid " + INK, borderRadius: 16, boxShadow: "8px 8px 0 0 " + INK, padding: 24, textAlign: "center" }}>
+      <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="The bead jar"
+        onClick={(e) => e.stopPropagation()} data-testid="beads-explorer" style={{ width: "min(440px, 94vw)", background: dark ? "#241409" : "#fff9ec", border: "3px solid " + INK, borderRadius: 16, boxShadow: "8px 8px 0 0 " + INK, padding: 24, textAlign: "center", outline: "none" }}>
         <div style={{ fontSize: 34, marginBottom: 6 }}>🫙</div>
         <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 22, color: dark ? "#ffe9c7" : INK }}>The bead jar</div>
         <div style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f", margin: "8px auto 16px", maxWidth: 320, lineHeight: 1.45 }}>

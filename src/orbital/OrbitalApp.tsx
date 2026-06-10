@@ -173,7 +173,7 @@ export default function OrbitalApp() {
   const [burnerId, setBurnerId] = useState<string | null>(null);
   const pageBg: CSSProperties["background"] = t.dark ? "#1a0f08" : "var(--cream)";
 
-  const data = useOrbitalData({ voiceCues: t.voiceCues });
+  const data = useOrbitalData({ voiceCues: t.voiceCues, desktopNotes: t.desktopNotes });
   const stations = useMemo(
     () => deriveStations(data.terminals, data.ledger, data.pendingCommands),
     [data.terminals, data.ledger, data.pendingCommands],
@@ -241,7 +241,7 @@ export default function OrbitalApp() {
             <ThePass notes={data.notes} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
               onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
               onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }} />
-            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} />
+            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
           </div>
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
           <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
@@ -254,16 +254,23 @@ export default function OrbitalApp() {
       )}
       {view === "pantry" && (
         <ThePantry dark={t.dark} projects={projects} stations={stations}
+          archived={data.archived}
           summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
           selectedProject={selectedProject}
           onUpdateSummary={data.updateProjectSummary}
-          onOpenStation={(id) => { data.selectActivePane(id); setBurnerId(id); }} />
+          onOpenStation={(id) => { data.selectActivePane(id); setBurnerId(id); }}
+          onRestoreArchived={data.restoreArchived}
+          onDeleteArchived={data.deleteArchived} />
       )}
       {view === "boh" && (
         <BackOfHouse dark={t.dark} settings={data.settings}
           globalMode={data.globalPermissionsMode}
           setGlobalMode={(m) => data.setGlobalMode(m)}
-          saveSettings={data.saveSettings} />
+          saveSettings={data.saveSettings}
+          /* 2K.2: the Rulebook's pane scope — live panes + their CURRENT override maps (ledger truth). */
+          panes={stations.map((s) => ({ id: s.id, name: s.name, project: s.project,
+            overrides: data.ledger[s.project]?.panes?.[s.id]?.capabilityGates }))}
+          setPaneGates={data.setPaneGates} />
       )}
 
       {newPaneProj !== null && (
@@ -278,9 +285,12 @@ export default function OrbitalApp() {
         <TerminalWindow st={burnerStation} backfill={burnerBackfill} accentHex={acc.hex} dark={t.dark}
           isMockRef={data.isMockModeRef} wsRef={data.wsRef} voiceCues={t.voiceCues}
           paneNotes={data.notes.filter((n) => n.pane_id === burnerStation.id)}
+          incomingDraft={data.paneDrafts[burnerStation.id]}
           onAddNote={(text) => data.addNote(burnerStation.project, text, burnerStation.id)}
           onDeleteNote={(id) => data.deleteNote(id, burnerStation.project)}
           onClose={() => setBurnerId(null)} onRestart={() => data.restartPane(burnerStation.id)}
+          onStop={() => data.stopPane(burnerStation.project, burnerStation.id)}
+          onRename={(name) => data.renamePane(burnerStation.project, burnerStation.id, name)}
           writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}
       {/* HiTL gating prompts — reuse the shared dialogs verbatim (server-truth posture). Wrapped in a
@@ -320,9 +330,17 @@ export default function OrbitalApp() {
       <CornerChef show={t.mascot && view === "line" && !panic} chatter={t.mascot} />
       <DanceTroupe show={t.danceParty && view === "line" && !panic} />
 
+      {/* 2K.5: role="status" aria-live="polite" so screen readers hear every kitchen ack.
+          2K.4: an action-bearing toast (Undo) renders its one-tap action inline. */}
       {data.toast && (
-        <div data-testid="toast" className="orb-pop-in" style={{ position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", zIndex: 130, background: data.toast.kind === "fire" ? "#4db892" : "#ffc94a", color: INK, border: "2px solid " + INK, borderRadius: 12, padding: "10px 18px", boxShadow: "4px 4px 0 0 " + INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16 }}>
+        <div data-testid="toast" role="status" aria-live="polite" className="orb-pop-in" style={{ position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", zIndex: 130, display: "flex", alignItems: "center", gap: 12, background: data.toast.kind === "fire" ? "#4db892" : "#ffc94a", color: INK, border: "2px solid " + INK, borderRadius: 12, padding: "10px 18px", boxShadow: "4px 4px 0 0 " + INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16 }}>
           {data.toast.msg}
+          {data.toast.action && (
+            <button data-testid="toast-action" onClick={data.toast.action.run}
+              style={{ padding: "4px 12px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5, boxShadow: "2px 2px 0 0 " + INK, whiteSpace: "nowrap" }}>
+              {data.toast.action.label}
+            </button>
+          )}
         </div>
       )}
 
@@ -338,6 +356,7 @@ export default function OrbitalApp() {
         <TweakToggle label="Chef mascot & chatter" value={t.mascot} onChange={(v) => setTweak("mascot", v)} />
         <TweakSection label="Hands-free" />
         <TweakToggle label="Voice cues" value={t.voiceCues} onChange={(v) => setTweak("voiceCues", v)} />
+        <TweakToggle label="Desktop notes" value={t.desktopNotes} onChange={(v) => setTweak("desktopNotes", v)} />
         <TweakToggle label="Chef dance party 🕺" value={t.danceParty} onChange={(v) => setTweak("danceParty", v)} />
       </TweaksPanel>
     </div>

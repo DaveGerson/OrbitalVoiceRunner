@@ -15,6 +15,8 @@ export interface Tweaks {
   mascot: boolean;
   voiceCues: boolean;
   danceParty: boolean;
+  /** 2K.6: desktop notifications for background-tab events (separate from Voice cues, which gates audio). */
+  desktopNotes: boolean;
 }
 
 export const TWEAK_DEFAULTS: Tweaks = {
@@ -25,6 +27,7 @@ export const TWEAK_DEFAULTS: Tweaks = {
   mascot: true,
   voiceCues: true,
   danceParty: false,
+  desktopNotes: true,
 };
 
 const LS_KEY = "orbital-tweaks";
@@ -51,6 +54,7 @@ export function mergedDefaults(): Tweaks {
   if (p.has("mascot")) d.mascot = p.get("mascot") === "1";
   if (p.has("cues")) d.voiceCues = p.get("cues") === "1";
   if (p.has("dance")) d.danceParty = p.get("dance") === "1";
+  if (p.has("notes")) d.desktopNotes = p.get("notes") === "1";
   return d;
 }
 

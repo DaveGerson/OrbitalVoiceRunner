@@ -112,6 +112,18 @@
 .orb-pop-in { animation: orb-pop .3s cubic-bezier(.34,1.56,.64,1); }
 .orb-listening-dot { width: 9px; height: 9px; border-radius: 50%; background: #4db892; border: 1.5px solid var(--ink); display: inline-block; animation: orb-pulse 1s var(--ease-bounce) infinite; }
 
+/* ============================================================
+   KEYBOARD REACHABILITY (2K.5) — a single, loud, kitchen-toned
+   focus ring for every interactive element. :focus-visible only,
+   so mouse clicks stay clean while Tab travel is unmistakable.
+   ============================================================ */
+.orbital-kitchen :focus-visible,
+.orbital-kitchen [role="button"]:focus-visible {
+  outline: 3px solid var(--butter);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* Kill BOTH @keyframes animations AND the inline lift/flatten/untilt transitions, so the signature
      sticker motion snaps instantly for users who asked for reduced motion (brief §6.8). Static resting

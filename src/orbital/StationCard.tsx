@@ -3,7 +3,7 @@
 // StationCard, fed by the real merged Station view-model.
 import { useState } from "react";
 import { INK, RUNTIMES, STATUS } from "./theme";
-import { ChefAvatar, Chip, Pips, StatusBadge, VoiceCue } from "./primitives";
+import { ChefAvatar, Chip, Pips, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { CHEFS } from "./theme";
 import type { Station } from "./station";
 
@@ -26,7 +26,13 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
   const tag = (st.projectName || "").replace(/[^a-z]/gi, "").slice(0, 4).toUpperCase() || "—";
 
   return (
+    // 2K.5: a station card is a real button to the keyboard — Tab reaches it, Enter/Space opens
+    // it, and the kitchen-wide :focus-visible ring (orbital.css) makes the stop unmistakable.
     <div onClick={onOpen} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      role="button" tabIndex={0} aria-label={`Open ${st.name} — ${st.status}`}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); }
+      }}
       data-testid="station-card" data-pane-id={st.id} data-status={st.status}
       style={{
         background: cardBg, border: "2px solid " + INK, borderRadius: 14, padding: compact ? 11 : 14,
@@ -55,6 +61,8 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
             </span>
           )}
           {!list && <div style={{ flex: 1 }} />}
+          {/* 2K.2: the pane's autonomy at a glance — server truth (posture/permissions_mode), visual only */}
+          {!list && <PostureChip posture={st.posture} mode={st.mode} />}
           {!list && <StatusBadge status={st.status} />}
         </div>
         <h3 style={{ margin: "0 0 6px", paddingLeft: 4, fontFamily: "Fraunces, serif", fontWeight: 800, fontSize: compact ? 16 : 18, lineHeight: 1.12, color: fg, letterSpacing: "-.01em" }}>{st.name}</h3>
@@ -90,6 +98,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         display: "flex", alignItems: "center", gap: 8, marginTop: list ? 0 : 10, paddingTop: list ? 0 : 9, paddingLeft: 4,
         borderTop: list ? "none" : "1.5px dashed " + (dark ? "#5b3a23" : "#c9a97a"), flex: list ? 1 : "none",
       }}>
+        {list && <PostureChip posture={st.posture} mode={st.mode} />}
         {list && <StatusBadge status={st.status} />}
         <Pips steps={PIP_COUNT} done={st.contextPips} color={accentHex} label={st.contextLabel} />
         <div style={{ flex: 1 }} />

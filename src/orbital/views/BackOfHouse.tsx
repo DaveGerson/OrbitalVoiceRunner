@@ -75,22 +75,47 @@ function fieldStyle(dark: boolean): CSSProperties {
   return { width: "100%", padding: "9px 11px", border: "2px solid " + INK, borderRadius: 9, background: dark ? "#1a0f08" : "#fff4de", color: dark ? "#ffe9c7" : INK, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, outline: "none", boxSizing: "border-box" };
 }
 
-export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSettings }: {
+// 2K.2: one live pane the Rulebook can scope to — id/name plus its CURRENT per-pane override
+// map (from the ledger; absent ⇒ the pane inherits the global default).
+export interface RulebookPane {
+  id: string;
+  name: string;
+  project: string;
+  overrides?: Partial<CapabilityGateMap>;
+}
+
+export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSettings, panes = [], setPaneGates }: {
   dark: boolean;
   settings: SystemSettings | null;
   globalMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
   setGlobalMode: (m: "Full Auto" | "Human-in-the-Loop" | "Read-Only") => void;
   saveSettings: (next: SystemSettings) => void;
+  /** 2K.2: live panes for the Rulebook's pane scope. */
+  panes?: RulebookPane[];
+  /** 2K.2: PUT the pane's whole override map (…/capability-gates). */
+  setPaneGates?: (projectId: string, paneId: string, gates: Record<string, string>) => void;
 }) {
   const [room, setRoom] = useState<RoomId>("rulebook");
+  // 2K.2: the Rulebook's scope — "kitchen" (the global map, existing behavior) or one live pane
+  // (its override map, PUT to the per-pane capability-gates route). Falls back to kitchen scope
+  // if the scoped pane disappears (closed/archived).
+  const [scope, setScope] = useState<string>("kitchen");
+  const scopedPane = scope !== "kitchen" ? panes.find((p) => p.id === scope) : undefined;
   const fg = dark ? "#ffe9c7" : INK;
 
   // The configured global gate map, seeded with the real safe defaults so unset caps show their true
   // effective gate (never a misleading all-Auto). Writing a gate persists the full map.
-  const gates: CapabilityGateMap = { ...DEFAULT_CAPABILITY_GATES, ...(settings?.advanced?.capabilityGates ?? {}) };
+  const globalGates: CapabilityGateMap = { ...DEFAULT_CAPABILITY_GATES, ...(settings?.advanced?.capabilityGates ?? {}) };
+  // Pane scope: the pane's override wins per-capability; anything unset inherits the global value.
+  const gates: CapabilityGateMap = scopedPane ? { ...globalGates, ...(scopedPane.overrides ?? {}) } : globalGates;
   const setGate = (cap: CapabilityGate, v: GateValue) => {
+    if (scopedPane) {
+      // Write {existing override + this change} so untouched capabilities keep inheriting.
+      setPaneGates?.(scopedPane.project, scopedPane.id, { ...(scopedPane.overrides ?? {}), [cap]: v });
+      return;
+    }
     if (!settings) return;
-    saveSettings({ ...settings, advanced: { ...settings.advanced, capabilityGates: { ...gates, [cap]: v } } });
+    saveSettings({ ...settings, advanced: { ...settings.advanced, capabilityGates: { ...globalGates, [cap]: v } } });
   };
   const patchVoice = (patch: Partial<SystemSettings["voiceAi"]>) => { if (settings) saveSettings({ ...settings, voiceAi: { ...settings.voiceAi, ...patch } }); };
   const patchAdvanced = (patch: Partial<SystemSettings["advanced"]>) => { if (settings) saveSettings({ ...settings, advanced: { ...settings.advanced, ...patch } }); };
@@ -124,6 +149,32 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
 
         {settings && room === "rulebook" && (
           <Room emoji="📋" title="The Rulebook" sub={`"Auto" fires on its own · "Ask" brings it to the pass · "Off" — not in my kitchen`} color="#ffc94a">
+            {/* 2K.2: scope — the whole kitchen (global map) or one live station (its override map). */}
+            <Card dark={dark}>
+              <Lbl dark={dark}>Who do these rules apply to?</Lbl>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <button data-testid="rulebook-scope-kitchen" aria-pressed={!scopedPane} onClick={() => setScope("kitchen")}
+                  style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, cursor: "pointer", background: !scopedPane ? "#ffc94a" : (dark ? "#1a0f08" : "#fff4de"), color: !scopedPane ? INK : fg, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5, boxShadow: !scopedPane ? "2px 2px 0 0 " + INK : "none" }}>
+                  🍽 Whole kitchen
+                </button>
+                {panes.map((p) => {
+                  const on = scopedPane?.id === p.id;
+                  return (
+                    <Fragment key={p.id}>
+                      <button data-testid={`rulebook-scope-${p.id}`} aria-pressed={on} onClick={() => setScope(p.id)}
+                        style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, cursor: "pointer", background: on ? "#4db892" : (dark ? "#1a0f08" : "#fff4de"), color: on ? INK : fg, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5, boxShadow: on ? "2px 2px 0 0 " + INK : "none" }}>
+                        {p.name}
+                      </button>
+                    </Fragment>
+                  );
+                })}
+              </div>
+              <div data-testid="rulebook-scope-note" style={{ fontFamily: "DM Sans", fontSize: 11.5, color: "#8a6a4f", marginTop: 8 }}>
+                {scopedPane
+                  ? <>Tuning <strong>{scopedPane.name}</strong> only — its overrides win; anything you don't touch keeps following the kitchen rule.</>
+                  : <>Kitchen-wide defaults — every station follows these unless you tune it individually above.</>}
+              </div>
+            </Card>
             {Object.entries(CAPABILITY_CATEGORIES).map(([cat, caps]) => (
               <Fragment key={cat}>
                 <Card dark={dark}>
@@ -145,7 +196,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
         )}
 
         {settings && room === "chef" && (
-          <Room emoji="👨‍🍳" title="Chef de Cuisine" sub="the global default — any single pane can still be tuned in the Rulebook" color="#ff8a3d">
+          <Room emoji="👨‍🍳" title="Chef de Cuisine" sub="the global default — pick a single station in the Rulebook's scope row to tune just that pane" color="#ff8a3d">
             <Card dark={dark}>
               <Lbl dark={dark}>Service mode (global autonomy)</Lbl>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>

@@ -21,6 +21,10 @@ declare global {
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
       setFrozenMock: (frozen: boolean, running: string[]) => void;
       switchActivePane: (paneId: string) => void;
+      /** 2K.3: stage a server-pushed draft_updated for a pane (kitchen Order Pad mirror). */
+      injectDraftUpdate: (paneId: string, text: string) => void;
+      /** 2K.1: flip a seeded mock pane's status (drives Clear-exited / confirm-free 86). */
+      setPaneStatusMock: (paneId: string, status: "Running" | "Idle" | "Exited") => void;
     };
   }
 }

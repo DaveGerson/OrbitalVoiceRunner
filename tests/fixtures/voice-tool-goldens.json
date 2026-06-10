@@ -47,7 +47,7 @@
         "add_watch_rule": "Ask",
         "apply_recipe": "Ask",
         "archive_pane": "Auto",
-        "clear_history": "Auto",
+        "clear_history": "Ask",
         "close_pane": "Ask",
         "compose_draft": "Auto",
         "create_pane": "Ask",

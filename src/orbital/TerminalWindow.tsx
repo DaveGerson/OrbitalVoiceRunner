@@ -16,8 +16,9 @@ import { TerminalView } from "../components/TerminalView";
 import { apiFetch } from "../utils/api";
 import { RAW_KEY_TABLE } from "../rawKeyClass";
 import { INK, RUNTIMES } from "./theme";
-import { Button, Chip, Icon, StatusBadge, VoiceCue } from "./primitives";
+import { Button, Chip, Icon, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { TICKET_KINDS } from "./theme";
+import { useDialog } from "./useFocusTrap";
 import type { Station } from "./station";
 import type { StoredNote } from "../store/types";
 
@@ -62,8 +63,11 @@ function ControlKeyBar({ paneId, dark, onKey }: { paneId: string; dark: boolean;
 // Per-pane WIP draft — the Order Pad. Fetches the saved draft on open (skipped in mock; the harness
 // has no server), persists edits over the observe WS (`draft_edit`) when connected or PUT otherwise,
 // and Send fires the real …/draft/send POST. Returns the live text + handlers.
-function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject<boolean>, wsRef: MutableRefObject<WebSocket | null>) {
+function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject<boolean>, wsRef: MutableRefObject<WebSocket | null>, incoming?: { text: string; at: number }) {
   const [text, setText] = useState("");
+  // 2K.3: the focus-lock (classic App.tsx:1164-1176) — a server-pushed draft must never clobber
+  // the operator mid-keystroke. Tracked by the textarea's onFocus/onBlur below.
+  const focusedRef = useRef(false);
   useEffect(() => {
     if (!paneId || isMockRef.current) { setText(""); return; }
     let cancelled = false;
@@ -73,6 +77,16 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
       .catch(() => { /* pane has no draft yet */ });
     return () => { cancelled = true; };
   }, [projectId, paneId, isMockRef]);
+
+  // 2K.3: mirror incoming draft_updated frames (Janus dictation, another view's edit) into the
+  // pad — ONLY while the textarea isn't focused (the classic guard). `at` keys re-application.
+  const incomingAt = incoming?.at;
+  const incomingText = incoming?.text;
+  useEffect(() => {
+    if (incomingAt === undefined || typeof incomingText !== "string") return;
+    if (focusedRef.current) return; // operator is typing — their keystrokes win
+    setText(incomingText);
+  }, [incomingAt, incomingText]);
 
   const onChange = (v: string) => {
     setText(v);
@@ -94,10 +108,10 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
     } catch { /* pane may have exited */ }
     return false;
   };
-  return { text, onChange, send, scrap: () => onChange("") };
+  return { text, onChange, send, scrap: () => onChange(""), focusedRef };
 }
 
-export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, onAddNote, onDeleteNote, onClose, onRestart, writeControlKey, resizeTerminal, showToast }: {
+export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, incomingDraft, onAddNote, onDeleteNote, onClose, onRestart, onStop, onRename, writeControlKey, resizeTerminal, showToast }: {
   st: Station;
   backfill?: string;
   accentHex: string;
@@ -106,30 +120,68 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   wsRef: MutableRefObject<WebSocket | null>;
   voiceCues: boolean;
   paneNotes: StoredNote[];
+  /** 2K.3: the latest server-pushed draft for this pane (applied only while the pad isn't focused). */
+  incomingDraft?: { text: string; at: number };
   onAddNote: (text: string) => void;
   onDeleteNote: (id: string) => void;
   onClose: () => void;
   onRestart: () => void;
+  /** 2K.1: "86 this station" — graceful stop + archive (recoverable). */
+  onStop: () => void;
+  /** 2K.1: rename the station (PUT …/rename). */
+  onRename: (name: string) => void;
   writeControlKey: (paneId: string, bytes: string) => void;
   resizeTerminal: (paneId: string, cols: number, rows: number) => void;
   showToast: (msg: string, kind?: "fire" | "warn") => void;
 }) {
   const [note, setNote] = useState("");
   const [tab, setTab] = useState<"pad" | "notes">("pad");
+  // 2K.1: inline rename + a one-tap inline confirm for 86 (an Exited pane skips the confirm).
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(st.name);
+  const [confirm86, setConfirm86] = useState(false);
+  const confirm86Timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (confirm86Timer.current) clearTimeout(confirm86Timer.current); }, []);
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
   const live = st.status === "Running";
   const fg = dark ? "#ffe9c7" : INK;
-  const draft = useDraft(st.project || "default_project", st.id, isMockRef, wsRef);
+  const draft = useDraft(st.project || "default_project", st.id, isMockRef, wsRef, incomingDraft);
+  // 2K.5: shared dialog semantics — initial focus, focus trap, Escape closes (top-most only).
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
 
   const onSend = async () => {
     const ok = await draft.send();
     showToast(ok ? "Sent to the line 🔥" : "Nothing to send", ok ? "fire" : "warn");
   };
 
+  // Guard against the Enter→blur double-fire (Enter commits, then the input unmounts and its
+  // blur would commit again) — one commit per edit session.
+  const renameDone = useRef(false);
+  const commitRename = () => {
+    if (renameDone.current) return;
+    renameDone.current = true;
+    const n = nameDraft.trim();
+    setRenaming(false);
+    if (n && n !== st.name) onRename(n);
+  };
+
+  const on86 = () => {
+    // An Exited pane has nothing left to kill — 86 it without ceremony. A live one confirms once.
+    if (st.status !== "Exited" && !confirm86) {
+      setConfirm86(true);
+      if (confirm86Timer.current) clearTimeout(confirm86Timer.current);
+      confirm86Timer.current = setTimeout(() => setConfirm86(false), 3000);
+      return;
+    }
+    setConfirm86(false);
+    onStop();
+  };
+
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(42,26,16,.62)", zIndex: 200, display: "grid", placeItems: "center", padding: 24 }}>
-      <div onClick={(e) => e.stopPropagation()} className="orb-pop-in" data-testid="burner" data-burner-pane={st.id} data-status={st.status}
-        style={{ width: "min(1080px, 96vw)", height: "min(760px, 94vh)", background: dark ? "#241409" : "#fff4de", border: "4px solid " + INK, borderRadius: 16, boxShadow: "10px 10px 0 0 " + INK, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={`${st.name} — station terminal`}
+        onClick={(e) => e.stopPropagation()} className="orb-pop-in" data-testid="burner" data-burner-pane={st.id} data-status={st.status}
+        style={{ width: "min(1080px, 96vw)", height: "min(760px, 94vh)", background: dark ? "#241409" : "#fff4de", border: "4px solid " + INK, borderRadius: 16, boxShadow: "10px 10px 0 0 " + INK, display: "flex", flexDirection: "column", overflow: "hidden", outline: "none" }}>
         {/* window title bar */}
         <div style={{ padding: "11px 16px", background: accentHex, borderBottom: "3px solid " + INK, display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ display: "flex", gap: 6 }}>
@@ -138,13 +190,37 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
             <span style={{ width: 13, height: 13, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
           </div>
           <div style={{ flex: 1, textAlign: "center", lineHeight: 1.1, minWidth: 0 }}>
-            <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{st.name}</div>
+            {renaming ? (
+              <input data-testid="burner-rename-input" autoFocus value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRename();
+                  if (e.key === "Escape") { e.stopPropagation(); renameDone.current = true; setNameDraft(st.name); setRenaming(false); }
+                }}
+                onBlur={commitRename}
+                aria-label="Rename this station"
+                style={{ width: "min(360px, 90%)", padding: "3px 8px", border: "2px solid " + INK, borderRadius: 8, background: "#fff9ec", color: INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16, textAlign: "center", outline: "none" }} />
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, minWidth: 0 }}>
+                <span style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{st.name}</span>
+                <button data-testid="burner-rename" onClick={() => { renameDone.current = false; setNameDraft(st.name); setRenaming(true); }} title="Rename this station" aria-label="Rename this station"
+                  style={{ display: "grid", placeItems: "center", width: 22, height: 22, padding: 0, borderRadius: 6, border: "1.5px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", flexShrink: 0 }}>
+                  <Icon name="ticket" size={11} />
+                </button>
+              </div>
+            )}
             <div style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: INK, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>#{st.id} · {rt.label} on the {rt.burner} · {st.cwd}</div>
           </div>
           <button data-testid="burner-restart" onClick={onRestart} title="Re-fire this station (restart the process)"
             style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
             <Icon name="fire" size={13} color="#e23a3a" /> Re-fire
           </button>
+          <button data-testid="burner-86" onClick={on86} data-confirming={confirm86 || undefined}
+            title={st.status === "Exited" ? "86 this station (it already exited — straight to the freezer, recoverable)" : "86 this station (stop the process and freeze it — recoverable)"}
+            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, background: confirm86 ? "#e23a3a" : "#fff4de", color: confirm86 ? "#fff4de" : "#a8151a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
+            <Icon name="x" size={12} /> {confirm86 ? "Sure, Chef? Tap again" : "86 this station"}
+          </button>
+          <PostureChip posture={st.posture} mode={st.mode} />
           <StatusBadge status={st.status} />
         </div>
 
@@ -185,6 +261,8 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
             {tab === "pad" ? (
               <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
                 <textarea data-testid="burner-draft" value={draft.text} onChange={(e) => draft.onChange(e.target.value)}
+                  onFocus={() => { draft.focusedRef.current = true; }}
+                  onBlur={() => { draft.focusedRef.current = false; }}
                   placeholder={`Write the next order for ${st.name}, or dictate it to the Chef…`}
                   style={{ flex: 1, minHeight: 120, resize: "none", padding: 12, border: "2px solid " + INK, borderRadius: 10, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, lineHeight: 1.5, outline: "none", boxShadow: "inset 2px 2px 0 0 #00000010" }} />
                 {voiceCues && <div style={{ marginTop: 8 }}><VoiceCue phrase="send it to the line" dark={dark} tone="live" /></div>}

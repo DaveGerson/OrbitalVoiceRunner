@@ -74,6 +74,18 @@ export interface OrbitalE2EHooks {
    * render-states are staged directly. No-op for hosts that don't wire `setConnMock` (classic app).
    */
   setConnMock: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
+  /**
+   * Phase 2 2K.3: stage a server-pushed `draft_updated` for a pane (the harness is client-only —
+   * no real WS). Drives the same per-pane mirror state the live socket writes, so the e2e can
+   * pin the Order Pad's focus-guard. No-op for hosts that don't wire `setPaneDraftMock` (classic).
+   */
+  injectDraftUpdate: (paneId: string, text: string) => void;
+  /**
+   * Phase 2 2K.1: flip a seeded mock pane's status (e.g. → "Exited") so lifecycle affordances
+   * that key on status (the board's "Clear exited" chip, the burner's confirm-free 86 on an
+   * Exited pane) render deterministically. Re-seeds both default panes with the override applied.
+   */
+  setPaneStatusMock: (paneId: string, status: "Running" | "Idle" | "Exited") => void;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -105,6 +117,8 @@ export interface E2EHarnessDeps {
    * `setConnMock` hook. Optional so the classic App.tsx call site compiles/behaves unchanged.
    */
   setConnMock?: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
+  /** 2K.3 (OPTIONAL — kitchen only): receives staged `draft_updated` frames from `injectDraftUpdate`. */
+  setPaneDraftMock?: (paneId: string, text: string) => void;
 }
 
 /**
@@ -372,6 +386,20 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       // the host app doesn't wire setConnMock (classic).
       setConnMock: (s) => {
         deps.setConnMock?.(s);
+      },
+
+      // 2K.3: stage a draft_updated frame for the Order Pad mirror (kitchen only).
+      injectDraftUpdate: (paneId, text) => {
+        deps.setPaneDraftMock?.(paneId, text);
+      },
+
+      // 2K.1: re-seed the two default panes with one pane's status overridden.
+      setPaneStatusMock: (paneId, status) => {
+        const t1 = mockTerminal();
+        const t2 = mockTerminal("GUARDED", DEFAULT_MOCK_GATES, MOCK_TERMINAL_ID_2);
+        if (paneId === MOCK_TERMINAL_ID) t1.status = status;
+        if (paneId === MOCK_TERMINAL_ID_2) t2.status = status;
+        deps.setTerminals([t1, t2]);
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;
