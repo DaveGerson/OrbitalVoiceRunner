@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
 import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHandoff, HandoffState } from "./types";
-import { pruneOnBoot, type PruneOpts } from "./retention";
+import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
 
 /**
  * One persisted row of the unified ACTION LOG (schema v6, PLM2). Mirrors F1's ActionAuditRow call
@@ -389,25 +389,42 @@ export class JanusStore {
 
   savePane(pane: StoredPane): void {
     const now = Date.now();
-    this.recordActivity(
-      { type: EVENT_TYPES.PANE_CREATED, project_id: pane.workspace_id, pane_id: pane.pane_id, summary: `pane ${pane.name}` },
-      (db) => db.prepare(
-        `INSERT INTO panes(pane_id,workspace_id,name,runtime_type,tool_preset,permissions_mode,
-           session_id,last_known_state,is_busy,alive,context_size,last_status_change_at,
-           last_command,scrollback_path,created_at,updated_at)
-         VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,
-           @session_id,@last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,
-           @last_command,@scrollback_path,@created_at,@updated_at)
-         ON CONFLICT(pane_id,workspace_id) DO UPDATE SET name=excluded.name,
-           runtime_type=excluded.runtime_type, tool_preset=excluded.tool_preset,
-           permissions_mode=excluded.permissions_mode, session_id=excluded.session_id,
-           last_known_state=excluded.last_known_state, is_busy=excluded.is_busy, alive=excluded.alive,
-           context_size=excluded.context_size, last_status_change_at=excluded.last_status_change_at,
-           last_command=excluded.last_command, scrollback_path=excluded.scrollback_path,
-           updated_at=excluded.updated_at`
-      ).run({ ...pane, is_busy: pane.is_busy?1:0, alive: pane.alive?1:0,
-              created_at: pane.created_at || now, updated_at: now })
-    );
+    const upsert = (db: Database.Database) => db.prepare(
+      `INSERT INTO panes(pane_id,workspace_id,name,runtime_type,tool_preset,permissions_mode,
+         session_id,last_known_state,is_busy,alive,context_size,last_status_change_at,
+         last_command,scrollback_path,created_at,updated_at)
+       VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,
+         @session_id,@last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,
+         @last_command,@scrollback_path,@created_at,@updated_at)
+       ON CONFLICT(pane_id,workspace_id) DO UPDATE SET name=excluded.name,
+         runtime_type=excluded.runtime_type, tool_preset=excluded.tool_preset,
+         permissions_mode=excluded.permissions_mode, session_id=excluded.session_id,
+         last_known_state=excluded.last_known_state, is_busy=excluded.is_busy, alive=excluded.alive,
+         context_size=excluded.context_size, last_status_change_at=excluded.last_status_change_at,
+         last_command=excluded.last_command, scrollback_path=excluded.scrollback_path,
+         updated_at=excluded.updated_at`
+    ).run({ ...pane, is_busy: pane.is_busy?1:0, alive: pane.alive?1:0,
+            created_at: pane.created_at || now, updated_at: now });
+    // 4E.3a: PANE_CREATED fires ONLY on a genuine first insert. This method used to emit
+    // it (+ an events_fts row) unconditionally per call — and listPanes()→syncLedger()→
+    // updatePane→savePane runs per voice turn, so the events table filled with bogus
+    // 'created' spam. The existence pre-check and the event+insert run in ONE transaction
+    // (recordActivity nests as a savepoint), so the audit semantics for real creations —
+    // from every path that lands here — are unchanged and atomic.
+    const tx = this.db.transaction(() => {
+      const exists = this.db.prepare(
+        "SELECT 1 FROM panes WHERE pane_id=? AND workspace_id=?"
+      ).get(pane.pane_id, pane.workspace_id);
+      if (exists) {
+        upsert(this.db);
+      } else {
+        this.recordActivity(
+          { type: EVENT_TYPES.PANE_CREATED, project_id: pane.workspace_id, pane_id: pane.pane_id, summary: `pane ${pane.name}` },
+          upsert
+        );
+      }
+    });
+    tx();
   }
 
   getPanes(workspaceId: string): Record<string, StoredPane> {
@@ -547,6 +564,17 @@ export class JanusStore {
 
   bootMaintenance(opts: PruneOpts): void {
     pruneOnBoot(this.db, opts);
+  }
+
+  /**
+   * 4E.3b: one tick of the PERIODIC retention sweep (armed in server.ts on an unref'd
+   * JANUS_RETENTION_SWEEP_MS interval). Batched deletes — see pruneIncremental. Guarded
+   * on db.open: the unref'd timer can fire during process teardown after the
+   * process-exit handler closed the shared store.
+   */
+  sweepMaintenance(opts: SweepOpts): SweepResult {
+    if (!this.db.open) return { deleted: {}, more: false };
+    return pruneIncremental(this.db, opts);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -748,15 +776,17 @@ export class JanusStore {
     return this.getNotes({ projectId, paneId }).map(n => n.text).reverse();
   }
 
-  /** Project a StoredPane into the legacy PaneMeta shape (with notes[]). */
-  private toPaneMeta(p: StoredPane): import("../types").PaneMeta {
+  /** Project a StoredPane into the legacy PaneMeta shape (with notes[]).
+   *  4E.4: `notes` may be pre-fetched by a batched caller (the `workspaces` projection);
+   *  per-call paths keep the per-pane query. Output shape is identical either way. */
+  private toPaneMeta(p: StoredPane, notes?: string[]): import("../types").PaneMeta {
     return {
       pane_id: p.pane_id,
       name: p.name,
       alive: p.alive,
       last_command: p.last_command ?? undefined,
       last_known_state: p.last_known_state,
-      notes: this.paneNoteStrings(p.workspace_id, p.pane_id),
+      notes: notes ?? this.paneNoteStrings(p.workspace_id, p.pane_id),
       session_id: p.session_id,
       context_size: p.context_size,
       is_busy: p.is_busy,
@@ -794,13 +824,61 @@ export class JanusStore {
     return id ? this.getProject(id) : null;
   }
 
-  /** All projects keyed by id, in legacy Workspace shape (read snapshot). */
+  /** All projects keyed by id, in legacy Workspace shape (read snapshot).
+   *
+   *  4E.4: built in ONE pass — three queries total (projects, panes, notes) assembled in
+   *  JS. The old shape did getProject per id → getPanes per project → getNotes per pane
+   *  (N+1 synchronous queries), and broadcastLedgerUpdate calls this getter on ~40
+   *  mutation sites. Output is byte-identical to the per-call assembly (the golden suite
+   *  tests/test_store_projection.ts pins deepStrictEqual against getProject-per-id):
+   *   - projects iterate in created_at order; panes in created_at order per project;
+   *   - notes replicate getNotes' ORDER BY created_at DESC then .reverse() (ASC), with
+   *     project notes = rows with no pane_id and pane notes partitioned per (project,pane);
+   *   - orphan pane notes (their pane is gone) stay invisible, exactly as before. */
   get workspaces(): Record<string, import("../types").Workspace> {
     const out: Record<string, import("../types").Workspace> = {};
-    const ids = (this.db.prepare("SELECT id FROM projects ORDER BY created_at").all() as any[]).map(r => r.id);
-    for (const id of ids) {
-      const ws = this.getProject(id);
-      if (ws) out[id] = ws;
+    const projRows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as any[];
+    if (projRows.length === 0) return out;
+    const paneRows = this.db.prepare("SELECT * FROM panes ORDER BY created_at").all() as any[];
+    const noteRows = this.db.prepare("SELECT * FROM notes ORDER BY created_at DESC").all() as any[];
+
+    // Partition notes once. Partitioning preserves the DESC order within each group, so a
+    // trailing reverse() reproduces the legacy per-group ASC lists exactly.
+    const projectNotes = new Map<string, string[]>();
+    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
+    for (const n of noteRows) {
+      if (n.pane_id) {
+        const key = `${n.project_id} ${n.pane_id}`;
+        const arr = paneNotes.get(key);
+        if (arr) arr.push(n.text); else paneNotes.set(key, [n.text]);
+      } else {
+        const arr = projectNotes.get(n.project_id);
+        if (arr) arr.push(n.text); else projectNotes.set(n.project_id, [n.text]);
+      }
+    }
+
+    const panesByProject = new Map<string, any[]>();
+    for (const r of paneRows) {
+      const arr = panesByProject.get(r.workspace_id);
+      if (arr) arr.push(r); else panesByProject.set(r.workspace_id, [r]);
+    }
+
+    for (const r of projRows) {
+      const panes: Record<string, import("../types").PaneMeta> = {};
+      for (const paneRow of panesByProject.get(r.id) ?? []) {
+        const sp = this.hydratePane(paneRow);
+        const notes = (paneNotes.get(`${r.id} ${sp.pane_id}`) ?? []).slice().reverse();
+        panes[sp.pane_id] = this.toPaneMeta(sp, notes);
+      }
+      out[r.id] = {
+        id: r.id,
+        name: r.name,
+        directory: r.directory,
+        summary: r.summary ?? "",
+        notes: (projectNotes.get(r.id) ?? []).slice().reverse(),
+        panes,
+        keyTerms: this.parseJSON(r.key_terms, [] as string[]),
+      } as import("../types").Workspace;
     }
     return out;
   }

@@ -257,8 +257,39 @@ export interface HistoryEntry {
   finalResponse?: string;
 }
 
+// 4E.1: HistoryManager used to fs.readFileSync + JSON.parse the WHOLE multi-pane
+// .janus_history.json, mutate, JSON.stringify(...,null,2) + writeFileSync — on EVERY PTY
+// data chunk (src/observe/index.ts onOutput → appendOutputToLastCommand). A chatty pane
+// was continuous O(file-size) synchronous I/O blocking the loop that serves voice/WS/HTTP,
+// and the write was non-atomic. Mutations now land in an in-memory DIRTY cache and flush
+// DEBOUNCED (JANUS_HISTORY_FLUSH_MS, default 500ms after the last mutation, with a
+// JANUS_HISTORY_FLUSH_MAX_MS = 2s maximum linger so a perpetually-chatty pane still
+// persists), ASYNC (fs.promises), and ATOMIC (write tmp + rename). loadHistory serves
+// dirty panes from the cache, so a read after a write but before the flush is NEVER stale.
+// The on-disk format is unchanged (operators may have tooling): one pretty-printed JSON
+// object keyed by terminalId. The flush MERGES over the on-disk file so foreign pane keys
+// written by the inline action-def ports (src/actions/defs/{reads,panes_rest,handoff}.ts)
+// survive. server close() awaits flushAll(); an abrupt kill loses at most the linger
+// window (~2s) of output tail — history is a display/recall buffer, not a ledger.
 export class HistoryManager {
   private static instance: HistoryManager;
+
+  // Flush policy (env-tunable so the unit suite can compress the windows).
+  private readonly flushDebounceMs = Math.max(10, Number(process.env.JANUS_HISTORY_FLUSH_MS) || 500);
+  private readonly flushMaxLingerMs = Math.max(
+    this.flushDebounceMs,
+    Number(process.env.JANUS_HISTORY_FLUSH_MAX_MS) || 2000,
+  );
+
+  // Per-file (cwd can change across in-process test servers) dirty state:
+  // filePath -> terminalId -> the latest pruned entries awaiting flush. saveHistory always
+  // installs a FRESH array, so reference equality tells the flusher whether a key was
+  // re-dirtied while an async flush was in flight.
+  private dirty = new Map<string, Map<string, HistoryEntry[]>>();
+  private debounceTimers = new Map<string, NodeJS.Timeout>();
+  private firstDirtyAt = new Map<string, number>();
+  private flushChain = new Map<string, Promise<void>>();
+  private tmpSeq = 0;
 
   private constructor() {}
 
@@ -279,50 +310,47 @@ export class HistoryManager {
     return { maxCmds, maxOutput };
   }
 
-  public loadHistory(terminalId: string): HistoryEntry[] {
-    const filePath = this.getFilePath();
-    const { maxCmds } = this.getLimits();
+  /** Parse the on-disk multi-pane map; {} on missing/corrupt (legacy loadHistory behavior). */
+  private readFileMap(filePath: string): Record<string, HistoryEntry[]> {
     try {
       if (fs.existsSync(filePath)) {
-        const data = fs.readFileSync(filePath, "utf-8");
-        const parsed = JSON.parse(data);
+        const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const list = parsed[terminalId];
-          if (Array.isArray(list)) {
-            return list.slice(-maxCmds);
-          }
+          return parsed as Record<string, HistoryEntry[]>;
         }
       }
     } catch (e) {
       // Return empty if file not found or corrupted
     }
-    return [];
+    return {};
+  }
+
+  public loadHistory(terminalId: string): HistoryEntry[] {
+    const filePath = this.getFilePath();
+    const { maxCmds } = this.getLimits();
+    // Dirty-first: an unflushed mutation must be visible immediately (never stale).
+    // Entries are copied so callers mutating the result (addCommand/onIdle) can't alias
+    // the cache — exactly the isolation the per-call JSON.parse used to provide.
+    const dirty = this.dirty.get(filePath)?.get(terminalId);
+    if (dirty) return dirty.slice(-maxCmds).map(entry => ({ ...entry }));
+    const list = this.readFileMap(filePath)[terminalId];
+    return Array.isArray(list) ? list.slice(-maxCmds) : [];
   }
 
   public saveHistory(terminalId: string, history: HistoryEntry[]): void {
     const filePath = this.getFilePath();
     const { maxCmds, maxOutput } = this.getLimits();
-    try {
-      const pruned = history.slice(-maxCmds).map(entry => ({
-        ...entry,
-        output: (entry.output || "").slice(-maxOutput)
-      }));
-
-      let allHistory: Record<string, HistoryEntry[]> = {};
-      if (fs.existsSync(filePath)) {
-        try {
-          const data = fs.readFileSync(filePath, "utf-8");
-          const parsed = JSON.parse(data);
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            allHistory = parsed;
-          }
-        } catch (e) {}
-      }
-      allHistory[terminalId] = pruned;
-      fs.writeFileSync(filePath, JSON.stringify(allHistory, null, 2), "utf-8");
-    } catch (e) {
-      console.warn(`[HistoryManager] Failed to save history to ${filePath}:`, e);
+    const pruned = history.slice(-maxCmds).map(entry => ({
+      ...entry,
+      output: (entry.output || "").slice(-maxOutput)
+    }));
+    let perFile = this.dirty.get(filePath);
+    if (!perFile) {
+      perFile = new Map();
+      this.dirty.set(filePath, perFile);
     }
+    perFile.set(terminalId, pruned);
+    this.scheduleFlush(filePath);
   }
 
   public addCommand(terminalId: string, command: string) {
@@ -344,6 +372,82 @@ export class HistoryManager {
       lastEntry.output = ((lastEntry.output || "") + chunk).slice(-maxOutput);
       this.saveHistory(terminalId, history);
     }
+  }
+
+  /** Debounce per file; the max-linger deadline caps how long a chatty pane can defer. */
+  private scheduleFlush(filePath: string): void {
+    const now = Date.now();
+    if (!this.firstDirtyAt.has(filePath)) this.firstDirtyAt.set(filePath, now);
+    const lingerDeadline = this.firstDirtyAt.get(filePath)! + this.flushMaxLingerMs;
+    const delay = Math.max(0, Math.min(this.flushDebounceMs, lingerDeadline - now));
+    const prev = this.debounceTimers.get(filePath);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.debounceTimers.delete(filePath);
+      void this.flushFile(filePath);
+    }, delay);
+    timer.unref?.(); // never holds the process open; close() flushes the remainder
+    this.debounceTimers.set(filePath, timer);
+  }
+
+  /** Serialize flushes per file (a rename racing a rename is how files get corrupted). */
+  private flushFile(filePath: string): Promise<void> {
+    const prev = this.flushChain.get(filePath) ?? Promise.resolve();
+    const next = prev
+      .then(() => this.doFlush(filePath))
+      .catch((e) => {
+        // Same failure posture as the legacy writer: warn and keep serving from memory
+        // (the dirty entries survive, so the next mutation/flush retries).
+        console.warn(`[HistoryManager] Failed to save history to ${filePath}:`, e);
+      });
+    this.flushChain.set(filePath, next);
+    return next;
+  }
+
+  private async doFlush(filePath: string): Promise<void> {
+    const perFile = this.dirty.get(filePath);
+    if (!perFile || perFile.size === 0) {
+      this.firstDirtyAt.delete(filePath);
+      return;
+    }
+    const snapshot = new Map(perFile); // terminalId -> array reference at flush time
+    this.firstDirtyAt.delete(filePath); // mutations during the flush open a new linger window
+
+    // Merge over the on-disk file so out-of-band writers' OTHER pane keys survive.
+    let allHistory: Record<string, HistoryEntry[]> = {};
+    try {
+      const data = await fs.promises.readFile(filePath, "utf-8");
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) allHistory = parsed;
+    } catch {
+      // missing/corrupt file: start fresh (legacy behavior)
+    }
+    for (const [terminalId, entries] of snapshot) allHistory[terminalId] = entries;
+
+    // Atomic: write a unique sibling tmp, then rename over the live file.
+    const tmpPath = `${filePath}.${process.pid}.${++this.tmpSeq}.tmp`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(allHistory, null, 2), "utf-8");
+    try {
+      await fs.promises.rename(tmpPath, filePath);
+    } catch (e) {
+      try { await fs.promises.unlink(tmpPath); } catch { /* best-effort cleanup */ }
+      throw e;
+    }
+
+    // Clear ONLY keys not re-dirtied during the async write (saveHistory always installs
+    // a new array, so reference equality is exact).
+    for (const [terminalId, entries] of snapshot) {
+      if (perFile.get(terminalId) === entries) perFile.delete(terminalId);
+    }
+    if (perFile.size === 0) this.dirty.delete(filePath);
+  }
+
+  /** Flush every pending mutation now — the server close() path. */
+  public async flushAll(): Promise<void> {
+    const files = new Set([...this.dirty.keys(), ...this.debounceTimers.keys()]);
+    for (const timer of this.debounceTimers.values()) clearTimeout(timer);
+    this.debounceTimers.clear();
+    await Promise.all([...files].map((filePath) => this.flushFile(filePath)));
   }
 }
 
@@ -1172,6 +1276,27 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // keep the returned handle so the close() handler can clearInterval it.
   const approvalSweepTimer = gating.startSweepTimer();
 
+  // 4E.3b: periodic incremental retention. bootMaintenance (module scope, once per process)
+  // used to be the ONLY prune — an always-on server never reclaimed events/approvals/
+  // action_log rows, and the eventual boot prune after long uptime was one giant blocking
+  // delete. This unref'd per-server interval (default 10min, JANUS_RETENTION_SWEEP_MS)
+  // runs sweepMaintenance — BATCHED deletes (≤1000 rows per table per tick) so a sweep can
+  // never stall the serving loop; a backlog simply drains across ticks. Same TTLs as the
+  // boot prune (+ the 4E.3c categories: claimed pending_approvals, action_log 30d TTL).
+  // Cleared in close(); sweepMaintenance itself is a no-op once the shared store closes.
+  const RETENTION_SWEEP_MS = Math.max(30_000, Number(process.env.JANUS_RETENTION_SWEEP_MS) || 600_000);
+  let retentionSweepTimer: NodeJS.Timeout | null = null;
+  if (store) {
+    retentionSweepTimer = setInterval(() => {
+      try {
+        store!.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14 });
+      } catch (e) {
+        console.error("[STORE] periodic retention sweep failed (will retry next tick):", e);
+      }
+    }, RETENTION_SWEEP_MS);
+    retentionSweepTimer.unref?.();
+  }
+
   // dec-5 (DBT5): the GEMINI LIVE VOICE SESSION — the entire `wss.on("connection", ...)` envelope
   // (the resumption-token persist/rehydrate, the per-connection live-session lifecycle, the gated
   // voice approval/dispatch path, the per-call ActionContext factory, the bounded auto-reconnect, and
@@ -1376,12 +1501,21 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const close = async (): Promise<void> => {
     announcementBus.stop(); // WS-D: clear coalescing/rate-limit timers
     clearInterval(approvalSweepTimer); // WS-E.3: clear the TTL sweep
+    if (retentionSweepTimer) clearInterval(retentionSweepTimer); // 4E.3b: stop the retention sweep
     for (const term of Object.values(manager.terminals)) {
       try {
         await term.stop();
       } catch (err) {
         console.error(`Error stopping terminal ${term.terminalId}:`, err);
       }
+    }
+    // 4E.1: drain the debounced history cache — the last output tail of every pane must
+    // hit disk before the process can exit. (After the terminal stop loop so the final
+    // PTY chunks have already been appended.)
+    try {
+      await HistoryManager.getInstance().flushAll();
+    } catch (err) {
+      console.warn("[HistoryManager] close-time flush failed:", err);
     }
     // Force every live WS client + lingering keep-alive socket to CLOSED before we
     // resolve. Otherwise wss/server.close() leave half-closed libuv handles in the

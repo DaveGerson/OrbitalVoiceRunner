@@ -1,5 +1,21 @@
-import { execSync } from "child_process";
+import { execFile } from "child_process";
+import * as fs from "fs";
 import { SHELL_COMMS } from "./statusConstants";
+
+/**
+ * 4E.2: promise wrapper around execFile so the platform probes never block the event
+ * loop. The old execSync calls ran a FULL process-list scan synchronously on the 500ms
+ * probe interval per pane — 0.5-2s of blocked loop per tick on a cold Windows CIM query.
+ * No shell is involved (args array), default maxBuffer matches the old execSync default.
+ */
+function execFileText(cmd: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { encoding: "utf-8", timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
 
 /**
  * StatusProbe — the authoritative busy/idle signal source (WS-C design §2.0).
@@ -25,8 +41,15 @@ export interface StatusProbe {
   /**
    * shellPid = the PTY's shell/agent root pid. Returns whether a foreground
    * child command is currently running under it.
+   *
+   * 4E.2: the result may be a Promise — every PLATFORM probe is async (execFile /
+   * fs.promises) so a slow process-list scan never blocks the serving loop. A plain
+   * (sync) ProbeResult is still accepted: FallbackProbe and the injected test probes
+   * return one, and runProbeTick applies a sync result synchronously, preserving the
+   * status-machine suites' exact timing. The consumer (UniversalTerminal.runProbeTick)
+   * skips ticks while an async probe is in flight, so slow probes never stack.
    */
-  probe(shellPid: number): ProbeResult;
+  probe(shellPid: number): ProbeResult | Promise<ProbeResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,18 +347,22 @@ function treeHasNonShellDescendant(recs: WinProcRec[], root: number): boolean {
 // ---------------------------------------------------------------------------
 
 export class LinuxProcProbe implements StatusProbe {
-  probe(shellPid: number): ProbeResult {
+  async probe(shellPid: number): Promise<ProbeResult> {
     try {
-      const fs = require("fs") as typeof import("fs");
-      const pids: string[] = fs.readdirSync("/proc").filter((d: string) => /^\d+$/.test(d));
-      const entries: string[] = [];
-      for (const pid of pids) {
-        try {
-          entries.push(fs.readFileSync(`/proc/${pid}/stat`, "utf-8"));
-        } catch {
-          // process may have exited mid-scan; ignore
-        }
-      }
+      // Top-level `import * as fs` (the old lazy require("fs") is undefined under ESM/tsx,
+      // which silently degraded every Linux probe to fallback).
+      const pids = (await fs.promises.readdir("/proc")).filter((d: string) => /^\d+$/.test(d));
+      const reads = await Promise.all(
+        pids.map(async (pid) => {
+          try {
+            return await fs.promises.readFile(`/proc/${pid}/stat`, "utf-8");
+          } catch {
+            // process may have exited mid-scan; ignore
+            return null;
+          }
+        })
+      );
+      const entries = reads.filter((e): e is string => e !== null);
       return { hasRunningChild: parseProcTree(entries, shellPid), confidence: "authoritative" };
     } catch {
       return { hasRunningChild: false, confidence: "fallback" };
@@ -344,9 +371,9 @@ export class LinuxProcProbe implements StatusProbe {
 }
 
 export class MacPsProbe implements StatusProbe {
-  probe(shellPid: number): ProbeResult {
+  async probe(shellPid: number): Promise<ProbeResult> {
     try {
-      const raw = execSync("ps -o pid=,ppid=,stat=,comm= -ax", { encoding: "utf-8", timeout: 2000 });
+      const raw = await execFileText("ps", ["-o", "pid=,ppid=,stat=,comm=", "-ax"], 2000);
       return { hasRunningChild: parsePsTree(raw, shellPid), confidence: "authoritative" };
     } catch {
       return { hasRunningChild: false, confidence: "fallback" };
@@ -355,7 +382,7 @@ export class MacPsProbe implements StatusProbe {
 }
 
 export class WindowsProbe implements StatusProbe {
-  probe(shellPid: number): ProbeResult {
+  async probe(shellPid: number): Promise<ProbeResult> {
     // P1: prefer PowerShell Get-CimInstance — `wmic` is deprecated and ABSENT by
     // default on Windows 11 24H2+ / Server 2025, where the old wmic call throws
     // and silently downgrades to fallback. ConvertTo-Csv yields the deterministic
@@ -367,18 +394,20 @@ export class WindowsProbe implements StatusProbe {
         "Get-CimInstance Win32_Process | " +
         "Select-Object Name,ProcessId,ParentProcessId | " +
         "ConvertTo-Csv -NoTypeInformation";
-      const raw = execSync(
-        `powershell -NoProfile -NonInteractive -Command "${psCmd}"`,
-        { encoding: "utf-8", timeout: 4000 }
+      const raw = await execFileText(
+        "powershell",
+        ["-NoProfile", "-NonInteractive", "-Command", psCmd],
+        4000
       );
       return { hasRunningChild: parseProcessList(raw, shellPid), confidence: "authoritative" };
     } catch {
       // PowerShell unavailable/blocked — fall back to legacy wmic CSV.
     }
     try {
-      const raw = execSync(
-        "wmic process get Name,ParentProcessId,ProcessId /format:csv",
-        { encoding: "utf-8", timeout: 3000 }
+      const raw = await execFileText(
+        "wmic",
+        ["process", "get", "Name,ParentProcessId,ProcessId", "/format:csv"],
+        3000
       );
       return { hasRunningChild: parseProcessList(raw, shellPid), confidence: "authoritative" };
     } catch {
