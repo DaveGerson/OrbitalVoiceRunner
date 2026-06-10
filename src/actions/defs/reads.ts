@@ -37,6 +37,7 @@ import type { GateValue } from "../../types";
 import { ALWAYS_ALLOWED } from "../types";
 import { ALL_CAPABILITIES } from "../../gateSurface";
 import { stripAnsiSequences, redactSecrets } from "../../terminal";
+import { getHistoryBridge } from "../../historyBridge";
 import { serializePending } from "../../pendingApprovals";
 
 /** Empty-params schema (pins declarations -> properties {}), shared by the no-arg reads. */
@@ -93,19 +94,27 @@ export const getPaneCommandHistory: ActionDef<typeof PaneIdParams> = {
     // and cannot be imported without booting the listener; this reproduces its loadHistory exactly.
     const maxCmds = ctx.manager.settings?.advanced?.historyMaxCommands ?? 50;
     let history: HistoryEntry[] = [];
-    try {
-      const filePath = path.join(process.cwd(), ".janus_history.json");
-      if (fs.existsSync(filePath)) {
-        const data = fs.readFileSync(filePath, "utf-8");
-        const parsed = JSON.parse(data);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const list = parsed[targetId];
-          if (Array.isArray(list)) history = list.slice(-maxCmds);
+    // Bridge-first (PR #68 review): in a running server the HistoryManager's dirty cache is the
+    // truth — the file can be up to the flush linger (~2s) stale. Fall back to the faithful file
+    // port only when no server registered the bridge (bare def tests).
+    const bridge = getHistoryBridge();
+    if (bridge) {
+      history = (bridge.loadHistory(targetId) as HistoryEntry[]).slice(-maxCmds);
+    } else {
+      try {
+        const filePath = path.join(process.cwd(), ".janus_history.json");
+        if (fs.existsSync(filePath)) {
+          const data = fs.readFileSync(filePath, "utf-8");
+          const parsed = JSON.parse(data);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const list = parsed[targetId];
+            if (Array.isArray(list)) history = list.slice(-maxCmds);
+          }
         }
+      } catch {
+        // missing / corrupt file -> empty history
+        history = [];
       }
-    } catch {
-      // missing / corrupt file -> empty history
-      history = [];
     }
     const conciseHistory = history.map((entry) => ({
       command: entry.command,
@@ -362,18 +371,25 @@ export const getTerminalHistory: ActionDef<typeof PaneIdParams> = {
     const targetId = args.pane_id;
     const maxCmds = ctx.manager.settings?.advanced?.historyMaxCommands ?? 50;
     let history: HistoryEntry[] = [];
-    try {
-      const filePath = path.join(process.cwd(), ".janus_history.json");
-      if (fs.existsSync(filePath)) {
-        const data = fs.readFileSync(filePath, "utf-8");
-        const parsed = JSON.parse(data);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const list = parsed[targetId];
-          if (Array.isArray(list)) history = list.slice(-maxCmds);
+    // Bridge-first (PR #68 review): the dirty cache is the truth in a running server; the file
+    // can be up to the flush linger (~2s) stale. File port is the no-server test fallback.
+    const bridge = getHistoryBridge();
+    if (bridge) {
+      history = (bridge.loadHistory(targetId) as HistoryEntry[]).slice(-maxCmds);
+    } else {
+      try {
+        const filePath = path.join(process.cwd(), ".janus_history.json");
+        if (fs.existsSync(filePath)) {
+          const data = fs.readFileSync(filePath, "utf-8");
+          const parsed = JSON.parse(data);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const list = parsed[targetId];
+            if (Array.isArray(list)) history = list.slice(-maxCmds);
+          }
         }
+      } catch {
+        history = [];
       }
-    } catch {
-      history = [];
     }
     // RAW: the entries are returned verbatim (no concise/redacted mapping) — the UI history panel shape.
     return { kind: "ok", output: history };

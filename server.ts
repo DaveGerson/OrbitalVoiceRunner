@@ -7,6 +7,7 @@ import http from "http";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
+import { registerHistoryBridge } from "./src/historyBridge";
 import { PaneSignalBus } from "./src/paneSignalBus";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
@@ -374,6 +375,13 @@ export class HistoryManager {
     }
   }
 
+  /** Clear ONE pane's history — in the dirty cache AND (via the flush) on disk. Installing an
+   *  empty dirty array means the clear WINS over any entries already pending flush, closing the
+   *  review-flagged race where a def-level direct file clear was resurrected by a pending flush. */
+  public clearHistory(terminalId: string): void {
+    this.saveHistory(terminalId, []);
+  }
+
   /** Debounce per file; the max-linger deadline caps how long a chatty pane can defer. */
   private scheduleFlush(filePath: string): void {
     const now = Date.now();
@@ -450,6 +458,11 @@ export class HistoryManager {
     await Promise.all([...files].map((filePath) => this.flushFile(filePath)));
   }
 }
+
+// Register the singleton on the history bridge so the action defs (which cannot import server.ts
+// without booting a listener) route reads/writes/clears through the SAME dirty cache instead of
+// racing the debounced flush with direct file I/O (review block on PR #68).
+registerHistoryBridge(HistoryManager.getInstance());
 
 // WS-M/Handoffs: the persistent JanusStore (SQLite). better-sqlite3 loads cleanly under tsx
 // (confirmed by the store unit tests + smoke), so a static import is fine here — unlike node-pty

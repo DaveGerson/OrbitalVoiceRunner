@@ -178,3 +178,49 @@ describe("4E.1 HistoryManager debounced/atomic flush", () => {
     assert.ok(String(parsed.t3[0].output).endsWith("+more"), "the dirty pane's mutation landed too");
   });
 });
+
+// Review block on PR #68: a def-level direct file write of a CLEAR during the flush window was
+// silently RESURRECTED when the pending flush merged the dirty cache back over the file. The fix
+// routes defs through src/historyBridge.ts; HistoryManager.clearHistory(tid) wins over any
+// pending dirty entries for that pane. PIN both the manager method and the bridge registration.
+describe("4E.1-fix: clear during the flush window is NOT resurrected", () => {
+  let hm: any;
+  let tmpDir: string;
+  let prevCwd: string;
+
+  before(async () => {
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-histclear-"));
+    process.chdir(tmpDir);
+    const serverMod = await import("../server");
+    hm = serverMod.HistoryManager.getInstance();
+  });
+
+  after(async () => {
+    try { await hm.flushAll?.(); } catch { /* noop */ }
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("clearHistory(tid) beats a pending dirty flush (no resurrection)", async () => {
+    hm.addCommand("clr1", "echo doomed");           // dirty entry, flush pending
+    hm.clearHistory("clr1");                         // operator clears DURING the window
+    await hm.flushAll();                             // force every pending flush to land
+    const parsed = readHistoryFile();
+    assert.deepStrictEqual(parsed.clr1 ?? [], [],
+      "a cleared pane must stay cleared after the pending flush lands");
+    assert.deepStrictEqual(hm.loadHistory("clr1"), [],
+      "the cache view agrees (no dirty resurrection)");
+  });
+
+  it("the server registers itself on the history bridge (defs route through the cache)", async () => {
+    const { getHistoryBridge } = await import("../src/historyBridge");
+    const bridge = getHistoryBridge();
+    assert.ok(bridge, "importing server.ts must register the HistoryManager on the bridge");
+    bridge!.addCommand("clr2", "echo via-bridge");
+    assert.strictEqual(hm.loadHistory("clr2")[0]?.command, "echo via-bridge",
+      "bridge.addCommand lands in the SAME manager cache");
+    bridge!.clearHistory("clr2");
+    assert.deepStrictEqual(hm.loadHistory("clr2"), [], "bridge.clearHistory clears the cache");
+  });
+});
