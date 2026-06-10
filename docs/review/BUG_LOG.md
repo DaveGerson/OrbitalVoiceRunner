@@ -803,6 +803,21 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add a "(session only — not saved)" qualifier until persistence lands.
 - **Source gaps:** J7-G13.
 
+#### BUG-040 — Spoken approve/reject confirmations are dead code (sessionFor read after delete)
+- **Priority:** P2
+- **Category:** Sub-capable (eyes-off feedback)
+- **Journeys affected:** J2, J3.
+- **Evidence:** `applyResolution` (`src/gating/index.ts:755`) calls `resolveDecision` first,
+  which claim+deletes the approval record (`src/pendingApprovals.ts:343–371`); the store's
+  `delete()` (`src/pendingApprovals.ts:615`) also drops the session side-map entry, so
+  `sessionFor(messageId)` at `src/gating/index.ts:764` is always `undefined` and the
+  "Approving: run on pane … Dispatching now." / "Rejecting the command on pane …" pushes
+  (`src/gating/index.ts:800/806`) are skipped on EVERY terminal outcome. Operators get the
+  broadcast frames but never the spoken confirmation. Surfaced by the voice journey lane
+  (`tests/test_voice_journeys.ts`, journey-1 assertion comment).
+- **Suggested fix:** Read `sessionFor(messageId)` (and any narration context) BEFORE calling
+  `resolveDecision`, then push the narration after the resolution succeeds.
+
 ---
 
 ## 4. Systemic / Cross-Cutting Defects
