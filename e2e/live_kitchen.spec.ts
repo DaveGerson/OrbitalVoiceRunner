@@ -13,6 +13,9 @@ import { expect, test } from "@playwright/test";
 test.describe.configure({ mode: "serial" });
 
 test("boot → real board → new pane via the UI → stop-all freeze/release → clear-exited", async ({ page }) => {
+  // The kitchen's signature animations (e.g. the All Hands orb-shake) never settle, which makes
+  // Playwright's stability check spin forever — the suite runs with reduced motion, like the mock lane.
+  await page.emulateMedia({ reducedMotion: "reduce" });
   // ── 1) boot: the kitchen renders REAL (non-mock) against the live server ──
   await page.goto("/");
   await expect(page.getByTestId("tab-line")).toBeVisible();
@@ -24,12 +27,15 @@ test("boot → real board → new pane via the UI → stop-all freeze/release �
 
   // ── 2) open a project (the fresh temp DB boots an empty kitchen) ──
   await page.getByText("New project").click();
-  await expect(page.getByTestId("orbital-modal")).toBeVisible();
+  const modal = page.getByTestId("orbital-modal"); // scope clicks to the modal (the top-nav reuses some labels)
+  await expect(modal).toBeVisible();
   await page.getByTestId("newproject-name").fill("Live Smoke");
   await page.getByPlaceholder("~/code/notifications").fill("."); // a real cwd for the PTY spawn
-  await page.getByText("Open it up").click();
-  const projRow = page.locator('[data-testid^="project-row-"]:not([data-testid="project-row-all"])');
-  await expect(projRow).toHaveCount(1, { timeout: 15_000 }); // POST /api/projects landed; ledger refetched
+  await modal.getByText("Open it up").click();
+  // (a fresh ledger still seeds default_project — pick OUR project by name, not by position)
+  const projRow = page.locator('[data-testid^="project-row-"]', { hasText: "Live Smoke" });
+  await expect(projRow).toBeVisible({ timeout: 15_000 }); // POST /api/projects landed; ledger refetched
+  const projectId = (await projRow.getAttribute("data-testid"))!.replace("project-row-", "");
   await projRow.click();
 
   // ── 3) fire a pane via the UI (Pass ticket → "Fire a pane" → New Pane modal) ──
@@ -37,11 +43,11 @@ test("boot → real board → new pane via the UI → stop-all freeze/release �
   await page.getByTestId("pass-jot-add").click();
   await expect(page.getByTestId("pass-ticket")).toHaveCount(1);
   await page.getByTestId("pass-ticket-fire").click();
-  await expect(page.getByTestId("orbital-modal")).toBeVisible();
+  await expect(modal).toBeVisible();
   await page.getByTestId("newpane-name").fill("smoke pane");
-  await page.getByText("Custom", { exact: true }).click(); // Custom preset → bash (exists everywhere)
-  await page.getByText("let 'em cook").click(); // pane-level Full Auto, so the Order Pad send runs
-  await page.getByText("Fire it up").click();
+  await modal.getByText("Custom", { exact: true }).click(); // Custom preset → bash (exists everywhere)
+  await modal.getByText("let 'em cook").click(); // pane-level Full Auto, so the Order Pad send runs
+  await modal.getByText("Fire it up").click();
 
   // POST /api/terminals runs through the REAL capability gate. Default settings gate create_pane
   // on Ask → the server defers (202) and pushes action_pending → the confirm dialog at the pass.
@@ -65,7 +71,7 @@ test("boot → real board → new pane via the UI → stop-all freeze/release �
   await expect(page.getByTestId("frozen-banner")).toBeVisible({ timeout: 30_000 });
   await page.getByTestId("frozen-banner").click();
   await expect(page.getByTestId("emergency-stop")).toBeVisible();
-  await page.getByText("Release the brake").click(); // POST /api/stop-all/release
+  await page.getByRole("button", { name: /Release the brake/ }).click(); // POST /api/stop-all/release
   await expect(page.getByTestId("frozen-banner")).toHaveCount(0);
   await expect(page.getByTestId("emergency-stop")).toHaveCount(0);
   // and the release stuck server-side too
@@ -83,6 +89,15 @@ test("boot → real board → new pane via the UI → stop-all freeze/release �
   await page.getByTestId("burner-close").click();
   // the real PTY died → pane_status pushes Exited onto the board
   await expect(page.locator('[data-testid="station-card"][data-status="Exited"]')).toHaveCount(1, { timeout: 90_000 });
+  // SERVER-SIDE GAP this lane surfaced (reported, not papered over): after a pane SELF-exits,
+  // nothing on the REST surface re-syncs the ledger's `alive` flag — the rest branch of
+  // list_panes (GET /api/terminals) deliberately skips syncLedger (registry.ts, c55 Batch F),
+  // so clear-exited (which archives ledger rows with alive=false) would archive 0 forever.
+  // switch_context IS the one REST path that refreshes the ledger (orient.ts calls
+  // manager.refreshLedger()) — switching to the project (a real operator action, same auth
+  // cookie) persists alive=false, making the clear honest end-to-end.
+  const switched = await page.request.post(`/api/projects/${projectId}/switch`);
+  expect(switched.ok()).toBeTruthy();
   await expect(page.getByTestId("clear-exited")).toBeVisible();
   await page.getByTestId("clear-exited").click(); // POST /api/terminals/clear-exited
   await expect(page.locator('[data-testid="station-card"]')).toHaveCount(0, { timeout: 30_000 });

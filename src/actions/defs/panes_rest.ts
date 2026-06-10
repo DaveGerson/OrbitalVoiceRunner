@@ -375,6 +375,11 @@ export const clearExited: ActionDef<typeof ClearExitedParams> = {
     // 2S.4: frozen means frozen — this stops/drops lingering terminal objects and archives panes,
     // none of which may happen while the STOP-ALL brake is engaged (ALWAYS_ALLOWED bypasses the gate).
     if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
+    // Phase 4 live-lane finding: ws.panes[].alive is only as fresh as the last syncLedger(), and
+    // nothing on the REST surface re-syncs after a pane SELF-exits — so clear-exited read
+    // alive:true for dead panes and archived 0 forever. Force the live PTY->ledger sync first
+    // (the same seam switch_context uses, orient.ts).
+    ctx.manager.refreshLedger();
     const activeId = ctx.manager.ledger.activeProjectId || undefined;
     const ws = activeId ? ctx.manager.ledger.getProject(activeId) : null;
     if (ws) {
