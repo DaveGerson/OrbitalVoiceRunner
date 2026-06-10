@@ -8,8 +8,8 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { apiFetch } from "../utils/api";
 import { publishChunk } from "../terminalStream";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback } from "../utils/audio";
-import { playEarcon } from "../utils/earcon";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "../utils/audio";
+import { isEarconType, playEarcon } from "../utils/earcon";
 import { useE2EHarness, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
 import type {
@@ -25,6 +25,12 @@ export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inhe
 export type { TranscriptEntry };
 
 const POLL_MS = 20000;
+
+// 1B.7: long auto-executed/blocked commands are toasted — keep the chip glanceable (~80 chars).
+function truncateCmd(cmd: unknown): string {
+  const s = typeof cmd === "string" ? cmd : "";
+  return s.length > 80 ? s.slice(0, 77) + "…" : s;
+}
 
 // Mock settings seeded under ?mock=1 so the Back of House rooms (and any settings-driven surface)
 // render deterministically in the e2e harness, which is client-only (no real GET /api/settings).
@@ -58,6 +64,10 @@ export interface OrbitalData {
   isMock: boolean;
   isLive: boolean;
   voiceReconnecting: boolean;
+  /** 1B.5: TRUE only while the voice /live socket is actually OPEN ("● LIVE" gates on this). */
+  voiceConnected: boolean;
+  /** 1B.5: getUserMedia was denied/failed — the radio must say so, not claim it's listening. */
+  micBlocked: boolean;
   micMuted: boolean;
   streamConnected: boolean;
   toast: { msg: string; kind: "fire" | "warn" } | null;
@@ -66,7 +76,7 @@ export interface OrbitalData {
   setGlobalPermissionsMode: (m: GlobalMode) => void;
   setGlobalMode: (m: GlobalMode) => void;
   saveSettings: (next: SystemSettings) => void;
-  showToast: (msg: string, kind?: "fire" | "warn") => void;
+  showToast: (msg: string, kind?: "fire" | "warn", earconOverride?: Parameters<typeof playEarcon>[0] | null) => void;
   createPane: (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => void;
   createProject: (opts: { name: string; directory: string; emoji?: string; color?: string }) => void;
   updateProjectSummary: (projectId: string, summary: string) => void;
@@ -122,6 +132,10 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
   // the outbound mic frames without tearing the session down.
   const [voiceLive, setVoiceLive] = useState<boolean>(false);
   const [voiceReconnecting, setVoiceReconnecting] = useState<boolean>(false);
+  // 1B.5: LIVE means live — the chip gates on the voice socket actually being OPEN, and a denied
+  // mic must be loud (micBlocked drives the "MIC BLOCKED" chip instead of "I'm listening, Chef").
+  const [voiceConnected, setVoiceConnected] = useState<boolean>(false);
+  const [micBlocked, setMicBlocked] = useState<boolean>(false);
   const [micMuted, setMicMuted] = useState<boolean>(false);
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn" } | null>(null);
 
@@ -134,6 +148,18 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
   const voiceCuesRef = useRef<boolean>(true);
   voiceCuesRef.current = opts?.voiceCues ?? true;
   const earcon = useCallback((type: Parameters<typeof playEarcon>[0]) => { if (voiceCuesRef.current) playEarcon(type); }, []);
+  // Declared ABOVE the live-socket effect (which now references it for honest WS-driven feedback —
+  // 1B.5 mic denial, 1B.7 auto-executed/blocked/proactive toasts). `earconOverride` lets a caller
+  // pick a more specific tone than the fire→success / warn→alert default, or `null` for no tone
+  // (proactive_notification: the bus already sent its own proactive_earcon — don't double-chime).
+  const showToast = useCallback((msg: string, kind: "fire" | "warn" = "fire", earconOverride?: Parameters<typeof playEarcon>[0] | null) => {
+    setToast({ msg, kind });
+    setTimeout(() => setToast(null), 2400);
+    // Narrate every ack into the Kitchen Radio — the brief's "source of truth" — so an eyes-off chef
+    // keeps a durable, scrollable record even when off-air. Renders as a Chef de Cuisine bubble.
+    setTranscript((prev) => [...prev, { sender: "Janus" as const, text: msg, timestamp: new Date() }].slice(-50));
+    if (earconOverride !== null) earcon(earconOverride ?? (kind === "fire" ? "success" : "alert")); // audible + visible ack (gated by Voice cues)
+  }, [earcon]);
   // Voice session audio plumbing (ported from App.tsx connectLive). All per-session; torn down on stop.
   const desiredVoiceRef = useRef<boolean>(false);
   const micMutedRef = useRef<boolean>(false);
@@ -246,12 +272,32 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
     setFrozen,
     setFrozenRunning,
     setWipDrafts: () => {},
+    // 1B.1/1B.5 e2e seam: lets Playwright drive the connection truth-states the client renders
+    // (offline pill / "TUNING IN…" / "MIC BLOCKED") — the mock harness has no real sockets.
+    setConnMock: (s) => {
+      if (typeof s.stream === "boolean") setStreamConnected(s.stream);
+      if (typeof s.voice === "boolean") setVoiceConnected(s.voice);
+      if (typeof s.micBlocked === "boolean") setMicBlocked(s.micBlocked);
+    },
   });
 
   // Under the ?mock=1 harness there is no real server, so seed settings once so Back of House renders.
   useEffect(() => {
     if (isMock && !settings) setSettings(MOCK_SETTINGS);
   }, [isMock, settings]);
+
+  // 1B.1: the harness is client-only (no real /live socket), so the kitchen reads as open under
+  // ?mock=1 — the e2e setConnMock hook can still flip it to drive the offline pill.
+  useEffect(() => {
+    if (isMock) setStreamConnected(true);
+  }, [isMock]);
+
+  // 1B.6: apply the persisted playback volume (Back of House → voice volume) to the audio layer
+  // whenever settings load or change (mirrors classic App.tsx — setPlaybackVolume clamps/normalizes).
+  useEffect(() => {
+    const vol = settings?.voiceAi?.volume;
+    if (typeof vol === "number") setPlaybackVolume(vol);
+  }, [settings?.voiceAi?.volume]);
 
   // Mount: initial fetch + slow safety-net poll (the realtime push wave is P5).
   useEffect(() => {
@@ -321,7 +367,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
           }
         };
       } catch (err) {
+        // 1B.5: a denied/failed mic must be LOUD — the chip said "I'm listening, Chef" forever while
+        // nothing was captured. Flag it (KitchenRadio renders "MIC BLOCKED") and tell the operator.
         console.error("Mic capture failed to start:", err);
+        setMicBlocked(true);
+        showToast("Mic's blocked, Chef — check browser permissions.", "warn");
       }
     };
 
@@ -345,12 +395,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
 
       ws.onopen = () => {
         attempt = 0;
-        if (voice) { setVoiceLive(true); setVoiceReconnecting(false); }
+        if (voice) { setVoiceLive(true); setVoiceConnected(true); setVoiceReconnecting(false); }
         else setStreamConnected(true);
         // Re-assert the open pane so operator raw-input / draft writes target it through the gate.
         if (activeTerminalIdRef.current && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
         }
+        // 1B.1: a reconnect must RESYNC, not just re-arm — anything missed while dark (board,
+        // pending chips, freeze state, settings) is refetched the moment the socket is back.
+        refetchAll();
         if (voice && captureCtx) startMic(ws, captureCtx);
       };
       ws.onmessage = (event) => {
@@ -371,7 +424,14 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
             refetchLedger();
             break;
           case "settings_updated":
-            if (msg.settings) setSettings(msg.settings as SystemSettings);
+            if (msg.settings) {
+              setSettings(msg.settings as SystemSettings);
+              // 1B.4: propagate the authoritative mute state so a model-driven set_voice_mute
+              // actually gates mic capture (the processor reads micMutedRef) — mirrors classic
+              // App.tsx. The !== guard keeps our own optimistic toggle echo from bouncing it.
+              const wireMuted = msg.settings.voiceAi?.isMicMuted;
+              if (typeof wireMuted === "boolean" && wireMuted !== micMutedRef.current) setMicMuted(wireMuted);
+            }
             if (typeof msg.globalPermissionsMode === "string") setGlobalPermissionsMode(msg.globalPermissionsMode as GlobalMode);
             break;
           case "switch_active_pane":
@@ -410,12 +470,31 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
             if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
             break;
           case "command_auto_executed":
-            earcon("execute"); // it fired on its own (Full Auto)
+            // 1B.7: end silent autonomy — the kitchen says WHAT fired where, not just a blip.
+            // showToast carries the "execute" earcon itself (no doubled tone) + the transcript line.
+            showToast(`Fired on its own — ${msg.terminalId}: ${truncateCmd(msg.cmd)}`, "fire", "execute");
             refetchPending();
             break;
           case "command_blocked":
-            earcon("alert");
+            // 1B.7: a blocked command names the pane, the command and the server's reason.
+            showToast(
+              `Held back on ${msg.terminalId}: ${truncateCmd(msg.cmd)}${typeof msg.reason === "string" && msg.reason ? ` — ${msg.reason}` : ""}`,
+              "warn",
+            );
             refetchPending();
+            break;
+          case "proactive_notification":
+            // 1B.7: the orchestrator's proactive announcements reach the kitchen too (toast +
+            // durable transcript line — coalescing niceties live in the classic app only).
+            // earcon: null — the bus already fired its own proactive_earcon for this event.
+            if (typeof msg.message === "string" && msg.message) {
+              showToast(msg.message, msg.severity === "high" ? "warn" : "fire", null);
+            }
+            break;
+          case "proactive_earcon":
+            // 1B.7: immediate non-verbal feedback for a proactive event (fires before the
+            // notification frame). The union now includes "completion" (announcementKinds.ts).
+            if (isEarconType(msg.earcon)) earcon(msg.earcon);
             break;
           // ── voice-only frames (Kitchen Radio) ──
           case "audio":
@@ -470,6 +549,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
       ws.onclose = () => {
         if (wsRef.current === ws) wsRef.current = null;
         if (voice) {
+          setVoiceConnected(false); // 1B.5: the chip must stop saying LIVE the moment the channel drops
           teardownAudio();
           if (!closedByUs && desiredVoiceRef.current) scheduleReconnect();
           else { setVoiceLive(false); setVoiceReconnecting(false); }
@@ -488,7 +568,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
       if (ws) { try { ws.close(); } catch { /* noop */ } wsRef.current = null; }
       if (voice) teardownAudio();
     };
-  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, teardownAudio, earcon]);
+  }, [voiceLive, queueStdoutChunk, refetchTerminals, refetchLedger, refetchFrozen, refetchPending, refetchAll, teardownAudio, earcon, showToast]);
 
   // The UI is the source of truth for the single active pane. Echo it to the
   // server whenever it changes and the socket is open (the WS wave relies on this).
@@ -500,21 +580,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
     }
   }, []);
 
-  const showToast = useCallback((msg: string, kind: "fire" | "warn" = "fire") => {
-    setToast({ msg, kind });
-    setTimeout(() => setToast(null), 2400);
-    // Narrate every ack into the Kitchen Radio — the brief's "source of truth" — so an eyes-off chef
-    // keeps a durable, scrollable record even when off-air. Renders as a Chef de Cuisine bubble.
-    setTranscript((prev) => [...prev, { sender: "Janus" as const, text: msg, timestamp: new Date() }].slice(-50));
-    earcon(kind === "fire" ? "success" : "alert"); // audible + visible ack (gated by Voice cues)
-  }, [earcon]);
-
   // ── Kitchen Radio: tune in / off-air / mute ─────────────────────────────
   // Tuning in flips the wsRef socket to a full Gemini voice session (the effect above re-runs on
   // voiceLive). desiredVoiceRef is the reconnect kill-switch: a dropped session only auto-reconnects
   // while the operator still wants to be live. Mute gates outbound mic frames without a teardown.
-  const goLive = useCallback(() => { desiredVoiceRef.current = true; setMicMuted(false); setVoiceLive(true); }, []);
-  const stopLive = useCallback(() => { desiredVoiceRef.current = false; setVoiceLive(false); }, []);
+  const goLive = useCallback(() => {
+    desiredVoiceRef.current = true;
+    setMicMuted(false);
+    setMicBlocked(false); // a fresh tune-in retries the mic — re-flagged on failure
+    setVoiceLive(true);
+    // ?mock=1 is client-only (no real socket): mirror the connected state so the live UI renders;
+    // the e2e setConnMock hook can still drive the "TUNING IN…" window explicitly.
+    if (isMockModeRef.current) setVoiceConnected(true);
+  }, []);
+  const stopLive = useCallback(() => { desiredVoiceRef.current = false; setVoiceLive(false); setVoiceConnected(false); }, []);
   const toggleMute = useCallback(() => setMicMuted((m) => !m), []);
 
   // ── mutations (the real backend writes; gated routes may 202/403) ───────
@@ -546,9 +625,17 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
         const d = await res.json().catch(() => ({}));
         if (d && d.settings && typeof d.settings === "object" && Object.keys(d.settings).length > 0) setSettings(d.settings);
         if (d && typeof d.globalPermissionsMode === "string") setGlobalPermissionsMode(d.globalPermissionsMode);
+        showToast("Rulebook updated."); // 1B.3: a settings write acks — never a silent maybe
+      } else {
+        // 1B.3: failed write → say so AND reconcile the optimistic state with server truth.
+        showToast("That didn't save, Chef — try again.", "warn");
+        refetchSettings();
       }
-    } catch { /* silent */ }
-  }, []);
+    } catch {
+      showToast("That didn't save, Chef — try again.", "warn");
+      refetchSettings();
+    }
+  }, [showToast, refetchSettings]);
 
   const createPane = useCallback(async (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => {
     const ws = (Object.values(ledger) as Workspace[]).find((w) => w.id === opts.projectId);
@@ -566,7 +653,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
       if (res.status === 403) { showToast("Not in my kitchen — that's gated off", "warn"); return; }
       if (res.status === 202) { showToast("Queued — needs your ok at the pass 🛎", "warn"); return; }
       if (res.ok) { refetchTerminals(); refetchLedger(); selectActivePane(terminalId); showToast(`Fired up ${terminalId} 🔥`); }
-    } catch { /* silent */ }
+      else showToast("Couldn't fire that station, Chef — try again.", "warn"); // 1B.3: no silent failures
+    } catch { showToast("Couldn't fire that station, Chef — try again.", "warn"); }
   }, [ledger, settings, showToast, refetchTerminals, refetchLedger, selectActivePane]);
 
   const createProject = useCallback(async (opts: { name: string; directory: string; emoji?: string; color?: string }) => {
@@ -579,7 +667,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
         body: JSON.stringify({ id, name: opts.name || "New project", directory: opts.directory || ("~/" + id), summary: "" }),
       });
       if (res.ok) { refetchLedger(); showToast("New kitchen opened! 🍽"); }
-    } catch { /* silent */ }
+      else showToast("Couldn't open that kitchen, Chef — try again.", "warn"); // 1B.3: no silent failures
+    } catch { showToast("Couldn't open that kitchen, Chef — try again.", "warn"); }
   }, [showToast, refetchLedger]);
 
   // Re-fire a station (restart its process). Like the other burner wires (writeControlKey/resize), this
@@ -600,8 +689,10 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
       const res = await apiFetch(`/api/terminals/${id}/restart`, { method: "POST" });
       if (res.status === 403) { showToast("Re-fire is gated off", "warn"); return; }
       if (res.status === 202) { showToast("Re-fire queued — needs your ok 🛎", "warn"); return; }
+      // 1B.3: "Re-firing 🔥" only when the server actually accepted the restart.
+      if (!res.ok) { showToast("Re-fire didn't go through, Chef — try again.", "warn"); return; }
       refetchTerminals(); refetchLedger(); showToast("Re-firing the station 🔥");
-    } catch { /* silent */ }
+    } catch { showToast("Re-fire didn't go through, Chef — try again.", "warn"); }
   }, [refetchTerminals, refetchLedger, showToast]);
 
   // ── The Pass: per-project notes (the expediter's tickets) ───────────────
@@ -644,8 +735,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
     try {
       const res = await apiFetch(`/api/notes/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: t }) });
       if (res.ok && projectId && !isMockModeRef.current) refetchNotes([projectId]);
-    } catch { /* silent */ }
-  }, [refetchNotes]);
+      else if (!res.ok) showToast("That edit didn't stick, Chef — try again.", "warn"); // 1B.3
+    } catch { showToast("That edit didn't stick, Chef — try again.", "warn"); }
+  }, [refetchNotes, showToast]);
 
   const deleteNote = useCallback(async (id: string, projectId?: string) => {
     setNotes((prev) => prev.filter((n) => n.id !== id));
@@ -690,42 +782,70 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
   // Approve / reject a staged PTY write; confirm / cancel a gated deferred action. Each drops the chip
   // optimistically (the server emits approval_resolved/action_resolved to confirm) and routes through
   // the operator-above-the-gate REST choke-points. Optimistic-only in mock (the e2e asserts the wire).
+  // 1B.3 (honest feedback): the chip drop stays OPTIMISTIC, but the success toast/earcon fires only
+  // AFTER the server says ok. On !res.ok / network failure the chip is RESTORED (the decision is
+  // still pending on the server) and the kitchen says so. Mock keeps the optimistic+toast path (the
+  // harness is client-only; the wire is pinned by the server suite).
   const approveCommand = useCallback(async (messageId: string) => {
-    setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
-    showToast("Order up! 🍽"); // the most consequential operator action must never be silent (eyes-off)
-    if (isMockModeRef.current) return;
+    let removed: PendingCommand | undefined;
+    setPendingCommands((prev) => { removed = prev.find((c) => c.messageId === messageId) ?? removed; return prev.filter((c) => c.messageId !== messageId); });
+    if (isMockModeRef.current) { showToast("Order up! 🍽"); return; }
     try {
-      await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: true }) });
+      const res = await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: true }) });
+      if (!res.ok) throw new Error(`approve ${res.status}`);
+      showToast("Order up! 🍽"); // the most consequential operator action must never be silent (eyes-off)
       setTimeout(refetchTerminals, 500);
-    } catch { /* silent */ }
+    } catch {
+      const r = removed;
+      if (r) setPendingCommands((prev) => (prev.some((c) => c.messageId === r.messageId) ? prev : [...prev, r]));
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
   }, [refetchTerminals, showToast]);
 
   const rejectCommand = useCallback(async (messageId: string) => {
-    setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
-    showToast("86'd it — held back", "warn");
-    if (isMockModeRef.current) return;
+    let removed: PendingCommand | undefined;
+    setPendingCommands((prev) => { removed = prev.find((c) => c.messageId === messageId) ?? removed; return prev.filter((c) => c.messageId !== messageId); });
+    if (isMockModeRef.current) { showToast("86'd it — held back", "warn"); return; }
     try {
-      await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: false }) });
-    } catch { /* silent */ }
+      const res = await apiFetch("/api/commands/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messageId, approved: false }) });
+      if (!res.ok) throw new Error(`reject ${res.status}`);
+      showToast("86'd it — held back", "warn");
+    } catch {
+      const r = removed;
+      if (r) setPendingCommands((prev) => (prev.some((c) => c.messageId === r.messageId) ? prev : [...prev, r]));
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
   }, [showToast]);
 
   const confirmAction = useCallback(async (actionId: string) => {
-    setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
-    showToast("Fired it 🔥");
-    if (isMockModeRef.current) return;
+    let removed: PendingActionView | undefined;
+    setPendingActions((prev) => { removed = prev.find((a) => a.actionId === actionId) ?? removed; return prev.filter((a) => a.actionId !== actionId); });
+    if (isMockModeRef.current) { showToast("Fired it 🔥"); return; }
     try {
-      await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
+      const res = await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
+      if (!res.ok) throw new Error(`confirm ${res.status}`);
+      showToast("Fired it 🔥");
       setTimeout(refetchTerminals, 500);
-    } catch { /* silent */ }
+    } catch {
+      const r = removed;
+      if (r) setPendingActions((prev) => (prev.some((a) => a.actionId === r.actionId) ? prev : [...prev, r]));
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
   }, [refetchTerminals, showToast]);
 
   const cancelAction = useCallback(async (actionId: string) => {
-    setPendingActions((prev) => prev.filter((a) => a.actionId !== actionId));
-    showToast("Scrapped it", "warn");
-    if (isMockModeRef.current) return;
+    let removed: PendingActionView | undefined;
+    setPendingActions((prev) => { removed = prev.find((a) => a.actionId === actionId) ?? removed; return prev.filter((a) => a.actionId !== actionId); });
+    if (isMockModeRef.current) { showToast("Scrapped it", "warn"); return; }
     try {
-      await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
-    } catch { /* silent */ }
+      const res = await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
+      if (!res.ok) throw new Error(`cancel ${res.status}`);
+      showToast("Scrapped it", "warn");
+    } catch {
+      const r = removed;
+      if (r) setPendingActions((prev) => (prev.some((a) => a.actionId === r.actionId) ? prev : [...prev, r]));
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
   }, [showToast]);
 
   const stopAllFreeze = useCallback(async () => {
@@ -753,7 +873,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean }): OrbitalData {
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
-    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, micMuted, streamConnected, toast, notes,
+    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane, refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,

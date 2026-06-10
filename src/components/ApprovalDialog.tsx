@@ -31,6 +31,7 @@ export function ApprovalDialog({
   effectiveGates,
   effectiveMode,
   capability,
+  isTop = true,
   onApprove,
   onReject
 }: {
@@ -50,20 +51,27 @@ export function ApprovalDialog({
   effectiveMode?: EffectiveMode;
   /** The write capability gating this approval (write_to_pane / deliver_handoff). */
   capability?: CapabilityGate;
+  /**
+   * Phase 1 1B.2: only the TOPMOST overlay may own the window-level Escape handler — with several
+   * dialogs stacked, every instance registering its own listener meant one Escape bulk-rejected
+   * everything. Optional + default true so existing call sites (classic App.tsx) compile unchanged.
+   */
+  isTop?: boolean;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
 }) {
   useEffect(() => {
+    if (!isTop) return; // 1B.2: Escape belongs to the topmost dialog only
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onReject(messageId);
       }
     };
-    
+
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [messageId, onReject]);
+  }, [messageId, onReject, isTop]);
 
   // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
   const showEffective = !!posture || !!effectiveGates;

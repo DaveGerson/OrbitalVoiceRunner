@@ -67,6 +67,13 @@ export interface OrbitalE2EHooks {
    * context in the same frame as the cyan highlight, derived from the already-seeded local ledger.
    */
   switchActivePane: (paneId: string) => void;
+  /**
+   * Phase 1 1B.1/1B.5: drive the kitchen's connection truth-states (stream = the observe /live
+   * socket → the top-nav pill; voice = the voice socket → "● LIVE" vs "TUNING IN…"; micBlocked =
+   * getUserMedia denial → "MIC BLOCKED"). The harness is client-only (no real sockets), so these
+   * render-states are staged directly. No-op for hosts that don't wire `setConnMock` (classic app).
+   */
+  setConnMock: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -93,6 +100,11 @@ export interface E2EHarnessDeps {
     updater: (prev: { paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[])
       => { paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[],
   ) => void;
+  /**
+   * 1B.1/1B.5 (OPTIONAL — kitchen only): receives the staged connection states from the
+   * `setConnMock` hook. Optional so the classic App.tsx call site compiles/behaves unchanged.
+   */
+  setConnMock?: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
 }
 
 /**
@@ -354,6 +366,12 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       // must flip from the local (already-seeded) ledger in the same frame as the highlight.
       switchActivePane: (paneId) => {
         deps.setActiveTerminalId(paneId);
+      },
+
+      // 1B.1/1B.5: stage the connection truth-states (no real sockets under ?mock=1). No-op when
+      // the host app doesn't wire setConnMock (classic).
+      setConnMock: (s) => {
+        deps.setConnMock?.(s);
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;

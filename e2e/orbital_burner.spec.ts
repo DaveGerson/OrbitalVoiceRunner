@@ -65,6 +65,17 @@ test.describe("Orbital Kitchen — The Burner", () => {
     );
     await page.getByTestId("burner-restart").click();
     await restartReq;
+    // 1B.3: the "Re-firing" ack now fires only AFTER the server accepted the restart.
+    await expect(page.getByTestId("toast")).toContainText("Re-firing the station");
+  });
+
+  // 1B.3: a failed re-fire must warn instead of toasting "Re-firing 🔥" over a dead POST.
+  test("a failed Re-fire warns the operator instead of a false ack", async ({ page }) => {
+    await page.route(/\/api\/terminals\/.+\/restart$/, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' }));
+    await openBurner(page);
+    await page.getByTestId("burner-restart").click();
+    await expect(page.getByTestId("toast")).toContainText("didn't go through");
   });
 
   test("the Order Pad sends a draft to the line", async ({ page }) => {

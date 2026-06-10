@@ -74,4 +74,34 @@ test.describe("Orbital Kitchen — approvals (HiTL)", () => {
     await page.getByTestId("action-cancel").click();
     await expect(page.getByTestId("action-dialog")).toHaveCount(0);
   });
+
+  // 1B.2: with several overlays stacked, ONE Escape used to bulk-reject everything (every dialog
+  // registered its own window-level handler). Now only the TOPMOST dialog owns Escape.
+  test("Escape dismisses only the topmost dialog, one at a time", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectPendingAction(page, "create_pane", "Open a new pane in Notifications");
+    await injectPendingApproval(page, "npm run deploy");
+    await expect(page.getByTestId("action-dialog")).toHaveCount(1);
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(1);
+    // approvals render after actions → the approval is DOM-topmost and owns the first Escape
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0);
+    await expect(page.getByTestId("action-dialog")).toHaveCount(1); // survived the first Escape
+    // the action is now topmost → the second Escape cancels it
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("action-dialog")).toHaveCount(0);
+  });
+
+  test("Escape pops stacked approvals one at a time, newest first", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectPendingApproval(page, "first staged write");
+    await injectPendingApproval(page, "second staged write");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(2);
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(1);
+    // the survivor is the FIRST injected one (the topmost/newest was rejected)
+    await expect(page.getByTestId("approval-dialog")).toContainText("first staged write");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0);
+  });
 });
