@@ -213,8 +213,15 @@ test("3V.5: initStoreWithQuarantine — a corrupt DB is quarantined to .corrupt-
   assert.match(result.quarantinedTo!, /\.corrupt-\d+$/, "the bad DB is renamed to .corrupt-<timestamp>");
   assert.ok(fs.existsSync(result.quarantinedTo!), "the quarantined file exists (data recoverable)");
   assert.strictEqual(fs.readFileSync(result.quarantinedTo!, "utf8"), GARBAGE, "the corrupt bytes are preserved verbatim");
-  assert.ok(fs.existsSync(`${result.quarantinedTo}-wal`), "the -wal twin moved with it");
-  assert.ok(fs.existsSync(`${result.quarantinedTo}-shm`), "the -shm twin moved with it");
+  // Twin hygiene: the REAL safety property is that no stale -wal/-shm lingers under the LIVE name
+  // (a leftover -wal would replay into the fresh DB sqlite creates under the same path). sqlite's
+  // own close() checkpoints/unlinks the twins — which the handle-hygiene fix (close-before-rename,
+  // required for Windows renameSync) now triggers on the constructor-throw shape too. The earlier
+  // "twins moved with the quarantine" expectation was an artifact of the LEAKED handle (close never
+  // ran) — exactly the Windows-breaking bug. Either fate is safe: moved aside or unlinked — never
+  // present under the live name.
+  assert.ok(!fs.existsSync(`${dbPath}-wal`) || fs.readFileSync(`${dbPath}-wal`, "utf8") !== "stale wal",
+    "no stale -wal twin lingers under the live name (replay hazard)");
   assert.ok(!fs.existsSync(`${dbPath}-shm`) || fs.readFileSync(`${dbPath}-shm`, "utf8") !== "stale shm",
     "no stale twin lingers under the live name");
 
@@ -241,5 +248,35 @@ test("3V.5: initStoreWithQuarantine — a healthy (or absent) DB boots normally 
   assert.strictEqual(r2.store!.getKV("k"), "v", "existing data is intact (no destructive rename)");
   r2.store!.close();
   assert.strictEqual(fs.readdirSync(dir).some((f) => f.includes(".corrupt-")), false, "no .corrupt-* artifacts");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Review finding (PR #67 block): when the corrupt-DB throw originates INSIDE the JanusStore
+// constructor (SQLITE_NOTADB at the first pragma — the most common corruption shape), the
+// already-opened better-sqlite3 file handle must be CLOSED before the quarantine rename.
+// Linux renames an open-handled file happily (inode rename), so the quarantine test above can't
+// see the leak — but Windows renameSync throws EPERM/EBUSY on an open handle, making the entire
+// recovery path non-functional on the production platform. PIN the handle hygiene directly:
+// after a constructor throw, no fd in /proc/self/fd may point at the corrupt file.
+test("3V.5: a constructor-throw (SQLITE_NOTADB) leaves NO open handle on the corrupt file", (t) => {
+  if (!fs.existsSync("/proc/self/fd")) { t.skip("needs /proc (Linux)"); return; }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-fd-"));
+  const dbPath = path.join(dir, "janus.db");
+  fs.writeFileSync(dbPath, "THIS IS NOT A SQLITE DATABASE", "utf8");
+
+  assert.throws(() => new JanusStore(dbPath), /file is not a database|SQLITE_NOTADB/i,
+    "garbage DB must throw from the constructor (the pragma header touch)");
+
+  const openTargets = fs.readdirSync("/proc/self/fd").flatMap((fd) => {
+    try { return [fs.readlinkSync(`/proc/self/fd/${fd}`)]; } catch { return []; }
+  });
+  assert.ok(!openTargets.some((p) => p.includes(dbPath)),
+    "no open fd may point at the corrupt DB after the constructor throw (Windows rename precondition)");
+
+  // And the full quarantine flow works on the constructor-throw shape too.
+  const result = initStoreWithQuarantine(dbPath, (s) => s.init());
+  assert.ok(result.store, "fresh store boots after constructor-throw quarantine");
+  assert.ok(result.quarantinedTo && fs.existsSync(result.quarantinedTo), "corrupt file quarantined");
+  result.store!.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
