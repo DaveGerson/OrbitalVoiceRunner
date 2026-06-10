@@ -153,6 +153,32 @@ describe("observe pipeline (dec-2)", () => {
     );
   });
 
+  it("1C.2: the exited transition publishes an 'exited' pane signal to the voice lane", () => {
+    // AUDIT (Phase 1 Track C): a crashed/ended pane went only to the attention queue + the
+    // announcement bus — no PaneSignal ever reached the live-session observers, so the model
+    // kept narrating a dead pane as healthy. The exited edge must fan out on the signal bus
+    // exactly like the idle/running/quiescing edges do.
+    const frames: any[] = [];
+    const signals: any[] = [];
+    const { manager } = makeFakeManager("Exited");
+
+    const deps = makeDeps((msg) => frames.push(msg));
+    deps.paneSignalBus.subscribe((sig) => signals.push(sig));
+
+    const { onOutput } = attachObserve(manager, deps);
+    onOutput("p1", "process finished\n");
+
+    // Existing behavior preserved: the transition frame still broadcasts.
+    const transition = frames.find((f) => f.type === "pane_transition");
+    assert.ok(transition, "a pane_transition frame is broadcast");
+    assert.strictEqual(transition.transition, "exited");
+
+    // NEW: the voice lane hears it.
+    const exited = signals.find((s) => s.kind === "exited");
+    assert.ok(exited, "an 'exited' pane signal is published to bus observers");
+    assert.strictEqual(exited.paneId, "p1");
+  });
+
   it("dedupes: a second identical error chunk does not re-emit the transition", () => {
     const frames: any[] = [];
     const { manager } = makeFakeManager("Running");

@@ -33,6 +33,20 @@ test.describe("Orbital Kitchen — Back of House", () => {
     await page.getByTestId("rule-write_to_pane").getByTestId("gate-Off").click();
     await putReq;
     expect(body?.advanced?.capabilityGates?.write_to_pane).toBe("Off");
+    // 1B.3: a successful settings write acks — never a silent maybe.
+    await expect(page.getByTestId("toast")).toContainText("Rulebook updated");
+  });
+
+  // 1B.3: a FAILED settings write must say so (and reconcile the optimistic state) instead of the
+  // old silent catch that left the operator believing the rulebook changed.
+  test("a failed Rulebook write warns the operator instead of failing silently", async ({ page }) => {
+    await page.route(/\/api\/settings$/, (route) => {
+      if (route.request().method() === "PUT") return route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' });
+      return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+    });
+    await gotoBoH(page);
+    await page.getByTestId("rule-write_to_pane").getByTestId("gate-Off").click();
+    await expect(page.getByTestId("toast")).toContainText("didn't save");
   });
 
   test("Chef de Cuisine sets the global autonomy mode", async ({ page }) => {

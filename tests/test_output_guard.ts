@@ -33,7 +33,7 @@ class StubTerminal {
   writeInput(command: string) {
     this.lastCommand = command;
     this.writeInputCount++;
-    if (this.status !== "Exited") this.status = "Running";
+    this.status = "Running";
   }
   async stop() { this.stopCount++; this.status = "Exited"; }
 }

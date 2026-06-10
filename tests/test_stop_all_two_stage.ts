@@ -41,7 +41,7 @@ class StubTerminal {
   writeInput(command: string) {
     this.lastCommand = command;
     this.writeInputCount++;
-    if (this.status !== "Exited") this.status = "Running";
+    this.status = "Running";
   }
   // Stage-2 kill primitive: the real PTY teardown flips the pane to Exited.
   async stop() { this.stopCount++; this.status = "Exited"; }

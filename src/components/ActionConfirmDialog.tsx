@@ -38,6 +38,7 @@ export function ActionConfirmDialog({
   requestedMode,
   globalOverride,
   paneId,
+  isTop = true,
   onConfirm,
   onCancel,
 }: {
@@ -57,10 +58,17 @@ export function ActionConfirmDialog({
   globalOverride?: boolean;
   /** null for global actions (no pane scope — D2). */
   paneId?: string | null;
+  /**
+   * Phase 1 1B.2: only the TOPMOST overlay may own the window-level Escape handler — with several
+   * dialogs stacked, every instance registering its own listener meant one Escape bulk-cancelled
+   * everything. Optional + default true so existing call sites (classic App.tsx) compile unchanged.
+   */
+  isTop?: boolean;
   onConfirm: (id: string) => void;
   onCancel: (id: string) => void;
 }) {
   useEffect(() => {
+    if (!isTop) return; // 1B.2: Escape belongs to the topmost dialog only
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -69,7 +77,7 @@ export function ActionConfirmDialog({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [actionId, onCancel]);
+  }, [actionId, onCancel, isTop]);
 
   // rbh: render the effective rider only when the server supplied posture truth (degrade-safe, D5).
   const showEffective = !!posture || !!effectiveGate;

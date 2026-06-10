@@ -243,6 +243,71 @@ describe("AnnouncementBus — coalescing / debounce / rate-limit", () => {
     bus.stop();
   });
 
+  // 1C.1 (Phase 1 Track C): approvals previously BORROWED kind:"exited" for its high severity,
+  // so the rendered notification literally claimed a healthy pane died ("Pane 'x' exited.")
+  // while it was merely awaiting approval. The REAL kinds must render approval truth.
+  it("approval_pending renders 'needs your approval' — never the exited template", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    const ok = bus.enqueue({ kind: "approval_pending", terminalId: "pane-7", summary: "Awaiting your approval." });
+    assert.strictEqual(ok, true, "high severity => debounce-exempt enqueue");
+    // Immediate earcon reuses the EXISTING client-known "alert" tone (kitchen client updates later).
+    const earcon = earcons(sink).find((e) => e.kind === "approval_pending");
+    assert.ok(earcon, "approval_pending fires an immediate earcon");
+    assert.strictEqual(earcon.earcon, "alert");
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.strictEqual(out.length, 1);
+    assert.strictEqual(out[0].severity, "high", "approval arrival keeps its high-severity bucket");
+    assert.match(out[0].message, /needs your approval/);
+    assert.match(out[0].message, /pane-7/);
+    assert.match(out[0].message, /Awaiting your approval\./, "{summary} is interpolated");
+    assert.doesNotMatch(out[0].message, /exited/i, "an approval must never read as a pane death");
+    bus.stop();
+  });
+
+  it("approval_expired renders the expiry — never the exited template", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    const ok = bus.enqueue({ kind: "approval_expired", terminalId: "pane-9", summary: "Approval expired." });
+    assert.strictEqual(ok, true);
+    const earcon = earcons(sink).find((e) => e.kind === "approval_expired");
+    assert.ok(earcon, "approval_expired fires an immediate earcon");
+    assert.strictEqual(earcon.earcon, "alert");
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.strictEqual(out.length, 1);
+    assert.strictEqual(out[0].severity, "high");
+    assert.match(out[0].message, /approval for pane 'pane-9' expired/i);
+    assert.doesNotMatch(out[0].message, /exited/i, "an expired approval must never read as a pane death");
+    bus.stop();
+  });
+
+  it("an older operator templates object WITHOUT the new approval keys degrades to the defaults (no crash)", () => {
+    // Settings persisted before these kinds existed lack approvalPending/approvalExpired; the
+    // render must fall back to the default template instead of throwing on undefined.replace.
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const legacyTemplates: any = {
+      completion: "Pane '{pane}' finished. {summary}",
+      error: "Pane '{pane}' reported an error. {summary}",
+      buildFailed: "Build failed on pane '{pane}'.",
+      exited: "Pane '{pane}' exited.",
+      planCompleted: "Plan completed. {summary}",
+      planPaused: "Plan paused. {summary}",
+    };
+    const bus = makeBus(sink, clock, { getTemplates: () => legacyTemplates });
+    bus.enqueue({ kind: "approval_pending", terminalId: "old-cfg", summary: "Awaiting your approval." });
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.strictEqual(out.length, 1, "renders despite the missing key");
+    assert.match(out[0].message, /needs your approval/);
+    assert.doesNotMatch(out[0].message, /exited/i);
+    bus.stop();
+  });
+
   it("stop() clears pending timers so nothing keeps the loop alive", () => {
     const sink: any[] = [];
     const clock = new FakeClock();

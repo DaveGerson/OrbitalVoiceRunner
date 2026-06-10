@@ -70,8 +70,13 @@ function buildCalls(stations: { name: string }[]): { group: string; color: strin
   ];
 }
 
-export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voiceCues, stations, onGoLive, onToggleMute, onCall }: {
-  dark: boolean; live: boolean; muted: boolean; reconnecting: boolean; transcript: TranscriptEntry[];
+export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBlocked, transcript, voiceCues, stations, onGoLive, onToggleMute, onCall }: {
+  dark: boolean; live: boolean; muted: boolean; reconnecting: boolean;
+  /** 1B.5: the voice /live socket is actually OPEN — "● LIVE" gates on this, not on the click. */
+  connected: boolean;
+  /** 1B.5: getUserMedia denied/failed — the chip must say MIC BLOCKED, not "I'm listening". */
+  micBlocked: boolean;
+  transcript: TranscriptEntry[];
   voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -79,7 +84,7 @@ export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voic
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [transcript]);
 
   const panelBg = dark ? "#241409" : "#fff4de";
-  const listening = live && !muted;
+  const listening = live && connected && !muted && !micBlocked;
 
   return (
     <aside data-testid="kitchen-radio" style={{ position: "relative", display: "flex", flexDirection: "column", minHeight: 0, background: panelBg, height: "100%", overflow: "hidden" }}>
@@ -91,7 +96,11 @@ export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voic
           <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18 }}>Kitchen Radio</div>
         </div>
         <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
-        <Chip bg={!live ? "#8a6a4f" : muted ? "#8a6a4f" : "#e23a3a"} color="#fff4de" border="#fff4de">{!live ? (reconnecting ? "…" : "OFF AIR") : muted ? "MUTED" : "● LIVE"}</Chip>
+        {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
+            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen. */}
+        <Chip bg={!live ? "#8a6a4f" : micBlocked ? "#e23a3a" : !connected ? "#8a6a4f" : muted ? "#8a6a4f" : "#e23a3a"} color="#fff4de" border="#fff4de">
+          {!live ? (reconnecting ? "…" : "OFF AIR") : micBlocked ? "MIC BLOCKED" : !connected ? "TUNING IN…" : muted ? "MUTED" : "● LIVE"}
+        </Chip>
       </div>
 
       {/* now-speaking waveform */}
@@ -123,8 +132,8 @@ export function KitchenRadio({ dark, live, muted, reconnecting, transcript, voic
             <Icon name="spark" size={18} /> {reconnecting ? "Tuning in…" : "Tune in the radio"}
           </button>
         ) : (
-          <button data-testid="radio-mute" onClick={onToggleMute} style={micBtn(muted ? "#fff9ec" : "#4db892")}>
-            <Icon name={muted ? "x" : "spark"} size={18} /> {muted ? "Mic off — tap to talk" : "I'm listening, Chef"}
+          <button data-testid="radio-mute" onClick={onToggleMute} style={micBtn(micBlocked ? "#ff8a3d" : muted ? "#fff9ec" : "#4db892")}>
+            <Icon name={muted || micBlocked ? "x" : "spark"} size={18} /> {micBlocked ? "Mic's blocked — check browser permissions" : muted ? "Mic off — tap to talk" : "I'm listening, Chef"}
           </button>
         )}
       </div>

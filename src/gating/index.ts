@@ -442,10 +442,21 @@ export function createGating(deps: GatingDeps): Gating {
       }
       broadcast({ type: "frozen", frozen: true, running: stillRunning });
       broadcastTerminalsUpdated();
+      // 1C.3 (Phase 1 Track C): STOP-ALL must be AUDIBLE on the voice channel. Reuse the SAME
+      // injected narration seam the sweep last-call uses (pushApprovalNarration +
+      // coreState.activeLiveSession) so Janus is told the whole line is gated Off instead of
+      // chatting on unaware. No live session => nothing to narrate (the UI broadcast above stands).
+      if (coreState.activeLiveSession) {
+        pushApprovalNarration(coreState.activeLiveSession, "Stop-all engaged — the whole line is frozen until you release.");
+      }
       return stillRunning;
     }
     // Stage 2: kill the PTYs. QW4 — AWAIT every stop() (Promise.allSettled, mirroring close()'s
     // awaited per-term stop) so we report panes that ACTUALLY stopped, not the ones we asked to.
+    // 1C.3: narrate the irreversible step BEFORE the awaited kills (present-progressive truth).
+    if (coreState.activeLiveSession) {
+      pushApprovalNarration(coreState.activeLiveSession, "Stage two — running panes are being killed.");
+    }
     const { killed, failed } = await killAllPanes();
     if (store) {
       try {
@@ -499,6 +510,10 @@ export function createGating(deps: GatingDeps): Gating {
     }
     broadcast({ type: "frozen", frozen: false });
     broadcastTerminalsUpdated();
+    // 1C.3: the release is as voice-relevant as the freeze — same injected seam.
+    if (coreState.activeLiveSession) {
+      pushApprovalNarration(coreState.activeLiveSession, "Stop-all released — the kitchen is back.");
+    }
   }
 
   // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
@@ -636,7 +651,9 @@ export function createGating(deps: GatingDeps): Gating {
         break;
       case "expired":
         if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
-        announcementBus.enqueue({ kind: "exited", terminalId: record.terminalId, summary: "Approval expired." });
+        // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its
+        // severity, which rendered "Pane 'x' exited." for a pane that merely lost an approval.
+        announcementBus.enqueue({ kind: "approval_expired", terminalId: record.terminalId, summary: "Approval expired." });
         broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
         break;
     }
@@ -669,7 +686,21 @@ export function createGating(deps: GatingDeps): Gating {
   // approvals (the detach/re-attach seam), global `coreState.activeFrontendWs !== null` for the non-session-
   // bound pending actions. Only the TRIGGER + the connected-gate change; the reject itself stays
   // byte-for-byte (the mandatory claim gate / exactly-once / dead-pane invariants are untouched).
+  // 1C.4 (Phase 1 Track C): this IS the interval callback startSweepTimer arms, and it hits
+  // better-sqlite3 (pendingApprovals.expired -> store.getExpiredApprovals, plus the resolve path)
+  // with synchronous throws — a transient SQLITE_BUSY on a tick was an uncaughtException that
+  // killed the whole process. Guard the ENTIRE body here (not just the timer arm) so EVERY sweep
+  // path — the interval tick AND any direct sweepExpiredApprovals() call — is non-fatal: log and
+  // wait for the next tick (the durable rows are untouched, so nothing is lost).
   function sweepExpiredApprovals(now: number = Date.now()) {
+    try {
+      sweepExpiredApprovalsUnsafe(now);
+    } catch (e) {
+      console.error("[gating] sweep failed (non-fatal):", e);
+    }
+  }
+
+  function sweepExpiredApprovalsUnsafe(now: number) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
       const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
       const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);

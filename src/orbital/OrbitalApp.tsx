@@ -64,10 +64,12 @@ function useKitchenChrome() {
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic }: {
+function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
   needsCount: number; onJumpToNeeds: () => void;
   mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
+  /** 1B.1: the live /live stream is actually attached — the pill must not claim "Kitchen open" while dark. */
+  connected: boolean;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -102,9 +104,13 @@ function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJum
           🛎 Needs you · {needsCount}
         </button>
       )}
+      {/* 1B.1: honest status pill — green "Kitchen open" only while the live stream is attached;
+          a dropped socket shows the pulsing red "Kitchen dark" until the bounded backoff reconnects. */}
       <div data-testid="kitchen-status" style={{ display: "flex", alignItems: "center", gap: 8, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
-        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
-        <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>Kitchen open · {running} on the burner</span>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: connected ? "#4db892" : "#e23a3a", border: "1.5px solid " + INK, animation: connected ? undefined : "orb-pulse 1s var(--ease-bounce) infinite" }} />
+        <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>
+          {connected ? <>Kitchen open · {running} on the burner</> : <>Kitchen dark — reconnecting…</>}
+        </span>
       </div>
       <button data-testid="all-hands" onClick={onPanic} title="Emergency brake" style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 10, border: "2px solid " + INK, background: "#2a1a10", color: "#ffc94a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5, letterSpacing: ".04em", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0, textTransform: "uppercase" }}>
         <Icon name="fire" size={16} color="#e23a3a" /> All Hands
@@ -223,7 +229,10 @@ export default function OrbitalApp() {
       <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running}
         needsCount={needsList.length} onJumpToNeeds={jumpToNeeds}
         mode={serviceId} setMode={(id) => data.setGlobalMode(serviceIdToMode(id))}
-        onPanic={() => { data.stopAllFreeze(); setPanic(true); }} />
+        onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
+        /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
+           lane) — either one being open means the kitchen is genuinely attached. */
+        connected={data.streamConnected || data.voiceConnected} />
 
       {view === "line" && (
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
@@ -237,6 +246,7 @@ export default function OrbitalApp() {
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
           <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
             <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
+              connected={data.voiceConnected} micBlocked={data.micBlocked}
               transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
               onGoLive={data.goLive} onToggleMute={data.toggleMute} onCall={handleCall} />
           </aside>
@@ -274,20 +284,24 @@ export default function OrbitalApp() {
           writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}
       {/* HiTL gating prompts — reuse the shared dialogs verbatim (server-truth posture). Wrapped in a
-          high-z stacking context so a write/action confirm sits above the burner + board modals. */}
-      {data.pendingActions.map((a) => (
+          high-z stacking context so a write/action confirm sits above the burner + board modals.
+          1B.2: only the TOPMOST overlay owns Escape. Actions render before approvals here, so with
+          any approvals mounted the last APPROVAL is DOM-topmost; otherwise the last action is. */}
+      {data.pendingActions.map((a, i) => (
         <div key={a.actionId} style={{ position: "relative", zIndex: 260 }}>
           <ActionConfirmDialog actionId={a.actionId} capability={a.capability} summary={a.summary}
             posture={a.posture} effectiveGate={a.effective_gate} effectiveMode={a.effective_mode}
             requestedMode={a.requested_mode} globalOverride={a.global_override} paneId={a.pane_id}
+            isTop={data.pendingCommands.length === 0 && i === data.pendingActions.length - 1}
             onConfirm={data.confirmAction} onCancel={data.cancelAction} />
         </div>
       ))}
-      {data.pendingCommands.map((c) => (
+      {data.pendingCommands.map((c, i) => (
         <div key={c.messageId} style={{ position: "relative", zIndex: 260 }}>
           <ApprovalDialog messageId={c.messageId} terminalId={c.terminalId} cmd={c.cmd}
             rationale={c.rationale ? { trigger: c.rationale.trigger ?? "", summary: c.rationale.summary } : undefined}
             posture={c.posture} effectiveGates={c.effective_gates} effectiveMode={c.effective_mode} capability={c.capability}
+            isTop={i === data.pendingCommands.length - 1}
             onApprove={data.approveCommand} onReject={data.rejectCommand} />
         </div>
       ))}

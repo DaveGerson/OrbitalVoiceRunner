@@ -201,6 +201,12 @@ export async function applyPaneMode(
   let executePromise: Promise<PaneModeResult> | null = null;
   const syncRun = (): string => {
     executePromise = execute().then((r) => { outcome = r; return r; });
+    // Side-consumer on a SEPARATE derived promise: on the Ask→confirm path the gate replays this
+    // closure later and NOBODY awaits executePromise, so a rejecting execute() would otherwise be
+    // an unhandledRejection (process-killer). Deriving the .catch (instead of reassigning) leaves
+    // executePromise itself rejected, so the Auto path's `await` below still sees the rejection
+    // unchanged.
+    executePromise.catch((e) => console.error("[applyPaneMode] deferred mode-change failed:", e));
     return `Setting pane ${paneId} permissions to ${targetMode}.`;
   };
 

@@ -51,4 +51,19 @@ test.describe("Orbital Kitchen — shell", () => {
     // kitchen-only chrome must be ABSENT on the classic fallback
     await expect(page.getByTestId("tab-line")).toHaveCount(0);
   });
+
+  // 1B.1: the top-nav pill is no longer a hard-coded green "Kitchen open" — it tracks the live
+  // stream. The ?mock=1 harness has no real socket, so the setConnMock hook stages the states.
+  test("the status pill goes dark when the live stream drops, and recovers", async ({ page }) => {
+    await page.goto("/?ui=kitchen&mock=1");
+    await page.waitForSelector("html[data-e2e-ready='1']");
+    const pill = page.getByTestId("kitchen-status");
+    await expect(pill).toContainText("Kitchen open");
+    await page.evaluate(() =>
+      (window as unknown as { __ORBITAL_E2E__?: { setConnMock: (s: { stream?: boolean }) => void } }).__ORBITAL_E2E__?.setConnMock({ stream: false }));
+    await expect(pill).toContainText("Kitchen dark — reconnecting");
+    await page.evaluate(() =>
+      (window as unknown as { __ORBITAL_E2E__?: { setConnMock: (s: { stream?: boolean }) => void } }).__ORBITAL_E2E__?.setConnMock({ stream: true }));
+    await expect(pill).toContainText("Kitchen open");
+  });
 });

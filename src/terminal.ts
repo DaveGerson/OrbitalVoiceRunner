@@ -852,11 +852,14 @@ export class UniversalTerminal {
     // Capture the PTY root pid for the probe (design §5).
     this.shellPid = transport.pid;
 
-    // Set initial running state and stamp the transition.
-    if (this.status !== "Exited") {
-      this.status = "Running";
-      this.lastStatusChangeAt = Date.now();
-    }
+    // Set the running state and stamp the transition — UNCONDITIONALLY. A successful spawn means
+    // the pane IS running, including on /restart, where the prior stop()'s onExit left
+    // status === "Exited". The old `if (this.status !== "Exited")` guard wedged restarted panes:
+    // applyStatusEvent and runProbeTick both early-return on "Exited" and NO other path ever sets
+    // "Running", so the live process kept a permanently dead status machine. The degraded-spawn
+    // catch above returns early before this line, so the guard protected nothing.
+    this.status = "Running";
+    this.lastStatusChangeAt = Date.now();
 
     // Merged stdout/stderr stream from the transport.
     transport.onData((decoded: string) => {

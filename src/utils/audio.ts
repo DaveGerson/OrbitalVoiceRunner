@@ -27,6 +27,11 @@ export function setPlaybackVolume(v: number) {
 }
 
 export function playAudioChunk(audioCtx: AudioContext, base64: string) {
+  // Autoplay policy can leave the context suspended (no audible output even though chunks are
+  // scheduled). Resume fire-and-forget before scheduling — playback starts once the gesture lands.
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume().catch(() => { /* still blocked — chunks stay scheduled, degrade silently */ });
+  }
   const binary = atob(base64);
   const len = binary.length;
   const bytes = new Uint8Array(len);

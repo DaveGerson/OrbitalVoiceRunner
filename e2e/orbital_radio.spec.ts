@@ -73,4 +73,31 @@ test.describe("Orbital Kitchen — Kitchen Radio (voice)", () => {
     await mute.click();
     await expect(page.getByTestId("kitchen-radio")).toContainText("MUTED");
   });
+
+  // 1B.5: LIVE means live — between the tune-in click and the voice socket opening the chip reads
+  // "TUNING IN…". The harness has no real socket, so setConnMock stages the connection states.
+  test("the chip reads TUNING IN… until the voice channel actually opens", async ({ page }) => {
+    await gotoKitchen(page);
+    await page.getByTestId("radio-golive").click();
+    await page.evaluate(() =>
+      (window as unknown as { __ORBITAL_E2E__?: { setConnMock: (s: { voice?: boolean }) => void } }).__ORBITAL_E2E__?.setConnMock({ voice: false }));
+    await expect(page.getByTestId("kitchen-radio")).toContainText("TUNING IN…");
+    await expect(page.getByTestId("kitchen-radio")).not.toContainText("● LIVE");
+    await page.evaluate(() =>
+      (window as unknown as { __ORBITAL_E2E__?: { setConnMock: (s: { voice?: boolean }) => void } }).__ORBITAL_E2E__?.setConnMock({ voice: true }));
+    await expect(page.getByTestId("kitchen-radio")).toContainText("● LIVE");
+  });
+
+  // 1B.5: a denied mic must be LOUD — the chip names it instead of claiming "I'm listening, Chef".
+  // (The real getUserMedia denial path — toast + earcon from startMic's catch — needs a real browser
+  // permission denial and is verified manually; this pins the honest render-state.)
+  test("a blocked mic is named on the chip — never a false 'listening'", async ({ page }) => {
+    await gotoKitchen(page);
+    await page.getByTestId("radio-golive").click();
+    await page.evaluate(() =>
+      (window as unknown as { __ORBITAL_E2E__?: { setConnMock: (s: { micBlocked?: boolean }) => void } }).__ORBITAL_E2E__?.setConnMock({ micBlocked: true }));
+    await expect(page.getByTestId("kitchen-radio")).toContainText("MIC BLOCKED");
+    await expect(page.getByTestId("radio-mute")).toContainText("Mic's blocked");
+    await expect(page.getByTestId("radio-mute")).not.toContainText("I'm listening");
+  });
 });
