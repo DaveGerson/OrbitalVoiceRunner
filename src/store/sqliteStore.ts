@@ -28,9 +28,18 @@ export class JanusStore {
   readonly db: Database.Database;
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.db.pragma("synchronous = NORMAL");
+    // A corrupt/garbage DB typically throws HERE (SQLITE_NOTADB on the first header touch), AFTER
+    // new Database() opened the OS file handle. Close that handle before rethrowing — otherwise
+    // initStoreWithQuarantine's renameSync hits the still-open handle and fails EPERM/EBUSY on
+    // Windows, leaving the quarantine path non-functional on the production platform.
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      this.db.pragma("synchronous = NORMAL");
+    } catch (e) {
+      try { this.db.close(); } catch { /* best-effort — the throw below is the signal */ }
+      throw e;
+    }
   }
   init(): void { applyMigrations(this.db); }
   // Idempotent: better-sqlite3's db.close() is a no-op at the JS level on a second
