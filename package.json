@@ -13,6 +13,7 @@
     "test:unit": "tsx --test --test-force-exit tests/*.ts",
     "test:py": "tsx scripts/run-pytests.ts",
     "test:e2e": "playwright test",
+    "test:e2e:live": "node scripts/run-live-e2e.mjs",
     "setup": "npm install && npm run typecheck && npm test && npm run build && npm run e2e:install",
     "e2e:install": "playwright install chromium",
     "catalog": "tsx scripts/catalog.ts",
