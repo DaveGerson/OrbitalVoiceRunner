@@ -61,16 +61,66 @@ import { briefIsForActivePane } from "../memory";
  * narrate a SYSTEM EVENT into the live session so the model speaks it to the operator. Pure (no
  * closure state) — exported so gating injects the SAME identity server.ts feeds into attachVoiceSession,
  * keeping gating free of any voice import. The definition moved here from server.ts (dec-5).
+ *
+ * 3V.3: returns whether the push actually went out. The exception stays SWALLOWED (a narration
+ * failure must never break a sweep tick or a dispatch), but callers that gate state transitions on
+ * the operator having HEARD the line (the sweep's last-call -> grace -> reject) now get the truth:
+ * `false` = the send threw, nobody heard it. Fire-and-forget callers simply ignore the return.
  */
-export function pushApprovalNarration(session: any, text: string): void {
+export function pushApprovalNarration(session: any, text: string): boolean {
   try {
     session.sendClientContent({
       turns: [{ role: "user", parts: [{ text: `SYSTEM EVENT (say this to the operator, then stop): ${text}` }] }],
       turnComplete: true,
     });
+    return true;
   } catch (e) {
     console.error("Failed to push approval narration to session:", e);
+    return false;
   }
+}
+
+// ── 3V.2: WS keepalive + half-open cleanup ─────────────────────────────────────────────────────
+// There was NO ping/pong anywhere: a half-open client (network drop without a TCP FIN) buffered
+// broadcasts unboundedly, pinned coreState.activeFrontendWs/activePaneId, and kept the Gemini
+// session alive forever. Standard ws keepalive: mark isAlive=true on accept + on every pong; ONE
+// shared unref'd interval per WebSocketServer (armed in attachVoiceSession, cleared on wss close)
+// sweeps all clients via sweepHeartbeats below. terminate() destroys the socket, which makes ws
+// emit the connection's 'close' event — so the EXISTING per-connection cleanup paths (broadcast-set
+// removal, activeFrontendWs/activePaneId nulling, Gemini session close, reconnect-timer cancel)
+// run exactly as on a graceful close.
+
+/** The keepalive cadence: ping every 30s; a client that missed the previous pong is terminated. */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** The structural slice of a ws WebSocket the sweep touches (fakeable in unit tests). */
+export interface HeartbeatClient {
+  /** true = ponged since the last sweep (or just accepted); false = missed the previous ping. */
+  isAlive?: boolean;
+  ping: () => void;
+  terminate: () => void;
+}
+
+/**
+ * One keepalive sweep over `clients` (pure decision logic, extracted for unit coverage — the
+ * interval wiring lives in attachVoiceSession). A client whose isAlive is STRICTLY false missed the
+ * previous ping's pong window → terminate() it (best-effort; the socket may already be destroyed).
+ * Every other client (true, or undefined = not yet enrolled) is flipped to isAlive=false and pinged;
+ * its 'pong' handler re-sets isAlive=true before the next sweep. Per-client faults are swallowed so
+ * one broken socket never starves its siblings of their keepalive. Returns the terminated clients.
+ */
+export function sweepHeartbeats(clients: Iterable<HeartbeatClient>): HeartbeatClient[] {
+  const terminated: HeartbeatClient[] = [];
+  for (const ws of clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch { /* already destroyed — its 'close' already ran */ }
+      terminated.push(ws);
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* socket torn down mid-sweep; the next sweep terminates it */ }
+  }
+  return terminated;
 }
 
 /** A PaneSignal queued on the phase-2 "ready" defer path, tagged with the wall-clock time it was
@@ -304,6 +354,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
   // Boot rehydrate: a restart resumes from the last persisted handle.
   let lastSessionResumptionToken: any = rehydrateResumptionToken();
 
+  // 3V.2: ONE shared keepalive interval per WebSocketServer (NOT per connection). Unref'd (force-exit
+  // hygiene, same as every other timer here) and cleared when the wss closes so a torn-down test
+  // server never keeps sweeping. terminate() on a missed pong fires the connection's own 'close'
+  // handler below — the existing half-open cleanup (broadcast set, activeFrontendWs, Gemini session).
+  const heartbeatTimer = setInterval(
+    () => sweepHeartbeats(wss.clients as unknown as Iterable<HeartbeatClient>),
+    HEARTBEAT_INTERVAL_MS,
+  );
+  if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+  wss.on("close", () => clearInterval(heartbeatTimer));
+
   wss.on("connection", async (clientWs, req) => {
     const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
     if (tokenFromCookie !== API_AUTH_TOKEN) {
@@ -312,6 +373,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       clientWs.close(4001, "Unauthorized");
       return;
     }
+
+    // 3V.2: enroll this connection into the keepalive — alive on accept, re-alive on every pong.
+    // Marked BEFORE the observe-only early-return below so BOTH lanes (observe + voice) are swept.
+    (clientWs as unknown as HeartbeatClient).isAlive = true;
+    clientWs.on("pong", () => { (clientWs as unknown as HeartbeatClient).isAlive = true; });
 
     coreState.activeFrontendWs = clientWs;
     coreState.clients.add(clientWs);
@@ -585,6 +651,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
     const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
       if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
+      // 3V.1 (b): STALE-ATTEMPT GUARD — extend the identity principle (the activeLiveSession-nulling
+      // guard below) to the WHOLE teardown. If a NEWER connectLiveSession has bumped the generation,
+      // THIS attempt's session is stale (it was, or is about to be, closed by the post-connect
+      // generation guard) and its late onerror/onclose must be a complete no-op: its detachSession
+      // would detach the LIVE session's approvals (state.session already points at the newer
+      // session), its voice_channel_lost would be a lie, and its scheduleReconnect would hoist a
+      // THIRD session over the healthy one without closing it. The CURRENT generation's own
+      // callbacks own the real teardown. Mark this attempt dead so a paired onerror+onclose for the
+      // same stale drop stays idempotent.
+      if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
       sessionDead = true;
       if (state.session) {
         const detached = pendingApprovals.detachSession(state.session);
@@ -739,7 +815,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // (boundLiveConnector) so a sibling test server's setLiveConnector cannot redirect us.
       // bead 9fz: pass the RESOLVED sessionKey so the REAL connector can pre-validate a blank key and
       // short-circuit BEFORE a keyless ai.live.connect() (1007). The mock connector ignores this arg.
-      state.session = await boundLiveConnector(sessionAi, {
+      // 3V.1 (a): connect into a LOCAL — `state.session` is assigned ONLY after the generation guard
+      // below passes. The pre-fix code assigned BEFORE guarding, so an overlapping connect resolving
+      // LAST overwrote state.session with a handle the guard then closed: mic frames (clientWs
+      // "audio" -> state.session.sendRealtimeInput) fed a DEAD session while coreState.activeLiveSession
+      // still pointed at the healthy one.
+      const justConnected = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
           onmessage: async (message: LiveServerMessage) => {
@@ -1056,18 +1137,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       },
     }, sessionKey); // bead 9fz: 3rd arg = resolved key; the REAL connector short-circuits if blank.
 
-      // PLM4 (2): IDENTITY GUARD on the just-resolved connect. The async connect could have raced the
-      // operator leaving (wsClosed) or a newer session winning the hoist. If so, this freshly-minted
-      // session is stale — close it and bail WITHOUT clobbering the live channel. (`session` is the
-      // connection-scope let; on a reconnect a newer attempt could already have overwritten it, but
-      // last-write-wins here is fine: we only proceed if NOTHING newer has hoisted.)
-      const justConnected = state.session;
+      // PLM4 (2) + 3V.1 (a): IDENTITY GUARD on the just-resolved connect. The async connect could have
+      // raced the operator leaving (wsClosed) or a newer connect attempt superseding this one. If so,
+      // this freshly-minted session is stale — close it and bail WITHOUT touching ANY connection state
+      // (state.session in particular still points at whatever the CURRENT generation hoisted).
       if (state.wsClosed || myGeneration !== state.connectGeneration) {
         // Operator left during the await, OR a newer connect attempt has superseded this one. Either
         // way this session is stale: close it and bail WITHOUT clobbering the live channel.
         try { justConnected?.close?.(); } catch { /* best-effort */ }
         return;
       }
+      // The guard passed: THIS attempt owns the current generation — only now may it publish its
+      // session into the connection-scoped state the mic path / tool dispatch / WS-close read.
+      state.session = justConnected;
 
       // WS-F (spec §6.2): the live session is now established. Hoist it for the action last-call,
       // then re-attach every staged survivor that outlived the prior disconnect (or a process

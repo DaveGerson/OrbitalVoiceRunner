@@ -5,7 +5,13 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { JanusStore } from "../src/store/sqliteStore";
-import { migrateFromObjects, migrateFromJson } from "../src/store/migrate";
+import {
+  migrateFromObjects,
+  migrateFromJson,
+  migrateOnBootIfNeeded,
+  initStoreWithQuarantine,
+  LEDGER_MIGRATED_KEY,
+} from "../src/store/migrate";
 
 test("migrateFromObjects is atomic: a mid-import failure leaves the DB empty", () => {
   const s = new JanusStore(":memory:"); s.init();
@@ -107,5 +113,133 @@ test("migrateFromJson preserves the settings JSON in place (ahm regression) — 
   assert.ok(s.getSettings("secrets.geminiApiKey") == null, "the Gemini key must NOT be imported into the store");
 
   s.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// CARD 3V.5 — DB quarantine + migration marker inside the import transaction.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+test("3V.5: an EXISTING but unparseable legacy ledger THROWS — file untouched, no marker, nothing imported", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-parse-"));
+  const ledgerPath = path.join(dir, ".janus_ledger.json");
+  fs.writeFileSync(ledgerPath, "{ not json !!!", "utf8"); // exists, does not parse
+
+  const s = new JanusStore(":memory:"); s.init();
+  // Pre-fix the unreadable file was SWALLOWED (read() -> undefined), then archived to .bak and the
+  // marker set — the data was silently lost AND re-import was permanently blocked. Post-fix: throw,
+  // leave the file exactly where it is (server.ts's migration catch logs and boots without import).
+  assert.throws(() => migrateOnBootIfNeeded(s, {
+    ledgerPath,
+    settingsPath: path.join(dir, ".janus_settings.json"),
+    historyPath: path.join(dir, ".janus_history.json"),
+  }), /ledger|parse/i, "an existing-but-unparseable ledger must throw, not be silently archived");
+
+  assert.ok(fs.existsSync(ledgerPath), "the unparseable ledger file is left IN PLACE (recoverable)");
+  assert.ok(!fs.existsSync(`${ledgerPath}.bak`), "it is NOT renamed to .bak");
+  assert.strictEqual(s.getKV(LEDGER_MIGRATED_KEY), null, "the migration marker is NOT set");
+  assert.strictEqual(Object.keys(s.getWorkspaces()).length, 0, "nothing was imported");
+
+  s.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("3V.5: the migration marker commits ATOMICALLY with the import (a marker-write failure rolls back everything)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-marker-"));
+  const ledgerPath = path.join(dir, ".janus_ledger.json");
+  fs.writeFileSync(ledgerPath, JSON.stringify({
+    activeProjectId: "p1",
+    workspaces: { p1: { id: "p1", name: "P1", directory: "/tmp", summary: "", keyTerms: [], notes: [], panes: {} } },
+  }), "utf8");
+
+  const s = new JanusStore(":memory:"); s.init();
+  // Fault-inject EXACTLY the marker write. Pre-fix the marker was set OUTSIDE the import
+  // transaction: the import committed, the originals were renamed, and only then did the marker
+  // write fail — leaving an imported-but-unmarked store with the source file already archived.
+  // Post-fix the marker is written INSIDE the same transaction, so this throw rolls back the whole
+  // import and (because the .bak rename runs after the transaction) leaves the JSON untouched.
+  const origSetKV = s.setKV.bind(s);
+  (s as any).setKV = (k: string, v: string) => {
+    if (k === LEDGER_MIGRATED_KEY) throw new Error("simulated marker-write failure (disk full)");
+    return origSetKV(k, v);
+  };
+
+  assert.throws(() => migrateOnBootIfNeeded(s, {
+    ledgerPath,
+    settingsPath: path.join(dir, ".janus_settings.json"),
+    historyPath: path.join(dir, ".janus_history.json"),
+  }), /marker-write failure/);
+
+  assert.strictEqual(Object.keys(s.getWorkspaces()).length, 0,
+    "the import ROLLED BACK with the failed marker (marker + import are one transaction)");
+  assert.ok(fs.existsSync(ledgerPath), "the legacy ledger is still at the live path (no .bak rename)");
+  assert.ok(!fs.existsSync(`${ledgerPath}.bak`), "no .bak was created for a failed import");
+  assert.strictEqual(s.getKV(LEDGER_MIGRATED_KEY), null, "no marker survives the rollback");
+
+  s.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("3V.5: a successful migrateOnBootIfNeeded still sets the marker (inside the txn) and archives the originals", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-happy-"));
+  const ledgerPath = path.join(dir, ".janus_ledger.json");
+  fs.writeFileSync(ledgerPath, JSON.stringify({ activeProjectId: "p1", workspaces: {} }), "utf8");
+  const s = new JanusStore(":memory:"); s.init();
+  assert.strictEqual(migrateOnBootIfNeeded(s, {
+    ledgerPath,
+    settingsPath: path.join(dir, ".janus_settings.json"),
+    historyPath: path.join(dir, ".janus_history.json"),
+  }), true);
+  assert.ok(s.getKV(LEDGER_MIGRATED_KEY), "marker set on success");
+  assert.ok(fs.existsSync(`${ledgerPath}.bak`), "original archived to .bak on success");
+  s.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("3V.5: initStoreWithQuarantine — a corrupt DB is quarantined to .corrupt-<ts> and a FRESH store boots", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-quar-"));
+  const dbPath = path.join(dir, "janus.db");
+  const GARBAGE = "THIS IS NOT A SQLITE DATABASE   garbage bytes";
+  fs.writeFileSync(dbPath, GARBAGE, "utf8");
+  // Stale WAL/SHM twins must travel WITH the quarantined main file (a leftover -wal would otherwise
+  // be replayed into the FRESH db sqlite creates under the same name).
+  fs.writeFileSync(`${dbPath}-wal`, "stale wal", "utf8");
+  fs.writeFileSync(`${dbPath}-shm`, "stale shm", "utf8");
+
+  const result = initStoreWithQuarantine(dbPath, (s) => s.init());
+
+  assert.ok(result.store, "a FRESH store boots after the quarantine (never a silent legacy fallback)");
+  assert.ok(result.quarantinedTo, "the quarantine path is reported");
+  assert.match(result.quarantinedTo!, /\.corrupt-\d+$/, "the bad DB is renamed to .corrupt-<timestamp>");
+  assert.ok(fs.existsSync(result.quarantinedTo!), "the quarantined file exists (data recoverable)");
+  assert.strictEqual(fs.readFileSync(result.quarantinedTo!, "utf8"), GARBAGE, "the corrupt bytes are preserved verbatim");
+  assert.ok(fs.existsSync(`${result.quarantinedTo}-wal`), "the -wal twin moved with it");
+  assert.ok(fs.existsSync(`${result.quarantinedTo}-shm`), "the -shm twin moved with it");
+  assert.ok(!fs.existsSync(`${dbPath}-shm`) || fs.readFileSync(`${dbPath}-shm`, "utf8") !== "stale shm",
+    "no stale twin lingers under the live name");
+
+  // The fresh store WORKS (writes + reads round-trip).
+  result.store!.setKV("smoke", "ok");
+  assert.strictEqual(result.store!.getKV("smoke"), "ok", "the fresh store is functional");
+  result.store!.close();
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("3V.5: initStoreWithQuarantine — a healthy (or absent) DB boots normally with NO quarantine", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-3v5-healthy-"));
+  const dbPath = path.join(dir, "janus.db");
+  const r1 = initStoreWithQuarantine(dbPath, (s) => s.init()); // absent -> created fresh
+  assert.ok(r1.store, "an absent DB is created fresh");
+  assert.strictEqual(r1.quarantinedTo, null, "no quarantine for a fresh DB");
+  r1.store!.setKV("k", "v");
+  r1.store!.close();
+
+  const r2 = initStoreWithQuarantine(dbPath, (s) => s.init()); // healthy reopen
+  assert.ok(r2.store, "a healthy DB reopens");
+  assert.strictEqual(r2.quarantinedTo, null, "no quarantine for a healthy DB");
+  assert.strictEqual(r2.store!.getKV("k"), "v", "existing data is intact (no destructive rename)");
+  r2.store!.close();
+  assert.strictEqual(fs.readdirSync(dir).some((f) => f.includes(".corrupt-")), false, "no .corrupt-* artifacts");
   fs.rmSync(dir, { recursive: true, force: true });
 });

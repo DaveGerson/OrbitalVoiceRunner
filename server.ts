@@ -32,7 +32,7 @@ import { classifyRawKey, isKnownRawKey } from "./src/rawKeyClass";
 import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceResumption";
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
-import { migrateOnBootIfNeeded } from "./src/store/migrate";
+import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import type { CapabilityGate } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { z } from "zod";
@@ -352,35 +352,46 @@ export class HistoryManager {
 // which the transport layer loads via createRequire. init() applies migrations (idempotent);
 // bootMaintenance() prunes stale rows/scrollback. Created BEFORE the manager so it can serve as
 // the manager's ledger backend when the cutover flag is on.
+// 3V.5: store-init failure used to SILENTLY fall back to the legacy JSON ledger — but a previous
+// boot's migration already renamed .janus_ledger.json to .bak (and LEDGER_MIGRATED_KEY blocks any
+// re-import), so a corrupt .janus.db booted the app EMPTY on legacy and stranded every new write.
+// initStoreWithQuarantine instead renames the bad DB (plus -wal/-shm twins) to .janus.db.corrupt-<ts>
+// (loudly, recoverably) and retries ONCE with a fresh DB; only if THAT also fails do we fall back to
+// legacy — and we say so.
 let store: JanusStore | null = null;
-try {
-  store = new JanusStore(process.env.JANUS_DB || ".janus.db");
-  store.init();
-  store.bootMaintenance({
-    now: Date.now(),
-    eventsTtlDays: 30,
-    archiveTtlDays: 14,
-    scrollbackDirs: [process.cwd()],
-  });
-  console.log("[STORE] JanusStore initialized (handoffs + capability-gate audit).");
-
-  // One-shot, gated, reversible JSON→SQLite ledger migration. Runs at most once
-  // (guarded by an in-DB marker), only if a legacy .janus_ledger.json exists, and
-  // renames the originals to .bak so the operator can verify/rollback. Idempotent
-  // across restarts even though .janus.db already exists for the handoff store.
-  try {
-    const migrated = migrateOnBootIfNeeded(store, {
-      ledgerPath: process.env.JANUS_LEDGER_PATH || ".janus_ledger.json",
-      settingsPath: ".janus_settings.json",
-      historyPath: ".janus_history.json",
+{
+  const storeInit = initStoreWithQuarantine(process.env.JANUS_DB || ".janus.db", (s) => {
+    s.init();
+    s.bootMaintenance({
+      now: Date.now(),
+      eventsTtlDays: 30,
+      archiveTtlDays: 14,
+      scrollbackDirs: [process.cwd()],
     });
-    if (migrated) console.log("[STORE] Migrated legacy JSON ledger → SQLite (originals renamed to .bak).");
-  } catch (e) {
-    console.error("[STORE] Ledger migration skipped (import failed; legacy JSON left intact):", e);
+  });
+  store = storeInit.store;
+  if (store) {
+    console.log(`[STORE] JanusStore initialized (handoffs + capability-gate audit)${storeInit.quarantinedTo ? ` — FRESH DB after quarantining the corrupt one to ${storeInit.quarantinedTo}` : ""}.`);
+
+    // One-shot, gated, reversible JSON→SQLite ledger migration. Runs at most once
+    // (guarded by an in-DB marker set INSIDE the import transaction — 3V.5), only if a legacy
+    // .janus_ledger.json exists, and renames the originals to .bak (strictly after the commit) so
+    // the operator can verify/rollback. Idempotent across restarts even though .janus.db already
+    // exists for the handoff store. An EXISTING-but-unparseable ledger now THROWS into this catch
+    // (3V.5) — which leaves the JSON file untouched at its live path (no rename, no marker).
+    try {
+      const migrated = migrateOnBootIfNeeded(store, {
+        ledgerPath: process.env.JANUS_LEDGER_PATH || ".janus_ledger.json",
+        settingsPath: ".janus_settings.json",
+        historyPath: ".janus_history.json",
+      });
+      if (migrated) console.log("[STORE] Migrated legacy JSON ledger → SQLite (originals renamed to .bak).");
+    } catch (e) {
+      console.error("[STORE] Ledger migration skipped (import failed; legacy JSON left intact):", e);
+    }
+  } else {
+    console.error("[STORE] JanusStore unavailable even after the quarantine retry — falling back to the legacy JSON ledger; HANDOFF PERSISTENCE IS DISABLED for this run.");
   }
-} catch (e) {
-  console.error("[STORE] Failed to initialize JanusStore — handoff persistence disabled:", e);
-  store = null;
 }
 
 // WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the

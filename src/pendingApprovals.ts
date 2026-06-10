@@ -81,6 +81,15 @@ export interface PendingApproval {
    * simply earns a fresh last-call, which is harmless.
    */
   lastCallAt?: number;
+  /**
+   * 3V.3 sweep transient: consecutive sweep ticks whose last-call NARRATION failed while the session
+   * was connected (the sweep stamps lastCallAt only on a successful push, retrying next tick, and
+   * stamps anyway once this counter hits the bound so a broken TTS never wedges the queue). IN-MEMORY
+   * ONLY — never persisted; it resets on restart, which is safe because boot re-hydrates survivors
+   * and the next (re)connect re-announces them, opening a fresh last-call window anyway. Cleared with
+   * lastCallAt on re-attach.
+   */
+  lastCallFailures?: number;
   /** The capability this approval rides (design §3). Defaults to "write_to_pane". */
   capability?: string;
 }
@@ -766,8 +775,10 @@ export class PendingApprovalStore {
 
     // (1) Bind the new live handle.
     this.sessions[id] = session;
-    // (3) Clear the last-call transient — re-attach opens a fresh window.
+    // (3) Clear the last-call transients — re-attach opens a fresh window (3V.3: the narration
+    // failure counter resets with it; the new session is a fresh channel).
     rec.lastCallAt = undefined;
+    rec.lastCallFailures = undefined;
 
     if (!this.store) return;                           // legacy: nothing durable to rewrite.
 
