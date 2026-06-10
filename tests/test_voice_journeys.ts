@@ -232,7 +232,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     assert.strictEqual(executed.vocal, true, "flagged as a VOICE approval");
     assert.ok(String(executed.cmd).includes("echo approved_"), "the frame names the command");
 
-    // And the operator HEARS it (BUG-040): the spoken read-back names the pane + command. This was
+    // And the operator HEARS it (BUG-041): the spoken read-back names the pane + command. This was
     // dead code when this lane first ran — applyResolution read sessionFor(messageId) AFTER
     // resolveDecision claim+deleted the record (and its session side-map entry) — so the narration
     // never fired on any terminal outcome. The fix reads the session before resolving.
@@ -279,7 +279,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     assert.ok(blocked, "command_blocked frame broadcast");
     assert.match(String(blocked.reason), /cancelled by operator/i);
 
-    // And the spoken rejection read-back fires too (BUG-040 — same root cause as journey 1).
+    // And the spoken rejection read-back fires too (BUG-041 — same root cause as journey 1).
     const spoken = await waitFor(() => {
       const n = narrationText(live());
       return n.includes("Rejecting the command") ? n : undefined;

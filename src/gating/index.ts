@@ -753,7 +753,7 @@ export function createGating(deps: GatingDeps): Gating {
   }
 
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
-    // BUG-040: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
+    // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
     // resolve always misses and every spoken read-back below would be silently skipped.
     const session = pendingApprovals.sessionFor(messageId);
