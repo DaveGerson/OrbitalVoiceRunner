@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P8 — The Pantry (per-project tracker). Calm surface (no mascots). Picker + banner + panes are
 // live from the ledger; the About is the editable project summary (PUT /api/projects/:id {summary});
@@ -6,6 +7,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoPantry(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1&view=pantry");
   await page.waitForSelector("html[data-e2e-ready='1']");
   await expect(page.getByTestId("pantry")).toBeVisible();

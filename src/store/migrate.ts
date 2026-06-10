@@ -24,13 +24,22 @@ export const LEDGER_MIGRATED_KEY = "ledgerMigratedAt";
 export function migrateOnBootIfNeeded(store: JanusStore, paths: MigrationPaths): boolean {
   if (store.getKV(LEDGER_MIGRATED_KEY)) return false;   // already migrated
   if (!fs.existsSync(paths.ledgerPath)) return false;   // nothing to migrate
-  migrateFromJson(store, paths);                        // import + .bak the originals
-  store.setKV(LEDGER_MIGRATED_KEY, new Date().toISOString());
+  // 3V.5: the marker is written INSIDE the import transaction (threaded down via markMigratedAt),
+  // never as a separate post-commit write — a failure anywhere rolls back BOTH the imported rows and
+  // the marker, so a half-migrated store can never be marked "done" (and a marked store always holds
+  // the full import). The .bak rename runs strictly AFTER the commit, so a failed import leaves the
+  // legacy JSON untouched at its live path.
+  migrateFromJson(store, paths, { markMigratedAt: new Date().toISOString() });
   return true;
 }
 
-/** Pure, testable importer over already-parsed objects. Runs in one transaction. */
-export function migrateFromObjects(store: JanusStore, input: MigrationInput): void {
+/** Pure, testable importer over already-parsed objects. Runs in one transaction.
+ *  3V.5: opts.markMigratedAt, when given, writes LEDGER_MIGRATED_KEY INSIDE that same transaction. */
+export function migrateFromObjects(
+  store: JanusStore,
+  input: MigrationInput,
+  opts?: { markMigratedAt?: string },
+): void {
   const tx = store.db.transaction(() => {
     const now = Date.now();
     const ledger = input.ledger ?? {};
@@ -70,6 +79,8 @@ export function migrateFromObjects(store: JanusStore, input: MigrationInput): vo
       }
     }
     store.appendEvent({ type: EVENT_TYPES.COMMAND_OUTCOME, summary: "migrated from JSON", ts: now, payload: { migration: true } });
+    // 3V.5: the migration marker commits ATOMICALLY with the import (see migrateOnBootIfNeeded).
+    if (opts?.markMigratedAt) store.setKV(LEDGER_MIGRATED_KEY, opts.markMigratedAt);
   });
   tx();
 }
@@ -85,13 +96,34 @@ function flatten(obj: any, prefix: string): [string, any][] {
 }
 
 /** File-driven entry point: read JSON, import, then rename the LEDGER + HISTORY originals to .bak.
- *  The settings JSON is left in place — see the rename loop below (bug ahm). */
-export function migrateFromJson(store: JanusStore, paths: MigrationPaths): void {
+ *  The settings JSON is left in place — see the rename loop below (bug ahm).
+ *  3V.5: opts.markMigratedAt is threaded into migrateFromObjects so the migration marker commits in
+ *  the same transaction as the import. */
+export function migrateFromJson(
+  store: JanusStore,
+  paths: MigrationPaths,
+  opts?: { markMigratedAt?: string },
+): void {
   const read = (p: string) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return undefined; } };
+  // 3V.5: an EXISTING ledger file that cannot be read/parsed must THROW, not silently import an
+  // empty ledger — the pre-fix swallow archived the (unparsed!) file to .bak and set the migration
+  // marker, silently losing the operator's data and permanently blocking a re-import. The throw
+  // happens BEFORE the import transaction and BEFORE any rename, so the file stays untouched at its
+  // live path; server.ts's existing migration catch logs it and boots without the import.
+  const readLedger = (p: string) => {
+    if (!fs.existsSync(p)) return undefined;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch (e) {
+      throw new Error(`legacy ledger ${p} exists but could not be read/parsed — refusing to archive it or mark the migration done: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
   migrateFromObjects(store, {
-    ledger: read(paths.ledgerPath), settings: read(paths.settingsPath), history: read(paths.historyPath),
-  });
+    ledger: readLedger(paths.ledgerPath), settings: read(paths.settingsPath), history: read(paths.historyPath),
+  }, opts);
   // ahm fix: rename ONLY the ledger + history originals — they now live authoritatively in SQLite.
+  // (3V.5: this rename block runs strictly AFTER the import transaction committed — a throw above
+  // leaves every original at its live path.)
   // The settings JSON is DELIBERATELY NOT renamed: OrchestratorManager.loadSettings reads
   // .janus_settings.json as its source of truth post-migration, so archiving it to .bak dropped the
   // operator's config (gates/presets/model) AND the legacy Gemini key on the first-migration boot
@@ -100,5 +132,69 @@ export function migrateFromJson(store: JanusStore, paths: MigrationPaths): void 
   // imported into the store (in-memory-only hardening), so the key lives only in the JSON.
   for (const p of [paths.ledgerPath, paths.historyPath]) {
     try { if (fs.existsSync(p)) fs.renameSync(p, `${p}.bak`); } catch {}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// 3V.5 — store-boot QUARANTINE. server.ts used to fall back to the legacy JSON ledger whenever
+// JanusStore init threw. But a PREVIOUS boot's migration already renamed .janus_ledger.json → .bak
+// (and LEDGER_MIGRATED_KEY blocks any re-import), so a corrupt .janus.db made the app boot EMPTY on
+// the legacy backend and strand every new write. Instead: quarantine the bad DB file aside
+// (recoverable, loud) and retry ONCE with a fresh DB — the SQLite backend stays authoritative.
+// Only if the retry ALSO fails (a non-file-level fault: missing native module, unwritable dir, ...)
+// does the caller fall back to legacy, logging that handoff persistence is disabled.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+export interface StoreInitResult {
+  /** The booted store, or null when BOTH the first attempt and the post-quarantine retry failed. */
+  store: JanusStore | null;
+  /** Where the corrupt DB was moved (`<dbPath>.corrupt-<epoch-ms>`), or null if no quarantine ran. */
+  quarantinedTo: string | null;
+}
+
+/**
+ * Construct + boot a JanusStore at `dbPath` (the `boot` callback runs init/maintenance). On failure,
+ * QUARANTINE the on-disk DB — rename it to `<dbPath>.corrupt-<ts>` together with its -wal/-shm twins
+ * (a stale twin left under the live name would be replayed into the fresh DB sqlite creates there) —
+ * and retry once with a fresh file. Never throws; the caller decides what a null store means.
+ */
+export function initStoreWithQuarantine(
+  dbPath: string,
+  boot: (store: JanusStore) => void,
+  now: number = Date.now(),
+): StoreInitResult {
+  const attempt = (): JanusStore => {
+    const s = new JanusStore(dbPath);
+    try { boot(s); } catch (e) {
+      try { s.close(); } catch { /* release the handle so the rename below can run on every platform */ }
+      throw e;
+    }
+    return s;
+  };
+  try {
+    return { store: attempt(), quarantinedTo: null };
+  } catch (firstErr) {
+    console.error(`[STORE] JanusStore failed to initialize at ${dbPath}:`, firstErr);
+    if (dbPath === ":memory:" || !fs.existsSync(dbPath)) {
+      // Nothing on disk to quarantine — the failure is environmental; a retry would just repeat it.
+      return { store: null, quarantinedTo: null };
+    }
+    const target = `${dbPath}.corrupt-${now}`;
+    try {
+      fs.renameSync(dbPath, target);
+    } catch (renameErr) {
+      console.error(`[STORE] could not quarantine ${dbPath} -> ${target}; store stays down:`, renameErr);
+      return { store: null, quarantinedTo: null };
+    }
+    for (const suffix of ["-wal", "-shm"]) {
+      try { if (fs.existsSync(`${dbPath}${suffix}`)) fs.renameSync(`${dbPath}${suffix}`, `${target}${suffix}`); } catch { /* best-effort */ }
+    }
+    console.error(`[STORE] QUARANTINED the corrupt database to ${target} (with any -wal/-shm twins). Prior data is recoverable from that file. Retrying ONCE with a fresh DB at ${dbPath}.`);
+    try {
+      return { store: attempt(), quarantinedTo: target };
+    } catch (retryErr) {
+      console.error("[STORE] the fresh-DB retry ALSO failed — handoff persistence will be disabled:", retryErr);
+      return { store: null, quarantinedTo: target };
+    }
   }
 }

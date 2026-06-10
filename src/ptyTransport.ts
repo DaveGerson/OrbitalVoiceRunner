@@ -106,7 +106,12 @@ export function nodePtyAvailable(): boolean {
 
 export class NodePtyTransport implements PtyTransport {
   private proc: any;
+  // Any kill dispatched (gates drainTeardown). Kept falsy-safe: kill() must work even if
+  // field initializers never ran (tests build instances via Object.create(prototype)).
   private _killed = false;
+  // 3P.2: latched once an effective SIGKILL has been dispatched — past that point every
+  // further kill() is a no-op (nothing escalates past SIGKILL).
+  private _sigkillSent = false;
 
   constructor(file: string, args: string[], opts: PtySpawnOptions) {
     const pty = loadNodePty();
@@ -149,18 +154,32 @@ export class NodePtyTransport implements PtyTransport {
   }
 
   kill(signal?: string): void {
-    // Idempotent: node-pty's Windows ConPTY kill() arms the conout-worker dispose
-    // (a worker_threads.Worker, i.e. a libuv uv_async_t) AND the native
-    // _$onProcessExit callback independently tears the conout socket down. A second
-    // kill() (e.g. the SIGTERM→SIGKILL escalation in UniversalTerminal.stop(), or a
-    // double stop()) re-enters WindowsPtyAgent.kill()/ConoutConnection.dispose() and
-    // can drive a second worker.terminate() on a handle already in UV_HANDLE_CLOSING
-    // → the `src\win\async.c:76` abort under --test-force-exit. Guard so node-pty's
-    // teardown runs at most once per pty.
-    if (this._killed) return;
-    this._killed = true;
+    // Idempotent PER EFFECTIVE SIGNAL (3P.2). node-pty's Windows ConPTY kill() arms the
+    // conout-worker dispose (a worker_threads.Worker, i.e. a libuv uv_async_t) AND the native
+    // _$onProcessExit callback independently tears the conout socket down. A REPEAT kill()
+    // (a double stop(), or — on win32, where killSignalForPlatform maps every signal to the
+    // bare unconditional kill() — the SIGTERM→SIGKILL escalation) re-enters
+    // WindowsPtyAgent.kill()/ConoutConnection.dispose() and can drive a second
+    // worker.terminate() on a handle already in UV_HANDLE_CLOSING → the `src\win\async.c:76`
+    // abort under --test-force-exit. Guard so node-pty's teardown runs at most once per pty
+    // PER effective signal.
+    //
+    // The old absolute `if (this._killed) return` latch made UniversalTerminal.stop()'s POSIX
+    // SIGTERM→SIGKILL escalation a SILENT NO-OP: a SIGTERM-resistant child became a permanent
+    // zombie while stop() reported success. Now an effective SIGKILL passes exactly once even
+    // after an earlier signal; a same-effective-signal repeat still no-ops (Windows protection
+    // intact, since both stop() signals collapse to the same bare kill there); and once a
+    // SIGKILL has been dispatched, every later kill() no-ops (nothing escalates past SIGKILL).
+    const effective = killSignalForPlatform(process.platform, signal);
+    if (this._killed) {
+      if (effective !== "SIGKILL" || this._sigkillSent) return;
+      this._sigkillSent = true;
+    } else {
+      this._killed = true;
+      if (effective === "SIGKILL") this._sigkillSent = true;
+    }
     try {
-      this.proc.kill(killSignalForPlatform(process.platform, signal));
+      this.proc.kill(effective);
     } catch {
       // already dead
     }

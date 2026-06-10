@@ -12,9 +12,21 @@ interface TerminalViewProps {
   backfill?: string;
   /** Report the xterm grid so the backend PTY can be resized to match. */
   onResize?: (cols: number, rows: number) => void;
+  /**
+   * 3C.2b: bumps when the data socket RE-opens after a drop. Each bump rebuilds the screen from a
+   * fresh snapshot (reset + rewrite) and writes a dim one-line marker, so a socket gap is never a
+   * silent hole in the scrollback.
+   */
+  resyncKey?: number;
+  /**
+   * 3C.2b: fetch this pane's freshest raw backfill (server truth). When provided, it is also
+   * called once on mount so the burner opens on truth rather than a possibly-stale React snapshot.
+   * `null` → fall back to the latest `backfill` prop.
+   */
+  fetchBackfill?: () => Promise<string | null>;
 }
 
-export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill, onResize }) => {
+export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill, onResize, resyncKey, fetchBackfill }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -22,6 +34,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
   // Keep the latest onResize without re-running the mount effect on every render.
   const onResizeRef = useRef<typeof onResize>(onResize);
   onResizeRef.current = onResize;
+  // 3C.2b: latest fetcher/backfill without re-running the mount effect; the resync entry point is
+  // installed by the mount effect (it needs the live term) and invoked by the resyncKey effect.
+  const fetchBackfillRef = useRef<typeof fetchBackfill>(fetchBackfill);
+  fetchBackfillRef.current = fetchBackfill;
+  const backfillRef = useRef<typeof backfill>(backfill);
+  backfillRef.current = backfill;
+  const resyncRef = useRef<((opts: { marker: boolean }) => void) | null>(null);
 
   // Re-create the terminal when the pane changes; the raw stream + backfill are
   // pane-specific, so a key change must reset xterm cleanly.
@@ -70,9 +89,12 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    // Seed scrollback with the raw backfill (escape sequences intact), exactly
-    // once. After this, xterm owns the authoritative buffer.
+    // Seed scrollback with the raw backfill (escape sequences intact) for an instant first paint.
+    // When a fetchBackfill is wired (the kitchen burner), a quiet resync below replaces this with
+    // SERVER truth right after mount — the React-state snapshot can be up to a poll-interval stale.
     if (backfill) term.write(backfill);
+    // The base the screen was last rebuilt from — lets the quiet resync skip a no-op rewrite.
+    let lastBase = backfill ?? "";
 
     // Sync the backend PTY grid to the xterm grid. onResize fires after every
     // fit() (initial + container changes), so the PTY always wraps to the
@@ -85,9 +107,44 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
 
     // Live lane: raw chunks written DIRECTLY into xterm — no React state, no
     // string accumulation, no line cap. xterm reconstructs the 2D grid itself.
+    // While a resync's snapshot fetch is in flight, chunks are ALSO journaled so they can be
+    // replayed after the reset+rewrite (otherwise the rewrite would clobber them — a fresh hole).
+    let disposed = false;
+    let journal: string[] | null = null;
     const unsubscribe = subscribeChunks(terminalId, (chunk) => {
+      if (journal) journal.push(chunk);
       term.write(chunk);
     });
+
+    // 3C.2b: rebuild the screen from snapshot truth. `marker: true` (socket reconnected) always
+    // rewrites and stamps the dim gap marker; `marker: false` (mount refresh) is quiet — it skips
+    // when the snapshot brings nothing new, and never yanks an operator who has scrolled up.
+    const resync = async ({ marker }: { marker: boolean }) => {
+      if (journal) return; // a resync is already in flight
+      journal = [];
+      let fresh: string | null = null;
+      try { fresh = (await fetchBackfillRef.current?.()) ?? null; } catch { fresh = null; }
+      const replay = journal ?? [];
+      journal = null;
+      if (disposed) return;
+      if (fresh === null) fresh = backfillRef.current ?? null; // degrade to the freshest React state
+      if (!marker) {
+        const buf = term.buffer.active;
+        const atBottom = buf.viewportY >= buf.baseY;
+        if (fresh === null || fresh === lastBase || !atBottom) return; // nothing new / operator reading
+      }
+      // One synchronous frame: reset, rewrite from truth, stamp the gap (reconnect only), then
+      // replay any chunks that streamed in while the snapshot was in flight.
+      term.reset();
+      if (fresh !== null) { term.write(fresh); lastBase = fresh; }
+      if (marker) term.write("\r\n\x1b[2m— reconnected; replayed from snapshot —\x1b[0m\r\n");
+      for (const c of replay) term.write(c);
+    };
+    resyncRef.current = (opts) => { void resync(opts); };
+
+    // Burner open (3C.2b): pull the pane's freshest backfill so the screen starts from truth —
+    // the prop snapshot above only covers up to the last poll/refetch.
+    if (fetchBackfillRef.current) void resync({ marker: false });
 
     // Handle container resize
     const resizeObserver = new ResizeObserver(() => {
@@ -133,6 +190,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     }
 
     return () => {
+      disposed = true;
+      resyncRef.current = null;
       unsubscribe();
       resizeDisposable.dispose();
       resizeObserver.disconnect();
@@ -148,6 +207,19 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     // bind cleanly. fontSize is handled in a separate effect (no re-mount).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId]);
+
+  // 3C.2b/c: the data socket RE-opened after a drop — rebuild this screen from a fresh snapshot
+  // and stamp the gap marker so the hole is never silent. Keyed on the bump, not the value (the
+  // initial render must not resync; mount handles its own quiet refresh above).
+  const lastResyncKeyRef = useRef<number | undefined>(resyncKey);
+  useEffect(() => {
+    if (resyncKey === undefined || resyncKey === lastResyncKeyRef.current) {
+      lastResyncKeyRef.current = resyncKey;
+      return;
+    }
+    lastResyncKeyRef.current = resyncKey;
+    resyncRef.current?.({ marker: true });
+  }, [resyncKey]);
 
   // Sync state changes back to active terminal instance
   useEffect(() => {

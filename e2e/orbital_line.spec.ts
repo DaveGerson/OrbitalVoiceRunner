@@ -1,10 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P2 — The Line: the board renders live STATIONS merged from the mock
 // harness's seeded terminals + ledger (mock_pane_1 "React Frontend",
 // mock_pane_2 "Python Backend" in workspace "Mock Project").
 
 async function gotoKitchen(page: Page) {
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

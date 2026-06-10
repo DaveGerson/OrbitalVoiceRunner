@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P6 — Back of House (settings rooms). Calm surface (no mascots). The Rulebook is the
 // capability-gate matrix wired to settings.advanced.capabilityGates; Chef de Cuisine sets global
@@ -7,6 +8,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoBoH(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1&view=boh");
   await page.waitForSelector("html[data-e2e-ready='1']");
   await expect(page.getByTestId("boh-body")).toBeVisible();

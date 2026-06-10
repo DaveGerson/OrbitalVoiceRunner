@@ -33,6 +33,8 @@ interface FakeSession {
   params: any;
   responses: any[];
   clientContents: any[];
+  /** 3V.1: every sendRealtimeInput payload (mic frames) — pins WHICH session the mic routes to. */
+  realtimeInputs: any[];
   closed: boolean;
   emit: (m: any) => void;
   emitToolCall: (name: string, args?: Record<string, any>, id?: string) => string;
@@ -50,6 +52,7 @@ function makeFakeSession(params: any): FakeSession {
     params,
     responses: [],
     clientContents: [],
+    realtimeInputs: [],
     closed: false,
     emit(m: any) { params?.callbacks?.onmessage?.(m); },
     emitToolCall(name: string, args: Record<string, any> = {}, id?: string) {
@@ -60,11 +63,37 @@ function makeFakeSession(params: any): FakeSession {
     emitError(err: any = new Error("fake live socket error")) { params?.callbacks?.onerror?.(err); },
     emitClose(info: any = { code: 1006, reason: "fake live socket closed" }) { params?.callbacks?.onclose?.(info); },
     sendToolResponse(r: any) { this.responses.push(r); },
-    sendRealtimeInput() { /* unused here */ },
+    sendRealtimeInput(i: any) { this.realtimeInputs.push(i); },
     sendClientContent(c: any) { this.clientContents.push(c); },
     close() { this.closed = true; },
   };
   return s;
+}
+
+/**
+ * 3V.1: a connector whose every connect attempt is a MANUALLY-RESOLVED promise, so a test can
+ * interleave OVERLAPPING connects deterministically (resolve the newer attempt first, then the
+ * older "slow" one last — the exact race the generation guard must win).
+ */
+function makeDeferredConnector() {
+  const sessions: FakeSession[] = [];
+  const pending: { params: any; resolve: (s: FakeSession) => void; reject: (e: any) => void }[] = [];
+  const state = { connectCount: 0 };
+  const connector = (_ai: any, params: any) =>
+    new Promise<FakeSession>((resolve, reject) => {
+      state.connectCount++;
+      pending.push({ params, resolve, reject });
+    });
+  /** Resolve the (1-indexed) attempt with a fresh FakeSession and return it. */
+  const resolveAttempt = (attempt: number): FakeSession => {
+    const p = pending[attempt - 1];
+    if (!p) throw new Error(`no pending connect attempt #${attempt}`);
+    const s = makeFakeSession(p.params);
+    sessions.push(s);
+    p.resolve(s);
+    return s;
+  };
+  return { connector, sessions, pending, state, resolveAttempt };
 }
 
 /** A scripted connector: fails `failuresRemaining` times (throwing), then returns a fresh FakeSession. */
@@ -683,6 +712,141 @@ describe("2S.5: voice_channel_restored is broadcast on the reconnect that follow
       2,
       "each loss earns exactly one restored announcement",
     );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// (k) 3V.1 — OVERLAPPING-CONNECT generation guards. Two connects can overlap (a bounded reconnect
+//     attempt in flight + a settings-PUT reconnect nudge). The connection-scoped `state.session`
+//     must only ever be assigned by the attempt that OWNS the current generation:
+//     (i)  a SLOW stale connect resolving LAST must not capture mic routing — sendRealtimeInput
+//          keeps targeting the FAST (live) session, and exactly one live session remains;
+//     (ii) a STALE session's late onclose (handleSessionLost) must NOT detach the LIVE session's
+//          approvals and must NOT schedule an extra reconnect (no third-session hoist).
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+describe("3V.1 (i): the slow stale connect resolving LAST does not steal mic routing", () => {
+  let running: RunningServer;
+  let client: WebSocket;
+  let messages: any[];
+  let deferred: ReturnType<typeof makeDeferredConnector>;
+
+  before(async () => {
+    deferred = makeDeferredConnector();
+    serverMod.setLiveConnector(deferred.connector);
+    serverMod.resetSessionAiFactory();
+    running = await serverMod.startServer({ port: 0, enableVite: false });
+    messages = [];
+    client = await openClient(running, messages);
+    // Attempt 1 = the initial connect. Resolve it immediately so the nudge registers.
+    await waitFor(() => deferred.state.connectCount >= 1);
+    const session0 = deferred.resolveAttempt(1);
+    await waitFor(() => running._testActiveLiveSession?.() === session0);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    await teardownServerSuite(running);
+  });
+
+  it("mic frames route to the FAST/live session; the stale one is closed", async () => {
+    const session0 = deferred.sessions[0];
+
+    // Drop the live session -> the bounded reconnect schedules attempt 2 (left PENDING = "slow").
+    session0.emitClose({ code: 1006, reason: "drop -> slow reconnect attempt" });
+    await waitFor(() => deferred.state.connectCount >= 2);
+
+    // While attempt 2 is still in flight, the settings-PUT reconnect nudge starts attempt 3
+    // (activeLiveSession is null, the reconnect timer already fired -> a genuine overlap).
+    serverMod.requestVoiceReconnect();
+    await waitFor(() => deferred.state.connectCount >= 3);
+
+    // The FAST attempt (3 — the newest generation) resolves FIRST and hoists.
+    const fast = deferred.resolveAttempt(3);
+    await waitFor(() => running._testActiveLiveSession?.() === fast);
+
+    // The SLOW stale attempt (2) resolves LAST. The generation guard must close it WITHOUT
+    // capturing the connection-scoped session the mic path writes to.
+    const slow = deferred.resolveAttempt(2);
+    await waitFor(() => slow.closed === true);
+
+    // Exactly one live session remains: the fast one; the stale one is closed.
+    assert.strictEqual(fast.closed, false, "the fast/live session stays open");
+    assert.strictEqual(running._testActiveLiveSession?.(), fast, "the hoisted live session is the fast one");
+
+    // MIC ROUTING: an operator audio frame must reach the FAST session, never the dead slow one.
+    client.send(JSON.stringify({ type: "audio", audio: "QUJD" }));
+    await waitFor(() => fast.realtimeInputs.length >= 1);
+    assert.strictEqual(fast.realtimeInputs.length, 1, "mic frames reach the live (fast) session");
+    assert.strictEqual(slow.realtimeInputs.length, 0, "NO mic frame is fed to the stale (closed) session");
+  });
+});
+
+describe("3V.1 (ii): a STALE session's late onclose neither detaches live approvals nor reconnects", () => {
+  let running: RunningServer;
+  let client: WebSocket;
+  let messages: any[];
+  let deferred: ReturnType<typeof makeDeferredConnector>;
+
+  before(async () => {
+    deferred = makeDeferredConnector();
+    serverMod.setLiveConnector(deferred.connector);
+    serverMod.resetSessionAiFactory();
+    running = await serverMod.startServer({ port: 0, enableVite: false });
+    messages = [];
+    client = await openClient(running, messages);
+    await waitFor(() => deferred.state.connectCount >= 1);
+    const session0 = deferred.resolveAttempt(1);
+    await waitFor(() => running._testActiveLiveSession?.() === session0);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    await teardownServerSuite(running);
+  });
+
+  it("the stale onclose is a no-op: approvals stay attached to the live session, no extra connect", async () => {
+    const session0 = deferred.sessions[0];
+
+    // Same overlap prelude as (i): drop -> slow attempt 2 pending -> nudge -> attempt 3 pending.
+    session0.emitClose({ code: 1006, reason: "drop -> overlapping attempts" });
+    await waitFor(() => deferred.state.connectCount >= 2);
+    serverMod.requestVoiceReconnect();
+    await waitFor(() => deferred.state.connectCount >= 3);
+
+    // This time the STALE attempt (2) resolves FIRST — the generation guard closes it...
+    const stale = deferred.resolveAttempt(2);
+    await waitFor(() => stale.closed === true);
+    // ...then the CURRENT attempt (3) resolves and hoists as the live session.
+    const live = deferred.resolveAttempt(3);
+    await waitFor(() => running._testActiveLiveSession?.() === live);
+
+    // Stage an approval bound to the LIVE session.
+    const approvals = running._testPendingApprovals!();
+    const messageId = "stale-onclose-survivor";
+    approvals.add(
+      { messageId, instruction: "deploy to staging", kind: "shell", terminalId: "stale-pane", callId: messageId, timestamp: Date.now() } as any,
+      live,
+    );
+    assert.strictEqual(approvals.sessionFor(messageId), live, "approval bound to the live session");
+
+    // The SDK eventually fires onclose for the guard-closed stale session. That stale
+    // handleSessionLost must be a NO-OP — not a detach of the live session's approvals, not a
+    // voice_channel_lost, and not a scheduleReconnect hoisting a third session.
+    const connectsBefore = deferred.state.connectCount; // 3
+    const lostBefore = messages.filter((m) => m.type === "voice_channel_lost").length;
+    stale.emitClose({ code: 1006, reason: "late stale onclose" });
+
+    await new Promise((r) => setTimeout(r, 200));
+    assert.strictEqual(approvals.sessionFor(messageId), live, "the LIVE session's approval was NOT detached by the stale onclose");
+    assert.strictEqual(running._testActiveLiveSession?.(), live, "the live hoist survives the stale onclose");
+    assert.strictEqual(deferred.state.connectCount, connectsBefore, "no extra reconnect attempt was scheduled by the stale onclose");
+    assert.strictEqual(
+      messages.filter((m) => m.type === "voice_channel_lost").length,
+      lostBefore,
+      "no voice_channel_lost was broadcast for the stale session",
+    );
+
+    approvals.delete(messageId);
   });
 });
 

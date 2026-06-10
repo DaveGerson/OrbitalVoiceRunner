@@ -14,6 +14,7 @@
 import { Fragment, useEffect, useRef, useState, type CSSProperties, type MutableRefObject } from "react";
 import { TerminalView } from "../components/TerminalView";
 import { apiFetch } from "../utils/api";
+import { isE2EWireArmed } from "../e2e/harness";
 import { RAW_KEY_TABLE } from "../rawKeyClass";
 import { INK, RUNTIMES } from "./theme";
 import { Button, Chip, Icon, PostureChip, StatusBadge, VoiceCue } from "./primitives";
@@ -91,6 +92,9 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
   const onChange = (v: string) => {
     setText(v);
     if (!paneId) return;
+    // 3C.3b: under plain ?mock=1 the draft stays client-side; only a Playwright-armed page
+    // persists over the wire (the e2e intercepts + asserts the PUT).
+    if (isMockRef.current && !isE2EWireArmed()) return;
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "draft_edit", projectId, paneId, text: v }));
@@ -102,6 +106,8 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
   };
   const send = async (): Promise<boolean> => {
     if (!text.trim() || !paneId) return false;
+    // 3C.3b: same gate — a manual ?mock=1 "send" clears the pad client-side, no real POST.
+    if (isMockRef.current && !isE2EWireArmed()) { setText(""); return true; }
     try {
       const r = await apiFetch(`/api/panes/${projectId}/${paneId}/draft/send`, { method: "POST" });
       if (r.ok) { setText(""); return true; }
@@ -111,9 +117,13 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
   return { text, onChange, send, scrap: () => onChange(""), focusedRef };
 }
 
-export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, incomingDraft, onAddNote, onDeleteNote, onClose, onRestart, onStop, onRename, writeControlKey, resizeTerminal, showToast }: {
+export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, incomingDraft, onAddNote, onDeleteNote, onClose, onRestart, onStop, onRename, writeControlKey, resizeTerminal, showToast, streamGeneration, fetchBackfill }: {
   st: Station;
   backfill?: string;
+  /** 3C.2b: bumps when the observe socket RE-opens — drives the xterm resync-with-marker. */
+  streamGeneration?: number;
+  /** 3C.2b: fetch this pane's freshest raw backfill (server truth) for the resync/open rebuild. */
+  fetchBackfill?: () => Promise<string | null>;
   accentHex: string;
   dark: boolean;
   isMockRef: MutableRefObject<boolean>;
@@ -242,6 +252,8 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
                 terminalId={st.id}
                 backfill={backfill}
                 onResize={(cols, rows) => resizeTerminal(st.id, cols, rows)}
+                resyncKey={streamGeneration}
+                fetchBackfill={fetchBackfill}
               />
             </div>
             <ControlKeyBar paneId={st.id} dark={dark} onKey={writeControlKey} />

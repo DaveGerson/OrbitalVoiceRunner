@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P5b — Kitchen Radio (the voice channel). The radio rail renders the live transcript feed
 // (operator ASR + Janus turns + grounded sources), the "what're my calls?" sheet (voice parity), and
@@ -8,6 +9,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoKitchen(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

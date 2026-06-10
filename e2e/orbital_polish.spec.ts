@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P9 — the "feels good" polish (audit-driven). These pin the connective-tissue + feedback that
 // make the kitchen feel alive rather than merely look right: acks narrate into the Kitchen Radio,
@@ -7,6 +8,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoKitchen(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

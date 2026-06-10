@@ -66,6 +66,13 @@ export interface SetGlobalPermissionsParams { permissionsMode: string; }
 /** Params captured by the set_pane_permissions closure. */
 export interface SetPanePermissionsParams { paneId: string; projectId: string; permissionsMode: string; }
 /**
+ * Params captured by the applyPaneMode choke point's Ask deferral (src/applyPaneMode.ts, 3V.4).
+ * `source` is the SHAPE DISCRIMINATOR: the legacy locks.ts staging site never stages it, so its
+ * presence routes the rebuild to the applyPaneMode arm. No projectId is staged — the choke point
+ * persists against the ACTIVE project (gating's persistMode), which the rebuild mirrors.
+ */
+export interface ApplyPaneModeParams { paneId: string; permissionsMode: string; source: "voice" | "ui" | "restart_pane"; }
+/**
  * Params captured by the #27 update_metadata closures (amend_note / delete_note, server.ts:2511/2525).
  * `op` is the discriminator — both sites share capability "update_metadata" but call different ledger
  * methods and return different confirm strings. `text` is the ENQUEUE-BOUND amend text (#27 MUST-FIX
@@ -217,6 +224,40 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
       };
     }
     case "set_pane_permissions": {
+      // 3V.4: TWO staging sites share this capability. The applyPaneMode choke point (live-signal /
+      // restart-resume mechanics) stages { paneId, permissionsMode, source }; the legacy locks.ts
+      // fallback stages { paneId, projectId, permissionsMode }. `source` discriminates. A FULL
+      // live replay of applyPaneMode is impractical here — this deps bag has no adapter/poll/gate
+      // seams, and re-entering applyPaneMode would re-route through gateOrDefer (still Ask ->
+      // re-defer forever). So the rebuild applies WHAT IT CAN reach: the live pane object's mode
+      // (next-spawn semantics, when the pane is running) + the ledger persist (PERSIST-WINS mirror
+      // of gating's persistMode) + the broadcasts — and SAYS, in both the broadcast note and the
+      // confirm string, that the pane needs a restart (restart-resume) before the LIVE process
+      // switches. Post-restart panes boot INERT anyway, so the persisted mode governs the next start.
+      if (typeof (intent.params as { source?: unknown }).source === "string") {
+        const p = intent.params as unknown as ApplyPaneModeParams;
+        return () => {
+          const term = deps.manager.terminals[p.paneId];
+          if (term) term.setPermissionsMode(p.permissionsMode);
+          // PERSIST-WINS: mirror gating's persistMode (active project, forced updatePane).
+          const ws = deps.manager.ledger.getActiveProject?.();
+          const pane = ws?.panes?.[p.paneId];
+          if (ws && pane) {
+            pane.permissions_mode = p.permissionsMode;
+            deps.manager.ledger.updatePane(deps.manager.ledger.activeProjectId || "default_project", pane, true);
+          }
+          deps.broadcastLedgerUpdate();
+          deps.broadcast({ type: "settings_updated", paneId: p.paneId, permissionsMode: p.permissionsMode });
+          deps.broadcast({ type: "terminals_updated", paneId: p.paneId });
+          // The restart-resume note: the live process (if any) was NOT signal-switched by this replay.
+          deps.broadcast({
+            type: "pane_note",
+            paneId: p.paneId,
+            note: `Permission mode for pane ${p.paneId} set to ${p.permissionsMode} after restart — restart the pane (restart-resume) to apply it to a LIVE process.`,
+          });
+          return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode}. Applied after a restart: the next pane start uses it; restart the pane to switch a live process.`;
+        };
+      }
       const p = intent.params as unknown as SetPanePermissionsParams;
       return () => {
         if (deps.manager.terminals[p.paneId]) deps.manager.terminals[p.paneId].setPermissionsMode(p.permissionsMode);

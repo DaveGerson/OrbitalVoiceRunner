@@ -29,6 +29,9 @@
 import type { AgentAdapter, Mode } from "./agents";
 import type { PendingApprovalStore } from "./pendingApprovals";
 import type { PendingActionStore } from "./pendingActions";
+// 3V.4: the PLM3 version stamp for the staged Ask-intent. registry.ts is pure (zod + static
+// ActionDefs, no server boot) — the same import actionEffects.ts already takes.
+import { actionSchemaHash } from "./actions/registry";
 
 /** The disposition the injected gate returns — MATCHES server.ts gateOrDefer (server.ts:1768). */
 export type GateDisposition =
@@ -215,7 +218,18 @@ export async function applyPaneMode(
     paneId,
     `Set pane ${paneId} permissions to ${targetMode}`,
     syncRun,
-    { paneId, permissionsMode: targetMode, source },
+    // 3V.4: stamp the persisted intent with the PLM3 version guard ({ actionName, schemaHash }) —
+    // the same spread src/actions/defs/locks.ts:144 does via ctx.versionStamp. Without it, boot
+    // hydration (src/gating/index.ts) quarantined this intent as "unknown_action" and the
+    // operator's pending confirm silently vanished on restart. `source` doubles as the shape
+    // discriminator the actionEffects rebuild arm keys on (the legacy locks.ts path never stages it).
+    {
+      actionName: "set_pane_permissions",
+      schemaHash: actionSchemaHash("set_pane_permissions") ?? undefined,
+      paneId,
+      permissionsMode: targetMode,
+      source,
+    },
     targetMode,
   );
 

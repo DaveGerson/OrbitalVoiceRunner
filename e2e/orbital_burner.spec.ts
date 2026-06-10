@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { armE2EWire } from "./fixtures";
 
 // Wave P4 — The Burner (TerminalWindow). Opening a station card mounts the REAL
 // xterm (backfill scrollback + live raw-chunk stream) and wires every control to
@@ -8,6 +9,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function gotoKitchen(page: Page) {
   await page.emulateMedia({ reducedMotion: "reduce" });
+  await armE2EWire(page); // 3C.3b: mock-mode wires only fire on a Playwright-armed page
   await page.goto("/?ui=kitchen&mock=1");
   await page.waitForSelector("html[data-e2e-ready='1']");
 }

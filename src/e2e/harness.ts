@@ -16,6 +16,18 @@ export const MOCK_TERMINAL_ID = "mock_pane_1";
 // model/human context — the felt bug is "highlight moves, context body lags."
 export const MOCK_TERMINAL_ID_2 = "mock_pane_2";
 
+// 3C.3: TRUE only when the page was PRE-ARMED by the Playwright fixtures — armE2EWire() runs an
+// addInitScript that sets `window.__ORBITAL_E2E_WIRE__` BEFORE the bundle executes. A human typing
+// ?mock=1 into a real deployment has no init script, so mock-mode mutations stay fully client-side
+// for them instead of firing real PUTs/POSTs at a live server (the old behavior let ?mock=1
+// clobber prod settings). The marker is a DEDICATED property (not the hooks object itself):
+// StrictMode re-runs the harness effect, which would otherwise see its own installed hooks.
+/** Mock-mode call sites consult this before firing a REAL request "so the e2e can assert the wire". */
+export function isE2EWireArmed(): boolean {
+  return typeof window !== "undefined"
+    && (window as unknown as { __ORBITAL_E2E_WIRE__?: unknown }).__ORBITAL_E2E_WIRE__ === true;
+}
+
 export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } };
 
 /** Injection surface exposed on `window.__ORBITAL_E2E__` for Playwright to drive. */
@@ -86,6 +98,19 @@ export interface OrbitalE2EHooks {
    * Exited pane) render deterministically. Re-seeds both default panes with the override applied.
    */
   setPaneStatusMock: (paneId: string, status: "Running" | "Idle" | "Exited") => void;
+  /**
+   * Phase 3 3C.1: feed a frame through the SAME observe-lane WS switch the real /live socket
+   * drives (the harness is client-only — no real WS). Lets the e2e pin the in-place
+   * pane_status / pane_quiescing patch through the real handler path, not a parallel mock path.
+   * No-op for hosts that don't wire `onWsFrame` (classic).
+   */
+  injectWsFrame: (frame: unknown) => void;
+  /**
+   * Phase 3 3C.2: model the observe socket dropping and coming back. Bumps the same
+   * stream-generation counter a real reconnect bumps, which drives the mounted TerminalView's
+   * reset-and-rewrite-from-snapshot resync (with the visible "reconnected" marker).
+   */
+  simulateStreamReconnect: () => void;
 }
 
 export type PendingActionEntry = { actionId: string; capability: string; summary: string };
@@ -119,6 +144,10 @@ export interface E2EHarnessDeps {
   setConnMock?: (s: { stream?: boolean; voice?: boolean; micBlocked?: boolean }) => void;
   /** 2K.3 (OPTIONAL — kitchen only): receives staged `draft_updated` frames from `injectDraftUpdate`. */
   setPaneDraftMock?: (paneId: string, text: string) => void;
+  /** 3C.1 (OPTIONAL — kitchen only): the REAL observe-lane frame handler, for `injectWsFrame`. */
+  onWsFrame?: (frame: unknown) => void;
+  /** 3C.2 (OPTIONAL — kitchen only): bump the stream generation (models an observe reconnect). */
+  bumpStreamGeneration?: () => void;
 }
 
 /**
@@ -400,6 +429,16 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
         if (paneId === MOCK_TERMINAL_ID) t1.status = status;
         if (paneId === MOCK_TERMINAL_ID_2) t2.status = status;
         deps.setTerminals([t1, t2]);
+      },
+
+      // 3C.1: route a frame through the REAL observe-lane switch (kitchen only).
+      injectWsFrame: (frame) => {
+        deps.onWsFrame?.(frame);
+      },
+
+      // 3C.2: model an observe-socket drop/reopen → drives the TerminalView resync (kitchen only).
+      simulateStreamReconnect: () => {
+        deps.bumpStreamGeneration?.();
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;

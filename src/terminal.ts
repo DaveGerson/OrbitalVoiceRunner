@@ -438,6 +438,10 @@ export class UniversalTerminal {
   // onExit-driven resolve can never drive node-pty's ConPTY teardown more than once
   // (the conout-worker double-dispose that aborts at src\win\async.c:76).
   private _stopping: Promise<void> | null = null;
+  // SIGTERM→SIGKILL escalation window (ms) in _doStop. Injectable ONLY so the unit suite can
+  // exercise the killTimeout-resolved stop() path (a SIGTERM-ignoring child) without a 1s
+  // wall-clock wait; production always uses the default.
+  private killEscalationMs = 1000;
   public lastStatusChangeAt: number = Date.now();
   public lastCommand = "";
   // runtime_type drives the prompt-regex gating (I4): Custom preset ⇒ "shell";
@@ -784,6 +788,20 @@ export class UniversalTerminal {
     delete childEnv.CLAUDE_CODE_SSE_PORT;
     delete childEnv.CLAUDE_AGENT_SDK_VERSION;
 
+    // 3P.3: self-defending start() — make this spawn the pane's ONLY live transport regardless
+    // of caller discipline. Two overlapping restarts (`await term.stop(); term.start()` from two
+    // callers) both await the SAME _stopping promise, then BOTH call start(): without this, the
+    // second start() overwrites this.transport while the first spawn stays alive and wired (two
+    // live processes feeding one pane). A leftover transport can also be a DEAD one (self-exit
+    // never nulls this.transport). Kill it best-effort and null it before spawning. SIGKILL, not
+    // SIGTERM: the orphan is either milliseconds old (the restart race) or already dead — there
+    // is no session worth a graceful window, and nothing awaits its exit.
+    if (this.transport) {
+      const orphan = this.transport;
+      this.transport = null;
+      try { orphan.kill("SIGKILL"); } catch { /* already dead */ }
+    }
+
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
     // QW2: pty.spawn throws SYNCHRONOUSLY on native/ENOENT failures and propagates
     // out through createPtyTransport. Guard the single spawn chokepoint so a failed
@@ -824,16 +842,14 @@ export class UniversalTerminal {
     // command (writeInput) BEFORE the deferred start() ran — it sits in pendingInput. Snapshot it so
     // the reset below preserves it instead of dropping it on the floor.
     //
-    // The `transport === null` test does NOT distinguish first-spawn from /restart — stop() nulls
-    // this.transport before restart calls start(), so BOTH paths enter here with transport === null.
-    // That is fine: this carve-out is safe in both cases because pendingInput is only ever non-empty
-    // in the genuine first-spawn-before-start window. After ANY successful boot, markSpawnReady
-    // drains pendingInput to []; so on /restart the slice is [] (nothing stale carried), while a
-    // command typed during a stop→start gap is legitimately preserved and delivered to the new
-    // process. (Empirically confirmed: transport===null, spawnReady===true, pendingInput===[] at
-    // restart entry.) If you ever need to truly branch on first-spawn, key on an explicit flag — not
-    // on transport.
-    const preSpawn = this.transport ? [] : this.pendingInput.slice();
+    // this.transport is GUARANTEED null here (stop() nulls it; the degraded-spawn catch nulls it;
+    // the 3P.3 orphan-kill above nulls any leftover), so the snapshot is unconditional. It is safe
+    // in every path because pendingInput can only be non-empty when the queued input legitimately
+    // belongs to the NEXT process: the genuine first-spawn-before-start window, a command typed
+    // during a stop→start gap, or input queued during an overlapping-restart race. After ANY
+    // successful boot markSpawnReady drains pendingInput to [], and a session that DIED pre-ready
+    // has its queue cleared by the onExit teardown (3P.4) — so dead-session input never replays.
+    const preSpawn = this.pendingInput.slice();
     this.transport = transport;
     this.usingNodePty = usingNodePty;
     // G3: re-enter the gated state for THIS (re)spawn — a /restart must not inherit
@@ -863,6 +879,14 @@ export class UniversalTerminal {
 
     // Merged stdout/stderr stream from the transport.
     transport.onData((decoded: string) => {
+      // 3P.1 generation guard: these per-spawn callbacks close over `this`, which OUTLIVES the
+      // transport they were installed for. A SIGTERM-ignoring child makes _doStop resolve via the
+      // killEscalation timeout BEFORE the process dies; a restart then installs a NEW transport,
+      // and the OLD process's late data/exit would otherwise mutate the NEW spawn's state. A
+      // REPLACED transport (this.transport is a different live one) is stale → inert. When
+      // this.transport === null (pane stopped, not respawned) the edge passes through, preserving
+      // the legacy post-stop behavior (late output capture / exit → "Exited").
+      if (this.transport !== transport && this.transport !== null) return;
       // G3: first data out == the child is alive and has attached its PTY. Flush
       // any queued input BEFORE this chunk advances the status machine, so our
       // queued command causally precedes the child's response to it.
@@ -886,6 +910,12 @@ export class UniversalTerminal {
     // Lifecycle (Tier 0, design §3) — kept verbatim in semantics: a real exit
     // maps to status="Exited" and tears down the probe/idle timers.
     transport.onExit(() => {
+      // 3P.1 generation guard (same predicate as onData): a REPLACED transport's late exit must
+      // not mark the NEW spawn "Exited" or clear the NEW spawn's probe/idle/ready timers. The
+      // null case (stopped, not respawned) passes through so a post-stop exit still lands the
+      // deterministic "Exited" status.
+      if (this.transport !== transport && this.transport !== null) return;
+      const ownExit = this.transport === transport;
       this.status = "Exited";
       this.lastStatusChangeAt = Date.now();
       this.clearProbeTimer();
@@ -897,6 +927,17 @@ export class UniversalTerminal {
       if (this.readyFallbackTimer) {
         clearTimeout(this.readyFallbackTimer);
         this.readyFallbackTimer = null;
+      }
+      // 3P.4: a child that dies pre-spawn-ready strands its queued input — and because self-exit
+      // does not null this.transport, the restart path (`await stop(); start()`) would replay
+      // those dead-session commands into the fresh process. Drop them HERE, only for the pane's
+      // OWN live transport's exit (ownExit): when this.transport is already null the queue may
+      // hold input legitimately typed during a stop→start gap, which start() must preserve.
+      if (ownExit && this.pendingInput.length > 0) {
+        console.debug(
+          `[terminal] ${this.terminalId}: dropping ${this.pendingInput.length} queued input(s) — pane exited before spawn-ready`
+        );
+        this.pendingInput = [];
       }
     });
 
@@ -1111,7 +1152,7 @@ export class UniversalTerminal {
           // already dead
         }
         done();
-      }, 1000);
+      }, this.killEscalationMs);
       // In-flight rule: the awaited stop() DEPENDS on this timer when the child ignores SIGTERM
       // (or a stub transport never emits exit), so it must hold the loop while the stop is live.
       // done() clears it on every settle path, so it can never outlive the stop itself.

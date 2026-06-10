@@ -71,6 +71,9 @@ import type { CoreState } from "../core/coreState";
  *  - coreState:                 the shared mutable state (frozen / activePaneId / activeLiveSession / lastStopAllFailed).
  *  - announcementBus:           the proactive-feedback sink (earcons + on-screen stack).
  *  - pushApprovalNarration:     INJECTED — narrates a system event into the live session (voice owns it; dec-5 moves the def into voice).
+ *                               3V.3: the real seam returns `false` when the push threw (swallowed) so the
+ *                               sweep can gate the last-call stamp on a HEARD narration. `void` (legacy
+ *                               stubs) counts as success — only a strict `false` is a failed push.
  *  - sanitizeSettingsForClient: passed through to buildActionRun's deps for the rehydrated set_*_permissions effects.
  *  - addCommand:                the HistoryManager singleton's addCommand (server.ts HistoryManager is not importable);
  *                               the approved-write path records the command in command history exactly as before.
@@ -83,7 +86,7 @@ export interface GatingDeps {
   broadcastDraft: (projectId: string, paneId: string) => void;
   coreState: CoreState;
   announcementBus: AnnouncementBus;
-  pushApprovalNarration: (session: any, text: string) => void;
+  pushApprovalNarration: (session: any, text: string) => boolean | void;
   sanitizeSettingsForClient: (settings: any) => any;
   addCommand: (terminalId: string, command: string) => void;
 }
@@ -700,17 +703,42 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  // 3V.3 (last-call ack before reject): how many CONSECUTIVE sweep ticks a last-call narration may
+  // fail (while a session IS connected — both legs below only reach "lastcall" when connected) before
+  // we stamp lastCallAt anyway. The pre-fix sweep stamped BEFORE narrating, and pushApprovalNarration
+  // swallows send failures — so an item could auto-reject a grace after a last-call NOBODY heard.
+  // Now the stamp follows a SUCCESSFUL push; while un-narrated the item stays pre-last-call and the
+  // sweep retries next tick. The failure counter is IN-MEMORY ONLY (never persisted): a restart
+  // resets it, which is safe because boot re-hydrates the survivors and the next (re)connect
+  // re-announces them (reannounceSurvivors), re-opening a fresh last-call window anyway. The bound
+  // exists so a persistently-broken TTS channel can never hold approvals open forever.
+  const LAST_CALL_MAX_NARRATION_FAILURES = 3;
+
   function sweepExpiredApprovalsUnsafe(now: number) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
       const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
       const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
       if (decision.action === "none") continue; // not due, clock paused, or inside grace.
       if (decision.action === "lastcall") {
-        // First crossing while connected: SPEAK the last-call (no reject), stamp the transient.
-        pending.lastCallAt = now;
+        // First crossing while connected: SPEAK the last-call (no reject), THEN stamp the transient —
+        // only a push that actually went out starts the grace clock (3V.3).
         const session = pendingApprovals.sessionFor(pending.messageId);
-        if (session) pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`);
-        broadcastTerminalsUpdated();
+        const spoken = session !== undefined
+          && pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`) !== false;
+        if (spoken) {
+          pending.lastCallAt = now;
+          pending.lastCallFailures = undefined;
+          broadcastTerminalsUpdated();
+        } else {
+          pending.lastCallFailures = (pending.lastCallFailures ?? 0) + 1;
+          if (pending.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
+            // Bounded: the session is connected but narration keeps failing — stamp anyway so a
+            // broken TTS never wedges the queue (the grace still applies from here).
+            console.warn(`[gating] last-call narration failed ${pending.lastCallFailures}x for ${pending.messageId} — stamping the last-call anyway.`);
+            pending.lastCallAt = now;
+            broadcastTerminalsUpdated();
+          }
+        }
         continue;
       }
       // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
@@ -731,9 +759,24 @@ export function createGating(deps: GatingDeps): Gating {
       const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
       if (decision.action === "none") continue;
       if (decision.action === "lastcall") {
-        act.lastCallAt = now;
-        if (coreState.activeLiveSession) pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`);
-        broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        // 3V.3: same speak-then-stamp ordering as the approvals leg above. The retry counter lives on
+        // the in-memory record via a structural widening (PendingAction's serialized shape is owned by
+        // pendingActions.ts; the counter is a sweep-private transient, deliberately never persisted).
+        const retry = act as { lastCallFailures?: number };
+        const spoken = coreState.activeLiveSession !== null
+          && pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`) !== false;
+        if (spoken) {
+          act.lastCallAt = now;
+          retry.lastCallFailures = undefined;
+          broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        } else {
+          retry.lastCallFailures = (retry.lastCallFailures ?? 0) + 1;
+          if (retry.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
+            console.warn(`[gating] last-call narration failed ${retry.lastCallFailures}x for action ${act.id} — stamping the last-call anyway.`);
+            act.lastCallAt = now;
+            broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+          }
+        }
         continue;
       }
       // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
