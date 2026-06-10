@@ -753,6 +753,10 @@ export function createGating(deps: GatingDeps): Gating {
   }
 
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
+    // BUG-040: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
+    // and the store's delete() drops the session side-map entry with it, so a lookup after the
+    // resolve always misses and every spoken read-back below would be silently skipped.
+    const session = pendingApprovals.sessionFor(messageId);
     const action = resolveDecision(
       pendingApprovals,
       messageId,
@@ -761,7 +765,6 @@ export function createGating(deps: GatingDeps): Gating {
     );
     const { reason, record } = action;
     if (!record) return action; // not_found: idempotent no-op
-    const session = pendingApprovals.sessionFor(messageId);
     const safeInstr = redactSecrets(record.instruction);
     const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
 

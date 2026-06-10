@@ -803,8 +803,11 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add a "(session only — not saved)" qualifier until persistence lands.
 - **Source gaps:** J7-G13.
 
-#### BUG-040 — Spoken approve/reject confirmations are dead code (sessionFor read after delete)
+#### BUG-040 — Spoken approve/reject confirmations are dead code (sessionFor read after delete) — RESOLVED
 - **Priority:** P2
+- **Status:** RESOLVED — `applyResolution` now reads `sessionFor(messageId)` before
+  `resolveDecision`; the voice journey lane asserts the spoken "Approving:" / "Rejecting the
+  command" read-backs (`tests/test_voice_journeys.ts`, journeys 1–2).
 - **Category:** Sub-capable (eyes-off feedback)
 - **Journeys affected:** J2, J3.
 - **Evidence:** `applyResolution` (`src/gating/index.ts:755`) calls `resolveDecision` first,

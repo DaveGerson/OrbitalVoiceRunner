@@ -224,15 +224,6 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
 
     // The operator-visible resolution: the command_auto_executed frame names the pane + command and
     // is flagged operator-APPROVED + vocal (the UI renders this as the voice-approval confirmation).
-    //
-    // KNOWN SERVER GAP (found by this real-path test, deliberately NOT asserted around): the SPOKEN
-    // resolution narration ("Approving: run on pane … Dispatching now.", src/gating/index.ts:800)
-    // is dead code on every terminal outcome — applyResolution calls resolveDecision FIRST, which
-    // claim+DELETEs the record (src/pendingApprovals.ts resolveDecision -> store.delete), and
-    // PendingApprovalStore.delete() also drops the session side-map entry, so the subsequent
-    // pendingApprovals.sessionFor(messageId) (src/gating/index.ts:764) is always undefined and the
-    // narration push is skipped. Fixing it means reading sessionFor BEFORE resolveDecision; until
-    // then the broadcast frame below is the only operator-facing confirmation.
     const executed = clientMessages.find(
       (m) => m.type === "command_auto_executed" && m.terminalId === paneId
     );
@@ -240,6 +231,17 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     assert.strictEqual(executed.approved, true, "flagged operator-approved, not an auto-run");
     assert.strictEqual(executed.vocal, true, "flagged as a VOICE approval");
     assert.ok(String(executed.cmd).includes("echo approved_"), "the frame names the command");
+
+    // And the operator HEARS it (BUG-040): the spoken read-back names the pane + command. This was
+    // dead code when this lane first ran — applyResolution read sessionFor(messageId) AFTER
+    // resolveDecision claim+deleted the record (and its session side-map entry) — so the narration
+    // never fired on any terminal outcome. The fix reads the session before resolving.
+    const spoken = await waitFor(() => {
+      const n = narrationText(live());
+      return n.includes("Approving:") ? n : undefined;
+    }, 4000);
+    assert.ok(spoken.includes(paneId), `the spoken approval names the pane: ${spoken}`);
+    assert.ok(spoken.includes("echo approved_"), `the spoken approval reads the command back: ${spoken}`);
   });
 
   // ───────────────────────────────────────────────────────────────────────────────────────────
@@ -266,9 +268,6 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     assert.ok(!t.getRecentOutput(200).includes("rejected_42"), "the command did not execute");
 
     // The operator-visible rejection confirmation: the approval_resolved + command_blocked frames.
-    // (The spoken "Rejecting the command on pane …" narration at src/gating/index.ts:806 is dead on
-    // the live path for the same reason as journey 1's "Approving:" line — resolveDecision deletes
-    // the record/side-map before sessionFor is read — so the frames are the real confirmation.)
     const resolved = clientMessages
       .slice(seen)
       .find((m) => m.type === "approval_resolved" && m.messageId === callId);
@@ -279,6 +278,13 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
       .find((m) => m.type === "command_blocked" && m.terminalId === paneId);
     assert.ok(blocked, "command_blocked frame broadcast");
     assert.match(String(blocked.reason), /cancelled by operator/i);
+
+    // And the spoken rejection read-back fires too (BUG-040 — same root cause as journey 1).
+    const spoken = await waitFor(() => {
+      const n = narrationText(live());
+      return n.includes("Rejecting the command") ? n : undefined;
+    }, 4000);
+    assert.ok(spoken.includes(paneId), `the spoken rejection names the pane: ${spoken}`);
   });
 
   // ───────────────────────────────────────────────────────────────────────────────────────────
