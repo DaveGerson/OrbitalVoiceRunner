@@ -181,7 +181,7 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
           term.start();
           ctx.broadcastLedgerUpdate();
           ctx.broadcastTerminalsUpdated();
-        })();
+        })().catch((e) => console.error(`[restart_pane] deferred restart failed for ${id}:`, e));
         return `Terminal ${id} restarted.`;
       }
       const preset = normalizePreset(pane!.tool_preset);

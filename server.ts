@@ -1337,8 +1337,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const requestedPort = options.port ?? PORT;
 
   if (shouldListen) {
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
+      // A bind failure (EADDRINUSE, EACCES, ...) lands on the server's "error" event. Without
+      // this listener the QW1 process net swallows it and this promise NEVER settles — the boot
+      // hangs silently forever. Wire the rejection BEFORE listen; remove it on success so a
+      // later runtime "error" doesn't reject a long-settled promise. The wss listener is needed
+      // too: ws's WebSocketServer({ server }) FORWARDS the http server's "error" onto the wss,
+      // where, unconsumed, it re-throws as an uncaughtException.
+      const onListenError = (err: Error) => reject(err);
+      server.once("error", onListenError);
+      wss.once("error", onListenError);
       server.listen(requestedPort, bindHost, () => {
+        server.removeListener("error", onListenError);
+        wss.removeListener("error", onListenError);
         const addr = server.address();
         const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
         console.log(`Server running on http://${bindHost}:${boundPort}`);
@@ -1368,5 +1379,8 @@ export { startServer };
 // (An env flag rather than import.meta/require.main detection because esbuild
 // bundles this to CJS, where import.meta is empty.)
 if (process.env.JANUS_NO_AUTOSTART !== "1") {
-  startServer().catch(console.error);
+  startServer().catch((e) => {
+    console.error("[server] failed to start (is the port already in use?):", e);
+    process.exitCode = 1;
+  });
 }

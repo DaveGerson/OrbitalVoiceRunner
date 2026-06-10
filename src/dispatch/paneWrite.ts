@@ -182,7 +182,9 @@ export function applyDispatchDecision(
         ttlMs: approvalTtlMs,
       });
       // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
-      announcementBus.enqueue({ kind: "exited", terminalId: targetId, summary: "Awaiting your approval." });
+      // 1C.1: the REAL approval_pending kind — this used to borrow kind:"exited" for its severity,
+      // which rendered "Pane 'x' exited." for a healthy pane awaiting approval.
+      announcementBus.enqueue({ kind: "approval_pending", terminalId: targetId, summary: "Awaiting your approval." });
       // rbh: enrich the approval frame with the TARGET pane's EFFECTIVE posture so the dialog can show
       // "into what posture am I approving this write?". posturePayloadForPane is frozen-aware on main, so
       // the approval path needs no separate frozen fix (only the action path did). All additive optional

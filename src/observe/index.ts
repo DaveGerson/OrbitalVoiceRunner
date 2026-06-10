@@ -464,6 +464,17 @@ ${redact(rawOutput.slice(-3000))}`;
         // WS-D (BUG-024): high-severity proactive announcement (reuses the existing
         // lastStates edge-dedup, so this fires once per genuine transition edge).
         announcementBus.enqueue({ kind: transition, terminalId, summary: hint });
+
+        // 1C.2 (Phase 1 Track C): a crashed/ended pane must reach the VOICE lane too. Until now
+        // the exited edge went only to the attention queue + announcement bus — no PaneSignal was
+        // ever published, so the model kept narrating a dead pane as healthy. Publish exactly like
+        // the idle/running/quiescing edges (same bus, redacted detail); error/prompt already flow
+        // per-chunk via classifyPaneOutput, so only `exited` needs the lane here. The bus's
+        // per-(pane,kind) debounce is fine for this one-shot terminal event, and the lastStates
+        // edge-dedup above means it fires once per genuine exit.
+        if (transition === "exited") {
+          paneSignalBus.publish({ paneId: terminalId, kind: "exited", detail: hint || undefined });
+        }
       }
 
       handleWatchRulesTrigger(terminalId, transition);

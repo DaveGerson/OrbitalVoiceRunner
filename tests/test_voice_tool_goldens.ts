@@ -98,7 +98,7 @@ class StubTerminal {
   writeInput(command: string) {
     this.lastCommand = command;
     this.writeInputCount++;
-    if (this.status !== "Exited") this.status = "Running";
+    this.status = "Running";
   }
   // getPaneSummary reads the LAST `limit` output lines.
   getRecentOutput(_lines = 10): string {

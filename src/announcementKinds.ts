@@ -21,6 +21,8 @@ export type AnnouncementKind =
   | "error"        // error text detected
   | "build-failed" // build failure
   | "exited"       // process exited
+  | "approval_pending" // a write is awaiting operator approval (WS-E HiTL arrival)
+  | "approval_expired" // an unresolved approval crossed its TTL and was dropped
   | "plan_completed"
   | "plan_paused";
 
@@ -30,6 +32,8 @@ export type TemplateKey =
   | "error"
   | "buildFailed"
   | "exited"
+  | "approvalPending"
+  | "approvalExpired"
   | "planCompleted"
   | "planPaused";
 
@@ -51,14 +55,22 @@ export interface KindMeta {
  * `exited` is intentionally HIGH severity: it carries the `alert` earcon, gets its own
  * high-severity coalescing bucket, and is exempt from the per-pane debounce so a genuine
  * process exit is never starved by a preceding completion on the same pane (design §4).
+ *
+ * `approval_pending` / `approval_expired` (Phase 1 Track C, card 1C.1): the approval paths used
+ * to BORROW kind:"exited" for its high severity, which rendered the exited template — the
+ * notification literally claimed a healthy pane died. These are the REAL kinds: same high
+ * severity + the EXISTING client-known "alert" earcon (the kitchen client's playEarcon union is
+ * updated by a later track — never invent a new earcon type here).
  */
 export const KIND_META: Record<AnnouncementKind, KindMeta> = {
-  "build-failed": { earcon: "alert", severity: "high", priority: 5, templateKey: "buildFailed" },
-  error:          { earcon: "alert", severity: "high", priority: 4, templateKey: "error" },
-  exited:         { earcon: "alert", severity: "high", priority: 3, templateKey: "exited" },
-  plan_paused:    { earcon: "alert", severity: "high", priority: 2, templateKey: "planPaused" },
-  completion:     { earcon: "completion", severity: "normal", priority: 1, templateKey: "completion" },
-  plan_completed: { earcon: "success", severity: "normal", priority: 0, templateKey: "planCompleted" },
+  "build-failed":   { earcon: "alert", severity: "high", priority: 7, templateKey: "buildFailed" },
+  error:            { earcon: "alert", severity: "high", priority: 6, templateKey: "error" },
+  exited:           { earcon: "alert", severity: "high", priority: 5, templateKey: "exited" },
+  approval_pending: { earcon: "alert", severity: "high", priority: 4, templateKey: "approvalPending" },
+  approval_expired: { earcon: "alert", severity: "high", priority: 3, templateKey: "approvalExpired" },
+  plan_paused:      { earcon: "alert", severity: "high", priority: 2, templateKey: "planPaused" },
+  completion:       { earcon: "completion", severity: "normal", priority: 1, templateKey: "completion" },
+  plan_completed:   { earcon: "success", severity: "normal", priority: 0, templateKey: "planCompleted" },
 };
 
 /** Derived projections — never hand-maintained; always read from KIND_META. */
@@ -89,6 +101,8 @@ export const DEFAULT_ANNOUNCEMENT_TEMPLATES: AnnouncementTemplates = {
   error: "Pane '{pane}' reported an error. {summary}",
   buildFailed: "Build failed on pane '{pane}'.",
   exited: "Pane '{pane}' exited.",
+  approvalPending: "Pane '{pane}' needs your approval. {summary}",
+  approvalExpired: "An approval for pane '{pane}' expired. {summary}",
   planCompleted: "Plan completed. {summary}",
   planPaused: "Plan paused. {summary}",
 };
@@ -100,10 +114,16 @@ export const ANNOUNCEMENT_TEMPLATE_FIELDS: ReadonlyArray<readonly [TemplateKey, 
   ["error", "Error"],
   ["buildFailed", "Build failed"],
   ["exited", "Exited"],
+  ["approvalPending", "Approval pending"],
+  ["approvalExpired", "Approval expired"],
   ["planCompleted", "Plan completed"],
   ["planPaused", "Plan paused"],
 ];
 
 export function templateFor(kind: AnnouncementKind, t: AnnouncementTemplates): string {
-  return t[KIND_META[kind].templateKey];
+  // Default-merge degradation (card 1C.1): an operator templates object persisted BEFORE a kind
+  // existed lacks its key (loadSettings default-merges, but a stale in-memory object or a direct
+  // getTemplates injection may not). Fall back to the default template rather than handing the
+  // renderer `undefined`.
+  return t[KIND_META[kind].templateKey] ?? DEFAULT_ANNOUNCEMENT_TEMPLATES[KIND_META[kind].templateKey];
 }
