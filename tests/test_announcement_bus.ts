@@ -497,6 +497,136 @@ describe("WS-C coupling — announce only on genuine onIdle", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// CARD 4D.2 (Phase 4 Track D) — debounce DEFERS, never drops.
+//
+// AUDIT FINDINGS: (a) a suppressed announcement was DROPPED (return false before even the earcon);
+// (b) high-severity items were exempt from suppression but still STAMPED lastAnnouncedAt (keyed per
+// PANE, across kinds) — so an error followed ≤debounce-window later by a genuine completion on the
+// same pane silenced the completion FOREVER.
+//
+// FIX matrix (what stamps what):
+//   - the debounce window is keyed per (pane, kind) — never per pane across kinds;
+//   - a DELIVERED normal-severity item stamps its own (pane, kind) window;
+//   - a SUPPRESSED normal-severity item COALESCES-TO-LATEST into a pending slot flushed when the
+//     window expires (unref'd timer); its earcon fires AT FLUSH; the flush re-stamps the window so
+//     sustained flapping keeps collapsing (one announcement per window — the original anti-spam
+//     intent, preserved);
+//   - HIGH-severity items bypass the debounce entirely and stamp NOTHING (they can no longer starve
+//     another kind on the same pane).
+// ---------------------------------------------------------------------------
+describe("4D.2 AnnouncementBus — debounce defers, never drops", () => {
+  it("error then completion on the same pane within the window: the completion is STILL announced (the original bug)", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    bus.enqueue({ kind: "error", terminalId: "p", summary: "boom" });
+    clock.advance(100);
+    const ok = bus.enqueue({ kind: "completion", terminalId: "p", summary: "all green" });
+    assert.strictEqual(ok, true, "a high-severity error must NOT consume the completion's window");
+    clock.advance(1500);
+    const out = notifs(sink);
+    assert.ok(out.find((m) => m.kind === "completion" && /all green/.test(m.message)),
+      "the genuine completion is announced, not silenced forever");
+    bus.stop();
+  });
+
+  it("a suppressed same-(pane,kind) repeat COALESCES-TO-LATEST and is announced when the window expires", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock); // perPaneDebounceMs 4000, coalesce 1500
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "first" });
+    clock.advance(500);
+    assert.strictEqual(bus.enqueue({ kind: "completion", terminalId: "p", summary: "second" }), false, "deferred");
+    clock.advance(500);
+    assert.strictEqual(bus.enqueue({ kind: "completion", terminalId: "p", summary: "third" }), false, "still deferred");
+    // After the debounce window + coalesce window, EXACTLY one extra notification with the LATEST summary.
+    clock.advance(10_000);
+    const completions = notifs(sink).filter((m) => m.kind === "completion");
+    assert.strictEqual(completions.length, 2, "first + one coalesced flush (identical spam still collapses)");
+    assert.match(completions[1].message, /third/, "coalesce-to-latest: the newest summary wins");
+    assert.doesNotMatch(completions[1].message, /second/, "the superseded middle item is collapsed away");
+    bus.stop();
+  });
+
+  it("the earcon for a coalesced item fires AT FLUSH, not at the suppressed enqueue", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "first" });
+    assert.strictEqual(earcons(sink).length, 1, "immediate earcon for the delivered item");
+    clock.advance(100);
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "second" });
+    assert.strictEqual(earcons(sink).length, 1, "no earcon at the suppressed enqueue");
+    clock.advance(10_000);
+    assert.strictEqual(earcons(sink).length, 2, "the coalesced item's earcon fires at flush");
+    bus.stop();
+  });
+
+  it("sustained flapping still collapses to one announcement per debounce window (anti-spam intent preserved)", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, { rateLimitBurst: 100 });
+    // 10 completions, 400ms apart, on one pane: 4s of flapping.
+    for (let i = 0; i < 10; i++) {
+      bus.enqueue({ kind: "completion", terminalId: "flap", summary: `s${i}` });
+      clock.advance(400);
+    }
+    clock.advance(20_000);
+    const completions = notifs(sink).filter((m) => m.kind === "completion");
+    assert.ok(completions.length <= 3, `flapping must collapse (got ${completions.length})`);
+    assert.match(completions.at(-1)!.message, /s9/, "the final announcement carries the LATEST state");
+    bus.stop();
+  });
+
+  it("stop() cancels pending coalesce timers (nothing flushes after stop)", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "first" });
+    clock.advance(1500); // flush the first
+    const before = notifs(sink).length;
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "second" }); // deferred
+    bus.stop();
+    clock.advance(60_000);
+    assert.strictEqual(notifs(sink).length, before, "no coalesced flush after stop()");
+  });
+
+  it("the coalesce timer is unref'd (never pins the event loop)", () => {
+    // Use a recording clock over REAL host timers so the handles expose hasRef().
+    const handles: any[] = [];
+    const recClock = {
+      now: () => Date.now(),
+      setTimeout: (fn: () => void, ms: number) => { const h = setTimeout(fn, ms); handles.push(h); return h; },
+      clearTimeout: (h: any) => clearTimeout(h),
+    };
+    const sink: any[] = [];
+    const bus = new AnnouncementBus({ broadcast: (m) => sink.push(m), clock: recClock as any });
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "first" });  // arms the flush timer
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "second" }); // arms the coalesce timer
+    const coalesceHandle = handles.at(-1);
+    assert.ok(coalesceHandle && typeof coalesceHandle.hasRef === "function", "host timer handle");
+    assert.strictEqual(coalesceHandle.hasRef(), false, "the coalesce timer is unref'd");
+    bus.stop(); // clears both timers so the suite exits clean
+  });
+
+  it("onEnqueue listeners observe EVERY enqueue (even suppressed ones) and a throwing listener is contained", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock);
+    const seen: string[] = [];
+    bus.onEnqueue(() => { throw new Error("boom"); });
+    const off = bus.onEnqueue((item) => seen.push(`${item.terminalId}:${item.kind}`));
+    assert.doesNotThrow(() => bus.enqueue({ kind: "completion", terminalId: "p", summary: "1" }));
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "2" }); // suppressed, still observed
+    assert.deepStrictEqual(seen, ["p:completion", "p:completion"]);
+    off();
+    bus.enqueue({ kind: "error", terminalId: "p", summary: "3" });
+    assert.strictEqual(seen.length, 2, "unsubscribed listener stops observing");
+    bus.stop();
+  });
+});
+
 describe("notificationStack — coalesce-to-latest", () => {
   const n = (id: string, message: string, severity: "high" | "normal" = "normal"): ProactiveNotification => ({
     id, kind: "completion", terminalId: id.split("_")[1] || "t", severity, message, timestamp: new Date().toISOString(),

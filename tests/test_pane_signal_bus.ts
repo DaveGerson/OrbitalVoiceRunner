@@ -44,6 +44,55 @@ describe("PaneSignalBus", () => {
     assert.deepStrictEqual(seen, ["p9"]);
   });
 
+  // ── CARD 4D.2 (Phase 4 Track D) — debounce defers/passes, never drops real news ──────────────
+  // AUDIT FINDINGS: (a) lastPushAt was stamped even when observers.size === 0 — a signal landing
+  // just BEFORE the radio connected consumed the window and debounced away the first real signal
+  // AFTER connect; (b) a second DIFFERENT error (new detail) within the 3s window was dropped.
+  // FIX: stamp only when at least one observer hears the signal; within the window, a same-kind
+  // signal with a DIFFERENT detail is genuinely new information and passes through (identical
+  // repeats still collapse — the anti-spam intent).
+  it("4D.2: a zero-observer publish does NOT consume the (pane,kind) window", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, () => now);
+    // Nobody is listening yet — the signal is lost on the floor, but must not stamp the window.
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "boom" }), false, "no observers -> not delivered");
+    now += 10; // well inside the window
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "boom" }), true,
+      "the first signal after the radio connects is DELIVERED, not debounced away");
+    assert.deepStrictEqual(seen, ["p1:error"]);
+  });
+
+  it("4D.2: a same-kind signal with a DIFFERENT detail passes through inside the window", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.kind}:${s.detail ?? ""}`));
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "TypeError" }), true);
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "TypeError" }), false, "identical repeat still collapses");
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "ENOENT" }), true,
+      "a DIFFERENT error within the window is genuinely new information");
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "ENOENT" }), false, "the new detail now collapses its own repeats");
+
+    assert.deepStrictEqual(seen, ["error:TypeError", "error:ENOENT"]);
+  });
+
+  it("4D.2: detail-less repeats keep collapsing exactly as before (no regression)", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(s.kind));
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), true);
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), false, "undefined detail == undefined detail -> collapse");
+    assert.deepStrictEqual(seen, ["idle"]);
+  });
+
   // bead 53q sibling (ykr): publish() hands the SAME PaneSignal object reference to EVERY observer.
   // The voice defer path (voice/index.ts) used to stamp `__deferredAt` directly onto that shared object,
   // mutating the payload that every OTHER observer (and the bus's caller) holds. The fix clones before

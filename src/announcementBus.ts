@@ -144,9 +144,16 @@ export class AnnouncementBus {
 
   private buffer: AnnouncementItem[] = [];
   private flushTimer: any = null;
+  /** 4D.2: the debounce window stamps, keyed PER (pane, kind) — see the matrix on enqueue(). */
   private lastAnnouncedAt: Record<string, number> = {};
   /** Timestamps of recent flushes for the token-bucket. */
   private flushTimes: number[] = [];
+  /** 4D.2: suppressed items COALESCE-TO-LATEST here per (pane,kind) instead of dropping. */
+  private pendingCoalesced = new Map<string, AnnouncementItem>();
+  /** One unref'd timer per pending (pane,kind) slot, fired when its debounce window expires. */
+  private pendingTimers = new Map<string, any>();
+  /** 4D.1: observers notified on EVERY enqueue (pre-debounce) — the durable activity recorder. */
+  private enqueueListeners = new Set<(item: AnnouncementItem) => void>();
 
   constructor(opts: AnnouncementBusOptions) {
     this.broadcast = opts.broadcast;
@@ -159,30 +166,63 @@ export class AnnouncementBus {
     this.getTemplates = opts.getTemplates || (() => DEFAULT_ANNOUNCEMENT_TEMPLATES);
   }
 
-  /** Enqueue an announcement. The earcon fires IMMEDIATELY (non-verbal awareness even
-   *  while deferred), while the on-screen notification is debounced/coalesced/rate-limited
-   *  and emitted on the next flush. Returns false if the item was suppressed (per-pane
-   *  debounce) — the caller need not care, but tests assert on it. */
+  /**
+   * 4D.1: subscribe to EVERY enqueue, pre-debounce (even items the window later coalesces) — the
+   * gating core records the pane lifecycle edges durably for the "while you were away" digest.
+   * A throwing listener is contained. Returns an unsubscribe function.
+   */
+  onEnqueue(listener: (item: AnnouncementItem) => void): () => void {
+    this.enqueueListeners.add(listener);
+    return () => { this.enqueueListeners.delete(listener); };
+  }
+
+  /** Enqueue an announcement. Returns false when the item was DEFERRED (coalesced-to-latest into
+   *  its (pane,kind) window slot) — never silently dropped.
+   *
+   *  4D.2 debounce matrix (what stamps what — the original anti-spam INTENT, "a flapping build
+   *  must not machine-gun the operator", is preserved by collapsing repeats per window):
+   *   - HIGH severity (error / build-failed / exited / approval kinds / plan_paused): delivered now,
+   *     bypasses the window, stamps NOTHING. (Pre-fix it stamped the per-PANE window, so an error
+   *     silenced a genuine completion on the same pane forever — the 4D.2 finding.)
+   *   - normal severity, cold (pane,kind) window: delivered now; stamps its own (pane,kind).
+   *   - normal severity, hot (pane,kind) window: COALESCES-TO-LATEST into a pending slot and is
+   *     delivered (earcon + notification) when the window expires; the flush re-stamps the window,
+   *     so sustained flapping keeps collapsing to one announcement per window. */
   enqueue(item: AnnouncementItem): boolean {
     const now = this.clock.now();
-    const paneKey = item.terminalId;
+    // 4D.1: every genuine edge reaches the listeners, even when the announcement defers.
+    for (const listener of this.enqueueListeners) {
+      try { listener(item); } catch (e) { console.error("AnnouncementBus onEnqueue listener failed:", e); }
+    }
 
-    // Per-pane debounce: suppress a repeat for the same pane inside the window so a
-    // flapping build cannot machine-gun the operator. High-severity events
-    // (error/build-failed/plan_paused) are EXEMPT — they are already edge-deduped
-    // server-side (lastStates) and must never be starved by a preceding completion on
-    // the same pane (design §4: "errors are never starved by completions").
     if (!isHighSeverity(item.kind)) {
-      const last = this.lastAnnouncedAt[paneKey];
+      const key = `${item.terminalId} ${item.kind}`;
+      const last = this.lastAnnouncedAt[key];
       if (last !== undefined && now - last < this.perPaneDebounceMs) {
+        // 4D.2: DEFER, never drop — latest-wins into the pending slot; one timer per slot fires
+        // at window expiry. The timer is unref'd so a pending coalesce can never pin the process.
+        this.pendingCoalesced.set(key, { ...item, at: now });
+        if (!this.pendingTimers.has(key)) {
+          const wait = Math.max(1, last + this.perPaneDebounceMs - now);
+          const handle = this.clock.setTimeout(() => this.flushCoalesced(key), wait);
+          if (handle && typeof handle.unref === "function") handle.unref();
+          this.pendingTimers.set(key, handle);
+        }
         return false;
       }
+      this.lastAnnouncedAt[key] = now;
     }
-    this.lastAnnouncedAt[paneKey] = now;
 
-    this.buffer.push({ ...item, at: now });
+    this.deliver({ ...item, at: now });
+    return true;
+  }
 
-    // Immediate earcon (Seam B) — sub-100ms non-verbal feedback, never deferred.
+  /** Push an (already window-cleared) item into the coalescing buffer + fire its earcon. */
+  private deliver(item: AnnouncementItem): void {
+    this.buffer.push(item);
+
+    // Immediate earcon (Seam B) — sub-100ms non-verbal feedback. For a coalesced item this runs
+    // at FLUSH time (the moment the item is actually announced), per the 4D.2 design.
     this.broadcast({
       type: "proactive_earcon",
       earcon: EARCON_FOR[item.kind],
@@ -193,7 +233,18 @@ export class AnnouncementBus {
     if (!this.flushTimer) {
       this.flushTimer = this.clock.setTimeout(() => this.flush(), this.coalesceWindowMs);
     }
-    return true;
+  }
+
+  /** 4D.2: a (pane,kind) debounce window expired — deliver the latest coalesced item, if any,
+   *  and re-stamp the window so continued flapping collapses into the NEXT window. */
+  private flushCoalesced(key: string): void {
+    this.pendingTimers.delete(key);
+    const item = this.pendingCoalesced.get(key);
+    this.pendingCoalesced.delete(key);
+    if (!item) return;
+    const now = this.clock.now();
+    this.lastAnnouncedAt[key] = now;
+    this.deliver({ ...item, at: now });
   }
 
   /** Flush the coalescing buffer: emit the proactive notification(s). Respects the
@@ -257,6 +308,12 @@ export class AnnouncementBus {
       this.clock.clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    // 4D.2: cancel every pending coalesce slot too.
+    for (const handle of this.pendingTimers.values()) {
+      this.clock.clearTimeout(handle);
+    }
+    this.pendingTimers.clear();
+    this.pendingCoalesced.clear();
     this.buffer = [];
   }
 }

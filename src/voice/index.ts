@@ -297,6 +297,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     gateOrDefer,
     gateCapability,
     applyResolution,
+    applyDeferral,
+    noteSessionDetached,
     applyPaneMode,
     reannounceSurvivors,
     pendingApprovals,
@@ -664,6 +666,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       sessionDead = true;
       if (state.session) {
         const detached = pendingApprovals.detachSession(state.session);
+        // 4D.1: open the "while you were away" window — the next reconnect digests the durable
+        // activity rows recorded between this moment and the reconnect.
+        noteSessionDetached();
         if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
         // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
         // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
@@ -913,6 +918,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                         // >1 pending and nothing disambiguates -> clarify, list them.
                         const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
                         pushApprovalNarrationDep(session, `I have ${entries.length} pending: ${list}. Which one?`);
+                      } else if (parsed.intent === "defer") {
+                        // 4D.3: "later" / "not now" re-arms the TTL window (narration + cap live
+                        // inside applyDeferral) — never the claim+delete reject path.
+                        applyDeferral(target.messageId);
                       } else {
                         resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
                       }
@@ -1432,6 +1441,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // with no session), so nothing the operator stepped away from is silently dropped.
         // pendingActions needs nothing here — it is not session-bound and survives in-process.
         const detached = pendingApprovals.detachSession(state.session);
+        // 4D.1: the operator left — open the away window (no-op if handleSessionLost already did).
+        noteSessionDetached();
         if (detached.length) console.log(`[DETACH] kept ${detached.length} survivor(s) for re-announce on reconnect.`);
         // Drop the hoisted live-session ref if it points at this (now dead) session, so the action
         // last-call doesn't narrate into a torn-down channel. The action clock also pauses now

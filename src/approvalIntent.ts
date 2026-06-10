@@ -12,7 +12,15 @@
  * negation/apostrophe/collision table can be asserted in isolation.
  */
 
-export type ApprovalIntent = "approve" | "reject" | "clarify" | "none";
+export type ApprovalIntent = "approve" | "reject" | "defer" | "clarify" | "none";
+
+/**
+ * 4D.3: how many times one pending record may be DEFERRED ("later" / "not now") before the
+ * defer verb stops re-arming its TTL window and the normal last-call → grace → expire flow
+ * takes over. Shared by gating.applyDeferral (approvals) and resolvePendingActionByVoice
+ * (staged actions) so the no-infinite-parking cap is one number.
+ */
+export const MAX_DEFERRALS = 3;
 
 export interface TargetHint {
   /** A free-text fragment the operator named ("the npm install one"). */
@@ -80,6 +88,58 @@ function tokenize(s: string): string[] {
   return normalizeUtterance(s).split(" ").filter(Boolean);
 }
 
+// ── 4D.3: the DEFER phrase table ────────────────────────────────────────────────────────────────
+// "Defer" = "keep it staged, ask me again later" — the non-destructive fourth verb. Before this,
+// an eyes-off "skip that for now, ask me later" hit REJECT_WEAK's "skip" and permanently CANCELLED
+// the staged command (claim+delete, unrecoverable).
+//
+// PHRASE TABLE (all matching runs on the normalized token stream; a NEGATOR immediately before a
+// matched phrase suppresses it — "dont hold it" is NOT a defer):
+//   1. short utterance (≤3 tokens) containing "later"        -> defer   ("later", "maybe later")
+//   2. adjacent bigram "<me|again|it|that> later"             -> defer   ("ask me later", "do it later")
+//   3. "not now" / "not right now" / "not yet"                -> defer
+//   4. "hold on|off|that|it" / "on hold"                      -> defer   ("hold" needs its particle —
+//                                                                         bare "hold" stays unresolved)
+//   5. "in a minute|moment|bit|second"                        -> defer
+//   6. "for now" present AND any of {skip,hold,wait,leave,    -> defer   ("skip that for now",
+//      park,pass,not} present                                            "leave it for now")
+//
+// PRECEDENCE (deliberate, documented): the defer scan runs FIRST — before the bare-yes/no block and
+// before the verb scan — so a mixed utterance ("no, later" / "skip that for now, ask me later")
+// resolves to the NON-DESTRUCTIVE option. A wrong defer only re-arms a TTL and re-asks; a wrong
+// reject destroys the record. Bare "skip"/"skip it" (≤2 tokens, no "for now" rider) is pinned as
+// REJECT (see parseApprovalIntent), so the reject lane is unchanged without the rider.
+const DEFER_LATER_PRECEDERS = new Set(["me", "again", "it", "that", "them", "you"]);
+const DEFER_HOLD_PARTICLES = new Set(["on", "off", "that", "it", "them"]);
+const DEFER_IN_A_UNITS = new Set(["minute", "moment", "bit", "second", "sec", "while", "few"]);
+const DEFER_FOR_NOW_PAIRS = new Set(["skip", "hold", "wait", "leave", "park", "pass", "not"]);
+
+/** True when tokens[i-1] is a negator ("dont hold it" must not defer). */
+function negatorBefore(tokens: string[], i: number): boolean {
+  return i > 0 && NEGATORS.has(tokens[i - 1]);
+}
+
+function isDeferUtterance(tokens: string[]): boolean {
+  // (1) A short, directive utterance built around "later".
+  if (tokens.length <= 3 && tokens.includes("later")) return true;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const next = tokens[i + 1];
+    // (2) "<me|again|it|that> later" — "ask me later", "remind me later", "do it later".
+    if (next === "later" && DEFER_LATER_PRECEDERS.has(tok) && !negatorBefore(tokens, i)) return true;
+    // (3) "not now" / "not right now" / "not yet".
+    if (tok === "not" && (next === "now" || next === "yet" || (next === "right" && tokens[i + 2] === "now"))) return true;
+    // (4) "hold <particle>" / "on hold".
+    if (tok === "hold" && next !== undefined && DEFER_HOLD_PARTICLES.has(next) && !negatorBefore(tokens, i)) return true;
+    if (tok === "on" && next === "hold") return true;
+    // (5) "in a <minute|moment|bit|second|few...>".
+    if (tok === "in" && next === "a" && tokens[i + 2] !== undefined && DEFER_IN_A_UNITS.has(tokens[i + 2])) return true;
+    // (6) "for now" paired with a parking verb anywhere in the utterance.
+    if (tok === "for" && next === "now" && tokens.some((t) => DEFER_FOR_NOW_PAIRS.has(t))) return true;
+  }
+  return false;
+}
+
 /**
  * Returns true if a trigger verb at index `i` is NEGATED by a negator within the
  * preceding `window` tokens (default 3). "do not run it" -> run is negated.
@@ -118,6 +178,10 @@ function extractTargetHint(tokens: string[]): TargetHint | undefined {
     ...APPROVE_VERBS, ...REJECT_VERBS, ...NEGATORS, ...OBJECT_TOKENS,
     "to", "i", "want", "we", "lets", "let", "please", "and", "but", "actually", "now",
     "the", "a", "an", "on", "for", "pane", "in", "do", "make", "sure",
+    // 4D.3: defer-phrase vocabulary — "skip the npm install for now" must yield fragment
+    // "npm install", never "later"/"hold"/… as a bogus by-name target.
+    "later", "hold", "wait", "leave", "park", "pass", "minute", "moment", "bit", "second", "sec",
+    "while", "few", "yet", "again", "right", "maybe", "ask", "remind", "me",
   ]);
   const frag: string[] = [];
   let best: string[] = [];
@@ -145,6 +209,20 @@ function extractTargetHint(tokens: string[]): TargetHint | undefined {
 export function parseApprovalIntent(transcript: string): ParsedApproval {
   const tokens = tokenize(transcript);
   if (tokens.length === 0) return { intent: "none" };
+
+  // 4D.3 DEFER — checked FIRST (see the precedence note on the phrase table above): on mixed
+  // signals ("no, later" / "skip that for now, ask me later") the NON-destructive verb wins.
+  // A wrong defer merely re-arms a TTL and asks again; a wrong reject claim+deletes forever.
+  if (isDeferUtterance(tokens)) {
+    return { intent: "defer", targetHint: extractTargetHint(tokens) };
+  }
+
+  // 4D.3 (card-pinned): the bare skip family — "skip" / "skip it|that|this" with NO "for now"
+  // rider — resolves REJECT. (The defer scan above already claimed every "skip … for now" form.)
+  if (tokens[0] === "skip" && tokens.length <= 2 &&
+      (tokens.length === 1 || ["it", "that", "this"].includes(tokens[1]))) {
+    return { intent: "reject", targetHint: extractTargetHint(tokens) };
+  }
 
   // Bare short affirmation/denial ("yes" / "no" / "approved") — the whole utterance.
   if (tokens.length <= 2) {
