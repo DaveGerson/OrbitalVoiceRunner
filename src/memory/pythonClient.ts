@@ -233,8 +233,10 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
       if (disposed || !ready || !child) return Promise.resolve({ ok: false });
       const id = `r${++seq}`;
       return new Promise<SynthesizeResult>((resolve) => {
+        // In-flight rule: the awaited request DEPENDS on this expiry to settle when the daemon is
+        // silent, so it must hold the loop while pending. Every settle path clears it (onLine,
+        // write-failure below, settleAll via onDown/dispose), so it can never outlive the request.
         const timer = setTimeout(() => { pending.delete(id); resolve({ ok: false }); }, requestExpiryMs);
-        if (typeof (timer as any).unref === "function") (timer as any).unref();
         pending.set(id, { resolve, timer });
         try {
           child.stdin.write(JSON.stringify({ id, v: WIRE_VERSION, op: "synthesize", now, cfg, tiers }) + "\n");

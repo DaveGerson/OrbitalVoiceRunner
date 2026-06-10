@@ -264,8 +264,9 @@ function raceDeadline(
       settled = true;
       resolve({ kind: "error", message: `action ${name} exceeded its ${ms}ms deadline` });
     }, ms);
-    // node timers: don't keep the event loop alive on account of this watchdog.
-    (timer as { unref?: () => void }).unref?.();
+    // In-flight rule: the awaited dispatch DEPENDS on this timer to settle when the handler hangs,
+    // so it must hold the event loop while the race is live. It is ALWAYS cleared when the handler
+    // settles (both branches below), so it can never keep the loop alive after dispatch completes.
     run().then(
       (r) => {
         clearTimeout(timer);
