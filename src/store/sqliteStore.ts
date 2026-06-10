@@ -423,14 +423,29 @@ export class JanusStore {
       (db) => {
         const row = db.prepare("SELECT * FROM panes WHERE pane_id=? AND workspace_id=?").get(paneId, workspaceId) as any;
         if (!row) return;
+        // 2S.3: capability_gates (schema v4) and the v3 columns (draft / model_context /
+        // human_context, archive twins added in v8) must be LISTED here — better-sqlite3 silently
+        // ignores extra named params, so the v1-only column list dropped them all to NULL/default
+        // and an operator's "Off" override (and unsent draft) silently reverted through the
+        // archive round-trip.
         db.prepare(
           `INSERT OR REPLACE INTO panes_archive(pane_id,workspace_id,name,runtime_type,tool_preset,
              permissions_mode,session_id,last_known_state,is_busy,alive,context_size,last_status_change_at,
-             last_command,scrollback_path,created_at,updated_at,archived_at,archive_reason)
+             last_command,scrollback_path,created_at,updated_at,archived_at,archive_reason,capability_gates,
+             draft,model_context,human_context)
            VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,@session_id,
              @last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,@last_command,
-             @scrollback_path,@created_at,@updated_at,@archived_at,@archive_reason)`
-        ).run({ ...row, archived_at: Date.now(), archive_reason: reason ?? null });
+             @scrollback_path,@created_at,@updated_at,@archived_at,@archive_reason,@capability_gates,
+             @draft,@model_context,@human_context)`
+        ).run({
+          ...row,
+          capability_gates: row.capability_gates ?? null,
+          draft: row.draft ?? null,
+          model_context: row.model_context ?? "[]",
+          human_context: row.human_context ?? "[]",
+          archived_at: Date.now(),
+          archive_reason: reason ?? null,
+        });
         db.prepare("DELETE FROM panes WHERE pane_id=? AND workspace_id=?").run(paneId, workspaceId);
       }
     );
@@ -444,16 +459,27 @@ export class JanusStore {
     const pane = { ...this.hydratePane(row), alive: false, last_known_state: "Exited" as const };
     this.recordActivity(
       { type: EVENT_TYPES.PANE_RESTORED, project_id: workspaceId, pane_id: paneId, summary: "restored" },
+      // 2S.3: capability_gates AND the v3/v8 columns (draft, model_context, human_context) must be
+      // LISTED here too (see archivePane) so the restored live row carries the archived per-pane
+      // override, unsent draft, and both context lanes instead of silently reverting to defaults.
+      // (hydratePane leaves these as raw TEXT from the row, so they bind directly.)
       (db) => db.prepare(
         `INSERT INTO panes(pane_id,workspace_id,name,runtime_type,tool_preset,permissions_mode,session_id,
            last_known_state,is_busy,alive,context_size,last_status_change_at,last_command,scrollback_path,
-           created_at,updated_at)
+           created_at,updated_at,capability_gates,draft,model_context,human_context)
          VALUES(@pane_id,@workspace_id,@name,@runtime_type,@tool_preset,@permissions_mode,@session_id,
            @last_known_state,@is_busy,@alive,@context_size,@last_status_change_at,@last_command,
-           @scrollback_path,@created_at,@updated_at)
+           @scrollback_path,@created_at,@updated_at,@capability_gates,@draft,@model_context,@human_context)
          ON CONFLICT(pane_id,workspace_id) DO UPDATE SET alive=excluded.alive,
            last_known_state=excluded.last_known_state, updated_at=excluded.updated_at`
-      ).run({ ...pane, is_busy: 0, alive: 0, updated_at: Date.now() })
+      ).run({
+        ...pane,
+        capability_gates: pane.capability_gates ?? null,
+        draft: (pane as any).draft ?? null,
+        model_context: (pane as any).model_context ?? "[]",
+        human_context: (pane as any).human_context ?? "[]",
+        is_busy: 0, alive: 0, updated_at: Date.now(),
+      })
     );
     return pane;
   }

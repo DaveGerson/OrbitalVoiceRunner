@@ -1311,6 +1311,17 @@ export class OrchestratorManager {
     }
     if (newSettings.advanced) {
       this.settings.advanced = { ...this.settings.advanced, ...newSettings.advanced };
+      // 2S.1: mirror loadSettings exactly — deep-merge the capability matrix so a PUT carrying a
+      // PARTIAL capabilityGates map layers ON TOP of the defaults instead of REPLACING the whole
+      // matrix (which made every unmentioned capability resolve through the permissive
+      // `globalGate ?? "Auto"` fallback — fail-open). Only runs when the update actually carries
+      // a gates map; a gates-free advanced update leaves the existing matrix untouched.
+      if (newSettings.advanced.capabilityGates) {
+        this.settings.advanced.capabilityGates = {
+          ...DEFAULT_CAPABILITY_GATES,
+          ...newSettings.advanced.capabilityGates,
+        };
+      }
       this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode;
       if (newSettings.advanced.maxBufferLines !== undefined) {
         for (const term of Object.values(this.terminals)) {

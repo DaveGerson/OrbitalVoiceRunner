@@ -26,6 +26,12 @@ export interface Station {
   contextPips: number;      // squares filled (0..8)
   outputTail: string[];     // last lines of Terminal.output (the burner peek)
   needsInput: boolean;
+  // 2K.2: SERVER truth for the pane's autonomy, rendered visual-only by the posture chip.
+  // `posture` is the server-resolved effective posture the terminals payload already carries
+  // (Terminal.posture — same field the classic GateChip reads); `mode` is the ledger
+  // permissions_mode fallback for older payloads that omit posture.
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
+  mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
 }
 
 export interface StationProject {
@@ -108,6 +114,8 @@ export function deriveStations(
       contextPips: Math.round(fill * PIP_COUNT),
       outputTail: tail(t.output),
       needsInput,
+      posture: t.posture,
+      mode: t.permissions_mode ?? pane?.permissions_mode,
     };
   });
 }

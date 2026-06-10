@@ -8,6 +8,36 @@ import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
 import { INK } from "../theme";
 import { Button, Chip, Icon, Pips, StatusBadge } from "../primitives";
 import type { Station, StationProject } from "../station";
+import type { ArchivedPane } from "../useOrbitalData";
+
+// 2K.1: one archived pane in the freezer — Restore is one tap (non-destructive), Delete is
+// permanent so it takes a two-tap inline confirm (auto-resets after 3s).
+function FreezerRow({ a, dark, onRestore, onDelete }: {
+  a: ArchivedPane; dark: boolean; onRestore: (paneId: string) => void; onDelete: (paneId: string) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const fg = dark ? "#ffe9c7" : INK;
+  return (
+    <div data-testid="freezer-pane" data-pane-id={a.pane_id}
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff4de" }}>
+      <span style={{ fontSize: 15 }}>🧊</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{a.pane_id}</span>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, color: fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.name || a.pane_id}</span>
+        {a.last_command && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.last_command}</span>}
+      </span>
+      {a.tool_preset && <Chip bg={dark ? "#241409" : "#fff9ec"} color="#8a6a4f">{a.tool_preset}</Chip>}
+      <Button testId="freezer-restore" variant="mint" size="sm" icon="play" title="Thaw it — restore this pane to its project" onClick={() => onRestore(a.pane_id)}>Restore</Button>
+      <Button testId="freezer-delete" variant={confirming ? "primary" : "default"} size="sm" icon="x"
+        title={confirming ? "This is permanent — tap again to toss it" : "Toss it for good (permanent)"}
+        onClick={() => {
+          if (!confirming) { setConfirming(true); setTimeout(() => setConfirming(false), 3000); return; }
+          setConfirming(false);
+          onDelete(a.pane_id);
+        }}>{confirming ? "Sure, Chef?" : "Delete"}</Button>
+    </div>
+  );
+}
 
 function Card({ dark, children, style = {} }: { dark: boolean; children: ReactNode; style?: CSSProperties }) {
   return <div style={{ background: dark ? "#241409" : "#fff9ec", border: "2px solid " + INK, borderRadius: 14, padding: 18, boxShadow: "4px 4px 0 0 " + INK, ...style }}>{children}</div>;
@@ -16,14 +46,18 @@ function Head({ children, dark }: { children: ReactNode; dark: boolean }) {
   return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
 }
 
-export function ThePantry({ dark, projects, stations, summaryOf, selectedProject, onUpdateSummary, onOpenStation }: {
+export function ThePantry({ dark, projects, stations, archived, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
   dark: boolean;
   projects: StationProject[];
   stations: Station[];
+  /** 2K.1: the freezer — archived (recoverable) panes from GET /api/archive. */
+  archived: ArchivedPane[];
   summaryOf: (projectId: string) => string;
   selectedProject: string;
   onUpdateSummary: (projectId: string, summary: string) => void;
   onOpenStation: (id: string) => void;
+  onRestoreArchived: (paneId: string) => void;
+  onDeleteArchived: (paneId: string) => void;
 }) {
   // Derive the shown project each render (never hold stale state): an explicit pick if still valid,
   // else the board's selected project, else the first. Avoids the start-view race where `projects` is
@@ -36,6 +70,7 @@ export function ThePantry({ dark, projects, stations, summaryOf, selectedProject
   const proj = projects.find((p) => p.id === pid);
   const panes = stations.filter((s) => s.project === pid);
   const cooking = panes.filter((s) => s.status === "Running").length;
+  const frozen = archived.filter((a) => a.project_id === pid);
 
   return (
     <div data-testid="pantry" style={{ flex: 1, overflowY: "auto", padding: 24, background: dark ? "#1a0f08" : "var(--cream)", backgroundImage: dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
@@ -99,6 +134,26 @@ export function ThePantry({ dark, projects, stations, summaryOf, selectedProject
                       <Pips steps={8} done={s.contextPips} color={proj.color} label={s.contextLabel} />
                       <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, color: "#8a6a4f", flexShrink: 0 }}>{s.elapsed}</span>
                     </button>
+                  </Fragment>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          {/* 2K.1: In the freezer — archived (recoverable) panes. Restore brings one back to the
+              line; Delete is permanent (two-tap confirm). Driven by GET /api/archive, the same
+              feed as the classic app's restore tray. */}
+          <Card dark={dark}>
+            <Head dark={dark}>In the freezer</Head>
+            {frozen.length === 0 ? (
+              <div data-testid="freezer-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
+                Nothing in the freezer — 86'd and cleared stations land here, restorable.
+              </div>
+            ) : (
+              <div data-testid="freezer-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {frozen.map((a) => (
+                  <Fragment key={a.pane_id}>
+                    <FreezerRow a={a} dark={dark} onRestore={onRestoreArchived} onDelete={onDeleteArchived} />
                   </Fragment>
                 ))}
               </div>

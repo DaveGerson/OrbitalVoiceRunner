@@ -4,15 +4,19 @@
 import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
 import { INK, PROJECT_COLORS, PROJECT_EMOJIS } from "./theme";
 import { Button, Mascot, type MascotVariant } from "./primitives";
+import { useDialog } from "./useFocusTrap";
 import type { StationProject } from "./station";
 
 function ModalShell({ dark, accent, mascot, title, scribble, onClose, children, footer }: {
   dark: boolean; accent: string; mascot?: MascotVariant; title: string; scribble: string;
   onClose: () => void; children: ReactNode; footer: ReactNode;
 }) {
+  // 2K.5: shared dialog semantics — initial focus, focus trap, Escape closes (top-most only).
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(42,26,16,.6)", zIndex: 220, display: "grid", placeItems: "center", padding: 20 }}>
-      <div onClick={(e) => e.stopPropagation()} className="orb-pop-in" data-testid="orbital-modal" style={{ width: "min(480px, 95vw)", background: dark ? "#241409" : "#fff9ec", border: "3px solid " + INK, borderRadius: 16, boxShadow: "8px 8px 0 0 " + INK, overflow: "hidden" }}>
+      <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title}
+        onClick={(e) => e.stopPropagation()} className="orb-pop-in" data-testid="orbital-modal" style={{ width: "min(480px, 95vw)", background: dark ? "#241409" : "#fff9ec", border: "3px solid " + INK, borderRadius: 16, boxShadow: "8px 8px 0 0 " + INK, overflow: "hidden", outline: "none" }}>
         <div style={{ padding: "14px 16px", background: accent, borderBottom: "3px solid " + INK, display: "flex", alignItems: "center", gap: 12 }}>
           {mascot && <Mascot variant={mascot} size={50} />}
           <div style={{ flex: 1 }}>

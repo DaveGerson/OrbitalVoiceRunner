@@ -35,7 +35,9 @@ import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded } from "./src/store/migrate";
 import type { CapabilityGate } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
+import { z } from "zod";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
+import { CAPABILITY_DEFS } from "./src/actions/capabilities";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
 import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
@@ -76,6 +78,60 @@ let lastInteractionId: string | null = null;
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot.
 // Exported so in-process integration tests can authenticate without guessing the token.
 export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+
+// ── 2S.2: PUT /api/settings body validation ──────────────────────────────────────────────────────
+// The settings body stays a PERMISSIVE passthrough overall (settings carry many shapes — do NOT
+// enumerate the world), but the fields that drive GATE DECISIONS are strict when present:
+//   - advanced.globalPermissionsMode must be a REAL mode (a garbage value used to be assigned
+//     verbatim AND persisted, so every later gate decision compared against an unknown mode);
+//   - advanced.capabilityGates values must be Auto/Ask/Off on KNOWN capability keys. Unknown keys
+//     are STRIPPED (forward compat: an older server accepting a newer client), never a 400.
+// A non-object body is a 400 (it used to throw a 500 deeper in updateSettings).
+const SettingsGateValueSchema = z.enum(["Auto", "Ask", "Off"]);
+const SettingsGlobalModeSchema = z.enum(["Full Auto", "Human-in-the-Loop", "Read-Only", "Inherit"]);
+const KNOWN_CAPABILITY_IDS: ReadonlySet<string> = new Set(CAPABILITY_DEFS.map((d) => d.id));
+
+/** Validate (and forward-compat-strip) a PUT /api/settings body IN PLACE. Returns a 400-able error
+ *  naming the offending field, or ok. Pure over everything except the unknown-gate-key strip.
+ *  (Uniform shape, not a discriminated union — this tsconfig is non-strict, so `!r.ok` would not narrow.) */
+export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { ok: false, error: "Settings body must be a JSON object." };
+  }
+  const advanced = (body as Record<string, unknown>).advanced;
+  if (advanced === undefined) return { ok: true };
+  if (typeof advanced !== "object" || advanced === null || Array.isArray(advanced)) {
+    return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+  }
+  const adv = advanced as Record<string, unknown>;
+  if (adv.globalPermissionsMode !== undefined &&
+      !SettingsGlobalModeSchema.safeParse(adv.globalPermissionsMode).success) {
+    return {
+      ok: false,
+      error: `Invalid settings field 'advanced.globalPermissionsMode': must be one of ${SettingsGlobalModeSchema.options.join(", ")}.`,
+    };
+  }
+  const gates = adv.capabilityGates;
+  if (gates !== undefined) {
+    if (typeof gates !== "object" || gates === null || Array.isArray(gates)) {
+      return { ok: false, error: "Invalid settings field 'advanced.capabilityGates': expected an object map of capability -> Auto|Ask|Off." };
+    }
+    const gateMap = gates as Record<string, unknown>;
+    for (const key of Object.keys(gateMap)) {
+      if (!KNOWN_CAPABILITY_IDS.has(key)) {
+        delete gateMap[key]; // unknown capability row: strip, don't 400 (forward compat).
+        continue;
+      }
+      if (!SettingsGateValueSchema.safeParse(gateMap[key]).success) {
+        return {
+          ok: false,
+          error: `Invalid settings field 'advanced.capabilityGates.${key}': must be one of ${SettingsGateValueSchema.options.join(", ")}.`,
+        };
+      }
+    }
+  }
+  return { ok: true };
+}
 
 // The Gemini Live session is created through this seam so tests and the offline
 // simulator can swap in a fake session (no API key, no microphone) that still
@@ -1049,6 +1105,15 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   });
 
   app.put("/api/settings", (req, res) => {
+    // 2S.2: validate BEFORE applying anything. The body stays a PERMISSIVE passthrough overall
+    // (settings carry many shapes) but the DANGEROUS fields are strict; an invalid one is a 400
+    // naming the field, and the live settings/mode are untouched. (The only updateSettings()
+    // call site is this route — there is no WS/voice settings-mutation path to mirror.)
+    const validated = validateSettingsPutBody(req.body);
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
     const newSettings = req.body;
     // bead 9fz (part 2): capture the RAW incoming key BEFORE the masked/sentinel substitution below
     // mutates it, so we can tell a genuinely-new credential from a masked round-trip echo. NEVER logged.

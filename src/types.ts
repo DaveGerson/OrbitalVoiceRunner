@@ -65,6 +65,10 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   switch_context: "Auto",
   set_voice_mute: "Auto",
   dismiss_attention: "Auto",
+  // 2S.1: CAPABILITY_DEFS declares clear_history defaultGate "Ask" (destructive: wipes a pane's
+  // recorded history) but the default map omitted it, so it resolved through the permissive
+  // fallback to Auto. Pin it here so map and matrix agree.
+  clear_history: "Ask",
   // c55.10: rest-only writes tightened from ungated → Ask (gate-tightening only).
   send_keys: "Ask",
   remove_watch_rule: "Ask",

@@ -107,6 +107,7 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manag
     manager,
     session: null,
     redact: (s: string) => s,
+    isFrozen: () => false, // 2S.4: ActionContext requires it; update_project now checks the brake.
     broadcast: () => {},
     broadcastLedgerUpdate: () => { rec.ledgerUpdates++; },
     broadcastTerminalsUpdated: () => { rec.terminalsUpdated++; },

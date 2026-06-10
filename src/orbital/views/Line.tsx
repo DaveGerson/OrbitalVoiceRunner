@@ -67,16 +67,43 @@ function ProjectSection({ proj, items, dark, compact, layout, onOpen, showCue, a
   );
 }
 
-export function Board({ stations, projects, dark, density, layout, onOpen, showCue, activeId, selectedProject, onNewPane }: {
+// 2K.1: the "Clear exited" affordance — appears only while a station on the board is actually
+// Exited, archives them (recoverable) via the same clear-exited route the classic app uses.
+// One-tap (the operation is non-destructive: panes land in the Pantry's freezer, restorable).
+function ClearExitedChip({ count, onClear }: { count: number; onClear?: () => void }) {
+  if (count === 0 || !onClear) return null;
+  return (
+    <button data-testid="clear-exited" onClick={onClear}
+      title="Archive every exited station into the freezer (recoverable from the Pantry)"
+      style={{
+        display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 999,
+        border: "2px solid " + INK, background: "#8a6a4f", color: "#fff4de", cursor: "pointer",
+        fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap", boxShadow: "2px 2px 0 0 " + INK,
+      }}>
+      🧊 Clear exited · {count}
+    </button>
+  );
+}
+
+export function Board({ stations, projects, dark, density, layout, onOpen, showCue, activeId, selectedProject, onNewPane, onClearExited }: {
   stations: Station[]; projects: StationProject[]; dark: boolean; density: Tweaks["density"]; layout: Tweaks["layout"];
   onOpen: (st: Station) => void; showCue: boolean; activeId: string | null; selectedProject: string; onNewPane?: (projectId: string) => void;
+  /** 2K.1: archive all Exited panes (POST /api/terminals/clear-exited). */
+  onClearExited?: () => void;
 }) {
   const compact = density === "dense";
   const scope = selectedProject === "all" ? stations : stations.filter((s) => s.project === selectedProject);
+  const exitedCount = scope.filter((s) => s.status === "Exited").length;
 
   if (layout === "rail") {
     return (
-      <div style={{ flex: 1, display: "flex", gap: 14, padding: "18px 20px", overflow: "auto" }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {exitedCount > 0 && (
+          <div style={{ display: "flex", justifyContent: "flex-end", padding: "10px 20px 0" }}>
+            <ClearExitedChip count={exitedCount} onClear={onClearExited} />
+          </div>
+        )}
+        <div style={{ flex: 1, display: "flex", gap: 14, padding: "18px 20px", overflow: "auto" }}>
         {RAIL_COLS.map((col) => {
           const items = scope.filter((s) => s.status === col.status);
           return (
@@ -94,6 +121,7 @@ export function Board({ stations, projects, dark, density, layout, onOpen, showC
             </section>
           );
         })}
+        </div>
       </div>
     );
   }
@@ -101,6 +129,11 @@ export function Board({ stations, projects, dark, density, layout, onOpen, showC
   const groups = projects.map((p) => ({ p, items: scope.filter((s) => s.project === p.id) })).filter((g) => g.items.length);
   return (
     <div style={{ flex: 1, overflow: "auto", padding: "20px", maxWidth: layout === "list" ? 960 : 1280, margin: "0 auto", width: "100%" }}>
+      {exitedCount > 0 && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
+          <ClearExitedChip count={exitedCount} onClear={onClearExited} />
+        </div>
+      )}
       {groups.length === 0 && <Empty msg="the line's quiet — fire up a pane to start cookin' 🍳" />}
       {groups.map((g) => <Fragment key={g.p.id}><ProjectSection proj={g.p} items={g.items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} onNewPane={onNewPane} /></Fragment>)}
     </div>

@@ -5,28 +5,47 @@
 import { useEffect, useRef, useState } from "react";
 import { INK } from "./theme";
 import { Button, Chip, Mascot } from "./primitives";
+import { useDialog } from "./useFocusTrap";
 
 export function EmergencyStop({ onClose, onKill, runningCount }: { onClose: () => void; onKill: () => void; runningCount: number }) {
   const [stage, setStage] = useState<1 | 2>(1);
   const [hold, setHold] = useState(0);
   const holdTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 2K.5 fix: the threshold side effects (onKill/setStage) used to run INSIDE the setHold updater —
+  // a side-effect-in-updater bug (updaters can re-run under StrictMode/concurrent rendering, double-
+  // firing the kill). The hold progress now lives in a ref; the interval callback owns the threshold
+  // detection and side effects, and setHold is a pure render mirror.
+  const holdRef = useRef(0);
+  const stageRef = useRef<1 | 2>(1);
+  stageRef.current = stage;
 
   const startHold = () => {
-    if (holdTimer.current) return;
+    if (holdTimer.current || stageRef.current !== 1) return;
     holdTimer.current = setInterval(() => {
-      setHold((h) => {
-        if (h >= 100) { if (holdTimer.current) clearInterval(holdTimer.current); holdTimer.current = null; onKill(); setStage(2); return 100; }
-        return h + 7;
-      });
+      holdRef.current = Math.min(100, holdRef.current + 7);
+      setHold(holdRef.current);
+      if (holdRef.current >= 100) {
+        if (holdTimer.current) clearInterval(holdTimer.current);
+        holdTimer.current = null;
+        onKill();
+        setStage(2);
+      }
     }, 40);
   };
-  const endHold = () => { if (holdTimer.current) { clearInterval(holdTimer.current); holdTimer.current = null; } if (stage === 1) setHold(0); };
+  const endHold = () => {
+    if (holdTimer.current) { clearInterval(holdTimer.current); holdTimer.current = null; }
+    if (stageRef.current === 1) { holdRef.current = 0; setHold(0); }
+  };
   useEffect(() => () => { if (holdTimer.current) clearInterval(holdTimer.current); }, []);
 
+  // 2K.5: dialog semantics. Escape = "release the brake" (same as the close button) — the modal is
+  // itself the emergency state, so closing it must release the freeze, never leave it silently on.
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
+
   return (
-    <div data-testid="emergency-stop" style={{ position: "fixed", inset: 0, zIndex: 300, display: "grid", placeItems: "center", padding: 20 }}>
+    <div data-testid="emergency-stop" role="dialog" aria-modal="true" aria-label="All hands — emergency stop" style={{ position: "fixed", inset: 0, zIndex: 300, display: "grid", placeItems: "center", padding: 20 }}>
       <div className="orb-siren" style={{ position: "absolute", inset: 0 }} />
-      <div className="orb-shake" onClick={(e) => e.stopPropagation()} style={{ position: "relative", width: "min(560px, 94vw)", background: "#fff4de", border: "4px solid " + INK, borderRadius: 18, boxShadow: "10px 10px 0 0 " + INK, overflow: "hidden" }}>
+      <div ref={dialogRef} tabIndex={-1} className="orb-shake" onClick={(e) => e.stopPropagation()} style={{ position: "relative", width: "min(560px, 94vw)", background: "#fff4de", border: "4px solid " + INK, borderRadius: 18, boxShadow: "10px 10px 0 0 " + INK, overflow: "hidden", outline: "none" }}>
         <div style={{ height: 16, backgroundImage: "repeating-linear-gradient(45deg, #2a1a10 0 14px, #ffc94a 14px 28px)" }} />
         {stage === 1 ? (
           <div style={{ padding: "22px 24px 26px", textAlign: "center" }}>
@@ -38,8 +57,15 @@ export function EmergencyStop({ onClose, onKill, runningCount }: { onClose: () =
               The Chef de Cuisine is <strong>frozen</strong> and every in-flight order is cancelled. The burners are <strong>still hot</strong> — {runningCount} stations are running. Hold the kill switch to cut the gas, or release the brake to get back to service.
             </p>
             <button data-testid="hold-to-kill" onMouseDown={startHold} onMouseUp={endHold} onMouseLeave={endHold} onTouchStart={startHold} onTouchEnd={endHold}
+              // 2K.5: keyboard path — holding Space/Enter runs the SAME hold timer (keydown repeats
+              // are ignored so the timer isn't restarted), keyup/blur cancels exactly like mouseup.
+              onKeyDown={(e) => { if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); startHold(); } }}
+              onKeyUp={(e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); endHold(); } }}
+              onBlur={endHold}
+              aria-label={`Hold to kill ${runningCount} running burners — hold Space or Enter`}
               style={{ position: "relative", width: "100%", padding: "16px", borderRadius: 12, border: "3px solid " + INK, background: "#e23a3a", color: "#fff4de", cursor: "pointer", fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, overflow: "hidden", boxShadow: "4px 4px 0 0 " + INK, marginBottom: 12 }}>
-              <div style={{ position: "absolute", inset: 0, width: hold + "%", background: "#a8151a", transition: "width 40ms linear" }} />
+              <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={hold} aria-label="Kill-switch hold progress"
+                style={{ position: "absolute", inset: 0, width: hold + "%", background: "#a8151a", transition: "width 40ms linear" }} />
               <span style={{ position: "relative" }}>{hold > 0 ? `CUTTING THE GAS… ${hold}%` : `🔥 HOLD to kill ${runningCount} burners`}</span>
             </button>
             <Button variant="mint" icon="check" style={{ width: "100%", justifyContent: "center" }} onClick={onClose}>Release the brake — back to service</Button>

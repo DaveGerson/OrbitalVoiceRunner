@@ -8,7 +8,50 @@
 import { Fragment, useEffect, useRef, useState, type CSSProperties } from "react";
 import { INK } from "./theme";
 import { Chip, Icon, VoiceCue } from "./primitives";
+import { useDialog } from "./useFocusTrap";
 import type { TranscriptEntry } from "./useOrbitalData";
+
+// 2K.5: the call sheet as a proper dialog — initial focus, focus trap, Escape closes. Split out
+// so the useDialog hook mounts/unmounts with the overlay itself.
+function CallSheet({ dark, stations, onCall, onClose }: {
+  dark: boolean; stations: { name: string }[]; onCall: (phrase: string) => void; onClose: () => void;
+}) {
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
+  return (
+    <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="What're my calls?"
+      className="orb-pop-in" data-testid="radio-calls" style={{ position: "absolute", inset: 0, zIndex: 5, background: dark ? "#1a0f08f2" : "#fff4def5", display: "flex", flexDirection: "column", outline: "none" }}>
+      <div style={{ padding: "12px 14px", borderBottom: "3px solid " + INK, display: "flex", alignItems: "center", gap: 8, background: "#ffc94a" }}>
+        <span style={{ fontSize: 18 }}>🎙</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK }}>What're my calls?</div>
+          <div style={{ fontFamily: "Caveat, cursive", fontSize: 14, color: "#a8151a" }}>everything here works hands-free</div>
+        </div>
+        <button onClick={onClose} aria-label="Close" style={{ width: 30, height: 30, border: "2px solid " + INK, borderRadius: 8, background: "#fff4de", cursor: "pointer", fontWeight: 800, color: INK }}>✕</button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 14 }}>
+        {buildCalls(stations).map((g) => (
+          <Fragment key={g.group}>
+            <div>
+              <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: g.color, marginBottom: 6 }}>{g.group}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                {g.lines.map((l, i) => (
+                  <Fragment key={i}>
+                    <button data-testid="radio-call" onClick={() => { onCall(l); onClose(); }}
+                      style={{ all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: dark ? "#2f1d12" : "#fff9ec", border: "1.5px solid " + INK, borderRadius: 8, boxShadow: "1.5px 1.5px 0 0 " + INK, boxSizing: "border-box" }}>
+                      <VoiceCue phrase={l} dark={dark} tone="live" style={{ fontSize: 11.5 }} />
+                      <div style={{ flex: 1 }} />
+                      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".06em", textTransform: "uppercase", color: "#8a6a4f" }}>say it ›</span>
+                    </button>
+                  </Fragment>
+                ))}
+              </div>
+            </div>
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function ChefDeCuisineMark({ size = 42, live }: { size?: number; live: boolean }) {
   return (
@@ -138,40 +181,9 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
         )}
       </div>
 
-      {/* CALL SHEET — what you can say (hands-free reference) */}
-      {calls && (
-        <div className="orb-pop-in" data-testid="radio-calls" style={{ position: "absolute", inset: 0, zIndex: 5, background: dark ? "#1a0f08f2" : "#fff4def5", display: "flex", flexDirection: "column" }}>
-          <div style={{ padding: "12px 14px", borderBottom: "3px solid " + INK, display: "flex", alignItems: "center", gap: 8, background: "#ffc94a" }}>
-            <span style={{ fontSize: 18 }}>🎙</span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK }}>What're my calls?</div>
-              <div style={{ fontFamily: "Caveat, cursive", fontSize: 14, color: "#a8151a" }}>everything here works hands-free</div>
-            </div>
-            <button onClick={() => setCalls(false)} aria-label="Close" style={{ width: 30, height: 30, border: "2px solid " + INK, borderRadius: 8, background: "#fff4de", cursor: "pointer", fontWeight: 800, color: INK }}>✕</button>
-          </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 14 }}>
-            {buildCalls(stations).map((g) => (
-              <Fragment key={g.group}>
-                <div>
-                  <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: g.color, marginBottom: 6 }}>{g.group}</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                    {g.lines.map((l, i) => (
-                      <Fragment key={i}>
-                        <button data-testid="radio-call" onClick={() => { onCall(l); setCalls(false); }}
-                          style={{ all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: dark ? "#2f1d12" : "#fff9ec", border: "1.5px solid " + INK, borderRadius: 8, boxShadow: "1.5px 1.5px 0 0 " + INK, boxSizing: "border-box" }}>
-                          <VoiceCue phrase={l} dark={dark} tone="live" style={{ fontSize: 11.5 }} />
-                          <div style={{ flex: 1 }} />
-                          <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".06em", textTransform: "uppercase", color: "#8a6a4f" }}>say it ›</span>
-                        </button>
-                      </Fragment>
-                    ))}
-                  </div>
-                </div>
-              </Fragment>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* CALL SHEET — what you can say (hands-free reference). 2K.5: a real dialog (focus trap,
+          Escape closes). */}
+      {calls && <CallSheet dark={dark} stations={stations} onCall={onCall} onClose={() => setCalls(false)} />}
     </aside>
   );
 }

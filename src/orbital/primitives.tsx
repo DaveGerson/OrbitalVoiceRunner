@@ -130,6 +130,37 @@ export function StatusBadge({ status }: { status: StationStatus }) {
   );
 }
 
+// POSTURE CHIP (2K.2) — the pane's autonomy at a glance, strictly from SERVER truth.
+// Prefers the server-resolved effective posture (Terminal.posture — the same field the classic
+// GateChip reads); falls back to the ledger permissions_mode when posture is absent (older
+// payloads). Renders NOTHING when neither exists — never a guessed posture. Visual only.
+const POSTURE_SKIN: Record<"OPEN" | "GUARDED" | "LOCKED", { label: string; bg: string; fg: string; tip: string }> = {
+  OPEN:    { label: "full auto", bg: "#4db892", fg: INK,       tip: "Open kitchen — this pane fires on its own" },
+  GUARDED: { label: "guarded",   bg: "#ffc94a", fg: INK,       tip: "Guarded — risky moves come to the pass first" },
+  LOCKED:  { label: "read-only", bg: "#e23a3a", fg: "#fff4de", tip: "Locked — hands off, watching only" },
+};
+const MODE_SKIN: Record<"Full Auto" | "Human-in-the-Loop" | "Read-Only", { label: string; bg: string; fg: string; tip: string }> = {
+  "Full Auto":         { label: "full auto", bg: "#4db892", fg: INK,       tip: "Full Auto — this pane fires on its own" },
+  "Human-in-the-Loop": { label: "guarded",   bg: "#ffc94a", fg: INK,       tip: "Human-in-the-Loop — fires come to the pass first" },
+  "Read-Only":         { label: "read-only", bg: "#e23a3a", fg: "#fff4de", tip: "Read-Only — hands off, watching only" },
+};
+export function PostureChip({ posture, mode, style = {} }: {
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
+  mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  style?: CSSProperties;
+}) {
+  const skin = posture ? POSTURE_SKIN[posture] : mode ? MODE_SKIN[mode] : null;
+  if (!skin) return null; // no server truth — no chip (never a guess)
+  return (
+    <span data-testid="posture-chip" data-posture={posture ?? mode} title={skin.tip} style={{
+      display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999,
+      border: "1.5px solid " + INK, background: skin.bg, color: skin.fg,
+      fontFamily: "DM Sans, sans-serif", fontSize: 9.5, fontWeight: 800,
+      letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
+    }}>{skin.label}</span>
+  );
+}
+
 // VOICE CUE — the spoken call for any clickable thing. Hands-free first.
 export function VoiceCue({ phrase, dark, style = {}, tone = "muted" }: {
   phrase: string; dark?: boolean; style?: CSSProperties; tone?: "muted" | "live";

@@ -343,6 +343,9 @@ export const clearHistory: ActionDef<typeof ClearHistoryParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/terminals/:pane_id/history/clear" },
   handler: (args, ctx): ActionResult => {
+    // 2S.4: ALWAYS_ALLOWED never routes through effectiveCapabilityGateFor (where the STOP-ALL
+    // frozen short-circuit lives), so this destructive mutator must check the brake itself.
+    if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
     saveHistory(ctx, args.pane_id, []);
     return { kind: "ok", output: `History cleared for terminal ${args.pane_id}.` };
   },
@@ -369,6 +372,9 @@ export const clearExited: ActionDef<typeof ClearExitedParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/terminals/clear-exited" },
   handler: (_args, ctx): ActionResult => {
+    // 2S.4: frozen means frozen — this stops/drops lingering terminal objects and archives panes,
+    // none of which may happen while the STOP-ALL brake is engaged (ALWAYS_ALLOWED bypasses the gate).
+    if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
     const activeId = ctx.manager.ledger.activeProjectId || undefined;
     const ws = activeId ? ctx.manager.ledger.getProject(activeId) : null;
     if (ws) {

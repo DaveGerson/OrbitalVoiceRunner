@@ -13,13 +13,19 @@ async function gotoKitchen(page: Page) {
 }
 
 test.describe("Orbital Kitchen — controls", () => {
-  test("ServiceMode switches the autonomy posture", async ({ page }) => {
+  test("ServiceMode switches the autonomy posture (Full Auto takes one confirm tap)", async ({ page }) => {
     await gotoKitchen(page);
     // default posture = Human-in-the-Loop
     await expect(page.getByTestId("service-hitl")).toHaveAttribute("aria-pressed", "true");
+    // 2K.4: escalating to Full Auto is the riskiest click — the FIRST tap arms an inline confirm
+    // on the control itself (no mode change yet); the SECOND tap fires it.
+    await page.getByTestId("service-auto").click();
+    await expect(page.getByTestId("service-auto")).toHaveAttribute("data-confirming", "true");
+    await expect(page.getByTestId("service-auto")).toHaveAttribute("aria-pressed", "false"); // not flipped yet
     await page.getByTestId("service-auto").click();
     await expect(page.getByTestId("service-auto")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("service-hitl")).toHaveAttribute("aria-pressed", "false");
+    // de-escalation stays one-tap
     await page.getByTestId("service-read").click();
     await expect(page.getByTestId("service-read")).toHaveAttribute("aria-pressed", "true");
   });
