@@ -609,6 +609,83 @@ describe("PLM4 (h) Finding flap: an immediately-dropping (flapping) session is b
 //     It broadcasts a distinct key-problem loss and STOPS; recovery comes from the next client
 //     connect after a valid key is configured.
 // ───────────────────────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// (j) 2S.5 — voice_channel_restored: a successful reconnect that FOLLOWS a broadcast loss announces
+//     recovery with a `voice_channel_restored` frame. The FIRST connect (no prior loss on this client
+//     connection) must NOT announce "restored" — the flag is armed only where voice_channel_lost is
+//     broadcast, and disarmed on the restoring hoist.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+describe("2S.5: voice_channel_restored is broadcast on the reconnect that follows a loss", () => {
+  let running: RunningServer;
+  let client: WebSocket;
+  let messages: any[];
+  let scripted: ReturnType<typeof makeScriptedConnector>;
+
+  before(async () => {
+    scripted = makeScriptedConnector(0); // every connect succeeds.
+    serverMod.setLiveConnector(scripted.connector);
+    serverMod.resetSessionAiFactory();
+    running = await serverMod.startServer({ port: 0, enableVite: false });
+    messages = [];
+    client = await openClient(running, messages);
+    await waitFor(() => scripted.sessions.length >= 1 && running._testActiveLiveSession?.());
+  });
+
+  after(async () => {
+    await closeClient(client);
+    await teardownServerSuite(running);
+  });
+
+  it("the FIRST connect does NOT announce 'restored' (nothing was lost yet)", async () => {
+    // The initial session is hoisted (awaited in before); give any (wrong) broadcast time to land.
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(
+      messages.filter((m) => m.type === "voice_channel_restored").length,
+      0,
+      "no voice_channel_restored frame on the first connect",
+    );
+  });
+
+  it("a drop followed by a successful reconnect broadcasts exactly one voice_channel_restored AFTER the loss", async () => {
+    const session0 = scripted.sessions[scripted.sessions.length - 1]!;
+    const sessionsBefore = scripted.sessions.length;
+    session0.emitClose({ code: 1006, reason: "drop -> reconnect -> restored" });
+
+    // The loss is announced, then the reconnect succeeds and announces the restoration.
+    await waitFor(() => messages.find((m) => m.type === "voice_channel_lost"));
+    await waitFor(() => scripted.sessions.length > sessionsBefore);
+    const restored = await waitFor(() => messages.find((m) => m.type === "voice_channel_restored"));
+    assert.ok(restored, "a voice_channel_restored frame was broadcast after the reconnect");
+
+    // Ordering: the restored frame arrives AFTER the loss it answers.
+    const lostIdx = messages.findIndex((m) => m.type === "voice_channel_lost");
+    const restoredIdx = messages.findIndex((m) => m.type === "voice_channel_restored");
+    assert.ok(restoredIdx > lostIdx, "voice_channel_restored follows voice_channel_lost");
+
+    // Exactly ONE restored per loss — the flag disarms on the restoring hoist.
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(
+      messages.filter((m) => m.type === "voice_channel_restored").length,
+      1,
+      "exactly one voice_channel_restored for one loss",
+    );
+  });
+
+  it("a SECOND drop + reconnect announces a second restoration (the flag re-arms on each loss)", async () => {
+    const session1 = scripted.sessions[scripted.sessions.length - 1]!;
+    const sessionsBefore = scripted.sessions.length;
+    session1.emitClose({ code: 1006, reason: "second drop -> second restored" });
+
+    await waitFor(() => scripted.sessions.length > sessionsBefore);
+    await waitFor(() => messages.filter((m) => m.type === "voice_channel_restored").length >= 2);
+    assert.strictEqual(
+      messages.filter((m) => m.type === "voice_channel_restored").length,
+      2,
+      "each loss earns exactly one restored announcement",
+    );
+  });
+});
+
 describe("Issue A: a 1007 (invalid/missing API key) close does NOT consume the reconnect budget", () => {
   let running: RunningServer;
   let client: WebSocket;

@@ -193,6 +193,10 @@ interface VoiceSessionState {
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   stableResetTimer: ReturnType<typeof setTimeout> | null;
   connectGeneration: number;
+  // 2S.5: armed wherever a voice_channel_lost frame is broadcast for THIS client connection;
+  // disarmed by the next successful hoist, which then broadcasts voice_channel_restored. A FIRST
+  // connect (no prior loss) must NOT announce "restored" — that is exactly what this flag encodes.
+  voiceLostSinceLastRestore: boolean;
 }
 
 /**
@@ -399,6 +403,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // started (so a slow stale connect can never clobber a newer live session). Mirrors the QW3
       // `coreState.activeLiveSession === session` identity guard for the in-flight (not-yet-hoisted) window.
       connectGeneration: 0,
+      // 2S.5: no loss announced yet on this fresh connection — the first hoist stays silent.
+      voiceLostSinceLastRestore: false,
     };
 
     const turnId = (): string => {
@@ -618,9 +624,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       if (isInvalidKeyClose(closeCode)) {
         const blank = isBlankApiKey(sessionKey);
         console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
+        state.voiceLostSinceLastRestore = true; // 2S.5: a later successful connect announces recovery.
         broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
         return;
       }
+      state.voiceLostSinceLastRestore = true; // 2S.5: arm the restored announcement for the reconnect.
       broadcast({ type: "voice_channel_lost", reason });
       // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
       scheduleReconnect();
@@ -1067,6 +1075,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
       // connect promise resolves so `session` is live.
       coreState.activeLiveSession = justConnected;
+      // 2S.5: announce recovery — ONLY when this connect follows a broadcast loss on this same
+      // client connection (the flag is armed exactly where voice_channel_lost is broadcast, so a
+      // FIRST connect never says "restored"). Frame name is the kitchen-client contract:
+      // exactly `voice_channel_restored`.
+      if (state.voiceLostSinceLastRestore) {
+        state.voiceLostSinceLastRestore = false;
+        broadcast({ type: "voice_channel_restored" });
+      }
       clearReconnectTimer();
       // PLM4 (Finding: flap-unbounded backoff): do NOT refresh the bounded-retry budget eagerly on
       // hoist — a flapping session (connect -> immediate drop -> reconnect -> …) would then reset
@@ -1194,6 +1210,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       if (state.reconnectTimer) return;           // one in flight already.
       if (state.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
         console.warn(`[VOICE] reconnect giving up after ${state.reconnectAttempts} attempts.`);
+        state.voiceLostSinceLastRestore = true; // 2S.5: a later connect (new client action) still announces recovery.
         broadcast({ type: "voice_channel_lost", reason: "reconnect_failed", permanent: true });
         return;
       }

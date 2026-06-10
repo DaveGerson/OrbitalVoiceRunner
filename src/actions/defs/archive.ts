@@ -53,6 +53,9 @@ export const restoreArchivedPane: ActionDef<typeof PaneIdParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/archive/:pane_id/restore" },
   handler: (args, ctx): ActionResult => {
+    // 2S.4: frozen means frozen — ALWAYS_ALLOWED bypasses the gate matrix (and its frozen
+    // short-circuit), so this mutator must check the STOP-ALL brake itself.
+    if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
     const entry = ctx.manager.ledger.restoreArchivedPane(args.pane_id);
     // Accepted delta (c55 program): not-found maps to 200 ok-narration, not the inline 404. The UI
     // ignores the body and repaints off the broadcasts (which do NOT fire on this failure path).
@@ -72,6 +75,8 @@ export const deleteArchivedPane: ActionDef<typeof PaneIdParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "delete", path: "/api/archive/:pane_id" },
   handler: (args, ctx): ActionResult => {
+    // 2S.4: frozen means frozen — a permanent record delete may not run while the brake is engaged.
+    if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
     const ok = ctx.manager.ledger.deleteArchivedPane(args.pane_id);
     if (!ok) return { kind: "ok", output: `Archived pane ${args.pane_id} not found.` };
     ctx.broadcastLedgerUpdate();

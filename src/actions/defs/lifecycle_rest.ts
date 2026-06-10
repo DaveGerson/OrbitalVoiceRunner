@@ -26,6 +26,10 @@ export const updateProject: ActionDef<typeof UpdateProjectParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "put", path: "/api/projects/:project_id" },
   handler: (args, ctx): ActionResult => {
+    // 2S.4: frozen means frozen — ALWAYS_ALLOWED bypasses the gate matrix (and its frozen
+    // short-circuit), so this project-metadata mutator must check the STOP-ALL brake itself.
+    // (stop_pane below stays EXEMPT: stopping a pane is a de-escalation, like the brake trio.)
+    if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
     const ws = ctx.manager.ledger.getProject(args.project_id);
     if (!ws) return { kind: "ok", output: `Project ${args.project_id} not found.` }; // inline 404 -> 200 ok-narration
     if (args.directory !== undefined) ws.directory = args.directory;

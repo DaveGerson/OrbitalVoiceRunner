@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -260,6 +260,18 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
     db.exec(`
       ALTER TABLE action_log ADD COLUMN interaction_id TEXT;
       CREATE INDEX idx_action_log_interaction_id ON action_log(interaction_id);
+    `);
+  },
+  // v8 (Phase 2 / 2S.3): panes_archive twins for the v3 panes columns. v3 added draft /
+  // model_context / human_context to `panes` only, so the archive round-trip silently dropped an
+  // operator's unsent draft and both context lanes (the columns didn't exist on panes_archive to
+  // carry them). Additive ALTERs with the same defaults as v3 — safe on an already-migrated DB
+  // (existing archive rows hydrate as no-draft / empty contexts).
+  (db) => {
+    db.exec(`
+      ALTER TABLE panes_archive ADD COLUMN draft TEXT;
+      ALTER TABLE panes_archive ADD COLUMN model_context TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE panes_archive ADD COLUMN human_context TEXT NOT NULL DEFAULT '[]';
     `);
   },
 ];
