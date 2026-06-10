@@ -1109,7 +1109,9 @@ export class UniversalTerminal {
         }
         done();
       }, 1000);
-      if (killTimeout.unref) killTimeout.unref();
+      // In-flight rule: the awaited stop() DEPENDS on this timer when the child ignores SIGTERM
+      // (or a stub transport never emits exit), so it must hold the loop while the stop is live.
+      // done() clears it on every settle path, so it can never outlive the stop itself.
     });
 
     // Windows ConPTY: block until node-pty's delayed conout-worker teardown
@@ -1424,7 +1426,7 @@ export class OrchestratorManager {
    */
   private scheduleStart(term: UniversalTerminal): void {
     const p = new Promise<void>((resolve) => {
-      const t = setImmediate(() => {
+      setImmediate(() => {
         try {
           term.start();
         } catch (e) {
@@ -1439,8 +1441,9 @@ export class OrchestratorManager {
           resolve();
         }
       });
-      // Force-exit hygiene: the deferred-start handle must never hold the loop open on its own.
-      if (typeof (t as any)?.unref === "function") (t as any).unref();
+      // In-flight rule: a scheduled spawn is real awaited work (flushPendingSpawns), so the handle
+      // must hold the loop until it fires. It fires exactly once and cleans up pendingStarts, so it
+      // cannot outlive the spawn — unref'ing it would let a drained loop drop the spawn entirely.
     });
     this.pendingStarts.add(p);
   }

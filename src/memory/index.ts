@@ -34,8 +34,16 @@ export class MemoryService {
       const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
       const client = this.pythonClient;
       if (!client || !client.available()) return fallback();
-      const timeout = new Promise<null>((res) => { const t = setTimeout(() => res(null), this.timeoutMs); if (typeof (t as any).unref === "function") (t as any).unref(); });
-      const raced = await Promise.race([client.request(tiers, this.cfg, now), timeout]);
+      // In-flight rule: the awaited race DEPENDS on this ceiling to settle if the daemon request
+      // hangs, so it holds the loop while live and is cleared as soon as the race settles.
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<null>((res) => { timeoutTimer = setTimeout(() => res(null), this.timeoutMs); });
+      let raced: Awaited<ReturnType<PythonSynthClient["request"]>> | null;
+      try {
+        raced = await Promise.race([client.request(tiers, this.cfg, now), timeout]);
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      }
       if (raced && raced.ok) {
         return {
           text: raced.brief.text,
