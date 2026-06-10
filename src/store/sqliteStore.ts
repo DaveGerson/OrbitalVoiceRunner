@@ -554,6 +554,11 @@ export class JanusStore {
       project_id: row.workspace_id,
       archived_at: new Date(row.archived_at).toISOString(),
     };
+    // Legacy-Ledger parity (src/ledger.ts:440-443): recreate the destination project if it has since
+    // been removed. panes_archive deliberately carries NO FK (the record survives a project delete),
+    // but panes.workspace_id REFERENCES projects(id) with foreign_keys=ON — without this guard the
+    // re-insert below would throw where the legacy backend quietly recreates "Restored workspace".
+    this.addProject(row.workspace_id, process.cwd(), "Restored workspace");
     this.restorePane(paneId, row.workspace_id);
     this.db.prepare("DELETE FROM panes_archive WHERE pane_id=? AND workspace_id=?").run(paneId, row.workspace_id);
     return entry;

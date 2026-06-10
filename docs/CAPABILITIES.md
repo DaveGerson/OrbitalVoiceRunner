@@ -41,7 +41,6 @@ These bypass the capability gate entirely — they work even while the system is
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
 | `remove_note` | rest | no | Operator-UI |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
-| `restore_archived_pane` | rest | no | Restore an archived pane back into its project (operator-UI, ungated) |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 | `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
 | `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
@@ -224,6 +223,7 @@ These bypass the capability gate entirely — they work even while the system is
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `respawn_pane` | rest | no | Respawn a terminal pane (stop its process and start it again) |
+| `restore_archived_pane` | rest | no | Restore an archived pane back into its project AND respawn its terminal from the persisted identity (cwd/preset/permissions) |
 
 ## Send keystrokes to a pane
 

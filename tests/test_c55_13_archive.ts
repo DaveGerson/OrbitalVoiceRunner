@@ -1,9 +1,15 @@
 /**
  * tests/test_c55_13_archive.ts — c55.13 (wsm-e2e-pinned-c55.13): converge the 3 inline archive routes.
- * Faithful ports: UNGATED (ALWAYS_ALLOWED), readOnly:false. list rides rest.toHttp to emit {archived:[…]}
- * top-level; restore/delete use the default {output} map (UI repaints off ledger_updated/terminals_updated).
- * Same doctrine as c55.11/c55.12: run the real choke-point with a fake ctx, assert the ActionResult,
- * then assert applyResultToHttp maps it to {status, body}.
+ * Faithful ports: list/delete are UNGATED (ALWAYS_ALLOWED), readOnly:false. list rides rest.toHttp to
+ * emit {archived:[…]} top-level; restore/delete use the default {output} map (UI repaints off
+ * ledger_updated/terminals_updated). Same doctrine as c55.11/c55.12: run the real choke-point with a
+ * fake ctx, assert the ActionResult, then assert applyResultToHttp maps it to {status, body}.
+ *
+ * Core-journeys gap fix (e2e/live_journeys.spec.ts): restore_archived_pane now ALSO respawns the
+ * pane's PTY from its persisted identity, gated through `restart_pane` (the Re-fire gate) via
+ * ctx.gateOrDefer — so its declared capability moved ALWAYS_ALLOWED -> restart_pane, and the fake ctx
+ * grew gateOrDefer + manager.addTerminal. The end-to-end gate matrix (Auto/Ask/Off/frozen) is pinned
+ * against the REAL server in tests/test_restore_respawn.ts; here we pin the def shape + the wire map.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -35,8 +41,10 @@ async function runToHttp(name: string, args: Record<string, unknown>, ctx: Actio
   return { result, status: sent.status, json: sent.json };
 }
 
-// Fake ledger that records calls + a seeded archived list (projection sentinel).
-function makeCtx(opts: { restoreOk?: boolean; deleteOk?: boolean } = {}): { ctx: ActionContext; calls: string[] } {
+// Fake ledger that records calls + a seeded archived list (projection sentinel). The restore def now
+// gates a RESPAWN through ctx.gateOrDefer ("restart_pane"), so the fake grew gateOrDefer (disposition
+// configurable, default "run") + manager.addTerminal/terminals/settings + ledger.getProject.
+function makeCtx(opts: { restoreOk?: boolean; deleteOk?: boolean; gate?: "run" | "forbidden" | "deferred" } = {}): { ctx: ActionContext; calls: string[] } {
   const calls: string[] = [];
   const archivedRaw = [{
     pane: { pane_id: "p1", name: "Pane One", tool_preset: "Claude Code", last_command: "npm test" },
@@ -44,29 +52,53 @@ function makeCtx(opts: { restoreOk?: boolean; deleteOk?: boolean } = {}): { ctx:
   }];
   const ledger: any = {
     listArchived: () => { calls.push("listArchived"); return archivedRaw; },
-    restoreArchivedPane: (id: string) => { calls.push(`restore:${id}`); return opts.restoreOk === false ? null : { pane_id: id }; },
+    restoreArchivedPane: (id: string) => {
+      calls.push(`restore:${id}`);
+      if (opts.restoreOk === false) return null;
+      // The legacy ArchivedPane entry shape (pane meta carries the persisted spawn identity).
+      return {
+        pane: { pane_id: id, name: id, tool_preset: "Custom", permissions_mode: "Full Auto", session_id: "", last_command: "npm test" },
+        project_id: "proj", archived_at: "2026-06-05T00:00:00Z",
+      };
+    },
     deleteArchivedPane: (id: string) => { calls.push(`delete:${id}`); return opts.deleteOk === false ? false : true; },
+    getProject: () => null, // cwd falls back to process.cwd() in the spawn closure
   };
   const ctx = {
-    manager: { ledger }, session: null, surface: "rest",
+    manager: {
+      ledger,
+      terminals: {},
+      settings: { presets: [], advanced: {} },
+      addTerminal: (id: string, _cwd: string, cmd: string, preset: string, mode: string) => {
+        calls.push(`spawn:${id}:${preset}:${mode}:${cmd}`);
+        return `Created terminal '${id}'.`;
+      },
+    },
+    session: null, surface: "rest",
     broadcastLedgerUpdate: () => { calls.push("ledger_broadcast"); },
     broadcastTerminalsUpdated: () => { calls.push("terminals_broadcast"); },
+    gateOrDefer: (cap: string, paneId: string | null) => {
+      calls.push(`gate:${cap}:${paneId}`);
+      const d = opts.gate ?? "run";
+      return d === "deferred" ? { disposition: "deferred", actionId: "act-1", summary: `Restart pane ${paneId}` } : { disposition: d };
+    },
     redact: (s: string) => s, isFrozen: () => false, effectiveCapabilityGateFor: () => "Auto",
   } as unknown as ActionContext;
   return { ctx, calls };
 }
 
-const SHAPE: Array<{ name: string; method: string; path: string }> = [
-  { name: "list_archived_panes", method: "get", path: "/api/archive" },
-  { name: "restore_archived_pane", method: "post", path: "/api/archive/:pane_id/restore" },
-  { name: "delete_archived_pane", method: "delete", path: "/api/archive/:pane_id" },
+const SHAPE: Array<{ name: string; method: string; path: string; capability: string }> = [
+  { name: "list_archived_panes", method: "get", path: "/api/archive", capability: "ALWAYS_ALLOWED" },
+  // restore's respawn rides the Re-fire gate (restart_pane) — see the header note + test_restore_respawn.ts.
+  { name: "restore_archived_pane", method: "post", path: "/api/archive/:pane_id/restore", capability: "restart_pane" },
+  { name: "delete_archived_pane", method: "delete", path: "/api/archive/:pane_id", capability: "ALWAYS_ALLOWED" },
 ];
 
 describe("c55.13 — 3 rest-only archive defs (shape + asymmetry)", () => {
-  for (const { name, method, path: p } of SHAPE) {
-    it(`${name} is rest-only ALWAYS_ALLOWED readOnly:false, binds ${method.toUpperCase()} ${p}, allow-listed`, () => {
+  for (const { name, method, path: p, capability } of SHAPE) {
+    it(`${name} is rest-only capability:${capability} readOnly:false, binds ${method.toUpperCase()} ${p}, allow-listed`, () => {
       const def = findDef(name);
-      assert.strictEqual(def.capability, "ALWAYS_ALLOWED");
+      assert.strictEqual(def.capability, capability);
       assert.strictEqual(def.readOnly, false);
       assert.deepStrictEqual([...def.surfaces], ["rest"]);
       assert.deepStrictEqual(def.rest?.method, method);
@@ -86,17 +118,41 @@ describe("c55.13 — fidelity", () => {
       last_command: "npm test", archived_at: "2026-06-05T00:00:00Z",
     }] }, "byte-identical to the inline {archived:[…]} projection, top-level (not {output})");
   });
-  it("restore_archived_pane ok -> both broadcasts, 200", async () => {
+  it("restore_archived_pane ok (gate run) -> both broadcasts, gated respawn from the PERSISTED identity, 200", async () => {
     const { ctx, calls } = makeCtx();
     const { status } = await runToHttp("restore_archived_pane", { pane_id: "p1" }, ctx);
     assert.strictEqual(status, 200);
     assert.ok(calls.includes("restore:p1") && calls.includes("ledger_broadcast") && calls.includes("terminals_broadcast"));
+    // The respawn consulted the Re-fire gate, then spawned with the persisted preset/mode and the
+    // preset-DERIVED launch command (Custom -> bash/cmd.exe here) — NEVER the pane's last_command.
+    assert.ok(calls.includes("gate:restart_pane:p1"), "respawn routed through the restart_pane gate");
+    const spawn = calls.find((c) => c.startsWith("spawn:p1:"));
+    assert.ok(spawn, "manager.addTerminal fired on the run disposition");
+    assert.ok(spawn!.startsWith("spawn:p1:Custom:Full Auto:"), "persisted preset + permissions_mode used");
+    assert.ok(!spawn!.includes("npm test"), "NEVER auto-runs the archived last_command");
   });
-  it("restore_archived_pane not-found -> 200 ok-narration, NO broadcast (404→200 delta)", async () => {
+  it("restore_archived_pane gate deferred (Ask) -> ledger restore still lands, NO spawn, 200 narration", async () => {
+    const { ctx, calls } = makeCtx({ gate: "deferred" });
+    const { status, json } = await runToHttp("restore_archived_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(status, 200);
+    assert.ok(calls.includes("restore:p1") && calls.includes("ledger_broadcast"), "the ledger restore landed");
+    assert.ok(!calls.some((c) => c.startsWith("spawn:")), "spawn deferred to the action dialog");
+    assert.match(String((json as { output?: unknown }).output), /confirm/i, "the narration says the spawn awaits confirmation");
+  });
+  it("restore_archived_pane gate forbidden (Off) -> ledger restore still lands, NO spawn, 200 narration", async () => {
+    const { ctx, calls } = makeCtx({ gate: "forbidden" });
+    const { status, json } = await runToHttp("restore_archived_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(status, 200);
+    assert.ok(calls.includes("restore:p1") && calls.includes("ledger_broadcast"), "the ledger restore landed");
+    assert.ok(!calls.some((c) => c.startsWith("spawn:")), "no spawn while Off");
+    assert.match(String((json as { output?: unknown }).output), /gated Off/, "the narration names the Off gate");
+  });
+  it("restore_archived_pane not-found -> 200 ok-narration, NO broadcast, NO gate consult (404→200 delta)", async () => {
     const { ctx, calls } = makeCtx({ restoreOk: false });
     const { status } = await runToHttp("restore_archived_pane", { pane_id: "nope" }, ctx);
     assert.strictEqual(status, 200);
     assert.ok(calls.includes("restore:nope") && !calls.includes("ledger_broadcast"));
+    assert.ok(!calls.some((c) => c.startsWith("gate:") || c.startsWith("spawn:")), "no gate/spawn for a missing id");
   });
   it("delete_archived_pane ok -> ledger broadcast, 200", async () => {
     const { ctx, calls } = makeCtx();

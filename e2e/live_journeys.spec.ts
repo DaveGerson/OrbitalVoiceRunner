@@ -11,7 +11,9 @@ import { expect, test, type Page } from "@playwright/test";
  *      observe WS → ledger.setDraft), survives a full page reload, and Send actually
  *      reaches the live bash PTY (the echoed marker comes back through the stdout stream).
  *   2. Pane lifecycle — real command → `exit` → Exited card → "86 this station" → the
- *      Pantry freezer (GET /api/archive) → Restore (POST /api/archive/:id/restore).
+ *      Pantry freezer (GET /api/archive) → Restore (POST /api/archive/:id/restore), which
+ *      reinstates the ledger row AND respawns the pane's terminal (gated like Re-fire:
+ *      restart_pane, default Ask → confirm at the pass), so the station card REAPPEARS.
  *
  * The lane shares ONE live server with the other live_*.spec.ts files (single worker,
  * filename order), so every selector is scoped to THIS file's unique project/pane names and
@@ -132,7 +134,7 @@ test("pane lifecycle: exit → Exited card → 86 to the freezer → restore (le
   // self-closed (its station disappeared from the board).
   await expect(paneCard(page)).toHaveCount(0, { timeout: 30_000 });
 
-  // ── the Pantry freezer shows it (GET /api/archive), and Restore brings the record back ──
+  // ── the Pantry freezer shows it (GET /api/archive), and Restore brings the PANE back ──
   await page.getByTestId("tab-pantry").click();
   await expect(page.getByTestId("pantry")).toBeVisible();
   await page.getByTestId(`pantry-project-${projectId}`).click();
@@ -146,14 +148,60 @@ test("pane lifecycle: exit → Exited card → 86 to the freezer → restore (le
   const ledger = await (await page.request.get("/api/ledger")).json();
   expect(ledger?.[projectId]?.panes?.[paneId]).toBeTruthy();
 
-  // SERVER-SIDE GAP this lane surfaced (reported, not papered over): restore_archived_pane
-  // only reinstates the LEDGER row (ledger.restoreArchivedPane — no PTY respawn), and the
-  // board derives stations from GET /api/terminals, which lists only live manager.terminals
-  // (registry.ts list_panes, c55 Batch F). So a restored pane is INVISIBLE everywhere in the
-  // kitchen UI — no card on the Line, not in the Pantry's pane list — until something
-  // respawns it. The freezer row disappearing + the toast are the only operator feedback.
-  const terminals = await (await page.request.get("/api/terminals")).json();
-  expect(Array.isArray(terminals)).toBe(true);
-  expect((terminals as { id: string }[]).some((t) => t.id === paneId)).toBe(false);
-  await expect(paneCard(page)).toHaveCount(0); // honest: restore does NOT put a card back
+  // FIXED (this WAS the gap this lane surfaced): restore now ALSO respawns the pane's terminal
+  // from its persisted identity (project cwd + preset-derived launch command — never the old
+  // last_command), gated exactly like the burner's Re-fire (restart_pane, default Ask). Under
+  // Ask the ledger row lands immediately and the SPAWN defers to the action dialog — which is a
+  // GLOBAL fixed overlay that intercepts pointer events, so it must be handled BEFORE any tab
+  // navigation (clicking tab-line under it times out; an unconfirmed pending action then
+  // cascades its overlay into every later spec on this shared server). Tolerant of an Auto
+  // resolution (no dialog — the card just appears after the tab switch below).
+  const actionDialog = page.getByTestId("action-dialog");
+  const dialogAppeared = await actionDialog
+    .waitFor({ state: "visible", timeout: 15_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (dialogAppeared) {
+    await expect(actionDialog).toContainText("restart_pane");
+    await page.getByTestId("action-confirm").click();
+    await expect(actionDialog).toHaveCount(0, { timeout: 15_000 });
+  }
+
+  // SERVER truth first (no UI dependency): the respawned pane joins live manager.terminals.
+  await expect
+    .poll(
+      async () => {
+        const t = await (await page.request.get("/api/terminals")).json();
+        return Array.isArray(t) && (t as { id: string }[]).some((x) => x.id === paneId);
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(true);
+
+  // The respawn ACTIVATES the pane (the create-activates effect), and the kitchen auto-opens the
+  // active pane's burner window — a fixed modal that intercepts tab clicks. Close it if it landed
+  // before navigating (it may arrive a beat after the spawn broadcast — give it a settle).
+  await page.waitForTimeout(750);
+  const burner = page.getByTestId("burner");
+  if (await burner.isVisible().catch(() => false)) {
+    await page.getByTestId("burner-close").click();
+    await expect(burner).toHaveCount(0, { timeout: 15_000 });
+  }
+
+  // The station card REAPPEARS on the Line — the board derives stations from GET /api/terminals
+  // (live manager.terminals), so the respawned pane is visible everywhere again.
+  await page.getByTestId("tab-line").click();
+  await expect(
+    page.locator(`[data-testid="station-card"][data-pane-id="${paneId}"]`),
+  ).toHaveCount(1, { timeout: 60_000 });
+
+  // ── clean our pane off the board again (live_kitchen boots asserting an EMPTY Line): 86 the
+  // now-RUNNING station — a running pane takes the two-tap "Sure, Chef?" confirm. ──
+  await openBurner(page);
+  const btn86 = page.getByTestId("burner-86");
+  await btn86.click();
+  if ((await btn86.count()) > 0 && (await btn86.getAttribute("data-confirming")) !== null) {
+    await btn86.click(); // second tap confirms the 86 on a running pane
+  }
+  await expect(paneCard(page)).toHaveCount(0, { timeout: 30_000 });
 });
