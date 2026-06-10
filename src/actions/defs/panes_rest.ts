@@ -51,6 +51,7 @@ import path from "path";
 import { z } from "zod";
 import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
+import { getHistoryBridge } from "../../historyBridge";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HistoryManager re-derivation (faithful port of server.ts:129-217 load/save/add).
@@ -115,8 +116,12 @@ function saveHistory(ctx: ActionContext, terminalId: string, history: HistoryEnt
   }
 }
 
-/** FAITHFUL PORT of HistoryManager.addCommand (server.ts:197): append a new empty-output entry, save. */
+/** Bridge-first port of HistoryManager.addCommand: in a running server, write through the
+ *  manager's dirty cache (a direct file write would race the debounced flush — PR #68 review);
+ *  fall back to the faithful file port only when no server has registered the bridge. */
 function addCommand(ctx: ActionContext, terminalId: string, command: string): void {
+  const bridge = getHistoryBridge();
+  if (bridge) { bridge.addCommand(terminalId, command); return; }
   const history = loadHistory(ctx, terminalId);
   history.push({ command, timestamp: new Date().toISOString(), output: "" });
   saveHistory(ctx, terminalId, history);
@@ -346,7 +351,13 @@ export const clearHistory: ActionDef<typeof ClearHistoryParams> = {
     // 2S.4: ALWAYS_ALLOWED never routes through effectiveCapabilityGateFor (where the STOP-ALL
     // frozen short-circuit lives), so this destructive mutator must check the brake itself.
     if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
-    saveHistory(ctx, args.pane_id, []);
+    // Bridge-first (review block on PR #68): in a running server the HistoryManager owns a
+    // debounced dirty cache — a direct file clear here would be RESURRECTED by a pending flush.
+    // The bridge clears cache+disk through the flush chain; the direct write below remains only
+    // for bare def-level tests with no server registered (no concurrent writer to race).
+    const bridge = getHistoryBridge();
+    if (bridge) bridge.clearHistory(args.pane_id);
+    else saveHistory(ctx, args.pane_id, []);
     return { kind: "ok", output: `History cleared for terminal ${args.pane_id}.` };
   },
 };
@@ -375,6 +386,11 @@ export const clearExited: ActionDef<typeof ClearExitedParams> = {
     // 2S.4: frozen means frozen — this stops/drops lingering terminal objects and archives panes,
     // none of which may happen while the STOP-ALL brake is engaged (ALWAYS_ALLOWED bypasses the gate).
     if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
+    // Phase 4 live-lane finding: ws.panes[].alive is only as fresh as the last syncLedger(), and
+    // nothing on the REST surface re-syncs after a pane SELF-exits — so clear-exited read
+    // alive:true for dead panes and archived 0 forever. Force the live PTY->ledger sync first
+    // (the same seam switch_context uses, orient.ts).
+    ctx.manager.refreshLedger();
     const activeId = ctx.manager.ledger.activeProjectId || undefined;
     const ws = activeId ? ctx.manager.ledger.getProject(activeId) : null;
     if (ws) {

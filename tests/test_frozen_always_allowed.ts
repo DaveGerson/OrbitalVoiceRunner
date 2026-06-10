@@ -208,10 +208,14 @@ describe("2S.4 frozen guards on non-brake ALWAYS_ALLOWED REST mutators (headless
 
     // Post-release, a previously-guarded mutator works again (the guard is the freeze, not a gate):
     // clear_history now answers 200 AND its side effect lands (the on-disk history empties).
+    // PR #68 review fix: the clear routes through the HistoryManager's dirty cache (the truth in a
+    // running server) and reaches the FILE on the debounced flush — await flushAll() so the durable
+    // convergence is asserted without timing sensitivity.
     const hist = path.join(tmpDir, ".janus_history.json");
     fs.writeFileSync(hist, JSON.stringify({ "fz-hist": [{ command: "echo keep-me", timestamp: "t", output: "" }] }), "utf-8");
     const clear = await api("/api/terminals/fz-hist/history/clear", { method: "POST" });
     assert.strictEqual(clear.status, 200, "clear_history works again after release");
+    await (await import("../server")).HistoryManager.getInstance().flushAll();
     const after = JSON.parse(fs.readFileSync(hist, "utf-8"));
     assert.strictEqual(after["fz-hist"]?.length, 0, "the clear actually landed after release");
     delete (running.manager.terminals as any)["fz-brake"];

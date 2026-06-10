@@ -12,11 +12,16 @@
 //                                 confirm() in try/catch so a throwing run() can't unwind the voice
 //                                 message handler. (REST already does this; voice did not.)
 
-import { parseApprovalIntent, selectPendingAction } from "./approvalIntent";
+import { parseApprovalIntent, selectPendingAction, MAX_DEFERRALS } from "./approvalIntent";
+import { ACTION_DEFAULT_TTL_MS } from "./pendingActions";
 
-/** Minimal structural view of the PendingActionStore this resolver needs (keeps it decoupled). */
+/** Minimal structural view of the PendingActionStore this resolver needs (keeps it decoupled).
+ *  4D.3: all() now exposes the record's sweep fields (timestamp / lastCallAt) because the DEFER
+ *  verb re-arms the TTL window by mutating the live record in place — the real
+ *  PendingActionStore.all() already returns the live PendingAction objects, so this is a
+ *  structural widening, not a behavior change. */
 export interface PendingActionResolverStore {
-  all(): Array<{ id: string; summary: string }>;
+  all(): Array<{ id: string; summary: string; timestamp: number; lastCallAt?: number; claimed?: boolean }>;
   confirm(id: string): { reason: string; output?: string };
   cancel(id: string): { reason: string };
 }
@@ -77,6 +82,29 @@ export function resolvePendingActionByVoice(
   }
 
   const summary = target.summary ?? "";
+
+  if (parsed.intent === "defer") {
+    // 4D.3: "later" / "not now" / "hold that" must NEVER fall into the cancel branch. Re-arm the
+    // record's TTL window IN PLACE (the sweep measures off the in-memory `timestamp`; see
+    // gating.sweepExpiredApprovals + PendingActionStore.expired) and clear the last-call transient
+    // so the fresh window earns a fresh last-call. The record is NEVER claimed/removed here — a
+    // later approve/reject (or the normal expiry) still resolves it exactly once.
+    // No-infinite-parking cap: after MAX_DEFERRALS re-arms, refuse further holds and let the
+    // normal last-call → grace → expire flow close it out on the last-armed window.
+    const rec = actions.all().find((a) => a.id === target.id);
+    if (!rec) return; // resolved concurrently — nothing to hold.
+    const r = rec as typeof rec & { deferCount?: number };
+    const count = r.deferCount ?? 0;
+    if (count >= MAX_DEFERRALS) {
+      narrate(`I've already held that ${MAX_DEFERRALS} times — ${redact(summary)} needs a yes or a no now.`);
+      return;
+    }
+    r.deferCount = count + 1;
+    rec.timestamp = Date.now();
+    rec.lastCallAt = undefined;
+    narrate(`Holding it — I'll ask again in ${Math.round(ACTION_DEFAULT_TTL_MS / 60000)} minutes.`);
+    return;
+  }
 
   if (parsed.intent === "approve") {
     try {

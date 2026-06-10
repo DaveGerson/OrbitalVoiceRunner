@@ -19,6 +19,7 @@ import type {
   PendingCommand,
   PendingActionView,
   SystemSettings,
+  Plan,
 } from "../types";
 import type { StoredNote } from "../store/types";
 
@@ -39,7 +40,51 @@ export interface ArchivedPane {
 // 2K.4: an optional one-tap action riding a toast (e.g. Undo on a destructive delete).
 export interface ToastAction { label: string; run: () => void }
 
+// 4U.2: one recorded command in a pane's ticket history — the exact RAW entry shape
+// GET /api/terminals/:pane_id/history returns (server HistoryEntry, reads.ts getTerminalHistory).
+export interface PaneHistoryEntry {
+  command: string;
+  timestamp: string;
+  output: string;
+  finalResponse?: string;
+}
+
+// 4U.3: one service-log row — the exact ActionLogRow shape GET /api/action-log returns
+// (src/store/sqliteStore.ts; body is {output:{rows}} via the default resultToHttp map).
+export interface ServiceLogRow {
+  id: number;
+  ts: number;
+  name: string | null;
+  capability: string | null;
+  result_kind: string | null;
+  ms: number | null;
+  args_redacted: string | null;
+  surface: string | null;
+}
+
 const POLL_MS = 20000;
+
+// 4U.3: the radio transcript survives a reload (sessionStorage, capped at the existing 50-entry
+// slice). Session-scoped on purpose: a fresh tab starts a fresh service, a reload keeps the record.
+const TRANSCRIPT_STORE_KEY = "orbital_radio_transcript_v1";
+
+function loadStoredTranscript(): TranscriptEntry[] {
+  try {
+    const raw = sessionStorage.getItem(TRANSCRIPT_STORE_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((e) => e && (e.sender === "User" || e.sender === "Janus") && typeof e.text === "string" && e.text)
+      .slice(-50)
+      .map((e) => ({
+        sender: e.sender as "User" | "Janus",
+        text: e.text as string,
+        timestamp: new Date(typeof e.timestamp === "string" || typeof e.timestamp === "number" ? e.timestamp : Date.now()),
+        grounding: e.grounding && typeof e.grounding === "object" ? e.grounding : undefined,
+      }));
+  } catch { return []; } // sandboxed/full storage — boot with an empty radio, never crash
+}
 
 // 3C.3: the one-shot reload guard for a 4001 (unauthorized) WS close. sessionStorage-scoped so a
 // fresh tab can re-key again, but a reload that STILL 4001s can never loop — it toasts instead.
@@ -72,7 +117,8 @@ export interface OrbitalData {
   ledger: Record<string, Workspace>;
   settings: SystemSettings | null;
   globalPermissionsMode: GlobalMode;
-  plans: any[];
+  /** 4U.1: the voice-built orchestrator plans (GET /api/plans + plans_updated frames). */
+  plans: Plan[];
   pendingCommands: PendingCommand[];
   pendingActions: PendingActionView[];
   frozen: boolean;
@@ -98,6 +144,11 @@ export interface OrbitalData {
   archived: ArchivedPane[];
   /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror. */
   paneDrafts: Record<string, { text: string; at: number }>;
+  /** 4U.2: latest server-pushed history per pane (history_updated frames; entries null = refetch). */
+  paneHistories: Record<string, { entries: PaneHistoryEntry[] | null; at: number }>;
+  /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
+  serviceLog: ServiceLogRow[];
+  refetchServiceLog: () => void;
   // setters / actions
   selectActivePane: (paneId: string | null) => void;
   setGlobalPermissionsMode: (m: GlobalMode) => void;
@@ -120,6 +171,11 @@ export interface OrbitalData {
   /** Permanently delete an archived pane — DELETE /api/archive/:pane_id. */
   deleteArchived: (paneId: string) => void;
   refetchArchive: () => void;
+  // 4U.1: plans on The Pass — the same routes the classic Spec Buffer used.
+  /** Fire a plan (step 1 runs through the gate) — POST /api/plans/:id/execute (200/202/403/…). */
+  executePlan: (planId: string) => void;
+  /** 86 a plan — DELETE /api/plans/:id (gated: may 202-defer). */
+  deletePlan: (planId: string) => void;
   // 2K.2: per-pane capability-gate override (the Rulebook's pane scope) —
   // PUT /api/projects/:p/panes/:id/capability-gates {capabilityGates}.
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
@@ -159,12 +215,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [ledger, setLedger] = useState<Record<string, Workspace>>({});
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [globalPermissionsMode, setGlobalPermissionsMode] = useState<GlobalMode>("Inherit");
-  const [plans, setPlans] = useState<any[]>([]);
+  const [plans, setPlans] = useState<Plan[]>([]);
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
   const [frozen, setFrozen] = useState<boolean>(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  // 4U.3: seeded from sessionStorage so the radio's record survives a reload (capped 50 below).
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>(loadStoredTranscript);
   const [notes, setNotes] = useState<StoredNote[]>([]);
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [isMock, setIsMock] = useState<boolean>(false);
@@ -183,6 +240,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // 2K.1: the freezer (archived, recoverable panes). 2K.3: per-pane server-pushed draft mirror.
   const [archived, setArchived] = useState<ArchivedPane[]>([]);
   const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number }>>({});
+  // 4U.2: per-pane server-pushed history mirror (history_updated frames carry the full array;
+  // a frame without one stores entries:null so the burner knows to refetch).
+  const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
+  // 4U.3: the service log (GET /api/action-log rows, newest-first, capped 100).
+  const [serviceLog, setServiceLog] = useState<ServiceLogRow[]>([]);
 
   // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
   // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
@@ -327,7 +389,23 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     if (isMockModeRef.current) return;
     try {
       const res = await apiFetch("/api/plans");
-      if (res.ok) setPlans(await res.json());
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setPlans(rows);
+    } catch { /* silent */ }
+  }, []);
+
+  // 4U.3: the service log — GET /api/action-log (default resultToHttp wraps the rows: {output:{rows}}).
+  // Fetched on demand (the Pantry refreshes it when it opens), not on the poll — it's a review
+  // surface, not a live board. Under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
+  const refetchServiceLog = useCallback(async () => {
+    if (isMockModeRef.current && !isE2EWireArmed()) return;
+    try {
+      const res = await apiFetch("/api/action-log?limit=100");
+      if (!res.ok) return;
+      const d = await res.json().catch(() => null);
+      const rows = d && d.output && Array.isArray(d.output.rows) ? d.output.rows : null;
+      if (rows) setServiceLog(rows.slice(0, 100));
     } catch { /* silent */ }
   }, []);
 
@@ -420,6 +498,21 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       case "ledger_updated":
         refetchLedger();
         break;
+      case "plans_updated":
+        // 4U.1: the server broadcasts the full plans board on every plan mutation (create /
+        // execute / step-advance / delete) — adopt it directly; degrade to a refetch otherwise.
+        if (Array.isArray(msg.plans)) setPlans(msg.plans);
+        else refetchPlans();
+        break;
+      case "history_updated":
+        // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full
+        // array — mirror it per-pane so an open burner repaints; a payload-less frame stores
+        // entries:null, which tells the burner to refetch GET /api/terminals/:id/history.
+        if (typeof msg.terminalId === "string") {
+          const entries = Array.isArray(msg.history) ? (msg.history as PaneHistoryEntry[]) : null;
+          setPaneHistories((prev) => ({ ...prev, [msg.terminalId]: { entries, at: Date.now() } }));
+        }
+        break;
       case "settings_updated":
         if (msg.settings) {
           setSettings(msg.settings as SystemSettings);
@@ -505,7 +598,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       default:
         break;
     }
-  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -562,6 +655,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     const vol = settings?.voiceAi?.volume;
     if (typeof vol === "number") setPlaybackVolume(vol);
   }, [settings?.voiceAi?.volume]);
+
+  // 4U.3: persist the radio transcript across reloads (sessionStorage; the slice(-50) writers
+  // already cap the in-memory list, the slice here re-asserts the cap on the wire format).
+  useEffect(() => {
+    try { sessionStorage.setItem(TRANSCRIPT_STORE_KEY, JSON.stringify(transcript.slice(-50))); }
+    catch { /* sandboxed/full storage — the in-memory radio still works */ }
+  }, [transcript]);
 
   // Mount: initial fetch + slow safety-net poll (the realtime push wave is P5).
   useEffect(() => {
@@ -1062,6 +1162,46 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't toss that one, Chef — try again.", "warn"); }
   }, [refetchArchive, showToast, mockClientOnly]);
 
+  // ── 4U.1: plans on The Pass (the classic Spec Buffer's routes, kitchen-toned) ──
+  // execute_plan runs step 1 through the gate INSIDE the server (dispatchProposal), so the REST
+  // status carries the whole truth: 200 fired / 202 step-1 needs an ok / 403 gated off /
+  // 400 pane offline / 404 unknown plan / 409 clarify. The board repaints off plans_updated.
+  const executePlan = useCallback(async (planId: string) => {
+    if (mockClientOnly()) { showToast("Spec's firing — step 1 on the line 🔥", "fire", "execute"); return; }
+    try {
+      const res = await apiFetch(`/api/plans/${planId}/execute`, { method: "POST" });
+      if (res.status === 202) { showToast("Spec queued — step 1 needs your ok at the pass 🛎", "warn"); }
+      else if (res.status === 403) { showToast("That spec's gated off, Chef", "warn"); }
+      else if (!res.ok) {
+        // 400 (pane offline) carries {output}, 404 {error}-ish, 409 {clarify} — surface whichever.
+        const d = await res.json().catch(() => ({} as Record<string, unknown>));
+        const msg = [d.output, d.error, d.clarify].find((v) => typeof v === "string" && v) as string | undefined;
+        showToast(msg || "Couldn't fire that spec, Chef — try again.", "warn");
+      } else {
+        showToast("Spec's firing — step 1 on the line 🔥", "fire", "execute");
+      }
+      if (!isMockModeRef.current) refetchPlans();
+    } catch { showToast("Couldn't fire that spec, Chef — try again.", "warn"); }
+  }, [refetchPlans, showToast, mockClientOnly]);
+
+  // 86 a plan — DELETE /api/plans/:id (delete_orchestrator_plan, gated Ask by default → may 202).
+  const deletePlan = useCallback(async (planId: string) => {
+    if (mockClientOnly()) {
+      setPlans((prev) => prev.filter((p) => p.id !== planId)); // keep the pass honest client-side
+      showToast("86'd that spec", "fire", "execute");
+      return;
+    }
+    try {
+      const res = await apiFetch(`/api/plans/${planId}`, { method: "DELETE" });
+      if (res.status === 202) { showToast("86 queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("That 86 is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("Couldn't 86 that spec, Chef — try again.", "warn"); return; }
+      showToast("86'd that spec", "fire", "execute");
+      if (!isMockModeRef.current) refetchPlans();
+      else setPlans((prev) => prev.filter((p) => p.id !== planId)); // armed mock: no real refetch
+    } catch { showToast("Couldn't 86 that spec, Chef — try again.", "warn"); }
+  }, [refetchPlans, showToast, mockClientOnly]);
+
   // ── 2K.2: per-pane gate override (the Rulebook's pane scope) ─────────────
   // PUT the pane's whole override map (the bulk matrix-editor route, src/actions/defs/locks.ts
   // setPaneGates). res.ok-checked; on failure the ledger is refetched so the segs snap back to truth.
@@ -1269,10 +1409,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     pendingCommands, pendingActions, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
-    archived, paneDrafts,
+    archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
+    executePlan, deletePlan,
     refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,

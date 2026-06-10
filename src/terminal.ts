@@ -694,6 +694,11 @@ export class UniversalTerminal {
     }
   }
 
+  // 4E.2: true while an ASYNC platform probe is awaiting its result. The 500ms tick
+  // SKIPS while set, so a slow process-list scan (cold Windows CIM: 0.5-2s) can never
+  // stack concurrent scans or queue stale results.
+  private probeInFlight = false;
+
   /** Run one probe tick and feed it through the state machine. */
   private runProbeTick() {
     if (this.status === "Exited") return;
@@ -708,13 +713,37 @@ export class UniversalTerminal {
       this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } });
       return;
     }
-    let probe: ProbeResult;
+    if (this.probeInFlight) return; // 4E.2: previous async probe still running — skip this tick
+    let result: ProbeResult | Promise<ProbeResult>;
     try {
-      probe = this.statusProbe.probe(this.shellPid);
+      result = this.statusProbe.probe(this.shellPid);
     } catch {
-      probe = { hasRunningChild: false, confidence: "fallback" };
+      this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } });
+      return;
     }
-    this.applyStatusEvent({ kind: "probe", probe });
+    if (result && typeof (result as Promise<ProbeResult>).then === "function") {
+      // Async platform probe (4E.2). A rejection degrades to a fallback result (same
+      // busy-biased semantics as the old catch); nothing may escape the tick. The
+      // in-flight flag is released on settle either way. applyStatusEvent early-returns
+      // on "Exited", so a probe resolving after stop() is inert.
+      this.probeInFlight = true;
+      (result as Promise<ProbeResult>)
+        .then(
+          (probe) => this.applyStatusEvent({ kind: "probe", probe }),
+          () => this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } }),
+        )
+        .catch((e) => {
+          // applyStatusEvent itself threw — log; the probe loop must survive.
+          console.error(`[PROBE] applying probe result failed for ${this.terminalId}:`, e);
+        })
+        .finally(() => {
+          this.probeInFlight = false;
+        });
+    } else {
+      // Sync result (FallbackProbe / injected test probes): apply before the tick
+      // returns — the status-machine suites pin this exact timing.
+      this.applyStatusEvent({ kind: "probe", probe: result as ProbeResult });
+    }
   }
 
   private clearProbeTimer() {

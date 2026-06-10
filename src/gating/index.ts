@@ -52,6 +52,7 @@ import {
   ALL_CAPABILITIES,
   type EffectiveMode as GateSurfaceMode,
 } from "../gateSurface";
+import { MAX_DEFERRALS } from "../approvalIntent";
 import type { GateValue, CapabilityGate } from "../types";
 import type { JanusStore } from "../store/sqliteStore";
 import type { AnnouncementBus } from "../announcementBus";
@@ -115,6 +116,12 @@ export interface Gating {
   killAllPanes: () => Promise<{ killed: string[]; failed: string[] }>;
   releaseStopAll: () => void;
   applyResolution: (messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) => ReturnType<typeof resolveDecision>;
+  /** 4D.3: the voice DEFER verb — re-arm the pending approval's TTL window ("ask me later")
+   *  WITHOUT claiming/deleting it. Capped at MAX_DEFERRALS re-arms (no infinite parking). */
+  applyDeferral: (messageId: string, now?: number) => { reason: "deferred" | "defer_limit" | "not_found"; deferrals?: number };
+  /** 4D.1: stamp the moment the live voice session detached — opens the "while you were away"
+   *  window that reannounceSurvivors digests (and consumes) on the next reconnect. */
+  noteSessionDetached: (now?: number) => void;
   /** The LIVE mode-switch choke point (multi-cli spec §6, bead 1y8). set_pane_permissions + restart_pane delegate here. */
   applyPaneMode: (
     paneId: string,
@@ -225,6 +232,137 @@ export function createGating(deps: GatingDeps): Gating {
   // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
   const APPROVAL_TTL_MS = 5 * 60 * 1000;
   const APPROVAL_SWEEP_MS = 30 * 1000;
+
+  // ── 4D.1: the "while you were away" window ──────────────────────────────────────────────────
+  // The resumption digest used to cover ONLY surviving approvals + pending actions; everything
+  // that HAPPENED while no live session existed (panes finishing/erroring/exiting, stop-all
+  // engaging/releasing) was never mentioned. We stamp the last live-session detach moment here
+  // (in-memory, mirrored to the store KV so the window survives a process restart) and, on
+  // reconnect, replay the durable activity rows inside [detach, reconnect] into ONE compact
+  // spoken summary (see composeAwayDigest / reannounceSurvivors). store === null (legacy) ⇒ the
+  // digest is silently skipped — never a throw.
+  const AWAY_DETACH_KV = "gating.lastDetachAt";
+  let lastDetachAt: number | null = null;
+  if (store) {
+    try {
+      const raw = store.getKV(AWAY_DETACH_KV);
+      const n = raw ? Number(raw) : NaN;
+      if (Number.isFinite(n) && n > 0) lastDetachAt = n;
+    } catch { /* KV is best-effort — no window, no digest */ }
+  }
+
+  function noteSessionDetached(now: number = Date.now()): void {
+    // EARLIEST detach wins: a paired onerror/onclose (or the client-WS close following a live-
+    // session drop) must not shrink an already-open window — reconnect consumes it anyway.
+    if (lastDetachAt !== null) return;
+    lastDetachAt = now;
+    if (store) {
+      try { store.setKV(AWAY_DETACH_KV, String(now)); } catch { /* best-effort */ }
+    }
+  }
+
+  // 4D.1 production writer: the announcement bus already sees every genuine pane lifecycle edge
+  // (completion / error / build-failed / exited), session or no session — record those edges as
+  // durable `status_transition` events so the away digest can replay them. Registered defensively
+  // (test fakes inject `{ enqueue, stop }` stubs without onEnqueue). Summaries are NOT persisted
+  // here — only the kind — so nothing un-redacted can leak into the events table from this path.
+  const AWAY_RECORDED_KINDS = new Set(["completion", "error", "build-failed", "exited"]);
+  if (store && typeof (announcementBus as any).onEnqueue === "function") {
+    announcementBus.onEnqueue((item) => {
+      if (!AWAY_RECORDED_KINDS.has(item.kind)) return;
+      try {
+        store.recordActivity({
+          type: "status_transition",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: item.terminalId,
+          summary: `pane ${item.terminalId} ${item.kind}`,
+          payload: { transition: item.kind },
+        });
+      } catch { /* audit is best-effort */ }
+    });
+  }
+
+  /**
+   * 4D.1: compose the spoken "while you were away" line from the durable activity rows inside
+   * (since, now]. Event mapping (adapted to what the store records today — getEvents has no ts
+   * filter, so we fetch per type and filter by ts in JS):
+   *   - "status_transition"  payload.transition: error|build-failed → errors; exited → exits;
+   *                          completion|idle|finished → finished. (Recorded by the bus listener
+   *                          above; forward-compatible with any other writer of the same shape.)
+   *   - "permission_changed" payload.action: stop_all_freeze → engaged; stop_all_release →
+   *                          released; stop_all_kill → killed pane count.
+   *   - "command_dispatched" → auto-dispatches (nothing writes this type yet; mapped so the digest
+   *                          picks them up the day a writer lands).
+   * Most-severe-first (errors → exits → stop-all → finished → auto-dispatches); each pane counts
+   * ONCE, in its most severe bucket; clause count capped (≈3 sentences). Returns null when nothing
+   * notable happened.
+   */
+  function composeAwayDigest(since: number, now: number): string | null {
+    if (!store) return null;
+    let rows: ReturnType<JanusStore["getEvents"]>;
+    try {
+      rows = [
+        ...store.getEvents({ type: "status_transition" }),
+        ...store.getEvents({ type: "permission_changed" }),
+        ...store.getEvents({ type: "command_dispatched" }),
+      ];
+    } catch {
+      return null; // a failed read must never break the reconnect path.
+    }
+
+    const errors = new Set<string>();
+    const exits = new Set<string>();
+    const finished = new Set<string>();
+    const autos = new Set<string>();
+    let engaged = 0, released = 0, killed = 0;
+
+    for (const e of rows) {
+      if (e.ts <= since || e.ts > now) continue;
+      if (e.type === "status_transition") {
+        const t = String((e.payload as { transition?: unknown } | null)?.transition ?? e.summary ?? "");
+        const pane = e.pane_id ?? "a pane";
+        if (/error|build-failed/i.test(t)) errors.add(pane);
+        else if (/exit/i.test(t)) exits.add(pane);
+        else if (/completion|finished|idle/i.test(t)) finished.add(pane);
+      } else if (e.type === "permission_changed") {
+        const action = (e.payload as { action?: unknown } | null)?.action;
+        if (action === "stop_all_freeze") engaged++;
+        else if (action === "stop_all_release") released++;
+        else if (action === "stop_all_kill") killed += ((e.payload as { panes?: unknown[] })?.panes?.length ?? 0);
+      } else if (e.type === "command_dispatched") {
+        autos.add(e.pane_id ?? "a pane");
+      }
+    }
+
+    // Dedupe per pane across buckets: a pane counts once, in its MOST SEVERE bucket.
+    for (const p of errors) { exits.delete(p); finished.delete(p); }
+    for (const p of exits) finished.delete(p);
+
+    const paneClause = (panes: Set<string>, singular: string, plural: string): string =>
+      panes.size === 1 ? `pane ${[...panes][0]} ${singular}` : `${panes.size} panes ${plural}`;
+
+    const clauses: string[] = [];
+    if (errors.size) clauses.push(paneClause(errors, "reported an error", "reported errors"));
+    if (exits.size) clauses.push(paneClause(exits, "exited", "exited"));
+    if (engaged || released || killed) {
+      let stop: string;
+      if (engaged && released) stop = "stop-all was engaged and released";
+      else if (engaged) stop = "stop-all was engaged and is still holding";
+      else stop = "stop-all was released";
+      if (killed) stop += ` (${killed} pane${killed === 1 ? "" : "s"} killed)`;
+      clauses.push(stop);
+    }
+    if (finished.size) clauses.push(paneClause(finished, "finished", "finished"));
+    if (autos.size) clauses.push(`${autos.size} auto-dispatch${autos.size === 1 ? "" : "es"} ran`);
+
+    if (clauses.length === 0) return null;
+    // Spoken-compactness cap (≈3 sentences): at most 4 clauses, most-severe-first; the rest fold
+    // into a trailing count rather than disappearing.
+    const MAX_CLAUSES = 4;
+    const shown = clauses.slice(0, MAX_CLAUSES);
+    const more = clauses.length - shown.length;
+    return `While you were away: ${shown.join("; ")}${more > 0 ? `; and ${more} more thing${more === 1 ? "" : "s"}` : ""}.`;
+  }
 
   // R3: a fresh client-content push delivers the spoken read-back / resolution result. The
   // original call.id is consumed once by the non-blocking pending_approval response, so the
@@ -541,23 +679,39 @@ export function createGating(deps: GatingDeps): Gating {
       ...approvals.map((a) => ({ line: renderResumptionLine(a, now), ts: a.timestamp })),
       ...actions.map((a) => ({ line: `${a.capability}: ${redactSecrets(a.summary)}`, ts: a.timestamp })),
     ];
-    if (survivors.length === 0) return; // (spec §7) zero survivors -> SILENT.
-
-    // (3) Most-recent first; speak up to 3, summarize the rest (spec §7). UI shows the full list.
-    survivors.sort((x, y) => y.ts - x.ts);
-    const total = survivors.length;
-    const shown = survivors.slice(0, 3).map((s) => s.line);
-    let digest: string;
-    if (total === 1) {
-      digest = `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
-    } else if (total <= 3) {
-      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
-    } else {
-      digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+    // (spec §7) zero survivors -> the SURVIVOR digest stays silent (the 4D.1 away digest below has
+    // its own emptiness rule and may still speak — the operator deserves the news either way).
+    if (survivors.length > 0) {
+      // (3) Most-recent first; speak up to 3, summarize the rest (spec §7). UI shows the full list.
+      survivors.sort((x, y) => y.ts - x.ts);
+      const total = survivors.length;
+      const shown = survivors.slice(0, 3).map((s) => s.line);
+      let digest: string;
+      if (total === 1) {
+        digest = `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
+      } else if (total <= 3) {
+        digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
+      } else {
+        digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+      }
+      pushApprovalNarration(session, digest);
+      // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
+      broadcastTerminalsUpdated();
     }
-    pushApprovalNarration(session, digest);
-    // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
-    broadcastTerminalsUpdated();
+
+    // (5) 4D.1: AFTER the survivors digest, the since-last-session delta — "while you were away".
+    // The window is CONSUMED here (in-memory + KV) whether or not anything notable happened, so a
+    // flapping reconnect never replays the same news. store === null ⇒ composeAwayDigest is null
+    // and this is a silent no-op (legacy parity).
+    const since = lastDetachAt;
+    lastDetachAt = null;
+    if (store) {
+      try { store.setKV(AWAY_DETACH_KV, ""); } catch { /* best-effort */ }
+    }
+    if (since !== null) {
+      const away = composeAwayDigest(since, now);
+      if (away) pushApprovalNarration(session, away);
+    }
   }
 
   // M4: the approval-related WS-event `type:` literals, named in one place. NOTE: the frontend
@@ -674,6 +828,58 @@ export function createGating(deps: GatingDeps): Gating {
       broadcastTerminalsUpdated();
     }
     return action;
+  }
+
+  /**
+   * 4D.3: the voice DEFER verb — "later" / "not now" / "skip that for now, ask me later".
+   * Pre-fix those utterances hit REJECT_WEAK and applyResolution claim+DELETED the staged command,
+   * unrecoverably. Defer instead RE-ARMS the TTL window and walks away:
+   *   - rec.timestamp = now      → decideSweepAction measures the TTL off the in-memory timestamp,
+   *                                 so the sweep treats the record as freshly staged (the durable
+   *                                 expires_at stays stale, which only makes the durable expired()
+   *                                 enumeration a no-op candidate each tick — decideSweepAction
+   *                                 returns "none" until the re-armed window truly crosses; no new
+   *                                 store method needed, and a restart falls back to the existing
+   *                                 reattach-with-fresh-TTL on reconnect anyway);
+   *   - lastCallAt / lastCallFailures cleared → the fresh window earns a fresh spoken last-call;
+   *   - the record is NEVER claimed/deleted → a later approve/reject still resolves exactly once.
+   * NO INFINITE PARKING: after MAX_DEFERRALS (3) re-arms the verb refuses further holds (the window
+   * is left untouched, so the normal last-call → grace → expire flow closes the record out) and the
+   * operator is told so. deferCount is an in-memory transient (parity with lastCallFailures): a
+   * restart resets it, which only re-grants holds — never drops anything.
+   */
+  function applyDeferral(messageId: string, now: number = Date.now()): { reason: "deferred" | "defer_limit" | "not_found"; deferrals?: number } {
+    const rec = pendingApprovals.get(messageId);
+    if (!rec || rec.claimed) return { reason: "not_found" }; // gone or mid-resolve — nothing to hold.
+    const session = pendingApprovals.sessionFor(messageId);
+    const r = rec as typeof rec & { deferCount?: number };
+    const count = r.deferCount ?? 0;
+    if (count >= MAX_DEFERRALS) {
+      if (session) {
+        pushApprovalNarration(session, `I've already held "${redactSecrets(rec.instruction)}" ${MAX_DEFERRALS} times — it needs a yes or a no now, or it expires.`);
+      }
+      return { reason: "defer_limit", deferrals: count };
+    }
+    r.deferCount = count + 1;
+    rec.timestamp = now;
+    rec.lastCallAt = undefined;
+    rec.lastCallFailures = undefined;
+    if (store) {
+      try {
+        store.recordActivity({
+          type: "approval_decided",
+          project_id: manager.ledger.activeProjectId || "default_project",
+          pane_id: rec.terminalId,
+          summary: `DEFERRED approval on ${rec.terminalId} (hold ${r.deferCount}/${MAX_DEFERRALS})`,
+          payload: { action: "deferred", message_id: messageId, deferrals: r.deferCount },
+        });
+      } catch { /* audit is best-effort */ }
+    }
+    if (session) {
+      pushApprovalNarration(session, `Holding it — I'll ask again in ${Math.round(APPROVAL_TTL_MS / 60000)} minutes.`);
+    }
+    broadcastTerminalsUpdated(); // the chip's age just reset — repaint from server truth.
+    return { reason: "deferred", deferrals: r.deferCount };
   }
 
   // WS-F (spec §4.1/§6.3): the sweep no longer SILENTLY auto-rejects on TTL. It drives off the pure
@@ -844,6 +1050,8 @@ export function createGating(deps: GatingDeps): Gating {
     killAllPanes,
     releaseStopAll,
     applyResolution,
+    applyDeferral,
+    noteSessionDetached,
     reannounceSurvivors,
     pendingApprovals,
     pendingActions,

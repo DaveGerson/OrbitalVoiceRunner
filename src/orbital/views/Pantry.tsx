@@ -8,7 +8,44 @@ import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
 import { INK } from "../theme";
 import { Button, Chip, Icon, Pips, StatusBadge } from "../primitives";
 import type { Station, StationProject } from "../station";
-import type { ArchivedPane } from "../useOrbitalData";
+import type { ArchivedPane, ServiceLogRow } from "../useOrbitalData";
+
+// 4U.3: pull a pane id out of the redacted-args JSON (best-effort, presentation only) so a
+// service-log row can say WHERE it happened. The action log has no pane column; the args do.
+function paneOf(row: ServiceLogRow): string | null {
+  if (!row.args_redacted) return null;
+  try {
+    const a = JSON.parse(row.args_redacted);
+    const v = a?.pane_id ?? a?.paneId ?? a?.terminalId ?? a?.terminal_id;
+    return typeof v === "string" && v ? v : null;
+  } catch { return null; }
+}
+function logTime(ts: number): string {
+  try { return new Date(ts).toLocaleTimeString(); } catch { return String(ts); }
+}
+
+// One calm service-log row: time · what ran · where · how it went. All server truth
+// (GET /api/action-log — runAction's durable audit), newest-first.
+function ServiceLogLine({ r, dark }: { r: ServiceLogRow; dark: boolean }) {
+  const fg = dark ? "#ffe9c7" : INK;
+  const kind = (r.result_kind || "ok").toLowerCase();
+  const kindSkin = kind === "error" ? { bg: "#e23a3a", fg: "#fff4de" }
+    : kind === "blocked" ? { bg: "#ff8a3d", fg: INK }
+    : kind === "pending" ? { bg: "#ffc94a", fg: INK }
+    : { bg: "#4db892", fg: INK };
+  const pane = paneOf(r);
+  return (
+    <div data-testid="service-log-row" style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", borderRadius: 9, border: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff4de" }}>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f", flexShrink: 0, width: 72 }}>{logTime(r.ts)}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {r.name || r.capability || "—"}{pane ? <span style={{ color: "#8a6a4f", fontWeight: 600 }}> · #{pane}</span> : null}
+      </span>
+      {r.surface && <Chip bg={dark ? "#241409" : "#fff9ec"} color="#8a6a4f">{r.surface}</Chip>}
+      <Chip bg={kindSkin.bg} color={kindSkin.fg}>{kind}</Chip>
+      {typeof r.ms === "number" && <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{r.ms < 1 ? "<1" : Math.round(r.ms)}ms</span>}
+    </div>
+  );
+}
 
 // 2K.1: one archived pane in the freezer — Restore is one tap (non-destructive), Delete is
 // permanent so it takes a two-tap inline confirm (auto-resets after 3s).
@@ -46,12 +83,14 @@ function Head({ children, dark }: { children: ReactNode; dark: boolean }) {
   return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
 }
 
-export function ThePantry({ dark, projects, stations, archived, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
+export function ThePantry({ dark, projects, stations, archived, serviceLog, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
   dark: boolean;
   projects: StationProject[];
   stations: Station[];
   /** 2K.1: the freezer — archived (recoverable) panes from GET /api/archive. */
   archived: ArchivedPane[];
+  /** 4U.3: the service log — recent action-log rows (GET /api/action-log), newest-first. */
+  serviceLog: ServiceLogRow[];
   summaryOf: (projectId: string) => string;
   selectedProject: string;
   onUpdateSummary: (projectId: string, summary: string) => void;
@@ -173,6 +212,26 @@ export function ThePantry({ dark, projects, stations, archived, summaryOf, selec
           </Card>
         </div>
       )}
+
+      {/* 4U.3: the Service log — the kitchen's reviewable past, straight off the durable action
+          log (GET /api/action-log). Global (not per-project) and CALM, per the pantry's brief.
+          Capped at 100 rows (the fetch asks for limit=100; rows arrive newest-first). */}
+      <div style={{ maxWidth: 880, marginTop: 16 }}>
+        <Card dark={dark}>
+          <Head dark={dark}>Service log — what the kitchen's done lately</Head>
+          {serviceLog.length === 0 ? (
+            <div data-testid="service-log-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
+              Nothing on the record yet — actions land here as they run.
+            </div>
+          ) : (
+            <div data-testid="service-log" style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 380, overflowY: "auto" }}>
+              {serviceLog.slice(0, 100).map((r) => (
+                <Fragment key={r.id}><ServiceLogLine r={r} dark={dark} /></Fragment>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   );
 }

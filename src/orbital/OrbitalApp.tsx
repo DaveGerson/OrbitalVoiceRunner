@@ -223,6 +223,12 @@ export default function OrbitalApp() {
     if (ids.length) refetchNotes(ids);
   }, [selectedProject, projectIdsKey, refetchNotes]);
 
+  // 4U.3: the Service log is a review surface — refresh it when the Pantry opens (no polling).
+  const refetchServiceLog = data.refetchServiceLog;
+  useEffect(() => {
+    if (view === "pantry") refetchServiceLog();
+  }, [view, refetchServiceLog]);
+
   return (
     <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
       <IconSprite />
@@ -238,9 +244,10 @@ export default function OrbitalApp() {
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-            <ThePass notes={data.notes} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
+            <ThePass notes={data.notes} plans={data.plans} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
               onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
-              onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }} />
+              onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
+              onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan} />
             <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
           </div>
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
@@ -255,6 +262,7 @@ export default function OrbitalApp() {
       {view === "pantry" && (
         <ThePantry dark={t.dark} projects={projects} stations={stations}
           archived={data.archived}
+          serviceLog={data.serviceLog}
           summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
           selectedProject={selectedProject}
           onUpdateSummary={data.updateProjectSummary}
@@ -288,6 +296,7 @@ export default function OrbitalApp() {
           isMockRef={data.isMockModeRef} wsRef={data.wsRef} voiceCues={t.voiceCues}
           paneNotes={data.notes.filter((n) => n.pane_id === burnerStation.id)}
           incomingDraft={data.paneDrafts[burnerStation.id]}
+          incomingHistory={data.paneHistories[burnerStation.id]}
           onAddNote={(text) => data.addNote(burnerStation.project, text, burnerStation.id)}
           onDeleteNote={(id) => data.deleteNote(id, burnerStation.project)}
           onClose={() => setBurnerId(null)} onRestart={() => data.restartPane(burnerStation.id)}

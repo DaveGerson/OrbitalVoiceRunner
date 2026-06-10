@@ -11,7 +11,7 @@
 //   • Order Pad    — per-pane WIP draft: GET/PUT /api/panes/:proj/:pane/draft + POST …/draft/send
 // The "Notes & beads" tab is an explicit placeholder until The Pass (P7) wires
 // notes CRUD — it is visibly disabled, not a fake input.
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type MutableRefObject } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties, type MutableRefObject } from "react";
 import { TerminalView } from "../components/TerminalView";
 import { apiFetch } from "../utils/api";
 import { isE2EWireArmed } from "../e2e/harness";
@@ -22,6 +22,7 @@ import { TICKET_KINDS } from "./theme";
 import { useDialog } from "./useFocusTrap";
 import type { Station } from "./station";
 import type { StoredNote } from "../store/types";
+import type { PaneHistoryEntry } from "./useOrbitalData";
 
 // The control-key strip. Bytes come straight from the SERVER allowlist (RAW_KEY_TABLE in
 // src/rawKeyClass.ts) — importing it (a pure, dep-free table) is the single source of truth, so a
@@ -117,7 +118,64 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
   return { text, onChange, send, scrap: () => onChange(""), focusedRef };
 }
 
-export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, incomingDraft, onAddNote, onDeleteNote, onClose, onRestart, onStop, onRename, writeControlKey, resizeTerminal, showToast, streamGeneration, fetchBackfill }: {
+// 4U.2: the pane's recorded command history — the same raw feed the classic per-pane panel reads
+// (GET /api/terminals/:id/history, classic App.tsx:340-351). Fetched on open; a server-pushed
+// history_updated frame (mirrored per-pane by useOrbitalData) repaints in place — when the frame
+// carries the array we adopt it directly, otherwise we refetch. Under plain ?mock=1 the GET is
+// skipped (client-only harness); a Playwright-armed page fires the real wire (3C.3b).
+function usePaneHistory(
+  paneId: string,
+  isMockRef: MutableRefObject<boolean>,
+  incoming?: { entries: PaneHistoryEntry[] | null; at: number },
+) {
+  const [entries, setEntries] = useState<PaneHistoryEntry[]>([]);
+  const refetch = useCallback(async () => {
+    if (!paneId) return;
+    if (isMockRef.current && !isE2EWireArmed()) return;
+    try {
+      const r = await apiFetch(`/api/terminals/${paneId}/history`);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (Array.isArray(d)) setEntries(d);
+    } catch { /* pane may have exited — keep what we have */ }
+  }, [paneId, isMockRef]);
+  useEffect(() => { setEntries([]); refetch(); }, [refetch]);
+  const incomingAt = incoming?.at;
+  useEffect(() => {
+    if (incomingAt === undefined) return;
+    if (incoming && Array.isArray(incoming.entries)) setEntries(incoming.entries);
+    else refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incomingAt]);
+  return { entries, setEntries };
+}
+
+// One history row: command + time, tap to unfold the recorded output (collapsed by default).
+function HistoryRow({ e, dark }: { e: PaneHistoryEntry; dark: boolean }) {
+  const [open, setOpen] = useState(false);
+  const fg = dark ? "#ffe9c7" : INK;
+  let when = e.timestamp;
+  try { const d = new Date(e.timestamp); if (!isNaN(d.getTime())) when = d.toLocaleTimeString(); } catch { /* raw string */ }
+  const preview = (e.output || "").trim();
+  return (
+    <div data-testid="burner-history-entry" style={{ border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK, overflow: "hidden" }}>
+      <button onClick={() => setOpen((o) => !o)} title={open ? "Fold the output back up" : "Peek at what came back"}
+        style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "8px 10px", border: "none", background: "transparent", cursor: "pointer", textAlign: "left" }}>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.command}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{when}</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 10, color: "#8a6a4f", transform: open ? "rotate(180deg)" : "none", flexShrink: 0 }}>▾</span>
+      </button>
+      {open && (
+        <pre data-testid="burner-history-output" style={{ margin: 0, padding: "8px 10px", borderTop: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: dark ? "#e9d9c0" : "#5b3a23", fontFamily: "JetBrains Mono", fontSize: 10.5, lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 180, overflowY: "auto" }}>
+          {preview ? (preview.length > 4000 ? preview.slice(-4000) : preview) : "(no recorded output)"}
+          {e.finalResponse ? `\n— ${e.finalResponse}` : ""}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef, voiceCues, paneNotes, incomingDraft, incomingHistory, onAddNote, onDeleteNote, onClose, onRestart, onStop, onRename, writeControlKey, resizeTerminal, showToast, streamGeneration, fetchBackfill }: {
   st: Station;
   backfill?: string;
   /** 3C.2b: bumps when the observe socket RE-opens — drives the xterm resync-with-marker. */
@@ -132,6 +190,8 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   paneNotes: StoredNote[];
   /** 2K.3: the latest server-pushed draft for this pane (applied only while the pad isn't focused). */
   incomingDraft?: { text: string; at: number };
+  /** 4U.2: the latest server-pushed history for this pane (history_updated; entries null = refetch). */
+  incomingHistory?: { entries: PaneHistoryEntry[] | null; at: number };
   onAddNote: (text: string) => void;
   onDeleteNote: (id: string) => void;
   onClose: () => void;
@@ -145,13 +205,37 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   showToast: (msg: string, kind?: "fire" | "warn") => void;
 }) {
   const [note, setNote] = useState("");
-  const [tab, setTab] = useState<"pad" | "notes">("pad");
+  const [tab, setTab] = useState<"pad" | "notes" | "history">("pad");
   // 2K.1: inline rename + a one-tap inline confirm for 86 (an Exited pane skips the confirm).
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(st.name);
   const [confirm86, setConfirm86] = useState(false);
   const confirm86Timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (confirm86Timer.current) clearTimeout(confirm86Timer.current); }, []);
+  // 4U.2: the ticket history (recorded commands) + the two-tap confirm for the destructive clear.
+  const history = usePaneHistory(st.id, isMockRef, incomingHistory);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const confirmClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (confirmClearTimer.current) clearTimeout(confirmClearTimer.current); }, []);
+  const onClearHistory = async () => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      if (confirmClearTimer.current) clearTimeout(confirmClearTimer.current);
+      confirmClearTimer.current = setTimeout(() => setConfirmClear(false), 3000);
+      return;
+    }
+    setConfirmClear(false);
+    // Under plain ?mock=1 the wire stays client-side (3C.3b); armed pages fire the real POST.
+    if (isMockRef.current && !isE2EWireArmed()) { history.setEntries([]); showToast("Ticket history wiped"); return; }
+    try {
+      const r = await apiFetch(`/api/terminals/${st.id}/history/clear`, { method: "POST" });
+      if (r.ok) { history.setEntries([]); showToast("Ticket history wiped"); return; }
+      // Honest failure: the server refuses while stop-all is frozen (clear_history checks the
+      // brake itself) — surface ITS reason, e.g. "Stop-all is engaged — release it first."
+      const d = await r.json().catch(() => ({} as { error?: unknown }));
+      showToast(typeof d.error === "string" && d.error ? d.error : "Couldn't wipe the history, Chef — try again.", "warn");
+    } catch { showToast("Couldn't wipe the history, Chef — try again.", "warn"); }
+  };
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
   const live = st.status === "Running";
   const fg = dark ? "#ffe9c7" : INK;
@@ -262,7 +346,7 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
           {/* right column: Order Pad ⇄ Notes & beads */}
           <div style={{ flex: 1, minWidth: 300, display: "flex", flexDirection: "column", background: dark ? "#241409" : "#fff4de" }}>
             <div style={{ display: "flex", borderBottom: "3px solid " + INK, flexShrink: 0 }}>
-              {([["pad", "📝 Order Pad"], ["notes", "🎫 Notes & beads"]] as const).map(([id, lbl]) => (
+              {([["pad", "📝 Order Pad"], ["notes", "🎫 Notes & beads"], ["history", "🧾 Ticket history"]] as const).map(([id, lbl]) => (
                 <Fragment key={id}>
                   <button data-testid={`burner-tab-${id}`} onClick={() => setTab(id)} aria-pressed={tab === id}
                     style={{ flex: 1, padding: "9px 6px", border: "none", borderBottom: tab === id ? "3px solid #e23a3a" : "3px solid transparent", background: tab === id ? (dark ? "#2f1d12" : "#fff9ec") : "transparent", color: tab === id ? fg : "#8a6a4f", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5 }}>{lbl}</button>
@@ -284,6 +368,29 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
                 </div>
                 <div style={{ marginTop: 8, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
                   saved per-pane — your draft waits when you switch stations
+                </div>
+              </div>
+            ) : tab === "history" ? (
+              // 4U.2: the ticket history — recorded commands (newest first) with a fold-out output
+              // peek, plus the destructive clear (two-tap; the server's frozen refusal is surfaced).
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
+                <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+                  {history.entries.length === 0 ? (
+                    <div data-testid="burner-history-empty" style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>no orders on this ticket yet, Chef</div>
+                  ) : (
+                    [...history.entries].reverse().map((e, i) => (
+                      <Fragment key={`${e.timestamp}-${history.entries.length - 1 - i}`}><HistoryRow e={e} dark={dark} /></Fragment>
+                    ))
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 7, flexShrink: 0, alignItems: "center" }}>
+                  <span style={{ flex: 1, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
+                    every order this station fired, on the record
+                  </span>
+                  <Button testId="burner-history-clear" variant={confirmClear ? "primary" : "default"} size="sm" icon="x"
+                    disabled={history.entries.length === 0}
+                    title={confirmClear ? "This wipes the record for keeps — tap again" : "Clear this station's command history"}
+                    onClick={onClearHistory}>{confirmClear ? "Sure, Chef?" : "Clear history"}</Button>
                 </div>
               </div>
             ) : (

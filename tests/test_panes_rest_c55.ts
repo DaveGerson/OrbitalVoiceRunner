@@ -88,6 +88,9 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manag
   const manager: any = {
     terminals,
     settings: { presets: undefined, advanced: { defaultShellCommand: "" } },
+    // Phase 4: clear_exited now forces a live PTY->ledger sync before reading alive flags
+    // (ActionContext manager contract — same fixture completion pattern as isFrozen).
+    refreshLedger: () => {},
     addTerminal: (...a: unknown[]): string => {
       rec.addTerminalCalls.push(a);
       return (opts.addTerminal ? opts.addTerminal(...a) : "created");
