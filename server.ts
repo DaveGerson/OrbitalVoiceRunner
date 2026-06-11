@@ -31,6 +31,7 @@ import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 import { restGateOutcome } from "./src/restGate";
 import { classifyRawKey, isKnownRawKey } from "./src/rawKeyClass";
 import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceResumption";
+import { connectNovaSonic, type NovaAuth } from "./src/voice/novaSonic";
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
@@ -150,6 +151,15 @@ export type LiveConnector = (ai: GoogleGenAI, params: any, key?: string | null) 
 // the connector, NOT in connectLiveSession: installMockLive() replaces this connector wholesale and
 // connects with NO key, so the mock harness stays functional while only the real path short-circuits.
 export const realLiveConnector: LiveConnector = (ai, params, key) => {
+  // Nova Sonic routing: when the operator has selected the Nova provider, open a Bedrock bidirectional
+  // stream instead of a Gemini Live socket. The returned session exposes the SAME method surface
+  // (sendRealtimeInput / sendToolResponse / sendClientContent / close) and translates Nova output
+  // events into the Gemini LiveServerMessage shape, so connectLiveSession is provider-agnostic. The
+  // Nova adapter validates its OWN credentials and rejects when they are blank (mirroring the Gemini
+  // blank-key reject below), so the gemini-key short-circuit does not apply on this path.
+  if (resolveVoiceProvider() === "nova") {
+    return connectNovaSonic(params as any, novaAuthFromSettings());
+  }
   if (isBlankApiKey(key)) {
     // Reject WITHOUT touching ai.live.connect — connectLiveSession's catch turns this into a clean
     // "set a key in Settings" error frame instead of a 1007 round-trip. (Never log the key.)
@@ -157,6 +167,34 @@ export const realLiveConnector: LiveConnector = (ai, params, key) => {
   }
   return ai.live.connect(params);
 };
+
+/**
+ * Which conversational backend the live voice session should use. Reads `voiceAi.provider` (set from
+ * the Settings UI); DEFAULT "gemini" (absent ⇒ gemini) so every existing config is unchanged. The
+ * model id is sniffed as a belt-and-suspenders fallback (an "amazon.nova-*" model implies Nova even if
+ * the provider field was never set). Read at connect time so an Apply & Reconnect switches backends.
+ */
+function resolveVoiceProvider(): "gemini" | "nova" {
+  if (manager.settings.voiceAi?.provider === "nova") return "nova";
+  if (manager.settings.voiceAi?.provider === "gemini") return "gemini";
+  return String(manager.settings.voiceAi?.model ?? "").startsWith("amazon.nova") ? "nova" : "gemini";
+}
+
+/** Resolve AWS credentials for the Nova connector from settings (secret) or env (fallback). */
+function novaAuthFromSettings(): NovaAuth {
+  const s = manager.settings;
+  const accessKeyId = (s.secrets?.awsAccessKeyId && s.secrets.awsAccessKeyId !== "CONFIGURED_IN_ENV")
+    ? s.secrets.awsAccessKeyId : (process.env.AWS_ACCESS_KEY_ID || "");
+  const secretAccessKey = (s.secrets?.awsSecretAccessKey && s.secrets.awsSecretAccessKey !== "CONFIGURED_IN_ENV")
+    ? s.secrets.awsSecretAccessKey : (process.env.AWS_SECRET_ACCESS_KEY || "");
+  const region = s.voiceAi?.awsRegion || process.env.AWS_REGION || "us-east-1";
+  return {
+    accessKeyId,
+    secretAccessKey,
+    region,
+    ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}),
+  };
+}
 let liveConnector: LiveConnector = realLiveConnector;
 export function setLiveConnector(fn: LiveConnector) {
   liveConnector = fn;
@@ -242,11 +280,17 @@ function getCookie(cookieHeader: string | undefined, name: string): string | nul
 // any client (REST response or WS broadcast). The masking matches GET /api/settings so
 // the key is never shipped in plaintext over the `settings_updated` broadcast. PUT
 // restores the real key server-side when it sees a masked/blank value coming back.
-function sanitizeSettingsForClient<T extends { secrets?: { geminiApiKey?: string } }>(settings: T): T {
+function sanitizeSettingsForClient<T extends { secrets?: { geminiApiKey?: string; awsSecretAccessKey?: string } }>(settings: T): T {
   const sanitized = JSON.parse(JSON.stringify(settings)) as T;
   const key = sanitized.secrets?.geminiApiKey;
   if (key && key !== "CONFIGURED_IN_ENV" && key.length > 8) {
     sanitized.secrets!.geminiApiKey = key.substring(0, 6) + "••••••••" + key.substring(key.length - 4);
+  }
+  // Nova Sonic: mask the AWS secret access key identically (the access key id is not secret on its own,
+  // so it is left visible — like an account id — but the secret key is masked + restored on PUT).
+  const awsSecret = sanitized.secrets?.awsSecretAccessKey;
+  if (awsSecret && awsSecret !== "CONFIGURED_IN_ENV" && awsSecret.length > 8) {
+    sanitized.secrets!.awsSecretAccessKey = awsSecret.substring(0, 4) + "••••••••" + awsSecret.substring(awsSecret.length - 4);
   }
   return sanitized;
 }
@@ -1249,6 +1293,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     if (newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey)) {
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
+    // Nova Sonic: restore the real AWS secret access key when the client echoes back the masked sentinel
+    // (•••• / CONFIGURED_IN_ENV / blank), mirroring the geminiApiKey round-trip so a settings save that
+    // did NOT touch the secret never blanks it. Capture the raw incoming value first for the nudge below.
+    const incomingAwsSecret: string | null | undefined = newSettings.secrets?.awsSecretAccessKey;
+    if (newSettings.secrets && (newSettings.secrets.awsSecretAccessKey?.includes("••••") || newSettings.secrets.awsSecretAccessKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.awsSecretAccessKey)) {
+      newSettings.secrets.awsSecretAccessKey = manager.settings.secrets?.awsSecretAccessKey;
+    }
     manager.updateSettings(newSettings);
     broadcast({
       type: "settings_updated",
@@ -1259,6 +1310,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // key — nudge the live voice session to (re)connect so they need not reload the page. The blank-key
     // short-circuit (realLiveConnector) means a prior keyless connect failed cleanly; this resumes it.
     if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
+      requestVoiceReconnect();
+    }
+    // Nova Sonic: the same courtesy for AWS credentials — when the operator sets a REAL (non-masked,
+    // non-sentinel) AWS secret key, nudge the live voice session to (re)connect so a Nova session can
+    // start without a page reload. Reuses the identical "is this a genuinely-new credential" predicate.
+    else if (shouldNudgeReconnectOnSettingsKey(incomingAwsSecret)) {
       requestVoiceReconnect();
     }
     res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });

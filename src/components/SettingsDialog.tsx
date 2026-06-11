@@ -131,6 +131,11 @@ export function SettingsDialog({
   const [volume, setVolume] = useState<number>(80);
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false);
   const [model, setModel] = useState<string>("gemini-3.1-flash-live-preview");
+  // Nova Sonic: which conversational backend powers the live voice session. "gemini" (default) keeps
+  // the existing Gemini Live path; "nova" routes through the Amazon Nova Sonic 2 adapter (server-side).
+  const [provider, setProvider] = useState<"gemini" | "nova">("gemini");
+  // Nova Sonic: AWS region for the Bedrock bidirectional stream (config, not a secret).
+  const [awsRegion, setAwsRegion] = useState<string>("us-east-1");
   // sa4: operator-editable Gemini voice system prompt. Empty string => persist undefined =>
   // buildSystemInstruction() falls back to DEFAULT_SYSTEM_PROMPT (shown as the placeholder hint).
   const [systemPrompt, setSystemPrompt] = useState<string>("");
@@ -174,6 +179,11 @@ export function SettingsDialog({
   // Local states - Secret Key Cabinet
   const [geminiApiKey, setGeminiApiKey] = useState<string>("");
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
+  // Nova Sonic: AWS credentials. The access key id is shown like an account id; the secret key is
+  // masked on the wire (server sanitize) and restored on save when the masked sentinel is echoed back.
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>("");
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>("");
+  const [showAwsSecret, setShowAwsSecret] = useState<boolean>(false);
 
   // Raw JSON state
   const [rawJsonStr, setRawJsonStr] = useState<string>("");
@@ -219,6 +229,8 @@ export function SettingsDialog({
       setVolume(initialSettings.voiceAi?.volume ?? 80);
       setIsMicMuted(initialSettings.voiceAi?.isMicMuted ?? false);
       setModel(initialSettings.voiceAi?.model ?? "gemini-3.1-flash-live-preview");
+      setProvider(initialSettings.voiceAi?.provider ?? "gemini");
+      setAwsRegion(initialSettings.voiceAi?.awsRegion ?? "us-east-1");
       setSystemPrompt(initialSettings.voiceAi?.systemPrompt ?? "");
       setGroundingEnabled(initialSettings.voiceAi?.groundingEnabled ?? false);
       setSilenceGate(initialSettings.voiceAi?.silenceGate ?? false);
@@ -244,6 +256,8 @@ export function SettingsDialog({
       setMemorySynthTimeoutMs(initialSettings.advanced?.memorySynthTimeoutMs ?? 150);
 
       setGeminiApiKey(initialSettings.secrets?.geminiApiKey ?? "");
+      setAwsAccessKeyId(initialSettings.secrets?.awsAccessKeyId ?? "");
+      setAwsSecretAccessKey(initialSettings.secrets?.awsSecretAccessKey ?? "");
 
       // Format JSON string
       setRawJsonStr(JSON.stringify(initialSettings, null, 2));
@@ -267,6 +281,10 @@ export function SettingsDialog({
         speechSpeed: 1.0,
         isMicMuted,
         model,
+        // Nova Sonic: persist the selected backend + region. provider "gemini" persists undefined so
+        // gemini stays the implicit default in settings files (and existing files are unchanged).
+        provider: provider === "nova" ? "nova" : undefined,
+        awsRegion: provider === "nova" ? awsRegion : undefined,
         // sa4: persist undefined for a blank prompt so the builder falls back to
         // DEFAULT_SYSTEM_PROMPT (rather than storing a meaningless empty string).
         systemPrompt: systemPrompt.trim() ? systemPrompt : undefined,
@@ -302,7 +320,10 @@ export function SettingsDialog({
         memorySynthTimeoutMs
       }, capabilityGates) as SystemSettings["advanced"],
       secrets: {
-        geminiApiKey
+        geminiApiKey,
+        // Nova Sonic: persist undefined for blank credentials so they stay absent in settings files.
+        awsAccessKeyId: awsAccessKeyId || undefined,
+        awsSecretAccessKey: awsSecretAccessKey || undefined
       }
     };
   };
@@ -313,9 +334,10 @@ export function SettingsDialog({
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, provider, awsRegion, systemPrompt, groundingEnabled, silenceGate,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
+    awsAccessKeyId, awsSecretAccessKey,
     announcements, capabilityGates, memoryPythonEnabled, memorySynthTimeoutMs
   ]);
 
@@ -617,16 +639,46 @@ export function SettingsDialog({
                       </div>
                     </div>
 
+                    {/* Nova Sonic: choose the conversational backend. Switching providers swaps the
+                        model list below and, server-side, routes the live session to Gemini Live or to
+                        the Amazon Nova Sonic 2 bidirectional stream. (applies on reconnect) */}
                     <div>
-                      <label className="block text-zinc-400 mb-1">Gemini Voice Model Module</label>
+                      <label className="block text-zinc-400 mb-1">Conversational Model Provider</label>
+                      <select
+                        value={provider}
+                        data-testid="settings-voice-provider"
+                        onChange={e => {
+                          const next = e.target.value as "gemini" | "nova";
+                          setProvider(next);
+                          // Snap the model to a sensible default for the chosen provider so a Gemini id
+                          // is never sent to Nova (or vice-versa) on the first reconnect after switching.
+                          if (next === "nova" && !model.startsWith("amazon.nova")) setModel("amazon.nova-2-sonic-v1:0");
+                          if (next === "gemini" && model.startsWith("amazon.nova")) setModel("gemini-3.1-flash-live-preview");
+                        }}
+                        className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white focus:outline-none focus:border-cyan-500 cursor-pointer"
+                      >
+                        <option value="gemini">Google Gemini Live</option>
+                        <option value="nova">Amazon Nova Sonic 2 (AWS Bedrock)</option>
+                      </select>
+                      <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
+                    </div>
+
+                    <div>
+                      <label className="block text-zinc-400 mb-1">{provider === "nova" ? "Nova Sonic Voice Model Module" : "Gemini Voice Model Module"}</label>
                       <select
                         value={model}
                         onChange={e => setModel(e.target.value)}
                         className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white focus:outline-none focus:border-cyan-500 cursor-pointer"
                       >
-                        <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview (Fastest Live Output)</option>
-                        <option value="gemini-2.0-flash-exp">gemini-2.0-flash-exp (Experimental Series)</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash (Standard Medium-Fast Model)</option>
+                        {provider === "nova" ? (
+                          <option value="amazon.nova-2-sonic-v1:0">amazon.nova-2-sonic-v1:0 (Nova Sonic 2 Speech-to-Speech)</option>
+                        ) : (
+                          <>
+                            <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview (Fastest Live Output)</option>
+                            <option value="gemini-2.0-flash-exp">gemini-2.0-flash-exp (Experimental Series)</option>
+                            <option value="gemini-2.5-flash">gemini-2.5-flash (Standard Medium-Fast Model)</option>
+                          </>
+                        )}
                       </select>
                       <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
                     </div>
@@ -1285,7 +1337,7 @@ export function SettingsDialog({
                             placeholder={geminiApiKey ? "CONCURRENTLY CONFIGURED KEY" : "No token key loaded. Enter your AI Studio Key."}
                             className="w-full bg-black border border-white/10 rounded pl-3 pr-10 py-1.5 font-mono text-[11px] text-cyan-400 focus:outline-none focus:border-cyan-500"
                           />
-                          <button 
+                          <button
                             type="button"
                             onClick={() => setShowApiKey(!showApiKey)}
                             className="absolute right-2 text-zinc-500 hover:text-white transition-colors cursor-pointer"
@@ -1293,6 +1345,62 @@ export function SettingsDialog({
                             {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                           </button>
                         </div>
+                      </div>
+                    </div>
+
+                    {/* Nova Sonic: AWS credentials for the Amazon Nova Sonic 2 (Bedrock) voice backend.
+                        Only used when the Voice provider is set to Nova Sonic. The secret access key is
+                        masked over the wire and restored on save; the access key id + region are not
+                        secret on their own and are shown in plain text. */}
+                    <div className="p-3 bg-zinc-950 border border-white/5 rounded-lg space-y-3">
+                      <label className="block text-zinc-400 mb-1 flex justify-between items-center">
+                        <span>Amazon Nova Sonic 2 — AWS Credentials</span>
+                        <span className="text-[9px] text-zinc-500 uppercase tracking-widest">Nova voice stream only</span>
+                      </label>
+                      <div>
+                        <span className="block text-[10px] text-zinc-500 mb-1">AWS Access Key ID</span>
+                        <input
+                          type="text"
+                          value={awsAccessKeyId}
+                          data-testid="settings-aws-access-key-id"
+                          onChange={e => setAwsAccessKeyId(e.target.value)}
+                          placeholder="AKIA…"
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 font-mono text-[11px] text-cyan-400 focus:outline-none focus:border-cyan-500"
+                        />
+                      </div>
+                      <div>
+                        <span className="block text-[10px] text-zinc-500 mb-1">AWS Secret Access Key</span>
+                        <div className="relative flex items-center">
+                          <input
+                            type={showAwsSecret ? "text" : "password"}
+                            value={awsSecretAccessKey}
+                            data-testid="settings-aws-secret-access-key"
+                            onChange={e => setAwsSecretAccessKey(e.target.value)}
+                            placeholder={awsSecretAccessKey ? "CONCURRENTLY CONFIGURED KEY" : "No secret loaded. Enter your AWS secret access key."}
+                            className="w-full bg-black border border-white/10 rounded pl-3 pr-10 py-1.5 font-mono text-[11px] text-cyan-400 focus:outline-none focus:border-cyan-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowAwsSecret(!showAwsSecret)}
+                            className="absolute right-2 text-zinc-500 hover:text-white transition-colors cursor-pointer"
+                          >
+                            {showAwsSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <span className="block text-[10px] text-zinc-500 mb-1">AWS Region</span>
+                        <select
+                          value={awsRegion}
+                          data-testid="settings-aws-region"
+                          onChange={e => setAwsRegion(e.target.value)}
+                          className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white text-[11px] focus:outline-none focus:border-cyan-500 cursor-pointer"
+                        >
+                          <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                          <option value="us-west-2">us-west-2 (Oregon)</option>
+                          <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                        </select>
+                        <span className="text-[9px] text-zinc-600 mt-1 block">Nova Sonic 2 availability regions. (applies on reconnect)</span>
                       </div>
                     </div>
 

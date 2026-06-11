@@ -270,6 +270,15 @@ export interface SystemSettings {
     speechSpeed: number;
     isMicMuted: boolean;
     model: string;
+    // Nova Sonic integration: which conversational backend powers the live voice session. DEFAULT
+    // "gemini" (absent ⇒ gemini) so existing configs are byte-for-byte unchanged. When "nova", the
+    // server routes the connect through the Nova Sonic 2 adapter (src/voice/novaSonic.ts) using the
+    // AWS credentials in `secrets` + `awsRegion` below, and `model` carries the Nova model id
+    // (e.g. "amazon.nova-2-sonic-v1:0"). The whole downstream voice loop is provider-agnostic.
+    provider?: "gemini" | "nova";
+    // AWS region for the Nova Sonic bidirectional stream (CONFIG, not a secret). Only read when
+    // provider === "nova". Nova 2 Sonic is available in us-east-1 / us-west-2 / ap-northeast-1.
+    awsRegion?: string;
     // sa4: operator-editable Gemini voice system prompt. When unset/blank the builder
     // (src/voice/systemPrompt.ts) falls back to DEFAULT_SYSTEM_PROMPT. {{activeProjectId}} and
     // {{workspaces}} placeholders are substituted with live values at connect time. This is
@@ -335,6 +344,11 @@ export interface SystemSettings {
   };
   secrets: {
     geminiApiKey: string;
+    // Nova Sonic integration: AWS credentials for the Bedrock bidirectional stream. Optional (absent
+    // ⇒ Nova voice cannot connect, exactly like a blank geminiApiKey blocks Gemini voice). Masked on
+    // the wire by sanitizeSettingsForClient and restored on PUT, identically to geminiApiKey.
+    awsAccessKeyId?: string;
+    awsSecretAccessKey?: string;
   };
 }
 
