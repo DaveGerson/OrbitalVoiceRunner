@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import fs from "fs";
-import { OrchestratorManager } from "../src/terminal";
+import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
 import { Ledger } from "../src/ledger";
 
 describe("Voice-Driven Applet User Journeys Validation Suite", () => {
@@ -246,5 +246,125 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
 
     assert.strictEqual(busyMeta.is_busy, true, "Is_busy flag should accurately map tool outputs running commands");
     assert.strictEqual(idleMeta.is_busy, false, "Is_busy flag must flag false for idle tasks waiting input");
+  });
+
+  // ==========================================
+  // Journey 7: Dictate a specification
+  // ==========================================
+  it("Journey 7 (Dictate Spec): should durably capture dictated spec notes, surface them for same-session recall, and survive a restart", () => {
+    manager.ledger.addProject("spec_project", ".", "OAuth hardening specification");
+    manager.addTerminal("pane_spec", ".", "echo spec", "Claude Code", "Human-in-the-Loop", "", "spec_project");
+
+    // 1. Dictated fragments land as durable notes (the add_project_note / add_pane_note tool path)
+    assert.ok(
+      manager.ledger.addNote("spec_project", "Spec: the auth service must support PKCE, not implicit flow."),
+      "Project-level dictation must report success"
+    );
+    assert.ok(manager.ledger.addNote("spec_project", "Spec: refresh-token window is 30 days."));
+    assert.ok(
+      manager.ledger.addPaneNote("spec_project", "pane_spec", "Spec: token endpoint must reject grant_type=password."),
+      "Pane-level dictation must report success"
+    );
+
+    // A mis-addressed dictation must be signalled to the model, not silently dropped (J8-G10 class).
+    // Falsy-on-failure, not strictEqual(false): the LedgerLike contract is truthy-on-success
+    // (legacy Ledger returns false, JanusStore returns null), and this test should hold for both.
+    assert.ok(!manager.ledger.addPaneNote("spec_project", "pane_ghost", "lost"),
+      "Note to a nonexistent pane must report failure");
+    assert.ok(!manager.ledger.addNote("ghost_project", "lost"),
+      "Note to a nonexistent project must report failure");
+
+    // 2. Same-session recall ("Janus, what did I note?") via the notes-recall surface
+    const rows = manager.ledger.getNotes({ projectId: "spec_project" });
+    assert.strictEqual(rows.length, 3, "All three dictated notes must be retrievable without a context switch");
+    assert.ok(rows.some(r => r.pane_id === "pane_spec"), "Pane-scoped note must carry its pane attribution");
+
+    const hits = manager.ledger.search("PKCE");
+    assert.strictEqual(hits.length, 1, "Keyword recall must find exactly the matching spec fragment");
+    assert.ok(hits[0].snippet.includes("PKCE"));
+
+    // 3. Continuity: a fresh Ledger over the same storage path (server restart) keeps everything
+    const reloaded = new Ledger(TEST_LEDGER_PATH);
+    const brief = reloaded.getProjectBriefing("spec_project");
+    assert.strictEqual(brief?.notes.length, 2, "Project spec notes must survive a restart");
+    assert.strictEqual(brief?.notes[0], "Spec: the auth service must support PKCE, not implicit flow.");
+
+    const paneMeta = brief?.panes.find(p => p.pane_id === "pane_spec");
+    assert.strictEqual(paneMeta?.notes.length, 1, "Pane spec note must survive a restart");
+    assert.strictEqual(paneMeta?.notes[0], "Spec: token endpoint must reject grant_type=password.");
+  });
+
+  // ==========================================
+  // Journey 8: Narrate a terminal walk-through
+  // ==========================================
+  it("Journey 8 (Narrate Walkthrough): should read back the redacted recent pane tail, stay stable across repeated reads, error on missing panes, and capture the dictated note", () => {
+    manager.ledger.addProject("walkthrough_proj", ".", "Build pipeline triage");
+
+    // Spawn-free pane: the UniversalTerminal constructor does NOT start a PTY, so the
+    // ring buffer contents are deterministic. Register it with the manager + ledger the
+    // way a live pane would be.
+    const term: any = new UniversalTerminal("pane_build", ".", "npm run build", "Custom", "Read-Only", "", "walkthrough_proj");
+    manager.terminals["pane_build"] = term;
+    manager.ledger.updatePane("walkthrough_proj", {
+      pane_id: "pane_build",
+      name: "pane_build",
+      runtime_type: "shell",
+      last_known_state: "Idle",
+      is_busy: false,
+      alive: true,
+      notes: [],
+      permissions_mode: "Read-Only",
+      session_id: "",
+      tool_preset: "Custom",
+      context_size: 0,
+    }, false);
+
+    // An untouched pane narrates the explicit no-output sentinel, not an empty fence
+    assert.ok(manager.getPaneSummary("pane_build").includes("[No new output]"),
+      "Quiet pane must read back the no-output sentinel");
+
+    // Build output that scrolls past the default 20-line window, with a secret-shaped
+    // token inside the visible tail.
+    const lines = Array.from({ length: 30 }, (_, i) => `build step ${i + 1} ok`);
+    lines.push("warning: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE leaked to stdout");
+    lines.push("Build finished with exit code 0");
+    // Feed the model lane the way onData does, including the buffer-cap splice, so the
+    // buffer state cannot drift from the production path (cf. feed() in test_pane_delta.ts).
+    term.outputBuffer.push(...lines);
+    if (term.outputBuffer.length > term.maxBufferLines) {
+      term.outputBuffer.splice(0, term.outputBuffer.length - term.maxBufferLines);
+    }
+    term.totalLines += lines.length;
+
+    // 1. Narration source: fenced, last-20-line tail of the model-lane buffer
+    const summary = manager.getPaneSummary("pane_build");
+    assert.ok(summary.startsWith("```\n") && summary.endsWith("\n```"), "Summary must be markdown-fenced");
+    assert.ok(summary.includes("Build finished with exit code 0"), "Most recent line must be read back");
+    assert.ok(summary.includes("build step 30 ok"), "Recent lines inside the window must be read back");
+    assert.ok(!summary.includes("build step 5 ok"), "Lines that scrolled past the 20-line window must not be re-read");
+
+    // 2. Redaction (WS-B / J8-G1): secrets never reach the narration channel
+    assert.match(summary, /\[REDACTED/, "Secret-shaped tokens must be scrubbed before narration");
+    assert.ok(!summary.includes("AKIAIOSFODNN7EXAMPLE"), "The raw AWS key must never appear in the summary");
+
+    // 3. The operator can ask for a tighter slice
+    const tail = manager.getPaneSummary("pane_build", 2);
+    assert.ok(tail.includes("Build finished with exit code 0"), "Custom limit must keep the newest line");
+    assert.ok(!tail.includes("build step 30 ok"), "Custom limit must drop lines beyond the requested window");
+
+    // 4. Repeated reads with no new output are stable (tail read, not a consuming delta)
+    assert.strictEqual(manager.getPaneSummary("pane_build"), summary,
+      "Re-asking for the walkthrough without new output must narrate the same content");
+
+    // 5. A missing pane is an explicit spoken error, not a silent empty narration
+    assert.strictEqual(manager.getPaneSummary("pane_ghost"), "Error: Pane pane_ghost does not exist.");
+
+    // 6. Close the loop: the operator dictates a note about what was just narrated
+    assert.ok(manager.ledger.addPaneNote("walkthrough_proj", "pane_build",
+      "Walkthrough: build green; rotate the AWS key that leaked to stdout."));
+    const brief = manager.ledger.getProjectBriefing("walkthrough_proj");
+    const paneMeta = brief?.panes.find(p => p.pane_id === "pane_build");
+    assert.strictEqual(paneMeta?.notes.length, 1, "Dictated walkthrough note must persist on the narrated pane");
+    assert.strictEqual(paneMeta?.notes[0], "Walkthrough: build green; rotate the AWS key that leaked to stdout.");
   });
 });
