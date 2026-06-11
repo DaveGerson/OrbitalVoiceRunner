@@ -793,6 +793,16 @@ priority. Cross-cutting bugs appear **once** with all affected journeys listed.
 - **Suggested fix:** Add integration tests feeding raw output chunks through the heuristic and
   exercising the real approve path; label mock mode as a non-representative UI demo.
 - **Source gaps:** J6-G3, J2-G5, J2-G16, J3-G9, J3-G12, J1-G17, J8-G9.
+- **Status:** ⚠️ **Partially resolved (2026-06-11).** Closed halves: (a) the `is_busy` /
+  status heuristic now has the `decideStatus` replay harness (`tests/test_status_machine.ts`,
+  written against BUG-038/BUG-006); (b) the server-side approval gate / voice-intercept / REST
+  paths are exercised by `tests/test_approvals_wse.ts`, `tests/test_store_approvals.ts`,
+  `tests/test_voice_approval_routing.ts` and the approval e2e specs; (c) the missing J7/J8
+  journey tests (J8-G9, drift item D5) landed in `tests/test_journeys.ts` (`f91e518`), covering
+  dictate→durable-note→recall→restart and pane-tail→redaction→note-capture. **Still open:**
+  mock-mode `handleApprove`/`handleReject` short-circuit before the REST call and append
+  hardcoded output (`src/App.tsx`), and the UI `activeProjectId` divergence after
+  `switch_context` remains untested — bead seed `docs/beads/2026-06-11-journey-coverage.jsonl`.
 
 #### BUG-039 — "Shared Spec Sandbox" UI label implies durability the buffer does not have
 - **Priority:** P3
@@ -886,7 +896,7 @@ These were verified solid against the code and should be preserved:
 | D2 | `server.ts:1611` `get_pane_summary` description: "clean, redacted markdown delta." | Raw, unredacted, full-tail (not a delta) last-20-lines. | `server.ts:1611` vs `src/terminal.ts:324–326, 593–599` | BUG-002, BUG-030 |
 | D3 | `server.ts:1683` `get_attention_digest` description: covers "approvals." | Reads only `attentionQueue`; never includes `pendingApprovals`. | `server.ts:1683` vs `server.ts:1360–1373` | BUG-009 |
 | D4 | `JOURNEYS_DESIGN.md:82`: system instruction includes "file trees, notes, live status indicators." | Template has project IDs + workspace ID/name + terminal status/CWD only; no notes, no file trees. | `server.ts:1568` | BUG-033 |
-| D5 | `JOURNEYS_DESIGN.md §4`: "all 6 developer journeys are tested." | There are **8** journeys; J7 and J8 have no journey test. | `tests/test_journeys.ts` (ends at J6) | BUG-033, BUG-038 |
+| D5 | `JOURNEYS_DESIGN.md §4`: "all 6 developer journeys are tested." | ✅ **Resolved 2026-06-11** — J7/J8 journey tests added (`f91e518`); §4 now states all 8 journeys are tested. | `tests/test_journeys.ts` (J1–J8) | BUG-033, BUG-038 |
 | D6 | README permissions table | Accurate, **but** omits that per-pane changes are no-ops while global ≠ Inherit — the silent-override consequence. | `README.md:41–56` vs `server.ts:1272–1276` | BUG-003 (J5-G4) |
 | D7 | `src/App.tsx:1593` "Shared Spec Sandbox… reads this buffer in real-time." | Implies durability; the buffer is volatile and lost on restart. | `src/App.tsx:1593` vs `server.ts:133` | BUG-039 |
 | D8 | README "Agent tools" / WS message list | Does not document the orchestration tools/events (`create_pane`, `create_project`, `execute_plan`, watch rules, attention digest, handoff) or the dropped push events — understates surface area while overstating what the client consumes. | `server.ts:1577–1834` vs `src/App.tsx:872–922` | BUG-010 |
