@@ -341,9 +341,18 @@ export class HistoryManager {
   public saveHistory(terminalId: string, history: HistoryEntry[]): void {
     const filePath = this.getFilePath();
     const { maxCmds, maxOutput } = this.getLimits();
+    // Q2 — Secrets-at-rest choke point. EVERY history mutation funnels through saveHistory
+    // (addCommand, appendOutputToLastCommand, clearHistory), so redacting here guarantees no
+    // credential-shaped secret is ever persisted verbatim in .janus_history.json — in either
+    // the command string or the output. Order matters: redact BEFORE the maxOutput tail-slice,
+    // so a secret straddling the retained-tail boundary is matched whole (the slice can never
+    // leave a half-cut, now-unmatched fragment). redactSecrets is pure + idempotent, so the
+    // existing read-boundary redaction double-applying is harmless. appendOutputToLastCommand
+    // intentionally accumulates WITHOUT pre-slicing for the same reason (see its comment).
     const pruned = history.slice(-maxCmds).map(entry => ({
       ...entry,
-      output: (entry.output || "").slice(-maxOutput)
+      command: redactSecrets(entry.command || ""),
+      output: redactSecrets(entry.output || "").slice(-maxOutput)
     }));
     let perFile = this.dirty.get(filePath);
     if (!perFile) {
@@ -369,8 +378,12 @@ export class HistoryManager {
     const history = this.loadHistory(terminalId);
     if (history.length > 0) {
       const lastEntry = history[history.length - 1];
-      const { maxOutput } = this.getLimits();
-      lastEntry.output = ((lastEntry.output || "") + chunk).slice(-maxOutput);
+      // Q2: do NOT pre-slice here. saveHistory redacts-then-slices; pre-slicing would risk
+      // cutting a secret that straddles the maxOutput tail boundary into an unmatched fragment
+      // BEFORE redaction can fire. The accumulated string stays bounded anyway — loadHistory
+      // returns the prior dirty entry already capped at maxOutput, so this is at most
+      // maxOutput + chunk before saveHistory re-caps it on the redacted text.
+      lastEntry.output = (lastEntry.output || "") + chunk;
       this.saveHistory(terminalId, history);
     }
   }

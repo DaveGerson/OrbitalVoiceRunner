@@ -19,3 +19,61 @@ test("add() hard-caps stored size to avoid unbounded growth", () => {
   assert.equal(r.length, 3);
   assert.equal(r[0].text, "b99");
 });
+
+test("per-pane fairness: a noisy pane cannot evict quiet panes' latest breadcrumbs", () => {
+  // breadcrumbMax=4, but the noisy pane alone produces >4 in-window breadcrumbs.
+  // Under the OLD global-recency cut, the two quiet panes' single events (which are
+  // OLDER than the noisy pane's newest 4) would be sliced out entirely. The new
+  // fairness rule must guarantee each quiet pane keeps its single most-recent crumb.
+  const ring = new BreadcrumbRing({ breadcrumbMax: 4, breadcrumbMaxAgeMs: 10_000 });
+  // Quiet panes fire early (smaller ts) so they lose a pure recency race.
+  ring.add({ ts: 100, paneId: "quietA", text: "quietA-latest" });
+  ring.add({ ts: 200, paneId: "quietB", text: "quietB-latest" });
+  // Noisy pane floods with the newest events.
+  ring.add({ ts: 1000, paneId: "noisy", text: "noisy1" });
+  ring.add({ ts: 1001, paneId: "noisy", text: "noisy2" });
+  ring.add({ ts: 1002, paneId: "noisy", text: "noisy3" });
+  ring.add({ ts: 1003, paneId: "noisy", text: "noisy4" });
+  ring.add({ ts: 1004, paneId: "noisy", text: "noisy5" });
+
+  const r = ring.recent(2000);
+  const texts = r.map(b => b.text);
+
+  // Still capped at breadcrumbMax and newest-first.
+  assert.equal(r.length, 4);
+  for (let i = 1; i < r.length; i++) assert.ok(r[i - 1].ts >= r[i].ts, "newest-first preserved");
+
+  // BOTH quiet panes keep their single most-recent breadcrumb despite the flood.
+  assert.ok(texts.includes("quietA-latest"), "quietA's latest survives the noisy flood");
+  assert.ok(texts.includes("quietB-latest"), "quietB's latest survives the noisy flood");
+  // The noisy pane still appears, filling the remaining capacity by recency.
+  assert.ok(texts.some(t => t.startsWith("noisy")), "noisy pane still represented");
+});
+
+test("per-pane fairness: null paneId (system) is its own bucket", () => {
+  const ring = new BreadcrumbRing({ breadcrumbMax: 3, breadcrumbMaxAgeMs: 10_000 });
+  ring.add({ ts: 100, paneId: null, text: "system-latest" });
+  ring.add({ ts: 1000, paneId: "noisy", text: "n1" });
+  ring.add({ ts: 1001, paneId: "noisy", text: "n2" });
+  ring.add({ ts: 1002, paneId: "noisy", text: "n3" });
+  const r = ring.recent(2000);
+  const texts = r.map(b => b.text);
+  assert.equal(r.length, 3);
+  assert.ok(texts.includes("system-latest"), "null-pane (system) breadcrumb gets its guaranteed slot");
+});
+
+test("per-pane fairness fallback: more distinct in-window panes than breadcrumbMax", () => {
+  // 5 distinct panes, each ONE crumb, but breadcrumbMax=3 — we cannot give every pane a slot.
+  // Fallback: keep the most-recent crumb of the breadcrumbMax MOST-RECENTLY-ACTIVE panes.
+  const ring = new BreadcrumbRing({ breadcrumbMax: 3, breadcrumbMaxAgeMs: 10_000 });
+  ring.add({ ts: 100, paneId: "p1", text: "p1" });
+  ring.add({ ts: 200, paneId: "p2", text: "p2" });
+  ring.add({ ts: 300, paneId: "p3", text: "p3" });
+  ring.add({ ts: 400, paneId: "p4", text: "p4" });
+  ring.add({ ts: 500, paneId: "p5", text: "p5" });
+  const r = ring.recent(2000);
+  const texts = r.map(b => b.text);
+  assert.equal(r.length, 3);
+  // The 3 most-recently-active panes (by newest ts) are p5, p4, p3.
+  assert.deepEqual(texts, ["p5", "p4", "p3"], "keep the breadcrumbMax most-recently-active panes");
+});
