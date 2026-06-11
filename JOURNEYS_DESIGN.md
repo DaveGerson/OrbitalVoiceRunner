@@ -110,13 +110,13 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 | Secondary Journey | Core API Tool Hooks | Action Profile |
 | :--- | :--- | :--- |
 | **Dictate Specifications** | `add_project_note` & `add_pane_note` | Speech-to-text notes are written directly to ledger. |
-| **Narrate Terminal Walk-through** | `get_pane_summary` | Recent terminal output (ANSI-stripped) is read back; the operator dictates notes for needed changes. *(Output is not yet redacted or semantically analyzed — see `docs/review/IMPLEMENTATION_PLAN.md` WS-B/WS-J.)* |
+| **Narrate Terminal Walk-through** | `get_pane_summary` | Recent terminal output (ANSI-stripped, secret-redacted via WS-B's `redactSecrets`) is read back; the operator dictates notes for needed changes. *(No semantic analysis yet — see `docs/review/IMPLEMENTATION_PLAN.md` WS-J.)* |
 
 ---
 
 ## 4. Maintenance and Validation Strategy
 
-To prevent functional regression, the primary developer journeys are tested inside `/tests/test_journeys.ts` (Journeys 1–6). *(The two secondary journeys, 7 and 8, are not yet covered — tracked in `docs/review/BUG_LOG.md` BUG-038.)*
+To prevent functional regression, all eight user journeys are tested inside `/tests/test_journeys.ts` — the six primary journeys plus the two secondary ones (7: dictate spec → durable note → recall/restart; 8: pane tail → redaction → note capture). *(This closes the journey-coverage half of `docs/review/BUG_LOG.md` BUG-038 / drift item D5.)*
 
 To verify and run all validation tests:
 ```bash
