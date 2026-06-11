@@ -266,10 +266,12 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
       "Pane-level dictation must report success"
     );
 
-    // A mis-addressed dictation must be signalled to the model, not silently dropped (J8-G10 class)
-    assert.strictEqual(manager.ledger.addPaneNote("spec_project", "pane_ghost", "lost"), false,
+    // A mis-addressed dictation must be signalled to the model, not silently dropped (J8-G10 class).
+    // Falsy-on-failure, not strictEqual(false): the LedgerLike contract is truthy-on-success
+    // (legacy Ledger returns false, JanusStore returns null), and this test should hold for both.
+    assert.ok(!manager.ledger.addPaneNote("spec_project", "pane_ghost", "lost"),
       "Note to a nonexistent pane must report failure");
-    assert.strictEqual(manager.ledger.addNote("ghost_project", "lost"), false,
+    assert.ok(!manager.ledger.addNote("ghost_project", "lost"),
       "Note to a nonexistent project must report failure");
 
     // 2. Same-session recall ("Janus, what did I note?") via the notes-recall surface
@@ -326,7 +328,12 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     const lines = Array.from({ length: 30 }, (_, i) => `build step ${i + 1} ok`);
     lines.push("warning: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE leaked to stdout");
     lines.push("Build finished with exit code 0");
+    // Feed the model lane the way onData does, including the buffer-cap splice, so the
+    // buffer state cannot drift from the production path (cf. feed() in test_pane_delta.ts).
     term.outputBuffer.push(...lines);
+    if (term.outputBuffer.length > term.maxBufferLines) {
+      term.outputBuffer.splice(0, term.outputBuffer.length - term.maxBufferLines);
+    }
     term.totalLines += lines.length;
 
     // 1. Narration source: fenced, last-20-line tail of the model-lane buffer
