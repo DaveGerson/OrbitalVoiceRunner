@@ -132,6 +132,14 @@ export interface DispatchProposalArgs {
   explicitKind?: ApprovalKind;
   trigger: string;
   capability?: CapabilityGate;
+  /**
+   * Fan-out staging (dispatch_to_panes). When true the write may target a NON-active pane on the
+   * voice path, BUT can never auto-execute: an auto_execute decision is downgraded to
+   * pending_approval before the effect switch. Strictly more cautious than the default path — the
+   * operator still sees/approves every write before it lands, which is the active-pane guard's
+   * whole purpose. Absent/false everywhere except the multi-target dispatch handler.
+   */
+  forceStage?: boolean;
 }
 
 /**

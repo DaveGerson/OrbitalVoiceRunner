@@ -7,6 +7,13 @@
  * proactive completion announcement on the Running->Idle edge, the per-pane output buffer + 30ms
  * coalescing broadcast, and the best-effort PTY interaction-log leg.
  *
+ * Dispatch JOIN hook (docs/design/templates-layouts-dispatch.md §5): this pipeline also feeds the
+ * in-memory dispatch-group tracker (src/dispatch/joinTracker.ts) — `onRunning` flips staged members
+ * to in-flight, and `detectAndTriggerTransitions` settles them on the edge-deduped
+ * idle/error/build-failed/exited edges and fans out the ONE group-completion (attention item +
+ * attention_updated/dispatch_updated frames + announcement). Still pure observation + notification:
+ * the tracker is bookkeeping only, and no pane write originates here.
+ *
  * CRITICAL invariant (why this is the cleanest carve): the triggers here only ever SURFACE attention
  * suggestions and broadcast frames — there is NO autonomous CLI write, so there is NO capability-gate
  * coupling. The whole pipeline is pure observation + notification.
@@ -22,6 +29,7 @@ import { GoogleGenAI } from "@google/genai";
 import { OrchestratorManager, stripAnsiSequences, redactSecrets } from "../terminal";
 import { SHELL_PROMPT } from "../statusConstants";
 import { classifyPaneOutput } from "../paneSignals";
+import { dispatchJoinTracker } from "../dispatch/joinTracker";
 import type { PaneSignalBus } from "../paneSignalBus";
 import type { AnnouncementBus } from "../announcementBus";
 import type { InteractionLogger } from "../interactionLog";
@@ -209,6 +217,15 @@ ${redact(rawOutput.slice(-3000))}`;
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "running", detail });
     broadcast({ type: "pane_status", terminalId, status: "Running" });
+    // Dispatch join (templates-layouts-dispatch §5): the genuine Running edge is what flips a
+    // staged dispatch member to in-flight (its approved write landed and the pane started). Pure
+    // bookkeeping — settling/announcing happens on the transition edges below. Guarded so a join
+    // fault can never break the Running observation (QW5 philosophy).
+    try {
+      dispatchJoinTracker.noteRunning(terminalId);
+    } catch (e) {
+      console.error(`[ONRUNNING] dispatch-join step failed for ${terminalId}:`, e);
+    }
     // P0a memory: drop a redacted one-liner breadcrumb on the Running edge (cross-pane working memory).
     if (onBreadcrumb) {
       const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
@@ -479,6 +496,38 @@ ${redact(rawOutput.slice(-3000))}`;
 
       handleWatchRulesTrigger(terminalId, transition);
       handlePlansTrigger(terminalId, transition);
+
+      // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on this
+      // edge and announce each group it NEWLY completed. This is the ONE settle site for
+      // idle/error/build-failed/exited — the lastStates edge-dedup above means each pane edge
+      // settles exactly once, and onIdle deliberately does NOT call the tracker (its idle edge is
+      // already classified here; calling from both would double-settle). `prompt` is a no-op
+      // inside the tracker (awaiting input is not done). Guarded in its own try/catch (QW5
+      // philosophy): a join fault must never break observation or the triggers above.
+      try {
+        for (const g of dispatchJoinTracker.noteTransition(terminalId, transition)) {
+          const total = g.members.length;
+          const done = g.members.filter((m) => m.status === "done").length;
+          const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
+          const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
+          manager.attentionQueue.push({
+            id: "att_" + Math.random().toString(36).substring(2, 11),
+            // Informational completion item ("idle" — widened onto AttentionItem.type for this).
+            type: "idle",
+            terminalId,
+            projectId: manager.ledger.activeProjectId || "default_project",
+            message: summary,
+            timestamp: new Date().toISOString(),
+            dismissed: false
+          });
+          pruneAttention(); // BUG-035 cap/TTL
+          broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+          broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
+          announcementBus.enqueue({ kind: "completion", terminalId, summary });
+        }
+      } catch (e) {
+        console.error(`[TRANSITION] dispatch-join step failed for ${terminalId}:`, e);
+      }
     }
   }
 

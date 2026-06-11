@@ -1,5 +1,19 @@
 # Core-Journey Expansion Opportunities — 2026-06-10
 
+> **Revision 2026-06-11 — orchestration reframed (maintainer decision).** The
+> recipe/plan-authoring items below (J1-E2, J1-E3, J7-E2) are superseded by the
+> **template-centric model**: the agents in the panes do the orchestration
+> work; the orchestrator briefs (prompt templates), connects (multi-pane
+> dispatch with per-write gating + a single join announcement), and watches.
+> Layouts are split out of "recipes" as pure pane furniture. Plans stay as-is
+> for the deterministic-sequence niche but get no further UI investment.
+> Spec + implementation: `docs/design/templates-layouts-dispatch.md`
+> (shipped on this branch: `create/list/update/delete/apply_prompt_template`,
+> `save_project_layout` / `list_layouts` / `apply_layout` / `delete_layout`,
+> `dispatch_to_panes` + `get_dispatch_status` with the forceStage staging
+> invariant, plus the Pass UI for templates/layouts). The shortlist in §3 is
+> re-ranked accordingly.
+
 **Scope.** A journey-by-journey survey of how the eight core journeys
 (`JOURNEYS_DESIGN.md`, `docs/journeys/*`) can be *expanded or better supported*
 — in the UI, the voice surface, or the server — now that the Phase 0–4
@@ -60,9 +74,9 @@ and everything orchestration-shaped is voice-create-only.
 
 | # | Opportunity | Tags | Effort | Tier |
 |---|---|---|---|---|
-| J1-E1 | **Parallel step groups in plans** (= WS-K, endorsed). Add a `parallel_group` step type; dispatch all members concurrently, join when every member hits its expected transition; surface partial failure as a paused plan. Without it the journey's namesake — "run tests on all three panes at once" — is impossible via plans. | [Server][Voice] | M | M2 (planned) |
-| J1-E2 | **Plan builder + live progress UI.** The Pass gets: create/edit plan (name, steps, target panes, reorder, parallel groups), and a live tracker per executing plan (step chips → pane links, status, started/finished). Server already broadcasts `plans_updated`; the UI just never grew the surface. | [UI] | M–L | P1 (velocity) |
-| J1-E3 | **"Snapshot this project as a recipe."** One action that captures the active project's panes (preset, cwd, launch command, gate posture) into a named recipe; re-apply later via the existing `apply_orchestration_recipe`. Makes fan-out setups reusable instead of re-dictated. | [Server][Voice][UI] | M | P1 |
+| J1-E1 | ~~Parallel step groups in plans (WS-K)~~ **Superseded → SHIPPED as `dispatch_to_panes` + join** (rev. 2026-06-11): one (templated) instruction to N panes, every write staged for approval, one spoken/attention announcement when the group settles. The plan-DAG variant is dropped — agents sequence their own work. | [Server][Voice] | — | Done |
+| J1-E2 | ~~Plan builder + live progress UI~~ **Demoted** (rev. 2026-06-11): plans keep execute/delete only; group visibility comes from `get_dispatch_status` + the `dispatch_updated` frame instead. | [UI] | — | Dropped |
+| J1-E3 | ~~"Snapshot this project as a recipe"~~ **Superseded → SHIPPED as layouts** (rev. 2026-06-11): `save_project_layout` captures the live formation (command/cwd/preset/mode per pane); `apply_layout` re-materializes it under the same gates as a recipe apply. | [Server][Voice][UI] | — | Done |
 | J1-E4 | **Duplicate station / pane templates.** A clone button on station cards (re-create with same preset/cwd/command/mode) and per-pane config save-as-template in `CreateTerminalDialog`. Cheap because `create_pane` already accepts the full config. | [UI] | S | P1 |
 | J1-E5 | **Multi-target propose:** "tell every idle pane in this project to run the linter." A fan-out wrapper over `propose_command` that resolves a pane *set* (by status/project/preset), with each write still individually gated — N approvals stage if the gate says Ask. Pairs naturally with J2-E4 batch resolution. | [Voice][Server] | M | P1 |
 
@@ -141,7 +155,7 @@ is workflow closure.
 | # | Opportunity | Tags | Effort | Tier |
 |---|---|---|---|---|
 | J7-E1 | **Draft → artifact promotion.** Verbs/buttons to promote a draft into (a) a typed project note, (b) handoff cargo (`propose_handoff` pre-filled), or (c) a file in the project directory (e.g. `SPEC.md`) via a gated write. Dictation currently dead-ends at "send to pane". | [Server][Voice][UI] | M | M2 |
-| J7-E2 | **Spec templates as data.** Replace the hardcoded Template button string with a settings-registry of named templates + an `apply_spec_template` tool. | [Server][Voice][UI] | S | P1 (templates, planned) |
+| J7-E2 | ~~Spec templates as data~~ **Superseded → SHIPPED as prompt templates** (rev. 2026-06-11): first-class `PromptTemplate` artifacts with `{{slot}}` parameters; create/edit/apply by voice or on The Pass; `apply_prompt_template` instantiates into the pane's WIP draft for review-then-send. | [Server][Voice][UI] | — | Done |
 | J7-E3 | **Draft history.** Keep the last N revisions per pane draft (drafts are overwritten in place today); "undo my last edit" by voice. | [Server][UI] | S–M | P2 |
 | J7-E4 | **Focused-pane default for notes.** `add_pane_note`/`compose_draft` default `pane_id` to `coreState.activePaneId` so "note this here" needs no pane naming. | [Server] | S | P1 |
 
@@ -161,29 +175,34 @@ no UI counterpart.
 
 ## 3. Ranked shortlist (impact ÷ effort, scope-safe)
 
+> Rev. 2026-06-11: prompt templates, layouts, and dispatch+join (formerly
+> ranked 5–6 in plan-shaped form, plus J7-E2) **shipped on this branch** —
+> see `docs/design/templates-layouts-dispatch.md`. The remaining ranking:
+
 1. **J2-E1 Approvals + attention inbox** — the supervisor journey's missing
-   ambient surface; everything it shows already exists server-side.
+   ambient surface; everything it shows already exists server-side (now
+   including `dispatch_updated` group state).
 2. **J2-E2 + J2-E3 Defer button & TTL countdown** — two small PRs that give
    the mouse the same verbs the voice has and make the enforced deadline
-   visible.
+   visible. Doubly valuable now that `dispatch_to_panes` stages N approvals
+   at once.
 3. **J4-E1 Handoff surface** — the largest fully-built, fully-invisible
    feature; pure UI.
 4. **J6-E1 `get_status_summary`** — one tool that turns the most common
-   question into one round-trip.
-5. **J1-E1 Parallel plan steps (WS-K)** — unlocks the fan-out journey's
-   namesake capability.
-6. **J1-E2 Plan builder + live progress** — plans stop being a voice-only
-   black box.
-7. **J5-E1 Gate provenance** — makes the matrix self-explaining right as it
+   question into one round-trip (should fold in dispatch-group progress).
+5. **J2-E4 Batch approve/reject** — the natural companion to staged fan-out:
+   "approve all" resolves a dispatch group in one breath.
+6. **J5-E1 Gate provenance** — makes the matrix self-explaining right as it
    becomes the product's spine.
-8. **J8-E1 Scrollback search + error extraction (WS-J)** — depth for both
+7. **J8-E1 Scrollback search + error extraction (WS-J)** — depth for both
    narration and status journeys.
-9. **J5-E2 Timed autonomy** — the most-requested shape of trust ("just for
+8. **J5-E2 Timed autonomy** — the most-requested shape of trust ("just for
    this task") expressed inside the existing matrix.
-10. **J4-E3 Transcript → note** — near-free knowledge capture.
+9. **J4-E3 Transcript → note** — near-free knowledge capture.
+10. **J1-E4 Duplicate station** — the small sibling of layouts.
 
-Items 1–4 and 7 are surfacing work that could ride alongside the P0b matrix
-surface; 5, 6, 8–10 slot into the existing P1/M2 lanes.
+Items 1–4 and 6 are surfacing work that could ride alongside the P0b matrix
+surface; 5, 7–10 slot into the existing P1/M2 lanes.
 
 ---
 
