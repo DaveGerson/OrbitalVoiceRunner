@@ -49,6 +49,14 @@ const DispatchToPanesParams = z
         path: ["instruction"],
       });
     }
+    // Reject the ambiguous case rather than silently preferring one (review finding C3).
+    if (a.instruction && a.template_id) {
+      zctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "provide instruction OR template_id, not both",
+        path: ["template_id"],
+      });
+    }
   });
 
 export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {

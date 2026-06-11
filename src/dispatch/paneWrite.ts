@@ -139,15 +139,23 @@ export function applyDispatchDecision(
     term,
   } = deps;
 
+  // forceStage: a Full-Auto write becomes a staged approval (strictly more restrictive; never less).
+  // Computed BEFORE the guard below so the guard-skip can key on it structurally.
+  const effectiveDecision: ProposalDecision =
+    deps.forceStage && decision.type === "auto_execute" ? { type: "pending_approval" } : decision;
+
   // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so the
   // operator can SEE and improve the command before it lands (HiTL). A proposal for any other pane is
   // refused here — never written, in ANY policy mode — and Janus is told to ask for a switch. This sits
   // ABOVE the effective-mode gate on purpose. (architecture step 5.) GOVERNED by conn.enforceActivePaneGuard:
   // voice enforces it (Janus proposal); REST skips it (operator-directed click — design §5 row 3).
   // forceStage (dispatch_to_panes fan-out) skips the clarify INSTEAD of the guard's protection: the
-  // downgrade below guarantees nothing auto-executes, so every off-focus write still surfaces to the
+  // downgrade above guarantees nothing auto-executes, so every off-focus write still surfaces to the
   // operator as a pending approval before it can land — the property the guard exists to protect.
-  if (conn.enforceActivePaneGuard && !deps.forceStage) {
+  // The skip is keyed on the DOWNGRADED decision (not the flag alone), so the coupling is structural:
+  // if a refactor ever drops the downgrade, the skip condition fails and the guard re-engages.
+  const forceStagedSafely = deps.forceStage === true && effectiveDecision.type !== "auto_execute";
+  if (conn.enforceActivePaneGuard && !forceStagedSafely) {
     const activePaneId = getActivePaneId();
     if (!isActive(activePaneId, targetId)) {
       return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
@@ -155,10 +163,6 @@ export function applyDispatchDecision(
   }
 
   const safeInstr = redactSecrets(instruction);
-
-  // forceStage: a Full-Auto write becomes a staged approval (strictly more restrictive; never less).
-  const effectiveDecision: ProposalDecision =
-    deps.forceStage && decision.type === "auto_execute" ? { type: "pending_approval" } : decision;
 
   switch (effectiveDecision.type) {
     case "error_no_pane":

@@ -177,7 +177,13 @@ export const applyLayout: ActionDef<typeof ApplyLayoutParams> = {
         blocked.push(planned.paneId);
         continue;
       }
-      const p = paneById.get(planned.paneId)!;
+      const p = paneById.get(planned.paneId);
+      // Defensive: planRecipeApply only emits ids from its input, but layout.panes comes from
+      // operator-editable persisted JSON — never crash the apply on a malformed row.
+      if (!p) {
+        blocked.push(planned.paneId);
+        continue;
+      }
       const spawnPane = (): string => {
         ctx.manager.addTerminal(
           p.id,

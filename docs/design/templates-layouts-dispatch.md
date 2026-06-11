@@ -186,3 +186,49 @@ existing jots/plans —
 Durable dispatch groups, watch-rules firing templated handoffs, template
 versioning, per-slot descriptions/types, plan-builder UI, and anything on the
 RECONCILIATION §6 rejected list.
+
+## 10. Code-review outcome (2026-06-11, 7-angle + verify pass)
+
+Both safety-focused correctness angles (removed-behavior audit on the
+forceStage guard change; cross-file wiring tracer) returned **zero findings**.
+Verified-and-FIXED in the same change:
+
+- **C3** `dispatch_to_panes` silently preferred `instruction` when both
+  `instruction` and `template_id` were passed → the ambiguous case is now a
+  zod refusal.
+- **C1** `apply_layout` non-null-asserted a map lookup fed by
+  operator-editable persisted JSON → defensive guard (malformed row counts as
+  blocked, never a crash).
+- **V1** the forceStage guard-skip and auto-execute downgrade were coupled by
+  comment only → the skip is now keyed on the downgraded decision itself, so
+  removing the downgrade structurally re-engages the guard.
+
+Verified-and-FILED (follow-ups, severity order):
+
+- **V6** `templates_updated` broadcasts raw ledger rows while GET
+  `/api/templates` sends the slot-bearing projection — the client re-derives
+  slots; the broadcast should send `templateView()` so there is one wire shape.
+- **V3** `update_metadata`'s operator label ("Update notes & metadata") does
+  not say it now also gates template/layout management; widen the label or
+  split a `manage_templates` capability when the matrix next changes.
+- **V4** `dispatchJoinTracker` is a module singleton — fine for the
+  single-server production topology, shared state if two servers ever boot in
+  one process (today only the test harness does, and it stubs its own).
+- **V5** `joinTracker.settledAtDispatch` has no production caller (tests
+  only); remove or wire a REST consumer.
+- Cleanup batch: shared id-generation helper; a `mapGateDisposition` helper
+  for the 6× forbidden/deferred/run boilerplate; factor the near-identical
+  pane-spawn loops in `apply_layout` / `apply_orchestration_recipe`;
+  `React.memo` on Pass ticket cards; extract the two-tap-confirm component.
+
+Refuted with code citations (recorded so they aren't re-raised): duplicate
+join announcements (the tracker returns each completed group exactly once);
+the find-then-refind handler pattern (house idiom — deferred-Ask closures must
+re-find after index drift); empty-output apply toast (unreachable from the
+def); undocumented later-wins on duplicate slot values (documented);
+per-element Proxy flush (pre-existing `watchRules`/`plans` pattern, no bulk
+writers added).
+
+**Known validation gap:** the Playwright e2e lane could not run in the remote
+container (chromium download blocked by the sandbox network allowlist,
+`403 Host not in allowlist`); it needs a CI or local run before merge.
