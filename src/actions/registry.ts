@@ -35,6 +35,9 @@ import { ORCH_ACTIONS } from "./defs/orchestration";
 import { HANDOFF_ACTIONS } from "./defs/handoff";
 import { OBSERVABILITY_ACTIONS } from "./defs/observability";
 import { WATCH_RULES_ACTIONS } from "./defs/watch_rules";
+import { TEMPLATES_ACTIONS } from "./defs/templates";
+import { LAYOUTS_ACTIONS } from "./defs/layouts";
+import { DISPATCH_ACTIONS } from "./defs/dispatch_group";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -319,6 +322,10 @@ export const REGISTRY: readonly ActionDef[] = [
   ...LIFECYCLE_REST_ACTIONS,
   // ── c55.15 net-new rest-only approvals/pending HiTL defs (5: ALWAYS_ALLOWED operator-resolver surface) ──
   ...APPROVALS_REST_ACTIONS,
+  // ── journey-expansion: prompt templates / pane layouts / multi-pane dispatch+join (11) ──
+  ...TEMPLATES_ACTIONS,
+  ...LAYOUTS_ACTIONS,
+  ...DISPATCH_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

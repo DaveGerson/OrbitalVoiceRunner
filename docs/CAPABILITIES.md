@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**79** actions across **24** gated capabilities, plus the always-allowed group.
+**90** actions across **24** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -64,6 +64,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `apply_layout` | voice / rest | no | Re-materialize a saved pane layout into the active project |
 | `apply_orchestration_recipe` | voice / rest | no | Apply a pre-configured template layout suite (such as full-stack-web or python-worker) to standard workspaces |
 
 ## Close a pane
@@ -84,6 +85,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `apply_prompt_template` | voice / rest | no | Instantiate a saved prompt template (filling its {{slot}} values) into a pane's WIP draft for the operator to review and send |
 | `handoff_context_between_panes` | voice / rest | no | Gather context from a source CLI pane and package summaries/learnings to prime a model agent in another target pane |
 | `propose_handoff` | voice | no | Draft a first-class handoff to a target pane (UNGATED — never touches the pane) |
 | `reject_handoff` | voice | no | Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path) |
@@ -187,7 +189,9 @@ These bypass the capability gate entirely — they work even while the system is
 | `get_project_notes` | voice | yes | Recall the durable notes saved for a project (decisions, todos, warnings) |
 | `list_capabilities` | voice / rest | yes | List every gateable capability name |
 | `list_handoffs` | voice / rest | yes | List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output) |
+| `list_layouts` | voice / rest | yes | List the saved pane layouts (name, source project, and the panes each would spawn) |
 | `list_pending_approvals` | voice | yes | List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count) |
+| `list_prompt_templates` | voice / rest | yes | List the saved prompt templates (name, description, and the {{slot}} parameters each one needs) |
 | `read_handoff` | voice / rest | yes | Read a single handoff (UNGATED, redacted output) |
 | `search_notes` | voice | yes | Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries') |
 
@@ -199,6 +203,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `get_dispatch_status` | voice / rest | yes | Check a multi-pane dispatch group |
 | `get_pane_command_history` | voice / rest | yes | Return the list of recently executed commands in this pane with their concise, high-level final responses/outcomes, rather than raw/messy terminal outputs |
 | `get_pane_delta` | voice | yes | Return ONLY the pane output that is new since you last read this pane (true incremental delta; ANSI-stripped, secret-redacted) |
 | `get_pane_summary` | voice / rest | yes | Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted) |
@@ -298,9 +303,14 @@ These bypass the capability gate entirely — they work even while the system is
 | `add_pane_note` | voice | no | Add a durable note to a pane |
 | `add_project_note` | voice | no | Add a durable note to a project |
 | `amend_note` | voice | no | Edit the text of an existing note by its id (get the id from get_project_notes or search_notes) |
+| `create_prompt_template` | voice / rest | no | Save a reusable prompt template |
+| `delete_layout` | voice / rest | no | Delete a saved pane layout by its id |
 | `delete_note` | voice | no | Delete a note permanently by its id (get the id from get_project_notes or search_notes) |
+| `delete_prompt_template` | voice / rest | no | Delete a saved prompt template by its id |
 | `rename_pane` | voice / rest | no | Rename a pane |
 | `rename_project` | voice / rest | no | Rename a project |
+| `save_project_layout` | voice / rest | no | Snapshot the current project's running panes (launch command, directory, preset, permission mode) as a named layout you can re-apply later with apply_layout |
+| `update_prompt_template` | voice / rest | no | Edit a saved prompt template's name, description, or body by its id |
 
 ## Type a command into a pane
 
@@ -310,6 +320,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `dispatch_to_panes` | voice / rest | no | Send one instruction (raw text or a prompt template with slot values) to SEVERAL panes at once |
 | `propose_command` | voice | no | Direct work to the pane the operator currently has OPEN (the active pane) |
 
 ## Capabilities without actions (matrix-only)

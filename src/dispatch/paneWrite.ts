@@ -79,6 +79,14 @@ export interface DispatchDeps {
   callId: string;
   /** the live terminal handle for targetId (undefined for an inert/ledger-only pane). */
   term: { writeInput: (s: string) => void } | undefined;
+  /**
+   * Fan-out staging (dispatch_to_panes). When true: (a) an `auto_execute` decision is DOWNGRADED to
+   * `pending_approval` before the effect switch — nothing can land without operator confirmation —
+   * and (b) the active-pane guard's clarify is skipped, which is sound precisely BECAUSE of (a):
+   * the guard exists so the operator sees a write before it lands, and a staged approval is exactly
+   * that. Strictly more cautious than the normal path; false/absent everywhere else.
+   */
+  forceStage?: boolean;
 }
 
 /**
@@ -131,12 +139,23 @@ export function applyDispatchDecision(
     term,
   } = deps;
 
+  // forceStage: a Full-Auto write becomes a staged approval (strictly more restrictive; never less).
+  // Computed BEFORE the guard below so the guard-skip can key on it structurally.
+  const effectiveDecision: ProposalDecision =
+    deps.forceStage && decision.type === "auto_execute" ? { type: "pending_approval" } : decision;
+
   // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so the
   // operator can SEE and improve the command before it lands (HiTL). A proposal for any other pane is
   // refused here — never written, in ANY policy mode — and Janus is told to ask for a switch. This sits
   // ABOVE the effective-mode gate on purpose. (architecture step 5.) GOVERNED by conn.enforceActivePaneGuard:
   // voice enforces it (Janus proposal); REST skips it (operator-directed click — design §5 row 3).
-  if (conn.enforceActivePaneGuard) {
+  // forceStage (dispatch_to_panes fan-out) skips the clarify INSTEAD of the guard's protection: the
+  // downgrade above guarantees nothing auto-executes, so every off-focus write still surfaces to the
+  // operator as a pending approval before it can land — the property the guard exists to protect.
+  // The skip is keyed on the DOWNGRADED decision (not the flag alone), so the coupling is structural:
+  // if a refactor ever drops the downgrade, the skip condition fails and the guard re-engages.
+  const forceStagedSafely = deps.forceStage === true && effectiveDecision.type !== "auto_execute";
+  if (conn.enforceActivePaneGuard && !forceStagedSafely) {
     const activePaneId = getActivePaneId();
     if (!isActive(activePaneId, targetId)) {
       return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
@@ -145,14 +164,14 @@ export function applyDispatchDecision(
 
   const safeInstr = redactSecrets(instruction);
 
-  switch (decision.type) {
+  switch (effectiveDecision.type) {
     case "error_no_pane":
       return { kind: "error", text: `Error: pane ${targetId} not found.` };
     case "error_kind_mismatch":
-      return { kind: "error", text: decision.reason };
+      return { kind: "error", text: effectiveDecision.reason };
     case "clarify_shell":
       // Non-blocking re-route (never a dead-end, never execution).
-      return { kind: "clarify", text: decision.reason };
+      return { kind: "clarify", text: effectiveDecision.reason };
     case "capability_forbidden":
       broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: `Capability '${capability}' is set to Off.` });
       return { kind: "blocked", text: `Error: the '${capability}' capability is gated Off for pane ${targetId}; this action is forbidden by policy.` };

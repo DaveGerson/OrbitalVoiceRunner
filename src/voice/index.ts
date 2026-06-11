@@ -576,6 +576,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       /** The capability this write rides (design §3). Defaults to "write_to_pane". The handoff
        *  delivery path passes "deliver_handoff". The gate AND-composes with effectiveMode. */
       capability?: CapabilityGate;
+      /** Fan-out staging (dispatch_to_panes): never auto-execute; off-focus targets allowed
+       *  because every write is parked as a pending approval first (see paneWrite.ts). */
+      forceStage?: boolean;
     }): DispatchOutcome {
       // c55.9 (A3-min): dispatchProposal is now a THIN WRAPPER over the shared dispatch core
       // (applyDispatchDecision, src/dispatch/paneWrite.ts). It resolves the gate EXACTLY as before
@@ -623,6 +626,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           pendingId,
           callId,
           term,
+          forceStage: opts.forceStage === true,
         },
         {
           // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so

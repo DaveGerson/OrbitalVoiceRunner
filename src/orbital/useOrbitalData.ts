@@ -20,8 +20,10 @@ import type {
   PendingActionView,
   SystemSettings,
   Plan,
+  PaneLayout,
 } from "../types";
 import type { StoredNote } from "../store/types";
+import { extractSlots } from "../templates";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
 export type { TranscriptEntry };
@@ -47,6 +49,19 @@ export interface PaneHistoryEntry {
   timestamp: string;
   output: string;
   finalResponse?: string;
+}
+
+// Journey-expansion C: one saved prompt template, the exact projection GET /api/templates returns
+// (templateView in src/actions/defs/templates.ts — `slots` are DERIVED from the body server-side,
+// so they can never go stale against the body shown here).
+export interface TemplateView {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  slots: string[];
+  created_at: number;
+  updated_at: number;
 }
 
 // 4U.3: one service-log row — the exact ActionLogRow shape GET /api/action-log returns
@@ -149,6 +164,10 @@ export interface OrbitalData {
   /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
   serviceLog: ServiceLogRow[];
   refetchServiceLog: () => void;
+  /** Journey-expansion C: the cookbook — saved prompt templates (GET /api/templates + templates_updated). */
+  templates: TemplateView[];
+  /** Journey-expansion C: mise en place — saved pane layouts (GET /api/layouts + layouts_updated). */
+  layouts: PaneLayout[];
   // setters / actions
   selectActivePane: (paneId: string | null) => void;
   setGlobalPermissionsMode: (m: GlobalMode) => void;
@@ -176,6 +195,23 @@ export interface OrbitalData {
   executePlan: (planId: string) => void;
   /** 86 a plan — DELETE /api/plans/:id (gated: may 202-defer). */
   deletePlan: (planId: string) => void;
+  // Journey-expansion C: prompt templates + pane layouts on The Pass.
+  /** Save a new template — POST /api/templates (gated update_metadata: may 202/403). */
+  createTemplate: (opts: { name: string; body: string; description?: string }) => void;
+  /** Edit a template — PUT /api/templates/:id (gated update_metadata). */
+  updateTemplate: (id: string, opts: { name?: string; body?: string; description?: string }) => void;
+  /** Delete a template — DELETE /api/templates/:id (gated update_metadata). */
+  deleteTemplate: (id: string) => void;
+  /** Fill a pane's WIP draft from a template — POST /api/templates/:id/apply {pane_id, values}. */
+  applyTemplate: (id: string, paneId: string, values: { name: string; value: string }[]) => void;
+  /** Snapshot the current setup — POST /api/layouts {name} (gated update_metadata). */
+  saveLayout: (name: string) => void;
+  /** Re-materialize a layout — POST /api/layouts/:id/apply (gated like a recipe: 200 narration/403). */
+  applyLayout: (id: string) => void;
+  /** Delete a layout — DELETE /api/layouts/:id (gated update_metadata). */
+  deleteLayout: (id: string) => void;
+  refetchTemplates: () => void;
+  refetchLayouts: () => void;
   // 2K.2: per-pane capability-gate override (the Rulebook's pane scope) —
   // PUT /api/projects/:p/panes/:id/capability-gates {capabilityGates}.
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
@@ -245,6 +281,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
   // 4U.3: the service log (GET /api/action-log rows, newest-first, capped 100).
   const [serviceLog, setServiceLog] = useState<ServiceLogRow[]>([]);
+  // Journey-expansion C: the cookbook (prompt templates) + mise en place (pane layouts).
+  const [templates, setTemplates] = useState<TemplateView[]>([]);
+  const [layouts, setLayouts] = useState<PaneLayout[]>([]);
 
   // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
   // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
@@ -395,6 +434,28 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // Journey-expansion C: templates + layouts. Both GETs return the raw array TOP-LEVEL (the defs'
+  // rest.toHttp projection, src/actions/defs/{templates,layouts}.ts — list_watch_rules precedent).
+  const refetchTemplates = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/templates");
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setTemplates(rows);
+    } catch { /* silent */ }
+  }, []);
+
+  const refetchLayouts = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/layouts");
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setLayouts(rows);
+    } catch { /* silent */ }
+  }, []);
+
   // 4U.3: the service log — GET /api/action-log (default resultToHttp wraps the rows: {output:{rows}}).
   // Fetched on demand (the Pantry refreshes it when it opens), not on the poll — it's a review
   // surface, not a live board. Under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
@@ -453,7 +514,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchPlans();
     refetchFrozen();
     refetchArchive();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive]);
+    refetchTemplates();
+    refetchLayouts();
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts]);
 
   // ── observe-lane frame handler ───────────────────────────────────────────
   // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
@@ -503,6 +566,26 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         // execute / step-advance / delete) — adopt it directly; degrade to a refetch otherwise.
         if (Array.isArray(msg.plans)) setPlans(msg.plans);
         else refetchPlans();
+        break;
+      case "templates_updated":
+        // Journey-expansion C: the frame carries the RAW ledger rows (no derived `slots` — the
+        // server broadcasts ledger.promptTemplates verbatim). Adopt them with slots re-derived
+        // through the same pure engine the server projects with (extractSlots, src/templates.ts).
+        if (Array.isArray(msg.templates)) {
+          setTemplates(msg.templates
+            .filter((t: any) => t && typeof t.id === "string" && typeof t.body === "string")
+            .map((t: any) => ({
+              id: t.id, name: String(t.name ?? ""), description: String(t.description ?? ""),
+              body: t.body, slots: extractSlots(t.body),
+              created_at: Number(t.created_at ?? 0), updated_at: Number(t.updated_at ?? 0),
+            })));
+        } else refetchTemplates();
+        break;
+      case "layouts_updated":
+        // The frame carries the full layouts array (the same PaneLayout shape GET /api/layouts
+        // returns) — adopt it directly; degrade to a refetch otherwise (plans_updated precedent).
+        if (Array.isArray(msg.layouts)) setLayouts(msg.layouts);
+        else refetchLayouts();
         break;
       case "history_updated":
         // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full
@@ -598,7 +681,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       default:
         break;
     }
-  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -1202,6 +1285,161 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't 86 that spec, Chef — try again.", "warn"); }
   }, [refetchPlans, showToast, mockClientOnly]);
 
+  // ── Journey-expansion C: prompt templates (the cookbook) + pane layouts (mise en place) ──
+  // Same REST mapping as plans (src/actions/rest.ts resultToHttp): 200 ok {output} / 202 pending /
+  // 403 blocked {error} / 409 {clarify}. The board repaints off templates_updated/layouts_updated
+  // frames; the post-success refetch is the safety net for a missed frame. Honest-feedback rules
+  // apply: success acks only after the server said ok; 200-narrations that are really refusals
+  // ("not found", "no live panes") surface as warnings, never a false ack.
+
+  const createTemplate = useCallback(async (opts: { name: string; body: string; description?: string }) => {
+    if (mockClientOnly()) {
+      const now = Date.now();
+      setTemplates((prev) => [...prev, {
+        id: `tmp-${Math.random().toString(36).slice(2, 8)}`, name: opts.name, description: opts.description ?? "",
+        body: opts.body, slots: extractSlots(opts.body), created_at: now, updated_at: now,
+      }]);
+      showToast("Template's in the cookbook 🧾");
+      return;
+    }
+    try {
+      const res = await apiFetch("/api/templates", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) });
+      if (res.status === 202) { showToast("Save queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("Saving templates is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("Couldn't save that template, Chef — try again.", "warn"); return; }
+      showToast("Template's in the cookbook 🧾");
+      if (!isMockModeRef.current) refetchTemplates();
+    } catch { showToast("Couldn't save that template, Chef — try again.", "warn"); }
+  }, [refetchTemplates, showToast, mockClientOnly]);
+
+  const updateTemplate = useCallback(async (id: string, opts: { name?: string; body?: string; description?: string }) => {
+    if (mockClientOnly()) {
+      setTemplates((prev) => prev.map((t) => (t.id === id ? {
+        ...t,
+        ...(opts.name !== undefined ? { name: opts.name } : {}),
+        ...(opts.description !== undefined ? { description: opts.description } : {}),
+        ...(opts.body !== undefined ? { body: opts.body, slots: extractSlots(opts.body) } : {}),
+        updated_at: Date.now(),
+      } : t)));
+      showToast("Template updated 🧾");
+      return;
+    }
+    try {
+      const res = await apiFetch(`/api/templates/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) });
+      if (res.status === 202) { showToast("Edit queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("Editing templates is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("That edit didn't stick, Chef — try again.", "warn"); return; }
+      showToast("Template updated 🧾");
+      if (!isMockModeRef.current) refetchTemplates();
+    } catch { showToast("That edit didn't stick, Chef — try again.", "warn"); }
+  }, [refetchTemplates, showToast, mockClientOnly]);
+
+  const deleteTemplate = useCallback(async (id: string) => {
+    if (mockClientOnly()) {
+      setTemplates((prev) => prev.filter((t) => t.id !== id)); // keep the pass honest client-side
+      showToast("86'd that template", "fire", "execute");
+      return;
+    }
+    try {
+      const res = await apiFetch(`/api/templates/${id}`, { method: "DELETE" });
+      if (res.status === 202) { showToast("86 queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("That 86 is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("Couldn't 86 that template, Chef — try again.", "warn"); return; }
+      showToast("86'd that template", "fire", "execute");
+      if (!isMockModeRef.current) refetchTemplates();
+      else setTemplates((prev) => prev.filter((t) => t.id !== id)); // armed mock: no real refetch
+    } catch { showToast("Couldn't 86 that template, Chef — try again.", "warn"); }
+  }, [refetchTemplates, showToast, mockClientOnly]);
+
+  // Fill a pane's WIP draft from a template. The instantiated text lands on the pane's EXISTING
+  // draft surface (setDraft + draft_updated — the same Order Pad mirror 2K.3 already paints), so
+  // the review-then-gated-send loop stays the single write choke-point. A 200 can still be an
+  // ok-narration refusal (unknown id / pane not running) — only a genuine apply gets the ack.
+  const applyTemplate = useCallback(async (id: string, paneId: string, values: { name: string; value: string }[]) => {
+    if (mockClientOnly()) { showToast(`Draft's filled on ${paneId} — review it at the station 📝`); return; }
+    try {
+      const res = await apiFetch(`/api/templates/${id}/apply`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pane_id: paneId, values }),
+      });
+      const d = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (res.status === 409) {
+        // clarify: the slot list drifted under us (body edited elsewhere) — say so + resync.
+        showToast(typeof d.clarify === "string" && d.clarify ? d.clarify : "That template needs more values, Chef", "warn");
+        if (!isMockModeRef.current) refetchTemplates();
+        return;
+      }
+      if (!res.ok) {
+        const msg = [d.output, d.error, d.clarify].find((v) => typeof v === "string" && v) as string | undefined;
+        showToast(msg || "Couldn't fill that draft, Chef — try again.", "warn");
+        return;
+      }
+      const out = typeof d.output === "string" ? d.output : "";
+      if (out.includes("applied to pane")) showToast(`Draft's filled on ${paneId} — review it at the station 📝`);
+      else showToast(out || "Couldn't fill that draft, Chef — try again.", "warn");
+    } catch { showToast("Couldn't fill that draft, Chef — try again.", "warn"); }
+  }, [refetchTemplates, showToast, mockClientOnly]);
+
+  // Snapshot the current setup as a layout. The server captures the ACTIVE project's live panes
+  // (save_project_layout); a 200 can be a "no live panes" narration — surfaced honestly.
+  const saveLayout = useCallback(async (name: string) => {
+    const n = name.trim();
+    if (!n) return;
+    if (mockClientOnly()) { showToast(`Layout '${n}' is on the books 🗺`); return; }
+    try {
+      const res = await apiFetch("/api/layouts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n }) });
+      if (res.status === 202) { showToast("Save queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("Saving layouts is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("Couldn't save that layout, Chef — try again.", "warn"); return; }
+      const d = await res.json().catch(() => ({} as Record<string, unknown>));
+      const out = typeof d.output === "string" ? d.output : "";
+      if (out.includes("saved")) showToast(`Layout '${n}' is on the books 🗺`);
+      else showToast(out || "Couldn't save that layout, Chef — try again.", "warn");
+      if (!isMockModeRef.current) refetchLayouts();
+    } catch { showToast("Couldn't save that layout, Chef — try again.", "warn"); }
+  }, [refetchLayouts, showToast, mockClientOnly]);
+
+  // Re-materialize a layout (gated like a recipe: apply_recipe veto + per-pane create_pane). The
+  // 200 narration carries the per-pane mix (spawned / awaiting ok / skipped / blocked) — surface
+  // it verbatim; a 403 surfaces the server's reason.
+  const applyLayout = useCallback(async (id: string) => {
+    if (mockClientOnly()) { showToast("Setting those stations 🔥", "fire", "execute"); return; }
+    try {
+      const res = await apiFetch(`/api/layouts/${id}/apply`, { method: "POST" });
+      const d = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (res.status === 202) { showToast("Layout queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) {
+        showToast(typeof d.error === "string" && d.error ? d.error : "That layout's gated off, Chef", "warn");
+        return;
+      }
+      if (!res.ok) {
+        const msg = [d.output, d.error, d.clarify].find((v) => typeof v === "string" && v) as string | undefined;
+        showToast(msg || "Couldn't set that layout, Chef — try again.", "warn");
+        return;
+      }
+      const out = typeof d.output === "string" && d.output ? d.output : "Layout applied 🔥";
+      // "not found" / "no active project" come back as 200 ok-narrations — they read honestly as-is.
+      showToast(out, out.includes("applied") ? "fire" : "warn", out.includes("applied") ? "execute" : undefined);
+      if (!isMockModeRef.current) { refetchTerminals(); refetchLedger(); }
+    } catch { showToast("Couldn't set that layout, Chef — try again.", "warn"); }
+  }, [refetchTerminals, refetchLedger, showToast, mockClientOnly]);
+
+  const deleteLayout = useCallback(async (id: string) => {
+    if (mockClientOnly()) {
+      setLayouts((prev) => prev.filter((l) => l.id !== id)); // keep the pass honest client-side
+      showToast("86'd that layout", "fire", "execute");
+      return;
+    }
+    try {
+      const res = await apiFetch(`/api/layouts/${id}`, { method: "DELETE" });
+      if (res.status === 202) { showToast("86 queued — needs your ok at the pass 🛎", "warn"); return; }
+      if (res.status === 403) { showToast("That 86 is gated off, Chef", "warn"); return; }
+      if (!res.ok) { showToast("Couldn't 86 that layout, Chef — try again.", "warn"); return; }
+      showToast("86'd that layout", "fire", "execute");
+      if (!isMockModeRef.current) refetchLayouts();
+      else setLayouts((prev) => prev.filter((l) => l.id !== id)); // armed mock: no real refetch
+    } catch { showToast("Couldn't 86 that layout, Chef — try again.", "warn"); }
+  }, [refetchLayouts, showToast, mockClientOnly]);
+
   // ── 2K.2: per-pane gate override (the Rulebook's pane scope) ─────────────
   // PUT the pane's whole override map (the bulk matrix-editor route, src/actions/defs/locks.ts
   // setPaneGates). res.ok-checked; on failure the ledger is refetched so the segs snap back to truth.
@@ -1410,10 +1648,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
+    templates, layouts,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
     executePlan, deletePlan,
+    createTemplate, updateTemplate, deleteTemplate, applyTemplate,
+    saveLayout, applyLayout, deleteLayout, refetchTemplates, refetchLayouts,
     refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,

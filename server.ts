@@ -1403,6 +1403,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
         pendingId,
         callId,
         term,
+        // Fan-out staging (dispatch_to_panes): never auto-execute — every write parks as a pending
+        // approval. The REST guard is already off, so only the auto_execute downgrade applies here.
+        forceStage: opts.forceStage === true,
       },
       {
         // REST binds the THREE connection-bound values: null session, broadcast as the pending-notify

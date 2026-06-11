@@ -1,5 +1,5 @@
 import fs from "fs";
-import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft } from "./types";
+import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft, PromptTemplate, PaneLayout } from "./types";
 import type { StoredNote } from "./store/types";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
@@ -56,6 +56,8 @@ export interface LedgerLike {
   getPaneContext(projectId: string, paneId: string): { model: ContextEntry[]; human: ContextEntry[]; legacy: string[] } | null;
   plans: Plan[];
   watchRules: WatchRule[];
+  promptTemplates: PromptTemplate[];
+  layouts: PaneLayout[];
   archiveExitedPanes(projectId?: string): number;
   listArchived(workspaceId?: string): ArchivedPane[];
   restoreArchivedPane(paneId: string): ArchivedPane | null;
@@ -67,6 +69,8 @@ export class Ledger {
   workspaces: Record<string, Workspace> = {};
   watchRules: WatchRule[] = [];
   plans: Plan[] = [];
+  promptTemplates: PromptTemplate[] = [];
+  layouts: PaneLayout[] = [];
   archivedPanes: ArchivedPane[] = [];
   private storagePath: string;
 
@@ -84,6 +88,8 @@ export class Ledger {
         this.workspaces = parsed.workspaces || {};
         this.watchRules = parsed.watchRules || [];
         this.plans = parsed.plans || [];
+        this.promptTemplates = parsed.promptTemplates || [];
+        this.layouts = parsed.layouts || [];
         this.archivedPanes = parsed.archivedPanes || [];
       }
     } catch (e) {
@@ -132,6 +138,8 @@ export class Ledger {
         workspaces: this.workspaces,
         watchRules: this.watchRules,
         plans: this.plans,
+        promptTemplates: this.promptTemplates,
+        layouts: this.layouts,
         archivedPanes: this.archivedPanes
       }, null, 2);
       await fs.promises.writeFile(tempPath, data, "utf-8");
@@ -157,6 +165,8 @@ export class Ledger {
         workspaces: this.workspaces,
         watchRules: this.watchRules,
         plans: this.plans,
+        promptTemplates: this.promptTemplates,
+        layouts: this.layouts,
         archivedPanes: this.archivedPanes
       }, null, 2);
       fs.writeFileSync(tempPath, data, "utf-8");

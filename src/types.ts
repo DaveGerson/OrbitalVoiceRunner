@@ -340,7 +340,9 @@ export interface SystemSettings {
 
 export interface AttentionItem {
   id: string;
-  type: "approval" | "exited" | "error" | "build-failed" | "confirmation";
+  // "idle" = informational completion (dispatch-group join, src/observe/index.ts) — consumers only
+  // interpolate `type` into text, so the widening is display-safe.
+  type: "approval" | "exited" | "error" | "build-failed" | "confirmation" | "idle";
   terminalId: string;
   projectId: string;
   message: string;
@@ -386,6 +388,45 @@ export interface TemplateRecipe {
     preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
     permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   }[];
+}
+
+// ── Prompt templates (journey-expansion: structured instruction inputs) ──────
+// A named, parameterized instruction body. Slots use `{{slot_name}}` syntax and
+// are DERIVED from the body (extractSlots in src/templates.ts) — never stored
+// stale. Applying a template instantiates the body into a pane's WIP draft
+// (compose-then-send), so the existing draft review + gated send path stays the
+// single write choke-point.
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  body: string;
+  created_at: number;
+  updated_at: number;
+}
+
+// ── Pane layouts (journey-expansion: "mise en place", split out of recipes) ──
+// A snapshot of a project's pane formation: launch command, cwd, preset, and
+// permission mode per pane. Pure furniture — NO orchestration logic and NO
+// startup commands are ever auto-run. Applying a layout rides the same gates
+// as applying a recipe (apply_recipe layout veto + per-pane create_pane).
+export interface LayoutPane {
+  id: string;
+  name: string;
+  command: string;
+  cwd: string;
+  preset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
+  permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+}
+
+export interface PaneLayout {
+  id: string;
+  name: string;
+  description?: string;
+  /** The project the snapshot was taken from (informational; apply targets the active project). */
+  sourceProjectId?: string;
+  panes: LayoutPane[];
+  created_at: number;
 }
 
 
