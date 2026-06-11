@@ -124,6 +124,38 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
   const outputBuffers: Record<string, string[]> = {};
   let flushTimeout: NodeJS.Timeout | null = null;
 
+  // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on a pane
+  // edge and announce each group it NEWLY completed through the existing sinks. Called from TWO
+  // sites — the genuine onIdle completion edge (success settle; shell panes return to a prompt,
+  // so the chunk classifier often never sees a fresh "idle" edge) and detectAndTriggerTransitions
+  // (failure settles: error/build-failed/exited). noteTransition only flips still-running members
+  // and reports a group exactly once, so the sites can never double-announce.
+  function settleDispatchJoin(
+    terminalId: string,
+    transition: "idle" | "prompt" | "error" | "build-failed" | "exited"
+  ): void {
+    for (const g of dispatchJoinTracker.noteTransition(terminalId, transition)) {
+      const total = g.members.length;
+      const done = g.members.filter((m) => m.status === "done").length;
+      const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
+      const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
+      manager.attentionQueue.push({
+        id: "att_" + Math.random().toString(36).substring(2, 11),
+        // Informational completion item ("idle" — widened onto AttentionItem.type for this).
+        type: "idle",
+        terminalId,
+        projectId: manager.ledger.activeProjectId || "default_project",
+        message: summary,
+        timestamp: new Date().toISOString(),
+        dismissed: false
+      });
+      pruneAttention(); // BUG-035 cap/TTL
+      broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+      broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
+      announcementBus.enqueue({ kind: "completion", terminalId, summary });
+    }
+  }
+
   async function summarizeCommandOutcome(command: string, rawOutput: string): Promise<string> {
     try {
       const apiKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
@@ -164,6 +196,15 @@ ${redact(rawOutput.slice(-3000))}`;
   }
 
   const onIdle = async (terminalId: string): Promise<void> => {
+    // Dispatch join: the genuine Running→Idle completion edge is the SUCCESS settle signal (the
+    // chunk classifier below dedups on lastStates, so shell panes that return to a prompt never
+    // produce a fresh "idle" edge there). Guarded per QW5 — a join fault must not skip the
+    // summarization/announcement below.
+    try {
+      settleDispatchJoin(terminalId, "idle");
+    } catch (e) {
+      console.error(`[onIdle] dispatch-join settle failed for ${terminalId}:`, e);
+    }
     const term = manager.terminals[terminalId];
     if (term) {
       const history = historyManager.loadHistory(terminalId);
@@ -497,34 +538,15 @@ ${redact(rawOutput.slice(-3000))}`;
       handleWatchRulesTrigger(terminalId, transition);
       handlePlansTrigger(terminalId, transition);
 
-      // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on this
-      // edge and announce each group it NEWLY completed. This is the ONE settle site for
-      // idle/error/build-failed/exited — the lastStates edge-dedup above means each pane edge
-      // settles exactly once, and onIdle deliberately does NOT call the tracker (its idle edge is
-      // already classified here; calling from both would double-settle). `prompt` is a no-op
-      // inside the tracker (awaiting input is not done). Guarded in its own try/catch (QW5
-      // philosophy): a join fault must never break observation or the triggers above.
+      // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on the
+      // FAILURE edges here (error/build-failed/exited — lastStates-deduped, once per genuine
+      // edge). The SUCCESS settle lives on the genuine onIdle completion edge instead: a shell
+      // pane returns to a prompt after a command, so this classifier often sees no fresh "idle"
+      // edge at all (prompt==previousState), while the status machine's Running→Idle edge always
+      // fires. noteTransition only touches still-running members, so the two sites can never
+      // double-announce a group. Guarded per QW5: a join fault must never break observation.
       try {
-        for (const g of dispatchJoinTracker.noteTransition(terminalId, transition)) {
-          const total = g.members.length;
-          const done = g.members.filter((m) => m.status === "done").length;
-          const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
-          const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
-          manager.attentionQueue.push({
-            id: "att_" + Math.random().toString(36).substring(2, 11),
-            // Informational completion item ("idle" — widened onto AttentionItem.type for this).
-            type: "idle",
-            terminalId,
-            projectId: manager.ledger.activeProjectId || "default_project",
-            message: summary,
-            timestamp: new Date().toISOString(),
-            dismissed: false
-          });
-          pruneAttention(); // BUG-035 cap/TTL
-          broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-          broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
-          announcementBus.enqueue({ kind: "completion", terminalId, summary });
-        }
+        settleDispatchJoin(terminalId, transition);
       } catch (e) {
         console.error(`[TRANSITION] dispatch-join step failed for ${terminalId}:`, e);
       }

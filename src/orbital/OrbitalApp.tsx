@@ -244,10 +244,14 @@ export default function OrbitalApp() {
         <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
           <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
           <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-            <ThePass notes={data.notes} plans={data.plans} jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
+            <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts}
+              stations={stations} activePaneId={data.activeTerminalId}
+              jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
               onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
               onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
-              onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan} />
+              onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
+              onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
+              onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
             <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
           </div>
           {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}

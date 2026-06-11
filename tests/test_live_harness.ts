@@ -120,8 +120,11 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // then 37 -> 41 by bead bjm (get_project_notes + search_notes + amend_note + delete_note),
     // then 41 -> 43 by Wave D (get_action_log + get_health observability pair),
     // then 43 -> 44 by P4 / bead 1y8 (restart_pane — the live Full-Auto promotion voice tool),
-    // then 44 -> 45 by wsm-e2e-pinned-5h0 (close_pane — the exit+archive voice tool).
-    assert.strictEqual(decls.length, 45, "exactly 45 voice tools declared");
+    // then 44 -> 45 by wsm-e2e-pinned-5h0 (close_pane — the exit+archive voice tool),
+    // then 45 -> 56 by journey-expansion templates/layouts/dispatch (list/create/update/delete/
+    // apply_prompt_template, save_project_layout/list_layouts/apply_layout/delete_layout,
+    // dispatch_to_panes + get_dispatch_status — docs/design/templates-layouts-dispatch.md §3).
+    assert.strictEqual(decls.length, 56, "exactly 56 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

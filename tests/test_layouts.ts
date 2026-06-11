@@ -36,7 +36,7 @@ interface CtxProbe {
 
 /** A live-terminal stub carrying exactly the fields save_project_layout snapshots. */
 interface StubTerm {
-  id: string;
+  terminalId: string;
   projectId: string;
   shellCmd?: string;
   cwd?: string;
@@ -130,9 +130,9 @@ describe("save_project_layout — snapshots ONLY the target project's live panes
     const { ctx, probe, layouts } = makeCtx({
       projects: { projA: { directory: "/work/a" }, projB: { directory: "/work/b" } },
       terminals: {
-        a1: { id: "a1", projectId: "projA", shellCmd: "claude --resume", cwd: "/work/a/one", toolPreset: "Claude Code", permissionsMode: "Full Auto" },
-        a2: { id: "a2", projectId: "projA", shellCmd: "codex", cwd: "/work/a/two", toolPreset: "Codex", permissionsMode: "Read-Only" },
-        b1: { id: "b1", projectId: "projB", shellCmd: "bash", cwd: "/work/b", toolPreset: "Custom", permissionsMode: "Human-in-the-Loop" },
+        a1: { terminalId: "a1", projectId: "projA", shellCmd: "claude --resume", cwd: "/work/a/one", toolPreset: "Claude Code", permissionsMode: "Full Auto" },
+        a2: { terminalId: "a2", projectId: "projA", shellCmd: "codex", cwd: "/work/a/two", toolPreset: "Codex", permissionsMode: "Read-Only" },
+        b1: { terminalId: "b1", projectId: "projB", shellCmd: "bash", cwd: "/work/b", toolPreset: "Custom", permissionsMode: "Human-in-the-Loop" },
       },
     });
     const result = await runAction(REGISTRY, "save_project_layout", { name: "duo", project_id: "projA" }, ctx);
@@ -164,7 +164,7 @@ describe("save_project_layout — snapshots ONLY the target project's live panes
   it("missing snapshot fields fall back (command '' / preset Custom / mode Human-in-the-Loop)", async () => {
     const { ctx, layouts } = makeCtx({
       projects: { projA: { directory: "/work/a" } },
-      terminals: { bare: { id: "bare", projectId: "projA" } },
+      terminals: { bare: { terminalId: "bare", projectId: "projA" } },
     });
     const result = await runAction(REGISTRY, "save_project_layout", { name: "bare", project_id: "projA" }, ctx);
     assert.strictEqual(result.kind, "ok");
@@ -179,7 +179,7 @@ describe("save_project_layout — snapshots ONLY the target project's live panes
     const { ctx, probe, layouts } = makeCtx({
       projects: { projA: { directory: "/work/a" }, projB: { directory: "/work/b" } },
       // only projB has live panes — projA snapshots empty
-      terminals: { b1: { id: "b1", projectId: "projB" } },
+      terminals: { b1: { terminalId: "b1", projectId: "projB" } },
     });
     const result = await runAction(REGISTRY, "save_project_layout", { name: "empty", project_id: "projA" }, ctx);
     assert.strictEqual(result.kind, "ok");
@@ -198,7 +198,7 @@ describe("apply_layout — gate dispositions and the addTerminal spawn probe", (
     const { ctx, probe } = makeCtx({
       layouts: [seedLayout()],
       projects: { projA: { directory: "/work/a" } },
-      terminals: { p1: { id: "p1", projectId: "projA" } }, // p1 is already live
+      terminals: { p1: { terminalId: "p1", projectId: "projA" } }, // p1 is already live
     });
     const result = await runAction(REGISTRY, "apply_layout", { layout_id: "layout_seed1" }, ctx);
     assert.strictEqual(result.kind, "ok");

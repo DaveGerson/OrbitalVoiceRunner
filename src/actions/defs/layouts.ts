@@ -51,8 +51,8 @@ export const saveProjectLayout: ActionDef<typeof SaveProjectLayoutParams> = {
     const panes: LayoutPane[] = Object.values(ctx.manager.terminals)
       .filter((t: any) => t.projectId === projectId)
       .map((t: any) => ({
-        id: t.id,
-        name: t.id,
+        id: t.terminalId,
+        name: t.terminalId,
         command: String(t.shellCmd ?? ""),
         cwd: String(t.cwd ?? ""),
         preset: t.toolPreset ?? "Custom",

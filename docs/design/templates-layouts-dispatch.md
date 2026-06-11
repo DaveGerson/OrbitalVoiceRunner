@@ -107,19 +107,23 @@ and `DispatchDeps` (paneWrite.ts).
   `noteTransition()` returns groups *newly* completed so the caller announces
   exactly once.
 
-**Remaining (work item A):** `src/observe/index.ts` must feed the tracker:
+**Implemented (work item A; revised after live smoke):** `src/observe/index.ts`
+feeds the tracker:
 - `onRunning` → `dispatchJoinTracker.noteRunning(terminalId)`;
-- `detectAndTriggerTransitions` (after the watch-rules/plans triggers) and the
-  genuine `onIdle` edge → `noteTransition(terminalId, transition)`; for each
-  newly-completed group: push an attention item (type `"idle"`-style info,
-  message `Dispatch '<name>' complete: <done>/<n> done[, <e> failed]`),
-  `pruneAttention()`, `broadcast attention_updated` + `dispatch_updated`, and
-  `announcementBus.enqueue({ kind: "completion", terminalId, summary: … })` —
-  reusing the existing sinks only, no new I/O. NOTE: `onIdle` fires the
-  genuine Running→Idle completion edge but `detectAndTriggerTransitions` also
-  classifies `idle` — call the tracker from ONE place per edge kind
-  (transition handler for idle/error/build-failed/exited; `onRunning` for the
-  running edge) to avoid double-settling.
+- **success settle on the genuine `onIdle` completion edge** (the status
+  machine's Running→Idle). The original plan settled `idle` from
+  `detectAndTriggerTransitions`, but the live smoke showed shell panes return
+  to a *prompt* after a command, so the chunk classifier's `lastStates` dedup
+  often never produces a fresh `idle` edge — the group never completed.
+  `onIdle` always fires per genuine completion;
+- failure settles (`error`/`build-failed`/`exited`) stay in
+  `detectAndTriggerTransitions` (edge-deduped). Both sites share one
+  `settleDispatchJoin()` helper; `noteTransition` only flips still-running
+  members and reports a group exactly once, so the two sites can never
+  double-announce. Completion fans out through the existing sinks only:
+  attention item (type `"idle"`, widened onto `AttentionItem.type`),
+  `pruneAttention()`, `attention_updated` + `dispatch_updated` broadcasts, and
+  `announcementBus.enqueue({ kind: "completion", … })`.
 
 ## 6. UI slice (REMAINING — work item C)
 
