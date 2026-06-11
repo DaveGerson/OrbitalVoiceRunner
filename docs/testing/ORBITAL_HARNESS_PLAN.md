@@ -52,16 +52,25 @@ scored against regression thresholds (e.g. mis-attribution rate) rather than har
 | `tests/test_us_epic06_durability.ts`     | US-6.1 .. 6.6 |
 | `tests/helpers/vignettes.ts` + `tests/test_us_vignettes.ts` | US-2.5, 3.4, 3.5, 4.2, 5.4 scored |
 
-## Status
+## Status — COMPLETE
 
-- [ ] Production: Q1 breadcrumb fairness
-- [ ] Production: Q2 history redaction-at-rest
-- [ ] E01 monitoring
-- [ ] E02 switching
-- [ ] E03 ping-pong
-- [ ] E04 away/back
-- [ ] E05 orchestration
-- [ ] E06 durability
-- [ ] Vignette scoring harness
-- [ ] Full suite green (`npm run typecheck` + `npm test`)
-- [ ] Commit + push to `claude/orbital-harness-test-plan-jo30jw`
+- [x] Production: Q1 breadcrumb fairness (`b4404cd`)
+- [x] Production: Q2 history redaction-at-rest (`b4404cd`)
+- [x] E01 monitoring — 15 tests (`5a83366`)
+- [x] E02 switching — 15 tests (`0b37fea`)
+- [x] E03 ping-pong — 13 tests (`9995dba`)
+- [x] E04 away/back — 14 tests (`b909506`)
+- [x] E05 orchestration — 15 tests (`b70a697`)
+- [x] E06 durability — 19 tests (`0561a69`)
+- [x] Vignette scoring harness — 4 scored scenarios (`b909506`)
+- [x] Full suite green: `npm run typecheck` clean + `npm test` = 1730 pass / 0 fail
+- [x] Commit + push to `claude/orbital-harness-test-plan-jo30jw`
+
+### Characterizations recorded (current behavior pinned as regression guards)
+- US-2.2: attention entries are stamped with the *active* project id, not the pane's own project (pane ref carries the true target).
+- US-2.1: `GET /api/ledger` has no `activeProjectId` envelope; authoritative read is `manager.ledger.activeProjectId`.
+- US-3.2: legacy (JSON) backend drafts are durable on reload, not lost.
+- US-1.1: completion travels via the announcement/pane-signal lane + `pane_transition`, not a `pane_status status:"Idle"` frame.
+- US-1.5 / US-6.3: `add_pane_note` and `.janus_history`-adjacent surfaces — notes are stored raw in the ledger; redaction is a read/brief-boundary guarantee. (History file itself is now redacted at rest per Q2.)
+- US-6.1: WorldModel Project tier exposes summary/keyTerms; notes' recall home is `getProjectBriefing`, not the tier.
+- US-4.5: `bootMaintenance` prunes data honestly but emits no operator-facing "what rolled off" summary.
