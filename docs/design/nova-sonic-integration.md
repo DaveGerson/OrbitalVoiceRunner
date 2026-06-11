@@ -70,7 +70,9 @@ seam is the single place provider routing was added** — no new plumbing was th
 | --- | --- |
 | `src/voice/novaSonic.ts` | The Nova Sonic connector + session adapter + the pure output-event translator + input-event builders + the async input queue that drives the Bedrock bidirectional stream. |
 | `src/actions/nova.ts` | `toNovaToolSpecs(...)` — re-projects the **same** `toGeminiDeclarations(REGISTRY)` output into Bedrock's `toolConfiguration.tools[]` shape. Registry stays the single source of truth for the toolset. |
+| `src/voice/novaRouting.ts` | Pure provider-selection (`resolveVoiceProvider`) + AWS-credential precedence (`resolveNovaAuth`, settings → env → default), carved out of `server.ts` so the prod routing branch is unit-testable. |
 | `tests/test_nova_provider.ts` | 14 pure-logic tests (no AWS, no socket): output-event translation, tool conversion, voice mapping, input-event builders. |
+| `tests/test_nova_routing.ts` | 7 pure-logic tests: provider selection precedence + settings/env credential resolution. |
 | `docs/design/nova-sonic-integration.md` | This document. |
 
 ### Edited files (small, additive)
@@ -228,12 +230,59 @@ UI change" task. It is a reasonable follow-up if cross-reconnect continuity prov
 
 ---
 
+## 8a. Before you turn it on — IAM scope + first-session checklist
+
+AWS credentials are **not** a scoped API key. Unlike the Gemini key (one API), an AWS access/secret key
+is as powerful as its attached IAM policy and now lives in the app's settings file on the same host that
+runs arbitrary CLI panes. **Mint a dedicated, least-privilege credential** — do not paste a broad or
+admin key.
+
+Least-privilege IAM policy (only the one model, only the one action the adapter calls):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NovaSonic2BidirectionalOnly",
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModelWithBidirectionalStream",
+      "Resource": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-sonic-v1:0"
+    }
+  ]
+}
+```
+
+Notes: add a Resource line per region you enable (the model ARN is region-scoped); the account must
+have **Bedrock model access** granted for Nova 2 Sonic in that region (Bedrock console → Model access);
+prefer a short-lived/rotatable IAM user or a role with temporary credentials (the adapter honours
+`AWS_SESSION_TOKEN`).
+
+First live session — the acceptance gate (CI cannot cover this):
+
+1. Settings → Voice → provider **Amazon Nova Sonic 2**; Secrets → enter the scoped Access Key ID +
+   Secret Access Key + a Nova region; **Apply & Reconnect**.
+2. Confirm the basics: mic audio reaches the model, spoken audio returns, and both the operator and
+   "Janus" transcripts render.
+3. **Watch the stream lifecycle (the one real code unknown).** Have a multi-turn conversation and watch
+   the server log for repeated `[VOICE] … voice channel lost` → reconnect lines. One reconnect per
+   *turn* means Nova is ending the response stream per turn and the adapter is tearing down too early —
+   that needs a fix (keep the prompt open across turns) before real use. Steady, no per-turn reconnects
+   = correct.
+4. **Exercise a tool.** Say "list the panes" / "relay to pane 2 …" and confirm the tool dispatches and
+   the result is spoken back. A `promptStart` rejection here ("Unable to parse input chunk") means
+   tool-use isn't enabled for the model in that region — switch region (us-east-1 first).
+5. **Watch cost the first time.** Nova bills in your account; an always-open mic stream + a ~40-tool
+   surface (tool-loop reports exist) can run up usage. Check the Bedrock usage/billing console after the
+   first session until you trust it.
+
 ## 9. Reviewer's map (smallest-to-largest)
 
 1. `src/actions/nova.ts` — tool projection (mechanical).
-2. `tests/test_nova_provider.ts` — the behavioral contract in executable form.
-3. `src/voice/novaSonic.ts` — the adapter; read `translateNovaEvent` and `NovaLiveSession` first.
-4. `server.ts` — the routing branch in `realLiveConnector` + `resolveVoiceProvider` / `novaAuthFromSettings`, and the `sanitizeSettingsForClient` / `PUT` secret handling.
+2. `src/voice/novaRouting.ts` + `tests/test_nova_routing.ts` — provider/credential resolution (pure).
+3. `tests/test_nova_provider.ts` — the behavioral contract in executable form.
+4. `src/voice/novaSonic.ts` — the adapter; read `translateNovaEvent` and `NovaLiveSession` first.
+5. `server.ts` — the routing branch in `realLiveConnector` (now one-liners delegating to `novaRouting`), and the `sanitizeSettingsForClient` / `PUT` secret handling.
 5. `src/types.ts` — the four optional settings fields.
 6. `src/components/SettingsDialog.tsx` — provider selector + AWS credential fields.
 

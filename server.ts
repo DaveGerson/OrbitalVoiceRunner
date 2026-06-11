@@ -31,7 +31,8 @@ import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 import { restGateOutcome } from "./src/restGate";
 import { classifyRawKey, isKnownRawKey } from "./src/rawKeyClass";
 import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceResumption";
-import { connectNovaSonic, type NovaAuth } from "./src/voice/novaSonic";
+import { connectNovaSonic } from "./src/voice/novaSonic";
+import { resolveVoiceProvider, resolveNovaAuth } from "./src/voice/novaRouting";
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
@@ -157,8 +158,8 @@ export const realLiveConnector: LiveConnector = (ai, params, key) => {
   // events into the Gemini LiveServerMessage shape, so connectLiveSession is provider-agnostic. The
   // Nova adapter validates its OWN credentials and rejects when they are blank (mirroring the Gemini
   // blank-key reject below), so the gemini-key short-circuit does not apply on this path.
-  if (resolveVoiceProvider() === "nova") {
-    return connectNovaSonic(params as any, novaAuthFromSettings());
+  if (resolveVoiceProvider(manager.settings.voiceAi) === "nova") {
+    return connectNovaSonic(params as any, resolveNovaAuth(manager.settings, process.env));
   }
   if (isBlankApiKey(key)) {
     // Reject WITHOUT touching ai.live.connect — connectLiveSession's catch turns this into a clean
@@ -167,34 +168,6 @@ export const realLiveConnector: LiveConnector = (ai, params, key) => {
   }
   return ai.live.connect(params);
 };
-
-/**
- * Which conversational backend the live voice session should use. Reads `voiceAi.provider` (set from
- * the Settings UI); DEFAULT "gemini" (absent ⇒ gemini) so every existing config is unchanged. The
- * model id is sniffed as a belt-and-suspenders fallback (an "amazon.nova-*" model implies Nova even if
- * the provider field was never set). Read at connect time so an Apply & Reconnect switches backends.
- */
-function resolveVoiceProvider(): "gemini" | "nova" {
-  if (manager.settings.voiceAi?.provider === "nova") return "nova";
-  if (manager.settings.voiceAi?.provider === "gemini") return "gemini";
-  return String(manager.settings.voiceAi?.model ?? "").startsWith("amazon.nova") ? "nova" : "gemini";
-}
-
-/** Resolve AWS credentials for the Nova connector from settings (secret) or env (fallback). */
-function novaAuthFromSettings(): NovaAuth {
-  const s = manager.settings;
-  const accessKeyId = (s.secrets?.awsAccessKeyId && s.secrets.awsAccessKeyId !== "CONFIGURED_IN_ENV")
-    ? s.secrets.awsAccessKeyId : (process.env.AWS_ACCESS_KEY_ID || "");
-  const secretAccessKey = (s.secrets?.awsSecretAccessKey && s.secrets.awsSecretAccessKey !== "CONFIGURED_IN_ENV")
-    ? s.secrets.awsSecretAccessKey : (process.env.AWS_SECRET_ACCESS_KEY || "");
-  const region = s.voiceAi?.awsRegion || process.env.AWS_REGION || "us-east-1";
-  return {
-    accessKeyId,
-    secretAccessKey,
-    region,
-    ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}),
-  };
-}
 let liveConnector: LiveConnector = realLiveConnector;
 export function setLiveConnector(fn: LiveConnector) {
   liveConnector = fn;
