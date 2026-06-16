@@ -24,6 +24,7 @@
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
+import { findPaneOwningProject } from "../../paneOwnership";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // switch_active_pane — UNGATED focus move (server.ts:2613-2632).
@@ -54,8 +55,10 @@ export const switchActivePane: ActionDef<typeof SwitchActivePaneParams> = {
   handler: (args, ctx): ActionResult => {
     const targetId = args.pane_id;
     const term = ctx.manager.terminals[targetId];
-    const wsProj = ctx.manager.ledger.getActiveProject();
-    const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+    // bd #70: ungated existence guard (focus_pane is UNGATED) — resolve via the canonical
+    // owning-project lookup so a pane in a NON-active project isn't wrongly reported as missing.
+    // This is a usability guard, NOT a gate-decision path (the divergence is intentional).
+    const paneExists = !!term || !!findPaneOwningProject(ctx.manager, targetId);
     let output = "";
     if (!paneExists) {
       output = `Cannot switch: pane '${targetId}' does not exist.`;

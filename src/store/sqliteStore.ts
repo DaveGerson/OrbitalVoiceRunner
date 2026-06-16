@@ -852,6 +852,18 @@ export class JanusStore {
     return id ? this.getProject(id) : null;
   }
 
+  /** bd #69: the owning project id for a pane via ONE indexed query (the panes PRIMARY KEY leads
+   *  with pane_id, so this is an index probe — NOT a table scan). findPaneOwningProject's tier-3
+   *  runs on the hot gate/posture path; the old fallback read the `workspaces` getter, which on this
+   *  backend materializes the ENTIRE ledger (3× SELECT * + assembly) just to read one pane's owner.
+   *  Returns null when the pane is unknown. */
+  getProjectIdForPane(paneId: string): string | null {
+    const r = this.db.prepare("SELECT workspace_id FROM panes WHERE pane_id=? LIMIT 1").get(paneId) as
+      | { workspace_id: string }
+      | undefined;
+    return r?.workspace_id ?? null;
+  }
+
   /** All projects keyed by id, in legacy Workspace shape (read snapshot).
    *
    *  4E.4: built in ONE pass — three queries total (projects, panes, notes) assembled in

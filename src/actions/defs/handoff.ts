@@ -34,6 +34,7 @@ import type { CapabilityGate } from "../../types";
 import { redactSecrets, classifySecrets } from "../../terminal";
 import { isStagedStale } from "../../pendingApprovals";
 import { deliverOutcomeToHandoff, type DeliverDispatchKind } from "../../handoffFlow";
+import { findPaneOwningProject } from "../../paneOwnership";
 import type { HandoffState } from "../../store/types";
 
 /** Mirror of server.ts HistoryEntry (server.ts:93-98) — the per-command history row. */
@@ -275,8 +276,10 @@ export const stageHandoff: ActionDef<typeof StageHandoffParams> = {
         resp = `Error: handoff ${handoff_id} not found.`;
       } else {
         const targetTerm = ctx.manager.terminals[h.to_pane];
-        const wsProj = ctx.manager.ledger.getActiveProject();
-        const targetExists = !!targetTerm || !!(wsProj && wsProj.panes[h.to_pane]);
+        // bd #70: ungated existence guard (compose_draft is UNGATED) — resolve via the canonical
+        // owning-project lookup so a target pane in a NON-active project isn't wrongly reported as
+        // missing. Usability guard, NOT a gate-decision path (the divergence is intentional).
+        const targetExists = !!targetTerm || !!findPaneOwningProject(ctx.manager, h.to_pane);
         if (!targetExists) {
           resp = `Cannot stage: target pane ${h.to_pane} no longer exists.`;
         } else {

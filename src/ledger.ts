@@ -32,6 +32,10 @@ export interface LedgerLike {
   switchContext(id: string): unknown;
   getProject(id: string): Workspace | null;
   getActiveProject(): Workspace | null;
+  // bd #69: targeted pane→owning-project lookup for findPaneOwningProject tier-3. The SQLite
+  // backend answers this with ONE indexed query (panes PK leads with pane_id) instead of
+  // materializing every workspace via the `workspaces` getter on the hot gate/posture path.
+  getProjectIdForPane(paneId: string): string | null;
   getProjectBriefing(id: string): {
     project_id: string; summary: string; directory: string;
     panes: PaneMeta[]; notes: string[]; key_codebase_terms: string[];
@@ -301,6 +305,16 @@ export class Ledger {
   getActiveProject(): Workspace | null {
     if (!this.activeProjectId) return null;
     return this.workspaces[this.activeProjectId] || null;
+  }
+
+  // bd #69: the legacy in-memory backend has no index, so this is the same O(projects) scan the
+  // tier-3 fallback used to do inline — but it lives behind the shared LedgerLike method so the
+  // SQLite backend can answer it with a single indexed query on the hot gate/posture path.
+  getProjectIdForPane(paneId: string): string | null {
+    for (const ws of Object.values(this.workspaces)) {
+      if (ws?.panes?.[paneId]) return ws.id;
+    }
+    return null;
   }
 
   switchContext(id: string) {
