@@ -1,4 +1,4 @@
-name: "CI (lint + unit)"
+name: "CI (lint + unit + e2e)"
 
 on:
   push:
@@ -28,3 +28,70 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+  # The mock lane (?mock=1 harness, Vite only — no backend): every orbital_*.spec.ts UI flow.
+  # Green here proves the client wiring, not the server — the live lane below covers the wire.
+  e2e-mock:
+    name: "e2e mock lane / chromium / ubuntu"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright (mock lane)
+        run: npm run test:e2e
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-mock-traces
+          path: test-results/
+          retention-days: 7
+
+  # The live lane (PW_LIVE=1): the REAL `tsx server.ts` on a fresh temp JANUS_DB — pane
+  # creation through the capability gate, stop-all, drafts, real PTY spawns. No Gemini key
+  # needed (the lane never opens a voice session). Serial specs, generous timeouts.
+  e2e-live:
+    name: "e2e live lane / chromium / ubuntu"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright (live lane)
+        run: npm run test:e2e:live
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-live-traces
+          path: test-results/
+          retention-days: 7

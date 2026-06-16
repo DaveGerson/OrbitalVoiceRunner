@@ -52,6 +52,7 @@ import { z } from "zod";
 import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
 import { getHistoryBridge } from "../../historyBridge";
+import { findPaneOwningProject } from "../../paneOwnership";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HistoryManager re-derivation (faithful port of server.ts:129-217 load/save/add).
@@ -166,8 +167,11 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
   handler: (args, ctx): ActionResult => {
     const id = args.pane_id;
     const term = ctx.manager.terminals[id];
-    const activeProject = ctx.manager.ledger.getActiveProject();
-    const pane = activeProject?.panes[id];
+    // Resolve the pane via its OWNING project, not the active one (mirrors archive.ts Restore). A
+    // ledger-only pane in a NON-active project would otherwise be missed here and — worse — respawned
+    // into the active project's directory with no project id (lands it in the wrong project/cwd).
+    const owner = findPaneOwningProject(ctx.manager, id);
+    const pane = owner?.pane;
 
     // Unknown pane: faithful inline 404 path, surfaced as ok-narration (200) — the client ignores the
     // body. Resolve BEFORE the gate so we never stage/forbid a restart of a pane that does not exist.
@@ -191,7 +195,11 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
       }
       const preset = normalizePreset(pane!.tool_preset);
       const cmd = presetCommand(preset, ctx.manager.settings.presets, ctx.manager.settings.advanced?.defaultShellCommand);
-      ctx.manager.addTerminal(id, activeProject!.directory || process.cwd(), cmd, preset, pane!.permissions_mode, pane!.session_id);
+      // Spawn into the pane's OWNING project (its directory + project id as the 7th arg), NOT the active
+      // project — mirrors archive.ts Restore so a non-active-project pane lands back where it belongs.
+      const owningProjectId = owner!.projectId;
+      const cwd = ctx.manager.ledger.getProject(owningProjectId)?.directory || process.cwd();
+      ctx.manager.addTerminal(id, cwd, cmd, preset, pane!.permissions_mode, pane!.session_id, owningProjectId);
       ctx.broadcastLedgerUpdate();
       ctx.broadcastTerminalsUpdated();
       return `Terminal ${id} restored and started.`;

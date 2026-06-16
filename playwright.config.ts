@@ -17,8 +17,11 @@ import path from "node:path";
  *   own .janus* state is never touched and the boot-time JSON→SQLite migration finds nothing to
  *   import). No ?mock=1: pane creation, the capability gate, stop-all and clear-exited run
  *   end-to-end against the real REST + observe-WS surface. Boots WITHOUT a GEMINI key (the
- *   GoogleGenAI client only warns; the live lane never opens a voice session). One serial spec,
- *   generous timeouts (real PTY spawns).
+ *   GoogleGenAI client only warns; the live lane never opens a voice session). Every live spec
+ *   (e2e/live_*.spec.ts) is serial WITHIN its file, and the lane runs ONE worker (below) because
+ *   all files share the one real server: stop-all freezes every capability globally and the
+ *   gate engine resolves per-pane overrides against the single ACTIVE project, so interleaved
+ *   files would corrupt each other's state. Generous timeouts (real PTY spawns).
  */
 const LIVE = process.env.PW_LIVE === "1";
 const LIVE_PORT = Number(process.env.PW_LIVE_PORT || 3117);
@@ -30,6 +33,9 @@ if (LIVE) fs.mkdirSync(LIVE_STATE_DIR, { recursive: true });
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
+  // The live specs share ONE real server + state set (freeze flag, active project, the board),
+  // so the lane is single-worker: files run one at a time, in filename order.
+  workers: LIVE ? 1 : undefined,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? "github" : "list",
@@ -41,15 +47,15 @@ export default defineConfig({
     ? [
         {
           name: "live",
-          testMatch: /live_kitchen\.spec\.ts/,
+          testMatch: /live_.*\.spec\.ts/,
           timeout: 180_000, // real server, real PTYs — generous by design
           use: { ...devices["Desktop Chrome"] },
         },
       ]
     : [
-        // The default lane stays mock-only: the live spec is excluded here so `npm run test:e2e`
+        // The default lane stays mock-only: the live specs are excluded here so `npm run test:e2e`
         // never needs (or touches) a real server.
-        { name: "chromium", testIgnore: /live_kitchen\.spec\.ts/, use: { ...devices["Desktop Chrome"] } },
+        { name: "chromium", testIgnore: /live_.*\.spec\.ts/, use: { ...devices["Desktop Chrome"] } },
       ],
   webServer: LIVE
     ? {

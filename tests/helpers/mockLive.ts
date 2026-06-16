@@ -40,6 +40,12 @@ export interface MockLiveHandle {
   latest: () => MockLiveSession | undefined;
   /** Find the most recent tool response the server emitted for a given call id. */
   responseFor: (callId: string) => any | undefined;
+  /**
+   * Like responseFor, but returns the FULL `response` object instead of `.output`. Needed for
+   * structured non-ok responses that carry no `output` key — e.g. propose_command's HiTL answer
+   * `{ status: "pending_approval", messageId, pane_id, prompt }` (src/actions/gemini.ts voiceResponse).
+   */
+  rawResponseFor: (callId: string) => any | undefined;
   reset: () => void;
 }
 
@@ -98,6 +104,15 @@ export function installMockLive(): MockLiveHandle {
         for (let r = sessions[s].responses.length - 1; r >= 0; r--) {
           const fr = sessions[s].responses[r]?.functionResponses?.[0];
           if (fr?.id === callId) return fr.response?.output;
+        }
+      }
+      return undefined;
+    },
+    rawResponseFor(callId: string) {
+      for (let s = sessions.length - 1; s >= 0; s--) {
+        for (let r = sessions[s].responses.length - 1; r >= 0; r--) {
+          const fr = sessions[s].responses[r]?.functionResponses?.[0];
+          if (fr?.id === callId) return fr.response;
         }
       }
       return undefined;

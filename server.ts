@@ -46,7 +46,7 @@ import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/i
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonSynthClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
-import { createGating } from "./src/gating";
+import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
 dotenv.config();
@@ -1382,8 +1382,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     const pendingId = opts.pendingId ?? callId;
     const capability: CapabilityGate = opts.capability ?? "write_to_pane";
     const term = manager.terminals[targetId];
-    const wsProj = manager.ledger.getActiveProject();
-    const paneExists = !!term || !!(wsProj && wsProj.panes[targetId]);
+    // Pane existence follows the pane's OWNING project (findPaneOwningProject), not the active one —
+    // a REST dispatch at a ledger-only pane in a non-active project is a real pane, not error_no_pane.
+    const paneExists = !!term || !!findPaneOwningProject(manager, targetId);
     const runtimeType = term?.runtimeType;
     const kind = inferKind(opts.explicitKind, runtimeType);
 

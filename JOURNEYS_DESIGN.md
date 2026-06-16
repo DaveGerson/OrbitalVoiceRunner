@@ -116,10 +116,19 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 
 ## 4. Maintenance and Validation Strategy
 
-To prevent functional regression, all eight user journeys are tested inside `/tests/test_journeys.ts` — the six primary journeys plus the two secondary ones (7: dictate spec → durable note → recall/restart; 8: pane tail → redaction → note capture). *(This closes the journey-coverage half of `docs/review/BUG_LOG.md` BUG-038 / drift item D5.)*
+Journey coverage lives in several layers (not just the journey suite):
 
-To verify and run all validation tests:
+*   **Journey suite (`/tests/test_journeys.ts`):** Journeys 1–6 at the noun level (real PTY panes, real ledger). Its J2/J3/J6 verb logic is locally mocked — the real verbs are covered by the purpose-built suites below.
+*   **Purpose-built unit/integration suites:** the real approval parser/routing/durability (`test_approvals_wse`, `test_voice_approval_routing`, `test_pendingApprovals_durable`), the real status machine (`test_status_machine`), notes + recall with redaction (`test_notes_recall`, `test_c55_12_notes`), capability gates (`test_capability_gate`, `test_c55_16_set_pane_gates`), and `get_pane_summary` redaction at the real method (`test_redaction`) — covering the J7/J8 components.
+*   **Live e2e lane (`e2e/live_*.spec.ts`, `npm run test:e2e:live`):** real server + real PTYs, no mock harness — pane lifecycle through the capability gate, archive/restore, per-pane gate behavior, keyboard-only operation, draft durability, stop-all.
+*   **Drift guards:** every registry action must be referenced by at least one test (`tests/test_action_test_presence.ts`); voice/REST surface asymmetries are allowlist-gated (`tests/test_action_coverage.ts`).
+
+CI runs the lint + unit suite plus both Playwright lanes (mock and live) — see `.github/workflows/ci.yml`.
+
+To verify locally:
 ```bash
-# Compile and run the complete test suite
-npx tsx --test tests/*.ts
+npm run lint            # tsc --noEmit
+npm test                # unit suite (tsx --test --test-force-exit)
+npm run test:e2e        # Playwright mock lane (?mock=1)
+npm run test:e2e:live   # Playwright live lane (real server, fresh temp DB)
 ```

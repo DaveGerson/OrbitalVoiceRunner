@@ -53,7 +53,9 @@ export interface ActionPostureInput {
   globalMode: GlobalMode;
   /** The TARGET pane's current mode (term.permissionsMode); ignored when globalMode !== "Inherit". */
   paneMode: EffectiveMode | undefined;
-  /** The pane's per-pane capability overrides (PaneMeta.capabilityGates). */
+  /** The pane's per-pane capability overrides (PaneMeta.capabilityGates). LOCKSTEP: the caller must
+   *  source these from the pane's OWNING project (findPaneOwningProject, src/gating/index.ts) — NOT
+   *  ledger.getActiveProject() — or a non-active-project pane's override is silently dropped. */
   paneGates: CapabilityGateMap | undefined;
   /** The global default gates (settings.advanced.capabilityGates). */
   globalGates: CapabilityGateMap | undefined;
@@ -90,7 +92,8 @@ export function effectiveModeFromState(globalMode: GlobalMode, paneMode: Effecti
   return globalMode;
 }
 
-/** Mirror of server.ts effectiveCapabilityGateFor: one capability's effective gate (via gateSurface). */
+/** Mirror of effectiveCapabilityGateFor (src/gating/index.ts): one capability's effective gate (via
+ *  gateSurface). `paneGates` must be the OWNING project's overrides — see ActionPostureInput. */
 export function effectiveGateFromState(
   capability: CapabilityGate,
   paneId: string | null,

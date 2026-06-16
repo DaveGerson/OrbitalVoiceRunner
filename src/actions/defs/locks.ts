@@ -21,6 +21,7 @@ import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import type { CapabilityGate, CapabilityGateMap, GateValue } from "../../types";
 import { isLoosening } from "../../pendingApprovals";
+import { findPaneOwningProject } from "../../paneOwnership";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_global_permissions — server.ts:2887 (GATED, durable Ask-defer via gateOrDefer)
@@ -350,21 +351,20 @@ export const setCapabilityGate: ActionDef<typeof SetCapabilityGateParams> = {
       // preserves the SAME object reference + write while staying type-correct across the branch.
       const globalGates: CapabilityGateMap = ctx.manager.settings.advanced.capabilityGates;
       if (pane_id) {
-        const proj = ctx.manager.ledger.getActiveProject();
-        const pane = proj?.panes?.[pane_id];
-        if (!pane) {
-          resp = `Pane ${pane_id} not found in the active project.`;
+        // Resolve the pane's OWNING project (paneOwnership.ts) — the write side of the
+        // owning-project fix: a voice "lock down that pane" for a pane in a NON-active project
+        // used to fail with not-found because only getActiveProject() was consulted.
+        const owned = findPaneOwningProject(ctx.manager, pane_id);
+        if (!owned) {
+          resp = `Pane ${pane_id} not found in any project.`;
         } else {
+          const { projectId, pane } = owned;
           const nextGates: CapabilityGateMap = { ...(pane.capabilityGates || {}) };
           nextGates[capability as CapabilityGate] = gate as GateValue;
           pane.capabilityGates = nextGates;
           // Persist via updatePane so the per-pane override survives in BOTH backends (SQLite writes
           // the capability_gates column; a bare save() would be a no-op there — bead 8sq schema v4).
-          ctx.manager.ledger.updatePane(
-            ctx.manager.ledger.activeProjectId || "default_project",
-            pane,
-            true,
-          );
+          ctx.manager.ledger.updatePane(projectId, pane, true);
           resp = `Set per-pane gate '${capability}' = ${gate} for pane ${pane_id}.`;
         }
       } else {
