@@ -2704,24 +2704,30 @@ function AppRaw() {
             <div className="flex flex-1 flex-row overflow-hidden">
               <div className="flex-1 flex flex-col overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
-                  <div className="flex gap-2 items-center overflow-hidden">
+                  <div className="flex gap-2 items-center overflow-hidden min-w-0">
                     <span className="text-[10px] font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
                       {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
                     </span>
-                    <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate" title={activeTerminal.command}>
+                    <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
                       $ {activeTerminal.command}
                     </span>
                     {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
-                        payload). Click for the full 16-capability breakdown in plain language. */}
+                        payload). Click for the full 16-capability breakdown in plain language. The
+                        shrink-0 wrapper keeps the chip from being collapsed/overlapped by the right-hand
+                        controls when the header is narrowed (sidebar + transcript panel open). Without
+                        it the adjacent History button / cwd span hit-test on top of the trigger and
+                        intercept the click (CI e2e mock-lane gate_chip popover spec). */}
                     {activeTerminal.posture && (
-                      <GateChip
-                        effectiveGates={activeTerminal.effective_gates}
-                        posture={activeTerminal.posture}
-                        isActivePane
-                      />
+                      <span className="shrink-0">
+                        <GateChip
+                          effectiveGates={activeTerminal.effective_gates}
+                          posture={activeTerminal.posture}
+                          isActivePane
+                        />
+                      </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-4 shrink-0">
                     <span className="text-[10px] font-mono opacity-40 truncate" title={activeTerminal.cwd}>
                       {activeTerminal.cwd}
                     </span>
