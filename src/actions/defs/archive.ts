@@ -14,7 +14,7 @@
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import { ALWAYS_ALLOWED } from "../types";
-import { normalizePreset, presetCommand } from "../../terminal";
+import { respawnFromLedger } from "../respawnFromLedger";
 
 const NoParams = z.object({});
 const PaneIdParams = z.object({ pane_id: z.string() });
@@ -102,23 +102,14 @@ export const restoreArchivedPane: ActionDef<typeof PaneIdParams> = {
     // process.cwd()), command DERIVED from tool_preset (never last_command), persisted
     // permissions_mode + session_id, spawned INTO entry.project_id (not the active project).
     const pane = entry.pane;
-    const preset = normalizePreset(pane.tool_preset);
-    const cmd = presetCommand(preset, ctx.manager.settings.presets, ctx.manager.settings.advanced?.defaultShellCommand);
-    const cwd = ctx.manager.ledger.getProject(entry.project_id)?.directory || process.cwd();
-    const spawnEffect = (): string => {
-      ctx.manager.addTerminal(
+    const spawnEffect = (): string =>
+      respawnFromLedger(
+        ctx,
         args.pane_id,
-        cwd,
-        cmd,
-        preset,
-        pane.permissions_mode || "Human-in-the-Loop",
-        pane.session_id || "",
+        pane,
         entry.project_id,
+        `Pane ${args.pane_id} restored and its terminal respawned.`,
       );
-      ctx.broadcastLedgerUpdate();
-      ctx.broadcastTerminalsUpdated();
-      return `Pane ${args.pane_id} restored and its terminal respawned.`;
-    };
     const g = ctx.gateOrDefer(
       "restart_pane",
       args.pane_id,

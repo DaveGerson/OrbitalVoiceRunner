@@ -39,6 +39,13 @@ describe("restore_archived_pane respawns through the restart_pane gate", () => {
   let projDir: string;
   let prevCwd: string;
   const projectId = "restore-proj";
+  // A second project pair for the respawn_pane owning-project case (folded in from the former
+  // test_respawn_owning_project.ts): respawn must land a ledger-only pane in its OWNING project even
+  // when a DIFFERENT project is active.
+  let ownerDir: string;
+  let activeDir: string;
+  const ownerProjectId = "owner-proj";
+  const activeProjectId = "active-proj";
 
   const api = (pathname: string, init: RequestInit = {}): Promise<Response> =>
     fetch(`${base}${pathname}`, {
@@ -87,6 +94,13 @@ describe("restore_archived_pane respawns through the restart_pane gate", () => {
 
     // Our own project with a REAL directory — the respawned pane must inherit it as cwd.
     running.manager.ledger.addProject(projectId, projDir, "restore-respawn suite");
+
+    // Owning-project respawn case: two more projects with distinct dirs (the respawn_pane test below
+    // makes the NON-owner active to prove the pane still lands in its owning project).
+    ownerDir = fs.mkdtempSync(path.join(tmpDir, "owner-"));
+    activeDir = fs.mkdtempSync(path.join(tmpDir, "active-"));
+    running.manager.ledger.addProject(ownerProjectId, ownerDir, "respawn owning — owner");
+    running.manager.ledger.addProject(activeProjectId, activeDir, "respawn owning — active");
   });
 
   after(async () => {
@@ -94,7 +108,7 @@ describe("restore_archived_pane respawns through the restart_pane gate", () => {
     try {
       await (running.manager as any).flushPendingSpawns?.();
       for (const id of Object.keys(running.manager.terminals)) {
-        if (id.startsWith("rr-")) { await (running.manager.terminals as any)[id].stop(); delete (running.manager.terminals as any)[id]; }
+        if (id.startsWith("rr-") || id.startsWith("ro-")) { await (running.manager.terminals as any)[id].stop(); delete (running.manager.terminals as any)[id]; }
       }
     } catch { /* best-effort */ }
     await teardownServerSuite(running);
@@ -176,6 +190,39 @@ describe("restore_archived_pane respawns through the restart_pane gate", () => {
     const body = await res.json();
     assert.strictEqual(body.output, "Archived pane rr-ghost not found.");
     assert.strictEqual(Object.keys(running.manager.terminals).length, before, "no spawn for a missing id");
+  });
+
+  // ── respawn_pane owning-project coverage (folded in from the former test_respawn_owning_project.ts) ─
+  // UNIQUE assertion preserved: respawn_pane (POST /api/terminals/:id/restart), NOT restore, lands a
+  // LEDGER-ONLY pane in its OWNING project (term.projectId === ownerProjectId, term.cwd === ownerDir)
+  // when a DIFFERENT project is active. Regression target: the un-fixed ledger-only branch resolved the
+  // pane via the ACTIVE project and spawned with the active dir / no project id — this fails it (lands in
+  // the wrong project). Reuses this suite's single server boot (a separate server-boot describe would hit
+  // teardownServerSuite's already-closed fetch pool). The Auto/Ask/Off gate matrix stays pinned above.
+  it("respawn_pane: gate Auto respawns a ledger-only pane into its OWNING (non-active) project, not the active one", async () => {
+    setRestartGate("Auto");
+    // Make the NON-owner project active, then seed a ledger-only pane in the OWNER project.
+    running.manager.ledger.switchContext(activeProjectId);
+    assert.strictEqual(running.manager.ledger.getActiveProject()?.id, activeProjectId, "active project is the NON-owner");
+    running.manager.ledger.updatePane(ownerProjectId, {
+      pane_id: "ro-auto", name: "ro-auto", runtime_type: "shell", tool_preset: "Custom",
+      permissions_mode: "Full Auto", session_id: "", last_known_state: "Exited",
+      is_busy: false, alive: false, context_size: 0, notes: [],
+    } as any, true);
+    assert.ok(running.manager.ledger.getProject(ownerProjectId)?.panes?.["ro-auto"], "seed: ro-auto in owner project");
+    assert.ok(!(running.manager.terminals as any)["ro-auto"], "seed: ro-auto has no live terminal");
+
+    const res = await api("/api/terminals/ro-auto/restart", { method: "POST" });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.match(String(body.output), /restored and started|restarted/i, "narration confirms the respawn");
+
+    const term = (running.manager.terminals as any)["ro-auto"];
+    assert.ok(term, "pane respawned into manager.terminals");
+    assert.strictEqual(term.projectId, ownerProjectId, "respawn lands in the pane's OWNING project, NOT the active one");
+    assert.strictEqual(term.cwd, ownerDir, "respawn uses the OWNING project's directory as cwd, NOT the active one");
+    assert.strictEqual(term.toolPreset, "Custom", "respawn uses the persisted tool_preset");
+    assert.strictEqual(term.permissionsMode, "Full Auto", "respawn uses the persisted permissions_mode");
   });
 });
 

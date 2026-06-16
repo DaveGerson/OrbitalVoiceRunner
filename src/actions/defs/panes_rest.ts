@@ -50,9 +50,9 @@ import fs from "fs";
 import path from "path";
 import { z } from "zod";
 import type { ActionContext, ActionDef, ActionResult } from "../types";
-import { normalizePreset, presetCommand } from "../../terminal";
 import { getHistoryBridge } from "../../historyBridge";
 import { findPaneOwningProject } from "../../paneOwnership";
+import { respawnFromLedger } from "../respawnFromLedger";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HistoryManager re-derivation (faithful port of server.ts:129-217 load/save/add).
@@ -193,16 +193,10 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
         })().catch((e) => console.error(`[restart_pane] deferred restart failed for ${id}:`, e));
         return `Terminal ${id} restarted.`;
       }
-      const preset = normalizePreset(pane!.tool_preset);
-      const cmd = presetCommand(preset, ctx.manager.settings.presets, ctx.manager.settings.advanced?.defaultShellCommand);
       // Spawn into the pane's OWNING project (its directory + project id as the 7th arg), NOT the active
       // project — mirrors archive.ts Restore so a non-active-project pane lands back where it belongs.
-      const owningProjectId = owner!.projectId;
-      const cwd = ctx.manager.ledger.getProject(owningProjectId)?.directory || process.cwd();
-      ctx.manager.addTerminal(id, cwd, cmd, preset, pane!.permissions_mode, pane!.session_id, owningProjectId);
-      ctx.broadcastLedgerUpdate();
-      ctx.broadcastTerminalsUpdated();
-      return `Terminal ${id} restored and started.`;
+      // Shared spawn closure: presetCommand(normalizePreset(pane.tool_preset), …) — one launch home.
+      return respawnFromLedger(ctx, id, pane!, owner!.projectId, `Terminal ${id} restored and started.`);
     };
 
     const g = ctx.gateOrDefer(
