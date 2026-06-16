@@ -20,8 +20,9 @@
 //   1. SUPERVISED COMMAND — HiTL pane: propose_command stages a pending approval (the model gets
 //      the pending-style tool response), the operator SPEAKS "approve" (real transcript frame),
 //      the command executes on the real pane, and the operator-visible command_auto_executed
-//      frame (approved+vocal) names pane + command. (The SPOKEN "Approving:…" narration is a
-//      known dead path — see the journey-1 comment — so the frame is the asserted confirmation.)
+//      frame (approved+vocal) names pane + command, AND the SPOKEN "Approving:…" read-back now
+//      fires and is asserted (BUG-041 fix: applyResolution reads sessionFor() BEFORE resolveDecision
+//      claim+deletes the record — see the journey-1 body) — both the frame and the narration confirm.
 //   2. REJECTION — spoken "reject": the command NEVER runs, the approval clears, and the
 //      command_blocked / approval_resolved frames confirm.
 //   3. DEFER — spoken "not now" (the Phase 4 defer verb, src/approvalIntent.ts): the approval
