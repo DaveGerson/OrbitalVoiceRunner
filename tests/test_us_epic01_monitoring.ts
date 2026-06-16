@@ -155,7 +155,9 @@ describe("US-1.1 Background completion awareness (P0)", () => {
   async function spawnAndRun(mgr: any, id: string, cmd: string): Promise<any> {
     mgr.addTerminal(id, tmpDir, SHELL, "Custom", "Read-Only");
     const term = mgr.terminals[id];
-    // Let the PTY attach before writing (the shell flushes queued input on first onData).
+    // Fixed wait kept on purpose: this is pure attach-settling BEFORE the first writeInput, and the
+    // terminal exposes no public "PTY ready" signal to poll on (readiness is internal write-buffering).
+    // It precedes any status edge, so there is no observable condition for waitFor() to gate on here.
     await new Promise((r) => setTimeout(r, 400));
     term.writeInput(`${cmd}\n`);
     return term;
@@ -301,12 +303,16 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
       const A = mgr.terminals["us12r-A"] as any;
       A.idleTimeoutMs = 200;
       A.agentIdleTimeoutMs = 200;
-      await new Promise((r) => setTimeout(r, 400)); // let the PTY attach
+      // Fixed wait kept on purpose: pure attach-settling BEFORE writeInput; no public "PTY ready"
+      // signal to poll on (readiness is internal write-buffering) and it precedes any status edge.
+      await new Promise((r) => setTimeout(r, 400));
       A.writeInput("echo a; sleep 0.25; echo b; sleep 0.5; echo DONE\n");
 
       await waitFor(() => A.status === "Running", 4000);
       await waitFor(() => A.status === "Idle", 8000);
-      // Give a small grace window so a (buggy) second idle edge would have a chance to register.
+      // Fixed wait kept on purpose: this proves the ABSENCE of a second idle edge, so there is no
+      // positive condition to poll toward — the window must fully elapse to give a (buggy) extra
+      // onIdle a chance to register before we assert idleCount === 1.
       await new Promise((r) => setTimeout(r, 400));
 
       assert.ok(sawRunning, "the pane reached a genuine Running edge");

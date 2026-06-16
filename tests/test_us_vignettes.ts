@@ -375,7 +375,7 @@ describe("US-4.2 'what was I doing' (answer grounded in notes/history, not inven
     const grounding = scoreGroundingPrecedesClaim(run);
 
     // The recall turn led with grounding/recall tools (no invented-claim tool ran first).
-    assert.strictEqual(grounding.rate >= MIN_GROUNDED_RATE, true, `grounded rate ${grounding.rate} >= ${MIN_GROUNDED_RATE}`);
+    assert.ok(grounding.rate >= MIN_GROUNDED_RATE, `grounded rate ${grounding.rate} is below the threshold ${MIN_GROUNDED_RATE}`);
 
     // The history read returned the SEEDED content — verifiable in the leg's result + the tool output.
     const histLeg = run.legs.find((l) => l.name === "get_pane_command_history");
