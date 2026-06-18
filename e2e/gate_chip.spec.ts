@@ -3,8 +3,12 @@ import { test, expect, gotoMockedApp, setPostureMock } from "./fixtures";
 /**
  * bead 8sq (spec §2.A / §8): the per-pane EFFECTIVE-posture chip. Renders ONE calm posture word +
  * colored dot + a focus ★ when the spotlight loosened a write here; click opens a popover listing all
- * 16 capabilities in PLAIN language. The chip renders from SERVER truth (the posture/effective_gates
- * the harness seeds), never client policy re-derivation.
+ * capabilities in PLAIN language. The chip renders from SERVER truth (the posture/effective_gates the
+ * harness seeds), never client policy re-derivation.
+ *
+ * PHASE 2 (veto-toggle honesty): the popover now renders the HONEST status per enforcement class —
+ * deferrable caps show their raw Auto/Ask/Off word; veto caps show only Allowed/Blocked (a veto "Ask"
+ * is collapsed to "Allowed" — never shown as "Ask"); informational caps show an "Always on" badge.
  */
 
 const ALL_AUTO: Record<string, "Auto" | "Ask" | "Off"> = {
@@ -48,23 +52,60 @@ test.describe("gate chip — effective posture", () => {
     await expect(chip.getByTestId("gate-chip-trigger")).toContainText("LOCKED");
   });
 
-  test("popover lists all 16 capabilities in plain language (no raw identifiers)", async ({ page }) => {
+  test("popover lists all capabilities in plain language (no raw identifiers)", async ({ page }) => {
     await gotoMockedApp(page);
     await page.getByTestId("gate-chip-trigger").first().click();
     const popover = page.getByTestId("gate-chip-popover");
     await expect(popover).toBeVisible();
 
-    // A few plain labels are present; the raw identifier is NOT.
+    // A few plain labels are present; NO raw snake_case identifier leaks.
     await expect(popover).toContainText("Type a command into a pane");
     await expect(popover).toContainText("Close a pane");
     await expect(popover).toContainText("Change these safety gates");
     await expect(popover).not.toContainText("write_to_pane");
+    await expect(popover).not.toContainText("compose_draft");
+    await expect(popover).not.toContainText("set_voice_mute");
 
-    // All 16 capability rows render.
+    // Every seeded capability row renders.
     const caps = Object.keys(ALL_AUTO);
     for (const cap of caps) {
       await expect(popover.getByTestId(`gate-row-${cap}`)).toBeVisible();
     }
-    expect(caps).toHaveLength(16);
+    // And the PHASE 2 promoted veto/informational rows render too (27-cap matrix).
+    await expect(popover.getByTestId("gate-row-compose_draft")).toBeVisible();
+    await expect(popover.getByTestId("gate-row-read_pane")).toBeVisible();
+    await expect(popover.getByTestId("gate-row-set_voice_mute")).toBeVisible();
+  });
+
+  test("popover renders the HONEST control per enforcement class (Phase 2)", async ({ page }) => {
+    await gotoMockedApp(page);
+    await page.getByTestId("gate-chip-trigger").first().click();
+    const popover = page.getByTestId("gate-chip-popover");
+    await expect(popover).toBeVisible();
+
+    // informational (set_voice_mute) → read-only "Always on" badge, never a gate word.
+    const muteRow = popover.getByTestId("gate-row-set_voice_mute");
+    await expect(muteRow).toHaveAttribute("data-control", "badge");
+    await expect(muteRow).toContainText("Always on");
+
+    // veto (compose_draft) defaults Auto → shows "Allowed", and is tagged as a two-way control.
+    const draftRow = popover.getByTestId("gate-row-compose_draft");
+    await expect(draftRow).toHaveAttribute("data-control", "two-way");
+    await expect(draftRow).toContainText("Allowed");
+
+    // deferrable (write_to_pane) stays a three-way control.
+    const writeRow = popover.getByTestId("gate-row-write_to_pane");
+    await expect(writeRow).toHaveAttribute("data-control", "three-way");
+  });
+
+  test("a veto cap NEVER displays 'Ask' — a seeded Ask collapses to Allowed", async ({ page }) => {
+    await gotoMockedApp(page);
+    // Seed compose_draft = Ask (a legacy/incoherent value for a veto cap). The popover must show it as
+    // Allowed, proving the switch never lies about a veto cap supporting "Ask".
+    await setPostureMock(page, "GUARDED", { ...ALL_AUTO, compose_draft: "Ask" });
+    await page.getByTestId("gate-chip-trigger").first().click();
+    const draftRow = page.getByTestId("gate-chip-popover").getByTestId("gate-row-compose_draft");
+    await expect(draftRow).toContainText("Allowed");
+    await expect(draftRow).not.toContainText("Ask");
   });
 });

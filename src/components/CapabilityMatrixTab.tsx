@@ -17,9 +17,31 @@
 
 import React, { useState } from "react";
 import type { CapabilityGate, GateValue, CapabilityGateMap, CliPreset } from "../types";
-import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS, sanitizePartialGateMap } from "../gateSurface";
+import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS, sanitizePartialGateMap, controlForEnforcement } from "../gateSurface";
 
 const GATE_OPTIONS: GateValue[] = ["Auto", "Ask", "Off"];
+
+/**
+ * PHASE 2 (veto-toggle honesty): the 2-way Allow/Off control offered for VETO-class capabilities.
+ * "Ask" cannot defer-and-return a synchronous veto op, so it is NEVER shown. "Allow" maps to the
+ * stored value "Auto"; an existing stored "Ask" DISPLAYS as Allow (and writing Allow stores "Auto"),
+ * so a legacy Ask seed never renders a switch that lies about what it does.
+ */
+const VETO_OPTIONS: { label: string; value: GateValue }[] = [
+  { label: "Allow", value: "Auto" },
+  { label: "Off", value: "Off" },
+];
+
+/**
+ * Which veto slot reads "selected" for a stored value. Off ⇒ the Off slot; a stored Auto OR a legacy
+ * Ask ⇒ the Allow slot (a veto Ask is DISPLAYED as Allow — never as its own option). `undefined` (no
+ * override) selects NOTHING, mirroring the 3-way's "absent = follow global" unselected slot so the
+ * per-pane reset affordance still reads correctly.
+ */
+const vetoSelected = (value: GateValue | undefined, optValue: GateValue): boolean => {
+  if (value === undefined) return false;
+  return optValue === "Off" ? value === "Off" : value !== "Off";
+};
 
 /** Plain one-word effect per gate value + active swatch (the single gate-language palette). */
 const GATE_PRESENTATION: Record<GateValue, { label: string; active: string }> = {
@@ -162,30 +184,70 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
             {caps.map((cap) => {
               const value = valueOf(cap);
               const isPaneScope = scope.kind === "pane";
+              // PHASE 2: render the HONEST control for this capability's enforcement class.
+              const control = controlForEnforcement(cap);
               return (
-                <div key={cap} data-testid={`matrix-row-${cap}`} className="flex items-center justify-between gap-3 bg-black/40 border border-white/5 rounded px-3 py-1.5">
+                <div key={cap} data-testid={`matrix-row-${cap}`} data-control={control} className="flex items-center justify-between gap-3 bg-black/40 border border-white/5 rounded px-3 py-1.5">
                   <span className="text-zinc-300 text-[11px] flex-1 min-w-0 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
                   <div className="flex items-center gap-1 shrink-0">
-                    <div className="inline-flex rounded border border-white/10 overflow-hidden" role="group" aria-label={CAPABILITY_LABELS[cap]}>
-                      {GATE_OPTIONS.map((opt) => {
-                        const selected = value === opt;
-                        const p = GATE_PRESENTATION[opt];
-                        return (
-                          <button
-                            key={opt}
-                            type="button"
-                            data-testid={`matrix-${cap}-${opt}`}
-                            aria-pressed={selected}
-                            onClick={() => setGate(cap, opt)}
-                            className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
-                          >
-                            {p.label}
-                          </button>
-                        );
-                      })}
-                    </div>
-                    {/* Per-pane scope: a value absent means "follow global". Offer a clear-override affordance. */}
-                    {isPaneScope && value !== undefined && (
+                    {/* informational → read-only "Always on" badge (never an interactive control). */}
+                    {control === "badge" && (
+                      <span
+                        data-testid={`matrix-${cap}-badge`}
+                        title="This isn't a safety gate — it can't be turned off."
+                        className="px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold rounded border border-white/10 text-zinc-400 bg-white/[0.03]"
+                      >
+                        Always on
+                      </span>
+                    )}
+
+                    {/* veto → 2-way Allow / Off. "Allow" stores "Auto"; a stored Ask shows as Allow. */}
+                    {control === "two-way" && (
+                      <div className="inline-flex rounded border border-white/10 overflow-hidden" role="group" aria-label={CAPABILITY_LABELS[cap]}>
+                        {VETO_OPTIONS.map((opt) => {
+                          const selected = vetoSelected(value, opt.value);
+                          const p = GATE_PRESENTATION[opt.value];
+                          return (
+                            <button
+                              key={opt.label}
+                              type="button"
+                              data-testid={`matrix-${cap}-${opt.label}`}
+                              aria-pressed={selected}
+                              onClick={() => setGate(cap, opt.value)}
+                              className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* deferrable → 3-way Auto / Ask / Off (unchanged). */}
+                    {control === "three-way" && (
+                      <div className="inline-flex rounded border border-white/10 overflow-hidden" role="group" aria-label={CAPABILITY_LABELS[cap]}>
+                        {GATE_OPTIONS.map((opt) => {
+                          const selected = value === opt;
+                          const p = GATE_PRESENTATION[opt];
+                          return (
+                            <button
+                              key={opt}
+                              type="button"
+                              data-testid={`matrix-${cap}-${opt}`}
+                              aria-pressed={selected}
+                              onClick={() => setGate(cap, opt)}
+                              className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
+                            >
+                              {p.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Per-pane scope: a value absent means "follow global". Offer a clear-override
+                        affordance — but NOT for informational caps (no gate to reset). */}
+                    {isPaneScope && value !== undefined && control !== "badge" && (
                       <button
                         type="button"
                         data-testid={`matrix-${cap}-clear`}

@@ -161,6 +161,9 @@ function makeCtx(opts?: {
     broadcastDraft: (projectId: string, paneId: string): void => {
       probe.draftBroadcasts.push({ projectId, paneId });
     },
+    // PHASE 2: apply_prompt_template now Off-vetoes on the veto-class compose_draft capability.
+    // Default Auto keeps these tests behavior-preserving (the gate never bites here).
+    effectiveCapabilityGateFor: (): "Auto" | "Ask" | "Off" => "Auto",
   } as unknown as ActionContext;
   return { ctx, probe, templates };
 }

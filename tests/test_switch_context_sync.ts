@@ -47,6 +47,8 @@ describe("switch_context catch-up briefing is non-stale (fact [E])", () => {
     const ctx = {
       manager,
       broadcastLedgerUpdate: () => {},
+      // PHASE 2: switch_context now Off-vetoes on its veto-class capability; default Auto = no change.
+      effectiveCapabilityGateFor: () => "Auto",
     } as unknown as ActionContext;
 
     const res = switchContext.handler({ project_id: "proj_x" }, ctx);
@@ -80,6 +82,8 @@ describe("switch_context catch-up briefing is non-stale (fact [E])", () => {
     const ctx = {
       manager,
       broadcastLedgerUpdate: () => { events.push("broadcastLedgerUpdate"); },
+      // PHASE 2: switch_context now Off-vetoes on its veto-class capability; default Auto = no change.
+      effectiveCapabilityGateFor: () => "Auto",
     } as unknown as ActionContext;
 
     const res = switchContext.handler({ project_id: "proj_y" }, ctx);

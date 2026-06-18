@@ -14,13 +14,14 @@
  */
 
 import React, { useState, useRef, useEffect } from "react";
-import type { CapabilityGate, CapabilityGateMap } from "../types";
+import type { CapabilityGate, CapabilityGateMap, GateValue } from "../types";
 import {
   CAPABILITY_LABELS,
   CAPABILITY_CATEGORIES,
   ALL_CAPABILITIES,
   POSTURE_STYLE,
   GATE_STYLE,
+  controlForEnforcement,
   normalizePostureWord,
   normalizeEffectiveGates,
   type PostureWord,
@@ -130,14 +131,34 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
                   // `gates` is already normalized → always a valid GateValue. The `?? GATE_STYLE.Ask`
                   // hard fallback makes this row provably non-throwing regardless of upstream changes.
                   const value = gates[cap];
-                  const g = GATE_STYLE[value] ?? GATE_STYLE.Ask;
+                  // PHASE 2 (veto-toggle honesty): show the HONEST status per enforcement class so the
+                  // popover never implies a control the gate doesn't really have.
+                  //   informational → a read-only "Always on" badge (never gated).
+                  //   veto          → Allow/Blocked only; a veto "Ask" is collapsed to "Allowed" (it
+                  //                   can't defer, so Ask is effectively Allow — never shown as "Ask").
+                  //   deferrable    → the raw Auto/Ask/Off word (unchanged 3-way semantics).
+                  const control = controlForEnforcement(cap);
+                  if (control === "badge") {
+                    return (
+                      <div key={cap} data-testid={`gate-row-${cap}`} data-control="badge" className="flex items-center justify-between gap-2">
+                        <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
+                        <span className="flex items-center gap-1 shrink-0 text-zinc-500" title="Not a safety gate — always on.">
+                          <span className="uppercase normal-case font-sans text-[9px]">Always on</span>
+                        </span>
+                      </div>
+                    );
+                  }
+                  // veto displays Auto/Ask as "Allowed", Off as "Blocked"; deferrable shows the raw word.
+                  const displayValue: GateValue = control === "two-way" && value !== "Off" ? "Auto" : value;
+                  const g = GATE_STYLE[displayValue] ?? GATE_STYLE.Ask;
+                  const word = control === "two-way" ? g.word : displayValue;
                   const viaFocus = isActivePane && SPOTLIGHT_CAPS.has(cap) && value === "Auto";
                   return (
-                    <div key={cap} data-testid={`gate-row-${cap}`} className="flex items-center justify-between gap-2">
+                    <div key={cap} data-testid={`gate-row-${cap}`} data-control={control} className="flex items-center justify-between gap-2">
                       <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
                       <span className={`flex items-center gap-1 shrink-0 ${g.text}`}>
                         <span className={`inline-block w-1 h-1 rounded-full ${g.dot}`} />
-                        <span className="uppercase">{value}</span>
+                        <span className="uppercase">{word}</span>
                         {viaFocus && <span className="text-cyan-400 normal-case" title="Loosened because this is the focused pane">· via focus</span>}
                       </span>
                     </div>

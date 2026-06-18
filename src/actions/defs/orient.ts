@@ -137,6 +137,13 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
   // c55 Batch B: snake_case route param so Express injects :project_id onto the snake_case zod key.
   rest: { method: "post", path: "/api/projects/:project_id/switch" },
   handler: (args, ctx: ActionContext): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): switch_context is a veto-class capability — "Ask" cannot defer a
+    // synchronous focus switch, so the only meaningful operator setting is Off. Block on an EXPLICIT
+    // Off veto (default Auto → behavior-preserving). This is an ACTION, not a read, so STOP-ALL SHOULD
+    // block it (no `!ctx.isFrozen()` bypass — effectiveCapabilityGateFor resolves Off while frozen).
+    if (ctx.effectiveCapabilityGateFor(null, "switch_context") === "Off") {
+      return { kind: "ok", output: "Error: the 'switch_context' capability is gated Off; switching the active project is forbidden by policy." };
+    }
     const projectId = args.project_id;
     ctx.manager.ledger.switchContext(projectId);
     ctx.manager.settings.projects.activeContext = projectId;
@@ -288,6 +295,13 @@ export const dismissAttention: ActionDef<typeof DismissAttentionParams> = {
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/attention/:id/dismiss" },
   handler: (args, ctx: ActionContext): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): dismiss_attention is a veto-class capability — "Ask" cannot defer
+    // a synchronous queue mutation, so the only meaningful operator setting is Off. Block on an EXPLICIT
+    // Off veto (default Auto → behavior-preserving). This is an ACTION, not a read, so STOP-ALL SHOULD
+    // block it (no `!ctx.isFrozen()` bypass — effectiveCapabilityGateFor resolves Off while frozen).
+    if (ctx.effectiveCapabilityGateFor(null, "dismiss_attention") === "Off") {
+      return { kind: "ok", output: "Error: the 'dismiss_attention' capability is gated Off; dismissing alerts is forbidden by policy." };
+    }
     const targetId = args.id;
     let output: string;
     if (targetId) {

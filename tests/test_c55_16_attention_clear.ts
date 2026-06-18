@@ -73,6 +73,8 @@ function makeCtx(attentionQueue: Array<{ id: string; dismissed: boolean }>): {
       probe.pruneCalls += 1;
     },
     manager: { attentionQueue },
+    // PHASE 2: dismiss_attention now Off-vetoes on its veto-class capability; default Auto = no change.
+    effectiveCapabilityGateFor: () => "Auto",
   } as unknown as ActionContext;
   return { ctx, probe };
 }

@@ -97,6 +97,8 @@ function makeCtx(opts?: {
     },
     isFrozen: (): boolean => !!opts?.frozen,
     pruneAttention: (): void => {},
+    // PHASE 2: dismiss_attention now Off-vetoes on its veto-class capability; default Auto = no change.
+    effectiveCapabilityGateFor: () => "Auto",
     manager: {
       attentionQueue,
       ledger: {

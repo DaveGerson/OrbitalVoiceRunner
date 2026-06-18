@@ -53,6 +53,14 @@ export const switchActivePane: ActionDef<typeof SwitchActivePaneParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): focus_pane is a veto-class capability — "Ask" cannot defer-and-
+    // return a synchronous focus move, so the ONLY meaningful operator setting is Off. Block on an
+    // EXPLICIT Off veto (default Auto → behavior-preserving). Unlike the reads, this is an ACTION, not
+    // an observability read, so we deliberately do NOT add the `!ctx.isFrozen()` bypass: STOP-ALL
+    // SHOULD block a focus move (effectiveCapabilityGateFor resolves Off while frozen).
+    if (ctx.effectiveCapabilityGateFor(args.pane_id, "focus_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'focus_pane' capability is gated Off; switching the open pane is forbidden by policy." };
+    }
     const targetId = args.pane_id;
     const term = ctx.manager.terminals[targetId];
     // bd #70: ungated existence guard (focus_pane is UNGATED) — resolve via the canonical
@@ -102,6 +110,13 @@ export const updateDraftPrompt: ActionDef<typeof UpdateDraftPromptParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is a veto-class capability — "Ask" cannot defer a
+    // synchronous draft write, so the only meaningful operator setting is Off. Block on an EXPLICIT Off
+    // veto (default Auto → behavior-preserving). This is an ACTION, not a read, so STOP-ALL SHOULD block
+    // it (no `!ctx.isFrozen()` bypass — effectiveCapabilityGateFor resolves Off while frozen).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const t = ctx.activeDraftTarget();
     let output = "";
     if (!t) {

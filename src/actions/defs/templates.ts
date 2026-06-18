@@ -248,6 +248,12 @@ export const applyPromptTemplate: ActionDef<typeof ApplyPromptTemplateParams> = 
   surfaces: new Set(["voice", "rest"]),
   rest: { method: "post", path: "/api/templates/:template_id/apply" },
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): apply_prompt_template instantiates into the WIP draft, so it is
+    // gated under the veto-class compose_draft capability — block on an EXPLICIT Off veto (default Auto
+    // → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const tpl = ctx.manager.ledger.promptTemplates.find((t) => t.id === args.template_id || t.name === args.template_id);
     if (!tpl) {
       return { kind: "ok", output: `Template '${args.template_id}' not found. Use list_prompt_templates to see what is saved.` };

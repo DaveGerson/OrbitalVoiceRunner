@@ -107,6 +107,12 @@ export const handoffContextBetweenPanes: ActionDef<typeof HandoffContextParams> 
     return out;
   },
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is a veto-class capability — block on an EXPLICIT
+    // Off veto (default Auto → behavior-preserving). ACTION (not a read), so STOP-ALL blocks it (no
+    // !isFrozen bypass — effectiveCapabilityGateFor resolves Off while frozen).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const { source_pane_id, target_pane_id, context_notes } = args;
     const sourceTerm = ctx.manager.terminals[source_pane_id];
     const targetTerm = ctx.manager.terminals[target_pane_id];
@@ -154,6 +160,11 @@ export const proposeHandoff: ActionDef<typeof ProposeHandoffParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
+    // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const { to_pane, draft_text, from_pane, rationale } = args;
     const store = ctx.store;
     let resp: unknown;
@@ -223,6 +234,11 @@ export const reviseHandoff: ActionDef<typeof ReviseHandoffParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
+    // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const { handoff_id, new_draft_text } = args;
     const store = ctx.store;
     let resp: unknown;
@@ -265,6 +281,11 @@ export const stageHandoff: ActionDef<typeof StageHandoffParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
+    // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const { handoff_id } = args;
     const store = ctx.store;
     let resp: unknown;
@@ -440,6 +461,11 @@ export const rejectHandoff: ActionDef<typeof RejectHandoffParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
+    // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
+    // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
+    if (ctx.effectiveCapabilityGateFor(null, "compose_draft") === "Off") {
+      return { kind: "ok", output: "Error: the 'compose_draft' capability is gated Off; composing drafts is forbidden by policy." };
+    }
     const { handoff_id } = args;
     const store = ctx.store;
     let resp: unknown;

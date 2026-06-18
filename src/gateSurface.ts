@@ -17,6 +17,7 @@
  */
 
 import type { CapabilityGate, GateValue, CapabilityGateMap } from "./types";
+import type { CapabilityEnforcement } from "./actions/types";
 
 /** The pane's effective autonomy mode (mirrors EffectiveMode in src/pendingApprovals.ts). */
 export type EffectiveMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only";
@@ -242,6 +243,72 @@ export const CAPABILITY_CATEGORIES: Record<string, readonly CapabilityGate[]> = 
   "Orientation (low-risk)": ["create_project", "update_metadata", "switch_context", "set_voice_mute", "dismiss_attention", "archive_pane", "focus_pane", "compose_draft"],
   "Reading": ["read_pane", "read_notes"],
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 2 (veto-toggle honesty): the per-capability ENFORCEMENT class, surfaced FRONTEND-SAFELY so the
+// matrix editor + chip popover render the HONEST control for each capability (3-way / 2-way / badge).
+//
+// METADATA-PLUMBING CHOICE: this is a hand-list MIRROR of `enforcement` in src/actions/capabilities.ts
+// (CAPABILITY_DEFS), kept HERE rather than importing `enforcementOf` into the React bundle — for the
+// SAME reason ALL_CAPABILITIES is a hand-list (see its docblock): capabilities.ts imports
+// CAPABILITY_LABELS from THIS module EAGERLY inside its CAPABILITY_DEFS array literal, so a back-import
+// of capabilities.ts here would be a value-level circular dependency. The UI already sources ALL its
+// capability metadata (labels, categories, ALL_CAPABILITIES) from this one frontend-safe module; adding
+// enforcement here keeps that single surface and avoids coupling the React bundle to the actions layer.
+// A LOCKSTEP TEST (tests/test_capability_enforcement_lockstep.ts) asserts this map === enforcementOf for
+// all 27 caps, so the two sources can never drift.
+// ─────────────────────────────────────────────────────────────────────────────
+export const CAPABILITY_ENFORCEMENT: Record<CapabilityGate, CapabilityEnforcement> = {
+  // deferrable — full Auto/Ask/Off (3-way)
+  write_to_pane: "deferrable",
+  deliver_handoff: "deferrable",
+  send_keys: "deferrable",
+  create_pane: "deferrable",
+  close_pane: "deferrable",
+  delete_pane: "deferrable",
+  delete_project: "deferrable",
+  restart_pane: "deferrable",
+  clear_history: "deferrable",
+  delete_orchestrator_plan: "deferrable",
+  set_pane_permissions: "deferrable",
+  set_global_permissions: "deferrable",
+  set_capability_gate: "deferrable",
+  execute_plan: "deferrable",
+  apply_recipe: "deferrable",
+  add_watch_rule: "deferrable",
+  remove_watch_rule: "deferrable",
+  create_project: "deferrable",
+  update_metadata: "deferrable",
+  archive_pane: "deferrable",
+  // veto — Allow/Off only (2-way); "Ask" is meaningless and must never be shown
+  read_pane: "veto",
+  read_notes: "veto",
+  focus_pane: "veto",
+  switch_context: "veto",
+  compose_draft: "veto",
+  dismiss_attention: "veto",
+  // informational — gating is self-defeating; read-only badge, never an interactive control
+  set_voice_mute: "informational",
+};
+
+/** The honest control type the UI must render for a capability, derived from its enforcement class. */
+export type GateControlKind = "three-way" | "two-way" | "badge";
+
+/**
+ * controlForEnforcement(cap) — the SINGLE pure mapping from a capability to the control the UI renders:
+ *   deferrable    → "three-way" (Auto / Ask / Off)
+ *   veto          → "two-way"   (Allow / Off — "Allow" stores "Auto"; "Ask" is never offered)
+ *   informational → "badge"     (read-only, never gated)
+ * Unknown ids fall back to the safe 3-way (a full control never under-reports a real gate), mirroring
+ * enforcementOf's back-compat default. Extracted so the per-class mapping is unit-testable browserless.
+ */
+export function controlForEnforcement(cap: CapabilityGate): GateControlKind {
+  switch (CAPABILITY_ENFORCEMENT[cap] ?? "deferrable") {
+    case "veto": return "two-way";
+    case "informational": return "badge";
+    default: return "three-way";
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // n2r (bead wsm-e2e-pinned-n2r): PRESENTATION-NORMALIZERS — crash-safety for the gate UI.

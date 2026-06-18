@@ -178,6 +178,8 @@ function makeCtx(opts?: {
     // {disposition:"run"} WITHOUT invoking run — the CALLER runs the effect. The stub mirrors that so
     // the rename def-level contract (renameProject/renamePane ran + ledger_updated) holds byte-for-byte.
     gateOrDefer: (_cap: string, _pane: string | null, _summary: string, _run: () => string) => ({ disposition: "run" as const }),
+    // PHASE 2: switch_context now Off-vetoes on its veto-class capability; default Auto = no change.
+    effectiveCapabilityGateFor: () => "Auto",
     session: null,
     callId: "call-test",
     manager: {
