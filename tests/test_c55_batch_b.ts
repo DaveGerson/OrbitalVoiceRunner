@@ -173,6 +173,11 @@ function makeCtx(opts?: {
       probe.dispatchArgs.push(args);
       return opts?.dispatchOutcome ?? { kind: "executed", text: "ran" };
     },
+    // PHASE 1: rename_project / rename_pane now route through ctx.gateOrDefer (update_metadata,
+    // default Auto). The real gateOrDefer STAGES run only on Ask; on the Auto ("run") path it returns
+    // {disposition:"run"} WITHOUT invoking run — the CALLER runs the effect. The stub mirrors that so
+    // the rename def-level contract (renameProject/renamePane ran + ledger_updated) holds byte-for-byte.
+    gateOrDefer: (_cap: string, _pane: string | null, _summary: string, _run: () => string) => ({ disposition: "run" as const }),
     session: null,
     callId: "call-test",
     manager: {

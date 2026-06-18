@@ -1,10 +1,13 @@
 // Phase 2 Track S — CARD 2S.4: freeze means FROZEN for the non-brake ALWAYS_ALLOWED REST mutators.
 //
 // PINS: clear_history / clear_exited / restore_archived_pane / delete_archived_pane / update_project
-// are ALWAYS_ALLOWED (they never route through effectiveCapabilityGateFor, where the STOP-ALL frozen
-// short-circuit lives at src/gating/index.ts), so they used to run their side effects WHILE FROZEN.
-// Now each refuses with "Stop-all is engaged" and has NO side effect. The brake surface (stop_all /
-// confirm / release, and the stop_pane de-escalation) stays EXEMPT — the brake must always work.
+// keep an EXPLICIT STOP-ALL self-check (clear_exited / restore / delete / update_project are
+// ALWAYS_ALLOWED and never route through effectiveCapabilityGateFor; clear_history was promoted to a
+// genuine gate in PHASE 1 but KEEPS its explicit isFrozen() self-check so the distinct "Stop-all is
+// engaged" refusal still wins during a freeze). Each refuses with "Stop-all is engaged" and has NO
+// side effect while frozen. The brake surface (stop_all / confirm / release, and the stop_pane
+// de-escalation) stays EXEMPT — the brake must always work. NOTE (Phase 1): post-release clear_history
+// is now gated (default Ask) so it DEFERS (202) instead of instant-clearing — see the brake test.
 //
 // Boots the REAL server in-process (ce7 harness, same pattern as tests/test_stop_all_two_stage.ts).
 
@@ -206,15 +209,24 @@ describe("2S.4 frozen guards on non-brake ALWAYS_ALLOWED REST mutators (headless
     const rel = await api("/api/stop-all/release", { method: "POST" });
     assert.strictEqual(rel.status, 200, "release_stop_all answers 200 while frozen");
 
-    // Post-release, a previously-guarded mutator works again (the guard is the freeze, not a gate):
-    // clear_history now answers 200 AND its side effect lands (the on-disk history empties).
-    // PR #68 review fix: the clear routes through the HistoryManager's dirty cache (the truth in a
-    // running server) and reaches the FILE on the debounced flush — await flushAll() so the durable
-    // convergence is asserted without timing sensitivity.
+    // Post-release, the FREEZE guard is lifted — but PHASE 1 (deferrable-toggle honesty) made
+    // clear_history genuinely gated (default Ask), so it no longer instant-clears: it now DEFERS to a
+    // 202 pending_approval (an honest behavior change — a power user may set it Auto for instant
+    // clears). Set the gate to Auto so the clear actually lands at 200 and its side effect empties the
+    // on-disk history. PR #68 review fix: the clear routes through the HistoryManager's dirty cache
+    // (the truth in a running server) and reaches the FILE on the debounced flush — await flushAll().
     const hist = path.join(tmpDir, ".janus_history.json");
     fs.writeFileSync(hist, JSON.stringify({ "fz-hist": [{ command: "echo keep-me", timestamp: "t", output: "" }] }), "utf-8");
+    // Default Ask now defers post-release (the honest Phase 1 behavior).
+    const deferred = await api("/api/terminals/fz-hist/history/clear", { method: "POST" });
+    assert.strictEqual(deferred.status, 202, "clear_history (default Ask) defers to pending after release — Phase 1");
+    // Set the toggle to Auto so the clear runs instantly, proving the freeze guard (not a gate) was lifted.
+    (running.manager.settings.advanced ||= {} as any).capabilityGates = {
+      ...(running.manager.settings.advanced?.capabilityGates ?? {}),
+      clear_history: "Auto",
+    };
     const clear = await api("/api/terminals/fz-hist/history/clear", { method: "POST" });
-    assert.strictEqual(clear.status, 200, "clear_history works again after release");
+    assert.strictEqual(clear.status, 200, "clear_history works again after release when gated Auto");
     await (await import("../server")).HistoryManager.getInstance().flushAll();
     const after = JSON.parse(fs.readFileSync(hist, "utf-8"));
     assert.strictEqual(after["fz-hist"]?.length, 0, "the clear actually landed after release");

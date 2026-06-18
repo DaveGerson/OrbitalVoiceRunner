@@ -49,14 +49,31 @@ export const addProjectNote: ActionDef<typeof AddProjectNoteParams> = {
   readOnly: false,
   surfaces: new Set(["voice"]),
   handler: (args, ctx): ActionResult => {
-    const ok = ctx.manager.ledger.addNote(args.project_id, args.note);
-    if (ok) ctx.broadcastLedgerUpdate();
-    return {
-      kind: "ok",
-      output: ok
+    // PHASE 1 (deferrable-toggle honesty): add_project_note was ungated; mirror delete_note's
+    // gateOrDefer pattern (capability update_metadata, default Auto → silent unless tightened). The
+    // effect computes its own success/miss narration (addNote returns null when the project is gone).
+    // op:"add", scope:"project" discriminants keep the durable intent in lockstep with src/actionEffects.ts.
+    const addEffect = (): string => {
+      const ok = ctx.manager.ledger.addNote(args.project_id, args.note);
+      if (ok) ctx.broadcastLedgerUpdate();
+      return ok
         ? `Note added to project ${args.project_id}`
-        : `Could not add note: project ${args.project_id} not found.`,
+        : `Could not add note: project ${args.project_id} not found.`;
     };
+    const g = ctx.gateOrDefer("update_metadata", null, `Add note to project ${args.project_id}`, addEffect, {
+      ...(ctx.versionStamp ?? {}),
+      op: "add",
+      scope: "project",
+      projectId: args.project_id,
+      note: args.note,
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'update_metadata' capability is gated Off; adding notes is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to add the note.` };
+    }
+    return { kind: "ok", output: addEffect() };
   },
 };
 
@@ -93,14 +110,32 @@ export const addPaneNote: ActionDef<typeof AddPaneNoteParams> = {
       return { kind: "ok", output: "No pane is open, so there's nowhere to attach this note. Open a pane first." };
     }
     const projectId = args.project_id || ctx.manager.ledger.activeProjectId || "default_project";
-    const ok = ctx.manager.ledger.addPaneNote(projectId, paneId, args.note);
-    if (ok) ctx.broadcastLedgerUpdate();
-    return {
-      kind: "ok",
-      output: ok
+    // PHASE 1: gate add_pane_note through update_metadata (default Auto → silent unless tightened),
+    // mirroring delete_note. The no-pane refusal above is resolved BEFORE the gate (we never stage a
+    // note with no target). The effect computes its own success/miss narration. op:"add", scope:"pane"
+    // discriminants keep the durable intent in lockstep with src/actionEffects.ts.
+    const addEffect = (): string => {
+      const ok = ctx.manager.ledger.addPaneNote(projectId, paneId, args.note);
+      if (ok) ctx.broadcastLedgerUpdate();
+      return ok
         ? `Note added to pane ${paneId}`
-        : `Could not add note: pane ${paneId} not found in project ${projectId}.`,
+        : `Could not add note: pane ${paneId} not found in project ${projectId}.`;
     };
+    const g = ctx.gateOrDefer("update_metadata", paneId, `Add note to pane ${paneId}`, addEffect, {
+      ...(ctx.versionStamp ?? {}),
+      op: "add",
+      scope: "pane",
+      projectId,
+      paneId,
+      note: args.note,
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'update_metadata' capability is gated Off; adding notes is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to add the note.` };
+    }
+    return { kind: "ok", output: addEffect() };
   },
 };
 

@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**90** actions across **24** gated capabilities, plus the always-allowed group.
+**91** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -20,7 +20,6 @@ These bypass the capability gate entirely — they work even while the system is
 | `approve_pending_command` | rest | no | Approve or reject a pending spoken-command approval by messageId (approved=true approves, false rejects) |
 | `cancel_pending_action` | rest | no | Cancel (discard, no side effect) a pending NON-PTY deferred action by id |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
-| `clear_history` | rest | no | Clear a terminal pane's recorded command history |
 | `confirm_pending_action` | rest | no | Confirm (run) a pending NON-PTY deferred action by id |
 | `confirm_stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 2 (always allowed) |
 | `create_pane_note` | rest | no | Operator-UI |
@@ -65,6 +64,26 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `apply_layout` | voice / rest | no | Re-materialize a saved pane layout into the active project |
 | `apply_orchestration_recipe` | voice / rest | no | Apply a pre-configured template layout suite (such as full-stack-web or python-worker) to standard workspaces |
+
+## Archive an exited pane
+
+- **Capability:** `archive_pane`
+- **Default gate:** Auto
+- **Category:** Orientation (low-risk)
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `archive_pane` | rest | no | Archive a single pane's record into the recoverable archive (does NOT terminate its process) |
+
+## Clear a pane's history
+
+- **Capability:** `clear_history`
+- **Default gate:** Ask
+- **Category:** Destructive
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `clear_history` | rest | no | Clear a terminal pane's recorded command history |
 
 ## Close a pane
 
@@ -329,6 +348,4 @@ These capability rows exist in the matrix (so they are tunable and reserved) but
 
 | Capability | Label | Default gate | Category |
 | --- | --- | --- | --- |
-| `archive_pane` | Archive an exited pane | Auto | Orientation (low-risk) |
-| `clear_history` | Clear a pane's history | Ask | Destructive |
 | `deliver_handoff` | Hand a prompt to another pane | Ask | Acting in a pane |

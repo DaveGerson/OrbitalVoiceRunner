@@ -16,12 +16,20 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { buildActionRun } from "../src/actionEffects";
 
 function fakeDeps() {
   const calls: any = {
     added: [], notes: [], broadcasts: [], ledgerBroadcasts: 0, perms: null,
     projectsAdded: [], saved: 0, amended: [], deleted: [],
+    // PHASE 1 (deferrable-toggle honesty): durable-replay of the newly-gated update_metadata add/rename
+    // ops + create_project + archive_pane. Records the ledger calls each rebuilt effect makes.
+    projectNotesAdded: [] as Array<[string, string]>, paneNotesAddedG: [] as Array<[string, string, string]>,
+    projectsRenamed: [] as Array<[string, string]>, panesRenamed: [] as Array<[string, string, string]>,
+    archivedPanes: [] as Array<[string, string]>,
     // c55.16 tech_debt_buildactionrun: durable-replay of the c55.10 gated rest-only caps.
     // save(force) calls (the def force-persists via ledger.save(true)), live PTY writes, and the
     // live mutable ledger arrays the replay cases splice.
@@ -33,9 +41,14 @@ function fakeDeps() {
     ledger: {
       getProject: (id: string) => projects[id],
       addProject(id: string, dir: string, summary: string) { projects[id] = { panes: {}, directory: dir, summary }; calls.projectsAdded.push([id, dir, summary]); },
-      addPaneNote(...a: any[]) { calls.notes.push(a); },
+      addPaneNote(...a: any[]) { calls.notes.push(a); return true; },
       amendNote(id: string, text: string) { calls.amended.push([id, text]); },
       deleteNote(id: string) { calls.deleted.push(id); },
+      // PHASE 1: add/rename ledger ops for the durable update_metadata replay; archivePane for archive_pane.
+      addNote(projectId: string, note: string) { calls.projectNotesAdded.push([projectId, note]); return true; },
+      renameProject(projectId: string, name: string) { calls.projectsRenamed.push([projectId, name]); },
+      renamePane(projectId: string, paneId: string, name: string) { calls.panesRenamed.push([projectId, paneId, name]); },
+      archivePaneOwned(projectId: string, paneId: string) { calls.archivedPanes.push([projectId, paneId]); return true; },
       // save() tracks the legacy no-arg path; save(true) (force-persist) records the flag so the
       // watch-rule / plan replay cases can be pinned byte-for-byte against the def's `save(true)`.
       save(force?: boolean) { calls.saved++; calls.savedForce.push(force === true); },
@@ -238,6 +251,92 @@ describe("kzt — buildActionRun rebuilds deferred effects from intent", () => {
     assert.deepStrictEqual(calls.savedForce, [], "no persist when nothing changed");
     assert.strictEqual(calls.broadcasts.length, 0, "no broadcast when nothing changed");
     assert.strictEqual(out, "Plan plan_gone deleted.");
+  });
+
+  // ---------------------------------------------------------------------------
+  // PHASE 1 (deferrable-toggle honesty): durable replay of the newly-gated deferrable toggles —
+  // the additive update_metadata ops (add_project_note / add_pane_note / rename_project / rename_pane),
+  // create_project, and archive_pane. Each STAGES a pending action on Ask (gateOrDefer), so a
+  // confirm-AFTER-restart must rebuild the SAME side effect from the persisted intent. These pin the
+  // rebuild reproduces the def's effect closure BYTE-IDENTICALLY (ledger call + broadcast + EXACT
+  // confirm string), in lockstep with the def handlers.
+  // ---------------------------------------------------------------------------
+  it("update_metadata[op=add, scope=project] -> addNote + ledger broadcast + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "update_metadata", params: { op: "add", scope: "project", projectId: "p1", note: "hello" } }, deps as any)();
+    assert.deepStrictEqual(calls.projectNotesAdded, [["p1", "hello"]], "addNote called with the bound text");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "ledger update broadcast fired on success");
+    assert.strictEqual(out, "Note added to project p1");
+  });
+
+  it("update_metadata[op=add, scope=pane] -> addPaneNote + ledger broadcast + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "update_metadata", params: { op: "add", scope: "pane", projectId: "p1", paneId: "x", note: "pn" } }, deps as any)();
+    assert.deepStrictEqual(calls.notes, [["p1", "x", "pn"]], "addPaneNote called with project/pane/text");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "ledger update broadcast fired on success");
+    assert.strictEqual(out, "Note added to pane x");
+  });
+
+  it("update_metadata[op=rename, scope=project] -> renameProject + ledger broadcast + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "update_metadata", params: { op: "rename", scope: "project", projectId: "p1", name: "New Name" } }, deps as any)();
+    assert.deepStrictEqual(calls.projectsRenamed, [["p1", "New Name"]], "renameProject called");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "ledger update broadcast fired");
+    assert.strictEqual(out, "Project renamed to New Name");
+  });
+
+  it("update_metadata[op=rename, scope=pane] -> renamePane + ledger broadcast + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "update_metadata", params: { op: "rename", scope: "pane", projectId: "p1", paneId: "x", name: "Pane X" } }, deps as any)();
+    assert.deepStrictEqual(calls.panesRenamed, [["p1", "x", "Pane X"]], "renamePane called");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "ledger update broadcast fired");
+    assert.strictEqual(out, "Pane renamed to Pane X");
+  });
+
+  it("create_project intent -> addProject [+ rename] + ONE ledger broadcast + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "create_project", params: { projectId: "p9", directory: "/tmp/p9", summary: "s", keyTerms: ["k"], name: "Niner" } }, deps as any)();
+    assert.deepStrictEqual(calls.projectsAdded, [["p9", "/tmp/p9", "s"]], "addProject called with resolved directory + summary");
+    assert.deepStrictEqual(calls.projectsRenamed, [["p9", "Niner"]], "post-create rename runs when a name is staged");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "exactly one ledger_updated broadcast after both mutations");
+    assert.strictEqual(out, "Project context p9 created successfully.");
+  });
+
+  it("create_project intent with no name -> addProject only, no rename", () => {
+    const { calls, deps } = fakeDeps();
+    buildActionRun({ capability: "create_project", params: { projectId: "p10", directory: "/tmp/p10" } }, deps as any)();
+    assert.deepStrictEqual(calls.projectsAdded, [["p10", "/tmp/p10", ""]], "addProject with empty summary default");
+    assert.strictEqual(calls.projectsRenamed.length, 0, "no rename without a staged name");
+  });
+
+  it("archive_pane intent -> ledger.archivePane + ledger/terminals broadcasts + EXACT string", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "archive_pane", params: { paneId: "x", projectId: "p1" } }, deps as any)();
+    assert.deepStrictEqual(calls.archivedPanes, [["p1", "x"]], "archivePane called with the owning project + pane");
+    assert.strictEqual(calls.ledgerBroadcasts, 1, "ledger update broadcast fired on success");
+    assert.ok(calls.broadcasts.some((b: any) => b.type === "terminals_updated"), "terminals_updated broadcast fired");
+    assert.strictEqual(out, "Pane x archived (recoverable).");
+  });
+
+  it("clear_history intent -> falls back to a file clear (no bridge) + EXACT string", () => {
+    // No history bridge is registered in this PURE unit context, so the rebuild uses the file
+    // fallback. Run it in an isolated cwd so the .janus_history.json write does not collide.
+    const prev = process.cwd();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ae-clr-"));
+    process.chdir(dir);
+    try {
+      const fp = path.join(dir, ".janus_history.json");
+      fs.writeFileSync(fp, JSON.stringify({ x: [{ command: "a", timestamp: "t", output: "" }], y: [{ command: "b", timestamp: "t", output: "" }] }), "utf-8");
+      const { deps } = fakeDeps();
+      const out = buildActionRun({ capability: "clear_history", params: { op: "clear", paneId: "x" } }, deps as any)();
+      const parsed = JSON.parse(fs.readFileSync(fp, "utf-8"));
+      assert.deepStrictEqual(parsed["x"], [], "the target pane's history is cleared on replay");
+      assert.ok(Array.isArray(parsed["y"]) && parsed["y"].length === 1, "sibling pane history untouched");
+      assert.strictEqual(out, "History cleared for terminal x.");
+    } finally {
+      process.chdir(prev);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
   });
 
   // ---------------------------------------------------------------------------

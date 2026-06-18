@@ -63,6 +63,12 @@ export interface LedgerLike {
   promptTemplates: PromptTemplate[];
   layouts: PaneLayout[];
   archiveExitedPanes(projectId?: string): number;
+  // PHASE 1 (deferrable-toggle honesty): archive ONE pane by its owning project + id (recoverable,
+  // does NOT terminate the process). Truthy-on-success: false when the pane row is already gone.
+  // A backend-agnostic alias — the legacy Ledger and JanusStore both implement it with consistent
+  // (projectId, paneId) argument order (JanusStore's internal archivePane(paneId, workspaceId) keeps
+  // its own order; this alias bridges the two so the archive_pane action def is backend-portable).
+  archivePaneOwned(projectId: string, paneId: string): boolean;
   listArchived(workspaceId?: string): ArchivedPane[];
   restoreArchivedPane(paneId: string): ArchivedPane | null;
   deleteArchivedPane(paneId: string): boolean;
@@ -430,6 +436,12 @@ export class Ledger {
     });
     this.save(true);
     return true;
+  }
+
+  /** PHASE 1: backend-agnostic single-pane archive alias (LedgerLike.archivePaneOwned). On the legacy
+   *  Ledger this is exactly archivePane(projectId, paneId). */
+  archivePaneOwned(projectId: string, paneId: string): boolean {
+    return this.archivePane(projectId, paneId);
   }
 
   /** Archive every Exited (not alive) pane across all projects. Returns count archived. */

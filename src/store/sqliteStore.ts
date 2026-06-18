@@ -541,6 +541,17 @@ export class JanusStore {
 
   // ── Archive aliases matching the legacy Ledger signatures server.ts calls ───
 
+  /** PHASE 1 (deferrable-toggle honesty): backend-agnostic single-pane archive (LedgerLike parity).
+   *  Bridges the legacy (projectId, paneId) order to JanusStore's internal archivePane(paneId,
+   *  workspaceId). Truthy-on-success: false when the pane row is already gone (so the archive_pane
+   *  action narrates "already gone" without a spurious broadcast). */
+  archivePaneOwned(projectId: string, paneId: string): boolean {
+    const exists = !!(this.db.prepare("SELECT 1 FROM panes WHERE pane_id=? AND workspace_id=?").get(paneId, projectId));
+    if (!exists) return false;
+    this.archivePane(paneId, projectId, "archived");
+    return true;
+  }
+
   /** Archive every non-alive pane (optionally in one project). Returns the count. */
   archiveExitedPanes(projectId?: string): number {
     const projectIds = projectId

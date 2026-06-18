@@ -103,6 +103,10 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   resize_pane: new Set<Surface>(["rest"]),
   clear_history: new Set<Surface>(["rest"]),
   clear_exited: new Set<Surface>(["rest"]),
+  // ── Phase 1 (deferrable-toggle honesty): archive_pane is the rest-only "archive THIS pane" op (pure
+  // ledger move, no process stop). No voice twin BY DESIGN — the voice exit+archive tool is close_pane
+  // (which terminates), and bulk exited-archive is clear_exited; standalone archive is operator-UI. ──
+  archive_pane: new Set<Surface>(["rest"]),
 
   // ── c55 Batch F: NEW rest-only STRUCTURED page-load READS (no voice twin BY DESIGN) ─────────────
   // Both converge an inline GET route whose structured body the flat {output:string} cannot carry; they

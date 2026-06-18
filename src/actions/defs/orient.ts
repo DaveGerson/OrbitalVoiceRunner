@@ -42,9 +42,28 @@ export const renameProject: ActionDef<typeof RenameProjectParams> = {
   // c55 Batch B: snake_case route param so Express injects :project_id onto the snake_case zod key.
   rest: { method: "put", path: "/api/projects/:project_id/rename" },
   handler: (args, ctx: ActionContext): ActionResult => {
-    ctx.manager.ledger.renameProject(args.project_id, args.name);
-    ctx.broadcastLedgerUpdate();
-    return { kind: "ok", output: `Project renamed to ${args.name}` };
+    // PHASE 1 (deferrable-toggle honesty): rename_project was ungated; mirror delete_note's gateOrDefer
+    // pattern (capability update_metadata, default Auto → silent unless tightened). op:"rename",
+    // scope:"project" discriminants keep the durable intent in lockstep with src/actionEffects.ts.
+    const renameEffect = (): string => {
+      ctx.manager.ledger.renameProject(args.project_id, args.name);
+      ctx.broadcastLedgerUpdate();
+      return `Project renamed to ${args.name}`;
+    };
+    const g = ctx.gateOrDefer("update_metadata", null, `Rename project ${args.project_id} to ${args.name}`, renameEffect, {
+      ...(ctx.versionStamp ?? {}),
+      op: "rename",
+      scope: "project",
+      projectId: args.project_id,
+      name: args.name,
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'update_metadata' capability is gated Off; renaming is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to rename the project.` };
+    }
+    return { kind: "ok", output: renameEffect() };
   },
 };
 
@@ -69,9 +88,29 @@ export const renamePane: ActionDef<typeof RenamePaneParams> = {
   // c55 Batch B: snake_case route params so Express injects :project_id / :pane_id onto the zod keys.
   rest: { method: "put", path: "/api/projects/:project_id/panes/:pane_id/rename" },
   handler: (args, ctx: ActionContext): ActionResult => {
-    ctx.manager.ledger.renamePane(args.project_id, args.pane_id, args.name);
-    ctx.broadcastLedgerUpdate();
-    return { kind: "ok", output: `Pane renamed to ${args.name}` };
+    // PHASE 1: gate rename_pane through update_metadata (default Auto → silent unless tightened),
+    // mirroring delete_note. op:"rename", scope:"pane" discriminants keep the durable intent in
+    // lockstep with src/actionEffects.ts.
+    const renameEffect = (): string => {
+      ctx.manager.ledger.renamePane(args.project_id, args.pane_id, args.name);
+      ctx.broadcastLedgerUpdate();
+      return `Pane renamed to ${args.name}`;
+    };
+    const g = ctx.gateOrDefer("update_metadata", args.pane_id, `Rename pane ${args.pane_id} to ${args.name}`, renameEffect, {
+      ...(ctx.versionStamp ?? {}),
+      op: "rename",
+      scope: "pane",
+      projectId: args.project_id,
+      paneId: args.pane_id,
+      name: args.name,
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'update_metadata' capability is gated Off; renaming is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to rename the pane.` };
+    }
+    return { kind: "ok", output: renameEffect() };
   },
 };
 
@@ -193,12 +232,37 @@ export const createProject: ActionDef<typeof CreateProjectParams> = {
         output: `Error: the directory '${String(directory).trim()}' does not exist, so I did not create project ${project_id}. Give me a folder that exists, or omit it to use the current workspace.`,
       };
     }
-    ctx.manager.ledger.addProject(project_id, resolveProjectDir(directory), summary || "", key_terms || []); // MUTATION 1
-    if (name) {
-      ctx.manager.ledger.renameProject(project_id, name); // MUTATION 2 (conditional) — c55.16 post-create rename
+    // PHASE 1 (deferrable-toggle honesty): create_project was ungated; the capability row exists
+    // (default Auto). Route BOTH mutations + broadcast through ctx.gateOrDefer so the toggle is real.
+    // Default Auto → no behavior change unless the operator tightens it (Ask → confirm, Off → refuse).
+    // The DIRECTORY is resolved BEFORE the gate (the bad-dir clarify above already ran) so the staged
+    // intent carries the resolved path, not the raw input.
+    const resolvedDir = resolveProjectDir(directory);
+    const createEffect = (): string => {
+      ctx.manager.ledger.addProject(project_id, resolvedDir, summary || "", key_terms || []); // MUTATION 1
+      if (name) {
+        ctx.manager.ledger.renameProject(project_id, name); // MUTATION 2 (conditional) — c55.16 post-create rename
+      }
+      ctx.broadcastLedgerUpdate(); // ONE ledger_updated frame after BOTH mutations
+      return `Project context ${project_id} created successfully.`;
+    };
+    // PHASE 1: persist the create INTENT so a deferred create survives a restart and rebuilds the SAME
+    // effect on confirm. Keys in lockstep with src/actionEffects.ts CreateProjectParams.
+    const g = ctx.gateOrDefer("create_project", null, `Create project ${project_id}`, createEffect, {
+      ...(ctx.versionStamp ?? {}),
+      projectId: project_id,
+      directory: resolvedDir,
+      summary: summary || "",
+      keyTerms: key_terms || [],
+      ...(name ? { name } : {}),
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'create_project' capability is gated Off; creating projects is forbidden by policy.` };
     }
-    ctx.broadcastLedgerUpdate(); // ONE ledger_updated frame after BOTH mutations
-    return { kind: "ok", output: `Project context ${project_id} created successfully.` };
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to create the project.` };
+    }
+    return { kind: "ok", output: createEffect() };
   },
 };
 

@@ -66,11 +66,13 @@ function makeFakeTerm(): FakeTerm {
 
 interface CtxOpts {
   terminals?: Record<string, FakeTerm>;
-  activeProject?: { directory?: string; panes: Record<string, { tool_preset?: string; permissions_mode?: string; session_id?: string; alive?: boolean }> } | null;
+  activeProject?: { id?: string; directory?: string; panes: Record<string, { tool_preset?: string; permissions_mode?: string; session_id?: string; alive?: boolean }> } | null;
   activeProjectId?: string | null;
   gateDisposition?: GateDisposition;
   addTerminal?: (...a: unknown[]) => string;
   archiveExitedPanes?: (id?: string) => number;
+  // Phase 1: archive_pane backing op (returns false to simulate an already-gone row).
+  archivePane?: (projectId: string, paneId: string) => boolean;
 }
 
 interface Recorded {
@@ -79,12 +81,17 @@ interface Recorded {
   terminalsUpdated: number;
   addTerminalCalls: unknown[][];
   archiveCalls: Array<string | undefined>;
+  // Phase 1: archive_pane calls ledger.archivePane(projectId, paneId).
+  archivePaneCalls: Array<[string, string]>;
 }
 
 function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manager: any } {
-  const rec: Recorded = { gateCalls: [], ledgerUpdates: 0, terminalsUpdated: 0, addTerminalCalls: [], archiveCalls: [] };
+  const rec: Recorded = { gateCalls: [], ledgerUpdates: 0, terminalsUpdated: 0, addTerminalCalls: [], archiveCalls: [], archivePaneCalls: [] };
   const terminals = opts.terminals ?? {};
-  const activeProject = opts.activeProject === undefined ? null : opts.activeProject;
+  // findPaneOwningProject (tier 2) reads active.id, so stamp it from activeProjectId when present.
+  const activeProject = opts.activeProject === undefined
+    ? null
+    : (opts.activeProject ? { id: opts.activeProjectId ?? opts.activeProject.id, ...opts.activeProject } : opts.activeProject);
   const manager: any = {
     terminals,
     settings: { presets: undefined, advanced: { defaultShellCommand: "" } },
@@ -103,6 +110,12 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manag
       archiveExitedPanes: (id?: string): number => {
         rec.archiveCalls.push(id);
         return opts.archiveExitedPanes ? opts.archiveExitedPanes(id) : 0;
+      },
+      // Phase 1: archive_pane backing op. findPaneOwningProject resolves the owning project via
+      // getActiveProject (tier 2); archivePaneOwned records (projectId, paneId) and returns success.
+      archivePaneOwned: (projectId: string, paneId: string): boolean => {
+        rec.archivePaneCalls.push([projectId, paneId]);
+        return opts.archivePane ? opts.archivePane(projectId, paneId) : true;
       },
     },
   };
@@ -149,13 +162,13 @@ function readHistoryFile(): Record<string, unknown[]> {
 
 // ── registry shape: all five defs present, rest-only, with a rest binding ─────────────────────────
 describe("c55 Batch C — registry shape", () => {
-  const names = ["respawn_pane", "send_keys", "resize_pane", "clear_history", "clear_exited"];
+  const names = ["respawn_pane", "send_keys", "resize_pane", "clear_history", "clear_exited", "archive_pane"];
   for (const name of names) {
     it(`${name} is a rest-only def with a rest binding`, () => {
       const def = findDef(name);
       assert.deepStrictEqual([...def.surfaces].sort(), ["rest"], `${name} surfaces must be exactly {rest}`);
       assert.ok(def.rest, `${name} must declare a rest binding`);
-      assert.strictEqual(def.rest!.method, name === "clear_exited" || name === "respawn_pane" || name === "send_keys" || name === "resize_pane" || name === "clear_history" ? "post" : "post");
+      assert.strictEqual(def.rest!.method, "post");
     });
   }
 
@@ -165,18 +178,23 @@ describe("c55 Batch C — registry shape", () => {
     assert.strictEqual(findDef("resize_pane").rest!.path, "/api/terminals/:pane_id/resize");
     assert.strictEqual(findDef("clear_history").rest!.path, "/api/terminals/:pane_id/history/clear");
     assert.strictEqual(findDef("clear_exited").rest!.path, "/api/terminals/clear-exited");
+    assert.strictEqual(findDef("archive_pane").rest!.path, "/api/terminals/:pane_id/archive");
   });
 
-  it("gates (c55.10): send_keys is GATED (send_keys); resize_pane/clear_history/clear_exited stay ALWAYS_ALLOWED; respawn_pane enforces", () => {
+  it("gates: send_keys GATED (send_keys); resize_pane/clear_exited ALWAYS_ALLOWED; clear_history NOW gated (clear_history); respawn_pane enforces; archive_pane gated (archive_pane)", () => {
     // c55.10 tightened send_keys (term.writeInput to the live PTY — a consequential CLI keystroke act)
-    // from ALWAYS_ALLOWED to its OWN matrix row `send_keys` (default Ask). resize/clear_history/clear_exited
-    // stay ungated per the P2 taxonomy (viewport plumbing / display-buffer clear / reversible archive).
+    // from ALWAYS_ALLOWED to its OWN matrix row `send_keys` (default Ask). resize/clear_exited stay
+    // ungated per the P2 taxonomy (viewport plumbing / reversible bulk archive).
     assert.strictEqual(findDef("send_keys").capability, "send_keys");
     assert.strictEqual(findDef("resize_pane").capability, "ALWAYS_ALLOWED");
-    assert.strictEqual(findDef("clear_history").capability, "ALWAYS_ALLOWED");
     assert.strictEqual(findDef("clear_exited").capability, "ALWAYS_ALLOWED");
+    // PHASE 1 (deferrable-toggle honesty): clear_history was ALWAYS_ALLOWED (unenforced); it now
+    // declares the clear_history capability (default Ask, pinned) so the toggle genuinely enforces.
+    assert.strictEqual(findDef("clear_history").capability, "clear_history");
     // The action is respawn_pane; the CAPABILITY it rides is still named restart_pane (matrix row).
     assert.strictEqual(findDef("respawn_pane").capability, "restart_pane");
+    // PHASE 1: archive_pane is the NEW standalone archive action, gated on its own matrix row.
+    assert.strictEqual(findDef("archive_pane").capability, "archive_pane");
   });
 });
 
@@ -317,16 +335,23 @@ describe("c55 resize_pane", () => {
   }
 });
 
-// ── clear_history ──────────────────────────────────────────────────────────────────────────────────
-describe("c55 clear_history", () => {
-  it("zeroes a pane's history; ok -> 200 {output}", async () => {
+// ── clear_history (PHASE 1: now GATED via clear_history capability) ────────────────────────────────
+describe("c55 clear_history (Phase 1 gated)", () => {
+  it("Auto -> gate consulted (clear_history) -> zeroes a pane's history; ok -> 200 {output}", async () => {
     await withTempCwd(async () => {
       // Seed a history file with two entries for p1.
       const fp = path.join(process.cwd(), ".janus_history.json");
       fs.writeFileSync(fp, JSON.stringify({ p1: [{ command: "a", timestamp: "t", output: "" }, { command: "b", timestamp: "t", output: "" }], p2: [{ command: "x", timestamp: "t", output: "" }] }), "utf-8");
-      const { ctx } = makeCtx({ terminals: {} });
+      const { ctx, rec } = makeCtx({ terminals: {} });
       const result = await runAction(REGISTRY, "clear_history", { pane_id: "p1" }, ctx);
       assert.strictEqual(result.kind, "ok");
+      // PHASE 1: clear_history MUST route through ctx.gateOrDefer with the clear_history capability
+      // and a durable-intent bag { op:"clear", paneId } (lockstep with buildActionRun).
+      assert.strictEqual(rec.gateCalls.length, 1, "clear_history MUST route through ctx.gateOrDefer");
+      assert.strictEqual(rec.gateCalls[0].capability, "clear_history");
+      assert.strictEqual(rec.gateCalls[0].paneId, "p1");
+      assert.strictEqual(rec.gateCalls[0].params?.op, "clear");
+      assert.strictEqual(rec.gateCalls[0].params?.paneId, "p1");
       const hist = readHistoryFile();
       assert.deepStrictEqual(hist["p1"], [], "p1 history cleared");
       assert.ok(Array.isArray(hist["p2"]) && hist["p2"].length === 1, "sibling pane history untouched");
@@ -334,6 +359,102 @@ describe("c55 clear_history", () => {
       resultToHttp(result, res);
       assert.strictEqual(sent.status, 200);
     });
+  });
+
+  it("Off gate -> blocked -> 403 {error}; history NOT cleared", async () => {
+    await withTempCwd(async () => {
+      const fp = path.join(process.cwd(), ".janus_history.json");
+      fs.writeFileSync(fp, JSON.stringify({ p1: [{ command: "a", timestamp: "t", output: "" }] }), "utf-8");
+      const { ctx } = makeCtx({ terminals: {}, gateDisposition: { disposition: "forbidden" } });
+      const result = await runAction(REGISTRY, "clear_history", { pane_id: "p1" }, ctx);
+      assert.strictEqual(result.kind, "blocked");
+      const hist = readHistoryFile();
+      assert.ok(Array.isArray(hist["p1"]) && hist["p1"].length === 1, "forbidden clear leaves history intact");
+      const { res, sent } = makeFakeRes();
+      resultToHttp(result, res);
+      assert.strictEqual(sent.status, 403);
+      assert.ok((sent.json as { error: string }).error);
+    });
+  });
+
+  it("Ask gate -> pending -> 202; history NOT cleared yet (effect deferred)", async () => {
+    await withTempCwd(async () => {
+      const fp = path.join(process.cwd(), ".janus_history.json");
+      fs.writeFileSync(fp, JSON.stringify({ p1: [{ command: "a", timestamp: "t", output: "" }] }), "utf-8");
+      const { ctx } = makeCtx({ terminals: {}, gateDisposition: { disposition: "deferred", actionId: "act_clr", summary: "Clear history for pane p1" } });
+      const result = await runAction(REGISTRY, "clear_history", { pane_id: "p1" }, ctx);
+      assert.strictEqual(result.kind, "pending");
+      const hist = readHistoryFile();
+      assert.ok(Array.isArray(hist["p1"]) && hist["p1"].length === 1, "deferred clear does NOT run yet");
+      const { res, sent } = makeFakeRes();
+      resultToHttp(result, res);
+      assert.strictEqual(sent.status, 202);
+      assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "act_clr" });
+    });
+  });
+});
+
+// ── archive_pane (PHASE 1: NEW gated action) ────────────────────────────────────────────────────────
+describe("Phase 1 archive_pane", () => {
+  it("Auto -> gate consulted (archive_pane) -> ledger.archivePane(projectId, paneId); ok -> 200 {output}", async () => {
+    const { ctx, rec } = makeCtx({
+      activeProjectId: "proj",
+      activeProject: { panes: { p1: { alive: true } } } as any,
+    });
+    const result = await runAction(REGISTRY, "archive_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.strictEqual(rec.gateCalls.length, 1, "archive_pane MUST route through ctx.gateOrDefer");
+    assert.strictEqual(rec.gateCalls[0].capability, "archive_pane");
+    assert.strictEqual(rec.gateCalls[0].paneId, "p1");
+    assert.deepStrictEqual(rec.gateCalls[0].params?.paneId, "p1");
+    assert.deepStrictEqual(rec.gateCalls[0].params?.projectId, "proj");
+    assert.deepStrictEqual(rec.archivePaneCalls, [["proj", "p1"]], "archives via ledger.archivePane(owning project, pane)");
+    assert.strictEqual(rec.ledgerUpdates, 1, "broadcasts ledger update on success");
+    assert.strictEqual(rec.terminalsUpdated, 1, "broadcasts terminals_updated on success");
+    const { res, sent } = makeFakeRes();
+    resultToHttp(result, res);
+    assert.strictEqual(sent.status, 200);
+  });
+
+  it("unknown pane (no owning project) -> ok narration -> 200; gate NOT consulted, no archive", async () => {
+    const { ctx, rec } = makeCtx({ activeProjectId: "proj", activeProject: { panes: {} } as any });
+    const result = await runAction(REGISTRY, "archive_pane", { pane_id: "ghost" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.strictEqual(rec.gateCalls.length, 0, "no stage/forbid of an archive for a non-existent pane");
+    assert.strictEqual(rec.archivePaneCalls.length, 0, "no archive for an unknown pane");
+    const { res, sent } = makeFakeRes();
+    resultToHttp(result, res);
+    assert.strictEqual(sent.status, 200);
+  });
+
+  it("Off gate -> blocked -> 403; no archive side effect", async () => {
+    const { ctx, rec } = makeCtx({
+      activeProjectId: "proj",
+      activeProject: { panes: { p1: { alive: true } } } as any,
+      gateDisposition: { disposition: "forbidden" },
+    });
+    const result = await runAction(REGISTRY, "archive_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "blocked");
+    assert.strictEqual(rec.archivePaneCalls.length, 0, "forbidden archive performs no ledger move");
+    const { res, sent } = makeFakeRes();
+    resultToHttp(result, res);
+    assert.strictEqual(sent.status, 403);
+    assert.ok((sent.json as { error: string }).error);
+  });
+
+  it("Ask gate -> pending -> 202; archive deferred (not run)", async () => {
+    const { ctx, rec } = makeCtx({
+      activeProjectId: "proj",
+      activeProject: { panes: { p1: { alive: true } } } as any,
+      gateDisposition: { disposition: "deferred", actionId: "act_arc", summary: "Archive pane p1" },
+    });
+    const result = await runAction(REGISTRY, "archive_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "pending");
+    assert.strictEqual(rec.archivePaneCalls.length, 0, "deferred archive does NOT run the move yet");
+    const { res, sent } = makeFakeRes();
+    resultToHttp(result, res);
+    assert.strictEqual(sent.status, 202);
+    assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "act_arc" });
   });
 });
 

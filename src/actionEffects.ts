@@ -32,8 +32,11 @@
 // The version guard derives an action's current schema hash from the canonical registry. registry.ts
 // imports only zod + the static ActionDef groups (NO server boot), so this keeps actionEffects PURE
 // (importable directly by the unit tests, no listener spun up).
+import fs from "fs";
+import path from "path";
 import { actionSchemaHash } from "./actions/registry";
 import { findPaneOwningProject } from "./paneOwnership";
+import { getHistoryBridge } from "./historyBridge";
 
 /**
  * Which staging site produced a create_pane intent. The three sites run the SAME side effects
@@ -79,9 +82,48 @@ export interface ApplyPaneModeParams { paneId: string; permissionsMode: string; 
  * methods and return different confirm strings. `text` is the ENQUEUE-BOUND amend text (#27 MUST-FIX
  * #3): a confirm-after-restart must apply exactly this text, not whatever the model says next.
  */
-export interface UpdateMetadataParams { op: "amend" | "delete"; noteId: string; text?: string; }
+export interface UpdateMetadataParams {
+  op: "amend" | "delete" | "add" | "rename";
+  /** amend/delete: the target note id. */
+  noteId?: string;
+  /** amend: the ENQUEUE-BOUND amend text (applied verbatim across a restart). */
+  text?: string;
+  // ── PHASE 1 (deferrable-toggle honesty) additive note/rename ops ──
+  /** add: "project" | "pane"; rename: "project" | "pane" — the scope discriminator. */
+  scope?: "project" | "pane";
+  /** add/rename: the owning project id. */
+  projectId?: string;
+  /** add(pane)/rename(pane): the target pane id. */
+  paneId?: string;
+  /** add: the note text. */
+  note?: string;
+  /** rename: the new display name. */
+  name?: string;
+}
 /** Params captured by the close_pane closure (terminate + recoverable archive). */
 export interface ClosePaneParams { paneId: string; projectId?: string; }
+/**
+ * PHASE 1 (deferrable-toggle honesty). Params captured by the create_project closure (orient.ts).
+ * `directory` is the RESOLVED path (resolveProjectDir ran before staging). `name` is the OPTIONAL
+ * post-create display rename (c55.16 2nd mutation). The rebuild reproduces addProject [+ rename] +
+ * the single ledger_updated broadcast + the exact confirm string.
+ */
+export interface CreateProjectParams { projectId: string; directory: string; summary?: string; keyTerms?: string[]; name?: string; }
+/**
+ * PHASE 1 (deferrable-toggle honesty). Params captured by the clear_history closure (panes_rest.ts).
+ * `op:"clear"` is a forward-looking discriminator (clear_history has one op today). The rebuild
+ * re-fires the SAME bridge-first clear + confirm string. NOTE: a confirm-AFTER-restart clears the
+ * pane's history through the freshly-registered bridge bound at the new boot — safe + idempotent
+ * (clearing an already-empty history is a no-op).
+ */
+export interface ClearHistoryParams { op: "clear"; paneId: string; }
+/**
+ * PHASE 1 (deferrable-toggle honesty). Params captured by the archive_pane closure (panes_rest.ts).
+ * `projectId` is the OWNING project resolved at stage time. The rebuild re-fires ledger.archivePane
+ * + the broadcasts + the exact confirm string. Idempotent: an already-archived row returns false →
+ * the "already gone" narration, no broadcast.
+ */
+export interface ArchivePaneParams { paneId: string; projectId: string; }
 /**
  * Params captured by the c55.10 remove_watch_rule closure (src/actions/defs/watch_rules.ts).
  * `ruleId` is the WIDENED payload (the staging bag formerly carried only { origin, versionStamp }, so a
@@ -279,14 +321,43 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
       // two sites; `text` is the enqueue-bound amend text (applied verbatim across a restart).
       const p = intent.params as unknown as UpdateMetadataParams;
       return () => {
+        // PHASE 1 (deferrable-toggle honesty): the additive note/rename ops join amend/delete under
+        // the shared update_metadata capability. `op` (+ `scope` for add/rename) discriminates; each
+        // arm reproduces its def's EXACT confirm string + broadcast (the Risk-1 drift guard). The
+        // ledger return value branches add_*'s success/miss narration, byte-identical to the def.
         if (p.op === "amend") {
           deps.manager.ledger.amendNote(p.noteId, p.text ?? "");
           deps.broadcastLedgerUpdate();
-          return `Note ${p.noteId} updated.`;     // EXACT — matches server.ts:2514
+          return `Note ${p.noteId} updated.`;     // EXACT — matches registry.ts amend_note
         }
+        if (p.op === "add") {
+          if (p.scope === "pane") {
+            const ok = deps.manager.ledger.addPaneNote(p.projectId ?? "", p.paneId ?? "", p.note ?? "");
+            if (ok) deps.broadcastLedgerUpdate();
+            return ok
+              ? `Note added to pane ${p.paneId}`                                              // EXACT — notes.ts add_pane_note
+              : `Could not add note: pane ${p.paneId} not found in project ${p.projectId}.`;
+          }
+          const ok = deps.manager.ledger.addNote(p.projectId ?? "", p.note ?? "");
+          if (ok) deps.broadcastLedgerUpdate();
+          return ok
+            ? `Note added to project ${p.projectId}`                                          // EXACT — notes.ts add_project_note
+            : `Could not add note: project ${p.projectId} not found.`;
+        }
+        if (p.op === "rename") {
+          if (p.scope === "pane") {
+            deps.manager.ledger.renamePane(p.projectId ?? "", p.paneId ?? "", p.name ?? "");
+            deps.broadcastLedgerUpdate();
+            return `Pane renamed to ${p.name}`;     // EXACT — orient.ts rename_pane
+          }
+          deps.manager.ledger.renameProject(p.projectId ?? "", p.name ?? "");
+          deps.broadcastLedgerUpdate();
+          return `Project renamed to ${p.name}`;    // EXACT — orient.ts rename_project
+        }
+        // op:"delete" (and any legacy delete-shaped row).
         deps.manager.ledger.deleteNote(p.noteId);
         deps.broadcastLedgerUpdate();
-        return `Note ${p.noteId} deleted.`;       // EXACT — matches server.ts:2528
+        return `Note ${p.noteId} deleted.`;       // EXACT — matches notes.ts delete_note
       };
     }
     case "close_pane": {
@@ -333,6 +404,63 @@ export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): ()
           deps.broadcast({ type: "plans_updated", plans: deps.manager.ledger.plans });
         }
         return `Plan ${p.planId} deleted.`;  // EXACT — matches watch_rules.ts:255
+      };
+    }
+    case "create_project": {
+      // PHASE 1 (deferrable-toggle honesty): durable replay of the orient.ts create_project deferral.
+      // Mirrors createEffect BYTE-IDENTICALLY — addProject (resolved directory + summary + keyTerms),
+      // the OPTIONAL post-create rename (c55.16 2nd mutation), ONE ledger_updated broadcast, the EXACT
+      // confirm string. The bad-dir clarify already ran at stage time (the path here is resolved).
+      const p = intent.params as unknown as CreateProjectParams;
+      return () => {
+        deps.manager.ledger.addProject(p.projectId, p.directory, p.summary ?? "", p.keyTerms ?? []);
+        if (p.name) deps.manager.ledger.renameProject(p.projectId, p.name);
+        deps.broadcastLedgerUpdate();
+        return `Project context ${p.projectId} created successfully.`;  // EXACT — orient.ts create_project
+      };
+    }
+    case "clear_history": {
+      // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts clear_history deferral.
+      // Bridge-first (the server registers its HistoryManager bridge at boot); a direct file clear is the
+      // fallback only when no bridge is registered (bare tests). Returns the EXACT confirm string.
+      const p = intent.params as unknown as ClearHistoryParams;
+      return () => {
+        const bridge = getHistoryBridge();
+        if (bridge) {
+          bridge.clearHistory(p.paneId);
+        } else {
+          // Faithful fallback (mirrors panes_rest.ts saveHistory(id, [])): set this pane's history to []
+          // in the on-disk map at process.cwd()/.janus_history.json. Best-effort (never throws).
+          try {
+            const fp = path.join(process.cwd(), ".janus_history.json");
+            let all: Record<string, unknown[]> = {};
+            if (fs.existsSync(fp)) {
+              const parsed = JSON.parse(fs.readFileSync(fp, "utf-8"));
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) all = parsed;
+            }
+            all[p.paneId] = [];
+            fs.writeFileSync(fp, JSON.stringify(all, null, 2), "utf-8");
+          } catch (e) {
+            console.warn(`[clear_history replay] failed for ${p.paneId}:`, e);
+          }
+        }
+        return `History cleared for terminal ${p.paneId}.`;  // EXACT — panes_rest.ts clear_history
+      };
+    }
+    case "archive_pane": {
+      // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts archive_pane deferral.
+      // Mirrors archiveEffect BYTE-IDENTICALLY — ledger.archivePane (recoverable move), the
+      // ledger_updated + terminals_updated broadcasts on success, the EXACT confirm string. Idempotent:
+      // an already-archived row (false) returns the "already gone" narration with no broadcast.
+      const p = intent.params as unknown as ArchivePaneParams;
+      return () => {
+        const ok = deps.manager.ledger.archivePaneOwned(p.projectId, p.paneId);
+        if (ok) {
+          deps.broadcastLedgerUpdate();
+          deps.broadcast({ type: "terminals_updated" });
+          return `Pane ${p.paneId} archived (recoverable).`;       // EXACT — panes_rest.ts archive_pane
+        }
+        return `Pane ${p.paneId} could not be archived (already gone).`;
       };
     }
     // NOTE: send_keys is DELIBERATELY absent (panes_rest.ts:222-225 accepted scope-out). Its effect

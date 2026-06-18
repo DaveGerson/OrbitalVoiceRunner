@@ -337,30 +337,60 @@ const ClearHistoryParams = z.object({
 
 /**
  * clear_history — FAITHFUL PORT of inline app.post("/api/terminals/:id/history/clear") (server.ts ~746):
- * HistoryManager.saveHistory(id, []) (re-derived inline). SAFE DEFAULT ALWAYS_ALLOWED — the inline route
- * was ungated; even though a clear_history capability row exists (default Ask), the c55 safe-default
- * policy preserves current instant behavior (flagged for later tightening).
+ * HistoryManager.saveHistory(id, []) (re-derived inline). PHASE 1 (deferrable-toggle honesty): the
+ * clear_history capability row already exists (default Ask, pinned) but the def was ALWAYS_ALLOWED —
+ * the toggle was unenforced. It now declares `clear_history` and routes the history-clear mutation
+ * through ctx.gateOrDefer("clear_history", ...) with a durable-intent bag { op:"clear", paneId } in
+ * lockstep with src/actionEffects.ts buildActionRun's clear_history case, so a deferred clear replays
+ * after a restart. Default stays Ask (no default changed) → it now genuinely asks; a power user may set
+ * it Auto for instant clears. Off->blocked->403, Ask->pending->202, Auto->run-now->200.
+ *
+ * The explicit STOP-ALL frozen self-check is KEPT (BEFORE the gate): it preserves the distinct
+ * "Stop-all is engaged" error narration for a destructive mutator. (gateOrDefer's resolver also
+ * short-circuits to Off→forbidden while frozen, so the self-check is belt-and-suspenders, not a
+ * double-block — the early return wins and the gate is never reached during a freeze.)
  */
 export const clearHistory: ActionDef<typeof ClearHistoryParams> = {
   name: "clear_history",
-  description: "Clear a terminal pane's recorded command history. REST/UI surface only.",
+  description: "Clear a terminal pane's recorded command history. Gated 'clear_history' (default Ask — destructive). REST/UI surface only.",
   params: ClearHistoryParams,
-  capability: "ALWAYS_ALLOWED",
+  capability: "clear_history",
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/terminals/:pane_id/history/clear" },
   handler: (args, ctx): ActionResult => {
-    // 2S.4: ALWAYS_ALLOWED never routes through effectiveCapabilityGateFor (where the STOP-ALL
-    // frozen short-circuit lives), so this destructive mutator must check the brake itself.
+    // 2S.4: keep the explicit brake self-check (preserves the distinct "Stop-all is engaged" error
+    // narration). gateOrDefer would also forbid while frozen, but this early return wins.
     if (ctx.isFrozen()) return { kind: "error", message: "Stop-all is engaged — release it first." };
-    // Bridge-first (review block on PR #68): in a running server the HistoryManager owns a
-    // debounced dirty cache — a direct file clear here would be RESURRECTED by a pending flush.
-    // The bridge clears cache+disk through the flush chain; the direct write below remains only
-    // for bare def-level tests with no server registered (no concurrent writer to race).
-    const bridge = getHistoryBridge();
-    if (bridge) bridge.clearHistory(args.pane_id);
-    else saveHistory(ctx, args.pane_id, []);
-    return { kind: "ok", output: `History cleared for terminal ${args.pane_id}.` };
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    // Bridge-first (review block on PR #68): in a running server the HistoryManager owns a debounced
+    // dirty cache — a direct file clear here would be RESURRECTED by a pending flush. The bridge clears
+    // cache+disk through the flush chain; the direct write below remains only for bare def-level tests
+    // with no server registered (no concurrent writer to race).
+    const clearEffect = (): string => {
+      const bridge = getHistoryBridge();
+      if (bridge) bridge.clearHistory(args.pane_id);
+      else saveHistory(ctx, args.pane_id, []);
+      return `History cleared for terminal ${args.pane_id}.`;
+    };
+    // PHASE 1: persist the clear INTENT (op + paneId) so a deferred clear survives a restart and
+    // rebuilds the SAME effect on confirm. Keys in lockstep with src/actionEffects.ts ClearHistoryParams
+    // ({ op:"clear", paneId }).
+    const g = ctx.gateOrDefer(
+      "clear_history",
+      args.pane_id,
+      `Clear history for pane ${args.pane_id}`,
+      clearEffect,
+      { ...(ctx.versionStamp ?? {}), op: "clear", paneId: args.pane_id }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'clear_history' capability is gated Off; clearing pane history is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    // Auto: gateOrDefer does NOT invoke `run` on the "run" disposition — the caller runs it now.
+    return { kind: "ok", output: clearEffect() };
   },
 };
 
@@ -410,11 +440,83 @@ export const clearExited: ActionDef<typeof ClearExitedParams> = {
   },
 };
 
-/** The c55 Batch C rest-only registry slice. */
+// ─────────────────────────────────────────────────────────────────────────────
+// archive_pane — POST /api/terminals/:pane_id/archive (PHASE 1 — NEW gated action).
+//   The standalone "archive THIS pane" operation: a pure LEDGER move of a single pane's row into the
+//   archive (recoverable), WITHOUT terminating its process. Distinct from close_pane (voice: terminate
+//   + archive via stopAndArchivePane) and clear_exited (bulk-archive only already-Exited panes). The
+//   archive_pane capability row already existed in the matrix (default Auto, enforcement deferrable)
+//   but no action declared it — this fills that gap honestly and makes the toggle enforce.
+//   Default Auto → no behavior change unless the operator tightens it. Off->blocked->403,
+//   Ask->pending->202, Auto->run-now->200.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ArchivePaneParams = z.object({
+  pane_id: z.string(),
+});
+
+/**
+ * archive_pane — resolve the pane's OWNING project (findPaneOwningProject, the canonical resolver),
+ * archive the ledger row (ledger.archivePane, recoverable), broadcast ledger + postures, narrate.
+ * Routed through ctx.gateOrDefer("archive_pane", …) with a durable-intent bag { paneId, projectId } in
+ * lockstep with src/actionEffects.ts buildActionRun's archive_pane case, so a deferred archive replays
+ * after a restart. Unknown pane → ok narration resolved BEFORE the gate (we never stage/forbid an
+ * archive of a pane that does not exist). archivePane returns false if the row is already gone (a
+ * concurrent archive between stage and run) — narrated, no broadcast.
+ */
+export const archivePane: ActionDef<typeof ArchivePaneParams> = {
+  name: "archive_pane",
+  description: "Archive a single pane's record into the recoverable archive (does NOT terminate its process). Gated 'archive_pane' (default Auto). REST/UI surface only.",
+  params: ArchivePaneParams,
+  capability: "archive_pane",
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: { method: "post", path: "/api/terminals/:pane_id/archive" },
+  handler: (args, ctx): ActionResult => {
+    const id = args.pane_id;
+    // Resolve the pane via its OWNING project (the canonical resolver) BEFORE the gate so we never
+    // stage/forbid an archive of a pane that does not exist.
+    const owner = findPaneOwningProject(ctx.manager, id);
+    if (!owner) {
+      return { kind: "ok", output: `Pane ${id} not found.` };
+    }
+    const projectId = owner.projectId;
+    // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
+    const archiveEffect = (): string => {
+      const ok = ctx.manager.ledger.archivePaneOwned(projectId, id);
+      if (ok) {
+        ctx.broadcastLedgerUpdate();
+        ctx.broadcastTerminalsUpdated();
+        return `Pane ${id} archived (recoverable).`;
+      }
+      return `Pane ${id} could not be archived (already gone).`;
+    };
+    // PHASE 1: persist the archive INTENT (paneId + projectId) so a deferred archive survives a restart
+    // and rebuilds the SAME effect on confirm. Keys in lockstep with src/actionEffects.ts ArchivePaneParams.
+    const g = ctx.gateOrDefer(
+      "archive_pane",
+      id,
+      `Archive pane ${id}`,
+      archiveEffect,
+      { ...(ctx.versionStamp ?? {}), paneId: id, projectId }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'archive_pane' capability is gated Off; archiving panes is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    // Auto: gateOrDefer does NOT invoke `run` on the "run" disposition — the caller runs it now.
+    return { kind: "ok", output: archiveEffect() };
+  },
+};
+
+/** The c55 Batch C rest-only registry slice (+ Phase 1 archive_pane). */
 export const PANES_REST_ACTIONS: ActionDef[] = [
   respawnPane,
   sendKeys,
   resizePane,
   clearHistory,
   clearExited,
+  archivePane,
 ];

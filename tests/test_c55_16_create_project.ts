@@ -148,6 +148,11 @@ function makeCtx(): {
       probe.ledgerUpdates += 1;
       probe.broadcasts.push({ type: "ledger_updated" });
     },
+    // PHASE 1: create_project now routes its mutations through ctx.gateOrDefer (default Auto). The
+    // real gateOrDefer STAGES run only on Ask; on the Auto ("run") path it returns {disposition:"run"}
+    // WITHOUT invoking run — the CALLER runs the effect. The stub mirrors that so the happy-path
+    // assertions (addProject/renameProject ran, ONE ledger_updated) still hold byte-for-byte.
+    gateOrDefer: (_cap: string, _pane: string | null, _summary: string, _run: () => string) => ({ disposition: "run" as const }),
     session: null,
     callId: "call-test",
     manager: { ledger },
