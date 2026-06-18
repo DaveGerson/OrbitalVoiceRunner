@@ -2718,7 +2718,15 @@ function AppRaw() {
                         it the adjacent History button / cwd span hit-test on top of the trigger and
                         intercept the click (CI e2e mock-lane gate_chip popover spec). */}
                     {activeTerminal.posture && (
-                      <span className="shrink-0">
+                      // relative z-10: give the chip its own stacking context ABOVE the right-hand
+                      // control group (History/Restart/Grid/Exit). Even if a narrow header lets those
+                      // decorative icons visually overlap the chip's box, a click at the trigger's own
+                      // location now hits the trigger and not the refresh icon — the test wants the
+                      // chip's click, and a stacking guard makes that deterministic regardless of the
+                      // exact pixel widths (1d5b66a's width-only guard regressed under Phase 2's wider
+                      // 27-cap popover header). The right group below is left at the default z so the
+                      // chip wins the hit-test where they overlap.
+                      <span className="shrink-0 relative z-10">
                         <GateChip
                           effectiveGates={activeTerminal.effective_gates}
                           posture={activeTerminal.posture}
