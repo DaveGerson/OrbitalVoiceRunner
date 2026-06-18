@@ -12,7 +12,7 @@
  * the metadata table those derived ids index into; a test (§8.1b #5b) asserts no orphans either way.
  */
 
-import type { ActionDef, Capability, CapabilityDef } from "./types";
+import type { ActionDef, Capability, CapabilityDef, CapabilityEnforcement } from "./types";
 import { ALWAYS_ALLOWED } from "./types";
 import { CAPABILITY_LABELS } from "../gateSurface";
 
@@ -67,45 +67,55 @@ const CATEGORY: Record<string, string> = {
 export const CAPABILITY_DEFS: readonly CapabilityDef[] = [
   // ── NEW promotions (Decision 6/7) — default to today's effective behavior. Labels come from
   //    CAPABILITY_LABELS (gateSurface) — the SINGLE label source for all 24 caps, so no drift (F4). ──
-  { id: "read_pane", label: CAPABILITY_LABELS.read_pane, category: CATEGORY.read_pane, defaultGate: "Auto" },
-  { id: "read_notes", label: CAPABILITY_LABELS.read_notes, category: CATEGORY.read_notes, defaultGate: "Auto" },
-  { id: "focus_pane", label: CAPABILITY_LABELS.focus_pane, category: CATEGORY.focus_pane, defaultGate: "Auto" },
-  { id: "compose_draft", label: CAPABILITY_LABELS.compose_draft, category: CATEGORY.compose_draft, defaultGate: "Auto" },
-  { id: "archive_pane", label: CAPABILITY_LABELS.archive_pane, category: CATEGORY.archive_pane, defaultGate: "Auto" },
-  { id: "clear_history", label: CAPABILITY_LABELS.clear_history, category: CATEGORY.clear_history, defaultGate: "Ask" },
+  { id: "read_pane", label: CAPABILITY_LABELS.read_pane, category: CATEGORY.read_pane, defaultGate: "Auto", enforcement: "veto" },
+  { id: "read_notes", label: CAPABILITY_LABELS.read_notes, category: CATEGORY.read_notes, defaultGate: "Auto", enforcement: "veto" },
+  { id: "focus_pane", label: CAPABILITY_LABELS.focus_pane, category: CATEGORY.focus_pane, defaultGate: "Auto", enforcement: "veto" },
+  { id: "compose_draft", label: CAPABILITY_LABELS.compose_draft, category: CATEGORY.compose_draft, defaultGate: "Auto", enforcement: "veto" },
+  { id: "archive_pane", label: CAPABILITY_LABELS.archive_pane, category: CATEGORY.archive_pane, defaultGate: "Auto", enforcement: "deferrable" },
+  { id: "clear_history", label: CAPABILITY_LABELS.clear_history, category: CATEGORY.clear_history, defaultGate: "Ask", enforcement: "deferrable" },
 
   // ── EXISTING 16 (gateSurface labels; current defaults transcribed from behavior) ──
-  { id: "write_to_pane", label: CAPABILITY_LABELS.write_to_pane, category: CATEGORY.write_to_pane, defaultGate: "Ask", spotlightEligible: true },
-  { id: "deliver_handoff", label: CAPABILITY_LABELS.deliver_handoff, category: CATEGORY.deliver_handoff, defaultGate: "Ask", spotlightEligible: true },
-  { id: "create_pane", label: CAPABILITY_LABELS.create_pane, category: CATEGORY.create_pane, defaultGate: "Ask" },
-  { id: "close_pane", label: CAPABILITY_LABELS.close_pane, category: CATEGORY.close_pane, defaultGate: "Ask" },
-  { id: "delete_pane", label: CAPABILITY_LABELS.delete_pane, category: CATEGORY.delete_pane, defaultGate: "Ask" },
-  { id: "delete_project", label: CAPABILITY_LABELS.delete_project, category: CATEGORY.delete_project, defaultGate: "Ask" },
-  { id: "restart_pane", label: CAPABILITY_LABELS.restart_pane, category: CATEGORY.restart_pane, defaultGate: "Ask" },
-  { id: "set_pane_permissions", label: CAPABILITY_LABELS.set_pane_permissions, category: CATEGORY.set_pane_permissions, defaultGate: "Ask" },
-  { id: "set_global_permissions", label: CAPABILITY_LABELS.set_global_permissions, category: CATEGORY.set_global_permissions, defaultGate: "Ask" },
-  { id: "set_capability_gate", label: CAPABILITY_LABELS.set_capability_gate, category: CATEGORY.set_capability_gate, defaultGate: "Ask" },
-  { id: "add_watch_rule", label: CAPABILITY_LABELS.add_watch_rule, category: CATEGORY.add_watch_rule, defaultGate: "Ask" },
-  { id: "execute_plan", label: CAPABILITY_LABELS.execute_plan, category: CATEGORY.execute_plan, defaultGate: "Ask" },
-  { id: "apply_recipe", label: CAPABILITY_LABELS.apply_recipe, category: CATEGORY.apply_recipe, defaultGate: "Ask" },
-  { id: "create_project", label: CAPABILITY_LABELS.create_project, category: CATEGORY.create_project, defaultGate: "Auto" },
-  { id: "update_metadata", label: CAPABILITY_LABELS.update_metadata, category: CATEGORY.update_metadata, defaultGate: "Auto" },
-  { id: "switch_context", label: CAPABILITY_LABELS.switch_context, category: CATEGORY.switch_context, defaultGate: "Auto" },
-  { id: "set_voice_mute", label: CAPABILITY_LABELS.set_voice_mute, category: CATEGORY.set_voice_mute, defaultGate: "Auto" },
-  { id: "dismiss_attention", label: CAPABILITY_LABELS.dismiss_attention, category: CATEGORY.dismiss_attention, defaultGate: "Auto" },
+  { id: "write_to_pane", label: CAPABILITY_LABELS.write_to_pane, category: CATEGORY.write_to_pane, defaultGate: "Ask", enforcement: "deferrable", spotlightEligible: true },
+  { id: "deliver_handoff", label: CAPABILITY_LABELS.deliver_handoff, category: CATEGORY.deliver_handoff, defaultGate: "Ask", enforcement: "deferrable", spotlightEligible: true },
+  { id: "create_pane", label: CAPABILITY_LABELS.create_pane, category: CATEGORY.create_pane, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "close_pane", label: CAPABILITY_LABELS.close_pane, category: CATEGORY.close_pane, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "delete_pane", label: CAPABILITY_LABELS.delete_pane, category: CATEGORY.delete_pane, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "delete_project", label: CAPABILITY_LABELS.delete_project, category: CATEGORY.delete_project, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "restart_pane", label: CAPABILITY_LABELS.restart_pane, category: CATEGORY.restart_pane, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "set_pane_permissions", label: CAPABILITY_LABELS.set_pane_permissions, category: CATEGORY.set_pane_permissions, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "set_global_permissions", label: CAPABILITY_LABELS.set_global_permissions, category: CATEGORY.set_global_permissions, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "set_capability_gate", label: CAPABILITY_LABELS.set_capability_gate, category: CATEGORY.set_capability_gate, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "add_watch_rule", label: CAPABILITY_LABELS.add_watch_rule, category: CATEGORY.add_watch_rule, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "execute_plan", label: CAPABILITY_LABELS.execute_plan, category: CATEGORY.execute_plan, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "apply_recipe", label: CAPABILITY_LABELS.apply_recipe, category: CATEGORY.apply_recipe, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "create_project", label: CAPABILITY_LABELS.create_project, category: CATEGORY.create_project, defaultGate: "Auto", enforcement: "deferrable" },
+  { id: "update_metadata", label: CAPABILITY_LABELS.update_metadata, category: CATEGORY.update_metadata, defaultGate: "Auto", enforcement: "deferrable" },
+  { id: "switch_context", label: CAPABILITY_LABELS.switch_context, category: CATEGORY.switch_context, defaultGate: "Auto", enforcement: "veto" },
+  { id: "set_voice_mute", label: CAPABILITY_LABELS.set_voice_mute, category: CATEGORY.set_voice_mute, defaultGate: "Auto", enforcement: "informational" },
+  { id: "dismiss_attention", label: CAPABILITY_LABELS.dismiss_attention, category: CATEGORY.dismiss_attention, defaultGate: "Auto", enforcement: "veto" },
 
   // ── c55.10: rest-only writes tightened ALWAYS_ALLOWED → Ask (gate-tightening only; strictly more
   //    restrictive). send_keys is the raw-PTY keystroke twin of write_to_pane; remove_watch_rule mirrors
   //    add_watch_rule; delete_orchestrator_plan is a destructive plan delete. ──
-  { id: "send_keys", label: CAPABILITY_LABELS.send_keys, category: CATEGORY.send_keys, defaultGate: "Ask" },
-  { id: "remove_watch_rule", label: CAPABILITY_LABELS.remove_watch_rule, category: CATEGORY.remove_watch_rule, defaultGate: "Ask" },
-  { id: "delete_orchestrator_plan", label: CAPABILITY_LABELS.delete_orchestrator_plan, category: CATEGORY.delete_orchestrator_plan, defaultGate: "Ask" },
+  { id: "send_keys", label: CAPABILITY_LABELS.send_keys, category: CATEGORY.send_keys, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "remove_watch_rule", label: CAPABILITY_LABELS.remove_watch_rule, category: CATEGORY.remove_watch_rule, defaultGate: "Ask", enforcement: "deferrable" },
+  { id: "delete_orchestrator_plan", label: CAPABILITY_LABELS.delete_orchestrator_plan, category: CATEGORY.delete_orchestrator_plan, defaultGate: "Ask", enforcement: "deferrable" },
 ] as const;
 
 /** Fast id -> CapabilityDef lookup over the table. */
 export const CAPABILITY_DEF_BY_ID: ReadonlyMap<Capability, CapabilityDef> = new Map(
   CAPABILITY_DEFS.map((d) => [d.id, d] as const)
 );
+
+/**
+ * enforcementOf(cap) — the control-type class of a capability (Phase 0 metadata helper).
+ * Looks up the CapabilityDef and returns its `enforcement`. Unknown ids fall back to "deferrable"
+ * (the safe, behavior-preserving default — a 3-way control never under-reports a real gate). NOT yet
+ * plumbed into any handler or UI; consumers land in Phase 1/2.
+ */
+export function enforcementOf(cap: Capability): CapabilityEnforcement {
+  return CAPABILITY_DEF_BY_ID.get(cap)?.enforcement ?? "deferrable";
+}
 
 /**
  * deriveCapabilities(registry) — the matrix is a PROJECTION of the registry (Decision 5).

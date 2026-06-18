@@ -32,12 +32,26 @@ export type Surface = "voice" | "rest" | "ws";
 /** A capability = one row of the matrix. The set is DERIVED from the registry, not hand-listed. */
 export type Capability = string; // closed at runtime by the registry; see deriveCapabilities()
 
+/**
+ * Enforcement class of a capability — what kind of CONTROL the matrix/UI can honestly offer for it.
+ * Phase 0 metadata foundation: classification ONLY, no behavior change. Later phases (1/2) drive the
+ * correct control type (3-way / 2-way / read-only badge) and gate plumbing off this.
+ *
+ * - "deferrable":    side-effecting action that returns a narration string and can WAIT; supports full
+ *                    Auto/Ask/Off via gateOrDefer/dispatchProposal → UI shows a 3-way toggle.
+ * - "veto":          synchronous/return-style op where "Ask" cannot defer-and-return; only Off is
+ *                    meaningful (Allow/Off) → UI shows a 2-way toggle.
+ * - "informational": gating is self-defeating/nonsensical; shown as a read-only badge, never gated.
+ */
+export type CapabilityEnforcement = "deferrable" | "veto" | "informational";
+
 /** One capability-matrix row. The metadata (label/category/default) lives in CAPABILITY_DEFS. */
 export interface CapabilityDef {
   id: Capability;                 // e.g. "write_to_pane", "read_pane", "archive_pane"
   label: string;                  // plain language, no jargon (matrix + voice read-backs)
   category: string;               // grouping for the matrix editor
   defaultGate: "Auto" | "Ask" | "Off"; // behavior-preserving default (Decision 6)
+  enforcement: CapabilityEnforcement;   // control-type class (Phase 0 metadata; drives UI in Phase 1/2)
   spotlightEligible?: boolean;    // may loosen to Auto on the active pane (today: write_to_pane, deliver_handoff)
 }
 
