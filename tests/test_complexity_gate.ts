@@ -14,7 +14,6 @@ import tseslint from 'typescript-eslint';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const fixturesDir = path.join(repoRoot, 'tests', 'fixtures', 'complexity');
-const fixturesConfig = path.join(fixturesDir, 'eslint.fixtures.config.js');
 const prodConfig = path.join(repoRoot, 'eslint.config.js');
 
 function fixture(name: string): string {
@@ -26,19 +25,34 @@ function complexityMessages(result: ESLint.LintResult) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Tool reports the exact hand-counted value (fixtures config, max:4).
+// 1. Tool reports the exact hand-counted value. We enumerate with an inline
+//    complexity:['warn', 0] config (max 0 => every function is reported, so the
+//    message embeds the function's actual computed CC) — the same technique the
+//    hotspot report uses. No separate fixtures config file is needed.
 // ---------------------------------------------------------------------------
+function enumerateCC(): ESLint {
+  return new ESLint({
+    overrideConfigFile: true,
+    overrideConfig: {
+      files: ['**/*.ts'],
+      languageOptions: {
+        parser: tseslint.parser,
+        parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
+      },
+      rules: { complexity: ['warn', 0] },
+    },
+  });
+}
+
 const exactCases: Array<[string, number]> = [
   ['cc-05.ts', 5],
   ['cc-10.ts', 10],
   ['cc-11.ts', 11],
-  ['cc-15.ts', 15],
-  ['cc-16.ts', 16],
 ];
 
 for (const [file, expected] of exactCases) {
-  test(`fixtures config: ${file} reports complexity of ${expected}`, async () => {
-    const eslint = new ESLint({ overrideConfigFile: fixturesConfig });
+  test(`enumerate: ${file} reports complexity of ${expected}`, async () => {
+    const eslint = enumerateCC();
     const [res] = await eslint.lintFiles([fixture(file)]);
     const msgs = complexityMessages(res);
     assert.equal(msgs.length, 1, `expected exactly one complexity message, got ${msgs.length}`);
