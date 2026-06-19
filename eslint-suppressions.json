@@ -4,6 +4,11 @@
       "count": 1
     }
   },
+  "scripts/live-smoke-kitchen.mjs": {
+    "complexity": {
+      "count": 1
+    }
+  },
   "scripts/smoke-handoff.ts": {
     "complexity": {
       "count": 1
@@ -14,9 +19,19 @@
       "count": 1
     }
   },
+  "scripts/wt-lock.mjs": {
+    "complexity": {
+      "count": 1
+    }
+  },
   "server.ts": {
     "complexity": {
       "count": 3
+    }
+  },
+  "src/App.tsx": {
+    "complexity": {
+      "count": 11
     }
   },
   "src/actionEffects.ts": {
@@ -72,6 +87,34 @@
   "src/approvalIntent.ts": {
     "complexity": {
       "count": 5
+    }
+  },
+  "src/components/ActionConfirmDialog.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/components/ApprovalDialog.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/components/GateChip.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/components/SettingsDialog.tsx": {
+    "complexity": {
+      "count": 7
+    }
+  },
+  "src/components/TerminalView.tsx": {
+    "complexity": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
     }
   },
   "src/dispatch/joinTracker.ts": {
@@ -134,6 +177,39 @@
       "count": 4
     }
   },
+  "src/orbital/KitchenRadio.tsx": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "src/orbital/OrbitalApp.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/ServiceMode.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/StationCard.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/TerminalWindow.tsx": {
+    "complexity": {
+      "count": 2
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/orbital/primitives.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
   "src/orbital/station.ts": {
     "complexity": {
       "count": 1
@@ -150,6 +226,21 @@
     },
     "complexity": {
       "count": 7
+    }
+  },
+  "src/orbital/views/BackOfHouse.tsx": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/views/Pantry.tsx": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/orbital/views/Pass.tsx": {
+    "complexity": {
+      "count": 3
     }
   },
   "src/paneOwnership.ts": {

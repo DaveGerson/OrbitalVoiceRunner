@@ -1,7 +1,7 @@
 // scripts/complexity-report.mjs — churn × complexity HOTSPOT report (evaluation, not a gate).
 //
 // WHAT IT MEASURES
-//   For every function in the gated source set (server.ts, src/**/*.ts, scripts/**/*.ts)
+//   For every function in the gated source set (server.ts, src/**/*.{ts,tsx}, scripts/**/*.{ts,mjs})
 //   it extracts the function's cyclomatic complexity (CC) straight out of ESLint, then
 //   weights each file by how often it changes (git churn). The headline metric is:
 //
@@ -66,9 +66,12 @@ function churnFor(relPath) {
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     const n = Number.parseInt(out, 10);
-    return Number.isFinite(n) && n > 0 ? n : 1;
-  } catch {
-    return 1; // no git / no history
+    return Number.isFinite(n) && n > 0 ? n : 1; // 0 commits => new/untracked file, churn 1
+  } catch (err) {
+    // A git FAILURE (not "no history") would silently floor a hot file to churn 1 and
+    // demote a real hotspot — surface it on stderr instead of hiding it.
+    process.stderr.write(`[complexity-report] WARN: churn lookup failed for ${relPath} (${err.message}); using churn=1\n`);
+    return 1;
   }
 }
 
@@ -80,18 +83,18 @@ async function collect() {
     overrideConfigFile: true,
     overrideConfig: [
       {
-        files: ['**/*.ts'],
+        files: ['**/*.{ts,tsx,mjs}'],
         languageOptions: {
           parser: tseslint.parser,
-          parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
+          parserOptions: { ecmaVersion: 'latest', sourceType: 'module', ecmaFeatures: { jsx: true } },
         },
         rules: { complexity: ['warn', 0] },
       },
     ],
   });
 
-  // Same gated source set as the production gate.
-  const results = await eslint.lintFiles(['server.ts', 'src/**/*.ts', 'scripts/**/*.ts']);
+  // Same gated source set as the production gate (.ts/.tsx app code + .ts/.mjs scripts).
+  const results = await eslint.lintFiles(['server.ts', 'src/**/*.{ts,tsx}', 'scripts/**/*.{ts,mjs}']);
 
   const rows = [];
   for (const res of results) {

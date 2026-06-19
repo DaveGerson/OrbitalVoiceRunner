@@ -24,11 +24,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
 // RATCHET_CEILING: the current baselined `complexity` suppression total. LOWER THIS when
-// suppressions are pruned (`eslint . --prune-suppressions`); it must NEVER be raised. Raising
-// it would let new complexity violations be silently baselined instead of fixed.
-// 85 -> 80: Phase 7 (cyclomatic-complexity plan) refactored src/voice/index.ts's 5 over-limit
-// functions under CC 10 and pruned its 5 complexity suppressions.
-const RATCHET_CEILING = 80;
+// suppressions are pruned (`eslint . --prune-suppressions`). It must NOT be raised to silence
+// a NEW violation — that's what the per-file guard (scripts/check-suppressions-ratchet.mjs)
+// prevents. The ONLY legitimate raise is a deliberate, reviewed GATE-SCOPE EXPANSION.
+// 85 -> 80: Phase 7 refactored src/voice/index.ts under CC 10 and pruned its 5 suppressions.
+// 80 -> 119: scope expansion — the gate now also covers .tsx React components and .mjs scripts
+//   (previously ungated); +39 pre-existing violations baselined. This is a one-time scope raise.
+const RATCHET_CEILING = 119;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

@@ -24,12 +24,16 @@ export default tseslint.config(
     ],
   },
   {
-    files: ['server.ts', 'src/**/*.ts', 'scripts/**/*.ts'],
+    // Gate ALL first-party source: .ts/.tsx app code (incl. React components,
+    // where UI complexity concentrates) and .ts/.mjs build+CI scripts. Leaving
+    // .tsx/.mjs ungated was a real hole — a 13-branch render function would pass.
+    files: ['server.ts', 'src/**/*.{ts,tsx}', 'scripts/**/*.{ts,mjs}'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
         ecmaVersion: 'latest',
         sourceType: 'module',
+        ecmaFeatures: { jsx: true },
       },
     },
     plugins: {
