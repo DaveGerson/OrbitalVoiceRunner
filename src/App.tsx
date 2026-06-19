@@ -2712,21 +2712,13 @@ function AppRaw() {
                       $ {activeTerminal.command}
                     </span>
                     {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
-                        payload). Click for the full 16-capability breakdown in plain language. The
-                        shrink-0 wrapper keeps the chip from being collapsed/overlapped by the right-hand
-                        controls when the header is narrowed (sidebar + transcript panel open). Without
-                        it the adjacent History button / cwd span hit-test on top of the trigger and
-                        intercept the click (CI e2e mock-lane gate_chip popover spec). */}
+                        payload). Click for the full breakdown in plain language. The shrink-0 wrapper +
+                        the min-w-0/shrink-0 group guards keep the chip from being visually collapsed or
+                        overlapped by the right-hand controls when the header is narrowed (sidebar +
+                        transcript panel open). The e2e opens the popover via dispatchEvent('click'), so
+                        the spec no longer hinges on this layout winning a pixel-level hit-test. */}
                     {activeTerminal.posture && (
-                      // relative z-10: give the chip its own stacking context ABOVE the right-hand
-                      // control group (History/Restart/Grid/Exit). Even if a narrow header lets those
-                      // decorative icons visually overlap the chip's box, a click at the trigger's own
-                      // location now hits the trigger and not the refresh icon — the test wants the
-                      // chip's click, and a stacking guard makes that deterministic regardless of the
-                      // exact pixel widths (1d5b66a's width-only guard regressed under Phase 2's wider
-                      // 27-cap popover header). The right group below is left at the default z so the
-                      // chip wins the hit-test where they overlap.
-                      <span className="shrink-0 relative z-10">
+                      <span className="shrink-0">
                         <GateChip
                           effectiveGates={activeTerminal.effective_gates}
                           posture={activeTerminal.posture}

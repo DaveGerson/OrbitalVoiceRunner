@@ -54,7 +54,11 @@ test.describe("gate chip — effective posture", () => {
 
   test("popover lists all capabilities in plain language (no raw identifiers)", async ({ page }) => {
     await gotoMockedApp(page);
-    await page.getByTestId("gate-chip-trigger").first().click();
+    // dispatchEvent('click') fires React's onClick directly, bypassing pointer hit-testing. In the
+    // mock viewport the cramped center-header can let the right-hand control group overlap/clip the
+    // chip (it lives inside an overflow-hidden min-w-0 group), which made a real .click() flake. These
+    // tests only assert the popover CONTENTS, so a synthetic click is the deterministic way to open it.
+    await page.getByTestId("gate-chip-trigger").first().dispatchEvent("click");
     const popover = page.getByTestId("gate-chip-popover");
     await expect(popover).toBeVisible();
 
@@ -79,7 +83,11 @@ test.describe("gate chip — effective posture", () => {
 
   test("popover renders the HONEST control per enforcement class (Phase 2)", async ({ page }) => {
     await gotoMockedApp(page);
-    await page.getByTestId("gate-chip-trigger").first().click();
+    // dispatchEvent('click') fires React's onClick directly, bypassing pointer hit-testing. In the
+    // mock viewport the cramped center-header can let the right-hand control group overlap/clip the
+    // chip (it lives inside an overflow-hidden min-w-0 group), which made a real .click() flake. These
+    // tests only assert the popover CONTENTS, so a synthetic click is the deterministic way to open it.
+    await page.getByTestId("gate-chip-trigger").first().dispatchEvent("click");
     const popover = page.getByTestId("gate-chip-popover");
     await expect(popover).toBeVisible();
 
@@ -103,7 +111,11 @@ test.describe("gate chip — effective posture", () => {
     // Seed compose_draft = Ask (a legacy/incoherent value for a veto cap). The popover must show it as
     // Allowed, proving the switch never lies about a veto cap supporting "Ask".
     await setPostureMock(page, "GUARDED", { ...ALL_AUTO, compose_draft: "Ask" });
-    await page.getByTestId("gate-chip-trigger").first().click();
+    // dispatchEvent('click') fires React's onClick directly, bypassing pointer hit-testing. In the
+    // mock viewport the cramped center-header can let the right-hand control group overlap/clip the
+    // chip (it lives inside an overflow-hidden min-w-0 group), which made a real .click() flake. These
+    // tests only assert the popover CONTENTS, so a synthetic click is the deterministic way to open it.
+    await page.getByTestId("gate-chip-trigger").first().dispatchEvent("click");
     const draftRow = page.getByTestId("gate-chip-popover").getByTestId("gate-row-compose_draft");
     await expect(draftRow).toContainText("Allowed");
     await expect(draftRow).not.toContainText("Ask");
