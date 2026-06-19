@@ -2,7 +2,7 @@
 
 - **Bead:** _(to file)_ `cyclomatic-complexity-gate` — "Measure, gate, and trend per-function cyclomatic complexity across the TS codebase"
 - **Date:** 2026-06-19
-- **Status:** Design / TDD — spec + plan only; no production tooling wired in this pass.
+- **Status:** Design / TDD — open questions resolved 2026-06-19 (see §9 Decisions); no production tooling wired in this pass.
 - **Author context:** requested by operator — "develop a spec and plan to test for and evaluate Cyclomatic complexity."
 - **Scope:** all first-party TypeScript under `server.ts`, `src/**`, `scripts/**`. Excludes `tests/**`, `dist/**`, `node_modules/**`, generated files (`*.generated.ts`), and Python.
 - **Depends on (today):** nothing — this is greenfield tooling. The repo has **no ESLint and no complexity tooling** today; `npm run lint` is `tsc --noEmit` only.
@@ -237,12 +237,16 @@ Tracked in `bd`; each phase is a separate bead under `cyclomatic-complexity-gate
 
 ---
 
-## 9. Open questions (operator)
+## 9. Decisions (locked 2026-06-19, operator interview)
 
-- **O-1 — Add ESLint, or zero-ESLint fallback?** Recommended: **add ESLint** (per-function granularity, editor feedback, cognitive complexity, free CI exit). Fallback (`cyclomatic-complexity` CLI) only if keeping the dependency surface minimal outweighs those. (§3.4/§3.5)
-- **O-2 — Separate `complexity.yml` lane or fold the gate into `ci.yml`'s existing lint step?** Recommended: **separate lane** first (easy to make non-blocking while we tune the baseline), fold in once stable.
-- **O-3 — Gate threshold 10 or 15?** Recommended: **10** (NIST default) for new code; 15 is defensible given the legacy profile. The baseline absorbs existing violations either way.
-- **O-4 — Should the ratchet ever fail CI, or stay advisory for one milestone?** Recommended: **fail on new violations immediately** (suppressions keep legacy green), advisory only for the cognitive `warn`s.
+- **D-1 (was O-1) — Toolchain: add the ESLint stack.** `eslint` + `typescript-eslint` + `eslint-plugin-sonarjs`. Per-function granularity, editor feedback, and cognitive complexity in one pass. The zero-ESLint fallback (§3.5) is dropped.
+- **D-2 (was O-2) — CI: separate `complexity.yml` lane** first (easy to keep non-blocking while tuning), fold into `ci.yml` once stable.
+- **D-3 (was O-3) — Threshold: cyclomatic `error` at 10** (McCabe/NIST) for new code; cognitive `warn` at 15 (advisory).
+- **D-4 (was O-4) — Enforcement: fail on new/changed violations immediately.** Bulk suppressions keep legacy green; cognitive stays advisory.
+- **D-5 (new) — Refactor appetite: measure first, then refactor the top 3 files now.** After baselining, refactor the *violating functions* in the 3 highest-priority files (ranked by churn × complexity); produce a next-step burn-down plan for the remaining hotspots. Not an open-ended whole-repo refactor in this effort.
+- **D-6 (new) — Safety net: characterization tests first for core machinery.** Before refactoring `server.ts` (WS/REST hub) and `src/terminal.ts` (PTY lifecycle), pin current behavior with tests, then refactor strictly behavior-preserving. Lower-risk files (`src/orbital/useOrbitalData.ts`, etc.) may rely on the existing suite.
+
+> Sequencing consequence of D-5: complexity is a **per-function** metric, so refactor targets are unknown until the analyzer runs. The measure → baseline → report steps (Phases 1–5 of the plan) therefore precede any refactoring (Phases 6+).
 
 ---
 
