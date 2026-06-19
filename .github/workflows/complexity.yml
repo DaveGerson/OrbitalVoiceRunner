@@ -1,0 +1,59 @@
+name: "Complexity (cyclomatic gate)"
+
+# Dedicated lane so the complexity gate is independently triageable from the
+# main CI lane (locked decision D-2). It enforces per-function cyclomatic
+# complexity (McCabe) at <= 10 on NEW/changed code, while pre-existing
+# violations stay grandfathered in eslint-suppressions.json (baseline + ratchet).
+#
+# `eslint .` exit-code contract (see plan Phase 3/4):
+#   0 = clean
+#   1 = a new/changed function exceeds the limit -> fix it
+#   2 = a suppression is now unused (code improved) -> run `npx eslint . --prune-suppressions`
+#       and commit the (smaller) eslint-suppressions.json. The baseline only ratchets DOWN.
+#
+# cognitive-complexity is advisory (warn) and intentionally NOT gated here, so we
+# run a plain `eslint .` (NOT `--max-warnings 0`) — warnings print but never block.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  complexity:
+    name: "cyclomatic gate / node22 / ubuntu"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the churn x complexity report can count commits per file.
+          fetch-depth: 0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cyclomatic gate (eslint complexity + baseline ratchet)
+        run: npm run complexity
+
+      - name: Gate self-tests (fixtures + ratchet guard)
+        run: npx tsx --test --test-force-exit tests/test_complexity_gate.ts tests/test_complexity_ratchet.ts
+
+      - name: Hotspot report (churn x complexity)
+        if: always()
+        run: npm run complexity:report -- --format json > complexity-report.json
+
+      - name: Upload complexity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complexity-report
+          path: complexity-report.json
+          retention-days: 14
