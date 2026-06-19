@@ -26,7 +26,9 @@ const repoRoot = path.resolve(__dirname, '..');
 // RATCHET_CEILING: the current baselined `complexity` suppression total. LOWER THIS when
 // suppressions are pruned (`eslint . --prune-suppressions`); it must NEVER be raised. Raising
 // it would let new complexity violations be silently baselined instead of fixed.
-const RATCHET_CEILING = 85;
+// 85 -> 80: Phase 7 (cyclomatic-complexity plan) refactored src/voice/index.ts's 5 over-limit
+// functions under CC 10 and pruned its 5 complexity suppressions.
+const RATCHET_CEILING = 80;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

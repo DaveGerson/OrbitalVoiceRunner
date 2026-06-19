@@ -182,11 +182,6 @@
       "count": 9
     }
   },
-  "src/voice/index.ts": {
-    "complexity": {
-      "count": 5
-    }
-  },
   "src/voice/speakGate.ts": {
     "complexity": {
       "count": 1
