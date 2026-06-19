@@ -40,11 +40,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Exit-code-aware so a stale-suppression failure (exit 2) is actionable
+      # rather than masquerading as "you added complex code" (exit 1). The gate
+      # self-tests are NOT re-run here — the unit lane (`npm test`) already runs
+      # tests/test_complexity_*.ts.
       - name: Cyclomatic gate (eslint complexity + baseline ratchet)
-        run: npm run complexity
-
-      - name: Gate self-tests (fixtures + ratchet guard)
-        run: npx tsx --test --test-force-exit tests/test_complexity_gate.ts tests/test_complexity_ratchet.ts
+        run: |
+          npx eslint . ; code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Complexity baseline has unused suppressions — code improved below a baselined function. Run 'npx eslint . --prune-suppressions', commit the smaller eslint-suppressions.json, and lower RATCHET_CEILING in tests/test_complexity_ratchet.ts."
+            exit 1
+          fi
+          exit "$code"
 
       - name: Hotspot report (churn x complexity)
         if: always()
