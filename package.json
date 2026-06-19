@@ -25,7 +25,8 @@
     "verify:agy-resume": "tsx scripts/verify-agy-resume.ts",
     "sim": "tsx scripts/simulate-voice.ts",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "complexity": "eslint ."
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -57,9 +58,12 @@
     "@types/ws": "^8.18.1",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
+    "eslint": "^10.5.0",
+    "eslint-plugin-sonarjs": "^4.1.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
+    "typescript-eslint": "^8.61.1",
     "vite": "^6.2.3"
   }
 }
