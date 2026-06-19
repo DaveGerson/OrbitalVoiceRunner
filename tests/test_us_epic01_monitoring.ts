@@ -125,9 +125,19 @@ describe("US-1.1 Background completion awareness (P0)", () => {
     apiToken = serverMod.API_AUTH_TOKEN;
     mock = installMockLive();
 
-    // Compress the silence-to-idle window so the real `sleep` pane idles fast.
+    // Idle threshold must sit ABOVE the longest in-command silent gap (the `sleep 0.4`/`sleep 0.3`
+    // below). This matters in FALLBACK mode — when node-pty is unavailable so idle is driven purely by
+    // output quiescence (this sandbox's legacy `script` transport; CI with a real node-pty prebuild
+    // uses the AUTHORITATIVE process-tree probe, where a live `sleep` child keeps the pane Running and
+    // this race can't occur). At 250ms the pane went Idle DURING the sleep (400ms silence > 250ms),
+    // then flipped back to Running on the trailing `echo`/prompt; `waitFor(Idle)` could catch that
+    // premature edge and a REST read land in the following Running window — a flake under parallel-suite
+    // load (and a semantically wrong assert: that idle isn't "finished"). Use the documented production
+    // default (2000ms) — 5x the 400ms silence, so a premature idle would need ~1.6s of event-loop
+    // starvation: the ONLY idle edge in practice is the real post-completion one. Harmless in
+    // authoritative mode (idle there is gated on the probe, not this timeout).
     running = await startServer({ port: 0, enableVite: false });
-    running.manager.updateSettings({ advanced: { idleTimeoutMs: 250 } as any });
+    running.manager.updateSettings({ advanced: { idleTimeoutMs: 2000 } as any });
     base = `http://127.0.0.1:${running.port}`;
 
     clientMessages = [];
@@ -173,7 +183,7 @@ describe("US-1.1 Background completion awareness (P0)", () => {
     // First the pane must become busy (a real Running edge), then quiesce to Idle on its own once the
     // command's output goes silent for idleTimeoutMs (the interactive shell returns to its prompt).
     await waitFor(() => A.status === "Running", 4000);
-    await waitFor(() => A.status === "Idle", 6000);
+    await waitFor(() => A.status === "Idle", 10000);
 
     // GET /api/terminals is the operator's at-a-glance status board (list_panes REST surface).
     const res = await api("/api/terminals");
@@ -190,14 +200,28 @@ describe("US-1.1 Background completion awareness (P0)", () => {
 
   it("US-1.1: a real-time pane_status WS frame broadcasts for the background pane as it transitions (operator doesn't poll)", async () => {
     const mgr = running!.manager;
-    const A = await spawnAndRun(mgr, "us11f-A", "sleep 0.3 && echo HI");
-    await waitFor(() => A.status === "Idle", 6000);
+    mgr.addTerminal("us11f-A", tmpDir, SHELL, "Custom", "Read-Only");
+    const A = mgr.terminals["us11f-A"];
+    // Settle the freshly-spawned shell to Idle FIRST, THEN kick the command — so what follows is a
+    // clean Idle->Running edge, which is exactly what fires onRunning -> the pane_status:Running frame.
+    // We must wait for the genuine Idle (not a fixed delay): at the 2000ms threshold the shell's startup
+    // output keeps the pane Running past any short fixed wait, so a command written then would NOT be a
+    // fresh edge and no Running frame would broadcast. (The fixed 400ms is only attach-settle so the
+    // PTY is ready for the first writeInput when the shell emits no startup output — there is no
+    // pollable "PTY ready" signal.)
+    await new Promise((r) => setTimeout(r, 400));
+    await waitFor(() => A.status === "Idle", 10000);
+    A.writeInput("sleep 0.3 && echo HI\n");
 
     // The ears edges broadcast a `pane_status` frame on the Running edge (onRunning) so the UI flips
-    // the chip live without the 20s poll. CHARACTERIZATION: onIdle does NOT emit a `pane_status`
-    // status:"Idle" frame — the completion travels via the announcement/pane-signal lane + the
-    // `pane_transition` classifier, not a pane_status:Idle frame. So we assert the Running frame
-    // (the real-time edge that DOES broadcast) reached this WS client for pane A.
+    // the chip live without the 20s poll. Poll for it — frame delivery to this WS client is async.
+    // CHARACTERIZATION: onIdle does NOT emit a `pane_status` status:"Idle" frame — the completion
+    // travels via the announcement/pane-signal lane + the `pane_transition` classifier, not a
+    // pane_status:Idle frame. So we assert the Running frame (the real-time edge that DOES broadcast).
+    await waitFor(
+      () => clientMessages.some((m) => m.type === "pane_status" && m.terminalId === "us11f-A" && m.status === "Running"),
+      6000,
+    );
     const statusFrames = clientMessages.filter((m) => m.type === "pane_status" && m.terminalId === "us11f-A");
     assert.ok(statusFrames.length >= 1, "at least one real-time pane_status frame broadcast for the background pane");
     assert.ok(statusFrames.some((f) => f.status === "Running"), "the Running edge broadcasts a pane_status frame in real time");
