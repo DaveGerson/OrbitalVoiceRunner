@@ -1,0 +1,200 @@
+{
+  "scripts/catalog.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "scripts/smoke-handoff.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "scripts/verify-live-modeswitch-agy.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "server.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/actionEffects.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/actions/defs/dispatch_group.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/actions/defs/handoff.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/actions/defs/layouts.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/actions/defs/locks.ts": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "src/actions/defs/orchestration.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/actions/defs/panes_write.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/actions/defs/reads.ts": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "src/actions/gemini.ts": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "src/announcementBus.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/approvalIntent.ts": {
+    "complexity": {
+      "count": 5
+    }
+  },
+  "src/dispatch/joinTracker.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/dispatch/paneWrite.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/e2e/harness.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/eventBus.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/gating/index.ts": {
+    "complexity": {
+      "count": 7
+    }
+  },
+  "src/handoffFlow.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/ledger.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/liveGrounding.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/liveTranscripts.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/memory/assembler.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/memory/pythonClient.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/observe/index.ts": {
+    "complexity": {
+      "count": 4
+    }
+  },
+  "src/orbital/station.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/useFocusTrap.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/orbital/useOrbitalData.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    },
+    "complexity": {
+      "count": 7
+    }
+  },
+  "src/paneOwnership.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/pendingApprovals.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/statusProbe.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "src/store/migrate.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/store/sqliteStore.ts": {
+    "complexity": {
+      "count": 4
+    }
+  },
+  "src/terminal.ts": {
+    "complexity": {
+      "count": 9
+    }
+  },
+  "src/voice/index.ts": {
+    "complexity": {
+      "count": 5
+    }
+  },
+  "src/voice/speakGate.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/voiceApprovalRouting.ts": {
+    "complexity": {
+      "count": 1
+    }
+  }
+}
