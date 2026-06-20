@@ -2718,7 +2718,10 @@ function AppRaw() {
                         transcript panel open). The e2e opens the popover via dispatchEvent('click'), so
                         the spec no longer hinges on this layout winning a pixel-level hit-test. */}
                     {activeTerminal.posture && (
-                      <span className="shrink-0">
+                      // data-testid: an inert hook so e2e can target THIS (center-header) chip
+                      // specifically — `getByTestId("gate-chip-trigger").first()` resolves to a sidebar
+                      // chip, not this one. Used by the real-pointer clickability regression guard.
+                      <span className="shrink-0" data-testid="gate-chip-header">
                         <GateChip
                           effectiveGates={activeTerminal.effective_gates}
                           posture={activeTerminal.posture}

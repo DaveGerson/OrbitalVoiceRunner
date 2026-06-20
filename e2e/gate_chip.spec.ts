@@ -120,4 +120,18 @@ test.describe("gate chip — effective posture", () => {
     await expect(draftRow).toContainText("Allowed");
     await expect(draftRow).not.toContainText("Ask");
   });
+
+  test("the center-header chip is genuinely clickable by a real pointer at a desktop width", async ({ page }) => {
+    // Regression guard for the coverage the dispatchEvent opens above intentionally trade away. The
+    // popover-content tests use dispatchEvent because at the default 1280px mock viewport the OPEN
+    // transcript panel narrows the center header enough that the right-hand controls can overlap the
+    // chip and steal a real pointer click. At a normal desktop width the header has room, so a REAL
+    // click (full Playwright actionability + hit-test — it throws if the trigger is occluded) must land
+    // on the header chip and open the popover. Targets the header chip explicitly (gate-chip-header):
+    // `gate-chip-trigger.first()` resolves to a sidebar chip, which was never the occluded one.
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await gotoMockedApp(page);
+    await page.getByTestId("gate-chip-header").getByTestId("gate-chip-trigger").click();
+    await expect(page.getByTestId("gate-chip-popover")).toBeVisible();
+  });
 });
