@@ -122,6 +122,8 @@ npm run test:e2e                               # Playwright (auto-starts Vite, ?
 npm run build                                  # vite + esbuild → dist/server.cjs
 npm run smoke:claude                           # live pane smoke (needs authed Claude binary)
 node scripts/check-deps.mjs                     # verify node_modules is in sync with package.json
+npm run complexity                             # cyclomatic gate: eslint complexity<=10 + advisory cognitive; baseline in eslint-suppressions.json (exit 2 = run `npx eslint . --prune-suppressions`)
+npm run complexity:report                      # churn × complexity hotspot ranking (what to refactor next)
 ```
 
 > Gotchas:
@@ -133,6 +135,10 @@ node scripts/check-deps.mjs                     # verify node_modules is in sync
 >   `sh scripts/install-wt-lock.sh` (they run `node scripts/check-deps.mjs --warn`, fail-open).
 > - The catalog drift guard (`scripts/catalog.ts`) normalizes CRLF→LF before comparing, so it
 >   won't false-fail on Windows; a real drift means the registry changed — run `npm run catalog`.
+> - Complexity (CC ≤ 10) is gated only on NEW/changed code; legacy violations are baselined in
+>   `eslint-suppressions.json` and ratcheted down (`RATCHET_CEILING` in
+>   `tests/test_complexity_ratchet.ts`). Paydown is scheduled in
+>   `docs/superpowers/plans/2026-06-19-cyclomatic-complexity-burndown.md`.
 
 ## Architecture Overview
 
