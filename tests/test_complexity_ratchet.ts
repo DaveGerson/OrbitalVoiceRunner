@@ -61,37 +61,25 @@ test('cognitive-complexity is advisory and must NOT be suppressed', () => {
   );
 });
 
-// Smoke: prove the PRODUCTION config flags new over-limit code. The filePath matches the
-// production `scripts/**` glob so eslint.config.js applies. ~12 if-statements => CC ~13.
+// Smoke: prove the PRODUCTION config flags new over-limit code end-to-end. The source
+// below is DELIBERATELY synthetic — its exact shape is irrelevant; it only needs to be
+// comfortably over the limit. We assert a complexity ERROR (severity 2) is raised through
+// the real eslint.config.js, proving config + glob + rule wiring catch new code (not just
+// that a number sits in a JSON file). Unlike a fixture, no exact count is asserted.
 function overcomplexSource() {
-  const branches = Array.from(
-    { length: 12 },
-    (_, i) => `  if (a === ${i}) return ${i};`,
-  ).join('\n');
+  const branches = Array.from({ length: 12 }, (_, i) => `  if (a === ${i}) return ${i};`).join('\n');
   return `export function overcomplex(a: number): number {\n${branches}\n  return -1;\n}\n`;
 }
 
 test('production gate flags new over-limit code (complexity error, severity 2)', async () => {
-  const source = overcomplexSource();
-  // Try scripts/** first, fall back to src/** if ignores swallow it.
-  const candidates = ['scripts', 'src'];
-  let errorMsgs = [];
-  for (const dir of candidates) {
-    const eslint = new ESLint({
-      overrideConfigFile: path.join(repoRoot, 'eslint.config.js'),
-    });
-    const filePath = path.join(repoRoot, dir, '__complexity_smoke__.ts');
-    const results = await eslint.lintText(source, { filePath });
-    const msgs = (results[0]?.messages ?? []).filter(
-      (m) => m.ruleId === 'complexity' && m.severity === 2,
-    );
-    if (msgs.length > 0) {
-      errorMsgs = msgs;
-      break;
-    }
-  }
+  const eslint = new ESLint({ overrideConfigFile: path.join(repoRoot, 'eslint.config.js') });
+  // filePath matches the production src/** glob so eslint.config.js applies.
+  const [res] = await eslint.lintText(overcomplexSource(), {
+    filePath: path.join(repoRoot, 'src', '__complexity_smoke__.ts'),
+  });
+  const errors = (res?.messages ?? []).filter((m) => m.ruleId === 'complexity' && m.severity === 2);
   assert.ok(
-    errorMsgs.length >= 1,
+    errors.length >= 1,
     'production eslint.config.js did not flag over-limit code as a complexity error (severity 2)',
   );
 });
