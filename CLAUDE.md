@@ -137,8 +137,8 @@ npm run complexity:report                      # churn × complexity hotspot ran
 >   won't false-fail on Windows; a real drift means the registry changed — run `npm run catalog`.
 > - Complexity (CC ≤ 10) is gated only on NEW/changed code; legacy violations are baselined in
 >   `eslint-suppressions.json` and ratcheted down (`RATCHET_CEILING` in
->   `tests/test_complexity_ratchet.ts`). Paydown is scheduled in
->   `docs/superpowers/plans/2026-06-19-cyclomatic-complexity-burndown.md`.
+>   `tests/test_complexity_ratchet.ts`). Design, decisions, and the paydown burn-down are in
+>   `docs/superpowers/specs/2026-06-19-cyclomatic-complexity.md`.
 
 ## Architecture Overview
 
