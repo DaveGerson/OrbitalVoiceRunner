@@ -3,7 +3,13 @@
 // `eslint . --suppress-all` bypass that the total-count ceiling alone cannot.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { evaluateRatchet, complexityCounts } from '../scripts/check-suppressions-ratchet.mjs';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SCRIPT = path.join(repoRoot, 'scripts', 'check-suppressions-ratchet.mjs');
 
 const supp = (counts: Record<string, number>) =>
   Object.fromEntries(Object.entries(counts).map(([f, c]) => [f, { complexity: { count: c } }]));
@@ -36,4 +42,24 @@ test('cognitive-complexity entries are ignored (only complexity is gated)', () =
   const cur = { 'a.ts': { 'sonarjs/cognitive-complexity': { count: 9 } } };
   assert.deepEqual(complexityCounts(cur), {});
   assert.equal(evaluateRatchet({}, cur).ok, true);
+});
+
+// The CLI must FAIL CLOSED when the base ref doesn't resolve (shallow/fork clone),
+// instead of mistaking it for "no baseline yet" and passing blind.
+test('CLI exits non-zero when the base ref is unresolvable (fail closed)', () => {
+  let code = 0;
+  try {
+    execFileSync('node', [SCRIPT, '--base', 'definitely-not-a-ref-xyz123'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (err: any) {
+    code = err.status ?? 1;
+  }
+  assert.equal(code, 1, 'expected fail-closed exit 1 for an unresolvable base ref');
+});
+
+test('CLI passes against a resolvable base (HEAD) — current tree does not grow vs HEAD', () => {
+  // HEAD always resolves and matches the committed baseline, so this is a clean pass.
+  execFileSync('node', [SCRIPT, '--base', 'HEAD'], { cwd: repoRoot, stdio: ['ignore', 'ignore', 'ignore'] });
 });

@@ -58,7 +58,7 @@ jobs:
       # which the total-count ceiling can't. Bootstraps green until main has a baseline.
       - name: Ratchet guard (suppressions may only shrink vs base)
         run: |
-          git fetch --no-tags --depth=1 origin main || true
+          git fetch --no-tags --depth=1 origin main
           node scripts/check-suppressions-ratchet.mjs --base origin/main
 
       - name: Hotspot report (churn x complexity)

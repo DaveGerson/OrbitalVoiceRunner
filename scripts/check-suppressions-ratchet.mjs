@@ -51,9 +51,34 @@ function parseBase(argv) {
   return process.env.RATCHET_BASE || 'origin/main';
 }
 
+// Does the base ref actually resolve to a commit in this clone?
+function refResolves(ref) {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function main() {
   const base = parseBase(process.argv.slice(2));
   const current = JSON.parse(readFileSync(SUPP, 'utf8'));
+
+  // FAIL CLOSED if the base ref doesn't resolve (shallow/fork CI clone, unfetched remote).
+  // Otherwise the guard would green-light a `--suppress-all` re-baseline by mistaking an
+  // unreachable ref for "no baseline yet". This is the bug the adversarial review caught.
+  if (!refResolves(base)) {
+    if (process.env.ALLOW_MISSING_BASE === '1') {
+      console.warn(`[ratchet] base ref '${base}' does not resolve; ALLOW_MISSING_BASE=1 set — skipping (NOT recommended in CI).`);
+      process.exit(0);
+    }
+    console.error(`[ratchet] FAIL — base ref '${base}' does not resolve, so the baseline cannot be verified. Fetch it (e.g. 'git fetch origin main') or, only if you know the base genuinely has no baseline, set ALLOW_MISSING_BASE=1. Refusing to pass blind.`);
+    process.exit(1);
+  }
+
   let baseObj;
   try {
     const raw = execFileSync('git', ['show', `${base}:${SUPP}`], {
@@ -62,7 +87,8 @@ function main() {
     });
     baseObj = JSON.parse(raw);
   } catch {
-    console.log(`[ratchet] base '${base}' has no ${SUPP} (bootstrapping baseline) — nothing to compare; passing.`);
+    // Ref resolves but carries no suppressions file yet — genuine bootstrap, pass.
+    console.log(`[ratchet] base '${base}' resolves but has no ${SUPP} (bootstrapping baseline) — nothing to compare; passing.`);
     process.exit(0);
   }
   const { ok, growth } = evaluateRatchet(baseObj, current);
