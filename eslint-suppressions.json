@@ -34,11 +34,6 @@
       "count": 11
     }
   },
-  "src/actionEffects.ts": {
-    "complexity": {
-      "count": 3
-    }
-  },
   "src/actions/defs/dispatch_group.ts": {
     "complexity": {
       "count": 1
@@ -82,11 +77,6 @@
   "src/announcementBus.ts": {
     "complexity": {
       "count": 1
-    }
-  },
-  "src/approvalIntent.ts": {
-    "complexity": {
-      "count": 5
     }
   },
   "src/components/ActionConfirmDialog.tsx": {
@@ -165,11 +155,6 @@
   "src/memory/pythonClient.ts": {
     "complexity": {
       "count": 3
-    }
-  },
-  "src/observe/index.ts": {
-    "complexity": {
-      "count": 4
     }
   },
   "src/orbital/KitchenRadio.tsx": {

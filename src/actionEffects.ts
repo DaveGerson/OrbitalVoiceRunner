@@ -199,6 +199,330 @@ export interface ActionEffectDeps {
   sanitizeSettingsForClient: (s: any) => any;
 }
 
+/** A capability builder: turns a rehydrated intent + live deps into the deferred-effect thunk. */
+type EffectBuilder = (intent: ActionIntent, deps: ActionEffectDeps) => () => string;
+
+// ── create_pane: the origin-specific confirm string (the Risk-1 drift guard) ──────────────────────
+// The three create_pane staging sites run IDENTICAL side effects but each returns a DIFFERENT
+// operator/model-facing confirm string. Capability alone can't discriminate them, so the persisted
+// intent carries an `origin` tag and we reproduce the exact string per origin here. Absent origin
+// (legacy rows) defaults to the richest, voice string. Extracted from the create_pane arrow so the
+// effect body stays under CC 10 and the per-origin mapping is hand-verifiable in one place.
+function createPaneConfirm(p: CreatePaneParams, projectId: string, result: unknown): string {
+  switch (p.origin) {
+    case "rest":
+      // REST /api/terminals spawnEffect: `return String(result);` (server.ts:840).
+      return String(result);
+    case "recipe":
+      // REST + voice recipe spawnPane: `return p.id;` (server.ts:1451 / 2810).
+      return p.paneId;
+    case "voice":
+    default:
+      // voice create_pane (server.ts:2652); also the back-compat default for legacy rows.
+      return `Pane ${p.paneId} created under project ${projectId}. Result: ${result}`;
+  }
+}
+
+function buildCreatePane(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  const p = intent.params as unknown as CreatePaneParams;
+  return () => {
+    const projectId = p.projectId ?? "";
+    // Co-create the project if missing (mirrors voice create_pane + REST projectId-sync).
+    if (projectId && !deps.manager.ledger.getProject(projectId)) {
+      deps.manager.ledger.addProject(projectId, p.cwd || ".", "Co-created with pane");
+    }
+    const result = deps.manager.addTerminal(
+      p.paneId,
+      p.cwd || process.cwd(),
+      p.command,
+      // `??` (not `||`) defaults only on nullish, mirroring addTerminal's own default-param
+      // semantics — so this matches the REST/recipe staging sites (which pass the value raw and
+      // rely on those param defaults) for every input, including an explicit "". (The voice site
+      // uses `|| "Custom"`, but tool_preset/permissions_mode are never an empty string in
+      // practice; nullish-default is the faithful, addTerminal-contract-aligned choice.)
+      p.toolPreset ?? "Custom",
+      p.permissionsMode ?? "Human-in-the-Loop",
+      p.sessionId || "",
+      projectId,
+    );
+    // Recipe variant: a suggested startup command is recorded as an auditable pane note.
+    if (p.startupCommand) {
+      deps.manager.ledger.addPaneNote(projectId, p.paneId, `Suggested startup command: ${p.startupCommand}`);
+    }
+    deps.broadcastLedgerUpdate();
+    deps.broadcast({ type: "terminals_updated" });
+    // Reproduce the EXACT confirm string of the originating staging site (Risk 1 drift guard).
+    // The side effects above are identical across origins; only the return string differs.
+    return createPaneConfirm(p, projectId, result);
+  };
+}
+
+function buildSetGlobalPermissions(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  const p = intent.params as unknown as SetGlobalPermissionsParams;
+  return () => {
+    deps.manager.globalPermissionsMode = p.permissionsMode;
+    deps.manager.settings.advanced.globalPermissionsMode = p.permissionsMode;
+    deps.manager.saveSettings();
+    deps.broadcast({
+      type: "settings_updated",
+      globalPermissionsMode: p.permissionsMode,
+      settings: deps.sanitizeSettingsForClient(deps.manager.settings),
+    });
+    return `Global permissions updated to ${p.permissionsMode}.`;
+  };
+}
+
+// ── set_pane_permissions: TWO staging sites share this capability; `source` discriminates ─────────
+// The applyPaneMode choke point stages { paneId, permissionsMode, source }; the legacy locks.ts
+// fallback stages { paneId, projectId, permissionsMode }. Each shape's thunk is extracted so the
+// dispatcher stays flat and each body stays under CC 10.
+
+function buildApplyPaneModeReplay(p: ApplyPaneModeParams, deps: ActionEffectDeps): () => string {
+  return () => {
+    const term = deps.manager.terminals[p.paneId];
+    if (term) term.setPermissionsMode(p.permissionsMode);
+    // PERSIST-WINS: mirror gating's persistMode (OWNING project, forced updatePane).
+    const owned = findPaneOwningProject(deps.manager, p.paneId);
+    if (owned) {
+      owned.pane.permissions_mode = p.permissionsMode as typeof owned.pane.permissions_mode;
+      deps.manager.ledger.updatePane(owned.projectId, owned.pane, true);
+    }
+    deps.broadcastLedgerUpdate();
+    deps.broadcast({ type: "settings_updated", paneId: p.paneId, permissionsMode: p.permissionsMode });
+    deps.broadcast({ type: "terminals_updated", paneId: p.paneId });
+    // The restart-resume note: the live process (if any) was NOT signal-switched by this replay.
+    deps.broadcast({
+      type: "pane_note",
+      paneId: p.paneId,
+      note: `Permission mode for pane ${p.paneId} set to ${p.permissionsMode} after restart — restart the pane (restart-resume) to apply it to a LIVE process.`,
+    });
+    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode}. Applied after a restart: the next pane start uses it; restart the pane to switch a live process.`;
+  };
+}
+
+function buildLegacyPanePermissions(p: SetPanePermissionsParams, deps: ActionEffectDeps): () => string {
+  return () => {
+    if (deps.manager.terminals[p.paneId]) deps.manager.terminals[p.paneId].setPermissionsMode(p.permissionsMode);
+    const ws = deps.manager.ledger.getProject(p.projectId);
+    if (ws && ws.panes[p.paneId]) {
+      ws.panes[p.paneId].permissions_mode = p.permissionsMode;
+      deps.manager.ledger.save();
+    }
+    deps.broadcastLedgerUpdate();
+    deps.broadcast({ type: "terminals_updated" });
+    // Exact confirm string — keep the trailing "successfully." (server.ts:3238 literal).
+    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode} successfully.`;
+  };
+}
+
+function buildSetPanePermissions(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // 3V.4: `source` (a string) routes to the applyPaneMode replay arm; its absence routes to the
+  // legacy locks.ts fallback arm. See the original header note on why a full live replay is
+  // impractical post-restart (this deps bag has no adapter/poll/gate seams).
+  if (typeof (intent.params as { source?: unknown }).source === "string") {
+    return buildApplyPaneModeReplay(intent.params as unknown as ApplyPaneModeParams, deps);
+  }
+  return buildLegacyPanePermissions(intent.params as unknown as SetPanePermissionsParams, deps);
+}
+
+// ── update_metadata: amend/add/rename/delete, each a leaf reproducing its def's EXACT string ──────
+// PHASE 1 (deferrable-toggle honesty): the additive note/rename ops join amend/delete under the
+// shared update_metadata capability. `op` (+ `scope` for add/rename) discriminates; each arm
+// reproduces its def's EXACT confirm string + broadcast (the Risk-1 drift guard). Decomposed from
+// the single CC21 arrow into one helper per op so each leaf is hand-verifiable and under CC 10.
+
+function applyUpdateAmend(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  deps.manager.ledger.amendNote(p.noteId, p.text ?? "");
+  deps.broadcastLedgerUpdate();
+  return `Note ${p.noteId} updated.`;     // EXACT — matches registry.ts amend_note
+}
+
+function applyUpdateAddPane(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  const ok = deps.manager.ledger.addPaneNote(p.projectId ?? "", p.paneId ?? "", p.note ?? "");
+  if (ok) deps.broadcastLedgerUpdate();
+  return ok
+    ? `Note added to pane ${p.paneId}`                                              // EXACT — notes.ts add_pane_note
+    : `Could not add note: pane ${p.paneId} not found in project ${p.projectId}.`;
+}
+
+function applyUpdateAddProject(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  const ok = deps.manager.ledger.addNote(p.projectId ?? "", p.note ?? "");
+  if (ok) deps.broadcastLedgerUpdate();
+  return ok
+    ? `Note added to project ${p.projectId}`                                          // EXACT — notes.ts add_project_note
+    : `Could not add note: project ${p.projectId} not found.`;
+}
+
+function applyUpdateAdd(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  return p.scope === "pane" ? applyUpdateAddPane(p, deps) : applyUpdateAddProject(p, deps);
+}
+
+function applyUpdateRename(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  if (p.scope === "pane") {
+    deps.manager.ledger.renamePane(p.projectId ?? "", p.paneId ?? "", p.name ?? "");
+    deps.broadcastLedgerUpdate();
+    return `Pane renamed to ${p.name}`;     // EXACT — orient.ts rename_pane
+  }
+  deps.manager.ledger.renameProject(p.projectId ?? "", p.name ?? "");
+  deps.broadcastLedgerUpdate();
+  return `Project renamed to ${p.name}`;    // EXACT — orient.ts rename_project
+}
+
+function applyUpdateDelete(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  // op:"delete" (and any legacy delete-shaped row).
+  deps.manager.ledger.deleteNote(p.noteId);
+  deps.broadcastLedgerUpdate();
+  return `Note ${p.noteId} deleted.`;       // EXACT — matches notes.ts delete_note
+}
+
+function buildUpdateMetadata(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // RE-SCOPE CORE (kzt-rescope.md §3.4): the #27 amend_note / delete_note deferral. `op` discriminates;
+  // `text` is the enqueue-bound amend text (applied verbatim across a restart). An unrecognized op
+  // takes the delete arm — the documented legacy-shaped default (preserved from the original chain).
+  const p = intent.params as unknown as UpdateMetadataParams;
+  return () => {
+    if (p.op === "amend") return applyUpdateAmend(p, deps);
+    if (p.op === "add") return applyUpdateAdd(p, deps);
+    if (p.op === "rename") return applyUpdateRename(p, deps);
+    return applyUpdateDelete(p, deps);
+  };
+}
+
+function buildClosePane(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // wsm-e2e-pinned-5h0 (A-voice): rebuild the deferred terminate+archive. stopAndArchivePane is
+  // async; fire-and-forget (the rebuild has no awaiting seam) and broadcast on completion —
+  // mirrors the panes_write closeEffect. manager.onClosed (wired in server.ts) publishes the
+  // turn-gated "closed" pane signal when the archive lands.
+  const p = intent.params as unknown as ClosePaneParams;
+  return () => {
+    Promise.resolve(deps.manager.stopAndArchivePane(p.projectId ?? "", p.paneId))
+      .then(() => { deps.broadcastLedgerUpdate(); deps.broadcast({ type: "terminals_updated" }); })
+      .catch((e: unknown) => console.error(`[close_pane replay] failed for ${p.paneId}:`, e));
+    return `Exiting and archiving pane ${p.paneId}. It's recoverable from the archive.`;
+  };
+}
+
+function buildRemoveWatchRule(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
+  // removeEffect (src/actions/defs/watch_rules.ts:187-195) BYTE-IDENTICALLY — re-find by id (the
+  // idempotent guard: a rule deleted between stage and confirm is a no-op), splice, force-persist
+  // via ledger.save(true), broadcast watch_rules_updated with the CURRENT live array, return the
+  // EXACT confirm string. CRITICAL LOCKSTEP RULE (header §): keep in step with the def closure.
+  const p = intent.params as unknown as RemoveWatchRuleParams;
+  return () => {
+    const i = deps.manager.ledger.watchRules.findIndex((r: { id: string }) => r.id === p.ruleId);
+    if (i !== -1) {
+      deps.manager.ledger.watchRules.splice(i, 1);
+      deps.manager.ledger["save"](true);
+      deps.broadcast({ type: "watch_rules_updated", watchRules: deps.manager.ledger.watchRules });
+    }
+    return `Watch rule ${p.ruleId} removed.`;  // EXACT — matches watch_rules.ts:194
+  };
+}
+
+function buildDeleteOrchestratorPlan(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
+  // deleteEffect (src/actions/defs/watch_rules.ts:248-256) BYTE-IDENTICALLY — re-find by id
+  // (idempotent guard), splice off the board, force-persist via ledger.save(true), broadcast
+  // plans_updated with the CURRENT live array, return the EXACT confirm string.
+  const p = intent.params as unknown as DeleteOrchestratorPlanParams;
+  return () => {
+    const i = deps.manager.ledger.plans.findIndex((pl: { id: string }) => pl.id === p.planId);
+    if (i !== -1) {
+      deps.manager.ledger.plans.splice(i, 1);
+      deps.manager.ledger["save"](true);
+      deps.broadcast({ type: "plans_updated", plans: deps.manager.ledger.plans });
+    }
+    return `Plan ${p.planId} deleted.`;  // EXACT — matches watch_rules.ts:255
+  };
+}
+
+function buildCreateProject(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // PHASE 1 (deferrable-toggle honesty): durable replay of the orient.ts create_project deferral.
+  // Mirrors createEffect BYTE-IDENTICALLY — addProject (resolved directory + summary + keyTerms),
+  // the OPTIONAL post-create rename (c55.16 2nd mutation), ONE ledger_updated broadcast, the EXACT
+  // confirm string. The bad-dir clarify already ran at stage time (the path here is resolved).
+  const p = intent.params as unknown as CreateProjectParams;
+  return () => {
+    deps.manager.ledger.addProject(p.projectId, p.directory, p.summary ?? "", p.keyTerms ?? []);
+    if (p.name) deps.manager.ledger.renameProject(p.projectId, p.name);
+    deps.broadcastLedgerUpdate();
+    return `Project context ${p.projectId} created successfully.`;  // EXACT — orient.ts create_project
+  };
+}
+
+function clearHistoryFallback(paneId: string): void {
+  // Faithful fallback (mirrors panes_rest.ts saveHistory(id, [])): set this pane's history to []
+  // in the on-disk map at process.cwd()/.janus_history.json. Best-effort (never throws).
+  try {
+    const fp = path.join(process.cwd(), ".janus_history.json");
+    let all: Record<string, unknown[]> = {};
+    if (fs.existsSync(fp)) {
+      const parsed = JSON.parse(fs.readFileSync(fp, "utf-8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) all = parsed;
+    }
+    all[paneId] = [];
+    fs.writeFileSync(fp, JSON.stringify(all, null, 2), "utf-8");
+  } catch (e) {
+    console.warn(`[clear_history replay] failed for ${paneId}:`, e);
+  }
+}
+
+function buildClearHistory(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts clear_history deferral.
+  // Bridge-first (the server registers its HistoryManager bridge at boot); a direct file clear is the
+  // fallback only when no bridge is registered (bare tests). Returns the EXACT confirm string.
+  void deps; // history clear goes through the module-level bridge (or the file fallback), not deps.
+  const p = intent.params as unknown as ClearHistoryParams;
+  return () => {
+    const bridge = getHistoryBridge();
+    if (bridge) {
+      bridge.clearHistory(p.paneId);
+    } else {
+      clearHistoryFallback(p.paneId);
+    }
+    return `History cleared for terminal ${p.paneId}.`;  // EXACT — panes_rest.ts clear_history
+  };
+}
+
+function buildArchivePane(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts archive_pane deferral.
+  // Mirrors archiveEffect BYTE-IDENTICALLY — ledger.archivePane (recoverable move), the
+  // ledger_updated + terminals_updated broadcasts on success, the EXACT confirm string. Idempotent:
+  // an already-archived row (false) returns the "already gone" narration with no broadcast.
+  const p = intent.params as unknown as ArchivePaneParams;
+  return () => {
+    const ok = deps.manager.ledger.archivePaneOwned(p.projectId, p.paneId);
+    if (ok) {
+      deps.broadcastLedgerUpdate();
+      deps.broadcast({ type: "terminals_updated" });
+      return `Pane ${p.paneId} archived (recoverable).`;       // EXACT — panes_rest.ts archive_pane
+    }
+    return `Pane ${p.paneId} could not be archived (already gone).`;
+  };
+}
+
+// The capability ⇄ builder dispatch table. A Map (not a string-keyed plain object) so a rehydrated
+// capability string can never collide with an Object.prototype member name (the prototype-leak class
+// that bit terminal.ts normalizePreset / the gating resolver). An unknown capability returns the
+// safe no-op below — we NEVER throw on rebuild: a corrupt/legacy row must not crash boot.
+// NOTE: send_keys is DELIBERATELY absent (panes_rest.ts:222-225 accepted scope-out). Its effect
+// re-fires term.writeInput straight to the LIVE PTY — a confirm-after-restart would re-send a
+// keystroke to a possibly-different pane process, a product question, not a mechanical port. A
+// rebuilt send_keys intent falls through to the no-op default; tests/test_actionEffects.ts pins that.
+const EFFECT_BUILDERS = new Map<string, EffectBuilder>([
+  ["create_pane", buildCreatePane],
+  ["set_global_permissions", buildSetGlobalPermissions],
+  ["set_pane_permissions", buildSetPanePermissions],
+  ["update_metadata", buildUpdateMetadata],
+  ["close_pane", buildClosePane],
+  ["remove_watch_rule", buildRemoveWatchRule],
+  ["delete_orchestrator_plan", buildDeleteOrchestratorPlan],
+  ["create_project", buildCreateProject],
+  ["clear_history", buildClearHistory],
+  ["archive_pane", buildArchivePane],
+]);
+
 /**
  * Rebuild the deferred side effect from a persisted intent, bound to the live deps. Mirrors the
  * literal closures at the staging sites EXACTLY, so a confirm-after-restart produces byte-identical
@@ -207,267 +531,12 @@ export interface ActionEffectDeps {
  * un-runnable (its confirm surfaces the explanation, then the row is removed by the normal path).
  */
 export function buildActionRun(intent: ActionIntent, deps: ActionEffectDeps): () => string {
-  switch (intent.capability) {
-    case "create_pane": {
-      const p = intent.params as unknown as CreatePaneParams;
-      return () => {
-        const projectId = p.projectId ?? "";
-        // Co-create the project if missing (mirrors voice create_pane + REST projectId-sync).
-        if (projectId && !deps.manager.ledger.getProject(projectId)) {
-          deps.manager.ledger.addProject(projectId, p.cwd || ".", "Co-created with pane");
-        }
-        const result = deps.manager.addTerminal(
-          p.paneId,
-          p.cwd || process.cwd(),
-          p.command,
-          // `??` (not `||`) defaults only on nullish, mirroring addTerminal's own default-param
-          // semantics — so this matches the REST/recipe staging sites (which pass the value raw and
-          // rely on those param defaults) for every input, including an explicit "". (The voice site
-          // uses `|| "Custom"`, but tool_preset/permissions_mode are never an empty string in
-          // practice; nullish-default is the faithful, addTerminal-contract-aligned choice.)
-          p.toolPreset ?? "Custom",
-          p.permissionsMode ?? "Human-in-the-Loop",
-          p.sessionId || "",
-          projectId,
-        );
-        // Recipe variant: a suggested startup command is recorded as an auditable pane note.
-        if (p.startupCommand) {
-          deps.manager.ledger.addPaneNote(projectId, p.paneId, `Suggested startup command: ${p.startupCommand}`);
-        }
-        deps.broadcastLedgerUpdate();
-        deps.broadcast({ type: "terminals_updated" });
-        // Reproduce the EXACT confirm string of the originating staging site (Risk 1 drift guard).
-        // The side effects above are identical across origins; only the return string differs.
-        switch (p.origin) {
-          case "rest":
-            // REST /api/terminals spawnEffect: `return String(result);` (server.ts:840).
-            return String(result);
-          case "recipe":
-            // REST + voice recipe spawnPane: `return p.id;` (server.ts:1451 / 2810).
-            return p.paneId;
-          case "voice":
-          default:
-            // voice create_pane (server.ts:2652); also the back-compat default for legacy rows.
-            return `Pane ${p.paneId} created under project ${projectId}. Result: ${result}`;
-        }
-      };
-    }
-    case "set_global_permissions": {
-      const p = intent.params as unknown as SetGlobalPermissionsParams;
-      return () => {
-        deps.manager.globalPermissionsMode = p.permissionsMode;
-        deps.manager.settings.advanced.globalPermissionsMode = p.permissionsMode;
-        deps.manager.saveSettings();
-        deps.broadcast({
-          type: "settings_updated",
-          globalPermissionsMode: p.permissionsMode,
-          settings: deps.sanitizeSettingsForClient(deps.manager.settings),
-        });
-        return `Global permissions updated to ${p.permissionsMode}.`;
-      };
-    }
-    case "set_pane_permissions": {
-      // 3V.4: TWO staging sites share this capability. The applyPaneMode choke point (live-signal /
-      // restart-resume mechanics) stages { paneId, permissionsMode, source }; the legacy locks.ts
-      // fallback stages { paneId, projectId, permissionsMode }. `source` discriminates. A FULL
-      // live replay of applyPaneMode is impractical here — this deps bag has no adapter/poll/gate
-      // seams, and re-entering applyPaneMode would re-route through gateOrDefer (still Ask ->
-      // re-defer forever). So the rebuild applies WHAT IT CAN reach: the live pane object's mode
-      // (next-spawn semantics, when the pane is running) + the ledger persist (PERSIST-WINS mirror
-      // of gating's persistMode) + the broadcasts — and SAYS, in both the broadcast note and the
-      // confirm string, that the pane needs a restart (restart-resume) before the LIVE process
-      // switches. Post-restart panes boot INERT anyway, so the persisted mode governs the next start.
-      if (typeof (intent.params as { source?: unknown }).source === "string") {
-        const p = intent.params as unknown as ApplyPaneModeParams;
-        return () => {
-          const term = deps.manager.terminals[p.paneId];
-          if (term) term.setPermissionsMode(p.permissionsMode);
-          // PERSIST-WINS: mirror gating's persistMode (OWNING project, forced updatePane).
-          const owned = findPaneOwningProject(deps.manager, p.paneId);
-          if (owned) {
-            owned.pane.permissions_mode = p.permissionsMode as typeof owned.pane.permissions_mode;
-            deps.manager.ledger.updatePane(owned.projectId, owned.pane, true);
-          }
-          deps.broadcastLedgerUpdate();
-          deps.broadcast({ type: "settings_updated", paneId: p.paneId, permissionsMode: p.permissionsMode });
-          deps.broadcast({ type: "terminals_updated", paneId: p.paneId });
-          // The restart-resume note: the live process (if any) was NOT signal-switched by this replay.
-          deps.broadcast({
-            type: "pane_note",
-            paneId: p.paneId,
-            note: `Permission mode for pane ${p.paneId} set to ${p.permissionsMode} after restart — restart the pane (restart-resume) to apply it to a LIVE process.`,
-          });
-          return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode}. Applied after a restart: the next pane start uses it; restart the pane to switch a live process.`;
-        };
-      }
-      const p = intent.params as unknown as SetPanePermissionsParams;
-      return () => {
-        if (deps.manager.terminals[p.paneId]) deps.manager.terminals[p.paneId].setPermissionsMode(p.permissionsMode);
-        const ws = deps.manager.ledger.getProject(p.projectId);
-        if (ws && ws.panes[p.paneId]) {
-          ws.panes[p.paneId].permissions_mode = p.permissionsMode;
-          deps.manager.ledger.save();
-        }
-        deps.broadcastLedgerUpdate();
-        deps.broadcast({ type: "terminals_updated" });
-        // Exact confirm string — keep the trailing "successfully." (server.ts:3238 literal).
-        return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode} successfully.`;
-      };
-    }
-    case "update_metadata": {
-      // RE-SCOPE CORE (kzt-rescope.md §3.4): the #27 amend_note / delete_note deferral. The ORIGINAL
-      // buildActionRun lacked this case → a rebuilt amend returned the no-op "unknown capability"
-      // string and applied NO text (the precise #27 notes-recall regression). `op` discriminates the
-      // two sites; `text` is the enqueue-bound amend text (applied verbatim across a restart).
-      const p = intent.params as unknown as UpdateMetadataParams;
-      return () => {
-        // PHASE 1 (deferrable-toggle honesty): the additive note/rename ops join amend/delete under
-        // the shared update_metadata capability. `op` (+ `scope` for add/rename) discriminates; each
-        // arm reproduces its def's EXACT confirm string + broadcast (the Risk-1 drift guard). The
-        // ledger return value branches add_*'s success/miss narration, byte-identical to the def.
-        if (p.op === "amend") {
-          deps.manager.ledger.amendNote(p.noteId, p.text ?? "");
-          deps.broadcastLedgerUpdate();
-          return `Note ${p.noteId} updated.`;     // EXACT — matches registry.ts amend_note
-        }
-        if (p.op === "add") {
-          if (p.scope === "pane") {
-            const ok = deps.manager.ledger.addPaneNote(p.projectId ?? "", p.paneId ?? "", p.note ?? "");
-            if (ok) deps.broadcastLedgerUpdate();
-            return ok
-              ? `Note added to pane ${p.paneId}`                                              // EXACT — notes.ts add_pane_note
-              : `Could not add note: pane ${p.paneId} not found in project ${p.projectId}.`;
-          }
-          const ok = deps.manager.ledger.addNote(p.projectId ?? "", p.note ?? "");
-          if (ok) deps.broadcastLedgerUpdate();
-          return ok
-            ? `Note added to project ${p.projectId}`                                          // EXACT — notes.ts add_project_note
-            : `Could not add note: project ${p.projectId} not found.`;
-        }
-        if (p.op === "rename") {
-          if (p.scope === "pane") {
-            deps.manager.ledger.renamePane(p.projectId ?? "", p.paneId ?? "", p.name ?? "");
-            deps.broadcastLedgerUpdate();
-            return `Pane renamed to ${p.name}`;     // EXACT — orient.ts rename_pane
-          }
-          deps.manager.ledger.renameProject(p.projectId ?? "", p.name ?? "");
-          deps.broadcastLedgerUpdate();
-          return `Project renamed to ${p.name}`;    // EXACT — orient.ts rename_project
-        }
-        // op:"delete" (and any legacy delete-shaped row).
-        deps.manager.ledger.deleteNote(p.noteId);
-        deps.broadcastLedgerUpdate();
-        return `Note ${p.noteId} deleted.`;       // EXACT — matches notes.ts delete_note
-      };
-    }
-    case "close_pane": {
-      // wsm-e2e-pinned-5h0 (A-voice): rebuild the deferred terminate+archive. stopAndArchivePane is
-      // async; fire-and-forget (the rebuild has no awaiting seam) and broadcast on completion —
-      // mirrors the panes_write closeEffect. manager.onClosed (wired in server.ts) publishes the
-      // turn-gated "closed" pane signal when the archive lands.
-      const p = intent.params as unknown as ClosePaneParams;
-      return () => {
-        Promise.resolve(deps.manager.stopAndArchivePane(p.projectId ?? "", p.paneId))
-          .then(() => { deps.broadcastLedgerUpdate(); deps.broadcast({ type: "terminals_updated" }); })
-          .catch((e: unknown) => console.error(`[close_pane replay] failed for ${p.paneId}:`, e));
-        return `Exiting and archiving pane ${p.paneId}. It's recoverable from the archive.`;
-      };
-    }
-    case "remove_watch_rule": {
-      // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
-      // removeEffect (src/actions/defs/watch_rules.ts:187-195) BYTE-IDENTICALLY — re-find by id (the
-      // idempotent guard: a rule deleted between stage and confirm is a no-op), splice, force-persist
-      // via ledger.save(true), broadcast watch_rules_updated with the CURRENT live array, return the
-      // EXACT confirm string. CRITICAL LOCKSTEP RULE (header §): keep in step with the def closure.
-      const p = intent.params as unknown as RemoveWatchRuleParams;
-      return () => {
-        const i = deps.manager.ledger.watchRules.findIndex((r: { id: string }) => r.id === p.ruleId);
-        if (i !== -1) {
-          deps.manager.ledger.watchRules.splice(i, 1);
-          deps.manager.ledger["save"](true);
-          deps.broadcast({ type: "watch_rules_updated", watchRules: deps.manager.ledger.watchRules });
-        }
-        return `Watch rule ${p.ruleId} removed.`;  // EXACT — matches watch_rules.ts:194
-      };
-    }
-    case "delete_orchestrator_plan": {
-      // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
-      // deleteEffect (src/actions/defs/watch_rules.ts:248-256) BYTE-IDENTICALLY — re-find by id
-      // (idempotent guard), splice off the board, force-persist via ledger.save(true), broadcast
-      // plans_updated with the CURRENT live array, return the EXACT confirm string.
-      const p = intent.params as unknown as DeleteOrchestratorPlanParams;
-      return () => {
-        const i = deps.manager.ledger.plans.findIndex((pl: { id: string }) => pl.id === p.planId);
-        if (i !== -1) {
-          deps.manager.ledger.plans.splice(i, 1);
-          deps.manager.ledger["save"](true);
-          deps.broadcast({ type: "plans_updated", plans: deps.manager.ledger.plans });
-        }
-        return `Plan ${p.planId} deleted.`;  // EXACT — matches watch_rules.ts:255
-      };
-    }
-    case "create_project": {
-      // PHASE 1 (deferrable-toggle honesty): durable replay of the orient.ts create_project deferral.
-      // Mirrors createEffect BYTE-IDENTICALLY — addProject (resolved directory + summary + keyTerms),
-      // the OPTIONAL post-create rename (c55.16 2nd mutation), ONE ledger_updated broadcast, the EXACT
-      // confirm string. The bad-dir clarify already ran at stage time (the path here is resolved).
-      const p = intent.params as unknown as CreateProjectParams;
-      return () => {
-        deps.manager.ledger.addProject(p.projectId, p.directory, p.summary ?? "", p.keyTerms ?? []);
-        if (p.name) deps.manager.ledger.renameProject(p.projectId, p.name);
-        deps.broadcastLedgerUpdate();
-        return `Project context ${p.projectId} created successfully.`;  // EXACT — orient.ts create_project
-      };
-    }
-    case "clear_history": {
-      // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts clear_history deferral.
-      // Bridge-first (the server registers its HistoryManager bridge at boot); a direct file clear is the
-      // fallback only when no bridge is registered (bare tests). Returns the EXACT confirm string.
-      const p = intent.params as unknown as ClearHistoryParams;
-      return () => {
-        const bridge = getHistoryBridge();
-        if (bridge) {
-          bridge.clearHistory(p.paneId);
-        } else {
-          // Faithful fallback (mirrors panes_rest.ts saveHistory(id, [])): set this pane's history to []
-          // in the on-disk map at process.cwd()/.janus_history.json. Best-effort (never throws).
-          try {
-            const fp = path.join(process.cwd(), ".janus_history.json");
-            let all: Record<string, unknown[]> = {};
-            if (fs.existsSync(fp)) {
-              const parsed = JSON.parse(fs.readFileSync(fp, "utf-8"));
-              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) all = parsed;
-            }
-            all[p.paneId] = [];
-            fs.writeFileSync(fp, JSON.stringify(all, null, 2), "utf-8");
-          } catch (e) {
-            console.warn(`[clear_history replay] failed for ${p.paneId}:`, e);
-          }
-        }
-        return `History cleared for terminal ${p.paneId}.`;  // EXACT — panes_rest.ts clear_history
-      };
-    }
-    case "archive_pane": {
-      // PHASE 1 (deferrable-toggle honesty): durable replay of the panes_rest.ts archive_pane deferral.
-      // Mirrors archiveEffect BYTE-IDENTICALLY — ledger.archivePane (recoverable move), the
-      // ledger_updated + terminals_updated broadcasts on success, the EXACT confirm string. Idempotent:
-      // an already-archived row (false) returns the "already gone" narration with no broadcast.
-      const p = intent.params as unknown as ArchivePaneParams;
-      return () => {
-        const ok = deps.manager.ledger.archivePaneOwned(p.projectId, p.paneId);
-        if (ok) {
-          deps.broadcastLedgerUpdate();
-          deps.broadcast({ type: "terminals_updated" });
-          return `Pane ${p.paneId} archived (recoverable).`;       // EXACT — panes_rest.ts archive_pane
-        }
-        return `Pane ${p.paneId} could not be archived (already gone).`;
-      };
-    }
-    // NOTE: send_keys is DELIBERATELY absent (panes_rest.ts:222-225 accepted scope-out). Its effect
-    // re-fires term.writeInput straight to the LIVE PTY — a confirm-after-restart would re-send a
-    // keystroke to a possibly-different pane process, a product question, not a mechanical port. The
-    // rebuilt intent falls through to the no-op default below; tests/test_actionEffects.ts pins that.
-    default:
-      return () => `Cannot replay deferred action: unknown capability "${intent.capability}".`;
-  }
+  // Map dispatch (prototype-safe) -> per-capability builder. An unknown capability returns a safe
+  // no-op run that yields an explanatory string — we NEVER throw on rebuild: a corrupt/legacy row
+  // must not crash boot; the action is simply un-runnable (its confirm surfaces the explanation,
+  // then the row is removed by the normal path). Each builder reproduces its staging-site closure
+  // EXACTLY (effects, ordering, broadcasts, and the byte-identical confirm string).
+  const builder = EFFECT_BUILDERS.get(intent.capability);
+  if (builder) return builder(intent, deps);
+  return () => `Cannot replay deferred action: unknown capability "${intent.capability}".`;
 }

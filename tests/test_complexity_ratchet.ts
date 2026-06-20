@@ -33,7 +33,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 119 -> 110: Phase 7b refactored src/terminal.ts under CC 10 and pruned its 9 suppressions.
 // 110 -> 103: burndown refactored src/gating/index.ts under CC 10 and pruned its 7 suppressions.
 // 103 -> 99: burndown refactored src/store/sqliteStore.ts under CC 10 and pruned its 4 suppressions.
-const RATCHET_CEILING = 99;
+// 99 -> 87: burndown refactored approvalIntent/actionEffects/observe under CC 10 and pruned their 5+3+4 suppressions.
+const RATCHET_CEILING = 87;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');
