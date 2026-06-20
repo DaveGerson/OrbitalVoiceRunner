@@ -1,9 +1,12 @@
-// Proves the cyclomatic-complexity gate is CORRECT, not just present:
-//   1. The tool reports the exact hand-counted value for each fixture.
-//   2. The production boundary sits at >10 (cc-10 passes, cc-11 fails).
-//   3. A trivial function (cc-01) passes a max:10 gate.
+// Proves the cyclomatic-complexity gate is CORRECT, not merely present:
+//   1. ESLint reports the EXACT hand-counted complexity of a known function.
+//   2. The rule fires when complexity > max and passes when complexity <= max.
 //
-// Uses the ESLint Node API (`import { ESLint } from 'eslint'`) + node:test.
+// The boundary is proven by varying `max` against ONE realistic fixture — ESLint's
+// threshold logic (`complexity > max`) is identical at any number, so there's no need
+// for a contrived function pinned to 10. The PRODUCTION threshold (10) firing on real
+// over-limit code is covered end-to-end by tests/test_complexity_ratchet.ts (the smoke
+// test through the real eslint.config.js).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -13,108 +16,52 @@ import tseslint from 'typescript-eslint';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-const fixturesDir = path.join(repoRoot, 'tests', 'fixtures', 'complexity');
+const fixture = path.join(repoRoot, 'tests', 'fixtures', 'complexity', 'username-validator.ts');
 const prodConfig = path.join(repoRoot, 'eslint.config.js');
 
-function fixture(name: string): string {
-  return path.join(fixturesDir, name);
+// validateUsername's hand-counted cyclomatic complexity (see the fixture's comment).
+const FIXTURE_CC = 6;
+
+function eslintAt(max: number): ESLint {
+  return new ESLint({
+    overrideConfigFile: true,
+    overrideConfig: {
+      // A `files` pattern is REQUIRED in flat config — without it ESLint silently
+      // ignores the file and returns zero messages, a false pass for any
+      // "expect no violations" assertion.
+      files: ['**/*.ts'],
+      languageOptions: {
+        parser: tseslint.parser,
+        parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
+      },
+      rules: { complexity: ['error', max] },
+    },
+  });
 }
 
 function complexityMessages(result: ESLint.LintResult) {
   return result.messages.filter((m) => m.ruleId === 'complexity');
 }
 
-// ---------------------------------------------------------------------------
-// 1. Tool reports the exact hand-counted value. We enumerate with an inline
-//    complexity:['warn', 0] config (max 0 => every function is reported, so the
-//    message embeds the function's actual computed CC) — the same technique the
-//    hotspot report uses. No separate fixtures config file is needed.
-// ---------------------------------------------------------------------------
-function enumerateCC(): ESLint {
-  return new ESLint({
-    overrideConfigFile: true,
-    overrideConfig: {
-      files: ['**/*.ts'],
-      languageOptions: {
-        parser: tseslint.parser,
-        parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
-      },
-      rules: { complexity: ['warn', 0] },
-    },
-  });
-}
+test(`reports the exact hand-counted complexity (${FIXTURE_CC})`, async () => {
+  // max:0 => the rule reports every function, embedding its computed CC in the message.
+  const [res] = await eslintAt(0).lintFiles([fixture]);
+  const msgs = complexityMessages(res);
+  assert.equal(msgs.length, 1, `expected exactly one complexity message, got ${msgs.length}`);
+  assert.match(msgs[0].message, new RegExp(`complexity of ${FIXTURE_CC}\\b`), msgs[0].message);
+});
 
-const exactCases: Array<[string, number]> = [
-  ['cc-05.ts', 5],
-  ['cc-10.ts', 10],
-  ['cc-11.ts', 11],
-];
-
-for (const [file, expected] of exactCases) {
-  test(`enumerate: ${file} reports complexity of ${expected}`, async () => {
-    const eslint = enumerateCC();
-    const [res] = await eslint.lintFiles([fixture(file)]);
-    const msgs = complexityMessages(res);
-    assert.equal(msgs.length, 1, `expected exactly one complexity message, got ${msgs.length}`);
-    assert.match(
-      msgs[0].message,
-      new RegExp(`complexity of ${expected}\\b`),
-      `message was: ${msgs[0].message}`,
-    );
-  });
-}
-
-// ---------------------------------------------------------------------------
-// 2. Production boundary is at >10. The production config (eslint.config.js)
-//    ignores tests/**, so linting a fixture through it directly would be
-//    skipped. We assert the boundary by re-linting the fixtures with an inline
-//    config of complexity:['error', 10] — functionally identical to the
-//    production threshold — which avoids the ignore problem cleanly.
-// ---------------------------------------------------------------------------
-function gateAt10(): ESLint {
-  return new ESLint({
-    overrideConfigFile: true, // do not merge with any discovered config
-    overrideConfig: {
-      // A `files` pattern is REQUIRED in flat config, otherwise the config
-      // object matches nothing and ESLint reports "File ignored because no
-      // matching configuration was supplied" (a silent false-pass for any
-      // "expect zero violations" assertion).
-      files: ['**/*.ts'],
-      languageOptions: {
-        // Use the same TS parser the production config uses.
-        parser: tseslint.parser,
-        parserOptions: { ecmaVersion: 'latest', sourceType: 'module' },
-      },
-      rules: { complexity: ['error', 10] },
-    },
-  });
-}
-
-test('production boundary: cc-10 yields ZERO complexity violations at max:10', async () => {
-  const eslint = gateAt10();
-  const [res] = await eslint.lintFiles([fixture('cc-10.ts')]);
+test('passes when complexity <= max (boundary: equal is allowed)', async () => {
+  const [res] = await eslintAt(FIXTURE_CC).lintFiles([fixture]);
   assert.equal(complexityMessages(res).length, 0);
 });
 
-test('production boundary: cc-11 yields exactly ONE complexity violation at max:10', async () => {
-  const eslint = gateAt10();
-  const [res] = await eslint.lintFiles([fixture('cc-11.ts')]);
+test('fails when complexity > max (boundary: one over is flagged)', async () => {
+  const [res] = await eslintAt(FIXTURE_CC - 1).lintFiles([fixture]);
   assert.equal(complexityMessages(res).length, 1);
 });
 
-// ---------------------------------------------------------------------------
-// 3. A trivial function passes the max:10 gate.
-// ---------------------------------------------------------------------------
-test('cc-01 yields ZERO complexity violations at max:10', async () => {
-  const eslint = gateAt10();
-  const [res] = await eslint.lintFiles([fixture('cc-01.ts')]);
-  assert.equal(complexityMessages(res).length, 0);
-});
-
-// Sanity: the production config file itself parses/loads without a config error.
 test('production eslint.config.js loads without a config error', async () => {
   const eslint = new ESLint({ overrideConfigFile: prodConfig });
-  // Linting an ignored fixture should simply produce no results-of-interest,
-  // not throw a configuration error.
   await eslint.calculateConfigForFile(path.join(repoRoot, 'server.ts'));
 });
