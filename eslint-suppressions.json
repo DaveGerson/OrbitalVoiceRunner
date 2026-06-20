@@ -137,11 +137,6 @@
       "count": 1
     }
   },
-  "src/gating/index.ts": {
-    "complexity": {
-      "count": 7
-    }
-  },
   "src/handoffFlow.ts": {
     "complexity": {
       "count": 1

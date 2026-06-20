@@ -190,58 +190,85 @@ export function createGating(deps: GatingDeps): Gating {
   const pendingActions = new PendingActionStore(store);
   let pendingActionSeq = 0;
 
-  // kzt: rebuild deferred-action survivors from durable intent. The run() closure is non-serializable,
-  // so we persisted the INTENT (capability+params) and rebuild it here, bound to the LIVE manager/
-  // broadcast (a deserialized closure could never re-bind them — they are fresh in this startServer()
-  // closure). Re-staging via add() carries the existing durable row (INSERT OR REPLACE is a no-op
-  // rewrite) and makes the survivor confirmable/cancellable exactly as before the restart. Hydration
-  // only REBUILDS + re-stages run; it never INVOKES it (effects run on explicit confirm only). This
-  // runs AFTER manager + pendingActions are built and BEFORE the first WS connection / sweep tick.
-  for (const row of pendingActions.hydrateIntents()) {
-    let params: Record<string, unknown> = {};
-    try { params = JSON.parse(row.params); } catch { /* corrupt -> empty params; run() degrades gracefully */ }
-    const versionCheck = checkActionVersion({
-      actionName: (params as { actionName?: string }).actionName,
-      schemaHash: (params as { schemaHash?: string }).schemaHash,
-    });
-    if (!versionCheck.ok) {
-      // PLM3: the staged def drifted (renamed/moved/reshaped) or is unstamped/legacy -> do NOT blindly
-      // rebuild+replay it against a possibly-mismatched effect. Quarantine: skip re-staging; record it
-      // so the operator can re-issue. (A future boot-prune sweep removes quarantined rows.)
-      if (store) {
-        try {
-          store.recordActivity({
-            type: "permission_changed", project_id: "default_project", pane_id: null,
-            summary: `QUARANTINED deferred ${row.capability} (${versionCheck.reason}): ${row.summary}`,
-            payload: { capability: row.capability, action: "quarantined", reason: versionCheck.reason, action_id: row.id },
-          });
-        } catch { /* audit best-effort */ }
-      }
-      continue;
-    }
-    const run = buildActionRun(
-      { capability: row.capability, params },
-      { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
-    );
-    pendingActions.add({
-      id: row.id, capability: row.capability, summary: row.summary, params,
-      timestamp: row.timestamp, run, ttlMs: Math.max(0, row.expires_at - row.timestamp),
-    });
-    if (store) {
-      try {
-        store.recordActivity({
-          type: "permission_changed", project_id: "default_project", pane_id: null,
-          summary: `REHYDRATED deferred ${row.capability}: ${row.summary}`,
-          payload: { capability: row.capability, action: "rehydrated", action_id: row.id },
-        });
-      } catch { /* audit is best-effort */ }
-    }
-  }
+  // kzt: rebuild deferred-action survivors from durable intent. Extracted to hydrateDeferredActions()
+  // (behavior-preserving) but invoked HERE, in the exact original order: AFTER manager + pendingActions
+  // are built and BEFORE the first WS connection / sweep tick. See the helper for the full rationale.
+  hydrateDeferredActions();
   // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
   const shellAllowlist = loadShellAllowlist();
   // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
   const APPROVAL_TTL_MS = 5 * 60 * 1000;
   const APPROVAL_SWEEP_MS = 30 * 1000;
+
+  // Best-effort durable audit (extracted from the many inline `if (store) { try { store.recordActivity(
+  // { project_id: active||default, ... }) } catch {} }` sites). Behavior-preserving: a null store is a
+  // silent no-op, the project_id defaults to the active project exactly as before, and the recordActivity
+  // throw is swallowed — the audit must NEVER break a gate decision. `project_id` is overridable for the
+  // few callers (boot quarantine/rehydrate) that pin "default_project" explicitly.
+  function recordActivitySafe(entry: {
+    type: string;
+    pane_id: string | null;
+    summary: string;
+    payload?: Record<string, unknown>;
+    project_id?: string;
+  }): void {
+    if (!store) return;
+    // NB: `||` (not `??`) to match the original inline sites byte-for-byte — an EMPTY activeProjectId
+    // falls back to "default_project" exactly as before.
+    const projectId = entry.project_id ?? (manager.ledger.activeProjectId || "default_project");
+    try {
+      store.recordActivity({
+        type: entry.type as any,
+        project_id: projectId,
+        pane_id: entry.pane_id,
+        summary: entry.summary,
+        ...(entry.payload !== undefined ? { payload: entry.payload } : {}),
+      } as any);
+    } catch { /* audit is best-effort */ }
+  }
+
+  // kzt: rebuild deferred-action survivors from durable intent. The run() closure is non-serializable,
+  // so we persisted the INTENT (capability+params) and rebuild it here, bound to the LIVE manager/
+  // broadcast (a deserialized closure could never re-bind them — they are fresh in this startServer()
+  // closure). Re-staging via add() carries the existing durable row (INSERT OR REPLACE is a no-op
+  // rewrite) and makes the survivor confirmable/cancellable exactly as before the restart. Hydration
+  // only REBUILDS + re-stages run; it never INVOKES it (effects run on explicit confirm only). Body
+  // extracted VERBATIM from the original inline boot loop (behavior-preserving); the quarantine /
+  // rehydrate audits pin project_id "default_project" exactly as before.
+  function hydrateDeferredActions(): void {
+    for (const row of pendingActions.hydrateIntents()) {
+      let params: Record<string, unknown> = {};
+      try { params = JSON.parse(row.params); } catch { /* corrupt -> empty params; run() degrades gracefully */ }
+      const versionCheck = checkActionVersion({
+        actionName: (params as { actionName?: string }).actionName,
+        schemaHash: (params as { schemaHash?: string }).schemaHash,
+      });
+      if (!versionCheck.ok) {
+        // PLM3: the staged def drifted (renamed/moved/reshaped) or is unstamped/legacy -> do NOT blindly
+        // rebuild+replay it against a possibly-mismatched effect. Quarantine: skip re-staging; record it
+        // so the operator can re-issue. (A future boot-prune sweep removes quarantined rows.)
+        recordActivitySafe({
+          type: "permission_changed", project_id: "default_project", pane_id: null,
+          summary: `QUARANTINED deferred ${row.capability} (${versionCheck.reason}): ${row.summary}`,
+          payload: { capability: row.capability, action: "quarantined", reason: versionCheck.reason, action_id: row.id },
+        });
+        continue;
+      }
+      const run = buildActionRun(
+        { capability: row.capability, params },
+        { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
+      );
+      pendingActions.add({
+        id: row.id, capability: row.capability, summary: row.summary, params,
+        timestamp: row.timestamp, run, ttlMs: Math.max(0, row.expires_at - row.timestamp),
+      });
+      recordActivitySafe({
+        type: "permission_changed", project_id: "default_project", pane_id: null,
+        summary: `REHYDRATED deferred ${row.capability}: ${row.summary}`,
+        payload: { capability: row.capability, action: "rehydrated", action_id: row.id },
+      });
+    }
+  }
 
   // ── 4D.1: the "while you were away" window ──────────────────────────────────────────────────
   // The resumption digest used to cover ONLY surviving approvals + pending actions; everything
@@ -292,79 +319,115 @@ export function createGating(deps: GatingDeps): Gating {
     });
   }
 
-  /**
-   * 4D.1: compose the spoken "while you were away" line from the durable activity rows inside
-   * (since, now]. Event mapping (adapted to what the store records today — getEvents has no ts
-   * filter, so we fetch per type and filter by ts in JS):
-   *   - "status_transition"  payload.transition: error|build-failed → errors; exited → exits;
-   *                          completion|idle|finished → finished. (Recorded by the bus listener
-   *                          above; forward-compatible with any other writer of the same shape.)
-   *   - "permission_changed" payload.action: stop_all_freeze → engaged; stop_all_release →
-   *                          released; stop_all_kill → killed pane count.
-   *   - "command_dispatched" → auto-dispatches (nothing writes this type yet; mapped so the digest
-   *                          picks them up the day a writer lands).
-   * Most-severe-first (errors → exits → stop-all → finished → auto-dispatches); each pane counts
-   * ONCE, in its most severe bucket; clause count capped (≈3 sentences). Returns null when nothing
-   * notable happened.
-   */
-  function composeAwayDigest(since: number, now: number): string | null {
+  // The away-digest's accumulator: panes bucketed by most-severe edge + the stop-all counters. Shared
+  // by bucketAwayEvents (fills it) and renderAwayClauses (reads it).
+  type AwayBuckets = {
+    errors: Set<string>;
+    exits: Set<string>;
+    finished: Set<string>;
+    autos: Set<string>;
+    engaged: number;
+    released: number;
+    killed: number;
+  };
+
+  // 4D.1: fetch the durable activity rows the digest replays (getEvents has no ts filter, so we fetch
+  // per type and filter by ts in the bucketing pass). A failed read must NEVER break the reconnect
+  // path — it returns null exactly as the original inline try/catch did. Extracted verbatim.
+  function fetchAwayRows(): ReturnType<JanusStore["getEvents"]> | null {
     if (!store) return null;
-    let rows: ReturnType<JanusStore["getEvents"]>;
     try {
-      rows = [
+      return [
         ...store.getEvents({ type: "status_transition" }),
         ...store.getEvents({ type: "permission_changed" }),
         ...store.getEvents({ type: "command_dispatched" }),
       ];
     } catch {
-      return null; // a failed read must never break the reconnect path.
+      return null;
     }
+  }
 
-    const errors = new Set<string>();
-    const exits = new Set<string>();
-    const finished = new Set<string>();
-    const autos = new Set<string>();
-    let engaged = 0, released = 0, killed = 0;
+  // 4D.1: a "status_transition" row -> errors|exits|finished by its transition text (verbatim).
+  function classifyStatusTransition(b: AwayBuckets, e: ReturnType<JanusStore["getEvents"]>[number]): void {
+    const t = String((e.payload as { transition?: unknown } | null)?.transition ?? e.summary ?? "");
+    const pane = e.pane_id ?? "a pane";
+    if (/error|build-failed/i.test(t)) b.errors.add(pane);
+    else if (/exit/i.test(t)) b.exits.add(pane);
+    else if (/completion|finished|idle/i.test(t)) b.finished.add(pane);
+  }
 
+  // 4D.1: a "permission_changed" row -> stop-all engaged|released|killed counters (verbatim).
+  function classifyPermissionChanged(b: AwayBuckets, e: ReturnType<JanusStore["getEvents"]>[number]): void {
+    const action = (e.payload as { action?: unknown } | null)?.action;
+    if (action === "stop_all_freeze") b.engaged++;
+    else if (action === "stop_all_release") b.released++;
+    else if (action === "stop_all_kill") b.killed += ((e.payload as { panes?: unknown[] })?.panes?.length ?? 0);
+  }
+
+  // 4D.1: classify ONE durable activity row into the away buckets (mutates `b`). Thin type-dispatch;
+  // the per-type mapping lives in the helpers above + the command_dispatched auto-bucket below.
+  //   - "status_transition"  payload.transition: error|build-failed → errors; exit → exits;
+  //                          completion|finished|idle → finished.
+  //   - "permission_changed" payload.action: stop_all_freeze → engaged; stop_all_release → released;
+  //                          stop_all_kill → killed += panes.length.
+  //   - "command_dispatched" → auto-dispatches.
+  function classifyAwayRow(b: AwayBuckets, e: ReturnType<JanusStore["getEvents"]>[number]): void {
+    if (e.type === "status_transition") classifyStatusTransition(b, e);
+    else if (e.type === "permission_changed") classifyPermissionChanged(b, e);
+    else if (e.type === "command_dispatched") b.autos.add(e.pane_id ?? "a pane");
+  }
+
+  // 4D.1: bucket the in-window (since, now] rows, then dedupe per pane to its MOST SEVERE bucket.
+  function bucketAwayEvents(rows: ReturnType<JanusStore["getEvents"]>, since: number, now: number): AwayBuckets {
+    const b: AwayBuckets = {
+      errors: new Set<string>(), exits: new Set<string>(), finished: new Set<string>(),
+      autos: new Set<string>(), engaged: 0, released: 0, killed: 0,
+    };
     for (const e of rows) {
       if (e.ts <= since || e.ts > now) continue;
-      if (e.type === "status_transition") {
-        const t = String((e.payload as { transition?: unknown } | null)?.transition ?? e.summary ?? "");
-        const pane = e.pane_id ?? "a pane";
-        if (/error|build-failed/i.test(t)) errors.add(pane);
-        else if (/exit/i.test(t)) exits.add(pane);
-        else if (/completion|finished|idle/i.test(t)) finished.add(pane);
-      } else if (e.type === "permission_changed") {
-        const action = (e.payload as { action?: unknown } | null)?.action;
-        if (action === "stop_all_freeze") engaged++;
-        else if (action === "stop_all_release") released++;
-        else if (action === "stop_all_kill") killed += ((e.payload as { panes?: unknown[] })?.panes?.length ?? 0);
-      } else if (e.type === "command_dispatched") {
-        autos.add(e.pane_id ?? "a pane");
-      }
+      classifyAwayRow(b, e);
     }
-
     // Dedupe per pane across buckets: a pane counts once, in its MOST SEVERE bucket.
-    for (const p of errors) { exits.delete(p); finished.delete(p); }
-    for (const p of exits) finished.delete(p);
+    for (const p of b.errors) { b.exits.delete(p); b.finished.delete(p); }
+    for (const p of b.exits) b.finished.delete(p);
+    return b;
+  }
 
+  // 4D.1: the stop-all sentence (engaged/released/killed). Extracted verbatim.
+  function renderStopAllClause(engaged: number, released: number, killed: number): string {
+    let stop: string;
+    if (engaged && released) stop = "stop-all was engaged and released";
+    else if (engaged) stop = "stop-all was engaged and is still holding";
+    else stop = "stop-all was released";
+    if (killed) stop += ` (${killed} pane${killed === 1 ? "" : "s"} killed)`;
+    return stop;
+  }
+
+  // 4D.1: assemble the ordered clause list (most-severe-first) from the buckets. Verbatim ordering.
+  function renderAwayClauses(b: AwayBuckets): string[] {
     const paneClause = (panes: Set<string>, singular: string, plural: string): string =>
       panes.size === 1 ? `pane ${[...panes][0]} ${singular}` : `${panes.size} panes ${plural}`;
-
     const clauses: string[] = [];
-    if (errors.size) clauses.push(paneClause(errors, "reported an error", "reported errors"));
-    if (exits.size) clauses.push(paneClause(exits, "exited", "exited"));
-    if (engaged || released || killed) {
-      let stop: string;
-      if (engaged && released) stop = "stop-all was engaged and released";
-      else if (engaged) stop = "stop-all was engaged and is still holding";
-      else stop = "stop-all was released";
-      if (killed) stop += ` (${killed} pane${killed === 1 ? "" : "s"} killed)`;
-      clauses.push(stop);
-    }
-    if (finished.size) clauses.push(paneClause(finished, "finished", "finished"));
-    if (autos.size) clauses.push(`${autos.size} auto-dispatch${autos.size === 1 ? "" : "es"} ran`);
+    if (b.errors.size) clauses.push(paneClause(b.errors, "reported an error", "reported errors"));
+    if (b.exits.size) clauses.push(paneClause(b.exits, "exited", "exited"));
+    if (b.engaged || b.released || b.killed) clauses.push(renderStopAllClause(b.engaged, b.released, b.killed));
+    if (b.finished.size) clauses.push(paneClause(b.finished, "finished", "finished"));
+    if (b.autos.size) clauses.push(`${b.autos.size} auto-dispatch${b.autos.size === 1 ? "" : "es"} ran`);
+    return clauses;
+  }
 
+  /**
+   * 4D.1: compose the spoken "while you were away" line from the durable activity rows inside
+   * (since, now]. Most-severe-first (errors → exits → stop-all → finished → auto-dispatches); each
+   * pane counts ONCE, in its most severe bucket; clause count capped (≈3 sentences). Returns null
+   * when nothing notable happened. The fetch/bucket/render phases are extracted (behavior-preserving);
+   * see those helpers for the per-event-type mapping.
+   */
+  function composeAwayDigest(since: number, now: number): string | null {
+    const rows = fetchAwayRows();
+    if (rows === null) return null; // legacy (no store) OR a failed read — never breaks reconnect.
+    const buckets = bucketAwayEvents(rows, since, now);
+    const clauses = renderAwayClauses(buckets);
     if (clauses.length === 0) return null;
     // Spoken-compactness cap (≈3 sentences): at most 4 clauses, most-severe-first; the rest fold
     // into a trailing count rather than disappearing.
@@ -430,6 +493,46 @@ export function createGating(deps: GatingDeps): Gating {
     return { forbidden: gate === "Off", gate };
   }
 
+  // rbh: build the `action_pending` WS payload for a DEFERRED (Ask) non-PTY mutator. Extracted
+  // verbatim from gateOrDefer's Ask branch (behavior-preserving) so the function stays under the
+  // complexity gate. It enriches the confirm-dialog payload with the EFFECTIVE posture the engine
+  // WILL apply, not the nominal summary. paneId may be null for global actions (D2) — then we surface
+  // the resolved global mode + the global effective gate, no per-pane chip. The RESOLUTION is the pure
+  // resolveActionPendingPosture (src/actionPendingPayload) — the same override→spotlight→global
+  // precedence the chip uses (D1, server is the only authority), frozen-overlaid so the dialog matches
+  // the chip while STOP-ALL is engaged. LOCKSTEP with effectiveCapabilityGateFor: the pane gates come
+  // from the pane's OWNING project (findPaneOwningProject), not the active project, so the dialog's
+  // posture matches the gate the engine will actually enforce for a non-active-project pane.
+  function buildActionPendingBroadcast(
+    actionId: string,
+    capability: CapabilityGate,
+    paneId: string | null,
+    summary: string,
+    requestedMode?: string,
+  ): Record<string, unknown> {
+    const targetTerm = paneId ? manager.terminals[paneId] : undefined;
+    const posture = resolveActionPendingPosture({
+      paneId,
+      capability,
+      globalMode: manager.globalPermissionsMode as GlobalMode,
+      paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
+      paneGates: paneId ? findPaneOwningProject(manager, paneId)?.pane.capabilityGates : undefined,
+      globalGates: manager.settings.advanced?.capabilityGates,
+      isActivePane: !!paneId && coreState.activePaneId === paneId,
+      frozen: coreState.frozen,
+    });
+    return {
+      type: "action_pending", actionId, capability, summary,
+      pane_id: paneId,
+      effective_gate: posture.effective_gate,
+      effective_mode: posture.effective_mode,
+      ...(posture.posture ? { posture: posture.posture } : {}),
+      ...(posture.effective_gates ? { effective_gates: posture.effective_gates } : {}),
+      ...(requestedMode ? { requested_mode: requestedMode } : {}),
+      global_override: manager.globalPermissionsMode !== "Inherit",
+    };
+  }
+
   // G1: gate a NON-PTY mutator with full Auto/Ask/Off semantics. Unlike gateCapability (which only
   // enforced the Off veto and let Ask proceed), this DEFERS the side effect on Ask by staging
   // `run` in pendingActions; the operator confirms via POST /api/actions/:id/confirm and the effect
@@ -455,47 +558,23 @@ export function createGating(deps: GatingDeps): Gating {
     requestedMode?: string
   ): { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string } {
     const gate = effectiveCapabilityGateFor(paneId, capability);
-    const activeProjectId = manager.ledger.activeProjectId || "default_project";
     if (gate === "Off") {
-      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `FORBIDDEN ${capability}: ${summary}`, payload: { capability, gate, action: "forbidden" } }); } catch {} }
+      recordActivitySafe({
+        type: "permission_changed", pane_id: paneId,
+        summary: `FORBIDDEN ${capability}: ${summary}`,
+        payload: { capability, gate, action: "forbidden" },
+      });
       return { disposition: "forbidden" };
     }
     if (gate === "Ask") {
       const actionId = `act_${Date.now()}_${pendingActionSeq++}`;
       pendingActions.add({ id: actionId, capability, summary, params, timestamp: Date.now(), run });
-      if (store) { try { store.recordActivity({ type: "permission_changed", project_id: activeProjectId, pane_id: paneId ?? null, summary: `DEFERRED ${capability} (await confirm): ${summary}`, payload: { capability, gate, action: "deferred", action_id: actionId } }); } catch {} }
-      // rbh: enrich the confirm-dialog payload with the EFFECTIVE posture the engine WILL apply, not
-      // the nominal summary. paneId may be null for global actions (D2) — then we surface the resolved
-      // global mode + the global effective gate, no per-pane chip. The RESOLUTION is the pure
-      // resolveActionPendingPosture (src/actionPendingPayload) — the same override→spotlight→global
-      // precedence the chip uses (D1, server is the only authority), frozen-overlaid so the dialog
-      // matches the chip while STOP-ALL is engaged. It is extracted so the divergence truth (global
-      // Read-Only + pane Full Auto ⇒ LOCKED/Read-Only) is asserted at its SOURCE in
-      // tests/test_action_pending_payload.ts, not just rendered from a hand-fed mock.
-      // LOCKSTEP with effectiveCapabilityGateFor: the pane gates come from the pane's OWNING
-      // project (findPaneOwningProject), not the active project, so the dialog's posture matches
-      // the gate the engine will actually enforce for a non-active-project pane.
-      const targetTerm = paneId ? manager.terminals[paneId] : undefined;
-      const posture = resolveActionPendingPosture({
-        paneId,
-        capability,
-        globalMode: manager.globalPermissionsMode as GlobalMode,
-        paneMode: targetTerm ? (targetTerm.permissionsMode as EffectiveMode) : undefined,
-        paneGates: paneId ? findPaneOwningProject(manager, paneId)?.pane.capabilityGates : undefined,
-        globalGates: manager.settings.advanced?.capabilityGates,
-        isActivePane: !!paneId && coreState.activePaneId === paneId,
-        frozen: coreState.frozen,
+      recordActivitySafe({
+        type: "permission_changed", pane_id: paneId,
+        summary: `DEFERRED ${capability} (await confirm): ${summary}`,
+        payload: { capability, gate, action: "deferred", action_id: actionId },
       });
-      broadcast({
-        type: "action_pending", actionId, capability, summary,
-        pane_id: paneId,
-        effective_gate: posture.effective_gate,
-        effective_mode: posture.effective_mode,
-        ...(posture.posture ? { posture: posture.posture } : {}),
-        ...(posture.effective_gates ? { effective_gates: posture.effective_gates } : {}),
-        ...(requestedMode ? { requested_mode: requestedMode } : {}),
-        global_override: manager.globalPermissionsMode !== "Inherit",
-      });
+      broadcast(buildActionPendingBroadcast(actionId, capability, paneId, summary, requestedMode));
       return { disposition: "deferred", actionId, summary };
     }
     // Auto
@@ -563,71 +642,71 @@ export function createGating(deps: GatingDeps): Gating {
    * killed[] names panes that ACTUALLY stopped — not merely the panes we asked to kill. Panes whose
    * stop() rejects are excluded from killed[] and surfaced separately (see killAllPanes / broadcast).
    */
-  async function stopAll(kill: boolean): Promise<string[]> {
-    if (!kill) {
-      coreState.setFrozen(true);
-      // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
-      for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
-      // Expire every deferred non-PTY action (no side effect runs).
-      for (const a of [...pendingActions.all()]) pendingActions.expire(a.id);
-      // Halt running plans + enabled watch-rules (passive co-pilot state, no pane writes).
-      let ledgerChanged = false;
-      for (const plan of manager.ledger.plans) {
-        if (plan.status === "running") { plan.status = "paused"; ledgerChanged = true; }
-      }
-      for (const rule of manager.ledger.watchRules) {
-        if (rule.enabled) { rule.enabled = false; ledgerChanged = true; }
-      }
-      if (ledgerChanged) {
-        manager.ledger["save"]?.(true);
-        broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-        broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
-      }
-      const stillRunning = runningPaneIds();
-      if (store) {
-        try {
-          store.recordActivity({
-            type: "permission_changed",
-            project_id: manager.ledger.activeProjectId || "default_project",
-            pane_id: null,
-            summary: `STOP_ALL Stage 1: froze Janus + cancelled in-flight (${stillRunning.length} pane(s) still running)`,
-            payload: { action: "stop_all_freeze", running: stillRunning },
-          });
-        } catch { /* store optional */ }
-      }
-      broadcast({ type: "frozen", frozen: true, running: stillRunning });
-      broadcastTerminalsUpdated();
-      // 1C.3 (Phase 1 Track C): STOP-ALL must be AUDIBLE on the voice channel. Reuse the SAME
-      // injected narration seam the sweep last-call uses (pushApprovalNarration +
-      // coreState.activeLiveSession) so Janus is told the whole line is gated Off instead of
-      // chatting on unaware. No live session => nothing to narrate (the UI broadcast above stands).
-      if (coreState.activeLiveSession) {
-        pushApprovalNarration(coreState.activeLiveSession, "Stop-all engaged — the whole line is frozen until you release.");
-      }
-      return stillRunning;
+  // Stage-1 sub-step: halt the passive co-pilot state (running plans -> paused, enabled watch-rules
+  // -> disabled) and broadcast the change. Extracted verbatim from stopAllStage1Freeze; no pane writes.
+  function haltPlansAndWatchRules(): void {
+    let ledgerChanged = false;
+    for (const plan of manager.ledger.plans) {
+      if (plan.status === "running") { plan.status = "paused"; ledgerChanged = true; }
     }
-    // Stage 2: kill the PTYs. QW4 — AWAIT every stop() (Promise.allSettled, mirroring close()'s
-    // awaited per-term stop) so we report panes that ACTUALLY stopped, not the ones we asked to.
+    for (const rule of manager.ledger.watchRules) {
+      if (rule.enabled) { rule.enabled = false; ledgerChanged = true; }
+    }
+    if (ledgerChanged) {
+      manager.ledger["save"]?.(true);
+      broadcast({ type: "plans_updated", plans: manager.ledger.plans });
+      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+    }
+  }
+
+  // STOP-ALL Stage 1 (kill=false): freeze + cancel everything in-flight. PANES KEEP RUNNING. Extracted
+  // verbatim from stopAll's `!kill` branch (behavior-preserving) so stopAll stays a thin dispatcher.
+  function stopAllStage1Freeze(): string[] {
+    coreState.setFrozen(true);
+    // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
+    for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
+    // Expire every deferred non-PTY action (no side effect runs).
+    for (const a of [...pendingActions.all()]) pendingActions.expire(a.id);
+    haltPlansAndWatchRules();
+    const stillRunning = runningPaneIds();
+    recordActivitySafe({
+      type: "permission_changed", pane_id: null,
+      summary: `STOP_ALL Stage 1: froze Janus + cancelled in-flight (${stillRunning.length} pane(s) still running)`,
+      payload: { action: "stop_all_freeze", running: stillRunning },
+    });
+    broadcast({ type: "frozen", frozen: true, running: stillRunning });
+    broadcastTerminalsUpdated();
+    // 1C.3 (Phase 1 Track C): STOP-ALL must be AUDIBLE on the voice channel. Reuse the SAME injected
+    // narration seam the sweep last-call uses (pushApprovalNarration + coreState.activeLiveSession) so
+    // Janus is told the whole line is gated Off. No live session => nothing to narrate (UI stands).
+    if (coreState.activeLiveSession) {
+      pushApprovalNarration(coreState.activeLiveSession, "Stop-all engaged — the whole line is frozen until you release.");
+    }
+    return stillRunning;
+  }
+
+  // STOP-ALL Stage 2 (kill=true): terminate the PTYs. QW4 — AWAIT every stop() (Promise.allSettled,
+  // mirroring close()'s awaited per-term stop) so we report panes that ACTUALLY stopped. Extracted
+  // verbatim from stopAll's kill branch (behavior-preserving).
+  async function stopAllStage2Kill(): Promise<string[]> {
     // 1C.3: narrate the irreversible step BEFORE the awaited kills (present-progressive truth).
     if (coreState.activeLiveSession) {
       pushApprovalNarration(coreState.activeLiveSession, "Stage two — running panes are being killed.");
     }
     const { killed, failed } = await killAllPanes();
-    if (store) {
-      try {
-        store.recordActivity({
-          type: "permission_changed",
-          project_id: manager.ledger.activeProjectId || "default_project",
-          pane_id: null,
-          summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)${failed.length ? `; ${failed.length} kill(s) FAILED` : ""}`,
-          payload: { action: "stop_all_kill", panes: killed, failed },
-        });
-      } catch { /* store optional */ }
-    }
+    recordActivitySafe({
+      type: "permission_changed", pane_id: null,
+      summary: `STOP_ALL Stage 2: killed ${killed.length} pane PTY(s)${failed.length ? `; ${failed.length} kill(s) FAILED` : ""}`,
+      payload: { action: "stop_all_kill", panes: killed, failed },
+    });
     coreState.lastStopAllFailed = failed; // QW4: surfaced to the REST confirm route (read right after the await).
     broadcast({ type: "stop_all", killed, failed });
     broadcastTerminalsUpdated();
     return killed;
+  }
+
+  async function stopAll(kill: boolean): Promise<string[]> {
+    return kill ? stopAllStage2Kill() : stopAllStage1Freeze();
   }
 
   /**
@@ -745,6 +824,14 @@ export function createGating(deps: GatingDeps): Gating {
     APPROVAL_RESOLVED: "approval_resolved",
   } as const;
 
+  // Step 9: the resolve reasons whose handoff row must be flipped to its terminal state in the SAME
+  // choke-point. Replaces the inline `reason === "approved" || ... || "dead_pane"` chain byte-for-byte
+  // (lost_race / not_found are deliberately absent — they never flip a handoff). `reason` is a typed
+  // ResolveReason union (never external/prototype input), so Set membership is the exact equivalent.
+  const handoffFlipReasons: ReadonlySet<ResolveReason> = new Set<ResolveReason>([
+    "approved", "rejected", "expired", "dead_pane",
+  ]);
+
   // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
   // resolve path (REST approve, voice approve/reject, TTL sweep) renders the outcome of the pure
   // `resolveDecision`. The MANDATORY atomic `claim()` lives INSIDE `resolveDecision`, so no path
@@ -766,6 +853,60 @@ export function createGating(deps: GatingDeps): Gating {
     applyHandoffFlipOnResolve(store, messageId, reason as HandoffResolveReason, { vocal: opts?.vocal });
   }
 
+  // ── applyResolution per-reason renderers ─────────────────────────────────────────────────────
+  // Each switch-case body of the resolve choke-point, extracted VERBATIM (behavior-preserving) so
+  // applyResolution stays a thin dispatcher under the complexity gate. They share the pre-computed
+  // record / redacted instruction / verb / session, passed in. NONE of them claim or delete — the
+  // mandatory atomic claim already happened inside resolveDecision before any of these run.
+  type ResolvedRecord = NonNullable<ReturnType<typeof resolveDecision>["record"]>;
+
+  // DUP-SEND FIX (approved leg): the instruction just landed on the PTY, so a WIP draft holding that
+  // SAME text is now stale — a later draft Send would re-emit it. Clear it, mirroring server.ts's
+  // draft/send clear. Guard on a non-empty draft that MATCHES (or contains) the dispatched
+  // instruction so an UNRELATED in-progress draft for this pane is never silently destroyed.
+  function clearMatchingDraftOnApprove(record: ResolvedRecord): void {
+    const term = manager.terminals[record.terminalId];
+    const projectId = term?.projectId;
+    if (!projectId) return;
+    const current = manager.ledger.getDraft(projectId, record.terminalId);
+    const draftText = current?.text ?? "";
+    if (
+      draftText.trim().length > 0 &&
+      (draftText.trim() === record.instruction.trim() || draftText.includes(record.instruction))
+    ) {
+      manager.ledger.setDraft(projectId, record.terminalId, "", "operator");
+      broadcastDraft(projectId, record.terminalId);
+    }
+  }
+
+  function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
+    // Claim already won inside resolveDecision — this is the single write path.
+    addCommand(record.terminalId, record.instruction);
+    manager.terminals[record.terminalId]!.writeInput(record.instruction);
+    clearMatchingDraftOnApprove(record);
+    if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+    // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
+    broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+  }
+
+  function renderDeadPane(record: ResolvedRecord, safeInstr: string, session: any): void {
+    if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
+    broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+  }
+
+  function renderRejected(record: ResolvedRecord, safeInstr: string, session: any, opts?: { vocal?: boolean }): void {
+    if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
+    broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+  }
+
+  function renderExpired(record: ResolvedRecord, safeInstr: string, session: any): void {
+    if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
+    // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its severity,
+    // which rendered "Pane 'x' exited." for a pane that merely lost an approval.
+    announcementBus.enqueue({ kind: "approval_expired", terminalId: record.terminalId, summary: "Approval expired." });
+    broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+  }
+
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
     // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
@@ -782,57 +923,17 @@ export function createGating(deps: GatingDeps): Gating {
     const safeInstr = redactSecrets(record.instruction);
     const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
 
+    // Dispatch the per-reason render (each helper is the verbatim former switch-case body). lost_race
+    // renders NOTHING (exactly-once preserved — another resolver already won the claim and broadcast).
     switch (reason) {
-      case "lost_race":
-        // Another resolver already won the claim — render nothing (exactly-once preserved).
-        break;
-      case "dead_pane":
-        if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
-        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
-        break;
-      case "approved": {
-        // Claim already won inside resolveDecision — this is the single write path.
-        addCommand(record.terminalId, record.instruction);
-        manager.terminals[record.terminalId]!.writeInput(record.instruction);
-        // DUP-SEND FIX: the instruction just landed on the PTY, so a WIP draft holding that SAME
-        // text is now stale — a later draft Send would re-emit it (dictation auto-populates the
-        // active draft, so the approved instruction can sit there verbatim). Clear it, mirroring the
-        // draft/send clear at server.ts:1326-1327. Guard on a non-empty draft that MATCHES (or
-        // contains) the dispatched instruction so an UNRELATED in-progress draft for this pane is
-        // never silently destroyed. `term` is guaranteed live here (the writeInput above just
-        // dereferenced it), but resolve projectId defensively.
-        const term = manager.terminals[record.terminalId];
-        const projectId = term?.projectId;
-        if (projectId) {
-          const current = manager.ledger.getDraft(projectId, record.terminalId);
-          const draftText = current?.text ?? "";
-          if (
-            draftText.trim().length > 0 &&
-            (draftText.trim() === record.instruction.trim() || draftText.includes(record.instruction))
-          ) {
-            manager.ledger.setDraft(projectId, record.terminalId, "", "operator");
-            broadcastDraft(projectId, record.terminalId);
-          }
-        }
-        if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
-        // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
-        broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
-        break;
-      }
-      case "rejected":
-        if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
-        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
-        break;
-      case "expired":
-        if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
-        // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its
-        // severity, which rendered "Pane 'x' exited." for a pane that merely lost an approval.
-        announcementBus.enqueue({ kind: "approval_expired", terminalId: record.terminalId, summary: "Approval expired." });
-        broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
-        break;
+      case "approved":  renderApproved(record, safeInstr, verb, session, opts); break;
+      case "dead_pane": renderDeadPane(record, safeInstr, session); break;
+      case "rejected":  renderRejected(record, safeInstr, session, opts); break;
+      case "expired":   renderExpired(record, safeInstr, session); break;
+      case "lost_race": break;
     }
     // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
-    if (reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane") {
+    if (handoffFlipReasons.has(reason)) {
       flipHandoffOnResolve(messageId, reason, opts);
     }
     // Issue E: emit a messageId-keyed resolve event so EVERY client dismisses the ApprovalDialog in
@@ -881,17 +982,12 @@ export function createGating(deps: GatingDeps): Gating {
     rec.timestamp = now;
     rec.lastCallAt = undefined;
     rec.lastCallFailures = undefined;
-    if (store) {
-      try {
-        store.recordActivity({
-          type: "approval_decided",
-          project_id: manager.ledger.activeProjectId || "default_project",
-          pane_id: rec.terminalId,
-          summary: `DEFERRED approval on ${rec.terminalId} (hold ${r.deferCount}/${MAX_DEFERRALS})`,
-          payload: { action: "deferred", message_id: messageId, deferrals: r.deferCount },
-        });
-      } catch { /* audit is best-effort */ }
-    }
+    recordActivitySafe({
+      type: "approval_decided",
+      pane_id: rec.terminalId,
+      summary: `DEFERRED approval on ${rec.terminalId} (hold ${r.deferCount}/${MAX_DEFERRALS})`,
+      payload: { action: "deferred", message_id: messageId, deferrals: r.deferCount },
+    });
     if (session) {
       pushApprovalNarration(session, `Holding it — I'll ask again in ${Math.round(APPROVAL_TTL_MS / 60000)} minutes.`);
     }
@@ -937,35 +1033,74 @@ export function createGating(deps: GatingDeps): Gating {
   // exists so a persistently-broken TTS channel can never hold approvals open forever.
   const LAST_CALL_MAX_NARRATION_FAILURES = 3;
 
+  // One APPROVALS-leg item: the none/lastcall/reject decision for a single expired approval. Extracted
+  // VERBATIM from sweepExpiredApprovalsUnsafe (behavior-preserving) so each leg stays under the gate.
+  // Connectivity is per-record (sessionFor !== undefined — the detach/re-attach seam).
+  function sweepApprovalItem(pending: ReturnType<PendingApprovalStore["expired"]>[number], now: number): void {
+    const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
+    const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
+    if (decision.action === "none") return; // not due, clock paused, or inside grace.
+    if (decision.action === "lastcall") {
+      // First crossing while connected: SPEAK the last-call (no reject), THEN stamp the transient —
+      // only a push that actually went out starts the grace clock (3V.3).
+      const session = pendingApprovals.sessionFor(pending.messageId);
+      const spoken = session !== undefined
+        && pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`) !== false;
+      if (spoken) {
+        pending.lastCallAt = now;
+        pending.lastCallFailures = undefined;
+        broadcastTerminalsUpdated();
+      } else {
+        pending.lastCallFailures = (pending.lastCallFailures ?? 0) + 1;
+        if (pending.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
+          // Bounded: the session is connected but narration keeps failing — stamp anyway so a
+          // broken TTS never wedges the queue (the grace still applies from here).
+          console.warn(`[gating] last-call narration failed ${pending.lastCallFailures}x for ${pending.messageId} — stamping the last-call anyway.`);
+          pending.lastCallAt = now;
+          broadcastTerminalsUpdated();
+        }
+      }
+      return;
+    }
+    // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
+    applyResolution(pending.messageId, "expire");
+  }
+
+  // One PENDING-ACTIONS-leg item: same last-call->grace shape as the approvals leg. Extracted VERBATIM.
+  // Connectivity is the SAME ref used to narrate (`coreState.activeLiveSession`), resolved ONCE by the
+  // caller and passed in (see the long-form rationale at the call site).
+  function sweepActionItem(act: ReturnType<PendingActionStore["expired"]>[number], now: number, actionsConnected: boolean): void {
+    const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
+    if (decision.action === "none") return;
+    if (decision.action === "lastcall") {
+      // 3V.3: same speak-then-stamp ordering as the approvals leg. The retry counter lives on the
+      // in-memory record via a structural widening (PendingAction's serialized shape is owned by
+      // pendingActions.ts; the counter is a sweep-private transient, deliberately never persisted).
+      const retry = act as { lastCallFailures?: number };
+      const spoken = coreState.activeLiveSession !== null
+        && pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`) !== false;
+      if (spoken) {
+        act.lastCallAt = now;
+        retry.lastCallFailures = undefined;
+        broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+      } else {
+        retry.lastCallFailures = (retry.lastCallFailures ?? 0) + 1;
+        if (retry.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
+          console.warn(`[gating] last-call narration failed ${retry.lastCallFailures}x for action ${act.id} — stamping the last-call anyway.`);
+          act.lastCallAt = now;
+          broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        }
+      }
+      return;
+    }
+    // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
+    pendingActions.expire(act.id);
+    broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
+  }
+
   function sweepExpiredApprovalsUnsafe(now: number) {
     for (const pending of pendingApprovals.expired(APPROVAL_TTL_MS, now)) {
-      const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
-      const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
-      if (decision.action === "none") continue; // not due, clock paused, or inside grace.
-      if (decision.action === "lastcall") {
-        // First crossing while connected: SPEAK the last-call (no reject), THEN stamp the transient —
-        // only a push that actually went out starts the grace clock (3V.3).
-        const session = pendingApprovals.sessionFor(pending.messageId);
-        const spoken = session !== undefined
-          && pushApprovalNarration(session, `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`) !== false;
-        if (spoken) {
-          pending.lastCallAt = now;
-          pending.lastCallFailures = undefined;
-          broadcastTerminalsUpdated();
-        } else {
-          pending.lastCallFailures = (pending.lastCallFailures ?? 0) + 1;
-          if (pending.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
-            // Bounded: the session is connected but narration keeps failing — stamp anyway so a
-            // broken TTS never wedges the queue (the grace still applies from here).
-            console.warn(`[gating] last-call narration failed ${pending.lastCallFailures}x for ${pending.messageId} — stamping the last-call anyway.`);
-            pending.lastCallAt = now;
-            broadcastTerminalsUpdated();
-          }
-        }
-        continue;
-      }
-      // decision.action === "reject": grace elapsed after the last-call -> the UNCHANGED terminal path.
-      applyResolution(pending.messageId, "expire");
+      sweepApprovalItem(pending, now);
     }
     // G1 + WS-F: pending actions get the SAME last-call->grace shape. Connectivity is gated on the
     // SAME ref used to narrate (`coreState.activeLiveSession`), NOT `coreState.activeFrontendWs`. The two diverge during
@@ -979,32 +1114,7 @@ export function createGating(deps: GatingDeps): Gating {
     // `lastCallAt` drives the two-phase transition; expiry stays the unchanged pendingActions.expire(id).
     const actionsConnected = coreState.activeLiveSession !== null;
     for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
-      const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
-      if (decision.action === "none") continue;
-      if (decision.action === "lastcall") {
-        // 3V.3: same speak-then-stamp ordering as the approvals leg above. The retry counter lives on
-        // the in-memory record via a structural widening (PendingAction's serialized shape is owned by
-        // pendingActions.ts; the counter is a sweep-private transient, deliberately never persisted).
-        const retry = act as { lastCallFailures?: number };
-        const spoken = coreState.activeLiveSession !== null
-          && pushApprovalNarration(coreState.activeLiveSession, `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`) !== false;
-        if (spoken) {
-          act.lastCallAt = now;
-          retry.lastCallFailures = undefined;
-          broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
-        } else {
-          retry.lastCallFailures = (retry.lastCallFailures ?? 0) + 1;
-          if (retry.lastCallFailures >= LAST_CALL_MAX_NARRATION_FAILURES) {
-            console.warn(`[gating] last-call narration failed ${retry.lastCallFailures}x for action ${act.id} — stamping the last-call anyway.`);
-            act.lastCallAt = now;
-            broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
-          }
-        }
-        continue;
-      }
-      // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
-      pendingActions.expire(act.id);
-      broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
+      sweepActionItem(act, now, actionsConnected);
     }
   }
 
