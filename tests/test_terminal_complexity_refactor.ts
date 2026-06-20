@@ -181,6 +181,14 @@ describe("Phase 7b — parsePresetsSafe characterization (pure)", () => {
     assert.strictEqual(normalizePreset("garbage"), "Custom");
     assert.strictEqual(normalizePreset(undefined), "Custom");
   });
+
+  it("normalizePreset is prototype-pollution safe (inherited member names -> Custom)", () => {
+    // Regression guard: a plain-object lookup would resolve these to Object.prototype
+    // members and defeat the fail-safe. Every one must collapse to "Custom".
+    for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", "isPrototypeOf"]) {
+      assert.strictEqual(normalizePreset(name), "Custom", `${name} must normalize to Custom`);
+    }
+  });
 });
 
 describe("Phase 7b — UniversalTerminal constructor characterization (pure, no spawn)", () => {

@@ -134,7 +134,11 @@ const PRESET_UNION_BY_ALIAS: Record<string, ToolPresetUnion> = {
 
 export function normalizePreset(raw: string | undefined | null): ToolPresetUnion {
   const v = (raw ?? "").trim();
-  return PRESET_UNION_BY_ALIAS[v] ?? "Custom";
+  // Own-key check is REQUIRED: PRESET_UNION_BY_ALIAS is a plain object, so a bare
+  // `[v] ?? "Custom"` would resolve inherited Object.prototype members ("constructor",
+  // "toString", "valueOf", "hasOwnProperty", ...) to truthy values and defeat the
+  // fail-safe. Only an explicit alias maps to a preset; everything else -> "Custom".
+  return Object.hasOwn(PRESET_UNION_BY_ALIAS, v) ? PRESET_UNION_BY_ALIAS[v] : "Custom";
 }
 
 /**
