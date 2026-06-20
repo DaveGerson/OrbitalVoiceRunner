@@ -65,3 +65,19 @@ test('production eslint.config.js loads without a config error', async () => {
   const eslint = new ESLint({ overrideConfigFile: prodConfig });
   await eslint.calculateConfigForFile(path.join(repoRoot, 'server.ts'));
 });
+
+// Coverage guard: the gate must match by EXTENSION, not a location allowlist, so new
+// first-party source can't silently escape. Test code (tests/**, e2e/**) is exempt by design.
+test('gate covers all first-party source; exempts only test code', async () => {
+  const eslint = new ESLint({ overrideConfigFile: prodConfig });
+  const isGated = async (rel: string) => {
+    const cfg = await eslint.calculateConfigForFile(path.join(repoRoot, rel));
+    return Boolean(cfg && cfg.rules && cfg.rules.complexity);
+  };
+  for (const rel of ['server.ts', 'src/App.tsx', 'src/x.ts', 'scripts/x.mjs', 'worker.ts', 'src/new.jsx']) {
+    assert.equal(await isGated(rel), true, `${rel} must be complexity-gated`);
+  }
+  for (const rel of ['e2e/fixtures.ts', 'tests/x.ts']) {
+    assert.equal(await isGated(rel), false, `${rel} is test code and should be exempt`);
+  }
+});

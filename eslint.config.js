@@ -11,23 +11,31 @@ import sonarjs from 'eslint-plugin-sonarjs';
 export default tseslint.config(
   {
     // Global ignores (a config object with ONLY `ignores` is global per flat-config).
+    // Test code (tests/**, e2e/**) is INTENTIONALLY exempt — it is legitimately branchy
+    // and not production logic (same call as excluding tests/**). Everything else that
+    // isn't first-party source (build output, vendored stubs, generated, configs) is
+    // excluded here rather than by narrowing the `files` set below.
     ignores: [
       'tests/**',
+      'e2e/**',
       'dist/**',
       'node_modules/**',
-      '**/*.generated.ts',
+      'stubs/**',
+      'public/**',
       'python/**',
+      '**/*.generated.ts',
       'playwright.config*',
       'vite.config*',
-      '**/*.cjs',
       'server.js',
     ],
   },
   {
-    // Gate ALL first-party source: .ts/.tsx app code (incl. React components,
-    // where UI complexity concentrates) and .ts/.mjs build+CI scripts. Leaving
-    // .tsx/.mjs ungated was a real hole — a 13-branch render function would pass.
-    files: ['server.ts', 'src/**/*.{ts,tsx}', 'scripts/**/*.{ts,mjs}'],
+    // Gate by EXTENSION across the whole tree (minus the ignores above) rather than by
+    // an allowlist of locations. A location allowlist fails OPEN: a new top-level dir, a
+    // new root-level file, or a .jsx/.mts/.cts/.cjs would silently escape the gate. With
+    // an extension match, any NEW first-party source is gated by default. JSX is enabled
+    // so .tsx React components (where UI complexity concentrates) are covered.
+    files: ['**/*.{ts,tsx,mts,cts,mjs,cjs,jsx}'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
