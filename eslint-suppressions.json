@@ -39,19 +39,9 @@
       "count": 1
     }
   },
-  "src/actions/defs/handoff.ts": {
-    "complexity": {
-      "count": 3
-    }
-  },
   "src/actions/defs/layouts.ts": {
     "complexity": {
       "count": 1
-    }
-  },
-  "src/actions/defs/locks.ts": {
-    "complexity": {
-      "count": 2
     }
   },
   "src/actions/defs/orchestration.ts": {
@@ -62,16 +52,6 @@
   "src/actions/defs/panes_write.ts": {
     "complexity": {
       "count": 1
-    }
-  },
-  "src/actions/defs/reads.ts": {
-    "complexity": {
-      "count": 2
-    }
-  },
-  "src/actions/gemini.ts": {
-    "complexity": {
-      "count": 2
     }
   },
   "src/announcementBus.ts": {
