@@ -213,8 +213,9 @@ export function createGating(deps: GatingDeps): Gating {
     project_id?: string;
   }): void {
     if (!store) return;
-    // NB: `||` (not `??`) to match the original inline sites byte-for-byte — an EMPTY activeProjectId
-    // falls back to "default_project" exactly as before.
+    // NB: the explicit arg uses `??` (default only when project_id is absent); the inner
+    // `activeProjectId || "default_project"` uses `||` (not `??`) to match the original inline sites
+    // byte-for-byte — an EMPTY activeProjectId falls back to "default_project" exactly as before.
     const projectId = entry.project_id ?? (manager.ledger.activeProjectId || "default_project");
     try {
       store.recordActivity({
@@ -444,9 +445,20 @@ export function createGating(deps: GatingDeps): Gating {
   // the pane's own mode (HiTL default when the pane is unknown); otherwise the global override
   // wins. Used by EVERY write path (dispatchProposal + handoff_context) so "gate a new write" =
   // resolve the mode here, never re-derive it inline.
+  // Own-key lookup guard: a capability/pane key equal to an Object.prototype member name
+  // ("toString", "constructor", "__proto__", ...) must NOT resolve to an inherited function and
+  // leak past the gate as a truthy "configured" value. Only OWN keys count; anything else ->
+  // undefined -> the safe default (Auto gate / HiTL mode). cf. the normalizePreset fix.
+  function ownCapabilityGate(
+    gates: Partial<Record<CapabilityGate, GateValue>> | undefined,
+    capability: CapabilityGate,
+  ): GateValue | undefined {
+    return gates && Object.hasOwn(gates, capability) ? gates[capability] : undefined;
+  }
+
   function effectiveModeFor(targetId: string): EffectiveMode {
     if (manager.globalPermissionsMode === "Inherit") {
-      const term = manager.terminals[targetId];
+      const term = Object.hasOwn(manager.terminals, targetId) ? manager.terminals[targetId] : undefined;
       return (term ? term.permissionsMode : "Human-in-the-Loop") as EffectiveMode;
     }
     return manager.globalPermissionsMode as EffectiveMode;
@@ -464,10 +476,10 @@ export function createGating(deps: GatingDeps): Gating {
     const globalGates = manager.settings.advanced?.capabilityGates;
     let paneGate: GateValue | undefined;
     if (paneId) {
-      paneGate = findPaneOwningProject(manager, paneId)?.pane.capabilityGates?.[capability];
+      paneGate = ownCapabilityGate(findPaneOwningProject(manager, paneId)?.pane.capabilityGates, capability);
     }
     const isActivePane = !!paneId && coreState.activePaneId === paneId;
-    const resolved = resolveCapabilityGateWithContext(paneGate, globalGates?.[capability], capability, isActivePane);
+    const resolved = resolveCapabilityGateWithContext(paneGate, ownCapabilityGate(globalGates, capability), capability, isActivePane);
     // STOP-ALL Stage-1: the ONE place the `frozen` short-circuit is applied. While frozen every
     // capability resolves Off; the matrix above is untouched, so Release re-exposes it exactly.
     return applyFrozenShortCircuit(coreState.frozen, resolved);

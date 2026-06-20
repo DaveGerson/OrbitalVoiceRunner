@@ -164,25 +164,17 @@ describe("gating refactor — effectiveModeFor (mode resolution)", () => {
     const { gating } = makeHarness({ globalMode: "Inherit", terminals: {} });
     assert.strictEqual(gating.effectiveModeFor("nope"), "Human-in-the-Loop");
   });
-  // CHARACTERIZATION of a PRE-EXISTING latent quirk (do NOT "fix" in this behavior-preserving
-  // refactor): manager.terminals is a plain object, so `terminals["toString"]` resolves to the
-  // inherited Object.prototype.toString FUNCTION — which is truthy — so the lookup returns
-  // `term.permissionsMode` === undefined rather than the HiTL fallback. The point of pinning it is
-  // that the refactor (which may swap this access for a lookup table) must reproduce this EXACT
-  // output and must not, e.g., start returning the prototype member's value. This is the terminal.ts
-  // lesson, captured. (Real pane ids are opaque, non-prototype strings; this never fires in prod.)
-  it("Inherit + prototype-member-name pane id -> current output is preserved EXACTLY (latent quirk pinned)", () => {
+  // HARDENED (post-refactor adversarial review): the pane lookup is Object.hasOwn-guarded, so a
+  // prototype-member-name pane id ("toString", "constructor", "__proto__", ...) no longer resolves
+  // to an inherited Object.prototype function — it falls through to the HiTL default exactly like
+  // any other unknown pane. (Real pane ids are opaque strings; this is defense-in-depth against the
+  // same prototype-leak class that bit terminal.ts's normalizePreset.)
+  it("Inherit + prototype-member-name pane id -> HiTL default (prototype-leak guarded)", () => {
     const { gating } = makeHarness({ globalMode: "Inherit", terminals: {} });
-    // toString/valueOf/etc. exist on Object.prototype as functions -> term truthy -> permissionsMode undefined.
-    assert.strictEqual(gating.effectiveModeFor("toString"), undefined);
-    assert.strictEqual(gating.effectiveModeFor("valueOf"), undefined);
-    assert.strictEqual(gating.effectiveModeFor("hasOwnProperty"), undefined);
-    assert.strictEqual(gating.effectiveModeFor("isPrototypeOf"), undefined);
-    // "constructor" -> Object (truthy) -> .permissionsMode undefined.
-    assert.strictEqual(gating.effectiveModeFor("constructor"), undefined);
-    // "__proto__" reads the prototype object (truthy) -> .permissionsMode undefined.
-    assert.strictEqual(gating.effectiveModeFor("__proto__"), undefined);
-    // A genuinely-absent NON-prototype key still hits the HiTL fallback (the intended path).
+    for (const k of ["toString", "valueOf", "hasOwnProperty", "isPrototypeOf", "constructor", "__proto__"]) {
+      assert.strictEqual(gating.effectiveModeFor(k), "Human-in-the-Loop", `${k} must hit the HiTL default`);
+    }
+    // A genuinely-absent NON-prototype key hits the same HiTL fallback (the intended path).
     assert.strictEqual(gating.effectiveModeFor("a-real-but-unknown-pane"), "Human-in-the-Loop");
   });
   it("global override wins over the pane's own mode", () => {
@@ -237,20 +229,20 @@ describe("gating refactor — effectiveCapabilityGateFor (capability DECISION + 
   });
   // CHARACTERIZATION of the SAME pre-existing latent quirk on the capability axis (do NOT "fix"
   // here): the global gate map is a plain object, so `globalGates["toString"]` is the inherited
-  // function, and resolveCapabilityGateWithContext returns `globalGate ?? "Auto"` === that function.
-  // We pin the EXACT current shape (a function for prototype keys, the Auto default for a real
-  // unknown key) so the refactor reproduces it byte-for-byte. The capabilities the engine actually
-  // dispatches come from the typed CapabilityGate union and the ALL_CAPABILITIES hand-list, so a
-  // prototype-name capability can never reach prod here either. Flagged in the handoff regardless.
-  it("prototype-member-name CAPABILITY -> current output preserved EXACTLY (latent quirk pinned)", () => {
+  // HARDENED (post-refactor adversarial review): the gate lookups are Object.hasOwn-guarded, so a
+  // prototype-member-name capability no longer leaks the inherited function past the gate — it falls
+  // through to the same "Auto" back-compat default as any other unknown capability. This matters
+  // because `set_capability_gate` is model-exposed with `capability: z.string()` (no enum guard), so
+  // a prototype-name capability IS reachable — the review refuted the earlier "can never reach prod".
+  it("prototype-member-name CAPABILITY -> Auto default (prototype-leak guarded, reachable via set_capability_gate)", () => {
     const { gating } = makeHarness({ ledgerProjects: { default_project: [{ pane_id: "p1" }] } });
-    // toString resolves to the inherited function via globalGates["toString"] (paneGate undefined,
-    // not active pane) -> resolveCapabilityGateWithContext returns globalGate ?? "Auto" == the fn.
-    assert.strictEqual(typeof gating.effectiveCapabilityGateFor("p1", "toString" as any), "function");
-    assert.strictEqual(typeof gating.effectiveCapabilityGateFor("p1", "hasOwnProperty" as any), "function");
-    // A real, non-prototype unknown capability hits the Auto back-compat default (the intended path).
+    // No longer a leaked function — guarded to the Auto back-compat default.
+    assert.strictEqual(gating.effectiveCapabilityGateFor("p1", "toString" as any), "Auto");
+    assert.strictEqual(gating.effectiveCapabilityGateFor("p1", "hasOwnProperty" as any), "Auto");
+    assert.strictEqual(gating.effectiveCapabilityGateFor("p1", "__proto__" as any), "Auto");
+    // A real, non-prototype unknown capability hits the same Auto back-compat default (the intended path).
     assert.strictEqual(gating.effectiveCapabilityGateFor("p1", "a_real_unknown_cap" as any), "Auto");
-    // And FROZEN still wins over even the quirky function value -> Off (the fail-closed guarantee holds).
+    // And FROZEN still wins -> Off (the fail-closed guarantee holds regardless).
     const { gating: gf } = makeHarness({ frozen: true, ledgerProjects: { default_project: [{ pane_id: "p1" }] } });
     assert.strictEqual(gf.effectiveCapabilityGateFor("p1", "toString" as any), "Off");
   });
