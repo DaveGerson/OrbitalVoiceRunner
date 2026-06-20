@@ -149,6 +149,25 @@ real PTY (`src/ptyTransport.ts`, node-pty/ConPTY). State persists through a **SQ
 `JANUS_LEDGER_BACKEND=legacy`. Safety is the **capability-gate matrix** (per-capability
 Auto/Ask/Off, global + per-pane), the choke-point every pane-mutating action routes through.
 
+### Python ⇄ TS boundary (the seam — read before adding "logic")
+
+**Direction (operator, 2026-06-19): Python owns decisions; TypeScript owns the frontend and the
+I/O shell.** New decision-logic is born in Python; existing pure-logic ports to Python only when a
+file is *already* being changed (opportunistic, not a rewrite). Rationale: a forthcoming Python
+agent/LLM layer, team/language fit, separation of concerns. Full ADR:
+`docs/design/2026-06-19-python-ts-seam.md`.
+
+| Goes to **Python** (the brain) | Stays in **TypeScript** (frontend + shell) |
+|---|---|
+| Agent/LLM/planning logic (the new layer) | React/Vite **frontend — exclusively TS** |
+| Memory/RAG scoring, context synthesis (`python/synthesizer/`, already there) | WS/REST transport, `node-pty`/ConPTY pane lifecycle |
+| Policy *evaluation*, classification, non-hot validation/normalization | Capability-gate **enforcement** choke-point (sync, fail-closed) |
+| Pure, deterministic, no Node-object coupling, not per-frame/keystroke/spawn | Real-time audio/streaming, hot paths, SQLite I/O |
+
+- **Bridge:** the stdio-JSON daemon pattern — `src/memory/pythonClient.ts` ⇄ `python/<module>/__main__.py`, one JSON object per line. New Python logic modules follow that exact shape; do NOT invent a second transport.
+- **Don't cross the seam on a hot path.** Anything called per-keystroke / per-audio-frame / per-spawn (e.g. preset normalization) stays TS — the stdio round-trip costs more than the work.
+- **The gate is special:** its *decision* is portable in principle, but it's a synchronous, fail-closed security choke-point — do NOT move it across the boundary casually.
+
 ## Conventions & Patterns
 
 - **Task tracking & memory: use `bd` (beads)** — `bd ready` / `bd create` / `bd update --claim`
