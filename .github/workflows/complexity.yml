@@ -63,7 +63,9 @@ jobs:
 
       - name: Hotspot report (churn x complexity)
         if: always()
-        run: npm run complexity:report -- --format json > complexity-report.json
+        # Invoke the script directly (not via `npm run`) so npm's banner doesn't
+        # corrupt the redirected JSON artifact.
+        run: node scripts/complexity-report.mjs --format json > complexity-report.json
 
       - name: Upload complexity report
         if: always()
