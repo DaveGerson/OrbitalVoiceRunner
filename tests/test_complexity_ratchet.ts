@@ -32,7 +32,8 @@ const repoRoot = path.resolve(__dirname, '..');
 //   (previously ungated); +39 pre-existing violations baselined. This is a one-time scope raise.
 // 119 -> 110: Phase 7b refactored src/terminal.ts under CC 10 and pruned its 9 suppressions.
 // 110 -> 103: burndown refactored src/gating/index.ts under CC 10 and pruned its 7 suppressions.
-const RATCHET_CEILING = 103;
+// 103 -> 99: burndown refactored src/store/sqliteStore.ts under CC 10 and pruned its 4 suppressions.
+const RATCHET_CEILING = 99;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

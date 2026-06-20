@@ -258,11 +258,6 @@
       "count": 1
     }
   },
-  "src/store/sqliteStore.ts": {
-    "complexity": {
-      "count": 4
-    }
-  },
   "src/voice/speakGate.ts": {
     "complexity": {
       "count": 1
