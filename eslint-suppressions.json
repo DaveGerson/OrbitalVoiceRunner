@@ -268,11 +268,6 @@
       "count": 4
     }
   },
-  "src/terminal.ts": {
-    "complexity": {
-      "count": 9
-    }
-  },
   "src/voice/speakGate.ts": {
     "complexity": {
       "count": 1

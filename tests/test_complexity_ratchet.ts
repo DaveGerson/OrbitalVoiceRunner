@@ -30,7 +30,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 85 -> 80: Phase 7 refactored src/voice/index.ts under CC 10 and pruned its 5 suppressions.
 // 80 -> 119: scope expansion — the gate now also covers .tsx React components and .mjs scripts
 //   (previously ungated); +39 pre-existing violations baselined. This is a one-time scope raise.
-const RATCHET_CEILING = 119;
+// 119 -> 110: Phase 7b refactored src/terminal.ts under CC 10 and pruned its 9 suppressions.
+const RATCHET_CEILING = 110;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');
