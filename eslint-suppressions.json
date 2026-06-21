@@ -14,16 +14,6 @@
       "count": 1
     }
   },
-  "src/components/ApprovalDialog.tsx": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/components/GateChip.tsx": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/components/SettingsDialog.tsx": {
     "complexity": {
       "count": 7
@@ -48,11 +38,6 @@
     }
   },
   "src/orbital/OrbitalApp.tsx": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/orbital/ServiceMode.tsx": {
     "complexity": {
       "count": 1
     }

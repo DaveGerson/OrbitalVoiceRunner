@@ -42,7 +42,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 61 -> 54: burndown refactored actions/defs/{orchestration,dispatch_group,panes_write}, dispatch/joinTracker, handoffFlow, liveGrounding, pendingApprovals under CC 10 and pruned their 7 suppressions (1 each).
 // 54 -> 48: quick-win burndown refactored server.validateSettingsPutBody + HistoryManager.doFlush (2 of server's 3) and scripts catalog.renderCatalog / wt-lock.main / verify-live-modeswitch.main / live-smoke-kitchen.main under CC 10; pruned 2 (server 3->1) + 4 (scripts ->0).
 // 48 -> 45: burndown refactored store/migrate.ts (migrateFromObjects txn arrow), orbital/useFocusTrap.ts (onKey), scripts/smoke-handoff.ts (main) under CC 10 and pruned their 3 suppressions (1 each).
-const RATCHET_CEILING = 45;
+// 45 -> 42: burndown refactored .tsx leaves GateChip.GateChipInner, ServiceMode (.map cb), ApprovalDialog under CC 10 (pure helpers + inline render-fns, no new components/hooks) and pruned their 3 suppressions (1 each).
+const RATCHET_CEILING = 42;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');
