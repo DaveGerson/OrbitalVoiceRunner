@@ -26,32 +26,39 @@ export interface EventEffect {
   earcon: EarconType;
 }
 
+/**
+ * Static event -> effect rows for arms whose earcon is a constant (i.e. does not depend on
+ * the message payload). The two payload-dependent arms (attention_updated, pane_transition)
+ * derive their earcon at dispatch time and so stay out of this table.
+ *
+ * `watch_rule_suggested`: a matched watch rule is a co-pilot SUGGESTION, never an autonomous
+ * write. The suggestion is queued via a paired `attention_updated` event (which feeds
+ * setAttentionQueue), so here we only sound the chime.
+ */
+const STATIC_EFFECTS: Record<string, EventEffect> = {
+  plans_updated: { setter: "setPlans", earcon: null },
+  watch_rules_updated: { setter: "setWatchRules", earcon: null },
+  plan_step_completed: { setter: "fetchPlans", earcon: "execute" },
+  plan_completed: { setter: "fetchPlans", earcon: "success" },
+  plan_paused: { setter: "fetchPlans", earcon: "alert" },
+  history_updated: { setter: "noop", earcon: null },
+  watch_rule_suggested: { setter: "noop", earcon: "chime" },
+};
+
 /** The authoritative event -> (setter, earcon) mapping. Data-driven so it is testable. */
 export function effectForEvent(msg: any): EventEffect | null {
-  switch (msg?.type) {
+  const type = msg?.type;
+  switch (type) {
     case "attention_updated":
       return { setter: "setAttentionQueue", earcon: earconForAttention(msg.queue) };
-    case "plans_updated":
-      return { setter: "setPlans", earcon: null };
-    case "watch_rules_updated":
-      return { setter: "setWatchRules", earcon: null };
     case "pane_transition":
       return { setter: "fetchTerminals", earcon: earconForTransition(msg.transition) };
-    case "plan_step_completed":
-      return { setter: "fetchPlans", earcon: "execute" };
-    case "plan_completed":
-      return { setter: "fetchPlans", earcon: "success" };
-    case "plan_paused":
-      return { setter: "fetchPlans", earcon: "alert" };
-    case "history_updated":
-      return { setter: "noop", earcon: null };
-    case "watch_rule_suggested":
-      // Prompt-composer refactor: a matched watch rule is a co-pilot SUGGESTION, never an
-      // autonomous write. The suggestion is queued via a paired `attention_updated` event
-      // (which feeds setAttentionQueue), so here we only sound the chime.
-      return { setter: "noop", earcon: "chime" };
     default:
-      return null;
+      // Prototype-safe lookup: own-property guard so a payload type of "__proto__" /
+      // "constructor" can never resolve to an inherited Object.prototype member.
+      return typeof type === "string" && Object.prototype.hasOwnProperty.call(STATIC_EFFECTS, type)
+        ? STATIC_EFFECTS[type]
+        : null;
   }
 }
 

@@ -19,30 +19,37 @@ export interface LiveTranscripts {
   modelThinking: string;
 }
 
+/** Concatenate the `.text` of every part (skipping text-less/empty parts), preserving order. */
+function joinParts(parts: any): string {
+  let out = "";
+  for (const part of parts ?? []) if (part?.text) out += part.text;
+  return out;
+}
+
+/**
+ * Operator ASR. The REAL channel is inputTranscription; the legacy turn/userTurn casts are a
+ * FALLBACK used ONLY when inputTranscription is absent (this model populates one channel per
+ * message, never both — but prefer-then-fallback stays correct even if that ever changes; we must
+ * not concatenate the legacy casts onto a real transcript).
+ */
+function extractOperator(sc: any): string {
+  const inputTx = sc?.inputTranscription?.text;
+  if (typeof inputTx === "string" && inputTx.length > 0) return inputTx;
+  return joinParts(sc?.turn?.parts) + joinParts(sc?.userTurn?.parts);
+}
+
+/** Model narration / "thinking" transcription, from outputTranscription (string only). */
+function extractModelThinking(sc: any): string {
+  const outputTx = sc?.outputTranscription?.text;
+  return typeof outputTx === "string" ? outputTx : "";
+}
+
 /** Read operator/model transcripts from a LiveServerMessage. Pure; never throws on malformed input. */
 export function extractTranscripts(message: any): LiveTranscripts {
   const sc = message?.serverContent;
-  let operator = "";
-  let model = "";
-
-  // Operator ASR — the REAL channel is inputTranscription. The legacy turn/userTurn casts are a
-  // FALLBACK used ONLY when inputTranscription is absent (this model populates one channel per
-  // message, never both — but prefer-then-fallback stays correct even if that ever changes; we must
-  // not concatenate the legacy casts onto a real transcript).
-  const inputTx = sc?.inputTranscription?.text;
-  if (typeof inputTx === "string" && inputTx.length > 0) {
-    operator = inputTx;
-  } else {
-    for (const part of sc?.turn?.parts ?? []) if (part?.text) operator += part.text;
-    for (const part of sc?.userTurn?.parts ?? []) if (part?.text) operator += part.text;
-  }
-
-  // Model spoken text.
-  for (const part of sc?.modelTurn?.parts ?? []) if (part?.text) model += part.text;
-
-  // Model narration / "thinking" transcription.
-  const outputTx = sc?.outputTranscription?.text;
-  const modelThinking = typeof outputTx === "string" ? outputTx : "";
-
-  return { operator, model, modelThinking };
+  return {
+    operator: extractOperator(sc),
+    model: joinParts(sc?.modelTurn?.parts),
+    modelThinking: extractModelThinking(sc),
+  };
 }

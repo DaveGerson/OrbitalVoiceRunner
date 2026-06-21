@@ -49,11 +49,6 @@
       "count": 1
     }
   },
-  "src/announcementBus.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/components/ActionConfirmDialog.tsx": {
     "complexity": {
       "count": 1
@@ -92,27 +87,12 @@
       "count": 1
     }
   },
-  "src/eventBus.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/handoffFlow.ts": {
     "complexity": {
       "count": 1
     }
   },
   "src/liveGrounding.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/liveTranscripts.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/memory/assembler.ts": {
     "complexity": {
       "count": 1
     }
@@ -184,11 +164,6 @@
     }
   },
   "src/store/migrate.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/voice/speakGate.ts": {
     "complexity": {
       "count": 1
     }
