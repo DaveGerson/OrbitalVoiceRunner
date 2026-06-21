@@ -4,6 +4,10 @@ import { FitAddon } from "xterm-addon-fit";
 import "xterm/css/xterm.css";
 import { ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 import { subscribeChunks } from "../terminalStream";
+// resync's pure helpers live in a CSS-free sibling module so the unit tests can
+// import the REAL implementations (this file imports xterm CSS, which the node
+// test runner cannot load).
+import { tryFetchBackfill, resolveBackfill, shouldSkipQuietResync } from "./terminalViewResync";
 
 interface TerminalViewProps {
   /** Pane id — keys the live raw-chunk subscription and resize callback. */
@@ -122,16 +126,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     const resync = async ({ marker }: { marker: boolean }) => {
       if (journal) return; // a resync is already in flight
       journal = [];
-      let fresh: string | null = null;
-      try { fresh = (await fetchBackfillRef.current?.()) ?? null; } catch { fresh = null; }
+      const fetched = await tryFetchBackfill(fetchBackfillRef.current);
       const replay = journal ?? [];
       journal = null;
       if (disposed) return;
-      if (fresh === null) fresh = backfillRef.current ?? null; // degrade to the freshest React state
+      const fresh = resolveBackfill(fetched, backfillRef.current); // degrade to the freshest React state
       if (!marker) {
         const buf = term.buffer.active;
         const atBottom = buf.viewportY >= buf.baseY;
-        if (fresh === null || fresh === lastBase || !atBottom) return; // nothing new / operator reading
+        if (shouldSkipQuietResync(fresh, lastBase, atBottom)) return; // nothing new / operator reading
       }
       // One synchronous frame: reset, rewrite from truth, stamp the gap (reconnect only), then
       // replay any chunks that streamed in while the snapshot was in flight.

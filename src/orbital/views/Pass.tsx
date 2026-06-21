@@ -28,19 +28,42 @@ function ago(ms: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+// ── Pure module-level helpers (exported for tests) ────────────────────────────
+
+/** Returns "" for 1, "s" for any other count — avoids repeated ternaries in JSX. */
+export function pluralSuffix(n: number): string {
+  return n === 1 ? "" : "s";
+}
+
+/** Resolves TemplateForm's optional `initial` prop into concrete default strings. */
+export function resolveTemplateInitial(initial?: { name: string; description: string; body: string }): { name: string; description: string; body: string } {
+  return {
+    name: initial?.name ?? "",
+    description: initial?.description ?? "",
+    body: initial?.body ?? "",
+  };
+}
+
 function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n: StoredNote; dark: boolean; onEdit: (id: string, text: string) => void; onDelete: (id: string) => void; onFirePane: (projectId: string) => void; onJumpToPane: (paneId: string) => void }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(n.text);
   const k = TICKET_KINDS[kindFor(n.type)];
   const fg = dark ? "#ffe9c7" : INK;
+
+  // Inline render helper — moves 3 dark-mode branches out of TicketCard's CC budget.
+  function renderJumpButton(): ReactNode {
+    if (!n.pane_id) return null;
+    return (
+      <button data-testid="pass-ticket-jump" onClick={() => onJumpToPane(n.pane_id!)} title="Jump to this station"
+        style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#2f1d12" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", cursor: "pointer", fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700 }}>#{n.pane_id} ›</button>
+    );
+  }
+
   return (
     <div data-testid="pass-ticket" style={{ width: 230, flexShrink: 0, padding: 11, border: "2px solid " + INK, borderRadius: 11, background: dark ? "#241409" : "#fff9ec", boxShadow: "2px 2px 0 0 " + INK, display: "flex", flexDirection: "column", gap: 7 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
-        {n.pane_id && (
-          <button data-testid="pass-ticket-jump" onClick={() => onJumpToPane(n.pane_id!)} title="Jump to this station"
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#2f1d12" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", cursor: "pointer", fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700 }}>#{n.pane_id} ›</button>
-        )}
+        {renderJumpButton()}
         <div style={{ flex: 1 }} />
         <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{ago(n.created_at)}</span>
       </div>
@@ -118,9 +141,11 @@ function TemplateForm({ dark, initial, testPrefix, onCancel, onSave }: {
   dark: boolean; initial?: { name: string; description: string; body: string }; testPrefix: string;
   onCancel: () => void; onSave: (o: { name: string; body: string; description?: string }) => void;
 }) {
-  const [name, setName] = useState(initial?.name ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
-  const [body, setBody] = useState(initial?.body ?? "");
+  // resolveTemplateInitial removes 6 optional-chain/nullish branches from this function's CC.
+  const defaults = resolveTemplateInitial(initial);
+  const [name, setName] = useState(defaults.name);
+  const [description, setDescription] = useState(defaults.description);
+  const [body, setBody] = useState(defaults.body);
   const can = !!name.trim() && !!body.trim();
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -419,18 +444,19 @@ export function ThePass({ notes, plans, templates, layouts, stations, activePane
   const fg = dark ? "#ffe9c7" : INK;
   const empty = notes.length === 0 && plans.length === 0 && templates.length === 0 && layouts.length === 0;
 
-  return (
-    <div data-testid="the-pass" style={{ flexShrink: 0, borderBottom: "3px solid " + INK, background: dark ? "#2f1d12" : "#fff4de" }}>
-      {/* the bar */}
+  // Inline render helpers — each owns its own CC budget so ThePass stays ≤10.
+
+  function renderPassBar(): ReactNode {
+    return (
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 16px" }}>
         <button data-testid="pass-expand" onClick={() => setExpanded((e) => !e)} title={expanded ? "fold up" : "blow out the pass"}
           style={{ display: "flex", alignItems: "center", gap: 7, border: "none", background: "transparent", cursor: "pointer", color: fg }}>
           <span style={{ fontSize: 17 }}>🎫</span>
           <span style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 17 }}>The Pass</span>
           <Chip bg="#e23a3a" color="#fff4de">{notes.length}</Chip>
-          {plans.length > 0 && <Chip bg="#4b3bb3" color="#fff4de">{plans.length} spec{plans.length === 1 ? "" : "s"}</Chip>}
-          {templates.length > 0 && <Chip bg="#4db892" color={INK}>{templates.length} template{templates.length === 1 ? "" : "s"}</Chip>}
-          {layouts.length > 0 && <Chip bg="#ff8a3d" color={INK}>{layouts.length} layout{layouts.length === 1 ? "" : "s"}</Chip>}
+          {plans.length > 0 && <Chip bg="#4b3bb3" color="#fff4de">{plans.length} spec{pluralSuffix(plans.length)}</Chip>}
+          {templates.length > 0 && <Chip bg="#4db892" color={INK}>{templates.length} template{pluralSuffix(templates.length)}</Chip>}
+          {layouts.length > 0 && <Chip bg="#ff8a3d" color={INK}>{layouts.length} layout{pluralSuffix(layouts.length)}</Chip>}
           <span style={{ fontFamily: "DM Sans", fontSize: 11, color: "#8a6a4f", transform: expanded ? "rotate(180deg)" : "none" }}>▾</span>
         </button>
         {voiceCues && <VoiceCue phrase="what's on the pass?" dark={dark} />}
@@ -438,22 +464,36 @@ export function ThePass({ notes, plans, templates, layouts, stations, activePane
         <JotNote dark={dark} projectName={jotProjectName} disabled={!canJot} onAdd={(t) => jotProjectId && onAdd(jotProjectId, t)} />
         <button data-testid="pass-jar" onClick={() => setJar(true)} title="Explore the bead jar" style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 10px", borderRadius: 9, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: fg, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, flexShrink: 0 }}>🫙 jar</button>
       </div>
+    );
+  }
 
-      {/* the tickets (collapsed = a single scrolling row; expanded = wrap). 4U.1: spec tickets
-          (voice-built plans) lead the row — they're the fireable work; notes follow, then the
-          cookbook (templates) and mise en place (layouts). The two ghost creator cards live in the
-          expanded pass only, so the collapsed strip stays glanceable. */}
-      {empty && !expanded ? null : (
-        <div style={{ display: "flex", gap: 10, padding: "2px 16px 14px", overflowX: expanded ? "visible" : "auto", flexWrap: expanded ? "wrap" : "nowrap" }}>
-          {empty && <div data-testid="pass-empty" style={{ alignSelf: "center", flexShrink: 0, fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f" }}>nothin' on the pass — clean board, Chef 😌</div>}
-          {plans.map((p) => <Fragment key={p.id}><SpecTicket p={p} dark={dark} onExecute={onExecutePlan} onDelete={onDeletePlan} /></Fragment>)}
-          {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
-          {templates.map((t) => <Fragment key={t.id}><TemplateTicket t={t} dark={dark} stations={stations} activePaneId={activePaneId} onUpdate={onUpdateTemplate} onDelete={onDeleteTemplate} onApply={onApplyTemplate} /></Fragment>)}
-          {layouts.map((l) => <Fragment key={l.id}><LayoutTicket l={l} dark={dark} onApply={onApplyLayout} onDelete={onDeleteLayout} /></Fragment>)}
-          {expanded && <NewTemplateCard dark={dark} onCreate={onCreateTemplate} />}
-          {expanded && <SaveLayoutCard dark={dark} onSave={onSaveLayout} />}
-        </div>
-      )}
+  function renderPassTickets(): ReactNode {
+    // Collapsed with nothing on the pass → render nothing.
+    if (empty && !expanded) return null;
+    return (
+      /* the tickets (collapsed = a single scrolling row; expanded = wrap). 4U.1: spec tickets
+         (voice-built plans) lead the row — they're the fireable work; notes follow, then the
+         cookbook (templates) and mise en place (layouts). The two ghost creator cards live in the
+         expanded pass only, so the collapsed strip stays glanceable. */
+      <div style={{ display: "flex", gap: 10, padding: "2px 16px 14px", overflowX: expanded ? "visible" : "auto", flexWrap: expanded ? "wrap" : "nowrap" }}>
+        {empty && <div data-testid="pass-empty" style={{ alignSelf: "center", flexShrink: 0, fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f" }}>nothin' on the pass — clean board, Chef 😌</div>}
+        {plans.map((p) => <Fragment key={p.id}><SpecTicket p={p} dark={dark} onExecute={onExecutePlan} onDelete={onDeletePlan} /></Fragment>)}
+        {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
+        {templates.map((t) => <Fragment key={t.id}><TemplateTicket t={t} dark={dark} stations={stations} activePaneId={activePaneId} onUpdate={onUpdateTemplate} onDelete={onDeleteTemplate} onApply={onApplyTemplate} /></Fragment>)}
+        {layouts.map((l) => <Fragment key={l.id}><LayoutTicket l={l} dark={dark} onApply={onApplyLayout} onDelete={onDeleteLayout} /></Fragment>)}
+        {expanded && <NewTemplateCard dark={dark} onCreate={onCreateTemplate} />}
+        {expanded && <SaveLayoutCard dark={dark} onSave={onSaveLayout} />}
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="the-pass" style={{ flexShrink: 0, borderBottom: "3px solid " + INK, background: dark ? "#2f1d12" : "#fff4de" }}>
+      {/* the bar */}
+      {renderPassBar()}
+
+      {/* the tickets */}
+      {renderPassTickets()}
 
       {jar && <BeadsExplorer dark={dark} onClose={() => setJar(false)} />}
     </div>

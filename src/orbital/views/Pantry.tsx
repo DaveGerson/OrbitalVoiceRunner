@@ -12,16 +12,38 @@ import type { ArchivedPane, ServiceLogRow } from "../useOrbitalData";
 
 // 4U.3: pull a pane id out of the redacted-args JSON (best-effort, presentation only) so a
 // service-log row can say WHERE it happened. The action log has no pane column; the args do.
-function paneOf(row: ServiceLogRow): string | null {
+
+/** Try to read a pane-id field from one already-parsed args object. */
+export function extractPaneIdFromArgs(a: unknown): string | null {
+  if (!a || typeof a !== "object") return null;
+  const obj = a as Record<string, unknown>;
+  const v = obj["pane_id"] ?? obj["paneId"] ?? obj["terminalId"] ?? obj["terminal_id"];
+  return typeof v === "string" && v ? v : null;
+}
+
+/** Parse args_redacted JSON and extract a pane id (best-effort). */
+export function paneOf(row: ServiceLogRow): string | null {
   if (!row.args_redacted) return null;
   try {
-    const a = JSON.parse(row.args_redacted);
-    const v = a?.pane_id ?? a?.paneId ?? a?.terminalId ?? a?.terminal_id;
-    return typeof v === "string" && v ? v : null;
+    return extractPaneIdFromArgs(JSON.parse(row.args_redacted));
   } catch { return null; }
 }
+
 function logTime(ts: number): string {
   try { return new Date(ts).toLocaleTimeString(); } catch { return String(ts); }
+}
+
+/** Map a result_kind string to its badge colours. */
+export function kindSkinFor(kind: string): { bg: string; fg: string } {
+  if (kind === "error") return { bg: "#e23a3a", fg: "#fff4de" };
+  if (kind === "blocked") return { bg: "#ff8a3d", fg: INK };
+  if (kind === "pending") return { bg: "#ffc94a", fg: INK };
+  return { bg: "#4db892", fg: INK };
+}
+
+/** Derive the display label for a log row (name → capability → fallback). */
+export function resolveLogLabel(r: ServiceLogRow): string {
+  return r.name || r.capability || "—";
 }
 
 // One calm service-log row: time · what ran · where · how it went. All server truth
@@ -29,20 +51,20 @@ function logTime(ts: number): string {
 function ServiceLogLine({ r, dark }: { r: ServiceLogRow; dark: boolean }) {
   const fg = dark ? "#ffe9c7" : INK;
   const kind = (r.result_kind || "ok").toLowerCase();
-  const kindSkin = kind === "error" ? { bg: "#e23a3a", fg: "#fff4de" }
-    : kind === "blocked" ? { bg: "#ff8a3d", fg: INK }
-    : kind === "pending" ? { bg: "#ffc94a", fg: INK }
-    : { bg: "#4db892", fg: INK };
+  const kindSkin = kindSkinFor(kind);
   const pane = paneOf(r);
+  const msSuffix = typeof r.ms === "number"
+    ? <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{r.ms < 1 ? "<1" : Math.round(r.ms)}ms</span>
+    : null;
   return (
     <div data-testid="service-log-row" style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", borderRadius: 9, border: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff4de" }}>
       <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f", flexShrink: 0, width: 72 }}>{logTime(r.ts)}</span>
       <span style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-        {r.name || r.capability || "—"}{pane ? <span style={{ color: "#8a6a4f", fontWeight: 600 }}> · #{pane}</span> : null}
+        {resolveLogLabel(r)}{pane ? <span style={{ color: "#8a6a4f", fontWeight: 600 }}> · #{pane}</span> : null}
       </span>
       {r.surface && <Chip bg={dark ? "#241409" : "#fff9ec"} color="#8a6a4f">{r.surface}</Chip>}
       <Chip bg={kindSkin.bg} color={kindSkin.fg}>{kind}</Chip>
-      {typeof r.ms === "number" && <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{r.ms < 1 ? "<1" : Math.round(r.ms)}ms</span>}
+      {msSuffix}
     </div>
   );
 }
@@ -83,6 +105,20 @@ function Head({ children, dark }: { children: ReactNode; dark: boolean }) {
   return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
 }
 
+/**
+ * Resolve which project id to display. Uses an explicit pick when still valid,
+ * else the board's selected project, else the first available project.
+ */
+export function resolvePid(
+  picked: string | null,
+  selectedProject: string,
+  projects: StationProject[],
+): string {
+  if (picked && projects.some((p) => p.id === picked)) return picked;
+  if (selectedProject !== "all" && projects.some((p) => p.id === selectedProject)) return selectedProject;
+  return projects[0]?.id ?? "";
+}
+
 export function ThePantry({ dark, projects, stations, archived, serviceLog, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
   dark: boolean;
   projects: StationProject[];
@@ -102,14 +138,86 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, summ
   // else the board's selected project, else the first. Avoids the start-view race where `projects` is
   // empty on first paint (the ledger seeds a tick later).
   const [picked, setPicked] = useState<string | null>(null);
-  const pid = picked && projects.some((p) => p.id === picked)
-    ? picked
-    : (selectedProject !== "all" && projects.some((p) => p.id === selectedProject) ? selectedProject : (projects[0]?.id ?? ""));
+  const pid = resolvePid(picked, selectedProject, projects);
   const fg = dark ? "#ffe9c7" : INK;
   const proj = projects.find((p) => p.id === pid);
   const panes = stations.filter((s) => s.project === pid);
   const cooking = panes.filter((s) => s.status === "Running").length;
   const frozen = archived.filter((a) => a.project_id === pid);
+
+  function renderPanesCard(): ReactNode {
+    const body = panes.length === 0
+      ? <div style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>No panes open in this kitchen yet.</div>
+      : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {panes.map((s) => (
+            <Fragment key={s.id}>
+              <button data-testid="pantry-pane" onClick={() => onOpenStation(s.id)}
+                style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff4de", cursor: "pointer", textAlign: "left", width: "100%" }}>
+                <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{s.id}</span>
+                <StatusBadge status={s.status} />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, color: fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</span>
+                  {s.scribble && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.scribble}</span>}
+                </span>
+                <Pips steps={8} done={s.contextPips} color={proj!.color} label={s.contextLabel} />
+                <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, color: "#8a6a4f", flexShrink: 0 }}>{s.elapsed}</span>
+              </button>
+            </Fragment>
+          ))}
+        </div>
+      );
+    return <Card dark={dark}><Head dark={dark}>Panes &amp; their work</Head>{body}</Card>;
+  }
+
+  function renderFreezerCard(): ReactNode {
+    const body = frozen.length === 0
+      ? (
+        <div data-testid="freezer-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
+          Nothing in the freezer — 86'd and cleared stations land here, restorable.
+        </div>
+      ) : (
+        <div data-testid="freezer-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {frozen.map((a) => (
+            <Fragment key={a.pane_id}>
+              <FreezerRow a={a} dark={dark} onRestore={onRestoreArchived} onDelete={onDeleteArchived} />
+            </Fragment>
+          ))}
+        </div>
+      );
+    return (
+      /* 2K.1: In the freezer — archived (recoverable) panes. Restore brings one back to the
+         line; Delete is permanent (two-tap confirm). Driven by GET /api/archive, the same
+         feed as the classic app's restore tray. */
+      <Card dark={dark}><Head dark={dark}>In the freezer</Head>{body}</Card>
+    );
+  }
+
+  function renderServiceLog(): ReactNode {
+    const body = serviceLog.length === 0
+      ? (
+        <div data-testid="service-log-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
+          Nothing on the record yet — actions land here as they run.
+        </div>
+      ) : (
+        <div data-testid="service-log" style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 380, overflowY: "auto" }}>
+          {serviceLog.slice(0, 100).map((r) => (
+            <Fragment key={r.id}><ServiceLogLine r={r} dark={dark} /></Fragment>
+          ))}
+        </div>
+      );
+    return (
+      /* 4U.3: the Service log — the kitchen's reviewable past, straight off the durable action
+         log (GET /api/action-log). Global (not per-project) and CALM, per the pantry's brief.
+         Capped at 100 rows (the fetch asks for limit=100; rows arrive newest-first). */
+      <div style={{ maxWidth: 880, marginTop: 16 }}>
+        <Card dark={dark}>
+          <Head dark={dark}>Service log — what the kitchen's done lately</Head>
+          {body}
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div data-testid="pantry" style={{ flex: 1, overflowY: "auto", padding: 24, background: dark ? "#1a0f08" : "var(--cream)", backgroundImage: dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
@@ -154,50 +262,10 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, summ
           </Card>
 
           {/* panes */}
-          <Card dark={dark}>
-            <Head dark={dark}>Panes &amp; their work</Head>
-            {panes.length === 0 ? (
-              <div style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>No panes open in this kitchen yet.</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {panes.map((s) => (
-                  <Fragment key={s.id}>
-                    <button data-testid="pantry-pane" onClick={() => onOpenStation(s.id)}
-                      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff4de", cursor: "pointer", textAlign: "left", width: "100%" }}>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{s.id}</span>
-                      <StatusBadge status={s.status} />
-                      <span style={{ flex: 1, minWidth: 0 }}>
-                        <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, color: fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</span>
-                        {s.scribble && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.scribble}</span>}
-                      </span>
-                      <Pips steps={8} done={s.contextPips} color={proj.color} label={s.contextLabel} />
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, color: "#8a6a4f", flexShrink: 0 }}>{s.elapsed}</span>
-                    </button>
-                  </Fragment>
-                ))}
-              </div>
-            )}
-          </Card>
+          {renderPanesCard()}
 
-          {/* 2K.1: In the freezer — archived (recoverable) panes. Restore brings one back to the
-              line; Delete is permanent (two-tap confirm). Driven by GET /api/archive, the same
-              feed as the classic app's restore tray. */}
-          <Card dark={dark}>
-            <Head dark={dark}>In the freezer</Head>
-            {frozen.length === 0 ? (
-              <div data-testid="freezer-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
-                Nothing in the freezer — 86'd and cleared stations land here, restorable.
-              </div>
-            ) : (
-              <div data-testid="freezer-list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {frozen.map((a) => (
-                  <Fragment key={a.pane_id}>
-                    <FreezerRow a={a} dark={dark} onRestore={onRestoreArchived} onDelete={onDeleteArchived} />
-                  </Fragment>
-                ))}
-              </div>
-            )}
-          </Card>
+          {/* 2K.1: In the freezer */}
+          {renderFreezerCard()}
 
           {/* The Repo — honest disabled placeholder (no git data on the backend yet) */}
           <Card dark={dark}>
@@ -213,25 +281,8 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, summ
         </div>
       )}
 
-      {/* 4U.3: the Service log — the kitchen's reviewable past, straight off the durable action
-          log (GET /api/action-log). Global (not per-project) and CALM, per the pantry's brief.
-          Capped at 100 rows (the fetch asks for limit=100; rows arrive newest-first). */}
-      <div style={{ maxWidth: 880, marginTop: 16 }}>
-        <Card dark={dark}>
-          <Head dark={dark}>Service log — what the kitchen's done lately</Head>
-          {serviceLog.length === 0 ? (
-            <div data-testid="service-log-empty" style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: "#8a6a4f" }}>
-              Nothing on the record yet — actions land here as they run.
-            </div>
-          ) : (
-            <div data-testid="service-log" style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 380, overflowY: "auto" }}>
-              {serviceLog.slice(0, 100).map((r) => (
-                <Fragment key={r.id}><ServiceLogLine r={r} dark={dark} /></Fragment>
-              ))}
-            </div>
-          )}
-        </Card>
-      </div>
+      {/* 4U.3: the Service log */}
+      {renderServiceLog()}
     </div>
   );
 }
