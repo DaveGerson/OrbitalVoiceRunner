@@ -35,7 +35,12 @@ const repoRoot = path.resolve(__dirname, '..');
 // 103 -> 99: burndown refactored src/store/sqliteStore.ts under CC 10 and pruned its 4 suppressions.
 // 99 -> 87: burndown refactored approvalIntent/actionEffects/observe under CC 10 and pruned their 5+3+4 suppressions.
 // 87 -> 78: burndown refactored actions registry (handoff/locks/reads/gemini) under CC 10 and pruned their 3+2+2+2 suppressions.
-const RATCHET_CEILING = 78;
+// 78 -> 75: burndown refactored src/statusProbe.ts (parseProcRecords/parsePsTree/parseProcessList) under CC 10 and pruned its 3 suppressions.
+// 75 -> 72: burndown refactored ledger.getNotes, paneOwnership.findPaneOwningProject, voiceApprovalRouting.resolvePendingActionByVoice under CC 10 and pruned their 1+1+1 suppressions.
+// 72 -> 66: burndown refactored actions/defs/layouts.applyLayout, dispatch/paneWrite.applyDispatchDecision, memory/pythonClient (createPythonSynthClient/onLine/spawnDaemon), orbital/station.deriveStations under CC 10 and pruned their 1+1+3+1 suppressions.
+// 66 -> 61: burndown refactored eventBus.effectForEvent, announcementBus.pruneAttentionQueue, memory/assembler.assembleBrief, voice/speakGate.shouldSpeak, liveTranscripts.extractTranscripts under CC 10 and pruned their 5 suppressions (1 each).
+// 61 -> 54: burndown refactored actions/defs/{orchestration,dispatch_group,panes_write}, dispatch/joinTracker, handoffFlow, liveGrounding, pendingApprovals under CC 10 and pruned their 7 suppressions (1 each).
+const RATCHET_CEILING = 54;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

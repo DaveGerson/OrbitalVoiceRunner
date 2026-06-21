@@ -21,9 +21,10 @@
  */
 
 import { z } from "zod";
-import type { ActionDef, ActionResult } from "../types";
+import type { ActionContext, ActionDef, ActionResult } from "../types";
+import type { OrchestrationRecipe } from "../types";
 import { presetCommand, normalizePreset } from "../../terminal";
-import { planRecipeApply } from "../../recipeApply";
+import { planRecipeApply, type RecipeApplyPlan } from "../../recipeApply";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // create_orchestrator_plan — server.ts:2925 (UNGATED pure ledger write)
@@ -225,6 +226,181 @@ const ApplyOrchestrationRecipeParams = z.object({
   recipe_id: z.string(),
 });
 
+/** The recipe-pane shape read out of the catalog (one element of OrchestrationRecipe.panes). */
+type RecipePane = OrchestrationRecipe["panes"][number];
+
+/** The three apply_orchestration_recipe outcome buckets, accumulated across the per-pane loop and
+ *  rendered into the spoken read-back. Extracted VERBATIM from the handler's inline arrays — same
+ *  semantics, same membership, same order of append. */
+interface RecipeApplyBuckets {
+  spawned: string[];
+  deferred: string[];
+  blocked: string[];
+}
+
+/**
+ * Build the per-pane spawn closure — VERBATIM extraction of the handler's inline `spawnPane`. It
+ * adds the terminal, records the (never-auto-run) startupCommand pane note, and broadcasts INSIDE so a
+ * deferred-confirm repaints. Returns the bare pane id (the kzt create_pane rebuild shape). The launch
+ * command + preset are passed in already-derived (single Wave-B home), so this helper does NOT re-derive.
+ */
+function makeSpawnPane(
+  ctx: ActionContext,
+  p: RecipePane,
+  activeProjectId: string,
+  cwd: string,
+  paneCommand: string,
+  panePreset: ReturnType<typeof normalizePreset>,
+): () => string {
+  return (): string => {
+    ctx.manager.addTerminal(
+      p.id,
+      cwd,
+      paneCommand,
+      panePreset,
+      p.permissionsMode as any,
+      "",
+      activeProjectId,
+    );
+    if (p.startupCommand) {
+      ctx.manager.ledger.addPaneNote(
+        activeProjectId,
+        p.id,
+        `Suggested startup command: ${p.startupCommand}`,
+      );
+    }
+    ctx.broadcastLedgerUpdate();
+    ctx.broadcast({ type: "terminals_updated" });
+    return p.id;
+  };
+}
+
+/**
+ * Apply ONE planned recipe pane — VERBATIM extraction of the per-pane body of the handler's loop. It
+ * derives the launch command (single Wave-B home), builds the spawn closure, and routes a `defer`
+ * disposition through ctx.gateOrDefer (forbidden -> blocked, deferred -> deferred, run -> spawn-now);
+ * a non-defer (Auto) disposition spawns now. Mutates the shared `buckets` exactly as the inline loop did.
+ */
+function applyRecipePane(
+  ctx: ActionContext,
+  planned: RecipeApplyPlan["panes"][number],
+  p: RecipePane,
+  recipe: OrchestrationRecipe,
+  activeProjectId: string,
+  cwd: string,
+  buckets: RecipeApplyBuckets,
+): void {
+  // KS (§5.4): launch DERIVED from the pane's preset via the SAME single home
+  // presetCommand(normalizePreset(...)). startupCommand stays an auditable note (never auto-run);
+  // broadcasts INSIDE so a deferred-confirm repaints.
+  const panePreset = normalizePreset(p.preset);
+  const paneCommand = presetCommand(
+    panePreset,
+    ctx.manager.settings.presets,
+    ctx.manager.settings.advanced?.defaultShellCommand,
+  );
+  const spawnPane = makeSpawnPane(ctx, p, activeProjectId, cwd, paneCommand, panePreset);
+  if (planned.disposition === "defer") {
+    // Route through gateOrDefer so the audit row + action_pending broadcast + pendingActions.add fire
+    // identically to REST. (The planner already classified Ask, so this stages.) kzt: same create_pane
+    // intent shape as the REST recipe path (origin:"recipe" -> rebuild returns the bare pane id) —
+    // keys in lockstep with src/actionEffects.ts buildActionRun create_pane case.
+    const g = ctx.gateOrDefer(
+      "create_pane",
+      p.id,
+      `Create pane ${p.id} (recipe ${recipe.id})`,
+      spawnPane,
+      {
+        // PLM3: stamp the version guard FIRST so a deferred voice-recipe create_pane survives a restart
+        // instead of being quarantined on boot (the 7th staging site). Spread first so the create_pane
+        // intent keys below always win on any collision (kzt lockstep).
+        ...(ctx.versionStamp ?? {}),
+        origin: "recipe",
+        paneId: p.id,
+        cwd,
+        command: paneCommand,
+        toolPreset: panePreset,
+        permissionsMode: p.permissionsMode,
+        startupCommand: p.startupCommand,
+        projectId: activeProjectId,
+      },
+    );
+    if (g.disposition === "forbidden") buckets.blocked.push(p.id);
+    else if (g.disposition === "deferred") buckets.deferred.push(p.id);
+    else {
+      spawnPane();
+      buckets.spawned.push(p.id);
+    }
+  } else {
+    // Auto -> spawn now.
+    spawnPane();
+    buckets.spawned.push(p.id);
+  }
+}
+
+/**
+ * Render the spoken read-back string — VERBATIM extraction of the handler's `resp = ...` assembly.
+ * Same clause order, same wording, same trailing ".".
+ */
+function renderRecipeResponse(recipe: OrchestrationRecipe, buckets: RecipeApplyBuckets): string {
+  return (
+    `Template recipe layout '${recipe.name}': spawned ${buckets.spawned.length} pane(s)` +
+    (buckets.deferred.length
+      ? `, ${buckets.deferred.length} awaiting your confirmation (create_pane=Ask: ${buckets.deferred.join(", ")})`
+      : "") +
+    (buckets.blocked.length
+      ? `, ${buckets.blocked.length} blocked by create_pane=Off (${buckets.blocked.join(", ")})`
+      : "") +
+    "."
+  );
+}
+
+/**
+ * Materialize the recipe layout — VERBATIM extraction of the handler's `recipe`-found body (the
+ * gateCapability audit row, planRecipeApply, the layout Off-veto, and the per-pane loop). Returns the
+ * ActionResult (kind:"blocked" on layout Off, else kind:"ok" with the narration). Keeping this off the
+ * handler is what brings the handler's cyclomatic complexity to <= 10.
+ */
+function materializeRecipe(
+  ctx: ActionContext,
+  recipe: OrchestrationRecipe,
+  activeProjectId: string,
+  cwd: string,
+): ActionResult {
+  // One gateCapability call for the layout-level `apply_recipe` audit row (the planner is pure and
+  // emits none); the veto is authoritative via plan.layoutForbidden. Return is ignored.
+  ctx.gateCapability("apply_recipe", null);
+  const plan = planRecipeApply(
+    recipe.panes,
+    new Set(Object.keys(ctx.manager.terminals)),
+    () => ctx.effectiveCapabilityGateFor(null, "apply_recipe"),
+    (id) => ctx.effectiveCapabilityGateFor(id, "create_pane"),
+  );
+  if (plan.layoutForbidden) {
+    // c55 Batch D — STATUS-VIA-KINDS: the layout-level apply_recipe Off-veto is a REFUSAL, so return
+    // kind:"blocked" (was a kind:"ok" string). resultToHttp maps blocked -> 403, which the REST client
+    // status-branches on for the refusal earcon (the inline twin emitted 403 too). The voice surface
+    // still narrates from the same kind (voiceResponse blocked -> { output: reason }), so the spoken
+    // refusal is byte-identical to the old ok-string. No toHttp hook needed.
+    return {
+      kind: "blocked",
+      reason: `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`,
+    };
+  }
+  const paneById = new Map(recipe.panes.map((p) => [p.id, p]));
+  const buckets: RecipeApplyBuckets = { spawned: [], deferred: [], blocked: [] };
+  for (const planned of plan.panes) {
+    if (planned.disposition === "skip-existing") continue;
+    if (planned.disposition === "block") {
+      buckets.blocked.push(planned.paneId);
+      continue;
+    }
+    const p = paneById.get(planned.paneId)!;
+    applyRecipePane(ctx, planned, p, recipe, activeProjectId, cwd, buckets);
+  }
+  return { kind: "ok", output: renderRecipeResponse(recipe, buckets) };
+}
+
 /**
  * apply_orchestration_recipe — FAITHFUL PORT of server.ts:2992-3071. Materializes a template layout
  * via the shared pure planner planRecipeApply + per-pane ctx.gateOrDefer("create_pane", …). Gating is
@@ -258,126 +434,20 @@ export const applyOrchestrationRecipe: ActionDef<typeof ApplyOrchestrationRecipe
     const { recipe_id } = args;
     const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
     const proj = ctx.manager.ledger.getProject(activeProjectId);
-    let resp = "";
     if (!proj) {
-      resp = "Error: There is no active project context synchronized to apply templates under.";
-    } else {
-      const recipe = ctx.recipes.find((r) => r.id === recipe_id);
-      if (!recipe) {
-        resp = `Error: Template recipe ${recipe_id} not found.`;
-      } else {
-        // One gateCapability call for the layout-level `apply_recipe` audit row (the planner is pure
-        // and emits none); the veto is authoritative via plan.layoutForbidden. Return is ignored.
-        ctx.gateCapability("apply_recipe", null);
-        const plan = planRecipeApply(
-          recipe.panes,
-          new Set(Object.keys(ctx.manager.terminals)),
-          () => ctx.effectiveCapabilityGateFor(null, "apply_recipe"),
-          (id) => ctx.effectiveCapabilityGateFor(id, "create_pane"),
-        );
-        if (plan.layoutForbidden) {
-          // c55 Batch D — STATUS-VIA-KINDS: the layout-level apply_recipe Off-veto is a REFUSAL, so
-          // return kind:"blocked" (was a kind:"ok" string). resultToHttp maps blocked -> 403, which the
-          // REST client status-branches on for the refusal earcon (the inline twin emitted 403 too). The
-          // voice surface still narrates from the same kind (voiceResponse blocked -> { output: reason }),
-          // so the spoken refusal is byte-identical to the old ok-string. No toHttp hook needed.
-          return {
-            kind: "blocked",
-            reason: `Error: the 'apply_recipe' capability is gated Off; spawning template layouts is forbidden by policy.`,
-          };
-        } else {
-          const paneById = new Map(recipe.panes.map((p) => [p.id, p]));
-          const spawned: string[] = [];
-          const deferred: string[] = [];
-          const blocked: string[] = [];
-          for (const planned of plan.panes) {
-            if (planned.disposition === "skip-existing") continue;
-            if (planned.disposition === "block") {
-              blocked.push(planned.paneId);
-              continue;
-            }
-            const p = paneById.get(planned.paneId)!;
-            // KS (§5.4): same spawn closure shape as REST, launch DERIVED from the pane's preset via
-            // the SAME single home presetCommand(normalizePreset(...)). startupCommand stays an
-            // auditable note (never auto-run); broadcasts INSIDE so a deferred-confirm repaints.
-            const panePreset = normalizePreset(p.preset);
-            const paneCommand = presetCommand(
-              panePreset,
-              ctx.manager.settings.presets,
-              ctx.manager.settings.advanced?.defaultShellCommand,
-            );
-            const spawnPane = (): string => {
-              ctx.manager.addTerminal(
-                p.id,
-                proj.directory || process.cwd(),
-                paneCommand,
-                panePreset,
-                p.permissionsMode as any,
-                "",
-                activeProjectId,
-              );
-              if (p.startupCommand) {
-                ctx.manager.ledger.addPaneNote(
-                  activeProjectId,
-                  p.id,
-                  `Suggested startup command: ${p.startupCommand}`,
-                );
-              }
-              ctx.broadcastLedgerUpdate();
-              ctx.broadcast({ type: "terminals_updated" });
-              return p.id;
-            };
-            if (planned.disposition === "defer") {
-              // Route through gateOrDefer so the audit row + action_pending broadcast +
-              // pendingActions.add fire identically to REST. (The planner already classified Ask, so
-              // this stages.) kzt: same create_pane intent shape as the REST recipe path
-              // (origin:"recipe" -> rebuild returns the bare pane id) — keys in lockstep with
-              // src/actionEffects.ts buildActionRun create_pane case.
-              const g = ctx.gateOrDefer(
-                "create_pane",
-                p.id,
-                `Create pane ${p.id} (recipe ${recipe.id})`,
-                spawnPane,
-                {
-                  // PLM3: stamp the version guard FIRST so a deferred voice-recipe create_pane survives
-                  // a restart instead of being quarantined on boot (the 7th staging site). Spread first
-                  // so the create_pane intent keys below always win on any collision (kzt lockstep).
-                  ...(ctx.versionStamp ?? {}),
-                  origin: "recipe",
-                  paneId: p.id,
-                  cwd: proj.directory || process.cwd(),
-                  command: paneCommand,
-                  toolPreset: panePreset,
-                  permissionsMode: p.permissionsMode,
-                  startupCommand: p.startupCommand,
-                  projectId: activeProjectId,
-                },
-              );
-              if (g.disposition === "forbidden") blocked.push(p.id);
-              else if (g.disposition === "deferred") deferred.push(p.id);
-              else {
-                spawnPane();
-                spawned.push(p.id);
-              }
-            } else {
-              // Auto -> spawn now.
-              spawnPane();
-              spawned.push(p.id);
-            }
-          }
-          resp =
-            `Template recipe layout '${recipe.name}': spawned ${spawned.length} pane(s)` +
-            (deferred.length
-              ? `, ${deferred.length} awaiting your confirmation (create_pane=Ask: ${deferred.join(", ")})`
-              : "") +
-            (blocked.length
-              ? `, ${blocked.length} blocked by create_pane=Off (${blocked.join(", ")})`
-              : "") +
-            ".";
-        }
-      }
+      return {
+        kind: "ok",
+        output: "Error: There is no active project context synchronized to apply templates under.",
+      };
     }
-    return { kind: "ok", output: resp };
+    const recipe = ctx.recipes.find((r) => r.id === recipe_id);
+    if (!recipe) {
+      return { kind: "ok", output: `Error: Template recipe ${recipe_id} not found.` };
+    }
+    // The recipe-found body (gateCapability audit + planRecipeApply + layout veto + per-pane loop) is
+    // extracted VERBATIM into materializeRecipe (semantics identical). cwd is resolved here exactly as
+    // the inline body did (`proj.directory || process.cwd()`) and threaded through.
+    return materializeRecipe(ctx, recipe, activeProjectId, proj.directory || process.cwd());
   },
 };
 

@@ -185,6 +185,46 @@ const CreatePaneParamsSchema = z
   });
 
 /**
+ * REST camelCase -> voice snake_case alias map for create_pane bodies. The UI POSTs a camelCase body
+ * { terminalId, projectId, toolPreset, permissionsMode, ... }; the voice schema keys are snake_case.
+ */
+const CREATE_PANE_CAMEL_TO_SNAKE: ReadonlyArray<readonly [string, string]> = [
+  ["terminalId", "pane_id"],
+  ["projectId", "project_id"],
+  ["toolPreset", "tool_preset"],
+  ["permissionsMode", "permissions_mode"],
+];
+
+/**
+ * VERBATIM extraction from createPane.coerceArgs (CC burndown — behavior-preserving). For each
+ * camel->snake pair: alias the camel value onto the snake key ONLY when the snake key is absent
+ * (== null), so a voice call carrying snake_case is never clobbered; then delete the camel key
+ * unconditionally. Mutates `out` in place — identical to the original sequential if/delete block.
+ */
+function aliasCreatePaneCamelKeys(out: Record<string, unknown>): void {
+  for (const [camel, snake] of CREATE_PANE_CAMEL_TO_SNAKE) {
+    if (out[snake] == null && out[camel] != null) out[snake] = out[camel];
+    delete out[camel];
+  }
+}
+
+/**
+ * VERBATIM extraction from createPane.coerceArgs (CC burndown — behavior-preserving). REST-only: a
+ * client `command` is dropped for a non-Custom preset (mirroring the inline route's ignore). Returns
+ * true ONLY when this is a REST shape AND tool_preset is a string AND a command is present AND the
+ * normalized preset is not Custom — the exact conjunction the original inline `if` evaluated.
+ */
+function shouldDropRestCommand(out: Record<string, unknown>, isRestShape: boolean): boolean {
+  const presetRaw = out.tool_preset;
+  return (
+    isRestShape &&
+    typeof presetRaw === "string" &&
+    out.command != null &&
+    normalizePreset(presetRaw) !== "Custom"
+  );
+}
+
+/**
  * create_pane — FAITHFUL PORT of the voice branch (server.ts:2849-2886). DETERMINISTIC launch:
  * tool_preset is the single source of truth. normalizePreset() collapses id/name/union onto the
  * addTerminal union; presetCommand() derives the launch command from the (normalized) preset using
@@ -233,22 +273,15 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   coerceArgs: (raw) => {
     const out = { ...raw };
     const isRestShape = out.terminalId != null || out.toolPreset != null;
-    if (out.pane_id == null && out.terminalId != null) out.pane_id = out.terminalId;
-    if (out.project_id == null && out.projectId != null) out.project_id = out.projectId;
-    if (out.tool_preset == null && out.toolPreset != null) out.tool_preset = out.toolPreset;
-    if (out.permissions_mode == null && out.permissionsMode != null) out.permissions_mode = out.permissionsMode;
-    delete out.terminalId;
-    delete out.projectId;
-    delete out.toolPreset;
-    delete out.permissionsMode;
+    // camel->snake aliasing (fills only absent snake keys) + camel-key deletion.
+    aliasCreatePaneCamelKeys(out);
     // cwd/sessionId are inline-only REST resolution inputs the registry def does not model — drop them so
     // they never reach the strict zod object (the def derives cwd from the project + ignores sessionId).
     delete out.cwd;
     delete out.sessionId;
     // REST-only: drop a command for a non-Custom preset (mirrors the inline ignore). Voice keeps it so
     // the superRefine rejects an agent-preset command (the §5.4 guardrail).
-    const presetRaw = out.tool_preset;
-    if (isRestShape && typeof presetRaw === "string" && out.command != null && normalizePreset(presetRaw) !== "Custom") {
+    if (shouldDropRestCommand(out, isRestShape)) {
       delete out.command;
     }
     return out;

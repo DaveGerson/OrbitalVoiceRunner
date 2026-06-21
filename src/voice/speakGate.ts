@@ -109,6 +109,53 @@ function containsPhrase(s: string, phrase: string): boolean {
 }
 
 /**
+ * Rule 3 — ADDRESSED-TO-JANUS: name anywhere, leading second-person verb, or a request phrase.
+ * Returns a SPEAK decision on any hit, or null to fall through. Verbatim from the inline rule.
+ */
+function addressedDecision(norm: string, tokens: string[], first: string): SpeakDecision | null {
+  if (tokens.some((t) => ADDRESS_NAME.has(t))) return SPEAK("addressed_janus_name", 1);
+  const phrase = startsWithAny(norm, ADDRESS_PHRASES) ?? ADDRESS_PHRASES.find((p) => containsPhrase(norm, p));
+  if (phrase) return SPEAK(`addressed_phrase:${phrase}`, 0.9);
+  if (ADDRESS_VERBS.has(first)) return SPEAK(`addressed_verb:${first}`, 0.85);
+  return null;
+}
+
+/**
+ * Rule 4 — IMPERATIVE / emergency-brake: never mute a command. Returns a SPEAK decision on any hit,
+ * or null to fall through. Order (leading imperative -> emergency brake anywhere -> embedded
+ * imperative) is verbatim from the inline rule and load-bearing.
+ */
+function imperativeDecision(tokens: string[], first: string): SpeakDecision | null {
+  if (IMPERATIVE_VERBS.has(first)) return SPEAK(`imperative:${first}`, 0.9);
+  if (tokens.some((t) => EMERGENCY_BRAKES.has(t))) return SPEAK("emergency_brake", 1);
+  const embeddedImperative = tokens.find((t) => IMPERATIVE_VERBS.has(t));
+  if (embeddedImperative) return SPEAK(`imperative_embedded:${embeddedImperative}`, 0.8);
+  return null;
+}
+
+/**
+ * Rule 5 — THINKING-ALOUD: the ONLY mute path, gated on HIGH confidence. Requires a leading musing
+ * marker; deliberation words raise confidence. Returns the MUTE/low-conf-SPEAK decision when a leader
+ * is present, or null (no marker) so the caller falls through to the default. Verbatim confidence math.
+ */
+function thinkingAloudDecision(norm: string, tokens: string[]): SpeakDecision | null {
+  const leader = startsWithAny(norm, THINKING_LEADERS);
+  if (!leader) return null;
+  const deliberationHits = tokens.filter((t) => DELIBERATION_WORDS.has(t)).length;
+  // Base confidence from the leader; each deliberation word nudges it up. A bare "hmm" alone
+  // (no further signal) stays just under the bar so a terse grunt before a real request never mutes.
+  const strongLeader = leader.length > 3; // multi-word leaders ("so im thinking", "wait no") are strong
+  let confidence = strongLeader ? 0.8 : 0.6;
+  confidence = Math.min(1, confidence + deliberationHits * 0.1);
+  // Very short utterances (<= 2 tokens) are too thin to confidently call thinking-aloud — fail open.
+  if (tokens.length >= 3 && confidence >= 0.7) {
+    return MUTE(`thinking_aloud:${leader}`, confidence);
+  }
+  // Marker present but not high-confidence -> fail open (speak).
+  return SPEAK(`thinking_aloud_low_conf:${leader}`, confidence);
+}
+
+/**
  * shouldSpeak — the pure decision. Order is load-bearing (each rule can only ADD a reason to speak;
  * the single mute path is last and gated on HIGH confidence):
  *   1. flag OFF                      => speak (hard short-circuit; no heuristic runs).
@@ -130,38 +177,21 @@ export function shouldSpeak(transcript: string, opts: SpeakGateOpts): SpeakDecis
   const first = tokens[0] ?? "";
 
   // 3. ADDRESSED-TO-JANUS — name anywhere, leading second-person verb, or a request phrase. SPEAK.
-  if (tokens.some((t) => ADDRESS_NAME.has(t))) return SPEAK("addressed_janus_name", 1);
-  const phrase = startsWithAny(norm, ADDRESS_PHRASES) ?? ADDRESS_PHRASES.find((p) => containsPhrase(norm, p));
-  if (phrase) return SPEAK(`addressed_phrase:${phrase}`, 0.9);
-  if (ADDRESS_VERBS.has(first)) return SPEAK(`addressed_verb:${first}`, 0.85);
+  const addressed = addressedDecision(norm, tokens, first);
+  if (addressed) return addressed;
 
   // 4. IMPERATIVE / emergency-brake — never mute a command. SPEAK.
   //    A leading action verb is the canonical imperative ("run the tests"). But a command embedded
   //    after a musing leader ("so im thinking, run the tests now") is STILL a command — so any
   //    imperative or emergency-brake ANYWHERE forces SPEAK. This makes the mute path safe by
   //    construction: it can only be reached when NO command token is present (fail-safe toward speak).
-  if (IMPERATIVE_VERBS.has(first)) return SPEAK(`imperative:${first}`, 0.9);
-  if (tokens.some((t) => EMERGENCY_BRAKES.has(t))) return SPEAK("emergency_brake", 1);
-  const embeddedImperative = tokens.find((t) => IMPERATIVE_VERBS.has(t));
-  if (embeddedImperative) return SPEAK(`imperative_embedded:${embeddedImperative}`, 0.8);
+  const imperative = imperativeDecision(tokens, first);
+  if (imperative) return imperative;
 
   // 5. THINKING-ALOUD — the ONLY mute path, gated on HIGH confidence. Requires a leading musing
   //    marker; deliberation words raise confidence. Address/imperative already excluded above.
-  const leader = startsWithAny(norm, THINKING_LEADERS);
-  if (leader) {
-    const deliberationHits = tokens.filter((t) => DELIBERATION_WORDS.has(t)).length;
-    // Base confidence from the leader; each deliberation word nudges it up. A bare "hmm" alone
-    // (no further signal) stays just under the bar so a terse grunt before a real request never mutes.
-    const strongLeader = leader.length > 3; // multi-word leaders ("so im thinking", "wait no") are strong
-    let confidence = strongLeader ? 0.8 : 0.6;
-    confidence = Math.min(1, confidence + deliberationHits * 0.1);
-    // Very short utterances (<= 2 tokens) are too thin to confidently call thinking-aloud — fail open.
-    if (tokens.length >= 3 && confidence >= 0.7) {
-      return MUTE(`thinking_aloud:${leader}`, confidence);
-    }
-    // Marker present but not high-confidence -> fail open (speak).
-    return SPEAK(`thinking_aloud_low_conf:${leader}`, confidence);
-  }
+  const thinkingAloud = thinkingAloudDecision(norm, tokens);
+  if (thinkingAloud) return thinkingAloud;
 
   // 6. Default — fail open. Statements with no address, no imperative, no musing marker SPEAK.
   return SPEAK("default_fail_open", 0.5);

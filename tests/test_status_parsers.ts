@@ -75,6 +75,17 @@ describe("statusProbe pure parsers", () => {
       assert.strictEqual(parseProcTree(nodeRoot, 100), true, "node agent root also reads busy");
     });
 
+    it("skips malformed /proc lines lacking the (comm) parentheses", () => {
+      // A line with no parens (or junk) must be dropped, not crash the parse; a
+      // valid resting shell alongside it still reads idle.
+      const withGarbage = [
+        "garbage line with no parens",
+        "   ",
+        "100 (sh) S 50 100 100 34816 100 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0",
+      ];
+      assert.strictEqual(parseProcTree(withGarbage, 100), false);
+    });
+
     it("handles comm names containing spaces and parentheses", () => {
       const tricky = [
         "100 (sh) S 50 100 100 34816 100 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0",
@@ -113,6 +124,19 @@ describe("statusProbe pure parsers", () => {
     it("is busy-biased when no foreground shell exists", () => {
       const onlyCmd = ["  100   50 Ss   /bin/sh", "  303  100 R+   make"].join("\n");
       assert.strictEqual(parsePsTree(onlyCmd, 100), true);
+    });
+
+    it("no-comm fallback: a non-root foreground descendant ⇒ busy", () => {
+      // When `ps` yields no comm column at all, the parser cannot identify a shell
+      // and falls back to "any foreground descendant other than the root ⇒ busy".
+      const noCommBusy = ["100 50 Ss", "200 100 R+"].join("\n");
+      assert.strictEqual(parsePsTree(noCommBusy, 100), true);
+    });
+
+    it("no-comm fallback: only the root in foreground ⇒ idle", () => {
+      // No comm column, and the only foreground process is the root itself ⇒ idle.
+      const noCommIdle = "100 50 Ss+";
+      assert.strictEqual(parsePsTree(noCommIdle, 100), false);
     });
   });
 

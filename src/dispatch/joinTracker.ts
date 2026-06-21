@@ -97,21 +97,37 @@ export class DispatchJoinTracker {
     const newlyCompleted: DispatchGroup[] = [];
     for (const g of this.groups) {
       if (g.completed) continue;
-      let touched = false;
-      for (const m of g.members) {
-        if (m.paneId === paneId && m.status === "running") {
-          m.status = settled;
-          if (settled === "error") m.detail = `pane ${transition}`;
-          touched = true;
-        }
-      }
-      if (touched && g.members.every((m) => m.status !== "staged" && m.status !== "running")) {
+      const touched = this.settleGroupMembers(g, paneId, transition, settled);
+      if (touched && this.settledAtDispatch(g)) {
         g.completed = true;
         g.completedAt = now;
         newlyCompleted.push(g);
       }
     }
     return newlyCompleted;
+  }
+
+  /**
+   * Settle every running member of `group` on `paneId` to `settled` (error members also get the
+   * pane-edge detail). Returns whether any member was touched. Verbatim extraction of the inner
+   * settle loop from noteTransition — semantics IDENTICAL (including the `every` completion check,
+   * which settledAtDispatch already expresses).
+   */
+  private settleGroupMembers(
+    group: DispatchGroup,
+    paneId: string,
+    transition: "idle" | "error" | "build-failed" | "exited",
+    settled: DispatchMemberStatus
+  ): boolean {
+    let touched = false;
+    for (const m of group.members) {
+      if (m.paneId === paneId && m.status === "running") {
+        m.status = settled;
+        if (settled === "error") m.detail = `pane ${transition}`;
+        touched = true;
+      }
+    }
+    return touched;
   }
 
   /** True when the group settled entirely at dispatch time (nothing staged/running to join on). */

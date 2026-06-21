@@ -53,29 +53,43 @@ export function pruneAttentionQueue(
   const ttlMs = opts.ttlMs ?? ATTENTION_TTL_MS;
   const dismissedTtlMs = opts.dismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS;
 
-  // An unparseable/NaN timestamp is treated as infinitely old (stale) so it always evicts
-  // — `new Date("x").getTime()` is NaN and `NaN > ttl` is false, which previously pinned
-  // such items forever.
-  const ageOf = (it: AttentionItem) => {
-    const t = new Date(it.timestamp).getTime();
-    return Number.isNaN(t) ? Infinity : now - t;
-  };
+  evictExpiredAttentionItems(queue, now, ttlMs, dismissedTtlMs);
+  evictAttentionItemsOverCap(queue, cap);
+  return queue;
+}
 
-  // TTL eviction (in place).
+/** Age of an attention item in ms. An unparseable/NaN timestamp is treated as infinitely
+ *  old (stale) so it always evicts — `new Date("x").getTime()` is NaN and `NaN > ttl` is
+ *  false, which previously pinned such items forever. */
+function attentionItemAge(it: AttentionItem, now: number): number {
+  const t = new Date(it.timestamp).getTime();
+  return Number.isNaN(t) ? Infinity : now - t;
+}
+
+/** TTL eviction (in place): drop active items older than `ttlMs`, and dismissed items
+ *  older than `dismissedTtlMs`. */
+function evictExpiredAttentionItems(
+  queue: AttentionItem[],
+  now: number,
+  ttlMs: number,
+  dismissedTtlMs: number
+): void {
   for (let i = queue.length - 1; i >= 0; i--) {
-    const age = ageOf(queue[i]);
+    const age = attentionItemAge(queue[i], now);
     if (age > ttlMs || (queue[i].dismissed && age > dismissedTtlMs)) {
       queue.splice(i, 1);
     }
   }
+}
 
-  // Cap eviction: drop oldest dismissed first, then oldest overall.
+/** Cap eviction (in place): while over `cap`, drop the oldest DISMISSED first, then the
+ *  oldest overall. */
+function evictAttentionItemsOverCap(queue: AttentionItem[], cap: number): void {
   while (queue.length > cap) {
     let idx = queue.findIndex((it) => it.dismissed);
     if (idx === -1) idx = 0; // no dismissed -> oldest overall
     queue.splice(idx, 1);
   }
-  return queue;
 }
 
 export interface AnnouncementItem {
