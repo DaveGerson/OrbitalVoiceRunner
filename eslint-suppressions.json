@@ -1,9 +1,4 @@
 {
-  "server.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/App.tsx": {
     "complexity": {
       "count": 11
@@ -21,16 +16,6 @@
   },
   "src/e2e/harness.ts": {
     "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/orbital/OrbitalApp.tsx": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/orbital/StationCard.tsx": {
-    "complexity": {
       "count": 1
     }
   },
