@@ -1,14 +1,4 @@
 {
-  "src/App.tsx": {
-    "complexity": {
-      "count": 11
-    }
-  },
-  "src/components/SettingsDialog.tsx": {
-    "complexity": {
-      "count": 7
-    }
-  },
   "src/components/TerminalView.tsx": {
     "react-hooks/exhaustive-deps": {
       "count": 1
@@ -27,9 +17,6 @@
   "src/orbital/useOrbitalData.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 3
-    },
-    "complexity": {
-      "count": 7
     }
   }
 }
