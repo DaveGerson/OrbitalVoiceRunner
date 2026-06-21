@@ -12,11 +12,46 @@ let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? "✓" : "✗"} ${label}`); if (!cond) failures++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Returns true when the GET / response looks like the built app shell. Pure (no side effects). */
+export function isValidAppShell(status, html) {
+  return status === 200 && /<div id="root">/.test(html) && /assets\/index-.*\.js/.test(html);
+}
+
+/**
+ * Given the raw /api/actions/pending array, return the best-match create_pane action for paneId.
+ * Prefers an exact summary match so stale actions from a reused server are skipped; falls back to
+ * any create_pane action. Returns undefined when pending is not an array. Pure (no side effects).
+ */
+export function findOurPendingAction(pending, paneId) {
+  if (!Array.isArray(pending)) return undefined;
+  return (
+    pending.find((a) => a.capability === "create_pane" && (a.summary || "").includes(paneId)) ||
+    pending.find((a) => a.capability === "create_pane")
+  );
+}
+
+/**
+ * Reduce a frames array to a { [type]: count } histogram. Pure (no side effects).
+ */
+export function buildFrameHistogram(frames) {
+  const hist = {};
+  for (const f of frames) hist[f.type] = (hist[f.type] || 0) + 1;
+  return hist;
+}
+
+/**
+ * Returns true when the pane record's backfill/output text contains the live marker.
+ * Guards against non-object found values. Pure (no side effects).
+ */
+export function paneHasMarker(found) {
+  return typeof found === "object" && found !== null && /ORBITAL_LIVE_/.test((found.backfill || "") + (found.output || ""));
+}
+
 async function main() {
   // 1) the built app is served
   const root = await fetch(`${BASE}/`);
   const html = await root.text();
-  ok(root.status === 200 && /<div id="root">/.test(html) && /assets\/index-.*\.js/.test(html), "GET / serves the built app shell");
+  ok(isValidAppShell(root.status, html), "GET / serves the built app shell");
 
   // 2) REST reads the kitchen boots from
   for (const path of ["/api/terminals", "/api/ledger", "/api/settings"]) {
@@ -47,7 +82,7 @@ async function main() {
     await sleep(400);
     const pending = await (await fetch(`${BASE}/api/actions/pending`, { headers: H })).json();
     // Match OUR action by the pane id in its summary (stale actions can linger on a reused server).
-    const act = Array.isArray(pending) && (pending.find((a) => a.capability === "create_pane" && (a.summary || "").includes(paneId)) || pending.find((a) => a.capability === "create_pane"));
+    const act = findOurPendingAction(pending, paneId);
     ok(!!act, "gated create_pane queued a pending action");
     if (act) {
       const conf = await fetch(`${BASE}/api/actions/${act.id}/confirm`, { method: "POST", headers: H });
@@ -63,7 +98,7 @@ async function main() {
   const found = Array.isArray(term) && term.find((t) => t.id === paneId);
   ok(!!found, "spawned pane appears in GET /api/terminals");
   ok(sawType("terminals_updated") || sawType("pane_status"), `observe socket received board frames (${[...new Set(frames.map((f) => f.type))].join(",") || "none"})`);
-  const hist = {}; for (const f of frames) hist[f.type] = (hist[f.type] || 0) + 1;
+  const hist = buildFrameHistogram(frames);
   console.log("  [diag] frames:", JSON.stringify(hist), "| total", frames.length);
   const stdoutFrames = frames.filter((f) => f.type === "stdout_chunk");
   console.log("  [diag] stdout panes:", JSON.stringify([...new Set(stdoutFrames.map((f) => f.terminalId))]));
@@ -72,7 +107,7 @@ async function main() {
   // primary live-burner proof: real PTY stdout reached the mic-free observe socket, live, with our text
   ok(streamed.includes("ORBITAL_LIVE_"), `observe socket streamed live PTY stdout incl. marker (${streamed.length} bytes)`);
   // ...and the command actually ran (its marker is in the pane's output/backfill the burner seeds from)
-  ok(typeof found === "object" && found && /ORBITAL_LIVE_/.test((found.backfill || "") + (found.output || "")), "pane backfill/output carries the live marker (command ran)");
+  ok(paneHasMarker(found), "pane backfill/output carries the live marker (command ran)");
 
   // 6) clean up the pane
   await fetch(`${BASE}/api/terminals/${paneId}`, { method: "DELETE", headers: H }).catch(() => {});

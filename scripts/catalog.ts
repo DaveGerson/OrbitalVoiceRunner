@@ -80,6 +80,70 @@ function actionsTable(actions: ActionDef[]): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Render helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Bucket every action in REGISTRY under its declared capability key.
+ * The ALWAYS_ALLOWED sentinel ends up as its own bucket alongside gated ones.
+ */
+function buildCapabilityBuckets(): Map<string, ActionDef[]> {
+  const byCapability = new Map<string, ActionDef[]>();
+  for (const a of REGISTRY) {
+    const key = a.capability;
+    const arr = byCapability.get(key) ?? [];
+    arr.push(a);
+    byCapability.set(key, arr);
+  }
+  return byCapability;
+}
+
+/**
+ * Render the markdown section for a single gated capability (heading + meta + actions table).
+ * Returns the lines to push, already terminated with a trailing empty string.
+ */
+function renderCapabilitySection(capId: string, byCapability: Map<string, ActionDef[]>): string[] {
+  const def: CapabilityDef | undefined = CAPABILITY_DEF_BY_ID.get(capId);
+  const actions = (byCapability.get(capId) ?? []).slice().sort(byName);
+  const label = def ? def.label : capId;
+  const gate = def ? def.defaultGate : "(unknown)";
+  const category = def ? def.category : "(uncategorized)";
+  const spotlight = def?.spotlightEligible ? " · spotlight-eligible" : "";
+  return [
+    `## ${label}`,
+    "",
+    `- **Capability:** \`${capId}\``,
+    `- **Default gate:** ${gate}${spotlight}`,
+    `- **Category:** ${category}`,
+    "",
+    actionsTable(actions),
+    "",
+  ];
+}
+
+/**
+ * Render the appendix section listing capability definitions that have no actions wired yet.
+ * Returns an empty array when there are no unwired defs (no section emitted).
+ */
+function renderUnwiredAppendix(unwiredDefs: CapabilityDef[]): string[] {
+  if (unwiredDefs.length === 0) return [];
+  const rows = unwiredDefs.map(
+    (d) => `| \`${d.id}\` | ${d.label} | ${d.defaultGate} | ${d.category} |`
+  );
+  return [
+    "## Capabilities without actions (matrix-only)",
+    "",
+    "These capability rows exist in the matrix (so they are tunable and reserved) but have no action " +
+      "wired to them in the current registry.",
+    "",
+    "| Capability | Label | Default gate | Category |",
+    "| --- | --- | --- | --- |",
+    ...rows,
+    "",
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Render
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -88,16 +152,7 @@ function actionsTable(actions: ActionDef[]): string {
  * byte-identical output, no clock/random. Trailing newline included.
  */
 export function renderCatalog(): string {
-  // Bucket every action under the capability it DECLARES (action.capability). The ALWAYS_ALLOWED
-  // sentinel is its own group (the emergency brake + any other always-allowed action, e.g.
-  // deliver_handoff which gates internally via dispatchProposal).
-  const byCapability = new Map<string, ActionDef[]>();
-  for (const a of REGISTRY) {
-    const key = a.capability;
-    const arr = byCapability.get(key) ?? [];
-    arr.push(a);
-    byCapability.set(key, arr);
-  }
+  const byCapability = buildCapabilityBuckets();
 
   // Capabilities that actually have wired actions, excluding ALWAYS_ALLOWED, sorted by id.
   const wiredCapabilityIds = [...byCapability.keys()]
@@ -153,39 +208,11 @@ export function renderCatalog(): string {
 
   // ── One section per wired capability, sorted by id ──
   for (const capId of wiredCapabilityIds) {
-    const def: CapabilityDef | undefined = CAPABILITY_DEF_BY_ID.get(capId);
-    const actions = (byCapability.get(capId) ?? []).slice().sort(byName);
-    const label = def ? def.label : capId;
-    const gate = def ? def.defaultGate : "(unknown)";
-    const category = def ? def.category : "(uncategorized)";
-    const spotlight = def?.spotlightEligible ? " · spotlight-eligible" : "";
-
-    out.push(`## ${label}`);
-    out.push("");
-    out.push(`- **Capability:** \`${capId}\``);
-    out.push(`- **Default gate:** ${gate}${spotlight}`);
-    out.push(`- **Category:** ${category}`);
-    out.push("");
-    out.push(actionsTable(actions));
-    out.push("");
+    out.push(...renderCapabilitySection(capId, byCapability));
   }
 
   // ── Appendix: matrix capabilities with no action wired yet ──
-  if (unwiredDefs.length > 0) {
-    out.push("## Capabilities without actions (matrix-only)");
-    out.push("");
-    out.push(
-      "These capability rows exist in the matrix (so they are tunable and reserved) but have no action " +
-        "wired to them in the current registry."
-    );
-    out.push("");
-    out.push("| Capability | Label | Default gate | Category |");
-    out.push("| --- | --- | --- | --- |");
-    for (const d of unwiredDefs) {
-      out.push(`| \`${d.id}\` | ${d.label} | ${d.defaultGate} | ${d.category} |`);
-    }
-    out.push("");
-  }
+  out.push(...renderUnwiredAppendix(unwiredDefs));
 
   // Single trailing newline, no others.
   return out.join("\n").replace(/\n+$/, "\n");

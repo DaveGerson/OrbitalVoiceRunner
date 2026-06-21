@@ -27,9 +27,10 @@
 // is unavailable, but tsx is a devDependency so it is normally present.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { hostname, userInfo } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const ENV_MODE = "JANUS_WT_LOCK";
 const ENV_STALE = "JANUS_WT_LOCK_STALE_MS";
@@ -116,20 +117,17 @@ function holderLabel() {
   return user ? `${user}@${hostname()}` : hostname();
 }
 
-async function main() {
-  const argv = process.argv.slice(2);
-  const cmd = argv.find((a) => !a.startsWith("-")) ?? "check";
-  const force = argv.includes("--force") || argv.includes("-f");
-
-  const logic = await loadLogic();
-  const ctx = discoverContext();
-
-  // If logic failed to load, we can still service release/status structurally,
-  // and `check` simply fails open.
+// Derive mode, staleMs, and lockPath from logic + env in one place.
+// Extracted from main() to reduce its cyclomatic complexity. Exported for unit
+// tests (the run-as-script guard at the bottom keeps importing this side-effect-free).
+export function resolveConfig(logic, ctx) {
   const mode = logic ? logic.parseMode(process.env[ENV_MODE]) : "advisory";
+
+  const envStale = process.env[ENV_STALE];
+  const envStaleNum = envStale ? Number(envStale) : NaN;
   const staleMs =
-    logic && process.env[ENV_STALE] && Number.isFinite(Number(process.env[ENV_STALE]))
-      ? Number(process.env[ENV_STALE])
+    logic && Number.isFinite(envStaleNum)
+      ? envStaleNum
       : logic
         ? logic.DEFAULT_STALE_MS
         : 2 * 60 * 60 * 1000;
@@ -137,16 +135,12 @@ async function main() {
   const lockDir = join(ctx.commonDir, LOCK_DIRNAME);
   const fileName = logic ? logic.lockFileName(ctx.branch) : `${sanitize(ctx.branch)}.lock.json`;
   const lockPath = join(lockDir, fileName);
+  return { mode, staleMs, lockDir, lockPath };
+}
 
-  const self = {
-    worktree: ctx.worktree,
-    session: sessionId(),
-    branch: ctx.branch,
-    holder: holderLabel(),
-  };
-
-  const existing = readLock(lockPath, logic);
-
+// Dispatch parsed argv to the appropriate subcommand handler.
+// Extracted from main() to reduce its cyclomatic complexity.
+function dispatch(cmd, { existing, self, ctx, force, mode, staleMs, lockPath, lockDir, logic }) {
   switch (cmd) {
     case "status":
       return doStatus(existing, ctx, mode, lockPath);
@@ -160,6 +154,30 @@ async function main() {
     default:
       return doCheck({ existing, self, mode, staleMs, lockPath, lockDir, logic });
   }
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const cmd = argv.find((a) => !a.startsWith("-")) ?? "check";
+  const force = argv.includes("--force") || argv.includes("-f");
+
+  const logic = await loadLogic();
+  const ctx = discoverContext();
+
+  // If logic failed to load, we can still service release/status structurally,
+  // and `check` simply fails open.
+  const { mode, staleMs, lockDir, lockPath } = resolveConfig(logic, ctx);
+
+  const self = {
+    worktree: ctx.worktree,
+    session: sessionId(),
+    branch: ctx.branch,
+    holder: holderLabel(),
+  };
+
+  const existing = readLock(lockPath, logic);
+
+  return dispatch(cmd, { existing, self, ctx, force, mode, staleMs, lockPath, lockDir, logic });
 }
 
 function sanitize(branch) {
@@ -266,10 +284,24 @@ function doCheck({ existing, self, mode, staleMs, lockPath, lockDir, logic }) {
   }
 }
 
-main()
-  .then((code) => process.exit(typeof code === "number" ? code : 0))
-  .catch((e) => {
-    // Absolute last-resort guard: ANY uncaught error fails open.
-    warn(`unexpected error (${e?.message ?? e}); allowing commit (fail open).`);
-    process.exit(0);
-  });
+// Run main() only when invoked as a script (so importing this module for unit
+// tests is side-effect-free). FAIL-SAFE: if we cannot positively determine that
+// we were imported (any path-resolution error), we DEFAULT TO RUNNING — the hook
+// must never silently no-op because of a guard bug.
+function isRunAsScript() {
+  try {
+    return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return true;
+  }
+}
+
+if (isRunAsScript()) {
+  main()
+    .then((code) => process.exit(typeof code === "number" ? code : 0))
+    .catch((e) => {
+      // Absolute last-resort guard: ANY uncaught error fails open.
+      warn(`unexpected error (${e?.message ?? e}); allowing commit (fail open).`);
+      process.exit(0);
+    });
+}
