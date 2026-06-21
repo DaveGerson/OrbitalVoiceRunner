@@ -33,32 +33,61 @@
 import type { OrchestratorManager } from "./terminal";
 import type { PaneMeta } from "./types";
 
-export function findPaneOwningProject(
-  manager: Pick<OrchestratorManager, "terminals" | "ledger">,
-  paneId: string,
-): { projectId: string; pane: PaneMeta } | null {
+type Manager = Pick<OrchestratorManager, "terminals" | "ledger">;
+type Owned = { projectId: string; pane: PaneMeta };
+
+/** Tier 1: LIVE pane — manager.terminals[paneId].projectId → ledger.getProject → panes[paneId]. */
+function resolveLivePane(manager: Manager, paneId: string): Owned | null {
   const liveProjectId = manager.terminals[paneId]?.projectId;
-  if (liveProjectId) {
-    const pane = manager.ledger.getProject?.(liveProjectId)?.panes?.[paneId];
-    if (pane) return { projectId: liveProjectId, pane };
-  }
+  if (!liveProjectId) return null;
+  const pane = manager.ledger.getProject?.(liveProjectId)?.panes?.[paneId];
+  return pane ? { projectId: liveProjectId, pane } : null;
+}
+
+/** Tier 2: the active project — ledger.getActiveProject() → panes[paneId]. */
+function resolveActiveProjectPane(manager: Manager, paneId: string): Owned | null {
   const active = manager.ledger.getActiveProject?.();
   const activePane = active?.panes?.[paneId];
-  if (active && activePane) return { projectId: active.id, pane: activePane };
-  // Tier 3 (bd #69): targeted owner lookup, then fetch just that one project. Falls back to scanning
-  // ledger.workspaces only when getProjectIdForPane is absent (partial structural test fakes).
+  return active && activePane ? { projectId: active.id, pane: activePane } : null;
+}
+
+/**
+ * Tier 3 (bd #69): targeted owner lookup, then fetch just that one project. When present this is
+ * AUTHORITATIVE — it never falls back to the workspace scan (returns null on miss). Returns
+ * `undefined` ONLY when getProjectIdForPane is absent, signalling the caller to scan workspaces.
+ */
+function resolveTargetedOwner(manager: Manager, paneId: string): Owned | null | undefined {
   const getOwnerId = manager.ledger.getProjectIdForPane;
-  if (typeof getOwnerId === "function") {
-    const ownerId = getOwnerId.call(manager.ledger, paneId);
-    if (ownerId) {
-      const pane = manager.ledger.getProject?.(ownerId)?.panes?.[paneId];
-      if (pane) return { projectId: ownerId, pane };
-    }
-    return null;
+  if (typeof getOwnerId !== "function") return undefined;
+  const ownerId = getOwnerId.call(manager.ledger, paneId);
+  if (ownerId) {
+    const pane = manager.ledger.getProject?.(ownerId)?.panes?.[paneId];
+    if (pane) return { projectId: ownerId, pane };
   }
+  return null;
+}
+
+/** Tier 4: fallback workspace scan — FIRST match across ledger.workspaces wins. */
+function resolveByWorkspaceScan(manager: Manager, paneId: string): Owned | null {
   for (const ws of Object.values(manager.ledger.workspaces ?? {})) {
     const pane = ws?.panes?.[paneId];
     if (pane) return { projectId: ws.id, pane };
   }
   return null;
+}
+
+export function findPaneOwningProject(
+  manager: Manager,
+  paneId: string,
+): Owned | null {
+  const live = resolveLivePane(manager, paneId);
+  if (live) return live;
+  const active = resolveActiveProjectPane(manager, paneId);
+  if (active) return active;
+  // Tier 3 (bd #69): targeted owner lookup. `undefined` => getProjectIdForPane absent, so fall back
+  // to scanning ledger.workspaces (partial structural test fakes). Any non-undefined result (a hit
+  // OR an authoritative null) short-circuits — the targeted path never consults the scan.
+  const targeted = resolveTargetedOwner(manager, paneId);
+  if (targeted !== undefined) return targeted;
+  return resolveByWorkspaceScan(manager, paneId);
 }

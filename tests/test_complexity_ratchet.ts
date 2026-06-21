@@ -36,7 +36,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 99 -> 87: burndown refactored approvalIntent/actionEffects/observe under CC 10 and pruned their 5+3+4 suppressions.
 // 87 -> 78: burndown refactored actions registry (handoff/locks/reads/gemini) under CC 10 and pruned their 3+2+2+2 suppressions.
 // 78 -> 75: burndown refactored src/statusProbe.ts (parseProcRecords/parsePsTree/parseProcessList) under CC 10 and pruned its 3 suppressions.
-const RATCHET_CEILING = 75;
+// 75 -> 72: burndown refactored ledger.getNotes, paneOwnership.findPaneOwningProject, voiceApprovalRouting.resolvePendingActionByVoice under CC 10 and pruned their 1+1+1 suppressions.
+const RATCHET_CEILING = 72;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

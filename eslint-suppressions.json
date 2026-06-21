@@ -112,11 +112,6 @@
       "count": 1
     }
   },
-  "src/ledger.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/liveGrounding.ts": {
     "complexity": {
       "count": 1
@@ -203,11 +198,6 @@
       "count": 3
     }
   },
-  "src/paneOwnership.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/pendingApprovals.ts": {
     "complexity": {
       "count": 1
@@ -219,11 +209,6 @@
     }
   },
   "src/voice/speakGate.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/voiceApprovalRouting.ts": {
     "complexity": {
       "count": 1
     }

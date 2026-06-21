@@ -368,19 +368,28 @@ export class Ledger {
     return paneId ? ws.panes[paneId]?.notes : ws.notes;
   }
 
-  getNotes(filter: { projectId?: string; paneId?: string; type?: string } = {}): StoredNote[] {
+  // Collect the legacy synthetic-id rows for a single workspace, honoring the pane-id filter.
+  // When `paneId` is set the project-level (pane_id=null) notes are skipped and only the matching
+  // pane contributes; otherwise project-level notes plus every pane's notes are emitted.
+  private collectWorkspaceNotes(pid: string, paneId: string | undefined): StoredNote[] {
+    const ws = this.workspaces[pid];
+    if (!ws) return [];
     const rows: StoredNote[] = [];
+    if (!paneId) {
+      (ws.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, null, i, text)));
+    }
+    for (const pane of Object.values(ws.panes)) {
+      if (paneId && pane.pane_id !== paneId) continue;
+      (pane.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, pane.pane_id, i, text)));
+    }
+    return rows;
+  }
+
+  getNotes(filter: { projectId?: string; paneId?: string; type?: string } = {}): StoredNote[] {
     const projectIds = filter.projectId ? [filter.projectId] : Object.keys(this.workspaces);
+    let rows: StoredNote[] = [];
     for (const pid of projectIds) {
-      const ws = this.workspaces[pid];
-      if (!ws) continue;
-      if (!filter.paneId) {
-        (ws.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, null, i, text)));
-      }
-      for (const pane of Object.values(ws.panes)) {
-        if (filter.paneId && pane.pane_id !== filter.paneId) continue;
-        (pane.notes ?? []).forEach((text, i) => rows.push(this.legacyNoteRow(pid, pane.pane_id, i, text)));
-      }
+      rows = rows.concat(this.collectWorkspaceNotes(pid, filter.paneId));
     }
     const typed = filter.type ? rows.filter((r) => r.type === filter.type) : rows;
     // Mirror JanusStore.getNotes: newest-first.
