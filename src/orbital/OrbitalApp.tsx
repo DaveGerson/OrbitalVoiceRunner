@@ -1,7 +1,7 @@
 // ── ORBITAL KITCHEN — app shell + view router ───────────────────────────
 // Wave P0: chrome + routing + tweaks (all genuinely working, client-side).
 // Live data, board, burner, radio, settings, the pass land in later waves.
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import "./orbital.css";
 import { ACCENTS, INK } from "./theme";
 import { Icon, IconSprite, Mascot } from "./primitives";
@@ -21,8 +21,11 @@ import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
 import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
 import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
-
-type View = "line" | "pantry" | "boh";
+import {
+  resolveStartView, resolveStartProject, getLocationSearch,
+  resolveServiceId, resolvePassProjectId, resolvePassProjectName,
+  matchVoiceCall, type View,
+} from "./orbitalAppHelpers";
 
 const CHATTER = [
   "Order up, Chef!", "Two on the burner, lookin' good.", "Heard, Chef.",
@@ -161,12 +164,11 @@ function DanceTroupe({ show }: { show: boolean }) {
 
 export default function OrbitalApp() {
   useKitchenChrome();
-  const params = typeof location !== "undefined" ? new URLSearchParams(location.search) : new URLSearchParams();
+  const locationSearch = getLocationSearch();
   const [t, setTweak] = useTweaks(mergedDefaults());
   const acc = ACCENTS[t.accent] || ACCENTS.cherry;
-  const startView = (["boh", "pantry"].includes(params.get("view") || "") ? params.get("view") : "line") as View;
-  const [view, setView] = useState<View>(startView);
-  const [selectedProject, setSelectedProject] = useState<string>(params.get("project") || "all");
+  const [view, setView] = useState<View>(resolveStartView(locationSearch));
+  const [selectedProject, setSelectedProject] = useState<string>(resolveStartProject(locationSearch));
   const [panic, setPanic] = useState(false);
   const [newPaneProj, setNewPaneProj] = useState<string | null>(null);
   const [newProjOpen, setNewProjOpen] = useState(false);
@@ -188,19 +190,14 @@ export default function OrbitalApp() {
   // the real handler; genuinely voice-only lines (free-form orders, queries the model answers) get an
   // honest "say it out loud" coaching hint instead of a false success ack.
   const handleCall = (phrase: string) => {
-    const p = phrase.toLowerCase().trim();
-    if (p.startsWith("open ")) {
-      const st = stations.find((s) => s.name.toLowerCase() === p.slice(5).trim());
-      if (st) { data.selectActivePane(st.id); setBurnerId(st.id); return; }
-    }
-    if (p === "let 'em cook") { data.setGlobalMode("Full Auto"); return; }
-    if (p === "taste every plate") { data.setGlobalMode("Human-in-the-Loop"); return; }
-    if (p === "hands off — read only") { data.setGlobalMode("Read-Only"); return; }
-    if (p === "all hands — stop the line" || p === "kill the burners") { data.stopAllFreeze(); setPanic(true); return; }
-    if (p === "back to service") { data.stopAllRelease(); setPanic(false); return; }
-    data.showToast(`🎙 Say "${phrase}" out loud to fire it`); // honest coaching — not a receipt
+    const action = matchVoiceCall(phrase, stations);
+    if (action.kind === "open") { data.selectActivePane(action.stationId); setBurnerId(action.stationId); }
+    else if (action.kind === "setMode") { data.setGlobalMode(action.mode); }
+    else if (action.kind === "stopFreeze") { data.stopAllFreeze(); setPanic(true); }
+    else if (action.kind === "stopRelease") { data.stopAllRelease(); setPanic(false); }
+    else { data.showToast(`🎙 Say "${action.phrase}" out loud to fire it`); } // honest coaching — not a receipt
   };
-  const serviceId = modeToServiceId(data.globalPermissionsMode === "Inherit" ? "Human-in-the-Loop" : data.globalPermissionsMode);
+  const serviceId = resolveServiceId(data.globalPermissionsMode);
 
   // The Burner: the station whose live terminal is open. Resolved from the live board so it tracks
   // status; if the pane disappears (closed/archived) the modal self-closes on the next render.
@@ -211,10 +208,8 @@ export default function OrbitalApp() {
   }, [burnerId, stations]);
 
   // The Pass jots into one concrete project: the selected one, else the active station's, else the first.
-  const passProjectId = selectedProject !== "all"
-    ? selectedProject
-    : (stations.find((s) => s.id === data.activeTerminalId)?.project || projects[0]?.id || null);
-  const passProjectName = projects.find((p) => p.id === passProjectId)?.name || "a kitchen";
+  const passProjectId = resolvePassProjectId(selectedProject, stations, data.activeTerminalId, projects);
+  const passProjectName = resolvePassProjectName(passProjectId, projects);
   // Keep The Pass's tickets fresh for the in-view project(s): the selected one, or all when unfiltered.
   const projectIdsKey = projects.map((p) => p.id).join(",");
   const refetchNotes = data.refetchNotes;
@@ -229,62 +224,69 @@ export default function OrbitalApp() {
     if (view === "pantry") refetchServiceLog();
   }, [view, refetchServiceLog]);
 
-  return (
-    <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
-      <IconSprite />
-      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running}
-        needsCount={needsList.length} onJumpToNeeds={jumpToNeeds}
-        mode={serviceId} setMode={(id) => data.setGlobalMode(serviceIdToMode(id))}
-        onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
-        /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
-           lane) — either one being open means the kitchen is genuinely attached. */
-        connected={data.streamConnected || data.voiceConnected} />
+  // ── inline render helpers — relocate JSX subsections; no new components, no hook changes ──
 
-      {view === "line" && (
-        <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
-          <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: t.dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
-            <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts}
-              stations={stations} activePaneId={data.activeTerminalId}
-              jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
-              onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
-              onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
-              onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
-              onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
-              onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
-            <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
-          </div>
-          {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
-          <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
-            <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
-              connected={data.voiceConnected} micBlocked={data.micBlocked}
-              transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
-              onGoLive={data.goLive} onToggleMute={data.toggleMute} onCall={handleCall} />
-          </aside>
+  const renderLineView = (): ReactNode => {
+    if (view !== "line") return null;
+    const dotBg = t.dark
+      ? "radial-gradient(#3a2415 1px, transparent 1.5px)"
+      : "radial-gradient(#e7cfa0 1px, transparent 1.5px)";
+    return (
+      <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
+        <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: dotBg, backgroundSize: "18px 18px" }}>
+          <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts}
+            stations={stations} activePaneId={data.activeTerminalId}
+            jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
+            onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
+            onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
+            onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
+            onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
+            onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
+          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
         </div>
-      )}
-      {view === "pantry" && (
-        <ThePantry dark={t.dark} projects={projects} stations={stations}
-          archived={data.archived}
-          serviceLog={data.serviceLog}
-          summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
-          selectedProject={selectedProject}
-          onUpdateSummary={data.updateProjectSummary}
-          onOpenStation={(id) => { data.selectActivePane(id); setBurnerId(id); }}
-          onRestoreArchived={data.restoreArchived}
-          onDeleteArchived={data.deleteArchived} />
-      )}
-      {view === "boh" && (
-        <BackOfHouse dark={t.dark} settings={data.settings}
-          globalMode={data.globalPermissionsMode}
-          setGlobalMode={(m) => data.setGlobalMode(m)}
-          saveSettings={data.saveSettings}
-          /* 2K.2: the Rulebook's pane scope — live panes + their CURRENT override maps (ledger truth). */
-          panes={stations.map((s) => ({ id: s.id, name: s.name, project: s.project,
-            overrides: data.ledger[s.project]?.panes?.[s.id]?.capabilityGates }))}
-          setPaneGates={data.setPaneGates} />
-      )}
+        {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
+        <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
+          <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
+            connected={data.voiceConnected} micBlocked={data.micBlocked}
+            transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
+            onGoLive={data.goLive} onToggleMute={data.toggleMute} onCall={handleCall} />
+        </aside>
+      </div>
+    );
+  };
 
+  const renderPantryView = (): ReactNode => {
+    if (view !== "pantry") return null;
+    return (
+      <ThePantry dark={t.dark} projects={projects} stations={stations}
+        archived={data.archived}
+        serviceLog={data.serviceLog}
+        summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
+        selectedProject={selectedProject}
+        onUpdateSummary={data.updateProjectSummary}
+        onOpenStation={(id) => { data.selectActivePane(id); setBurnerId(id); }}
+        onRestoreArchived={data.restoreArchived}
+        onDeleteArchived={data.deleteArchived} />
+    );
+  };
+
+  const renderBohView = (): ReactNode => {
+    if (view !== "boh") return null;
+    return (
+      <BackOfHouse dark={t.dark} settings={data.settings}
+        globalMode={data.globalPermissionsMode}
+        setGlobalMode={(m) => data.setGlobalMode(m)}
+        saveSettings={data.saveSettings}
+        /* 2K.2: the Rulebook's pane scope — live panes + their CURRENT override maps (ledger truth). */
+        panes={stations.map((s) => ({ id: s.id, name: s.name, project: s.project,
+          overrides: data.ledger[s.project]?.panes?.[s.id]?.capabilityGates }))}
+        setPaneGates={data.setPaneGates} />
+    );
+  };
+
+  const renderModals = (): ReactNode => (
+    <>
       {newPaneProj !== null && (
         <NewPaneModal projectId={newPaneProj} projects={projects} dark={t.dark} onClose={() => setNewPaneProj(null)}
           onCreate={(o) => { data.createPane(o); setNewPaneProj(null); if (o.projectId) setSelectedProject(o.projectId); }} />
@@ -308,10 +310,15 @@ export default function OrbitalApp() {
           onRename={(name) => data.renamePane(burnerStation.project, burnerStation.id, name)}
           writeControlKey={data.writeControlKey} resizeTerminal={data.resizeTerminal} showToast={data.showToast} />
       )}
-      {/* HiTL gating prompts — reuse the shared dialogs verbatim (server-truth posture). Wrapped in a
-          high-z stacking context so a write/action confirm sits above the burner + board modals.
-          1B.2: only the TOPMOST overlay owns Escape. Actions render before approvals here, so with
-          any approvals mounted the last APPROVAL is DOM-topmost; otherwise the last action is. */}
+    </>
+  );
+
+  const renderApprovals = (): ReactNode => (
+    // HiTL gating prompts — reuse the shared dialogs verbatim (server-truth posture). Wrapped in a
+    // high-z stacking context so a write/action confirm sits above the burner + board modals.
+    // 1B.2: only the TOPMOST overlay owns Escape. Actions render before approvals here, so with
+    // any approvals mounted the last APPROVAL is DOM-topmost; otherwise the last action is.
+    <>
       {data.pendingActions.map((a, i) => (
         <div key={a.actionId} style={{ position: "relative", zIndex: 260 }}>
           <ActionConfirmDialog actionId={a.actionId} capability={a.capability} summary={a.summary}
@@ -330,21 +337,35 @@ export default function OrbitalApp() {
             onApprove={data.approveCommand} onReject={data.rejectCommand} />
         </div>
       ))}
+    </>
+  );
 
+  const renderMascots = (): ReactNode => (
+    <>
+      <CornerChef show={t.mascot && view === "line" && !panic} chatter={t.mascot} />
+      <DanceTroupe show={t.danceParty && view === "line" && !panic} />
+    </>
+  );
+
+  // NOTE: emergency overlays (panic + frozen-banner) and the toast are kept as SEPARATE render
+  // helpers so the final return preserves the original DOM order: …approvals → panic → frozen →
+  // mascots → toast. (Folding them into one block would move the mascots; see render order below.)
+  const renderEmergencyOverlays = (): ReactNode => (
+    <>
       {panic && (
         <EmergencyStop runningCount={data.frozenRunning.length || running} onKill={data.stopAllKill}
           onClose={() => { data.stopAllRelease(); setPanic(false); }} />
       )}
-
       {data.frozen && !panic && (
         <div data-testid="frozen-banner" onClick={() => setPanic(true)} style={{ position: "fixed", top: 64, left: "50%", transform: "translateX(-50%)", zIndex: 110, background: "#e23a3a", color: "#fff4de", border: "2px solid " + INK, borderRadius: 10, padding: "7px 14px", boxShadow: "3px 3px 0 0 " + INK, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5, cursor: "pointer" }}>
           ❄ Line frozen — Janus paused. Click to manage.
         </div>
       )}
+    </>
+  );
 
-      <CornerChef show={t.mascot && view === "line" && !panic} chatter={t.mascot} />
-      <DanceTroupe show={t.danceParty && view === "line" && !panic} />
-
+  const renderToast = (): ReactNode => (
+    <>
       {/* 2K.5: role="status" aria-live="polite" so screen readers hear every kitchen ack.
           2K.4: an action-bearing toast (Undo) renders its one-tap action inline. */}
       {data.toast && (
@@ -358,6 +379,28 @@ export default function OrbitalApp() {
           )}
         </div>
       )}
+    </>
+  );
+
+  return (
+    <div className="orbital-kitchen" style={{ height: "100%", display: "flex", flexDirection: "column", background: pageBg, overflow: "hidden" }}>
+      <IconSprite />
+      <TopNav accentHex={acc.hex} accentOn={acc.on} view={view} setView={setView} running={running}
+        needsCount={needsList.length} onJumpToNeeds={jumpToNeeds}
+        mode={serviceId} setMode={(id) => data.setGlobalMode(serviceIdToMode(id))}
+        onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
+        /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
+           lane) — either one being open means the kitchen is genuinely attached. */
+        connected={data.streamConnected || data.voiceConnected} />
+
+      {renderLineView()}
+      {renderPantryView()}
+      {renderBohView()}
+      {renderModals()}
+      {renderApprovals()}
+      {renderEmergencyOverlays()}
+      {renderMascots()}
+      {renderToast()}
 
       <TweaksPanel title="Tweaks">
         <TweakSection label="The board" />

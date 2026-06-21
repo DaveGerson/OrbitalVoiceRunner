@@ -635,6 +635,361 @@ export interface RunningServer {
   _testSetReconnectNudge?: (fn: (() => void) | null) => void;
 }
 
+// VERBATIM extraction from startServer (CC paydown). Registers, IN ORDER: (1) the cookie-seed
+// middleware that drops the httpOnly SameSite auth_token on non-/api, non-/live renders, then (2)
+// the `/api` authMiddleware. Behavior, branch logic, and registration order are byte-identical to
+// the inline block this replaced; it must be invoked at the SAME point (right after express.json()).
+function registerAuthMiddleware(app: express.Express): void {
+  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders
+  app.use((req, res, next) => {
+    if (!req.path.startsWith("/api") && !req.path.startsWith("/live")) {
+      const currentToken = getCookie(req.headers.cookie, "auth_token");
+      if (currentToken !== API_AUTH_TOKEN) {
+        res.cookie("auth_token", API_AUTH_TOKEN, {
+          httpOnly: true,
+          sameSite: "strict",
+          secure: process.env.NODE_ENV === "production"
+        });
+      }
+    }
+    next();
+  });
+
+  const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
+    const tokenFromHeader = req.headers["x-api-token"]?.toString() || req.headers["authorization"]?.toString().replace(/^Bearer\s+/, "");
+
+    if (tokenFromCookie === API_AUTH_TOKEN || tokenFromHeader === API_AUTH_TOKEN) {
+      next();
+    } else {
+      res.status(401).json({ error: "Unauthorized: Invalid or missing API security token. Reload your interface." });
+    }
+  };
+
+  app.use("/api", authMiddleware);
+}
+
+// VERBATIM extraction from startServer (CC paydown). Pure boot-time clamp of the persisted memory
+// synth deadline: a 0/negative/NaN/non-number value would fire synthesizeAsync's race timer
+// immediately (?? does not catch 0), so floor it to the 150ms default. Behavior is byte-identical
+// to the inline ternary it replaced. Exported for unit testing.
+export function clampMemorySynthTimeoutMs(raw: unknown): number {
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
+}
+
+// VERBATIM extraction from startServer (CC paydown). Best-effort, non-fatal construction of the
+// optional warm Python synthesizer client: disabled ⇒ undefined; an init throw is logged and
+// degrades to undefined (permanent fallback). Identical to the inline `if (memoryPythonEnabled) {
+// try { ... } catch { ... } }` block it replaced.
+function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean): PythonSynthClient | undefined {
+  if (!memoryPythonEnabled) return undefined;
+  try {
+    return createPythonSynthClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+  } catch (e) {
+    console.error("[memory] python synth client init failed (continuing on fallback):", e);
+    return undefined;
+  }
+}
+
+// VERBATIM extraction from startServer (CC paydown). Registers the raw control-byte path
+// (POST /api/terminals/:id/raw-input) — the multi-cli adapter spec §7/§10 surface. Every branch,
+// status code, message, the active-pane guard, the isKnownRawKey allowlist, and the
+// always-allowed/gated bifurcation are byte-identical to the inline route this replaced. `manager`,
+// `isPaneActiveForWrite`, `isKnownRawKey`, `classifyRawKey`, and `restGateOutcome` are module-scope;
+// only the connection-bound `coreState` + `gateOrDefer` are injected.
+function registerRawInputRoute(
+  app: express.Express,
+  deps: {
+    coreState: ReturnType<typeof createCoreState>;
+    gateOrDefer: ReturnType<typeof createGating>["gateOrDefer"];
+  }
+): void {
+  const { coreState, gateOrDefer } = deps;
+  // Raw control-byte path (multi-cli adapter spec §7, §10) — KEPT INLINE (concurrent multi-cli feature; no
+  // c55 registry twin; a future convergence item). Writes literal keystrokes (arrows,
+  // Tab, Esc, Enter, PgUp/PgDn, Ctrl+C, Shift+Tab) into a pane's PTY via writeRaw — NO Enter-append,
+  // NO history (contrast the /input endpoint above, which is SUBMIT semantics). The gate is
+  // BIFURCATED: navigation keys + Ctrl+C (the emergency brake) are always-allowed and run
+  // immediately; the disruptive Shift+Tab (ESC[Z) routes through gateOrDefer("write_to_pane", …)
+  // so it is Ask off-spotlight (202 deferred), Auto on-spotlight (200), or Off (403).
+  app.post("/api/terminals/:id/raw-input", (req, res) => {
+    const { id } = req.params;
+    const { bytes } = req.body;
+    if (typeof bytes !== "string" || bytes.length === 0) {
+      res.status(400).json({ error: "Missing or empty bytes parameter" });
+      return;
+    }
+    const term = manager.terminals[id];
+    if (!term) {
+      res.status(404).json({ error: "Terminal not found or offline" });
+      return;
+    }
+    // 409 when the pane exists but has no live PTY (inert / un-spawned) — writeRaw would no-op.
+    if (!(term as any).transport) {
+      res.status(409).json({ error: "Pane has no live process (not spawned)." });
+      return;
+    }
+    // Active-pane guard (mirrors the voice write path in src/voice/index.ts): raw keystrokes may
+    // only ever reach the SINGLE pane the operator has open (coreState.activePaneId). Refuse a key
+    // aimed at any other pane — in ALL gate modes and for EVERY key, including the always-allowed
+    // nav keys and the Ctrl+C brake — because the guard is about WHICH pane, not which key. This
+    // sits BEFORE the always-allowed/gated branching so nothing reaches a non-active pane's PTY.
+    if (!isPaneActiveForWrite(coreState.activePaneId, id)) {
+      res.status(409).json({
+        error: coreState.activePaneId
+          ? `Raw input refused: pane '${id}' is not the active pane ('${coreState.activePaneId}'). Switch to it first.`
+          : `Raw input refused: no pane is active, so there is nowhere to write. Open the pane first.`,
+      });
+      return;
+    }
+    // bead ym3: raw-input is an ALLOWLIST, not a denylist-of-one. Reject ANY payload that is not one
+    // of the 11 vetted canonical control-key sequences (isKnownRawKey) BEFORE writeRaw — this is what
+    // stops an arbitrary shell line ("rm -rf ~\r") from being written verbatim to the PTY, bypassing
+    // the write_to_pane gate. Sits AFTER the 400/404/409 checks and BEFORE classifyRawKey, so
+    // classifyRawKey only ever runs on a vetted key. (Ctrl+C \x03 IS in the table — §13.1 preserved.)
+    if (!isKnownRawKey(bytes)) {
+      res.status(400).json({ error: "Unrecognized raw-key sequence" });
+      return;
+    }
+    // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
+    if (classifyRawKey(bytes) === "always-allowed") {
+      term.writeRaw(bytes);
+      res.json({ success: true });
+      return;
+    }
+    // Gated disruptive key (Shift+Tab): defer the writeRaw effect through the capability gate.
+    const rawEffect = (): string => { term.writeRaw(bytes); return "ok"; };
+    const g = gateOrDefer("write_to_pane", id, `Send Shift+Tab (mode cycle) to pane ${id}`, rawEffect);
+    const out = restGateOutcome(g);
+    if (g.disposition === "run") rawEffect(); // Auto: run now
+    res.status(out.status).json(out.body);
+  });
+}
+
+// VERBATIM extraction from startServer (CC paydown). Registers, IN ORDER: the four per-pane WIP
+// draft routes (GET/PUT /api/panes/:projectId/:paneId/draft, GET /api/projects/:projectId/drafts,
+// POST /api/panes/:projectId/:paneId/draft/send) then the two settings routes (GET /api/settings,
+// PUT /api/settings). `manager`, `HistoryManager`, `redactSecrets`, `sanitizeSettingsForClient`,
+// `validateSettingsPutBody`, `shouldNudgeReconnectOnSettingsKey`, and the module-level
+// `requestVoiceReconnect` are in module scope; only the connection-bound `broadcast` +
+// `broadcastDraft` (and the module `requestVoiceReconnect`, passed for locality) are injected. Every
+// route path, verb, branch, status code, and broadcast is byte-identical to the inline block.
+function registerDraftAndSettingsRoutes(
+  app: express.Express,
+  deps: {
+    broadcast: (msg: any) => void;
+    broadcastDraft: (projectId: string, paneId: string) => void;
+    requestVoiceReconnect: () => void;
+  }
+): void {
+  const { broadcast, broadcastDraft, requestVoiceReconnect } = deps;
+
+  // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
+  app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
+    const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
+      ?? { text: "", updatedAt: new Date().toISOString() };
+    res.json({ draft });
+  });
+
+  app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
+    const { text } = req.body;
+    if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
+    const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
+    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    broadcastDraft(req.params.projectId, req.params.paneId);
+    res.json({ success: true });
+  });
+
+  // The WIP register (the scalable part of "B"): every pane in a project with a non-empty draft,
+  // so work composed for one pane is never lost when the operator switches to another.
+  app.get("/api/projects/:projectId/drafts", (req, res) => {
+    res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
+  });
+
+  // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
+  // architecture §2): clicking Send IS the approval, so it writes immediately. The draft is then
+  // cleared. Janus never calls this — it only fills the draft for the operator to send.
+  app.post("/api/panes/:projectId/:paneId/draft/send", (req, res) => {
+    const { projectId, paneId } = req.params;
+    const text = (manager.ledger.getDraft(projectId, paneId)?.text ?? "").trim();
+    if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
+    const term = manager.terminals[paneId];
+    if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
+    HistoryManager.getInstance().addCommand(paneId, text);
+    term.writeInput(text);
+    broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
+    manager.ledger.setDraft(projectId, paneId, "", "operator");
+    broadcastDraft(projectId, paneId);
+    res.json({ success: true });
+  });
+
+  app.get("/api/settings", (req, res) => {
+    res.json(sanitizeSettingsForClient(manager.settings));
+  });
+
+  app.put("/api/settings", (req, res) => {
+    // 2S.2: validate BEFORE applying anything. The body stays a PERMISSIVE passthrough overall
+    // (settings carry many shapes) but the DANGEROUS fields are strict; an invalid one is a 400
+    // naming the field, and the live settings/mode are untouched. (The only updateSettings()
+    // call site is this route — there is no WS/voice settings-mutation path to mirror.)
+    const validated = validateSettingsPutBody(req.body);
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+    const newSettings = req.body;
+    // bead 9fz (part 2): capture the RAW incoming key BEFORE the masked/sentinel substitution below
+    // mutates it, so we can tell a genuinely-new credential from a masked round-trip echo. NEVER logged.
+    const incomingGeminiKey: string | null | undefined = newSettings.secrets?.geminiApiKey;
+    if (newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey)) {
+      newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
+    }
+    manager.updateSettings(newSettings);
+    broadcast({
+      type: "settings_updated",
+      globalPermissionsMode: manager.globalPermissionsMode,
+      settings: sanitizeSettingsForClient(manager.settings)
+    });
+    // bead 9fz (part 2): the operator just set a REAL (non-blank, non-masked, non-env-sentinel) Gemini
+    // key — nudge the live voice session to (re)connect so they need not reload the page. The blank-key
+    // short-circuit (realLiveConnector) means a prior keyless connect failed cleanly; this resumes it.
+    if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
+      requestVoiceReconnect();
+    }
+    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
+  });
+}
+
+// VERBATIM extraction from startServer (CC paydown). 4E.3b periodic incremental retention sweep:
+// an unref'd per-server interval (default 10min, JANUS_RETENTION_SWEEP_MS) that runs BATCHED
+// sweepMaintenance deletes, armed only when a durable store exists. Returns the timer handle (null
+// when no store) so close() can clearInterval it. Identical to the inline `if (store) {...}` block.
+function startRetentionSweepTimer(store: JanusStore | null): NodeJS.Timeout | null {
+  const RETENTION_SWEEP_MS = Math.max(30_000, Number(process.env.JANUS_RETENTION_SWEEP_MS) || 600_000);
+  if (!store) return null;
+  const retentionSweepTimer = setInterval(() => {
+    try {
+      store.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14 });
+    } catch (e) {
+      console.error("[STORE] periodic retention sweep failed (will retry next tick):", e);
+    }
+  }, RETENTION_SWEEP_MS);
+  retentionSweepTimer.unref?.();
+  return retentionSweepTimer;
+}
+
+// VERBATIM extraction from startServer (CC paydown). Mounts the frontend LAST (after every REST
+// route + the registry mount): in dev, the dynamically-imported Vite middleware; in production, the
+// static dist serve + SPA catch-all. The dev/prod/neither branching and the dynamic import are
+// byte-identical to the inline `if (enableVite) {...} else if (...production) {...}` block. It MUST
+// run after all API routes are registered so the catch-all never shadows them (registration order).
+async function mountFrontend(app: express.Express, enableVite: boolean): Promise<void> {
+  if (enableVite) {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else if (process.env.NODE_ENV === "production") {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+}
+
+// VERBATIM extraction from startServer (CC paydown). The dev/prod default-host pick, unchanged.
+function resolveBindHost(optionHost: string | undefined): string {
+  return optionHost ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+}
+
+// VERBATIM extraction from startServer (CC paydown). Reads the actually-bound port off the live
+// http server address, falling back to the requested port. Identical to the inline ternary.
+function resolveBoundPort(server: http.Server, requestedPort: number): number {
+  const addr = server.address();
+  return typeof addr === "object" && addr ? addr.port : requestedPort;
+}
+
+// VERBATIM extraction from startServer (CC paydown). The listen() bind with its pre-listen error
+// wiring: a bind failure (EADDRINUSE/EACCES) lands on the server's "error" event (and is FORWARDED
+// onto the wss by ws's WebSocketServer({ server })), so both listeners are wired BEFORE listen and
+// removed on success. Byte-identical to the inline `await new Promise(...)` body the `if (shouldListen)`
+// guarded; the guard itself stays in startServer so the bind only happens when listening is requested.
+function listenServer(
+  server: http.Server,
+  wss: WebSocketServer,
+  requestedPort: number,
+  bindHost: string
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    // A bind failure (EADDRINUSE, EACCES, ...) lands on the server's "error" event. Without
+    // this listener the QW1 process net swallows it and this promise NEVER settles — the boot
+    // hangs silently forever. Wire the rejection BEFORE listen; remove it on success so a
+    // later runtime "error" doesn't reject a long-settled promise. The wss listener is needed
+    // too: ws's WebSocketServer({ server }) FORWARDS the http server's "error" onto the wss,
+    // where, unconsumed, it re-throws as an uncaughtException.
+    const onListenError = (err: Error) => reject(err);
+    server.once("error", onListenError);
+    wss.once("error", onListenError);
+    server.listen(requestedPort, bindHost, () => {
+      server.removeListener("error", onListenError);
+      wss.removeListener("error", onListenError);
+      const addr = server.address();
+      const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
+      console.log(`Server running on http://${bindHost}:${boundPort}`);
+      resolve();
+    });
+  });
+}
+
+// VERBATIM extraction from startServer (CC paydown). Builds the Memory Synthesis subsystem (P0a
+// in-process anti-rot layer + the optional P0b warm Python synthesizer). Every dependency, default,
+// and null-safe shim is byte-identical to the inline block: the null-store WorldModel shim, the
+// WorldModel-narrow live-getter manager adapter, the python-master-switch flag (default true via
+// `!== false`), the boot timeout clamp, the non-fatal python client, and the createMemoryService
+// call with the SAME budget/weights/breadcrumb defaults. Returns both the service and the python
+// client so startServer's close() can dispose the daemon. `manager`, `redactSecrets`,
+// `createMemoryService`, `clampMemorySynthTimeoutMs`, and `createPythonSynthClientOrUndefined` are
+// all module-scope; only the connection-bound `store` is injected.
+function createMemorySubsystem(store: JanusStore | null): {
+  memory: ReturnType<typeof createMemoryService>;
+  pythonSynthClient: PythonSynthClient | undefined;
+} {
+  const memoryStore = store ?? { getProject: () => null, getProjectBriefing: () => null };
+  // The WorldModel reads the gate posture off `settings.globalPermissionsMode`, but the live value
+  // is `manager.globalPermissionsMode` (resolved from advanced.globalPermissionsMode). Adapt the
+  // manager to the WorldModel's narrow dep shape (live getters — every read is current, never a
+  // stale snapshot) so the Janus-frame tier reports the REAL posture instead of the safe default.
+  const memoryManager = {
+    get activeId() { return manager.activeId; },
+    get terminals() { return manager.terminals as any; },
+    get ledger() { return { activeProjectId: manager.ledger.activeProjectId }; },
+    get settings() { return { globalPermissionsMode: manager.globalPermissionsMode }; },
+    listPanes: () => manager.listPanes(),
+  };
+  // P0b: the optional warm Python synthesizer. A STRICT UPGRADE — gated by the master switch, eagerly
+  // pre-warmed and non-fatal. Absent/broken interpreter ⇒ permanent fallback; Janus stays fully functional.
+  const memoryPythonEnabled = manager.settings.advanced?.memoryPythonEnabled !== false; // default true
+  // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
+  // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
+  const memorySynthTimeoutMs = clampMemorySynthTimeoutMs(manager.settings.advanced?.memorySynthTimeoutMs);
+  const pythonSynthClient: PythonSynthClient | undefined = createPythonSynthClientOrUndefined(memoryPythonEnabled);
+  const memory = createMemoryService(
+    { manager: memoryManager, store: memoryStore, redact: redactSecrets },
+    {
+      totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
+      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+      breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
+      breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
+    },
+    pythonSynthClient,
+    memorySynthTimeoutMs,
+  );
+  return { memory, pythonSynthClient };
+}
+
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
   const shouldListen = options.listen ?? true;
@@ -654,33 +1009,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const app = express();
   app.use(express.json());
 
-  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders
-  app.use((req, res, next) => {
-    if (!req.path.startsWith("/api") && !req.path.startsWith("/live")) {
-      const currentToken = getCookie(req.headers.cookie, "auth_token");
-      if (currentToken !== API_AUTH_TOKEN) {
-        res.cookie("auth_token", API_AUTH_TOKEN, {
-          httpOnly: true,
-          sameSite: "strict",
-          secure: process.env.NODE_ENV === "production"
-        });
-      }
-    }
-    next();
-  });
-
-  const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
-    const tokenFromHeader = req.headers["x-api-token"]?.toString() || req.headers["authorization"]?.toString().replace(/^Bearer\s+/, "");
-    
-    if (tokenFromCookie === API_AUTH_TOKEN || tokenFromHeader === API_AUTH_TOKEN) {
-      next();
-    } else {
-      res.status(401).json({ error: "Unauthorized: Invalid or missing API security token. Reload your interface." });
-    }
-  };
-
-  app.use("/api", authMiddleware);
+  // VERBATIM extraction (CC paydown): the auth/cookie middleware pair — the cookie-seed `app.use`
+  // and the `/api` authMiddleware — are registered together, IN THE SAME ORDER, by this helper.
+  registerAuthMiddleware(app);
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: "/live" });
@@ -769,48 +1100,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // store is null under JANUS_LEDGER_BACKEND=legacy (or store-init failure). The WorldModel only
   // reads getProject/getProjectBriefing; a null-safe shim degrades the Project tier to absent
   // (the brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8).
-  const memoryStore = store ?? { getProject: () => null, getProjectBriefing: () => null };
-  // The WorldModel reads the gate posture off `settings.globalPermissionsMode`, but the live value
-  // is `manager.globalPermissionsMode` (resolved from advanced.globalPermissionsMode). Adapt the
-  // manager to the WorldModel's narrow dep shape (live getters — every read is current, never a
-  // stale snapshot) so the Janus-frame tier reports the REAL posture instead of the safe default.
-  const memoryManager = {
-    get activeId() { return manager.activeId; },
-    get terminals() { return manager.terminals as any; },
-    get ledger() { return { activeProjectId: manager.ledger.activeProjectId }; },
-    get settings() { return { globalPermissionsMode: manager.globalPermissionsMode }; },
-    listPanes: () => manager.listPanes(),
-  };
-  // P0b: the optional warm Python synthesizer. A STRICT UPGRADE — gated by the master switch, eagerly
-  // pre-warmed and non-fatal. Absent/broken interpreter ⇒ permanent fallback; Janus stays fully functional.
-  const memoryPythonEnabled = manager.settings.advanced?.memoryPythonEnabled !== false; // default true
-  // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
-  // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
-  const _synthTimeoutRaw = manager.settings.advanced?.memorySynthTimeoutMs;
-  const memorySynthTimeoutMs =
-    typeof _synthTimeoutRaw === "number" && Number.isFinite(_synthTimeoutRaw) && _synthTimeoutRaw > 0
-      ? _synthTimeoutRaw
-      : 150;
-  let pythonSynthClient: PythonSynthClient | undefined;
-  if (memoryPythonEnabled) {
-    try {
-      pythonSynthClient = createPythonSynthClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
-    } catch (e) {
-      console.error("[memory] python synth client init failed (continuing on fallback):", e);
-      pythonSynthClient = undefined;
-    }
-  }
-  const memory = createMemoryService(
-    { manager: memoryManager, store: memoryStore, redact: redactSecrets },
-    {
-      totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
-      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
-      breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
-      breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
-    },
-    pythonSynthClient,
-    memorySynthTimeoutMs,
-  );
+  // VERBATIM extraction (CC paydown): the entire Memory Synthesis P0a/P0b subsystem construction
+  // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
+  // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).
+  // Returns the memory service AND the python client (close() disposes the latter).
+  const { memory, pythonSynthClient } = createMemorySubsystem(store);
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
@@ -980,58 +1274,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // BIFURCATED: navigation keys + Ctrl+C (the emergency brake) are always-allowed and run
   // immediately; the disruptive Shift+Tab (ESC[Z) routes through gateOrDefer("write_to_pane", …)
   // so it is Ask off-spotlight (202 deferred), Auto on-spotlight (200), or Off (403).
-  app.post("/api/terminals/:id/raw-input", (req, res) => {
-    const { id } = req.params;
-    const { bytes } = req.body;
-    if (typeof bytes !== "string" || bytes.length === 0) {
-      res.status(400).json({ error: "Missing or empty bytes parameter" });
-      return;
-    }
-    const term = manager.terminals[id];
-    if (!term) {
-      res.status(404).json({ error: "Terminal not found or offline" });
-      return;
-    }
-    // 409 when the pane exists but has no live PTY (inert / un-spawned) — writeRaw would no-op.
-    if (!(term as any).transport) {
-      res.status(409).json({ error: "Pane has no live process (not spawned)." });
-      return;
-    }
-    // Active-pane guard (mirrors the voice write path in src/voice/index.ts): raw keystrokes may
-    // only ever reach the SINGLE pane the operator has open (coreState.activePaneId). Refuse a key
-    // aimed at any other pane — in ALL gate modes and for EVERY key, including the always-allowed
-    // nav keys and the Ctrl+C brake — because the guard is about WHICH pane, not which key. This
-    // sits BEFORE the always-allowed/gated branching so nothing reaches a non-active pane's PTY.
-    if (!isPaneActiveForWrite(coreState.activePaneId, id)) {
-      res.status(409).json({
-        error: coreState.activePaneId
-          ? `Raw input refused: pane '${id}' is not the active pane ('${coreState.activePaneId}'). Switch to it first.`
-          : `Raw input refused: no pane is active, so there is nowhere to write. Open the pane first.`,
-      });
-      return;
-    }
-    // bead ym3: raw-input is an ALLOWLIST, not a denylist-of-one. Reject ANY payload that is not one
-    // of the 11 vetted canonical control-key sequences (isKnownRawKey) BEFORE writeRaw — this is what
-    // stops an arbitrary shell line ("rm -rf ~\r") from being written verbatim to the PTY, bypassing
-    // the write_to_pane gate. Sits AFTER the 400/404/409 checks and BEFORE classifyRawKey, so
-    // classifyRawKey only ever runs on a vetted key. (Ctrl+C \x03 IS in the table — §13.1 preserved.)
-    if (!isKnownRawKey(bytes)) {
-      res.status(400).json({ error: "Unrecognized raw-key sequence" });
-      return;
-    }
-    // Always-allowed keys (nav + Ctrl+C brake) bypass the gate and dispatch now.
-    if (classifyRawKey(bytes) === "always-allowed") {
-      term.writeRaw(bytes);
-      res.json({ success: true });
-      return;
-    }
-    // Gated disruptive key (Shift+Tab): defer the writeRaw effect through the capability gate.
-    const rawEffect = (): string => { term.writeRaw(bytes); return "ok"; };
-    const g = gateOrDefer("write_to_pane", id, `Send Shift+Tab (mode cycle) to pane ${id}`, rawEffect);
-    const out = restGateOutcome(g);
-    if (g.disposition === "run") rawEffect(); // Auto: run now
-    res.status(out.status).json(out.body);
-  });
+  registerRawInputRoute(app, { coreState, gateOrDefer });
 
   // c55 Batch C: the inline POST /api/terminals/:id/resize is converged to the registry resize_pane def
   // (mountRestRoutes only-set above) — removed here to avoid double-registration. The concurrent merge had
@@ -1221,80 +1464,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // model-context layer (ungated — handoff carries CONTEXT, not commands) + ledger_updated broadcast.
   // behaviorDelta (client ignores the body): inline 400 (both panes must be active) -> 200 ok-narration.
 
-  // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
-  app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
-    const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
-      ?? { text: "", updatedAt: new Date().toISOString() };
-    res.json({ draft });
-  });
-
-  app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
-    const { text } = req.body;
-    if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
-    const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
-    if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
-    broadcastDraft(req.params.projectId, req.params.paneId);
-    res.json({ success: true });
-  });
-
-  // The WIP register (the scalable part of "B"): every pane in a project with a non-empty draft,
-  // so work composed for one pane is never lost when the operator switches to another.
-  app.get("/api/projects/:projectId/drafts", (req, res) => {
-    res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
-  });
-
-  // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
-  // architecture §2): clicking Send IS the approval, so it writes immediately. The draft is then
-  // cleared. Janus never calls this — it only fills the draft for the operator to send.
-  app.post("/api/panes/:projectId/:paneId/draft/send", (req, res) => {
-    const { projectId, paneId } = req.params;
-    const text = (manager.ledger.getDraft(projectId, paneId)?.text ?? "").trim();
-    if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
-    const term = manager.terminals[paneId];
-    if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
-    HistoryManager.getInstance().addCommand(paneId, text);
-    term.writeInput(text);
-    broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
-    manager.ledger.setDraft(projectId, paneId, "", "operator");
-    broadcastDraft(projectId, paneId);
-    res.json({ success: true });
-  });
-
-  app.get("/api/settings", (req, res) => {
-    res.json(sanitizeSettingsForClient(manager.settings));
-  });
-
-  app.put("/api/settings", (req, res) => {
-    // 2S.2: validate BEFORE applying anything. The body stays a PERMISSIVE passthrough overall
-    // (settings carry many shapes) but the DANGEROUS fields are strict; an invalid one is a 400
-    // naming the field, and the live settings/mode are untouched. (The only updateSettings()
-    // call site is this route — there is no WS/voice settings-mutation path to mirror.)
-    const validated = validateSettingsPutBody(req.body);
-    if (!validated.ok) {
-      res.status(400).json({ error: validated.error });
-      return;
-    }
-    const newSettings = req.body;
-    // bead 9fz (part 2): capture the RAW incoming key BEFORE the masked/sentinel substitution below
-    // mutates it, so we can tell a genuinely-new credential from a masked round-trip echo. NEVER logged.
-    const incomingGeminiKey: string | null | undefined = newSettings.secrets?.geminiApiKey;
-    if (newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey)) {
-      newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
-    }
-    manager.updateSettings(newSettings);
-    broadcast({
-      type: "settings_updated",
-      globalPermissionsMode: manager.globalPermissionsMode,
-      settings: sanitizeSettingsForClient(manager.settings)
-    });
-    // bead 9fz (part 2): the operator just set a REAL (non-blank, non-masked, non-env-sentinel) Gemini
-    // key — nudge the live voice session to (re)connect so they need not reload the page. The blank-key
-    // short-circuit (realLiveConnector) means a prior keyless connect failed cleanly; this resumes it.
-    if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
-      requestVoiceReconnect();
-    }
-    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
-  });
+  // VERBATIM extraction (CC paydown): the four per-pane WIP draft routes (GET/PUT pane draft, GET
+  // project drafts, POST draft/send) then the two settings routes (GET/PUT) — registered together,
+  // IN THE SAME ORDER, by this helper at the SAME point in the boot sequence.
+  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect });
 
   // dec-4 (DBT5): the WS-E pending-approval store + the deferred-action store + their durable boot
   // hydration, effectiveModeFor / effectiveCapabilityGateFor / gateCapability / gateOrDefer, the
@@ -1329,18 +1502,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // never stall the serving loop; a backlog simply drains across ticks. Same TTLs as the
   // boot prune (+ the 4E.3c categories: claimed pending_approvals, action_log 30d TTL).
   // Cleared in close(); sweepMaintenance itself is a no-op once the shared store closes.
-  const RETENTION_SWEEP_MS = Math.max(30_000, Number(process.env.JANUS_RETENTION_SWEEP_MS) || 600_000);
-  let retentionSweepTimer: NodeJS.Timeout | null = null;
-  if (store) {
-    retentionSweepTimer = setInterval(() => {
-      try {
-        store!.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14 });
-      } catch (e) {
-        console.error("[STORE] periodic retention sweep failed (will retry next tick):", e);
-      }
-    }, RETENTION_SWEEP_MS);
-    retentionSweepTimer.unref?.();
-  }
+  const retentionSweepTimer: NodeJS.Timeout | null = startRetentionSweepTimer(store);
 
   // dec-5 (DBT5): the GEMINI LIVE VOICE SESSION — the entire `wss.on("connection", ...)` envelope
   // (the resumption-token persist/rehydrate, the per-connection live-session lifecycle, the gated
@@ -1532,20 +1694,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 
   // Vite middleware for development (dynamically imported so tests / production
   // bundles that disable it don't need vite resolvable at module load).
-  if (enableVite) {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else if (process.env.NODE_ENV === "production") {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+  await mountFrontend(app, enableVite);
 
   const close = async (): Promise<void> => {
     announcementBus.stop(); // WS-D: clear coalescing/rate-limit timers
@@ -1592,33 +1741,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  const bindHost = options.bindHost ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+  const bindHost = resolveBindHost(options.bindHost);
   const requestedPort = options.port ?? PORT;
 
   if (shouldListen) {
-    await new Promise<void>((resolve, reject) => {
-      // A bind failure (EADDRINUSE, EACCES, ...) lands on the server's "error" event. Without
-      // this listener the QW1 process net swallows it and this promise NEVER settles — the boot
-      // hangs silently forever. Wire the rejection BEFORE listen; remove it on success so a
-      // later runtime "error" doesn't reject a long-settled promise. The wss listener is needed
-      // too: ws's WebSocketServer({ server }) FORWARDS the http server's "error" onto the wss,
-      // where, unconsumed, it re-throws as an uncaughtException.
-      const onListenError = (err: Error) => reject(err);
-      server.once("error", onListenError);
-      wss.once("error", onListenError);
-      server.listen(requestedPort, bindHost, () => {
-        server.removeListener("error", onListenError);
-        wss.removeListener("error", onListenError);
-        const addr = server.address();
-        const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
-        console.log(`Server running on http://${bindHost}:${boundPort}`);
-        resolve();
-      });
-    });
+    await listenServer(server, wss, requestedPort, bindHost);
   }
 
-  const addr = server.address();
-  const port = typeof addr === "object" && addr ? addr.port : requestedPort;
+  const port = resolveBoundPort(server, requestedPort);
 
   return {
     app, server, wss, manager, port, close,
