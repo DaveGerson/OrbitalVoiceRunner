@@ -23,15 +23,24 @@ export interface GroundingInfo {
   sources: GroundingSource[];
 }
 
-/** Read grounding queries + web sources from a LiveServerMessage. Pure; never throws. */
-export function extractGrounding(message: any): GroundingInfo {
-  const gm = message?.serverContent?.groundingMetadata;
-  if (!gm) return { queries: [], sources: [] };
-
-  const queries: string[] = Array.isArray(gm.webSearchQueries)
+/** Pull the model's web search queries, dropping non-strings + empties. Order/dupes preserved. */
+function extractQueries(gm: any): string[] {
+  return Array.isArray(gm.webSearchQueries)
     ? gm.webSearchQueries.filter((q: unknown): q is string => typeof q === "string" && q.length > 0)
     : [];
+}
 
+/** Human-readable title for a web chunk: title -> domain -> "". */
+function pickTitle(web: any): string {
+  return (
+    (typeof web.title === "string" && web.title) ||
+    (typeof web.domain === "string" && web.domain) ||
+    ""
+  );
+}
+
+/** Pull the web grounding sources from groundingChunks, deduped by uri (first occurrence wins). */
+function extractSources(gm: any): GroundingSource[] {
   const sources: GroundingSource[] = [];
   const seen = new Set<string>();
   const chunks = Array.isArray(gm.groundingChunks) ? gm.groundingChunks : [];
@@ -40,14 +49,16 @@ export function extractGrounding(message: any): GroundingInfo {
     const uri = web?.uri;
     if (typeof uri !== "string" || uri.length === 0 || seen.has(uri)) continue;
     seen.add(uri);
-    const title =
-      (typeof web.title === "string" && web.title) ||
-      (typeof web.domain === "string" && web.domain) ||
-      "";
-    sources.push({ uri, title });
+    sources.push({ uri, title: pickTitle(web) });
   }
+  return sources;
+}
 
-  return { queries, sources };
+/** Read grounding queries + web sources from a LiveServerMessage. Pure; never throws. */
+export function extractGrounding(message: any): GroundingInfo {
+  const gm = message?.serverContent?.groundingMetadata;
+  if (!gm) return { queries: [], sources: [] };
+  return { queries: extractQueries(gm), sources: extractSources(gm) };
 }
 
 /** True when the info carries at least one query or source — the gate for surfacing anything. */

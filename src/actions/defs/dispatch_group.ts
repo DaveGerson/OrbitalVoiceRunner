@@ -21,7 +21,7 @@
  */
 
 import { z } from "zod";
-import type { ActionDef, ActionResult } from "../types";
+import type { ActionContext, ActionDef, ActionResult, DispatchOutcome } from "../types";
 import { dispatchJoinTracker } from "../../dispatch/joinTracker";
 import { instantiateTemplate, valuesArrayToRecord } from "../../templates";
 
@@ -59,6 +59,80 @@ const DispatchToPanesParams = z
     }
   });
 
+type DispatchArgs = z.infer<typeof DispatchToPanesParams>;
+
+/**
+ * Resolve the instruction text + group label from raw args (template instantiation clarifies on
+ * missing slots — never guesses). Returns either the resolved { text, label } or an early
+ * ActionResult to return verbatim (unknown template -> ok narration; missing slots -> clarify).
+ * Behavior-preserving extraction of the handler's template-resolution preamble.
+ */
+function resolveDispatchText(
+  args: DispatchArgs,
+  ctx: ActionContext
+): { text: string; label: string } | { early: ActionResult } {
+  let text = args.instruction ?? "";
+  let label = args.name ?? "";
+  if (args.template_id) {
+    const tpl = ctx.manager.ledger.promptTemplates.find(
+      (t) => t.id === args.template_id || t.name === args.template_id
+    );
+    if (!tpl) {
+      return { early: { kind: "ok", output: `Template '${args.template_id}' not found. Use list_prompt_templates to see what is saved.` } };
+    }
+    const inst = instantiateTemplate(tpl.body, valuesArrayToRecord(args.values));
+    if (inst.missing.length) {
+      return {
+        early: {
+          kind: "clarify",
+          text: `Template '${tpl.name}' needs values for: ${inst.missing.join(", ")}. Ask the operator, then dispatch again with the values filled in.`,
+        },
+      };
+    }
+    text = inst.text;
+    if (!label) label = tpl.name;
+  }
+  if (!label) label = text.slice(0, 40);
+  return { text, label };
+}
+
+/**
+ * Stamp ONE per-pane dispatch outcome onto the join group and classify it as staged or refused.
+ * Behavior-preserving extraction of the per-pane outcome branch inside the fan-out loop.
+ */
+function recordDispatchOutcome(groupId: string, paneId: string, outcome: DispatchOutcome): { staged: boolean; refused?: string } {
+  if (outcome.kind === "pending") {
+    dispatchJoinTracker.recordOutcome(groupId, paneId, "staged");
+    return { staged: true };
+  }
+  if (outcome.kind === "executed") {
+    // Defensive: forceStage should make this unreachable, but record it honestly if the engine
+    // ever executes (e.g. a future caller drops the flag).
+    dispatchJoinTracker.recordOutcome(groupId, paneId, "running");
+    return { staged: true };
+  }
+  dispatchJoinTracker.recordOutcome(
+    groupId,
+    paneId,
+    outcome.kind === "blocked" ? "blocked" : "error",
+    outcome.text
+  );
+  return { staged: false, refused: `${paneId} (${outcome.kind})` };
+}
+
+/** Assemble the spoken read-back from the staged/refused tallies. Behavior-preserving extraction. */
+function narrateDispatch(label: string, groupId: string, staged: string[], refused: string[]): string {
+  const parts: string[] = [];
+  if (staged.length) {
+    parts.push(
+      `Dispatch '${label}' (${groupId}) staged ${staged.length} approval(s): ${staged.join(", ")}. Nothing runs until the operator approves each one; I'll be told when the whole group finishes.`
+    );
+  }
+  if (refused.length) parts.push(`Not staged: ${refused.join("; ")}.`);
+  if (!staged.length) parts.push("No writes were staged.");
+  return parts.join(" ");
+}
+
 export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {
   name: "dispatch_to_panes",
   description:
@@ -70,26 +144,9 @@ export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {
   rest: { method: "post", path: "/api/dispatch" },
   handler: (args, ctx): ActionResult => {
     // Resolve the instruction text (template instantiation clarifies on missing slots — never guesses).
-    let text = args.instruction ?? "";
-    let label = args.name ?? "";
-    if (args.template_id) {
-      const tpl = ctx.manager.ledger.promptTemplates.find(
-        (t) => t.id === args.template_id || t.name === args.template_id
-      );
-      if (!tpl) {
-        return { kind: "ok", output: `Template '${args.template_id}' not found. Use list_prompt_templates to see what is saved.` };
-      }
-      const inst = instantiateTemplate(tpl.body, valuesArrayToRecord(args.values));
-      if (inst.missing.length) {
-        return {
-          kind: "clarify",
-          text: `Template '${tpl.name}' needs values for: ${inst.missing.join(", ")}. Ask the operator, then dispatch again with the values filled in.`,
-        };
-      }
-      text = inst.text;
-      if (!label) label = tpl.name;
-    }
-    if (!label) label = text.slice(0, 40);
+    const resolved = resolveDispatchText(args, ctx);
+    if ("early" in resolved) return resolved.early;
+    const { text, label } = resolved;
 
     const paneIds = [...new Set(args.pane_ids)];
     const group = dispatchJoinTracker.create(label, text, paneIds);
@@ -111,36 +168,14 @@ export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {
         // resolves (individually or via batch voice verbs). See paneWrite.ts forceStage.
         forceStage: true,
       });
-      if (outcome.kind === "pending") {
-        dispatchJoinTracker.recordOutcome(group.id, paneId, "staged");
-        staged.push(paneId);
-      } else if (outcome.kind === "executed") {
-        // Defensive: forceStage should make this unreachable, but record it honestly if the engine
-        // ever executes (e.g. a future caller drops the flag).
-        dispatchJoinTracker.recordOutcome(group.id, paneId, "running");
-        staged.push(paneId);
-      } else {
-        dispatchJoinTracker.recordOutcome(
-          group.id,
-          paneId,
-          outcome.kind === "blocked" ? "blocked" : "error",
-          outcome.text
-        );
-        refused.push(`${paneId} (${outcome.kind})`);
-      }
+      const recorded = recordDispatchOutcome(group.id, paneId, outcome);
+      if (recorded.staged) staged.push(paneId);
+      else refused.push(recorded.refused!);
     }
 
     ctx.broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
 
-    const parts: string[] = [];
-    if (staged.length) {
-      parts.push(
-        `Dispatch '${label}' (${group.id}) staged ${staged.length} approval(s): ${staged.join(", ")}. Nothing runs until the operator approves each one; I'll be told when the whole group finishes.`
-      );
-    }
-    if (refused.length) parts.push(`Not staged: ${refused.join("; ")}.`);
-    if (!staged.length) parts.push("No writes were staged.");
-    return { kind: "ok", output: parts.join(" ") };
+    return { kind: "ok", output: narrateDispatch(label, group.id, staged, refused) };
   },
 };
 

@@ -83,6 +83,45 @@ export interface HandoffFlipResult {
 const NO_FLIP: HandoffFlipResult = { flipped: false };
 
 /**
+ * Resolve the LINKED handoff row for a resolved approval `messageId`, mirroring the two-way lookup:
+ * (1) primary getHandoff(messageId) — a direct PK hit when messageId == handoff_id;
+ * (2) fallback listHandoffs().filter(gate_approval_id === messageId) — takes matches[0].
+ * Returns null when neither resolves (a non-handoff approval).
+ */
+function findLinkedHandoff(store: HandoffFlipStore, messageId: string): StoredHandoff | null {
+  const direct = store.getHandoff(messageId);
+  if (direct) return direct;
+  const matches = store.listHandoffs().filter((h) => h.gate_approval_id === messageId);
+  return matches[0] ?? null;
+}
+
+/**
+ * Apply the persisted write for an already-resolved `nextState`, reproducing the exact
+ * updateHandoffState(id, state, patch) calls and provenance the inline switch made:
+ *   delivered => { approved_via: vocal?voice:rest, delivered_at: now() }
+ *   rejected  => { approved_via: vocal?voice:rest }
+ *   expired   => { approved_via: 'ttl_expire' }
+ */
+function writeHandoffFlip(
+  store: HandoffFlipStore,
+  handoffId: string,
+  nextState: HandoffState,
+  vocal: boolean | undefined,
+  now: () => number
+): void {
+  if (nextState === "delivered") {
+    store.updateHandoffState(handoffId, "delivered", {
+      approved_via: vocal ? "voice" : "rest",
+      delivered_at: now(),
+    });
+  } else if (nextState === "rejected") {
+    store.updateHandoffState(handoffId, "rejected", { approved_via: vocal ? "voice" : "rest" });
+  } else if (nextState === "expired") {
+    store.updateHandoffState(handoffId, "expired", { approved_via: "ttl_expire" });
+  }
+}
+
+/**
  * The resolve-leg flip (design §5.3, gap G3): given a resolved pending-approval `messageId` and its
  * resolution `reason`, transition the LINKED handoff row to its terminal/transition state. This is the
  * single, exported source of truth the server's resolver choke-point calls (server.ts:flipHandoffOnResolve
@@ -109,28 +148,15 @@ export function applyHandoffFlipOnResolve(
   opts: { vocal?: boolean; now?: () => number; onError?: (e: unknown) => void } = {}
 ): HandoffFlipResult {
   if (!store) return NO_FLIP;
-  let handoff = store.getHandoff(messageId);
-  if (!handoff) {
-    const matches = store.listHandoffs().filter((h) => h.gate_approval_id === messageId);
-    handoff = matches[0] ?? null;
-  }
+
+  const handoff = findLinkedHandoff(store, messageId);
   if (!handoff) return NO_FLIP;
 
   const nextState = resolveReasonToHandoffState(reason);
   if (!nextState) return NO_FLIP;
 
-  const now = opts.now ?? Date.now;
   try {
-    if (nextState === "delivered") {
-      store.updateHandoffState(handoff.id, "delivered", {
-        approved_via: opts.vocal ? "voice" : "rest",
-        delivered_at: now(),
-      });
-    } else if (nextState === "rejected") {
-      store.updateHandoffState(handoff.id, "rejected", { approved_via: opts.vocal ? "voice" : "rest" });
-    } else if (nextState === "expired") {
-      store.updateHandoffState(handoff.id, "expired", { approved_via: "ttl_expire" });
-    }
+    writeHandoffFlip(store, handoff.id, nextState, opts.vocal, opts.now ?? Date.now);
   } catch (e) {
     if (opts.onError) opts.onError(e);
     else console.error("[HANDOFF] Failed to flip handoff state on resolve:", e);

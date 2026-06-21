@@ -250,13 +250,15 @@ export function isLoosening(from: GateValue, to: GateValue): boolean {
 }
 
 /**
- * The single, pure gate decision. Both `kind`s pass through the SAME effective-mode gate;
- * `kind` does NOT bypass permissions. The allowlist check is IN ADDITION to the mode gate.
+ * Pre-gate input validation (design §2.1, P2): the soft-error / re-route checks that fire in
+ * EVERY mode BEFORE the per-capability gate × effectiveMode composition. Order is load-bearing
+ * and preserved verbatim from decideProposal: missing pane → empty instruction → kind/runtimeType
+ * mismatch → non-allowlisted shell. Returns the early decision, or `null` to defer to the gate.
+ * Extracted pure so decideProposal stays within the cyclomatic-complexity gate (≤10) WITHOUT
+ * changing any branch, condition, or message byte.
  */
-export function decideProposal(input: DecideProposalInput): ProposalDecision {
-  const { kind, instruction, effectiveMode, runtimeType, paneExists, allowlist } = input;
-  const capability = input.capability ?? "write_to_pane";
-  const gate: GateValue = input.gate ?? "Auto";
+function validateProposalInput(input: DecideProposalInput): ProposalDecision | null {
+  const { kind, instruction, runtimeType, paneExists, allowlist } = input;
 
   if (!paneExists) return { type: "error_no_pane" };
 
@@ -285,6 +287,23 @@ export function decideProposal(input: DecideProposalInput): ProposalDecision {
       reason: `"${firstShellToken(instruction)}" is heavy-lifting shell — I should hand this to the agent in that pane instead of running it myself. Want me to direct the agent?`,
     };
   }
+
+  return null; // valid input — defer to the gate × mode composition.
+}
+
+/**
+ * The single, pure gate decision. Both `kind`s pass through the SAME effective-mode gate;
+ * `kind` does NOT bypass permissions. The allowlist check is IN ADDITION to the mode gate.
+ */
+export function decideProposal(input: DecideProposalInput): ProposalDecision {
+  const { effectiveMode } = input;
+  const capability = input.capability ?? "write_to_pane";
+  const gate: GateValue = input.gate ?? "Auto";
+
+  // Pre-gate input validation (missing pane / empty instruction / kind mismatch / shell allowlist),
+  // in the SAME order, BEFORE any gate × mode composition. Returns early when it fires.
+  const invalid = validateProposalInput(input);
+  if (invalid) return invalid;
 
   // AND-veto (design §3): the per-capability gate is evaluated AFTER the kind/allowlist checks
   // and AND-composed with effectiveMode. A capability can only TIGHTEN, never loosen, the mode.

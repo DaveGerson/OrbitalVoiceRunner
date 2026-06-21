@@ -34,21 +34,6 @@
       "count": 11
     }
   },
-  "src/actions/defs/dispatch_group.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/actions/defs/orchestration.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/actions/defs/panes_write.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/components/ActionConfirmDialog.tsx": {
     "complexity": {
       "count": 1
@@ -77,23 +62,8 @@
       "count": 1
     }
   },
-  "src/dispatch/joinTracker.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/e2e/harness.ts": {
     "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/handoffFlow.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/liveGrounding.ts": {
-    "complexity": {
       "count": 1
     }
   },
@@ -156,11 +126,6 @@
   "src/orbital/views/Pass.tsx": {
     "complexity": {
       "count": 3
-    }
-  },
-  "src/pendingApprovals.ts": {
-    "complexity": {
-      "count": 1
     }
   },
   "src/store/migrate.ts": {
