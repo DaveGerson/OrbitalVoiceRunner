@@ -48,39 +48,82 @@ export function Chip({ children, color = INK, bg = "#fff9ec", border = INK, styl
 }
 
 export type ButtonVariant = "default" | "primary" | "butter" | "mint" | "blueberry" | "ghost";
+
+// ── Button pure helpers (exported for unit tests) ────────────────────────────
+
+const BUTTON_PALETTES: Record<ButtonVariant, { bg: string; fg: string }> = {
+  default:   { bg: "#fff9ec", fg: INK },
+  primary:   { bg: "#e23a3a", fg: "#fff4de" },
+  butter:    { bg: "#ffc94a", fg: INK },
+  mint:      { bg: "#4db892", fg: INK },
+  blueberry: { bg: "#4b3bb3", fg: "#fff4de" },
+  ghost:     { bg: "transparent", fg: INK },
+};
+
+/** Returns the bg/fg palette for a Button variant. */
+export function getButtonPalette(variant: ButtonVariant): { bg: string; fg: string } {
+  return BUTTON_PALETTES[variant] || BUTTON_PALETTES.default;
+}
+
+/** Returns the padding and font-size for a Button size. */
+export function getButtonSizing(size: "sm" | "md" | "lg"): { pad: string; fs: number } {
+  const pad = size === "sm" ? "5px 10px" : size === "lg" ? "12px 20px" : "8px 14px";
+  const fs  = size === "sm" ? 12 : size === "lg" ? 15 : 13;
+  return { pad, fs };
+}
+
+/** Returns the box-shadow for a Button given variant and interaction state. */
+export function getButtonShadow(variant: ButtonVariant, hover: boolean, press: boolean): string {
+  if (variant === "ghost") return "none";
+  if (press) return "none";
+  if (hover) return "4px 4px 0 0 " + INK;
+  return "2px 2px 0 0 " + INK;
+}
+
+/** Returns the CSS transform for a Button given interaction state. */
+export function getButtonTransform(hover: boolean, press: boolean): string {
+  if (press) return "translate(2px,2px)";
+  if (hover) return "translate(-1px,-1px)";
+  return "translate(0,0)";
+}
+
+/** Assembles the full inline style object for a Button. */
+export function getButtonStyle(
+  variant: ButtonVariant,
+  size: "sm" | "md" | "lg",
+  disabled: boolean | undefined,
+  hover: boolean,
+  press: boolean,
+  extraStyle: CSSProperties,
+): CSSProperties {
+  const p      = getButtonPalette(variant);
+  const { pad, fs } = getButtonSizing(size);
+  const shadow = getButtonShadow(variant, hover, press);
+  const translate = getButtonTransform(hover, press);
+  return {
+    display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
+    padding: pad, borderRadius: 10,
+    border: variant === "ghost" ? `2px dashed ${INK}55` : `2px solid ${INK}`,
+    background: p.bg, color: p.fg,
+    fontFamily: "DM Sans, sans-serif", fontSize: fs, fontWeight: 800,
+    letterSpacing: ".01em", cursor: disabled ? "not-allowed" : "pointer", whiteSpace: "nowrap", lineHeight: 1.2,
+    boxShadow: disabled ? "none" : shadow, transform: disabled ? "none" : translate, opacity: disabled ? 0.5 : 1,
+    transition: "transform 120ms cubic-bezier(.34,1.56,.64,1), box-shadow 120ms", ...extraStyle,
+  };
+}
+
 export function Button({ children, variant = "default", size = "md", onClick, style = {}, icon, title, disabled, testId }: {
   children?: ReactNode; variant?: ButtonVariant; size?: "sm" | "md" | "lg";
   onClick?: () => void; style?: CSSProperties; icon?: string; title?: string; disabled?: boolean; testId?: string;
 }) {
-  const palettes: Record<ButtonVariant, { bg: string; fg: string }> = {
-    default:   { bg: "#fff9ec", fg: INK },
-    primary:   { bg: "#e23a3a", fg: "#fff4de" },
-    butter:    { bg: "#ffc94a", fg: INK },
-    mint:      { bg: "#4db892", fg: INK },
-    blueberry: { bg: "#4b3bb3", fg: "#fff4de" },
-    ghost:     { bg: "transparent", fg: INK },
-  };
-  const p = palettes[variant] || palettes.default;
-  const pad = size === "sm" ? "5px 10px" : size === "lg" ? "12px 20px" : "8px 14px";
-  const fs = size === "sm" ? 12 : size === "lg" ? 15 : 13;
   const [hover, setHover] = useState(false);
   const [press, setPress] = useState(false);
-  const shadow = variant === "ghost" ? "none" : press ? "none" : hover ? "4px 4px 0 0 " + INK : "2px 2px 0 0 " + INK;
-  const translate = press ? "translate(2px,2px)" : hover ? "translate(-1px,-1px)" : "translate(0,0)";
+  const { fs } = getButtonSizing(size);
   return (
     <button onClick={disabled ? undefined : onClick} title={title} disabled={disabled} data-testid={testId}
       onMouseEnter={() => setHover(true)} onMouseLeave={() => { setHover(false); setPress(false); }}
       onMouseDown={() => setPress(true)} onMouseUp={() => setPress(false)}
-      style={{
-        display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
-        padding: pad, borderRadius: 10,
-        border: variant === "ghost" ? `2px dashed ${INK}55` : `2px solid ${INK}`,
-        background: p.bg, color: p.fg,
-        fontFamily: "DM Sans, sans-serif", fontSize: fs, fontWeight: 800,
-        letterSpacing: ".01em", cursor: disabled ? "not-allowed" : "pointer", whiteSpace: "nowrap", lineHeight: 1.2,
-        boxShadow: disabled ? "none" : shadow, transform: disabled ? "none" : translate, opacity: disabled ? 0.5 : 1,
-        transition: "transform 120ms cubic-bezier(.34,1.56,.64,1), box-shadow 120ms", ...style,
-      }}>
+      style={getButtonStyle(variant, size, disabled, hover, press, style)}>
       {icon && <Icon name={icon} size={fs + 2} />}
       {children}
     </button>
