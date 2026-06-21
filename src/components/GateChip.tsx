@@ -25,6 +25,7 @@ import {
   normalizePostureWord,
   normalizeEffectiveGates,
   type PostureWord,
+  type GateControlKind,
 } from "../gateSurface";
 
 /** Spotlight-eligible productive capabilities (mirror of gateSurface SPOTLIGHT_CAPABILITIES). */
@@ -58,6 +59,100 @@ function spotlightActive(gates: CapabilityGateMap, isActivePane: boolean): boole
   return false;
 }
 
+// ─── Pure helpers (extracted to reduce GateChipInner CC) ─────────────────────
+
+/**
+ * Resolve the display GateValue for a capability row.
+ * two-way (veto) collapses Auto/Ask → Auto; Off stays Off.
+ * All other control kinds pass the value through unchanged.
+ */
+export function deriveDisplayValue(control: GateControlKind, value: GateValue): GateValue {
+  return control === "two-way" && value !== "Off" ? "Auto" : value;
+}
+
+/**
+ * Resolve the display word string for a capability row.
+ * two-way uses the GATE_STYLE word (e.g. "Allowed" / "Blocked").
+ * All other control kinds use the raw displayValue string.
+ */
+export function deriveDisplayWord(
+  control: GateControlKind,
+  gStyleWord: string,
+  displayValue: GateValue,
+): string {
+  return control === "two-way" ? gStyleWord : displayValue;
+}
+
+/**
+ * Whether the "· via focus" spotlight annotation should appear on a capability row.
+ * True iff this is the active pane, the cap is spotlight-eligible, and the gate is Auto.
+ */
+export function isViaFocus(isActivePane: boolean, cap: CapabilityGate, value: GateValue): boolean {
+  return isActivePane && SPOTLIGHT_CAPS.has(cap) && value === "Auto";
+}
+
+/**
+ * className for the chip trigger button — compact flag selects padding + font-size tokens.
+ * Extracted to eliminate 2 ternaries from GateChipInner's CC count.
+ */
+function chipTriggerClassName(style: typeof POSTURE_STYLE[keyof typeof POSTURE_STYLE], compact: boolean): string {
+  const py = compact ? "py-0" : "py-0.5";
+  const textSize = compact ? "text-[8px]" : "text-[9px]";
+  return `inline-flex items-center gap-1.5 rounded border px-1.5 ${py} font-mono uppercase tracking-wider ${textSize} font-bold transition-colors cursor-pointer ${style.ring} ${style.text}`;
+}
+
+/**
+ * className for the trigger dot span — compact flag selects the dot size.
+ * Extracted to eliminate 1 ternary from GateChipInner's CC count.
+ */
+function chipDotClassName(style: typeof POSTURE_STYLE[keyof typeof POSTURE_STYLE], compact: boolean): string {
+  const size = compact ? "w-1 h-1" : "w-1.5 h-1.5";
+  return `inline-block rounded-full ${size} ${style.dot}`;
+}
+
+/**
+ * Inline render helper: one capability row in the popover list.
+ * Module-level so its branches are NOT counted in GateChipInner's CC.
+ * Called inline as {renderCapRow(cap, gates, isActivePane)}.
+ * PHASE 2 (veto-toggle honesty): badge caps get a fixed "Always on" badge; gated caps show the
+ * HONEST veto (two-way) or deferrable (three-way) control.
+ */
+function renderCapRow(
+  cap: CapabilityGate,
+  gates: Record<CapabilityGate, GateValue>,
+  isActivePane: boolean,
+): React.ReactNode {
+  // `gates` is already normalized → always a valid GateValue. The `?? GATE_STYLE.Ask`
+  // hard fallback makes this row provably non-throwing regardless of upstream changes.
+  const value = gates[cap];
+  const control = controlForEnforcement(cap);
+  if (control === "badge") {
+    return (
+      <div key={cap} data-testid={`gate-row-${cap}`} data-control="badge" className="flex items-center justify-between gap-2">
+        <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
+        <span className="flex items-center gap-1 shrink-0 text-zinc-500" title="Not a safety gate — always on.">
+          <span className="uppercase normal-case font-sans text-[9px]">Always on</span>
+        </span>
+      </div>
+    );
+  }
+  // veto displays Auto/Ask as "Allowed", Off as "Blocked"; deferrable shows the raw word.
+  const displayValue = deriveDisplayValue(control, value);
+  const g = GATE_STYLE[displayValue] ?? GATE_STYLE.Ask;
+  const word = deriveDisplayWord(control, g.word, displayValue);
+  const viaFocus = isViaFocus(isActivePane, cap, value);
+  return (
+    <div key={cap} data-testid={`gate-row-${cap}`} data-control={control} className="flex items-center justify-between gap-2">
+      <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
+      <span className={`flex items-center gap-1 shrink-0 ${g.text}`}>
+        <span className={`inline-block w-1 h-1 rounded-full ${g.dot}`} />
+        <span className="uppercase">{word}</span>
+        {viaFocus && <span className="text-cyan-400 normal-case" title="Loosened because this is the focused pane">· via focus</span>}
+      </span>
+    </div>
+  );
+}
+
 function GateChipInner({ effectiveGates, posture, isActivePane = false, compact = false }: GateChipProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -89,10 +184,10 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
         onClick={(e) => { e.stopPropagation(); setOpen(true); }}
         onMouseEnter={() => setOpen(true)}
         title={`${style.label} Click for the full breakdown.`}
-        className={`inline-flex items-center gap-1.5 rounded border px-1.5 ${compact ? "py-0" : "py-0.5"} font-mono uppercase tracking-wider ${compact ? "text-[8px]" : "text-[9px]"} font-bold transition-colors cursor-pointer ${style.ring} ${style.text}`}
+        className={chipTriggerClassName(style, compact)}
         data-testid="gate-chip-trigger"
       >
-        <span className={`inline-block rounded-full ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${style.dot}`} />
+        <span className={chipDotClassName(style, compact)} />
         <span>{safePosture}</span>
         {focused && (
           <span data-testid="gate-chip-focus-star" title="Focused — trust follows your focus here" className="text-cyan-300 leading-none">★</span>
@@ -127,43 +222,7 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
             <div key={category} className="mb-2 last:mb-0">
               <div className="text-[8px] uppercase tracking-widest text-zinc-600 font-bold mb-1">{category}</div>
               <div className="space-y-0.5">
-                {caps.map((cap) => {
-                  // `gates` is already normalized → always a valid GateValue. The `?? GATE_STYLE.Ask`
-                  // hard fallback makes this row provably non-throwing regardless of upstream changes.
-                  const value = gates[cap];
-                  // PHASE 2 (veto-toggle honesty): show the HONEST status per enforcement class so the
-                  // popover never implies a control the gate doesn't really have.
-                  //   informational → a read-only "Always on" badge (never gated).
-                  //   veto          → Allow/Blocked only; a veto "Ask" is collapsed to "Allowed" (it
-                  //                   can't defer, so Ask is effectively Allow — never shown as "Ask").
-                  //   deferrable    → the raw Auto/Ask/Off word (unchanged 3-way semantics).
-                  const control = controlForEnforcement(cap);
-                  if (control === "badge") {
-                    return (
-                      <div key={cap} data-testid={`gate-row-${cap}`} data-control="badge" className="flex items-center justify-between gap-2">
-                        <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
-                        <span className="flex items-center gap-1 shrink-0 text-zinc-500" title="Not a safety gate — always on.">
-                          <span className="uppercase normal-case font-sans text-[9px]">Always on</span>
-                        </span>
-                      </div>
-                    );
-                  }
-                  // veto displays Auto/Ask as "Allowed", Off as "Blocked"; deferrable shows the raw word.
-                  const displayValue: GateValue = control === "two-way" && value !== "Off" ? "Auto" : value;
-                  const g = GATE_STYLE[displayValue] ?? GATE_STYLE.Ask;
-                  const word = control === "two-way" ? g.word : displayValue;
-                  const viaFocus = isActivePane && SPOTLIGHT_CAPS.has(cap) && value === "Auto";
-                  return (
-                    <div key={cap} data-testid={`gate-row-${cap}`} data-control={control} className="flex items-center justify-between gap-2">
-                      <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
-                      <span className={`flex items-center gap-1 shrink-0 ${g.text}`}>
-                        <span className={`inline-block w-1 h-1 rounded-full ${g.dot}`} />
-                        <span className="uppercase">{word}</span>
-                        {viaFocus && <span className="text-cyan-400 normal-case" title="Loosened because this is the focused pane">· via focus</span>}
-                      </span>
-                    </div>
-                  );
-                })}
+                {caps.map((cap) => renderCapRow(cap, gates, isActivePane))}
               </div>
             </div>
           ))}
