@@ -24,6 +24,12 @@ import type {
 } from "../types";
 import type { StoredNote } from "../store/types";
 import { extractSlots } from "../templates";
+import {
+  projectTemplatesFrame, historyEntriesFromFrame, draftTextFromFrame, shouldAdoptMute,
+  buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
+  firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
+  templateClarifyText, templateApplyToast, layoutGatedText,
+} from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
 export type { TranscriptEntry };
@@ -525,162 +531,116 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // live, and double-handling would double the refetches and duplicate xterm writes.
   // Voice-only frames (audio/transcripts/grounding/channel state) live in the voice effect below.
   const handleObserveFrame = useCallback((msg: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
-    switch (msg?.type) {
-      case "stdout_chunk":
+    // The original flat switch is replaced by a per-type dispatch table: one tiny handler per frame
+    // type, each a thin closure over the same setters. The OBSERVABLE order of setState / refetch /
+    // earcon / desktopNote calls inside each handler is byte-identical to the original switch arm; the
+    // table just routes by type (prototype-safe Object.hasOwn lookup) instead of a giant branch ladder.
+    const handlers: Record<string, () => void> = {
+      stdout_chunk: () => {
         if (typeof msg.terminalId === "string" && typeof msg.chunk === "string") queueStdoutChunk(msg.terminalId, msg.chunk);
-        break;
-      case "terminals_updated":
+      },
+      terminals_updated: () => {
         refetchTerminals();
         refetchArchive(); // 2K.1: a stop/clear/restore elsewhere must repaint the freezer too
-        break;
-      case "pane_status":
-        // 3C.1: patch the matching pane IN PLACE from the frame's own fields (the classic app's
-        // deliberate pattern, App.tsx:1177-1185) instead of a full refetchTerminals round-trip —
-        // the heavy payload + out-of-order resolution caused the status flap this removes. A real
-        // status change also clears the humble "cooking…" overlay so a stale label can't linger.
+      },
+      // 3C.1: patch the matching pane IN PLACE from the frame's own fields (the classic app's
+      // deliberate pattern, App.tsx:1177-1185) instead of a full refetchTerminals round-trip — the
+      // heavy payload + out-of-order resolution caused the status flap this removes. A real status
+      // change also clears the humble "cooking…" overlay so a stale label can't linger.
+      pane_status: () => {
         if (typeof msg.terminalId === "string" && typeof msg.status === "string") {
           setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t)));
         }
-        break;
-      case "pane_quiescing":
-        // 3C.1: the pre-idle "cooking…" overlay flag, set in place (frame carries terminalId only).
-        // Cleared by the next pane_status push or the 20s poll reconcile.
+      },
+      // 3C.1: the pre-idle "cooking…" overlay flag, set in place (frame carries terminalId only).
+      pane_quiescing: () => {
         if (typeof msg.terminalId === "string") {
           setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, quiescing: true } : t)));
         }
-        break;
-      case "draft_updated":
-        // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit).
-        // Stash the latest text per pane; the Order Pad applies it ONLY while the textarea
-        // isn't focused (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
-        if (typeof msg.paneId === "string") {
-          const text = typeof msg.draft?.text === "string" ? msg.draft.text : "";
-          setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text, at: Date.now() } }));
-        }
-        break;
-      case "ledger_updated":
-        refetchLedger();
-        break;
-      case "plans_updated":
-        // 4U.1: the server broadcasts the full plans board on every plan mutation (create /
-        // execute / step-advance / delete) — adopt it directly; degrade to a refetch otherwise.
-        if (Array.isArray(msg.plans)) setPlans(msg.plans);
-        else refetchPlans();
-        break;
-      case "templates_updated":
-        // Journey-expansion C: the frame carries the RAW ledger rows (no derived `slots` — the
-        // server broadcasts ledger.promptTemplates verbatim). Adopt them with slots re-derived
-        // through the same pure engine the server projects with (extractSlots, src/templates.ts).
-        if (Array.isArray(msg.templates)) {
-          setTemplates(msg.templates
-            .filter((t: any) => t && typeof t.id === "string" && typeof t.body === "string")
-            .map((t: any) => ({
-              id: t.id, name: String(t.name ?? ""), description: String(t.description ?? ""),
-              body: t.body, slots: extractSlots(t.body),
-              created_at: Number(t.created_at ?? 0), updated_at: Number(t.updated_at ?? 0),
-            })));
-        } else refetchTemplates();
-        break;
-      case "layouts_updated":
-        // The frame carries the full layouts array (the same PaneLayout shape GET /api/layouts
-        // returns) — adopt it directly; degrade to a refetch otherwise (plans_updated precedent).
-        if (Array.isArray(msg.layouts)) setLayouts(msg.layouts);
-        else refetchLayouts();
-        break;
-      case "history_updated":
-        // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full
-        // array — mirror it per-pane so an open burner repaints; a payload-less frame stores
-        // entries:null, which tells the burner to refetch GET /api/terminals/:id/history.
-        if (typeof msg.terminalId === "string") {
-          const entries = Array.isArray(msg.history) ? (msg.history as PaneHistoryEntry[]) : null;
-          setPaneHistories((prev) => ({ ...prev, [msg.terminalId]: { entries, at: Date.now() } }));
-        }
-        break;
-      case "settings_updated":
+      },
+      // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit). Stash the
+      // latest text per pane; the Order Pad applies it ONLY while the textarea isn't focused
+      // (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
+      draft_updated: () => {
+        if (typeof msg.paneId === "string") setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text: draftTextFromFrame(msg), at: Date.now() } }));
+      },
+      // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full array —
+      // mirror it per-pane so an open burner repaints; a payload-less frame stores entries:null, which
+      // tells the burner to refetch GET /api/terminals/:id/history.
+      history_updated: () => {
+        if (typeof msg.terminalId === "string") setPaneHistories((prev) => ({ ...prev, [msg.terminalId]: { entries: historyEntriesFromFrame(msg), at: Date.now() } }));
+      },
+      ledger_updated: () => { refetchLedger(); },
+      // 4U.1: the server broadcasts the full plans board on every plan mutation — adopt it directly;
+      // degrade to a refetch otherwise.
+      plans_updated: () => { if (Array.isArray(msg.plans)) setPlans(msg.plans); else refetchPlans(); },
+      // Journey-expansion C: the frame carries the RAW ledger rows (no derived `slots`). Adopt them with
+      // slots re-derived through the same pure engine the server projects with (extractSlots).
+      templates_updated: () => { const p = projectTemplatesFrame(msg); if (p) setTemplates(p); else refetchTemplates(); },
+      // The frame carries the full layouts array — adopt it directly; degrade to a refetch otherwise.
+      layouts_updated: () => { if (Array.isArray(msg.layouts)) setLayouts(msg.layouts); else refetchLayouts(); },
+      settings_updated: () => {
         if (msg.settings) {
           setSettings(msg.settings as SystemSettings);
-          // 1B.4: propagate the authoritative mute state so a model-driven set_voice_mute
-          // actually gates mic capture (the processor reads micMutedRef) — mirrors classic
-          // App.tsx. The !== guard keeps our own optimistic toggle echo from bouncing it.
-          const wireMuted = msg.settings.voiceAi?.isMicMuted;
-          if (typeof wireMuted === "boolean" && wireMuted !== micMutedRef.current) setMicMuted(wireMuted);
+          // 1B.4: propagate the authoritative mute state so a model-driven set_voice_mute actually gates
+          // mic capture (the processor reads micMutedRef). The !== guard keeps our own optimistic toggle
+          // echo from bouncing it.
+          if (shouldAdoptMute(msg.settings.voiceAi?.isMicMuted, micMutedRef.current)) setMicMuted(msg.settings.voiceAi.isMicMuted);
         }
         if (typeof msg.globalPermissionsMode === "string") setGlobalPermissionsMode(msg.globalPermissionsMode as GlobalMode);
-        break;
-      case "switch_active_pane":
-        if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId);
-        break;
-      case "frozen":
-      case "stop_all":
-        if (msg.type === "frozen") earcon("alert"); // the All Hands brake — never silent
-        refetchFrozen();
-        refetchTerminals();
-        break;
-      case "approval_pending":
-        // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload
-        // (immediate — same shape the classic app builds) so the ApprovalDialog renders at once.
+      },
+      switch_active_pane: () => { if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId); },
+      frozen: () => { earcon("alert"); refetchFrozen(); refetchTerminals(); }, // the All Hands brake — never silent
+      stop_all: () => { refetchFrozen(); refetchTerminals(); },
+      // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload (immediate)
+      // so the ApprovalDialog renders at once.
+      approval_pending: () => {
         earcon("alert"); // the bell: a pane needs you (eyes-off)
         desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
-        setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, {
-          messageId: msg.messageId, cmd: msg.cmd, terminalId: msg.terminalId, rationale: msg.rationale,
-          effective_gates: msg.effective_gates, posture: msg.posture, effective_mode: msg.effective_mode, capability: msg.capability,
-        }]);
-        break;
-      case "approval_resolved":
+        setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
+      },
+      approval_resolved: () => {
         if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
         refetchPending();
-        break;
-      case "action_pending":
-        // A gated non-PTY mutator (create_pane / set_*_permissions) staged on the Ask tier — carry
-        // the SERVER-resolved effective posture so the confirm dialog can render the rider + divergence.
+      },
+      // A gated non-PTY mutator staged on the Ask tier — carry the SERVER-resolved effective posture so
+      // the confirm dialog can render the rider + divergence.
+      action_pending: () => {
         earcon("alert"); // needs a taste at the pass
         desktopNote("🛎 Needs a taste", typeof msg.summary === "string" ? msg.summary : "An action is waiting at the pass"); // 2K.6
-        setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, {
-          actionId: msg.actionId, capability: msg.capability, summary: msg.summary,
-          effective_gate: msg.effective_gate, effective_mode: msg.effective_mode, posture: msg.posture,
-          effective_gates: msg.effective_gates, pane_id: msg.pane_id, requested_mode: msg.requested_mode, global_override: msg.global_override,
-        }]);
-        break;
-      case "action_resolved":
-        if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId));
-        break;
-      case "command_auto_executed":
-        // 1B.7: end silent autonomy — the kitchen says WHAT fired where, not just a blip.
-        // showToast carries the "execute" earcon itself (no doubled tone) + the transcript line.
+        setPendingActions((prev) => prev.some((a) => a.actionId === msg.actionId) ? prev : [...prev, buildPendingAction(msg)]);
+      },
+      action_resolved: () => { if (msg.actionId) setPendingActions((prev) => prev.filter((a) => a.actionId !== msg.actionId)); },
+      // 1B.7: end silent autonomy — the kitchen says WHAT fired where. showToast carries the "execute"
+      // earcon itself (no doubled tone) + the transcript line.
+      command_auto_executed: () => {
         showToast(`Fired on its own — ${msg.terminalId}: ${truncateCmd(msg.cmd)}`, "fire", "execute");
         desktopNote("▶ Fired on its own", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
         refetchPending();
-        break;
-      case "command_blocked":
-        // 1B.7: a blocked command names the pane, the command and the server's reason.
-        showToast(
-          `Held back on ${msg.terminalId}: ${truncateCmd(msg.cmd)}${typeof msg.reason === "string" && msg.reason ? ` — ${msg.reason}` : ""}`,
-          "warn",
-        );
+      },
+      // 1B.7: a blocked command names the pane, the command and the server's reason.
+      command_blocked: () => {
+        showToast(blockedToastText(msg.terminalId, truncateCmd(msg.cmd), msg.reason), "warn");
         desktopNote("⛔ Held back", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
         refetchPending();
-        break;
-      case "proactive_notification":
-        // 1B.7: the orchestrator's proactive announcements reach the kitchen too (toast +
-        // durable transcript line — coalescing niceties live in the classic app only).
-        // earcon: null — the bus already fired its own proactive_earcon for this event.
+      },
+      // 1B.7: the orchestrator's proactive announcements reach the kitchen too. earcon: null — the bus
+      // already fired its own proactive_earcon for this event.
+      proactive_notification: () => {
         if (typeof msg.message === "string" && msg.message) {
           showToast(msg.message, msg.severity === "high" ? "warn" : "fire", null);
           desktopNote("👨‍🍳 From the kitchen", msg.message); // 2K.6
         }
-        break;
-      case "proactive_earcon":
-        // 1B.7: immediate non-verbal feedback for a proactive event (fires before the
-        // notification frame). The union now includes "completion" (announcementKinds.ts).
-        if (isEarconType(msg.earcon)) earcon(msg.earcon);
-        break;
-      case "error":
+      },
+      // 1B.7: immediate non-verbal feedback for a proactive event (fires before the notification frame).
+      proactive_earcon: () => { if (isEarconType(msg.earcon)) earcon(msg.earcon); },
+      error: () => {
         setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
         setTimeout(() => setToast(null), 4000);
-        break;
-      default:
-        break;
-    }
+      },
+    };
+    const type = msg?.type;
+    if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
   }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
@@ -945,63 +905,64 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       ws.onmessage = (event) => {
         let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
         try { msg = JSON.parse(event.data); } catch { return; }
-        switch (msg.type) {
-          // ── voice-only frames (Kitchen Radio) ──
-          case "audio":
-            if (typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
-            break;
-          case "interrupted":
-            resetAudioPlayback();
-            break;
-          case "transcript_text":
-            if ((msg.sender === "User" || msg.sender === "Janus") && typeof msg.text === "string") {
-              setTranscript((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50));
-            }
-            break;
-          case "grounding":
-            // Attach grounded sources/queries to the most recent Janus turn (no-op if none yet).
-            setTranscript((prev) => {
-              const sources = Array.isArray(msg.sources) ? msg.sources : [];
-              const queries = Array.isArray(msg.queries) ? msg.queries : [];
-              if (sources.length === 0 && queries.length === 0) return prev;
-              let lastJanus = -1;
-              for (let i = prev.length - 1; i >= 0; i--) { if (prev[i].sender === "Janus") { lastJanus = i; break; } }
-              if (lastJanus === -1) return prev;
-              const next = prev.slice();
-              next[lastJanus] = { ...next[lastJanus], grounding: { queries, sources } };
-              return next;
-            });
-            break;
-          case "voice_channel_lost":
-            // The Gemini channel died while our browser WS stayed open. Eyes-off must HEAR it, and a
-            // PERMANENT loss must stop the rail lying "● LIVE" (UX_BRIEF §4: no quiet state changes).
-            earcon("alert");
-            if (msg.permanent === true) {
-              setToast({ msg: "Radio's down — tune back in, Chef", kind: "warn" });
-              setTimeout(() => setToast(null), 4000);
-              desiredVoiceRef.current = false;
-              setVoiceLive(false);
+        // Split into the audio/transcript half and the channel-state half so neither arrow trips the
+        // complexity gate; the per-case setState/audio ordering is unchanged from the flat switch.
+        const handleVoiceMedia = (): boolean => {
+          switch (msg.type) {
+            // ── voice-only frames (Kitchen Radio) ──
+            case "audio":
+              if (typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
+              return true;
+            case "interrupted":
+              resetAudioPlayback();
+              return true;
+            case "transcript_text":
+              if ((msg.sender === "User" || msg.sender === "Janus") && typeof msg.text === "string") {
+                setTranscript((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50));
+              }
+              return true;
+            case "grounding":
+              // Attach grounded sources/queries to the most recent Janus turn (no-op if none yet).
+              setTranscript((prev) => attachGrounding(prev, msg.sources, msg.queries));
+              return true;
+            default:
+              return false;
+          }
+        };
+        const handleVoiceChannel = (): void => {
+          switch (msg.type) {
+            case "voice_channel_lost":
+              // The Gemini channel died while our browser WS stayed open. Eyes-off must HEAR it, and a
+              // PERMANENT loss must stop the rail lying "● LIVE" (UX_BRIEF §4: no quiet state changes).
+              earcon("alert");
+              if (msg.permanent === true) {
+                setToast({ msg: "Radio's down — tune back in, Chef", kind: "warn" });
+                setTimeout(() => setToast(null), 4000);
+                desiredVoiceRef.current = false;
+                setVoiceLive(false);
+                setVoiceReconnecting(false);
+              } else {
+                setVoiceReconnecting(true); // server is still retrying a transient drop
+              }
+              break;
+            case "voice_channel_restored":
+              // 2K.6: the Gemini channel came back after a transient drop. The all-clear must be as
+              // loud as the loss was: success earcon + toast + a durable transcript line (showToast
+              // carries all three) and the reconnecting tell stands down.
               setVoiceReconnecting(false);
-            } else {
-              setVoiceReconnecting(true); // server is still retrying a transient drop
-            }
-            break;
-          case "voice_channel_restored":
-            // 2K.6: the Gemini channel came back after a transient drop. The all-clear must be as
-            // loud as the loss was: success earcon + toast + a durable transcript line (showToast
-            // carries all three) and the reconnecting tell stands down.
-            setVoiceReconnecting(false);
-            showToast("Back on the air.", "fire", "success");
-            break;
-          case "error":
-            setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
-            setTimeout(() => setToast(null), 4000);
-            resetAudioPlayback();
-            break;
-          default:
-            // Broadcast/board frames also reach this socket — the observe lane owns them.
-            break;
-        }
+              showToast("Back on the air.", "fire", "success");
+              break;
+            case "error":
+              setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
+              setTimeout(() => setToast(null), 4000);
+              resetAudioPlayback();
+              break;
+            default:
+              // Broadcast/board frames also reach this socket — the observe lane owns them.
+              break;
+          }
+        };
+        if (!handleVoiceMedia()) handleVoiceChannel();
       };
       ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
       ws.onclose = (ev) => {
@@ -1067,7 +1028,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // ── mutations (the real backend writes; gated routes may 202/403) ───────
   const setGlobalMode = useCallback(async (mode: GlobalMode) => {
     setGlobalPermissionsMode(mode); // optimistic
-    showToast(mode === "Full Auto" ? "Lettin' 'em cook 🔥" : mode === "Read-Only" ? "Hands off — watchin' the line" : "Tastin' every plate 🛎");
+    showToast(globalModeToast(mode));
     if (isMockModeRef.current) return;
     try {
       const body = { ...(settings ?? {}), advanced: { ...(settings?.advanced ?? {}), globalPermissionsMode: mode } };
@@ -1094,7 +1055,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       const res = await apiFetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next) });
       if (res.ok) {
         const d = await res.json().catch(() => ({}));
-        if (d && d.settings && typeof d.settings === "object" && Object.keys(d.settings).length > 0) setSettings(d.settings);
+        if (hasSettingsEcho(d)) setSettings(d.settings as unknown as SystemSettings);
         if (d && typeof d.globalPermissionsMode === "string") setGlobalPermissionsMode(d.globalPermissionsMode);
         showToast("Rulebook updated."); // 1B.3: a settings write acks — never a silent maybe
       } else {
@@ -1111,10 +1072,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const createPane = useCallback(async (opts: { projectId: string; toolPreset: string; permissionsMode: string; name?: string }) => {
     const ws = (Object.values(ledger) as Workspace[]).find((w) => w.id === opts.projectId);
     const cwd = ws?.directory || "~";
-    const slug = (opts.name || "pane").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "pane";
+    const slug = paneSlug(opts.name);
     const terminalId = `${slug}-${Math.random().toString(36).slice(2, 6)}`;
-    const cmdFor = (tp: string) => settings?.presets?.find((p) => p.name === tp)?.command
-      || ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity", Custom: "bash" }[tp] ?? "bash");
+    const cmdFor = (tp: string) => resolvePaneCommand(tp, settings?.presets);
     if (isMockModeRef.current) { showToast(`Fired up ${terminalId} 🔥`); return; }
     try {
       const res = await apiFetch("/api/terminals", {
@@ -1364,18 +1324,16 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       const d = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.status === 409) {
         // clarify: the slot list drifted under us (body edited elsewhere) — say so + resync.
-        showToast(typeof d.clarify === "string" && d.clarify ? d.clarify : "That template needs more values, Chef", "warn");
+        showToast(templateClarifyText(d), "warn");
         if (!isMockModeRef.current) refetchTemplates();
         return;
       }
       if (!res.ok) {
-        const msg = [d.output, d.error, d.clarify].find((v) => typeof v === "string" && v) as string | undefined;
-        showToast(msg || "Couldn't fill that draft, Chef — try again.", "warn");
+        showToast(firstServerMessage(d) || "Couldn't fill that draft, Chef — try again.", "warn");
         return;
       }
-      const out = typeof d.output === "string" ? d.output : "";
-      if (out.includes("applied to pane")) showToast(`Draft's filled on ${paneId} — review it at the station 📝`);
-      else showToast(out || "Couldn't fill that draft, Chef — try again.", "warn");
+      const t = templateApplyToast(d, paneId);
+      showToast(t.msg, t.kind);
     } catch { showToast("Couldn't fill that draft, Chef — try again.", "warn"); }
   }, [refetchTemplates, showToast, mockClientOnly]);
 
@@ -1391,9 +1349,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (res.status === 403) { showToast("Saving layouts is gated off, Chef", "warn"); return; }
       if (!res.ok) { showToast("Couldn't save that layout, Chef — try again.", "warn"); return; }
       const d = await res.json().catch(() => ({} as Record<string, unknown>));
-      const out = typeof d.output === "string" ? d.output : "";
-      if (out.includes("saved")) showToast(`Layout '${n}' is on the books 🗺`);
-      else showToast(out || "Couldn't save that layout, Chef — try again.", "warn");
+      const t = layoutSaveToast(d, n);
+      showToast(t.msg, t.kind);
       if (!isMockModeRef.current) refetchLayouts();
     } catch { showToast("Couldn't save that layout, Chef — try again.", "warn"); }
   }, [refetchLayouts, showToast, mockClientOnly]);
@@ -1408,17 +1365,16 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       const d = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.status === 202) { showToast("Layout queued — needs your ok at the pass 🛎", "warn"); return; }
       if (res.status === 403) {
-        showToast(typeof d.error === "string" && d.error ? d.error : "That layout's gated off, Chef", "warn");
+        showToast(layoutGatedText(d), "warn");
         return;
       }
       if (!res.ok) {
-        const msg = [d.output, d.error, d.clarify].find((v) => typeof v === "string" && v) as string | undefined;
-        showToast(msg || "Couldn't set that layout, Chef — try again.", "warn");
+        showToast(firstServerMessage(d) || "Couldn't set that layout, Chef — try again.", "warn");
         return;
       }
-      const out = typeof d.output === "string" && d.output ? d.output : "Layout applied 🔥";
       // "not found" / "no active project" come back as 200 ok-narrations — they read honestly as-is.
-      showToast(out, out.includes("applied") ? "fire" : "warn", out.includes("applied") ? "execute" : undefined);
+      const t = layoutApplyToast(d);
+      showToast(t.msg, t.kind, t.earcon);
       if (!isMockModeRef.current) { refetchTerminals(); refetchLedger(); }
     } catch { showToast("Couldn't set that layout, Chef — try again.", "warn"); }
   }, [refetchTerminals, refetchLedger, showToast, mockClientOnly]);
