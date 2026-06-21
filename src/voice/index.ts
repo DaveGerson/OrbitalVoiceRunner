@@ -153,6 +153,26 @@ function pushAck(session: any, text: string): void {
   }
 }
 
+/**
+ * Apply a `draft_edit` WS frame (operator editing a pane's WIP draft — ungated, not a CLI write).
+ * Defaults the project to the ledger's active project and the pane to the active pane when the frame
+ * names neither. Persists via `manager.ledger.setDraft` and, on a successful write, broadcasts
+ * `draft_updated` for that pane. Behaviour-preserving extraction of the byte-identical inline blocks
+ * that lived in BOTH the observe-socket and the voice clientWs message handlers (Phase 7 CC refactor).
+ */
+function applyDraftEditFrame(
+  msg: any,
+  manager: OrchestratorManager,
+  coreState: CoreState,
+  broadcastDraft: (projectId: string, paneId: string) => void,
+): void {
+  const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
+  const paneId = msg.paneId || coreState.activePaneId;
+  if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
+    broadcastDraft(projectId, paneId);
+  }
+}
+
 // DispatchOutcome (the result shape returned by `dispatchProposal`) is the single canonical type in
 // ../actions/types — imported above. The byte-identical local duplicate that used to live here was
 // removed in c55.16 (tech_debt_dispatchoutcome_dedup); both arms were always kept in lockstep by hand.
@@ -396,11 +416,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // (no mic, no model, no token cost, no auto-reconnect). This is the mic-free
     // read lane the classic app's connectLive() never had: connecting there always
     // eagerly opened a live session. The cookie auth above still applies.
-    let observeOnly = false;
-    try {
-      observeOnly = new URLSearchParams((req.url || "").split("?")[1] || "").get("observe") === "1";
-    } catch { observeOnly = false; }
-    if (observeOnly) {
+    //
+    // Extracted whole into setupObserveConnection (Phase 7 CC refactor): it returns TRUE when this is
+    // an observe socket (caller short-circuits before any voice machinery), FALSE for a voice client.
+    // Behaviour is byte-identical to the inline block — same observe-flag parse, same message/close
+    // handlers, same early return.
+    const setupObserveConnection = (): boolean => {
+      let observeOnly = false;
+      try {
+        observeOnly = new URLSearchParams((req.url || "").split("?")[1] || "").get("observe") === "1";
+      } catch { observeOnly = false; }
+      if (!observeOnly) return false;
       console.log("Client connected to WebSocket (observe-only — no voice session)");
       clientWs.on("message", (data) => {
         try {
@@ -411,9 +437,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
           } else if (msg.type === "draft_edit" && msg.text !== undefined) {
             // Per-pane WIP draft edit (ungated — composing is not a CLI write). Defaults to the active pane.
-            const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
-            const paneId = msg.paneId || coreState.activePaneId;
-            if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) broadcastDraft(projectId, paneId);
+            applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
           }
         } catch (err) {
           console.warn("Received malformed observe-socket frame, skipping:", err);
@@ -427,8 +451,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         }
         console.log("Client WS closed (observe-only)");
       });
-      return;
-    }
+      return true;
+    };
+    if (setupObserveConnection()) return;
 
     // Step 6: drafts are per-pane now; the client fetches the active pane's draft once it has told
     // us which pane is open (set_active_pane). No global buffer to push on connect.
@@ -721,9 +746,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       scheduleReconnect();
     };
 
-      const sessionKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
-        ? manager.settings.secrets.geminiApiKey
-        : (process.env.GEMINI_API_KEY || "");
+      // Resolve the Gemini key: a real configured secret wins; the "CONFIGURED_IN_ENV" sentinel and a
+      // missing secret both fall back to GEMINI_API_KEY (then ""). Extracted from the inline ternary
+      // (Phase 7 CC refactor) so its `?.`/`&&`/`||` reads don't load connectLiveSession's own count.
+      // Byte-identical resolution to the former inline expression.
+      function resolveSessionKey(): string {
+        const secret = manager.settings.secrets?.geminiApiKey;
+        if (secret && secret !== "CONFIGURED_IN_ENV") return secret;
+        return process.env.GEMINI_API_KEY || "";
+      }
+      const sessionKey = resolveSessionKey();
 
       // PLM4 (Finding A): constructed through the per-server factory seam (default = `new GoogleGenAI`).
       // This sits OUTSIDE the inner try below, so a throw here escapes connectLiveSession; on the
@@ -821,6 +853,61 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         };
       }
 
+      // Build the Gemini Live `config` payload (responseModalities, ASR channels, voice, system prompt,
+      // the resume-handle spread, and the tools array). Extracted from the inline connect call (Phase 7
+      // CC refactor) so its handful of `?.`/`||`/ternary reads do not load connectLiveSession's own
+      // cyclomatic count. Byte-identical to the former inline object — same fields, same env/settings
+      // reads, same resume-handle key (`handle: newHandle`) and grounding-enabled toggle.
+      function buildLiveConfig(): any {
+        return {
+          responseModalities: [Modality.AUDIO],
+          // Correlated log: capture operator ASR + the model's spoken transcription ("thinking"/
+          // narration) so the voice_in + gemini_thinking legs carry real content. Additive (the existing
+          // modelTurn parsing is untouched); an empty object enables each channel.
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+          },
+          // sa4: the system prompt is now operator-editable (voiceAi.systemPrompt, Settings UI). Read it
+          // at connect time so an edited prompt is picked up on the next session (the existing Apply &
+          // Reconnect path). Behavior-preserving: with no custom template, buildSystemInstruction()
+          // renders DEFAULT_SYSTEM_PROMPT — byte-identical to the former inline literal — substituting
+          // the SAME two live values this block used before.
+          systemInstruction: buildSystemInstruction({
+            template: manager.settings.voiceAi?.systemPrompt,
+            activeProjectId: manager.ledger.activeProjectId || "None",
+            workspaces: Object.keys(manager.ledger.workspaces).map((pId: string) => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", "),
+          }),
+          ...({
+            // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The
+            // @google/genai `SessionResumptionConfig` field is `handle` (node.d.ts:10236-10243), NOT
+            // `token`, and the persisted update's handle is `newHandle` (LiveServerSessionResumptionUpdate,
+            // node.d.ts:7968-7979) — NOT `token`. The previous `{ token: …token }` mismatched on BOTH, so
+            // resume was always `{}` (a fresh session every reconnect) and PLM4's persistence bought
+            // nothing. Empty object => start a brand-new session (the SDK treats an absent handle as new).
+            sessionResumption: lastSessionResumptionToken?.newHandle
+              ? { handle: lastSessionResumptionToken.newHandle }
+              : {},
+            contextWindowCompression: {
+              triggerTokens: 25000,
+              slidingWindow: { targetTokens: 16000 }
+            }
+          } as any),
+          // BEAD aqx: the live tools array is now built by buildVoiceTools(). With grounding OFF (the
+          // default) it is EXACTLY [{ functionDeclarations: toGeminiDeclarations(REGISTRY) }] — byte-for-
+          // byte the former inline literal. With voiceAi.groundingEnabled ON it appends the built-in
+          // { googleSearch: {} } grounding tool as a sibling entry (functionDeclarations stays FIRST, so
+          // the function-calling path and the tools[0] golden are untouched). The flag is read HERE at
+          // connect time (same next-session semantics as voiceAi.systemPrompt / voiceAi.voice), so toggling
+          // it takes effect on the next session via the existing Apply & Reconnect path.
+          tools: buildVoiceTools({
+            groundingEnabled: !!manager.settings.voiceAi?.groundingEnabled,
+            declarations: toGeminiDeclarations(REGISTRY),
+          }),
+        };
+      }
+
       // Initialize Gemini Live session (through the injectable seam so tests /
       // the offline simulator can substitute a fake session). Uses the per-server snapshot
       // (boundLiveConnector) so a sibling test server's setLiveConnector cannot redirect us.
@@ -831,29 +918,268 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // LAST overwrote state.session with a handle the guard then closed: mic frames (clientWs
       // "audio" -> state.session.sendRealtimeInput) fed a DEAD session while coreState.activeLiveSession
       // still pointed at the healthy one.
+      // ── onmessage sub-handlers (Phase 7 CC refactor) ──────────────────────────────────────────
+      // The Gemini onmessage callback (formerly CC=57) is decomposed into these per-concern nested
+      // helpers, each invoked once per message. Every helper does its OWN guard and closes over the
+      // same connection-scoped state/session the inline blocks read, so ordering, side-effects, and
+      // the swallowed-error semantics are byte-identical to the former single body. They live in
+      // connectLiveSession scope (NOT inside the object literal) and are referenced by the onmessage
+      // arrow passed to boundLiveConnector below.
+
+      // Persist a rotated session-resumption handle (best-effort; ignored after WS-close or once the
+      // session is dead, so a post-close flush can't poison the next reconnect's resume).
+      const handleResumptionUpdate = (message: any): void => {
+            if (!(message.sessionResumptionUpdate && !state.wsClosed && !sessionDead)) return;
+            const prevHandle = lastSessionResumptionToken?.newHandle;
+            lastSessionResumptionToken = message.sessionResumptionUpdate;
+            if (lastSessionResumptionToken?.newHandle !== prevHandle) {
+              // Don't log the handle value — it's a session-resumption token (mildly sensitive) and
+              // rotates almost every turn (log spam). It's persisted to KV for debugging if needed.
+              console.log("[SESSION RESUMPTION] Handle rotated.");
+              // PLM4 (1): persist the fresh handle so a process restart can resume. Best-effort,
+              // never-throw; guarded for store === null inside persistResumptionToken.
+              persistResumptionToken(lastSessionResumptionToken);
+            }
+          };
+
+          // Resolve a hands-free approval/defer utterance (parseApprovalIntent already ran -> non-none
+          // intent). Precedence: a pane-WRITE approval for this session wins; else fall back to a staged
+          // GLOBAL pending action. Byte-identical to the former inline `if (parsed.intent !== "none")` body.
+          const routeApprovalIntent = (parsed: ReturnType<typeof parseApprovalIntent>, cleanUtter: string, session: any): void => {
+            interactionLog.log({ interactionId: turnId(), kind: "approval", data: { intent: parsed.intent, targetHint: parsed.targetHint } });
+            const entries = pendingApprovals.forSession(session);
+            if (entries.length === 0) {
+              // U1 (bead wsm-e2e-pinned-9fe): no pending pane-WRITE approval for this session, but a gated
+              // NON-PTY mutator (create_pane / set_*_permissions) may be staged in the GLOBAL pendingActions
+              // store (gateOrDefer Ask branch). Resolve it by voice, MIRRORING the REST handlers so the
+              // claim() seam keeps exactly-once across a REST+voice race. pendingActions is GLOBAL (not
+              // session-scoped) — a sharp edge in multi-session setups; here the single live session owns it.
+              // Precedence is preserved by being the `else` of entries.length>0: a session with BOTH resolves
+              // the APPROVAL first.
+              resolvePendingActionByVoice(cleanUtter, pendingActions, {
+                broadcast,
+                narrate: (t) => pushApprovalNarrationDep(session, t),
+                redact: redactSecrets,
+              });
+              return;
+            }
+            // Collision/ambiguity in the utterance itself -> clarify, never approve.
+            if (parsed.intent === "clarify") {
+              pushApprovalNarrationDep(session, `I heard both approve and reject — which did you mean for the ${entries.length} pending command${entries.length === 1 ? "" : "s"}?`);
+              return;
+            }
+            const target = selectApprovalTarget(
+              entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
+              parsed.targetHint,
+              pendingApprovals.lastAnnouncedFor(session)
+            );
+            if (target.ambiguous || !target.messageId) {
+              // >1 pending and nothing disambiguates -> clarify, list them.
+              const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
+              pushApprovalNarrationDep(session, `I have ${entries.length} pending: ${list}. Which one?`);
+            } else if (parsed.intent === "defer") {
+              // 4D.3: "later" / "not now" re-arms the TTL window (narration + cap live inside applyDeferral)
+              // — never the claim+delete reject path.
+              applyDeferral(target.messageId);
+            } else {
+              resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
+            }
+          };
+
+          // Process an operator ASR transcript: latch the speak-gate, emit the User transcript frame,
+          // capture dictation, and route any approval intent. Byte-identical to the former `if (userUtterance)`.
+          const handleOperatorUtterance = (userUtterance: string, session: any): void => {
+            state.currentSessionUserUtterance = userUtterance;
+            interactionLog.log({ interactionId: onOperatorSpeech(), kind: "voice_in", text: userUtterance, data: { source: "operator" } });
+
+            // BEAD tkd (should-I-speak gate): decide ONCE per operator turn whether Janus's spoken AUDIO
+            // for the model's reply should be muted. DEFAULT OFF (silenceGate:false) => shouldSpeak
+            // short-circuits to {speak:true}, a no-op (audio path byte-for-byte today's). When ON it mutes
+            // ONLY at high confidence the director is thinking-aloud (fail-open). LATCHED on state for this
+            // turn's audio + logged so a mute is auditable. Decision logic lives entirely in speakGate.ts.
+            const gate = shouldSpeak(userUtterance.trim(), { enabled: !!manager.settings.voiceAi?.silenceGate });
+            state.muteCurrentModelTurn = !gate.speak;
+            if (!gate.speak) {
+              interactionLog.log({
+                interactionId: turnId(),
+                kind: "system",
+                data: { tag: "speak_gate", speak: gate.speak, reason: gate.reason, confidence: gate.confidence },
+              });
+            }
+
+            clientWs.send(JSON.stringify({
+              type: "transcript_text",
+              sender: "User",
+              text: userUtterance
+            }));
+
+            const cleanUtter = userUtterance.trim();
+            if (!shouldRouteUtterance(cleanUtter)) return;
+            // A4: route any utterance with non-whitespace content so bare votes ("no"/"ok", 2 chars) reach
+            // the parser. Empty/whitespace drops. Step 6: capture dictation into the ACTIVE pane's WIP
+            // draft (raw material the operator refines before sending). No-op if no pane is open.
+            appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
+
+            // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
+            // announced targeting (NOT FIFO, NOT substring matching).
+            const parsed = parseApprovalIntent(cleanUtter);
+            if (parsed.intent === "none") return;
+            routeApprovalIntent(parsed, cleanUtter, session);
+          };
+
+          // Process a model spoken-text transcript: emit the Janus transcript frame + capture the thought.
+          const handleModelUtterance = (modelUtterance: string): void => {
+            state.currentSessionModelUtterance = modelUtterance;
+            interactionLog.log({ interactionId: turnId(), kind: "gemini_text", text: modelUtterance });
+            setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
+            clientWs.send(JSON.stringify({
+              type: "transcript_text",
+              sender: "Janus",
+              text: modelUtterance
+            }));
+            // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
+            const cleanUtter = modelUtterance.trim();
+            if (cleanUtter.length > 2) {
+              appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
+            }
+          };
+
+          // Surface Google-Search grounding (queries + sources) when this turn used it. Strict no-op when
+          // grounding is OFF (the model never populates groundingMetadata -> extractGrounding returns empty).
+          const handleGrounding = (message: any): void => {
+            const grounding = extractGrounding(message);
+            if (!hasGrounding(grounding)) return;
+            interactionLog.log({
+              interactionId: turnId(),
+              kind: "system",
+              data: { tag: "grounding", queries: grounding.queries, sources: grounding.sources },
+            });
+            clientWs.send(JSON.stringify({
+              type: "grounding",
+              queries: grounding.queries,
+              sources: grounding.sources,
+            }));
+          };
+
+          // Pass model audio back to the client — the SINGLE spoken-output choke point (responseModalities
+          // is [AUDIO]-only). BEAD tkd: suppress the AUDIO when the speak-gate latched a mute for this turn
+          // (the transcript_text frame stays unconditional). With the flag off, muteCurrentModelTurn is
+          // always false, so this is byte-for-byte today's path.
+          const relayModelAudio = (message: any): void => {
+            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (audio && !state.muteCurrentModelTurn) {
+              clientWs.send(JSON.stringify({ type: "audio", audio }));
+            }
+          };
+
+          // Relay a barge-in to the client + latch it, and clear the speak-gate mute latch at the turn
+          // boundary so it can NEVER bleed past one turn. Byte-identical to the former inline barge-in /
+          // turn-complete handling.
+          const relayInterruptAndTurnState = (message: any): void => {
+            if (message.serverContent?.interrupted) {
+              clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
+              // B1 (turn-aware ack): a barge-in means the operator seized the turn. Latch it (so an async-
+              // spawn ack SUPPRESSES rather than speaks over them) and stamp recency. Cleared when the model
+              // next takes the turn (setModelTurn) or on the next operator transcript.
+              state.lastInterrupted = true;
+              state.lastOperatorSpeechAt = Date.now();
+            }
+            // BEAD tkd: clear the speak-gate mute latch at the model turn boundary. (Also cleared at the
+            // START of the next operator turn in onOperatorSpeech.)
+            if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
+              state.muteCurrentModelTurn = false;
+            }
+          };
+
+          // Run ONE tool call through the registry (idempotency replay-guard, dispatch, the create_pane
+          // opening ack), guarded so a handler throw can't escape onmessage. Byte-identical to the inline
+          // per-call body of the toolCall loop.
+
+          // PLM4 (3): PER-DISPATCH IDEMPOTENCY / replay guard. A tool call RE-DELIVERED after a reconnect
+          // (Gemini may replay the same functionCall id on a resumed session) must NOT double-apply a
+          // SIDE-EFFECTING action. TRUE => this idempotency_key already has a SUCCEEDED action_log row, so
+          // answer "already done" and DO NOT re-run. Reads (readOnly) are exempt. The store lookup is
+          // best-effort: any fault returns false (falls through to normal dispatch — never blocks it).
+          // Extracted from runToolCall (Phase 7 CC refactor) — byte-identical predicate.
+          const isReplayShortCircuit = (call: any, name: string): boolean => {
+            const replayDef = REGISTRY.find((d: any) => d.name === name);
+            if (!(store && call.id && replayDef && !replayDef.readOnly)) return false;
+            try {
+              return store.hasSucceededIdempotencyKey(call.id);
+            } catch {
+              return false; // store fault -> proceed; the guard must never block dispatch.
+            }
+          };
+
+          // B1 (phase-1 ack): an AUTO-created pane boots asynchronously, so confirm "opening" immediately —
+          // BUT only when it will not speak over the operator (turn-aware gate). Called on the NON-replay
+          // path so a reconnect-replayed create_pane never double-narrates. The startsWith("Pane ") check
+          // matches ONLY the Auto-created success string — NOT the gated-Ask "needs operator confirmation" /
+          // forbidden "Error" strings — so a deferred create gets no false ack (its phase-2 fires later).
+          // Extracted from runToolCall (Phase 7 CC refactor) — byte-identical condition + ack text.
+          const maybeSpeakCreatePaneAck = (name: string, result: any, session: any): void => {
+            if (
+              name === "create_pane" &&
+              result?.kind === "ok" &&
+              typeof result.output === "string" &&
+              result.output.startsWith("Pane ") &&
+              shouldSpeakOpeningAck(ackState()) === "speak"
+            ) {
+              pushAck(session, "Opening the pane now.");
+            }
+          };
+
+          const runToolCall = async (call: any, ixnId: string, session: any): Promise<void> => {
+            const name = call.name;
+            const args = call.args as Record<string, any>;
+            try {
+              // REG1 phase-C: unified registry dispatch. runAction is itself try/caught + never throws; the
+              // outer catch here is belt-and-suspenders. A re-delivered side-effecting call short-circuits.
+              if (isReplayShortCircuit(call, name)) {
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
+                });
+              } else {
+                const actionCtx: ActionContext = buildActionContext(call.id!, name);
+                const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
+                interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
+                resultToToolResponse(result, session, name!, call.id!);
+                maybeSpeakCreatePaneAck(name!, result, session);
+              }
+            } catch (toolErr) {
+              console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
+              try {
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
+                });
+              } catch { /* session already torn down; nothing more we can do */ }
+            }
+          };
+
+          // Dispatch every functionCall in a toolCall message through runToolCall (mints/stamps the turn id
+          // and clears the barge-in latch per call, as the inline loop did).
+          const handleToolCalls = async (message: any, session: any): Promise<void> => {
+            if (!message.toolCall) return;
+            for (const call of message.toolCall.functionCalls || []) {
+              const ixnId = turnId();
+              setModelTurn(); // B1: entering the toolCall loop is a model turn -> clear barge-in latch.
+              interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name: call.name, callId: call.id, args: call.args ?? {} } });
+              // Guard every tool handler: an uncaught throw here would escape the Gemini SDK onmessage
+              // callback, leave this call.id unanswered, and stall the conversation.
+              await runToolCall(call, ixnId, session);
+            }
+          };
+
       const justConnected = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
           onmessage: async (message: LiveServerMessage) => {
             const session = state.session;
-            // Check for sessionResumption update. Gemini Live emits a fresh handle on
-            // (nearly) every turn; only log when it actually changes, else a single
-            // session floods the log with dozens of near-identical lines (bug E).
-            // Also ignore the SDK's final post-close token flush (wsClosed): writing it
-            // would overwrite the live handle with a stale one from a dead session and
-            // poison the next reconnect's resume attempt.
-            if ((message as any).sessionResumptionUpdate && !state.wsClosed && !sessionDead) {
-              const prevHandle = lastSessionResumptionToken?.newHandle;
-              lastSessionResumptionToken = (message as any).sessionResumptionUpdate;
-              if (lastSessionResumptionToken?.newHandle !== prevHandle) {
-                // Don't log the handle value — it's a session-resumption token (mildly sensitive) and
-                // rotates almost every turn (log spam). It's persisted to KV for debugging if needed.
-                console.log("[SESSION RESUMPTION] Handle rotated.");
-                // PLM4 (1): persist the fresh handle so a process restart can resume. Best-effort,
-                // never-throw; guarded for store === null inside persistResumptionToken.
-                persistResumptionToken(lastSessionResumptionToken);
-              }
-            }
+            // Thin dispatcher (Phase 7 CC refactor): each concern is handled by a nested helper above,
+            // invoked in the SAME order the inline body ran them. The helpers own their own guards, so
+            // this body is a flat sequence with no branching — behaviour is byte-identical to the former
+            // single onmessage block (resumption persist, transcripts, grounding, audio/turn-state, tools).
+            handleResumptionUpdate(message);
 
             // Extract operator + model transcripts. The operator's words arrive on
             // serverContent.inputTranscription (the REAL ASR channel, enabled in the config below); the
@@ -868,222 +1194,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
             }
 
-            if (userUtterance) {
-              state.currentSessionUserUtterance = userUtterance;
-              interactionLog.log({ interactionId: onOperatorSpeech(), kind: "voice_in", text: userUtterance, data: { source: "operator" } });
-
-              // BEAD tkd (should-I-speak gate): decide ONCE per operator turn whether Janus's spoken
-              // AUDIO for the model's reply should be muted. DEFAULT OFF (silenceGate:false) =>
-              // shouldSpeak short-circuits to {speak:true}, so this is a no-op and the audio path is
-              // byte-for-byte today's. When ON it mutes ONLY at high confidence the director is
-              // thinking-aloud (fail-open). The decision is LATCHED on state for this turn's audio and
-              // logged so a mute is auditable (guards a silent dead-voice regression). Decision logic
-              // lives ENTIRELY in speakGate.ts — here we only read the boolean.
-              const gate = shouldSpeak(userUtterance.trim(), { enabled: !!manager.settings.voiceAi?.silenceGate });
-              state.muteCurrentModelTurn = !gate.speak;
-              if (!gate.speak) {
-                interactionLog.log({
-                  interactionId: turnId(),
-                  kind: "system",
-                  data: { tag: "speak_gate", speak: gate.speak, reason: gate.reason, confidence: gate.confidence },
-                });
-              }
-
-              clientWs.send(JSON.stringify({
-                type: "transcript_text",
-                sender: "User",
-                text: userUtterance
-              }));
-
-              const cleanUtter = userUtterance.trim();
-              if (shouldRouteUtterance(cleanUtter)) {
-                // A4: route any utterance with non-whitespace content so bare votes ("no"/"ok", 2
-                // chars) reach the parser (was `cleanUtter.length > 2`, which amputated them before
-                // parseApprovalIntent — which already resolves bare yes/no). Empty/whitespace drops.
-                // Step 6: capture dictation into the ACTIVE pane's WIP draft (raw material the
-                // operator refines before sending). No-op if no pane is open.
-                appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
-
-                // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser
-                // + most-recently-announced targeting (NOT FIFO, NOT substring matching).
-                const parsed = parseApprovalIntent(cleanUtter);
-                if (parsed.intent !== "none") {
-                  interactionLog.log({ interactionId: turnId(), kind: "approval", data: { intent: parsed.intent, targetHint: parsed.targetHint } });
-                  const entries = pendingApprovals.forSession(session);
-                  if (entries.length > 0) {
-                    // Collision/ambiguity in the utterance itself -> clarify, never approve.
-                    if (parsed.intent === "clarify") {
-                      pushApprovalNarrationDep(session, `I heard both approve and reject — which did you mean for the ${entries.length} pending command${entries.length === 1 ? "" : "s"}?`);
-                    } else {
-                      const target = selectApprovalTarget(
-                        entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
-                        parsed.targetHint,
-                        pendingApprovals.lastAnnouncedFor(session)
-                      );
-                      if (target.ambiguous || !target.messageId) {
-                        // >1 pending and nothing disambiguates -> clarify, list them.
-                        const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
-                        pushApprovalNarrationDep(session, `I have ${entries.length} pending: ${list}. Which one?`);
-                      } else if (parsed.intent === "defer") {
-                        // 4D.3: "later" / "not now" re-arms the TTL window (narration + cap live
-                        // inside applyDeferral) — never the claim+delete reject path.
-                        applyDeferral(target.messageId);
-                      } else {
-                        resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
-                      }
-                    }
-                  } else {
-                    // U1 (bead wsm-e2e-pinned-9fe): no pending pane-WRITE approval for this session,
-                    // but a gated NON-PTY mutator (create_pane / set_*_permissions) may be staged in
-                    // the GLOBAL pendingActions store (gateOrDefer Ask branch, server.ts:1407).
-                    // Resolve it by voice, MIRRORING the REST handlers (server.ts:1560-1580) so the
-                    // claim() seam keeps exactly-once across a REST+voice race.
-                    // NOTE: pendingActions is GLOBAL (not session-scoped like pendingApprovals) — a
-                    // sharp edge in multi-session setups; here the single live session owns the queue.
-                    // Precedence is preserved by being the `else` of `entries.length > 0`: a session
-                    // with BOTH a pending approval and a staged action resolves the APPROVAL first.
-                    resolvePendingActionByVoice(cleanUtter, pendingActions, {
-                      broadcast,
-                      narrate: (t) => pushApprovalNarrationDep(session, t),
-                      redact: redactSecrets,
-                    });
-                  }
-                }
-              }
-            }
-            if (modelUtterance) {
-              state.currentSessionModelUtterance = modelUtterance;
-              interactionLog.log({ interactionId: turnId(), kind: "gemini_text", text: modelUtterance });
-              setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
-              clientWs.send(JSON.stringify({
-                type: "transcript_text",
-                sender: "Janus",
-                text: modelUtterance
-              }));
-
-              // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
-              const cleanUtter = modelUtterance.trim();
-              if (cleanUtter.length > 2) {
-                appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
-              }
-            }
-
-            // BEAD aqx (build-out): when grounded web search informed this turn, Gemini returns the
-            // queries it ran + the web sources on serverContent.groundingMetadata. Surface them so a
-            // grounded answer SHOWS where it came from (transcript chip + interaction log). This is a
-            // strict no-op when grounding is OFF: the model never populates groundingMetadata, so
-            // extractGrounding() returns empty and nothing is sent. Pure reader; never throws.
-            const grounding = extractGrounding(message);
-            if (hasGrounding(grounding)) {
-              interactionLog.log({
-                interactionId: turnId(),
-                kind: "system",
-                data: { tag: "grounding", queries: grounding.queries, sources: grounding.sources },
-              });
-              clientWs.send(JSON.stringify({
-                type: "grounding",
-                queries: grounding.queries,
-                sources: grounding.sources,
-              }));
-            }
-
-            // Pass audio back to client. This is the SINGLE spoken-output choke point — the only
-            // place model audio reaches the operator (responseModalities is [AUDIO]-only).
-            // BEAD tkd: if the should-I-speak gate latched a MUTE for this turn, suppress the AUDIO
-            // here (and only here). The transcript_text frame above stays UNCONDITIONAL — a muted
-            // turn is still visible on-screen (graceful, debuggable, NOT dead voice). With the flag
-            // off, muteCurrentModelTurn is always false, so this is byte-for-byte today's path.
-            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-          if (audio) {
-            if (!state.muteCurrentModelTurn) {
-              clientWs.send(JSON.stringify({ type: "audio", audio }));
-            }
-          }
-          if (message.serverContent?.interrupted) {
-            clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
-            // B1 (turn-aware ack): a barge-in means the operator seized the turn. Latch it (so an
-            // async-spawn ack SUPPRESSES rather than speaks over them) and stamp recency. Cleared
-            // when the model next takes the turn (setModelTurn) or on the next operator transcript.
-            state.lastInterrupted = true;
-            state.lastOperatorSpeechAt = Date.now();
-          }
-          // BEAD tkd: clear the speak-gate mute latch at the model turn boundary so it can NEVER bleed
-          // past one turn. (Also cleared at the START of the next operator turn in onOperatorSpeech.)
-          if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
-            state.muteCurrentModelTurn = false;
-          }
-
-          // Handle Tool Calls
-          if (message.toolCall) {
-            for (const call of message.toolCall.functionCalls || []) {
-              const name = call.name;
-              const args = call.args as Record<string, any>;
-              const ixnId = turnId();
-              setModelTurn(); // B1: entering the toolCall loop is a model turn -> clear barge-in latch.
-              interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name, callId: call.id, args: args ?? {} } });
-
-              // Guard every tool handler: an uncaught throw here would escape the Gemini SDK
-              // onmessage callback, leave this call.id unanswered, and stall the conversation.
-              try {
-              // REG1 phase-C: the entire if (name === ...) dispatch chain is REPLACED by the unified
-              // registry. runAction parses args, runs the handler-owned gate, redacts readOnly results,
-              // and NEVER throws; resultToToolResponse answers call.id exactly once (§9 voice column).
-              //
-              // Unified dispatch — EVERY tool (incl. the always-allowed emergency-brake trio, now wired
-              // to the real stopAll/releaseStopAll/isFrozen closures via ActionContext) routes through
-              // the registry. runAction is itself try/caught + never throws; the outer catch is belt-and-
-              // suspenders. The Gemini declarations come from the SAME REGISTRY (toGeminiDeclarations).
-              // PLM4 (3): PER-DISPATCH IDEMPOTENCY / replay guard. A tool call RE-DELIVERED after a
-              // reconnect (Gemini may replay the same functionCall id on a resumed session) must NOT
-              // double-apply a SIDE-EFFECTING (non-readOnly) action. If this idempotency_key (the
-              // Gemini call.id, unique per dispatch) already has a SUCCEEDED action_log row, answer the
-              // model it was already done and DO NOT re-run the handler. Reads (readOnly) are exempt —
-              // replaying a read is harmless. The store lookup is best-effort: any fault falls through
-              // to normal dispatch (the guard NEVER blocks the never-throw path).
-              const replayDef = REGISTRY.find((d: any) => d.name === name);
-              let replayShortCircuit = false;
-              if (store && call.id && replayDef && !replayDef.readOnly) {
-                try {
-                  if (store.hasSucceededIdempotencyKey(call.id)) replayShortCircuit = true;
-                } catch { /* store fault -> proceed; the guard must never block dispatch. */ }
-              }
-              if (replayShortCircuit) {
-                session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
-                });
-              } else {
-                const actionCtx: ActionContext = buildActionContext(call.id!, name);
-                const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
-                interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
-                resultToToolResponse(result, session, name!, call.id!);
-                // B1 (phase-1 ack): an AUTO-created pane now boots asynchronously, so confirm "opening"
-                // immediately — BUT only when it will not speak over the operator (turn-aware gate).
-                // Placed on the NON-replay path (replay short-circuits above), so a reconnect-replayed
-                // create_pane never double-narrates. The `startsWith("Pane ")` check matches ONLY the
-                // Auto-created success string (panes_write.ts) — NOT the gated-Ask "needs operator
-                // confirmation" / forbidden "Error" strings — so a deferred create gets no false ack
-                // (its phase-2 fires later, after the operator confirms and the pane truly boots).
-                if (
-                  name === "create_pane" &&
-                  (result as any)?.kind === "ok" &&
-                  typeof (result as any).output === "string" &&
-                  (result as any).output.startsWith("Pane ") &&
-                  shouldSpeakOpeningAck(ackState()) === "speak"
-                ) {
-                  pushAck(session, "Opening the pane now.");
-                }
-              }
-              } catch (toolErr) {
-                console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
-                try {
-                  session.sendToolResponse({
-                    functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
-                  });
-                } catch { /* session already torn down; nothing more we can do */ }
-              }
-            }
-          }
-        },
+            if (userUtterance) handleOperatorUtterance(userUtterance, session);
+            if (modelUtterance) handleModelUtterance(modelUtterance);
+            handleGrounding(message);
+            relayModelAudio(message);
+            relayInterruptAndTurnState(message);
+            await handleToolCalls(message, session);
+          },
         // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
         // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
         // coreState.activeLiveSession kept a dead handle and the frontend was never told. These siblings mirror
@@ -1103,53 +1220,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           handleSessionLost("closed", typeof info?.code === "number" ? info.code : undefined);
         },
       },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        // Correlated log: capture operator ASR + the model's spoken transcription ("thinking"/
-        // narration) so the voice_in + gemini_thinking legs carry real content. Additive (the existing
-        // modelTurn parsing is untouched); an empty object enables each channel.
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName } },
-        },
-        // sa4: the system prompt is now operator-editable (voiceAi.systemPrompt, Settings UI). Read it
-        // at connect time so an edited prompt is picked up on the next session (the existing Apply &
-        // Reconnect path). Behavior-preserving: with no custom template, buildSystemInstruction()
-        // renders DEFAULT_SYSTEM_PROMPT — byte-identical to the former inline literal — substituting
-        // the SAME two live values this block used before.
-        systemInstruction: buildSystemInstruction({
-          template: manager.settings.voiceAi?.systemPrompt,
-          activeProjectId: manager.ledger.activeProjectId || "None",
-          workspaces: Object.keys(manager.ledger.workspaces).map((pId: string) => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", "),
-        }),
-        ...({
-          // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The
-          // @google/genai `SessionResumptionConfig` field is `handle` (node.d.ts:10236-10243), NOT
-          // `token`, and the persisted update's handle is `newHandle` (LiveServerSessionResumptionUpdate,
-          // node.d.ts:7968-7979) — NOT `token`. The previous `{ token: …token }` mismatched on BOTH, so
-          // resume was always `{}` (a fresh session every reconnect) and PLM4's persistence bought
-          // nothing. Empty object => start a brand-new session (the SDK treats an absent handle as new).
-          sessionResumption: lastSessionResumptionToken?.newHandle
-            ? { handle: lastSessionResumptionToken.newHandle }
-            : {},
-          contextWindowCompression: {
-            triggerTokens: 25000,
-            slidingWindow: { targetTokens: 16000 }
-          }
-        } as any),
-        // BEAD aqx: the live tools array is now built by buildVoiceTools(). With grounding OFF (the
-        // default) it is EXACTLY [{ functionDeclarations: toGeminiDeclarations(REGISTRY) }] — byte-for-
-        // byte the former inline literal. With voiceAi.groundingEnabled ON it appends the built-in
-        // { googleSearch: {} } grounding tool as a sibling entry (functionDeclarations stays FIRST, so
-        // the function-calling path and the tools[0] golden are untouched). The flag is read HERE at
-        // connect time (same next-session semantics as voiceAi.systemPrompt / voiceAi.voice), so toggling
-        // it takes effect on the next session via the existing Apply & Reconnect path.
-        tools: buildVoiceTools({
-          groundingEnabled: !!manager.settings.voiceAi?.groundingEnabled,
-          declarations: toGeminiDeclarations(REGISTRY),
-        }),
-      },
+      config: buildLiveConfig(),
     }, sessionKey); // bead 9fz: 3rd arg = resolved key; the REAL connector short-circuits if blank.
 
       // PLM4 (2) + 3V.1 (a): IDENTITY GUARD on the just-resolved connect. The async connect could have
@@ -1164,116 +1235,133 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       }
       // The guard passed: THIS attempt owns the current generation — only now may it publish its
       // session into the connection-scoped state the mic path / tool dispatch / WS-close read.
-      state.session = justConnected;
+      //
+      // hoistAndSubscribe (Phase 7 CC refactor): the entire post-guard "publish + announce + arm the
+      // stable-reset timer + (re)subscribe pane signals" block, hoisted verbatim into a nested helper so
+      // its branches stop loading connectLiveSession's own cyclomatic count. Ordering and side-effects
+      // are byte-identical to the inline block — it still runs exactly once per (re)connect, AFTER the
+      // generation guard passed and `justConnected` was confirmed current.
+      const hoistAndSubscribe = (): void => {
+        state.session = justConnected;
 
-      // WS-F (spec §6.2): the live session is now established. Hoist it for the action last-call,
-      // then re-attach every staged survivor that outlived the prior disconnect (or a process
-      // restart) to THIS session and speak ONE batched resumption digest — "welcome back, here's
-      // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
-      // connect promise resolves so `session` is live.
-      coreState.activeLiveSession = justConnected;
-      // 2S.5: announce recovery — ONLY when this connect follows a broadcast loss on this same
-      // client connection (the flag is armed exactly where voice_channel_lost is broadcast, so a
-      // FIRST connect never says "restored"). Frame name is the kitchen-client contract:
-      // exactly `voice_channel_restored`.
-      if (state.voiceLostSinceLastRestore) {
-        state.voiceLostSinceLastRestore = false;
-        broadcast({ type: "voice_channel_restored" });
-      }
-      clearReconnectTimer();
-      // PLM4 (Finding: flap-unbounded backoff): do NOT refresh the bounded-retry budget eagerly on
-      // hoist — a flapping session (connect -> immediate drop -> reconnect -> …) would then reset
-      // `reconnectAttempts` every cycle and reconnect forever at the base delay. Instead arm a one-shot
-      // timer that refreshes the budget ONLY after the session has stayed continuously live for
-      // RECONNECT_STABLE_UPTIME_MS. A drop before then (handleSessionLost) clears this timer, so the
-      // budget keeps depleting and a flapping session exhausts the cap and gives up (permanent loss).
-      clearStableResetTimer();
-      state.stableResetTimer = setTimeout(() => {
-        state.stableResetTimer = null;
-        if (state.wsClosed) return; // operator already left.
-        // Only the CURRENTLY-live session earns the refresh; a stale callback can't credit a newer one.
-        if (coreState.activeLiveSession === justConnected) {
-          state.reconnectAttempts = 0;
-          console.log(`[VOICE] session stable for ${RECONNECT_STABLE_UPTIME_MS}ms — reconnect budget refreshed.`);
+        // WS-F (spec §6.2): the live session is now established. Hoist it for the action last-call,
+        // then re-attach every staged survivor that outlived the prior disconnect (or a process
+        // restart) to THIS session and speak ONE batched resumption digest — "welcome back, here's
+        // your queue" — re-requiring explicit approval. Runs exactly once per (re)connect, AFTER the
+        // connect promise resolves so `session` is live.
+        coreState.activeLiveSession = justConnected;
+        // 2S.5: announce recovery — ONLY when this connect follows a broadcast loss on this same
+        // client connection (the flag is armed exactly where voice_channel_lost is broadcast, so a
+        // FIRST connect never says "restored"). Frame name is the kitchen-client contract:
+        // exactly `voice_channel_restored`.
+        if (state.voiceLostSinceLastRestore) {
+          state.voiceLostSinceLastRestore = false;
+          broadcast({ type: "voice_channel_restored" });
         }
-      }, RECONNECT_STABLE_UPTIME_MS);
-      if (typeof state.stableResetTimer.unref === "function") state.stableResetTimer.unref();
-      // PLM4 (4): reannounceSurvivors runs on the reconnect path too (this closure IS the reconnect
-      // path), so the surviving approvals are re-attached + re-announced for free on every (re)connect.
-      reannounceSurvivors(justConnected);
+        clearReconnectTimer();
+        // PLM4 (Finding: flap-unbounded backoff): do NOT refresh the bounded-retry budget eagerly on
+        // hoist — a flapping session (connect -> immediate drop -> reconnect -> …) would then reset
+        // `reconnectAttempts` every cycle and reconnect forever at the base delay. Instead arm a one-shot
+        // timer that refreshes the budget ONLY after the session has stayed continuously live for
+        // RECONNECT_STABLE_UPTIME_MS. A drop before then (handleSessionLost) clears this timer, so the
+        // budget keeps depleting and a flapping session exhausts the cap and gives up (permanent loss).
+        clearStableResetTimer();
+        state.stableResetTimer = setTimeout(() => {
+          state.stableResetTimer = null;
+          if (state.wsClosed) return; // operator already left.
+          // Only the CURRENTLY-live session earns the refresh; a stale callback can't credit a newer one.
+          if (coreState.activeLiveSession === justConnected) {
+            state.reconnectAttempts = 0;
+            console.log(`[VOICE] session stable for ${RECONNECT_STABLE_UPTIME_MS}ms — reconnect budget refreshed.`);
+          }
+        }, RECONNECT_STABLE_UPTIME_MS);
+        if (typeof state.stableResetTimer.unref === "function") state.stableResetTimer.unref();
+        // PLM4 (4): reannounceSurvivors runs on the reconnect path too (this closure IS the reconnect
+        // path), so the surviving approvals are re-attached + re-announced for free on every (re)connect.
+        reannounceSurvivors(justConnected);
 
-      // Memory Synthesis P0a (freshness trigger #2): never hand a fresh/resumed live client a stale
-      // brief — synthesize + inject the current situational context once, right after the hoist.
-      // Non-blocking + self-guarded (injectMemoryBrief owns its try/catch).
-      injectMemoryBrief(justConnected, coreState.activePaneId);
+        // Memory Synthesis P0a (freshness trigger #2): never hand a fresh/resumed live client a stale
+        // brief — synthesize + inject the current situational context once, right after the hoist.
+        // Non-blocking + self-guarded (injectMemoryBrief owns its try/catch).
+        injectMemoryBrief(justConnected, coreState.activePaneId);
 
-      // Push-observation: bridge global pane signals into THIS live session. The bus owns
-      // debounce; we forward each signal as a user-role nudge (same convention as approval
-      // narration the model already speaks). Unsubscribed on socket close.
-      if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
-      // B1 (phase-2 defer): reset the queue for this fresh session — its `sig` payloads + timer belong
-      // to the prior session's closure; a survivor "ready" is re-published by the bus, not replayed.
-      state.deferredReady = [];
-      if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
+        // Push-observation: bridge global pane signals into THIS live session. The bus owns
+        // debounce; we forward each signal as a user-role nudge (same convention as approval
+        // narration the model already speaks). Unsubscribed on socket close.
+        if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
+        // B1 (phase-2 defer): reset the queue for this fresh session — its `sig` payloads + timer belong
+        // to the prior session's closure; a survivor "ready" is re-published by the bus, not replayed.
+        state.deferredReady = [];
+        if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
 
-      // B1 (phase-2 defer): stale ceiling — a "ready" older than this is dropped on drain (the UI
-      // already shows the pane, so a 10s-late "it's up" is pure noise).
-      const READY_DEFER_MAX_MS = 10_000;
+        // B1 (phase-2 defer): stale ceiling — a "ready" older than this is dropped on drain (the UI
+        // already shows the pane, so a 10s-late "it's up" is pure noise).
+        const READY_DEFER_MAX_MS = 10_000;
 
-      // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds).
-      const pushSignal = (sig: PaneSignal) => {
-        try {
-          justConnected.sendClientContent({
-            turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
-            turnComplete: true,
-          });
-        } catch (e) {
-          console.error("Failed to push pane signal to session:", e);
-        }
-      };
+        // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds).
+        const pushSignal = (sig: PaneSignal) => {
+          try {
+            justConnected.sendClientContent({
+              turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
+              turnComplete: true,
+            });
+          } catch (e) {
+            console.error("Failed to push pane signal to session:", e);
+          }
+        };
 
-      // B1 (phase-2 defer): re-evaluate the queued "ready" signals at the next safe gap. Single unref'd
-      // timer (re-armed if still mid-utterance); each queued sig is dropped once stale or suppressed on
-      // a barge-in, spoken when the turn is clear.
-      const armReadyDrain = () => {
-        if (state.readyDrainTimer) return; // one timer in flight; it re-arms itself if needed.
-        state.readyDrainTimer = setTimeout(() => {
-          state.readyDrainTimer = null;
-          const now = Date.now();
-          const still: DeferredPaneSignal[] = [];
-          for (const sig of state.deferredReady) {
-            const age = now - (sig.__deferredAt ?? now);
-            if (age > READY_DEFER_MAX_MS) continue; // stale -> drop (UI already reflects the pane).
+        // B1 (phase-2 defer): re-evaluate the queued "ready" signals at the next safe gap. Single unref'd
+        // timer (re-armed if still mid-utterance); each queued sig is dropped once stale or suppressed on
+        // a barge-in, spoken when the turn is clear.
+        const armReadyDrain = () => {
+          if (state.readyDrainTimer) return; // one timer in flight; it re-arms itself if needed.
+          state.readyDrainTimer = setTimeout(() => {
+            state.readyDrainTimer = null;
+            const now = Date.now();
+            const still: DeferredPaneSignal[] = [];
+            for (const sig of state.deferredReady) {
+              const age = now - (sig.__deferredAt ?? now);
+              if (age > READY_DEFER_MAX_MS) continue; // stale -> drop (UI already reflects the pane).
+              const d = shouldSpeakReadyAck(ackState());
+              if (d === "speak") { pushSignal(sig); }
+              else if (d === "suppress") { /* barge-in -> drop */ }
+              else { still.push(sig); } // defer again
+            }
+            state.deferredReady = still;
+            if (state.deferredReady.length > 0) armReadyDrain();
+          }, OPERATOR_HOLD_MS);
+          if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
+        };
+
+        state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
+          // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
+          // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
+          // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
+          // immediate-push behavior verbatim.
+          if (sig.kind === "created" || sig.kind === "closed") {
             const d = shouldSpeakReadyAck(ackState());
-            if (d === "speak") { pushSignal(sig); }
-            else if (d === "suppress") { /* barge-in -> drop */ }
-            else { still.push(sig); } // defer again
+            if (d === "suppress") return;                       // barge-in -> drop the "ready".
+            if (d === "defer") {                                // mid-utterance -> queue + re-arm.
+              // bead ykr: clone before stamping — the bus shares ONE signal object across all observers,
+              // so we must NOT mutate the shared payload. The queue owns its tagged copy.
+              state.deferredReady.push(stampDeferred(sig, Date.now()));
+              armReadyDrain();
+              return;
+            }
           }
-          state.deferredReady = still;
-          if (state.deferredReady.length > 0) armReadyDrain();
-        }, OPERATOR_HOLD_MS);
-        if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
+          pushSignal(sig);
+        });
       };
-
-      state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
-        // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
-        // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
-        // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
-        // immediate-push behavior verbatim.
-        if (sig.kind === "created" || sig.kind === "closed") {
-          const d = shouldSpeakReadyAck(ackState());
-          if (d === "suppress") return;                       // barge-in -> drop the "ready".
-          if (d === "defer") {                                // mid-utterance -> queue + re-arm.
-            // bead ykr: clone before stamping — the bus shares ONE signal object across all observers,
-            // so we must NOT mutate the shared payload. The queue owns its tagged copy.
-            state.deferredReady.push(stampDeferred(sig, Date.now()));
-            armReadyDrain();
-            return;
-          }
-        }
-        pushSignal(sig);
-      });
+      hoistAndSubscribe();
     } catch (err: any) {
+      handleConnectFailure(err);
+    }
+
+    // The connect threw (a real fault, not an async close). Extracted from the inline catch (Phase 7 CC
+    // refactor): same poisoned-handle self-heal, then the reconnect-vs-initial branch — byte-identical
+    // to the former catch body. Defined as a nested function so its branches do not load
+    // connectLiveSession's own cyclomatic count.
+    function handleConnectFailure(err: any): void {
       console.error(`Failed to establish Gemini Live session${isReconnect ? " (reconnect attempt)" : ""}:`, err);
       // PLM4 (Finding B2) STALE-HANDLE SELF-HEAL: this attempt fed a persisted resume handle and still
       // failed — treat the handle as poisoned. Null the in-memory token AND delete the persisted KV so
@@ -1336,17 +1424,25 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // mirror the inner catch's initial-failure behavior, and FALL THROUGH so the listeners still bind.
     // The inner catch (initial path) already sends the frame and RETURNS (no rethrow), so this outer
     // catch only fires on a pre-try throw — there is no double error-frame.
-    try {
-      await connectLiveSession(false);
-    } catch (err: any) {
-      console.error("Failed to establish Gemini Live session (initial setup):", err);
+    //
+    // Extracted into doInitialConnect (Phase 7 CC refactor): the two nested try/catch frames (the
+    // outer pre-try guard + the inner client-gone send guard) lived directly in the connection handler.
+    // Hoisting them into this awaited nested helper keeps the SAME ordering and the SAME swallow-on-
+    // failure semantics while moving their decision points out of the connection handler's own count.
+    const doInitialConnect = async (): Promise<void> => {
       try {
-        clientWs.send(JSON.stringify({
-          type: "error",
-          message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings.",
-        }));
-      } catch { /* client gone */ }
-    }
+        await connectLiveSession(false);
+      } catch (err: any) {
+        console.error("Failed to establish Gemini Live session (initial setup):", err);
+        try {
+          clientWs.send(JSON.stringify({
+            type: "error",
+            message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings.",
+          }));
+        } catch { /* client gone */ }
+      }
+    };
+    await doInitialConnect();
 
     // bead 9fz (part 2): register THIS connection's reconnect-nudge so a settings PUT that sets a real
     // Gemini key can resume voice WITHOUT a page reload. Recovery only — if a session is already live
@@ -1362,53 +1458,61 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       scheduleReconnect();
     }, state); // bead 53q: this connection's state object is the owner token (guards the clear path).
 
+    // Step 6: feed an operator mic frame to the live session (best-effort; a dead/torn-down session
+    // simply drops it). Extracted from the clientWs message dispatch (Phase 7 CC refactor) — behaviour-
+    // preserving: same guard (state.session present) + same PCM mimeType + same swallowed send error.
+    const handleVoiceAudioFrame = (msg: any): void => {
+      if (state.session) {
+        try {
+          state.session.sendRealtimeInput({
+            audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
+          });
+        } catch (e) {
+          console.error("Error feeding user mic:", e);
+        }
+      }
+    };
+
+    // Step 5: the UI just told us which pane is open. Record it (null = nothing open) and re-focus the
+    // live memory brief on the new pane. Extracted from the dispatch (Phase 7); byte-identical effects.
+    const handleSetActivePaneFrame = (msg: any): void => {
+      coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
+      // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the operator switched the open
+      // pane — re-focus the live brief on it (the prior pane demotes to a breadcrumb). Non-blocking.
+      injectMemoryBrief(state.session, coreState.activePaneId);
+    };
+
+    // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated. Stage 1
+    // (kill=false): freeze + cancel in-flight; panes keep running. Stage 2 (kill=true): hold-to-fire
+    // kill of running PTYs, only when already frozen. stopAll broadcasts {type:'frozen'}/{type:'stop_all'}
+    // to ALL clients; this is the per-client ack so the requesting UI can confirm completion. Extracted
+    // from the dispatch (Phase 7 CC refactor) — control flow + acks are byte-identical to the inline form.
+    const handleStopAllFrame = async (msg: any): Promise<void> => {
+      if (msg.kill === true) {
+        if (!coreState.frozen) {
+          clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
+        } else {
+          const killed = await stopAll(true);
+          clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: coreState.lastStopAllFailed }));
+        }
+      } else {
+        const running = await stopAll(false);
+        clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 1, frozen: true, running }));
+      }
+    };
+
     clientWs.on("message", async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "audio" && msg.audio) {
-          // Feed user mic to Gemini
-          if (state.session) {
-            try {
-              state.session.sendRealtimeInput({
-                audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
-              });
-            } catch (e) {
-              console.error("Error feeding user mic:", e);
-            }
-          }
+          handleVoiceAudioFrame(msg);
         } else if (msg.type === "draft_edit" && msg.text !== undefined) {
-          // Step 6: operator editing a pane's WIP draft. Defaults to the active pane when the
-          // client doesn't name one. Not a CLI write — ungated.
-          const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
-          const paneId = msg.paneId || coreState.activePaneId;
-          if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
-            broadcastDraft(projectId, paneId);
-          }
+          // Step 6: operator editing a pane's WIP draft (ungated). Defaults to the active pane.
+          applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
         } else if (msg.type === "set_active_pane") {
-          // Step 5: the UI is the source of truth for the active pane. Whatever the operator has
-          // open (or null if nothing is open) is recorded here and gates every Janus write.
-          coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
-          // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the operator switched
-          // the open pane — re-focus the live brief on it (the prior pane demotes to a breadcrumb).
-          // Non-blocking + self-guarded.
-          injectMemoryBrief(state.session, coreState.activePaneId);
+          handleSetActivePaneFrame(msg);
         } else if (msg.type === "stop_all") {
-          // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated.
-          // Stage 1 (default / kill=false): freeze + cancel in-flight; panes keep running.
-          // Stage 2 (kill=true): hold-to-fire kill of running PTYs, only when already frozen.
-          // stopAll broadcasts {type:'frozen'}/{type:'stop_all'} to ALL clients; this is the
-          // per-client ack so the requesting UI can confirm completion.
-          if (msg.kill === true) {
-            if (!coreState.frozen) {
-              clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
-            } else {
-              const killed = await stopAll(true);
-              clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: coreState.lastStopAllFailed }));
-            }
-          } else {
-            const running = await stopAll(false);
-            clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 1, frozen: true, running }));
-          }
+          await handleStopAllFrame(msg);
         } else if (msg.type === "release_stop_all") {
           // Clear the freeze from the UI (bead 8sq). Always allowed.
           releaseStopAll();

@@ -1,0 +1,76 @@
+name: "Complexity (cyclomatic gate)"
+
+# Dedicated lane so the complexity gate is independently triageable from the
+# main CI lane (locked decision D-2). It enforces per-function cyclomatic
+# complexity (McCabe) at <= 10 on NEW/changed code, while pre-existing
+# violations stay grandfathered in eslint-suppressions.json (baseline + ratchet).
+#
+# `eslint .` exit-code contract (see plan Phase 3/4):
+#   0 = clean
+#   1 = a new/changed function exceeds the limit -> fix it
+#   2 = a suppression is now unused (code improved) -> run `npx eslint . --prune-suppressions`
+#       and commit the (smaller) eslint-suppressions.json. The baseline only ratchets DOWN.
+#
+# cognitive-complexity is advisory (warn) and intentionally NOT gated here, so we
+# run a plain `eslint .` (NOT `--max-warnings 0`) — warnings print but never block.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  complexity:
+    name: "cyclomatic gate / node22 / ubuntu"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the churn x complexity report can count commits per file.
+          fetch-depth: 0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Exit-code-aware so a stale-suppression failure (exit 2) is actionable
+      # rather than masquerading as "you added complex code" (exit 1). The gate
+      # self-tests are NOT re-run here — the unit lane (`npm test`) already runs
+      # tests/test_complexity_*.ts.
+      - name: Cyclomatic gate (eslint complexity + baseline ratchet)
+        run: |
+          npx eslint . ; code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Complexity baseline has unused suppressions — code improved below a baselined function. Run 'npx eslint . --prune-suppressions', commit the smaller eslint-suppressions.json, and lower RATCHET_CEILING in tests/test_complexity_ratchet.ts."
+            exit 1
+          fi
+          exit "$code"
+
+      # The real anti-bypass guard: the committed baseline may only shrink vs the
+      # base branch. Catches re-baselining a NEW violation via `--suppress-all`,
+      # which the total-count ceiling can't. Bootstraps green until main has a baseline.
+      - name: Ratchet guard (suppressions may only shrink vs base)
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          node scripts/check-suppressions-ratchet.mjs --base origin/main
+
+      - name: Hotspot report (churn x complexity)
+        if: always()
+        # Invoke the script directly (not via `npm run`) so npm's banner doesn't
+        # corrupt the redirected JSON artifact.
+        run: node scripts/complexity-report.mjs --format json > complexity-report.json
+
+      - name: Upload complexity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complexity-report
+          path: complexity-report.json
+          retention-days: 14

@@ -726,51 +726,60 @@ export class JanusStore {
    *  flush to force. Present so manager code written against Ledger.save() works. */
   save(_immediate?: boolean): void { /* auto-persisted per mutation */ }
 
-  /** Upsert a pane from the legacy PaneMeta shape into the panes table. The
-   *  `shouldSave` flag is accepted for Ledger parity but ignored (always durable). */
-  updatePane(projectId: string, paneMeta: import("../types").PaneMeta, _shouldSave = true): void {
-    this.savePane({
+  // PaneMeta -> StoredPane string/number fields with their `?? <default>` fallback, driven off a table
+  // so paneMetaFromMeta stays under CC 10 while reproducing the prior per-field defaults verbatim.
+  // (Booleans use `!!` and the constants are handled separately below — see paneMetaToStoredPane.)
+  private static readonly PANE_META_DEFAULTS: ReadonlyArray<readonly [keyof StoredPane, string | number]> = [
+    ["name", ""], ["runtime_type", ""], ["tool_preset", "Custom"],
+    ["permissions_mode", "Human-in-the-Loop"], ["session_id", ""], ["last_known_state", "Idle"],
+    ["context_size", 0], ["last_status_change_at", null as any], ["last_command", null as any],
+  ];
+
+  /** Coerce a legacy PaneMeta into the StoredPane savePane expects. Extracted from updatePane verbatim:
+   *  identical per-field defaults, `!!` boolean coercion, and the fixed scrollback_path/created_at fields. */
+  private paneMetaToStoredPane(projectId: string, paneMeta: import("../types").PaneMeta): StoredPane {
+    const sp = {
       pane_id: paneMeta.pane_id,
       workspace_id: projectId,
-      name: paneMeta.name ?? "",
-      runtime_type: paneMeta.runtime_type ?? "",
-      tool_preset: paneMeta.tool_preset ?? "Custom",
-      permissions_mode: paneMeta.permissions_mode ?? "Human-in-the-Loop",
-      session_id: paneMeta.session_id ?? "",
-      last_known_state: (paneMeta.last_known_state as any) ?? "Idle",
       is_busy: !!paneMeta.is_busy,
       alive: !!paneMeta.alive,
-      context_size: paneMeta.context_size ?? 0,
-      last_status_change_at: paneMeta.last_status_change_at ?? null,
-      last_command: paneMeta.last_command ?? null,
       scrollback_path: null,
       created_at: 0,
       updated_at: Date.now(),
-    });
-    // Persist layered context / draft if the caller carried them on the meta,
-    // so a manager that mutates PaneMeta in place doesn't silently drop them.
-    if (paneMeta.draft) {
-      this.db.prepare("UPDATE panes SET draft=? WHERE pane_id=? AND workspace_id=?")
-        .run(JSON.stringify(paneMeta.draft), paneMeta.pane_id, projectId);
+    } as Record<string, unknown>;
+    for (const [col, dflt] of JanusStore.PANE_META_DEFAULTS) {
+      // `??` so a missing/undefined meta field gets the documented default; present values pass through.
+      sp[col] = (paneMeta as any)[col] ?? dflt;
     }
-    if (paneMeta.modelContext) {
-      this.db.prepare("UPDATE panes SET model_context=? WHERE pane_id=? AND workspace_id=?")
-        .run(JSON.stringify(paneMeta.modelContext), paneMeta.pane_id, projectId);
-    }
-    if (paneMeta.humanContext) {
-      this.db.prepare("UPDATE panes SET human_context=? WHERE pane_id=? AND workspace_id=?")
-        .run(JSON.stringify(paneMeta.humanContext), paneMeta.pane_id, projectId);
-    }
-    // bead 8sq: persist the per-pane capability-gate override. ALWAYS written (even when undefined →
-    // NULL) so clearing an override actually erases it rather than leaving a stale row value. The
-    // savePane upsert above doesn't touch this column, so this is the single place it round-trips.
-    {
-      const gates = paneMeta.capabilityGates && Object.keys(paneMeta.capabilityGates).length
-        ? JSON.stringify(paneMeta.capabilityGates)
-        : null;
-      this.db.prepare("UPDATE panes SET capability_gates=? WHERE pane_id=? AND workspace_id=?")
-        .run(gates, paneMeta.pane_id, projectId);
-    }
+    return sp as unknown as StoredPane;
+  }
+
+  /** Persist the PaneMeta-carried columns the savePane upsert does NOT touch. Extracted from updatePane
+   *  verbatim (same conditions, same SQL, same order): draft / model_context / human_context are written
+   *  ONLY when present on the meta (so an in-place mutator can't silently drop them), while
+   *  capability_gates is ALWAYS written — NULL when absent/empty — so clearing an override erases it. */
+  private persistPaneMetaExtras(projectId: string, paneMeta: import("../types").PaneMeta): void {
+    const update = (column: string, value: unknown) =>
+      this.db.prepare(`UPDATE panes SET ${column}=? WHERE pane_id=? AND workspace_id=?`)
+        .run(value, paneMeta.pane_id, projectId);
+    if (paneMeta.draft) update("draft", JSON.stringify(paneMeta.draft));
+    if (paneMeta.modelContext) update("model_context", JSON.stringify(paneMeta.modelContext));
+    if (paneMeta.humanContext) update("human_context", JSON.stringify(paneMeta.humanContext));
+    // bead 8sq: ALWAYS written (even when undefined → NULL) so clearing an override actually erases it
+    // rather than leaving a stale row value. The savePane upsert above doesn't touch this column.
+    const gates = paneMeta.capabilityGates && Object.keys(paneMeta.capabilityGates).length
+      ? JSON.stringify(paneMeta.capabilityGates)
+      : null;
+    update("capability_gates", gates);
+  }
+
+  /** Upsert a pane from the legacy PaneMeta shape into the panes table. The
+   *  `shouldSave` flag is accepted for Ledger parity but ignored (always durable). */
+  updatePane(projectId: string, paneMeta: import("../types").PaneMeta, _shouldSave = true): void {
+    this.savePane(this.paneMetaToStoredPane(projectId, paneMeta));
+    // Persist layered context / draft / per-pane gate override carried on the meta, so a manager that
+    // mutates PaneMeta in place doesn't silently drop them (see persistPaneMetaExtras for semantics).
+    this.persistPaneMetaExtras(projectId, paneMeta);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -886,6 +895,66 @@ export class JanusStore {
    *   - notes replicate getNotes' ORDER BY created_at DESC then .reverse() (ASC), with
    *     project notes = rows with no pane_id and pane notes partitioned per (project,pane);
    *   - orphan pane notes (their pane is gone) stay invisible, exactly as before. */
+  // Composite key separator for the per-(project,pane) note map. A NUL byte cannot appear in a
+  // project/pane id, so `${project_id}\0${pane_id}` is an unambiguous key (a space would collide for
+  // ids containing spaces). Centralized here and threaded through the partition/assembly helpers so the
+  // workspaces refactor preserves the original delimiter EXACTLY.
+  private static readonly WS_NOTE_KEY_SEP = " ";
+
+  /** Partition note rows (DESC by created_at) into project-scoped and pane-scoped buckets. Extracted
+   *  from the `workspaces` getter verbatim: partitioning preserves the DESC order within each group so
+   *  the getter trailing reverse() reproduces the legacy per-group ASC lists exactly; pane notes are
+   *  keyed `${project_id}\0${pane_id}` (WS_NOTE_KEY_SEP). Maps (not plain objects), so no string-key
+   *  prototype-leak surface. */
+  private partitionNotes(noteRows: any[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
+    const projectNotes = new Map<string, string[]>();
+    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
+    for (const n of noteRows) {
+      const [bucket, key] = n.pane_id
+        ? ([paneNotes, `${n.project_id}${JanusStore.WS_NOTE_KEY_SEP}${n.pane_id}`] as const)
+        : ([projectNotes, n.project_id] as const);
+      const arr = bucket.get(key);
+      if (arr) arr.push(n.text); else bucket.set(key, [n.text]);
+    }
+    return { projectNotes, paneNotes };
+  }
+
+  /** Group pane rows by their owning project (workspace_id), preserving row order. Extracted verbatim. */
+  private partitionPanesByProject(paneRows: any[]): Map<string, any[]> {
+    const panesByProject = new Map<string, any[]>();
+    for (const r of paneRows) {
+      const arr = panesByProject.get(r.workspace_id);
+      if (arr) arr.push(r); else panesByProject.set(r.workspace_id, [r]);
+    }
+    return panesByProject;
+  }
+
+  /** Assemble ONE project row into the legacy Workspace shape using the pre-partitioned note/pane maps.
+   *  Extracted from the `workspaces` getter verbatim: identical field set, the per-group `.slice()
+   *  .reverse()` (DESC->ASC), orphan-pane-note invisibility, and the summary/keyTerms defaults. */
+  private assembleWorkspace(
+    r: any,
+    panesByProject: Map<string, any[]>,
+    projectNotes: Map<string, string[]>,
+    paneNotes: Map<string, string[]>,
+  ): import("../types").Workspace {
+    const panes: Record<string, import("../types").PaneMeta> = {};
+    for (const paneRow of panesByProject.get(r.id) ?? []) {
+      const sp = this.hydratePane(paneRow);
+      const notes = (paneNotes.get(`${r.id}${JanusStore.WS_NOTE_KEY_SEP}${sp.pane_id}`) ?? []).slice().reverse();
+      panes[sp.pane_id] = this.toPaneMeta(sp, notes);
+    }
+    return {
+      id: r.id,
+      name: r.name,
+      directory: r.directory,
+      summary: r.summary ?? "",
+      notes: (projectNotes.get(r.id) ?? []).slice().reverse(),
+      panes,
+      keyTerms: this.parseJSON(r.key_terms, [] as string[]),
+    } as import("../types").Workspace;
+  }
+
   get workspaces(): Record<string, import("../types").Workspace> {
     const out: Record<string, import("../types").Workspace> = {};
     const projRows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as any[];
@@ -893,43 +962,10 @@ export class JanusStore {
     const paneRows = this.db.prepare("SELECT * FROM panes ORDER BY created_at").all() as any[];
     const noteRows = this.db.prepare("SELECT * FROM notes ORDER BY created_at DESC").all() as any[];
 
-    // Partition notes once. Partitioning preserves the DESC order within each group, so a
-    // trailing reverse() reproduces the legacy per-group ASC lists exactly.
-    const projectNotes = new Map<string, string[]>();
-    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
-    for (const n of noteRows) {
-      if (n.pane_id) {
-        const key = `${n.project_id} ${n.pane_id}`;
-        const arr = paneNotes.get(key);
-        if (arr) arr.push(n.text); else paneNotes.set(key, [n.text]);
-      } else {
-        const arr = projectNotes.get(n.project_id);
-        if (arr) arr.push(n.text); else projectNotes.set(n.project_id, [n.text]);
-      }
-    }
-
-    const panesByProject = new Map<string, any[]>();
-    for (const r of paneRows) {
-      const arr = panesByProject.get(r.workspace_id);
-      if (arr) arr.push(r); else panesByProject.set(r.workspace_id, [r]);
-    }
-
+    const { projectNotes, paneNotes } = this.partitionNotes(noteRows);
+    const panesByProject = this.partitionPanesByProject(paneRows);
     for (const r of projRows) {
-      const panes: Record<string, import("../types").PaneMeta> = {};
-      for (const paneRow of panesByProject.get(r.id) ?? []) {
-        const sp = this.hydratePane(paneRow);
-        const notes = (paneNotes.get(`${r.id} ${sp.pane_id}`) ?? []).slice().reverse();
-        panes[sp.pane_id] = this.toPaneMeta(sp, notes);
-      }
-      out[r.id] = {
-        id: r.id,
-        name: r.name,
-        directory: r.directory,
-        summary: r.summary ?? "",
-        notes: (projectNotes.get(r.id) ?? []).slice().reverse(),
-        panes,
-        keyTerms: this.parseJSON(r.key_terms, [] as string[]),
-      } as import("../types").Workspace;
+      out[r.id] = this.assembleWorkspace(r, panesByProject, projectNotes, paneNotes);
     }
     return out;
   }
@@ -979,28 +1015,24 @@ export class JanusStore {
   // event in the SAME transaction as the row-flip via recordActivity().
   // ──────────────────────────────────────────────────────────────────────────
 
+  // Columns hydrated verbatim (no default) and the per-column default for nullable columns. Driving
+  // the repetitive `?? <default>` fallbacks off a table (instead of 16 inline `??` operators) keeps
+  // hydrateHandoff under CC 10 while preserving EXACTLY the prior per-field defaults. `null` here means
+  // "absent column -> null" (was `?? null`); the literals reproduce the prior `?? ""`/`?? 0`/`?? "{}"`/
+  // `?? "[]"` defaults. Static const map (typed-literal keyed) — no string-key prototype-leak surface.
+  private static readonly HANDOFF_VERBATIM = ["id", "workspace_id", "to_pane", "kind", "state", "created_at"] as const;
+  private static readonly HANDOFF_DEFAULTS: ReadonlyArray<readonly [keyof StoredHandoff, string | number | null]> = [
+    ["from_pane", null], ["composed_prompt", ""], ["source_context", "{}"],
+    ["source_context_refs", "[]"], ["gate_approval_id", null], ["approved_by", null],
+    ["approved_via", null], ["revision_count", 0], ["staged_at", null],
+    ["delivered_at", null], ["consumed_at", null], ["terminal_at", null], ["expires_at", null],
+  ];
+
   private hydrateHandoff(r: any): StoredHandoff {
-    return {
-      id: r.id,
-      workspace_id: r.workspace_id,
-      from_pane: r.from_pane ?? null,
-      to_pane: r.to_pane,
-      kind: r.kind,
-      composed_prompt: r.composed_prompt ?? "",
-      source_context: r.source_context ?? "{}",
-      source_context_refs: r.source_context_refs ?? "[]",
-      state: r.state,
-      gate_approval_id: r.gate_approval_id ?? null,
-      approved_by: r.approved_by ?? null,
-      approved_via: r.approved_via ?? null,
-      revision_count: r.revision_count ?? 0,
-      created_at: r.created_at,
-      staged_at: r.staged_at ?? null,
-      delivered_at: r.delivered_at ?? null,
-      consumed_at: r.consumed_at ?? null,
-      terminal_at: r.terminal_at ?? null,
-      expires_at: r.expires_at ?? null,
-    };
+    const out = {} as Record<string, unknown>;
+    for (const col of JanusStore.HANDOFF_VERBATIM) out[col] = r[col];
+    for (const [col, dflt] of JanusStore.HANDOFF_DEFAULTS) out[col] = r[col] ?? dflt;
+    return out as unknown as StoredHandoff;
   }
 
   /** Insert a new handoff row (state defaults to 'composing'). Emits a HANDOFF event. */
@@ -1089,20 +1121,48 @@ export class JanusStore {
    * Atomic state-flip + audit event. `patch` carries optional column updates (e.g.
    * approved_by/approved_via/staged_at/delivered_at). Sets terminal_at for terminal states.
    */
+  // The state -> "stamp this timestamp column with patch.<col> ?? now" rule, in the exact order the
+  // original pushed them (staged, delivered, consumed). At most one fires per call (state is one value).
+  private static readonly HANDOFF_STATE_TS: ReadonlyArray<readonly [HandoffState, keyof StoredHandoff]> = [
+    ["staged", "staged_at"], ["delivered", "delivered_at"], ["consumed", "consumed_at"],
+  ];
+  // Patch columns written ONLY when present in the patch (=== undefined check, so an explicit null IS
+  // written), in the original push order. Listed via a typed-literal tuple table — no string-key map.
+  private static readonly HANDOFF_PATCH_COLS: ReadonlyArray<keyof StoredHandoff> = [
+    "approved_by", "approved_via", "gate_approval_id",
+  ];
+  private static readonly HANDOFF_TERMINAL_STATES: ReadonlySet<HandoffState> = new Set<HandoffState>([
+    "consumed", "rejected", "expired", "blocked_read_only",
+  ]);
+
+  /** Build the ordered SET fragments + bound params for an updateHandoffState flip. Extracted verbatim
+   *  (behavior-preserving) so the host method clears CC 10; the fragment ORDER is identical to the
+   *  prior inline pushes (state, then any state-timestamp, then present patch cols, then terminal_at). */
+  private buildHandoffStateUpdate(
+    id: string,
+    state: HandoffState,
+    patch: Partial<StoredHandoff>,
+    now: number,
+  ): { sets: string[]; params: Record<string, any> } {
+    const sets: string[] = ["state=@state"];
+    const params: Record<string, any> = { id, state };
+    for (const [matchState, col] of JanusStore.HANDOFF_STATE_TS) {
+      if (state === matchState) { sets.push(`${col}=@${col}`); params[col] = (patch as any)[col] ?? now; }
+    }
+    for (const col of JanusStore.HANDOFF_PATCH_COLS) {
+      if (patch[col] !== undefined) { sets.push(`${col}=@${col}`); params[col] = patch[col]; }
+    }
+    if (JanusStore.HANDOFF_TERMINAL_STATES.has(state)) {
+      sets.push("terminal_at=@terminal_at"); params.terminal_at = patch.terminal_at ?? now;
+    }
+    return { sets, params };
+  }
+
   updateHandoffState(id: string, state: HandoffState, patch: Partial<StoredHandoff> = {}): StoredHandoff | null {
     const existing = this.getHandoff(id);
     if (!existing) return null;
     const now = Date.now();
-    const terminalStates: HandoffState[] = ["consumed", "rejected", "expired", "blocked_read_only"];
-    const sets: string[] = ["state=@state"];
-    const params: Record<string, any> = { id, state };
-    if (state === "staged") { sets.push("staged_at=@staged_at"); params.staged_at = patch.staged_at ?? now; }
-    if (state === "delivered") { sets.push("delivered_at=@delivered_at"); params.delivered_at = patch.delivered_at ?? now; }
-    if (state === "consumed") { sets.push("consumed_at=@consumed_at"); params.consumed_at = patch.consumed_at ?? now; }
-    if (patch.approved_by !== undefined) { sets.push("approved_by=@approved_by"); params.approved_by = patch.approved_by; }
-    if (patch.approved_via !== undefined) { sets.push("approved_via=@approved_via"); params.approved_via = patch.approved_via; }
-    if (patch.gate_approval_id !== undefined) { sets.push("gate_approval_id=@gate_approval_id"); params.gate_approval_id = patch.gate_approval_id; }
-    if (terminalStates.includes(state)) { sets.push("terminal_at=@terminal_at"); params.terminal_at = patch.terminal_at ?? now; }
+    const { sets, params } = this.buildHandoffStateUpdate(id, state, patch, now);
     this.recordActivity(
       {
         type: EVENT_TYPES.HANDOFF,

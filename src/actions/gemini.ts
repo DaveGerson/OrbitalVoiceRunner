@@ -66,37 +66,45 @@ function unwrap(schema: z.ZodTypeAny): { inner: z.ZodTypeAny; optional: boolean 
   return { inner, optional };
 }
 
+/** The scalar zod leaf types that map 1:1 to a Gemini scalar (no extra shaping). */
+const SCALAR_LEAF_TYPES: ReadonlyMap<string, Type> = new Map<string, Type>([
+  ["string", Type.STRING],
+  ["number", Type.NUMBER],
+  ["boolean", Type.BOOLEAN],
+]);
+
 /** Map ONE non-object zod leaf to its Gemini scalar schema. Throws on an unsupported shape (R4). */
 function leafToGemini(schema: z.ZodTypeAny): GeminiSchema {
   const def = (schema as { def?: { type?: string; entries?: Record<string, string>; element?: z.ZodTypeAny } }).def;
   const t = def?.type;
-  switch (t) {
-    case "string":
-      return { type: Type.STRING };
-    case "number":
-      return { type: Type.NUMBER };
-    case "boolean":
-      return { type: Type.BOOLEAN };
-    case "enum": {
-      // zod 4 enum: def.entries is a { value: value } record; the keys are the literal members.
-      const values = Object.values(def?.entries ?? {}).map((v) => String(v));
-      return { type: Type.STRING, enum: values };
-    }
-    case "array": {
-      // zod 4 array: def.element is the element schema. Unwrap any optional/default/nullable on the
-      // element, then recurse (e.g. create_project.key_terms: z.array(z.string()) -> items STRING).
-      const element = def?.element;
-      if (!element) throw new Error(`zodToGeminiSchema: z.array with no element type`);
-      return { type: Type.ARRAY, items: leafToGemini(unwrap(element).inner) };
-    }
-    case "object":
-      // Nested objects recurse through the top-level converter.
-      return zodToGeminiSchema(schema as z.ZodObject<z.ZodRawShape>);
-    default:
-      throw new Error(
-        `zodToGeminiSchema: unsupported zod type "${String(t)}" — only object/string/number/boolean/enum/array/optional are supported`
-      );
+  // Simple scalars first (typed dispatch table — no per-type branch).
+  const scalar = t ? SCALAR_LEAF_TYPES.get(t) : undefined;
+  if (scalar) return { type: scalar };
+  if (t === "enum") {
+    // zod 4 enum: def.entries is a { value: value } record; the keys are the literal members.
+    const values = Object.values(def?.entries ?? {}).map((v) => String(v));
+    return { type: Type.STRING, enum: values };
   }
+  if (t === "array") {
+    return arrayLeafToGemini(def?.element);
+  }
+  if (t === "object") {
+    // Nested objects recurse through the top-level converter.
+    return zodToGeminiSchema(schema as z.ZodObject<z.ZodRawShape>);
+  }
+  throw new Error(
+    `zodToGeminiSchema: unsupported zod type "${String(t)}" — only object/string/number/boolean/enum/array/optional are supported`
+  );
+}
+
+/**
+ * zod 4 array -> Gemini ARRAY: def.element is the element schema. Unwrap any optional/default/nullable
+ * on the element, then recurse (e.g. create_project.key_terms: z.array(z.string()) -> items STRING).
+ * Throws when the array carries no element type. Extracted from leafToGemini to keep it under CC 10.
+ */
+function arrayLeafToGemini(element: z.ZodTypeAny | undefined): GeminiSchema {
+  if (!element) throw new Error(`zodToGeminiSchema: z.array with no element type`);
+  return { type: Type.ARRAY, items: leafToGemini(unwrap(element).inner) };
 }
 
 /**
@@ -188,62 +196,95 @@ export async function runAction(
     }
 
     // 1 validation point: coerce legacy arg shapes, then parse against the zod schema.
-    const coerced = def.coerceArgs ? def.coerceArgs(rawArgs) : rawArgs;
-    let args: unknown;
-    try {
-      args = def.params.parse(coerced);
-    } catch (parseErr) {
-      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-      return { kind: "error", message: `invalid arguments for ${name}: ${msg}` };
-    }
+    const parsed = parseActionArgs(def, name, rawArgs);
+    if ("error" in parsed) return parsed.error;
+    const args = parsed.args;
 
     // 1 execution point. The HANDLER owns gating: it calls ctx.gateOrDefer / ctx.dispatchProposal /
     // ctx.gateCapability exactly where and how its legacy server.ts branch does (or not at all, for
     // the intentionally-ungated tools). runAction applies no gate of its own.
-    //
-    // PLM1 — per-action timeout. NON-ALWAYS_ALLOWED handlers race a deadline ceiling so a wedged tool
-    // can never hang the dispatch loop; ALWAYS_ALLOWED (the emergency brake) is EXEMPT — a brake call
-    // must always run to completion. Elapsed ms is measured around the handler with performance.now()
-    // (high-resolution) and fed to the audit seam below.
     const start = performance.now();
-    let result: ActionResult;
-    if (def.capability === ALWAYS_ALLOWED) {
-      result = await def.handler(args as never, ctx);
-    } else {
-      result = await raceDeadline(
-        () => Promise.resolve(def.handler(args as never, ctx)),
-        def.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
-        name
-      );
-    }
+    const result = await invokeHandler(def, name, args, ctx);
     const ms = performance.now() - start;
 
     // 1 redaction point: readOnly results never leave the process un-redacted (mandatory, §5.6).
     const finalResult: ActionResult = def.readOnly ? redactResult(result, ctx.redact) : result;
 
-    // audit() seam — best-effort, fired exactly once per dispatch. The store wiring (-> JanusStore,
-    // which stamps `ts` + applies redaction) is done later in server.ts; here we only define + call.
-    // The try/catch NEVER rethrows: an audit sink fault must not break dispatch.
-    try {
-      ctx.audit?.({
-        name,
-        capability: def.capability,
-        resultKind: finalResult.kind,
-        ms,
-        args, // parsed args (NOT raw); the store applies redaction later
-        // Clean surface token, NOT the raw operator utterance (ctx.trigger on the voice path is the
-        // spoken phrase). The context builders set ctx.surface explicitly (the one source of truth);
-        // fall back to a session-presence heuristic (voice carries a live session; REST/WS pass null).
-        surface: ctx.surface ?? (ctx.session ? "voice" : "rest"),
-      });
-    } catch {
-      // swallow — audit must never break the dispatch path.
-    }
-
+    emitAudit(ctx, def, name, finalResult, ms, args);
     return finalResult;
   } catch (e) {
     // ONE try/catch. A throwing handler becomes a typed error, answered once by the surface.
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Coerce + parse rawArgs against the def's zod schema. Returns `{ args }` on success, or `{ error }`
+ * carrying the typed invalid-arguments ActionResult (same message shape as the inlined try/catch).
+ * Extracted to keep runAction under CC 10.
+ */
+function parseActionArgs(
+  def: ActionDef,
+  name: string,
+  rawArgs: Record<string, unknown>
+): { args: unknown } | { error: ActionResult } {
+  const coerced = def.coerceArgs ? def.coerceArgs(rawArgs) : rawArgs;
+  try {
+    return { args: def.params.parse(coerced) };
+  } catch (parseErr) {
+    const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    return { error: { kind: "error", message: `invalid arguments for ${name}: ${msg}` } };
+  }
+}
+
+/**
+ * Run the handler under the PLM1 per-action timeout policy. NON-ALWAYS_ALLOWED handlers race a
+ * deadline ceiling so a wedged tool can never hang the dispatch loop; ALWAYS_ALLOWED (the emergency
+ * brake) is EXEMPT — a brake call must always run to completion. Extracted to keep runAction under CC 10.
+ */
+function invokeHandler(
+  def: ActionDef,
+  name: string,
+  args: unknown,
+  ctx: ActionContext
+): Promise<ActionResult> {
+  if (def.capability === ALWAYS_ALLOWED) {
+    return Promise.resolve(def.handler(args as never, ctx));
+  }
+  return raceDeadline(
+    () => Promise.resolve(def.handler(args as never, ctx)),
+    def.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS,
+    name
+  );
+}
+
+/**
+ * Best-effort audit() emit — fired exactly once per dispatch. The store wiring (-> JanusStore, which
+ * stamps `ts` + applies redaction) is done later in server.ts; here we only call. The try/catch NEVER
+ * rethrows: an audit sink fault must not break dispatch. Extracted to keep runAction under CC 10.
+ */
+function emitAudit(
+  ctx: ActionContext,
+  def: ActionDef,
+  name: string,
+  finalResult: ActionResult,
+  ms: number,
+  args: unknown
+): void {
+  try {
+    ctx.audit?.({
+      name,
+      capability: def.capability,
+      resultKind: finalResult.kind,
+      ms,
+      args, // parsed args (NOT raw); the store applies redaction later
+      // Clean surface token, NOT the raw operator utterance (ctx.trigger on the voice path is the
+      // spoken phrase). The context builders set ctx.surface explicitly (the one source of truth);
+      // fall back to a session-presence heuristic (voice carries a live session; REST/WS pass null).
+      surface: ctx.surface ?? (ctx.session ? "voice" : "rest"),
+    });
+  } catch {
+    // swallow — audit must never break the dispatch path.
   }
 }
 

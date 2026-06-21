@@ -37,6 +37,68 @@ import type { InteractionLogger } from "../interactionLog";
 /** A pane transition edge — kept identical to the inline union it replaced. */
 type Transition = "idle" | "prompt" | "error" | "build-failed" | "exited";
 
+// The transition-classification keyword tables, lifted out of the inline ||-chains so the ladder is
+// hand-verifiable in one place and the classifier stays under CC 10. Order/semantics are IDENTICAL
+// to the original: build-failed markers are matched against the LOWERCASED chunk; the error markers
+// split into case-SENSITIVE substrings ("Error:"/"Exception:"/"Stderr:") and lowercased ones
+// ("traceback"/"fatal: ").
+const BUILD_FAILED_MARKERS = [
+  "failed to compile", "build failed", "modulenotfounderror", "compile error",
+  "npm err!", "failed to build", "error: command failed", "error: not found",
+] as const;
+const ERROR_MARKERS_CASE_SENSITIVE = ["Error:", "Exception:", "Stderr:"] as const;
+const ERROR_MARKERS_LOWER = ["traceback", "fatal: "] as const;
+
+/** The subset of transitions that escalate to a high-severity attention item + proactive announce. */
+type FailureTransition = "build-failed" | "error" | "exited";
+const FAILURE_TRANSITIONS = new Set<FailureTransition>(["build-failed", "error", "exited"]);
+/** Type guard: narrows a Transition to the high-severity FailureTransition subset. */
+function isFailureTransition(t: Transition): t is FailureTransition {
+  return FAILURE_TRANSITIONS.has(t as FailureTransition);
+}
+
+/** A structural view of the bits of a UniversalTerminal the transition classifier reads. */
+interface ClassifiableTerm {
+  status: string;
+  runtimeType?: string;
+}
+
+/** True when the chunk carries a build-failed marker (matched against the lowercased text). */
+function isBuildFailedChunk(lower: string): boolean {
+  return BUILD_FAILED_MARKERS.some((m) => lower.includes(m));
+}
+
+/** True when the chunk carries an error marker (case-sensitive markers OR lowercased markers). */
+function isErrorChunk(cleanChunk: string, lower: string): boolean {
+  return ERROR_MARKERS_CASE_SENSITIVE.some((m) => cleanChunk.includes(m)) ||
+    ERROR_MARKERS_LOWER.some((m) => lower.includes(m));
+}
+
+/**
+ * Refine an already-Idle pane: a shell pane whose ANSI-stripped tail matches SHELL_PROMPT is a
+ * "prompt" (I4: shell panes only, never an interactive_cli TUI); otherwise it is plain "idle". This
+ * is an attention-label concern independent of the authoritative idle decision (statusMachine.ts).
+ */
+function classifyIdleRefinement(term: ClassifiableTerm, cleanChunk: string): Transition {
+  const isShell = term.runtimeType === "shell";
+  const tail = stripAnsiSequences(cleanChunk);
+  return isShell && SHELL_PROMPT.test(tail) ? "prompt" : "idle";
+}
+
+/**
+ * Classify a PTY chunk into a pane transition, or null for no edge. IDENTICAL ladder to the original
+ * inline chain: Exited short-circuits to "exited"; else build-failed (precedence) > error > (only
+ * when the pane is already Idle) the prompt/idle refinement.
+ */
+function classifyTransition(term: ClassifiableTerm, cleanChunk: string): Transition | null {
+  if (term.status === "Exited") return "exited";
+  const lower = cleanChunk.toLowerCase();
+  if (isBuildFailedChunk(lower)) return "build-failed";
+  if (isErrorChunk(cleanChunk, lower)) return "error";
+  if (term.status === "Idle") return classifyIdleRefinement(term, cleanChunk);
+  return null;
+}
+
 /**
  * The single history entry shape the observe pipeline reads/writes. Structural so this module does NOT
  * import `HistoryEntry`/`HistoryManager` from server.ts (the no-server.ts-coupling rule). The singleton
@@ -195,6 +257,32 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   }
 
+  // WS-D summary for the proactive completion notification. Built ONLY from already-redacted/derived
+  // sources (never raw pane text): a fresh summarization when there is substantive output (which is
+  // then persisted + history_updated re-broadcast), else the existing redacted finalResponse, else a
+  // brief last-command-based fallback, else the bare "finished". Extracted from onIdle so the handler
+  // stays under CC 10; the side-effect ordering (save -> broadcast) is identical to the inline code.
+  async function computeIdleSummary(terminalId: string): Promise<string> {
+    const history = historyManager.loadHistory(terminalId);
+    if (history.length === 0) return "finished";
+    const lastEntry = history[history.length - 1];
+    try {
+      const cleanOutput = lastEntry.output ? stripAnsiSequences(lastEntry.output).trim() : "";
+      if (cleanOutput.length > 5 && !lastEntry.finalResponse) {
+        const summary = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
+        lastEntry.finalResponse = summary;
+        historyManager.saveHistory(terminalId, history);
+        broadcast({ type: "history_updated", terminalId, history });
+        return summary;
+      }
+      if (lastEntry.finalResponse) return lastEntry.finalResponse; // already WS-B redacted
+      if (lastEntry.command) return `${lastEntry.command} finished`;
+    } catch (err) {
+      console.error("Auto-summarization failed for command outcomes:", err);
+    }
+    return "finished";
+  }
+
   const onIdle = async (terminalId: string): Promise<void> => {
     // Dispatch join: the genuine Running→Idle completion edge is the SUCCESS settle signal (the
     // chunk classifier below dedups on lastStates, so shell panes that return to a prompt never
@@ -206,43 +294,20 @@ ${redact(rawOutput.slice(-3000))}`;
       console.error(`[onIdle] dispatch-join settle failed for ${terminalId}:`, e);
     }
     const term = manager.terminals[terminalId];
-    if (term) {
-      const history = historyManager.loadHistory(terminalId);
-      // WS-D summary for the proactive completion notification. Built ONLY from
-      // already-redacted/derived sources (never raw pane text): a fresh summarization when
-      // there is substantive output, else the existing redacted finalResponse, else a brief
-      // last-command-based fallback. Always set so the announcement below can fire.
-      let summaryText = "finished";
-      if (history.length > 0) {
-        const lastEntry = history[history.length - 1];
-        try {
-          const cleanOutput = lastEntry.output ? stripAnsiSequences(lastEntry.output).trim() : "";
-          if (cleanOutput.length > 5 && !lastEntry.finalResponse) {
-            summaryText = await summarizeCommandOutcome(lastEntry.command, cleanOutput);
-            lastEntry.finalResponse = summaryText;
-            historyManager.saveHistory(terminalId, history);
-            broadcast({ type: "history_updated", terminalId, history });
-          } else if (lastEntry.finalResponse) {
-            summaryText = lastEntry.finalResponse; // already WS-B redacted
-          } else if (lastEntry.command) {
-            summaryText = `${lastEntry.command} finished`;
-          }
-        } catch (err) {
-          console.error("Auto-summarization failed for command outcomes:", err);
-        }
-      }
+    if (!term) return;
 
-      // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
-      // idle inference. Fires regardless of whether there was substantive output / an existing
-      // finalResponse, with the redacted summary above as the message. The bus owns the
-      // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
-      announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
-      paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
-      // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
-      if (onBreadcrumb) {
-        const lc = redact(summaryText).slice(0, 80);
-        onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
-      }
+    const summaryText = await computeIdleSummary(terminalId);
+
+    // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
+    // idle inference. Fires regardless of whether there was substantive output / an existing
+    // finalResponse, with the redacted summary above as the message. The bus owns the
+    // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
+    announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
+    paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
+    // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
+    if (onBreadcrumb) {
+      const lc = redact(summaryText).slice(0, 80);
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
     }
   };
 
@@ -341,102 +406,125 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   }
 
+  // Prompt-composer refactor (architecture §5: Demote plans): a plan is an OUTLINE, not an execution
+  // engine. On a matched step edge we advance/complete/fail the plan and SURFACE the next step as a
+  // co-pilot suggestion — we NEVER auto-write the next step into a pane. The three arms below are the
+  // exact bodies of the original nested branches, lifted out so each function stays under CC 10.
+
+  /** Step matched its expected transition AND a next step exists: pause + surface the suggestion. */
+  function advanceToNextPlanStep(plan: any, nextIndex: number): void {
+    plan.currentStepIndex = nextIndex;
+    const nextStep = plan.steps[nextIndex];
+    nextStep.status = "pending";
+    plan.status = "paused";
+    const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+    manager.attentionQueue.push({
+      id: itemID,
+      type: "confirmation",
+      terminalId: nextStep.terminalId,
+      projectId: manager.ledger.activeProjectId || "default_project",
+      message: `Plan '${plan.name}': step ${nextIndex + 1} ready — suggest '${nextStep.command}' on '${nextStep.terminalId}'.`,
+      timestamp: new Date().toISOString(),
+      dismissed: false,
+      details: {
+        kind: "plan_step_suggestion",
+        planId: plan.id,
+        stepId: nextStep.id,
+        suggestedCommand: nextStep.command,
+        targetTerminalId: nextStep.terminalId,
+      },
+    });
+    pruneAttention(); // BUG-035 cap/TTL
+    broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+    announcementBus.enqueue({
+      kind: "plan_paused",
+      terminalId: nextStep.terminalId,
+      summary: `Plan '${plan.name}' — step ${nextIndex + 1} ready for your approval.`
+    });
+  }
+
+  /** Step matched and was the LAST step: the plan is complete. */
+  function completePlan(plan: any): void {
+    plan.status = "completed";
+    console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
+    broadcast({
+      type: "plan_completed",
+      planId: plan.id,
+      message: `Plan '${plan.name}' completed all steps successfully!`
+    });
+    announcementBus.enqueue({
+      kind: "plan_completed",
+      terminalId: plan.id,
+      summary: `Plan '${plan.name}' completed.`
+    });
+  }
+
+  /** A failure transition on the running step: fail the step + pause the plan. */
+  function failPlanStep(plan: any, currentStep: any, terminalId: string, transition: Transition): void {
+    currentStep.status = "failed";
+    plan.status = "paused";
+    console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
+    const itemID = "att_" + Math.random().toString(36).substring(2, 11);
+    manager.attentionQueue.push({
+      id: itemID,
+      type: "build-failed",
+      terminalId,
+      projectId: manager.ledger.activeProjectId || "default_project",
+      message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+      timestamp: new Date().toISOString(),
+      dismissed: false
+    });
+    pruneAttention(); // BUG-035 cap/TTL
+    broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+    broadcast({
+      type: "plan_paused",
+      planId: plan.id,
+      message: `Plan '${plan.name}' paused due to execution error.`
+    });
+    announcementBus.enqueue({
+      kind: "plan_paused",
+      terminalId,
+      summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
+    });
+  }
+
+  /**
+   * Handle a transition edge against ONE plan whose current running step is bound to `terminalId`.
+   * Returns true when the plan changed (the caller then force-persists + re-broadcasts the board).
+   */
+  function handlePlanStepEdge(plan: any, currentStep: any, terminalId: string, transition: Transition): boolean {
+    if (transition === currentStep.expectedTransition) {
+      currentStep.status = "completed";
+      console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
+      broadcast({
+        type: "plan_step_completed",
+        planId: plan.id,
+        stepId: currentStep.id,
+        message: `Plan step completed successfully on '${terminalId}'.`
+      });
+      const nextIndex = plan.currentStepIndex + 1;
+      if (nextIndex < plan.steps.length) {
+        advanceToNextPlanStep(plan, nextIndex);
+      } else {
+        completePlan(plan);
+      }
+      return true;
+    }
+    if (transition === "error" || transition === "build-failed" || transition === "exited") {
+      failPlanStep(plan, currentStep, terminalId, transition);
+      return true;
+    }
+    return false;
+  }
+
   function handlePlansTrigger(terminalId: string, transition: Transition) {
     const plans = manager.ledger.plans;
     let changed = false;
     for (const plan of plans) {
-      if (plan.status === "running") {
-        const currentStep = plan.steps[plan.currentStepIndex];
-        if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
-          if (transition === currentStep.expectedTransition) {
-            currentStep.status = "completed";
-            console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
-            broadcast({
-              type: "plan_step_completed",
-              planId: plan.id,
-              stepId: currentStep.id,
-              message: `Plan step completed successfully on '${terminalId}'.`
-            });
-            const nextIndex = plan.currentStepIndex + 1;
-            if (nextIndex < plan.steps.length) {
-              // Prompt-composer refactor: a plan is an OUTLINE, not an execution engine. We do
-              // NOT auto-advance by writing the next step into a pane. Mark the next step pending,
-              // pause the plan awaiting the operator, and SURFACE it as a co-pilot suggestion the
-              // operator can act on (gated, on the active pane). (architecture §5: Demote plans.)
-              plan.currentStepIndex = nextIndex;
-              const nextStep = plan.steps[nextIndex];
-              nextStep.status = "pending";
-              plan.status = "paused";
-              const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-              manager.attentionQueue.push({
-                id: itemID,
-                type: "confirmation",
-                terminalId: nextStep.terminalId,
-                projectId: manager.ledger.activeProjectId || "default_project",
-                message: `Plan '${plan.name}': step ${nextIndex + 1} ready — suggest '${nextStep.command}' on '${nextStep.terminalId}'.`,
-                timestamp: new Date().toISOString(),
-                dismissed: false,
-                details: {
-                  kind: "plan_step_suggestion",
-                  planId: plan.id,
-                  stepId: nextStep.id,
-                  suggestedCommand: nextStep.command,
-                  targetTerminalId: nextStep.terminalId,
-                },
-              });
-              pruneAttention(); // BUG-035 cap/TTL
-              broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-              announcementBus.enqueue({
-                kind: "plan_paused",
-                terminalId: nextStep.terminalId,
-                summary: `Plan '${plan.name}' — step ${nextIndex + 1} ready for your approval.`
-              });
-              changed = true;
-            } else {
-              plan.status = "completed";
-              console.log(`[PLAN COMPLETED] Plan '${plan.name}' finished successfully!`);
-              broadcast({
-                type: "plan_completed",
-                planId: plan.id,
-                message: `Plan '${plan.name}' completed all steps successfully!`
-              });
-              announcementBus.enqueue({
-                kind: "plan_completed",
-                terminalId: plan.id,
-                summary: `Plan '${plan.name}' completed.`
-              });
-              changed = true;
-            }
-          } else if (transition === "error" || transition === "build-failed" || transition === "exited") {
-            currentStep.status = "failed";
-            plan.status = "paused";
-            console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
-
-            const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-            manager.attentionQueue.push({
-              id: itemID,
-              type: "build-failed",
-              terminalId,
-              projectId: manager.ledger.activeProjectId || "default_project",
-              message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
-              timestamp: new Date().toISOString(),
-              dismissed: false
-            });
-            pruneAttention(); // BUG-035 cap/TTL
-            broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-            broadcast({
-              type: "plan_paused",
-              planId: plan.id,
-              message: `Plan '${plan.name}' paused due to execution error.`
-            });
-            announcementBus.enqueue({
-              kind: "plan_paused",
-              terminalId,
-              summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
-            });
-            changed = true;
-          }
-        }
+      if (plan.status !== "running") continue;
+      const currentStep = plan.steps[plan.currentStepIndex];
+      if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
+        if (handlePlanStepEdge(plan, currentStep, terminalId, transition)) changed = true;
       }
     }
     if (changed) {
@@ -445,149 +533,111 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   }
 
+  // The high-severity escalation (build-failed/error/exited): push a redacted attention item,
+  // re-broadcast the queue, enqueue the proactive announcement, and — for `exited` only — publish
+  // the voice-lane signal (error/prompt already flow per-chunk via classifyPaneOutput). Extracted
+  // from detectAndTriggerTransitions so each function stays under CC 10; behaviour is identical.
+  function emitHighSeverityTransition(terminalId: string, transition: FailureTransition, cleanChunk: string): void {
+    const activeProjectId = manager.ledger.activeProjectId || "default_project";
+    const id = "att_" + Math.random().toString(36).substring(2, 11);
+    // WS-B: scrub the chunk before it becomes a displayed/announced hint.
+    const hint = redact(cleanChunk.trim()).slice(-160);
+    manager.attentionQueue.push({
+      id,
+      type: transition,
+      terminalId,
+      projectId: activeProjectId,
+      message: `Pane '${terminalId}' transitioned to '${transition}' state.`,
+      timestamp: new Date().toISOString(),
+      dismissed: false
+    });
+    pruneAttention(); // BUG-035 cap/TTL
+    broadcast({ type: "attention_updated", queue: manager.attentionQueue });
+
+    // WS-D (BUG-024): high-severity proactive announcement (reuses the existing lastStates
+    // edge-dedup, so this fires once per genuine transition edge).
+    announcementBus.enqueue({ kind: transition, terminalId, summary: hint });
+
+    // 1C.2 (Phase 1 Track C): a crashed/ended pane must reach the VOICE lane too. Publish exactly
+    // like the idle/running/quiescing edges (same bus, redacted detail); only `exited` needs the
+    // lane here. The lastStates edge-dedup above means it fires once per genuine exit.
+    if (transition === "exited") {
+      paneSignalBus.publish({ paneId: terminalId, kind: "exited", detail: hint || undefined });
+    }
+  }
+
   function detectAndTriggerTransitions(terminalId: string, cleanChunk: string) {
     const term = manager.terminals[terminalId];
     if (!term) return;
 
-    let transition: Transition | null = null;
-    if (term.status === "Exited") {
-      transition = "exited";
-    } else {
-      const lower = cleanChunk.toLowerCase();
-      if (
-        lower.includes("failed to compile") ||
-        lower.includes("build failed") ||
-        lower.includes("modulenotfounderror") ||
-        lower.includes("compile error") ||
-        lower.includes("npm err!") ||
-        lower.includes("failed to build") ||
-        lower.includes("error: command failed") ||
-        lower.includes("error: not found")
-      ) {
-        transition = "build-failed";
-      } else if (
-        cleanChunk.includes("Error:") ||
-        cleanChunk.includes("Exception:") ||
-        cleanChunk.includes("Stderr:") ||
-        lower.includes("traceback") ||
-        lower.includes("fatal: ")
-      ) {
-        transition = "error";
-      } else if (term.status === "Idle") {
-        // The busy/idle status is now owned by the authoritative state machine
-        // (src/statusMachine.ts). Here we only refine an already-Idle pane into a
-        // "prompt" attention if it looks like a shell prompt awaiting input —
-        // using the shared SHELL_PROMPT regex from statusConstants.ts (I4: shell
-        // panes only, never an interactive_cli TUI). This is an attention-label
-        // concern independent of the idle decision. Otherwise we defer to "idle".
-        const isShell = term.runtimeType === "shell";
-        const tail = stripAnsiSequences(cleanChunk);
-        if (isShell && SHELL_PROMPT.test(tail)) {
-          transition = "prompt";
-        } else {
-          transition = "idle";
-        }
-      }
+    const transition = classifyTransition(term, cleanChunk);
+    const previousState = lastStates[terminalId];
+    if (!transition || transition === previousState) return;
+
+    lastStates[terminalId] = transition;
+    console.log(`[TRANSITION] Terminal ${terminalId} transitioned: ${previousState || "none"} -> ${transition}`);
+
+    broadcast({
+      type: "pane_transition",
+      terminalId,
+      transition,
+      message: `Pane ${terminalId} is now ${transition}.`
+    });
+
+    if (isFailureTransition(transition)) {
+      emitHighSeverityTransition(terminalId, transition, cleanChunk);
     }
 
-    const previousState = lastStates[terminalId];
-    if (transition && transition !== previousState) {
-      lastStates[terminalId] = transition;
-      console.log(`[TRANSITION] Terminal ${terminalId} transitioned: ${previousState || "none"} -> ${transition}`);
+    handleWatchRulesTrigger(terminalId, transition);
+    handlePlansTrigger(terminalId, transition);
 
-      broadcast({
-        type: "pane_transition",
-        terminalId,
-        transition,
-        message: `Pane ${terminalId} is now ${transition}.`
-      });
-
-      if (transition === "build-failed" || transition === "error" || transition === "exited") {
-        const activeProjectId = manager.ledger.activeProjectId || "default_project";
-        const id = "att_" + Math.random().toString(36).substring(2, 11);
-        // WS-B: scrub the chunk before it becomes a displayed/announced hint.
-        const hint = redact(cleanChunk.trim()).slice(-160);
-        manager.attentionQueue.push({
-          id,
-          type: transition,
-          terminalId,
-          projectId: activeProjectId,
-          message: `Pane '${terminalId}' transitioned to '${transition}' state.`,
-          timestamp: new Date().toISOString(),
-          dismissed: false
-        });
-        pruneAttention(); // BUG-035 cap/TTL
-        broadcast({ type: "attention_updated", queue: manager.attentionQueue });
-
-        // WS-D (BUG-024): high-severity proactive announcement (reuses the existing
-        // lastStates edge-dedup, so this fires once per genuine transition edge).
-        announcementBus.enqueue({ kind: transition, terminalId, summary: hint });
-
-        // 1C.2 (Phase 1 Track C): a crashed/ended pane must reach the VOICE lane too. Until now
-        // the exited edge went only to the attention queue + announcement bus — no PaneSignal was
-        // ever published, so the model kept narrating a dead pane as healthy. Publish exactly like
-        // the idle/running/quiescing edges (same bus, redacted detail); error/prompt already flow
-        // per-chunk via classifyPaneOutput, so only `exited` needs the lane here. The bus's
-        // per-(pane,kind) debounce is fine for this one-shot terminal event, and the lastStates
-        // edge-dedup above means it fires once per genuine exit.
-        if (transition === "exited") {
-          paneSignalBus.publish({ paneId: terminalId, kind: "exited", detail: hint || undefined });
-        }
-      }
-
-      handleWatchRulesTrigger(terminalId, transition);
-      handlePlansTrigger(terminalId, transition);
-
-      // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on the
-      // FAILURE edges here (error/build-failed/exited — lastStates-deduped, once per genuine
-      // edge). The SUCCESS settle lives on the genuine onIdle completion edge instead: a shell
-      // pane returns to a prompt after a command, so this classifier often sees no fresh "idle"
-      // edge at all (prompt==previousState), while the status machine's Running→Idle edge always
-      // fires. noteTransition only touches still-running members, so the two sites can never
-      // double-announce a group. Guarded per QW5: a join fault must never break observation.
-      try {
-        settleDispatchJoin(terminalId, transition);
-      } catch (e) {
-        console.error(`[TRANSITION] dispatch-join step failed for ${terminalId}:`, e);
-      }
+    // Dispatch join (templates-layouts-dispatch §5): settle in-flight dispatch members on the
+    // FAILURE edges here (error/build-failed/exited — lastStates-deduped, once per genuine edge).
+    // The SUCCESS settle lives on the genuine onIdle completion edge instead: a shell pane returns
+    // to a prompt after a command, so this classifier often sees no fresh "idle" edge at all
+    // (prompt==previousState), while the status machine's Running→Idle edge always fires.
+    // noteTransition only touches still-running members, so the two sites can never double-announce
+    // a group. Guarded per QW5: a join fault must never break observation.
+    try {
+      settleDispatchJoin(terminalId, transition);
+    } catch (e) {
+      console.error(`[TRANSITION] dispatch-join step failed for ${terminalId}:`, e);
     }
   }
 
-  const onOutput = (terminalId: string, chunk: string): void => {
-    const term = manager.terminals[terminalId];
-    if (term) {
-      const cleanChunk = stripAnsiSequences(chunk);
-      // QW5 (bead qw5): this runs on EVERY PTY data chunk. Each observation step is independent —
-      // a throw from one bad chunk in any of them used to propagate out of the PTY data event,
-      // crashing the process AND blinding the pane (the buffering/broadcast tail below never ran).
-      // Guard each step in its own try/catch so one failing step neither kills the others nor blinds
-      // the stream; log and continue. This is a net, not a behavior change.
-      try {
-        // Push-observation: classify each chunk and publish error/prompt signals. The bus
-        // debounces per (pane,kind), so a chatty pane won't spam the model.
-        const cls = classifyPaneOutput(cleanChunk);
-        if (cls) {
-          paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
-        }
-      } catch (e) {
-        console.error(`[ONOUTPUT] pane-signal step failed for ${terminalId}:`, e);
+  // QW5 (bead qw5): this runs on EVERY PTY data chunk. Each observation step is independent — a throw
+  // from one bad chunk used to propagate out of the PTY data event, crashing the process AND blinding
+  // the pane (the buffering/broadcast tail never ran). Guard each step in its own try/catch so one
+  // failing step neither kills the others nor blinds the stream; log and continue. This is a net, not
+  // a behavior change. Extracted from onOutput so the handler stays under CC 10.
+  function runObservationSteps(terminalId: string, cleanChunk: string): void {
+    try {
+      // Push-observation: classify each chunk and publish error/prompt signals. The bus
+      // debounces per (pane,kind), so a chatty pane won't spam the model.
+      const cls = classifyPaneOutput(cleanChunk);
+      if (cls) {
+        paneSignalBus.publish({ paneId: terminalId, kind: cls.kind, detail: cls.detail });
       }
-      try {
-        historyManager.appendOutputToLastCommand(terminalId, cleanChunk);
-      } catch (e) {
-        console.error(`[ONOUTPUT] history step failed for ${terminalId}:`, e);
-      }
-      try {
-        // Classify transitions and handle trigger rules
-        detectAndTriggerTransitions(terminalId, cleanChunk);
-      } catch (e) {
-        console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
-      }
+    } catch (e) {
+      console.error(`[ONOUTPUT] pane-signal step failed for ${terminalId}:`, e);
     }
+    try {
+      historyManager.appendOutputToLastCommand(terminalId, cleanChunk);
+    } catch (e) {
+      console.error(`[ONOUTPUT] history step failed for ${terminalId}:`, e);
+    }
+    try {
+      // Classify transitions and handle trigger rules
+      detectAndTriggerTransitions(terminalId, cleanChunk);
+    } catch (e) {
+      console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
+    }
+  }
 
-    // Correlated log: attribute terminal output to the active turn (best-effort; VOICE_TRACE-gated
-    // because PTY is high-volume). Lets "what did the operator's command actually produce?" be
-    // answered from the same stream as the voice/tool legs.
+  // Correlated log: attribute terminal output to the active turn (best-effort; VOICE_TRACE-gated
+  // because PTY is high-volume). Lets "what did the operator's command actually produce?" be answered
+  // from the same stream as the voice/tool legs.
+  function logCorrelatedPtyOutput(terminalId: string, chunk: string): void {
     const lastInteractionId = getLastInteractionId();
     if (VOICE_TRACE && lastInteractionId) {
       try {
@@ -599,7 +649,11 @@ ${redact(rawOutput.slice(-3000))}`;
         });
       } catch { /* observability never breaks the PTY loop */ }
     }
+  }
 
+  // Per-pane output buffer + the single 30ms coalescing flush timer (shared across panes). Identical
+  // to the inline tail; extracted so onOutput stays flat.
+  function bufferAndScheduleFlush(terminalId: string, chunk: string): void {
     if (!outputBuffers[terminalId]) {
       outputBuffers[terminalId] = [];
     }
@@ -620,6 +674,15 @@ ${redact(rawOutput.slice(-3000))}`;
         }
       }, 30);
     }
+  }
+
+  const onOutput = (terminalId: string, chunk: string): void => {
+    const term = manager.terminals[terminalId];
+    if (term) {
+      runObservationSteps(terminalId, stripAnsiSequences(chunk));
+    }
+    logCorrelatedPtyOutput(terminalId, chunk);
+    bufferAndScheduleFlush(terminalId, chunk);
   };
 
   return { onOutput, onIdle, onRunning, onQuiescing };

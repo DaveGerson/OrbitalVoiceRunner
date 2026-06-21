@@ -13,51 +13,71 @@ import {
 } from "./statusMachine";
 import { AgentAdapter, createAdapter } from "./agents";
 
+// Status-machine input to applyStatusEvent and its extracted side-effect helpers.
+type StatusEvent =
+  | { kind: "output"; text: string }
+  | { kind: "probe"; probe: ProbeResult }
+  | { kind: "input" }
+  | { kind: "idleTimer" };
+
+// Field-level coercion helpers for the preset rebuild. Each isolates one `||`/`??`/`?:`
+// decision so buildPreset stays a flat property list (no inline branching to count).
+function presetStr(value: any): string {
+  return String(value || "");
+}
+function presetBool(value: any, fallback: boolean): boolean {
+  return Boolean(value ?? fallback);
+}
+function presetEnum<T extends string>(value: any, fallback: T): T {
+  return (value || fallback) as T;
+}
+function presetOptStr(value: any): string {
+  return value !== undefined ? String(value) : "";
+}
+
+// Rebuild a CliPreset field-by-field from an untrusted source object, applying the
+// canonical defaults + type coercions. `id` and `name` are computed by the caller
+// (the two parsePresetsSafe paths differ only there); every other field is coerced
+// identically. preservePresetGates (bead 8sq) carries the source's per-preset
+// capabilityGates through this rebuild — without it a saved gate matrix is erased.
+function buildPreset(source: any, id: string, name: string): CliPreset {
+  const s = source ?? {};
+  return preservePresetGates({
+    id,
+    name,
+    command: presetStr(s.command),
+    enabled: presetBool(s.enabled, true),
+    permissionsMode: presetEnum(s.permissionsMode, "Human-in-the-Loop"),
+    windowMode: presetEnum(s.windowMode, "Standard Split-Pane"),
+    visualTheme: presetEnum(s.visualTheme, "Default Green Mono"),
+    persistentRestore: presetBool(s.persistentRestore, false),
+    dangerouslySkipPermissions: presetBool(s.dangerouslySkipPermissions, false),
+    sessionResume: presetBool(s.sessionResume, true),
+    portOffset: presetOptStr(s.portOffset),
+    customEnvVars: presetOptStr(s.customEnvVars)
+  }, source);
+}
+
+// Map a settings-object key (claudeCode / codex / antigravity, or an arbitrary id)
+// to its display name. Unknown keys are capitalized.
+function presetDisplayName(key: string): string {
+  switch (key) {
+    case "claudeCode": return "Claude Code";
+    case "codex": return "Codex CLI";
+    case "antigravity": return "Antigravity Agent";
+    default: return key.charAt(0).toUpperCase() + key.slice(1);
+  }
+}
+
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
-    // bead 8sq: preservePresetGates carries per-preset capabilityGates through the field-by-field
-    // rebuild. This is the SERVER-SIDE persistence choke-point (updateSettings -> here); without it
-    // a saved preset's gate matrix was silently erased even when the client sent it.
-    return input.map((item: any) => preservePresetGates({
-      id: String(item?.id || ""),
-      name: String(item?.name || ""),
-      command: String(item?.command || ""),
-      enabled: Boolean(item?.enabled ?? true),
-      permissionsMode: item?.permissionsMode || "Human-in-the-Loop",
-      windowMode: item?.windowMode || "Standard Split-Pane",
-      visualTheme: item?.visualTheme || "Default Green Mono",
-      persistentRestore: Boolean(item?.persistentRestore ?? false),
-      dangerouslySkipPermissions: Boolean(item?.dangerouslySkipPermissions ?? false),
-      sessionResume: Boolean(item?.sessionResume ?? true),
-      portOffset: item?.portOffset !== undefined ? String(item.portOffset) : "",
-      customEnvVars: item?.customEnvVars !== undefined ? String(item.customEnvVars) : ""
-    }, item));
+    // bead 8sq: the field-by-field rebuild is the SERVER-SIDE persistence choke-point
+    // (updateSettings -> here); buildPreset carries per-preset capabilityGates through it.
+    return input.map((item: any) => buildPreset(item, String(item?.id || ""), String(item?.name || "")));
   }
   if (input && typeof input === "object") {
-    return Object.entries(input).map(([key, val]: [string, any]) => {
-      let displayName = key;
-      if (key === "claudeCode") displayName = "Claude Code";
-      else if (key === "codex") displayName = "Codex CLI";
-      else if (key === "antigravity") displayName = "Antigravity Agent";
-      else {
-        displayName = key.charAt(0).toUpperCase() + key.slice(1);
-      }
-      return preservePresetGates({
-        id: key,
-        name: val?.name || displayName,
-        command: String(val?.command || ""),
-        enabled: Boolean(val?.enabled ?? true),
-        permissionsMode: val?.permissionsMode || "Human-in-the-Loop",
-        windowMode: val?.windowMode || "Standard Split-Pane",
-        visualTheme: val?.visualTheme || "Default Green Mono",
-        persistentRestore: Boolean(val?.persistentRestore ?? false),
-        dangerouslySkipPermissions: Boolean(val?.dangerouslySkipPermissions ?? false),
-        sessionResume: Boolean(val?.sessionResume ?? true),
-        portOffset: val?.portOffset !== undefined ? String(val.portOffset) : "",
-        customEnvVars: val?.customEnvVars !== undefined ? String(val.customEnvVars) : ""
-      // bead 8sq: carry per-preset capabilityGates through (server-side persistence path).
-      }, val);
-    });
+    return Object.entries(input).map(([key, val]: [string, any]) =>
+      buildPreset(val, key, val?.name || presetDisplayName(key)));
   }
   return [
     { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
@@ -98,25 +118,27 @@ const PRESET_FALLBACK_CMD: Record<Exclude<ToolPresetUnion, "Custom">, string> = 
  * the addTerminal union. Unknown / empty -> "Custom" (fail-safe: a bare shell is
  * harmless; a mis-spawned agent under Full Auto is not).
  */
+// Every accepted spelling (preset .id, display .name, or already-union value) mapped
+// onto its canonical addTerminal union member. Anything absent -> "Custom" (fail-safe).
+const PRESET_UNION_BY_ALIAS: Record<string, ToolPresetUnion> = {
+  claudeCode: "Claude Code",
+  "Claude Code": "Claude Code",
+  codex: "Codex",
+  "Codex CLI": "Codex",
+  Codex: "Codex",
+  antigravity: "Antigravity",
+  "Antigravity Agent": "Antigravity",
+  Antigravity: "Antigravity",
+  Custom: "Custom",
+};
+
 export function normalizePreset(raw: string | undefined | null): ToolPresetUnion {
   const v = (raw ?? "").trim();
-  switch (v) {
-    case "claudeCode":
-    case "Claude Code":
-      return "Claude Code";
-    case "codex":
-    case "Codex CLI":
-    case "Codex":
-      return "Codex";
-    case "antigravity":
-    case "Antigravity Agent":
-    case "Antigravity":
-      return "Antigravity";
-    case "Custom":
-      return "Custom";
-    default:
-      return "Custom";
-  }
+  // Own-key check is REQUIRED: PRESET_UNION_BY_ALIAS is a plain object, so a bare
+  // `[v] ?? "Custom"` would resolve inherited Object.prototype members ("constructor",
+  // "toString", "valueOf", "hasOwnProperty", ...) to truthy values and defeat the
+  // fail-safe. Only an explicit alias maps to a preset; everything else -> "Custom".
+  return Object.hasOwn(PRESET_UNION_BY_ALIAS, v) ? PRESET_UNION_BY_ALIAS[v] : "Custom";
 }
 
 /**
@@ -491,30 +513,37 @@ export class UniversalTerminal {
     // Custom none). B2 fix: we no longer hardcode Claude's flag for every agent.
     this.shellCmd = applyBypassFlag(shellCmd, this.adapter, permissionsMode);
 
+    const session = this.resolveInitialSession(sessionId, toolPreset);
+    this.sessionId = session.sessionId;
+    this.sessionIsFresh = session.sessionIsFresh;
+  }
+
+  /**
+   * Decide the pane's initial session id + freshness (extracted from the constructor,
+   * behavior identical). Four mutually-exclusive cases (spec §9):
+   *  - a SUPPLIED id  -> RESUME verbatim, not fresh (launch via --resume <uuid>).
+   *  - supportsSessionPin (Claude) -> a DETERMINISTIC generated UUID, fresh (--session-id pin).
+   *  - supportsResume (Codex/agy)  -> a SYNTHETIC "<tool>-session-<hex>" tracking id, not fresh
+   *    (never passed to --resume; the real UUID is captured post-spawn).
+   *  - otherwise -> no session.
+   */
+  private resolveInitialSession(
+    sessionId: string,
+    toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
+  ): { sessionId: string; sessionIsFresh: boolean } {
     if (sessionId) {
-      // A supplied id means we are RESUMING a prior session (spec §9): the launch
-      // re-attaches via --resume <uuid>, never a fresh --session-id pin.
-      this.sessionId = sessionId;
-      this.sessionIsFresh = false;
-    } else if (this.adapter.capabilities().supportsSessionPin) {
-      // B3 fix (spec §9): Claude pins a DETERMINISTIC, orchestrator-generated UUID
-      // and passes it as --session-id at first launch. No stdout scrape — Claude
-      // never prints the id. start() emits --session-id <uuid> while sessionIsFresh.
-      this.sessionId = this.adapter.generateSessionId() ?? "";
-      this.sessionIsFresh = true;
-    } else if (this.adapter.capabilities().supportsResume) {
-      // Codex/agy have no pin flag → capture the id post-spawn. The synthetic
-      // "<tool>-session-<hex>" id is for internal tracking/display ONLY; it is never
-      // passed to --resume (which requires a real UUID). Real ids arrive later via
-      // captureSessionId(); start() guards on UUID format before appending --resume.
+      return { sessionId, sessionIsFresh: false };
+    }
+    const caps = this.adapter.capabilities();
+    if (caps.supportsSessionPin) {
+      return { sessionId: this.adapter.generateSessionId() ?? "", sessionIsFresh: true };
+    }
+    if (caps.supportsResume) {
       const toolLower = toolPreset.toLowerCase().replace(/\s+/g, "-");
       const randomId = Math.random().toString(16).substring(2, 10);
-      this.sessionId = `${toolLower}-session-${randomId}`;
-      this.sessionIsFresh = false;
-    } else {
-      this.sessionId = "";
-      this.sessionIsFresh = false;
+      return { sessionId: `${toolLower}-session-${randomId}`, sessionIsFresh: false };
     }
+    return { sessionId: "", sessionIsFresh: false };
   }
 
   public setPermissionsMode(mode: "Full Auto" | "Human-in-the-Loop" | "Read-Only") {
@@ -573,13 +602,7 @@ export class UniversalTerminal {
    * authoritative probe to report no running child (debounced), or — in fallback
    * mode — quiescence + a narrowed prompt for shell panes (I4/I5).
    */
-  private applyStatusEvent(
-    event:
-      | { kind: "output"; text: string }
-      | { kind: "probe"; probe: ProbeResult }
-      | { kind: "input" }
-      | { kind: "idleTimer" }
-  ) {
+  private applyStatusEvent(event: StatusEvent) {
     if (this.status === "Exited") return;
 
     // Track the confidence of the latest probe so output/idleTimer events know
@@ -588,17 +611,8 @@ export class UniversalTerminal {
       this.lastConfidence = event.probe.confidence;
     }
 
-    // Record whether genuine work occurred (gates the onIdle edge below). Raw
-    // output is deliberately EXCLUDED: a shell rendering its prompt at startup
-    // emits output but is not a running command, so counting it would fire a
-    // spurious "done". Work = an input was sent, or an authoritative probe saw a
-    // running child.
-    if (
-      event.kind === "input" ||
-      (event.kind === "probe" &&
-        event.probe.confidence === "authoritative" &&
-        event.probe.hasRunningChild)
-    ) {
+    // Record whether genuine work occurred BEFORE the decision (gates the onIdle edge).
+    if (this.isWorkEvent(event)) {
       this.sawWorkSinceIdle = true;
     }
 
@@ -612,85 +626,116 @@ export class UniversalTerminal {
       idleTimerArmed: this.idleTimer !== null,
     });
 
-    // P0-2: in fallback mode there is no authoritative busy probe, so genuine
-    // work driven purely by OUTPUT (the legacy script/cmd.exe transport, and every
-    // interactive_cli pane after the P0-1 gate whose turns are not all driven via
-    // writeInput) would otherwise reach the idleTimer with sawWorkSinceIdle=false
-    // and the onIdle edge would be suppressed — worse than today (violates I5).
-    // Count an output-driven Running transition (from a non-Running state) in
-    // fallback mode as real work so the eventual Running->Idle edge fires onIdle.
-    if (
+    // P0-2: count an output-driven Running transition in fallback mode as real work so the
+    // eventual Running->Idle edge still fires onIdle (see isOutputDrivenWork for the rationale).
+    if (this.isOutputDrivenWork(event, result)) {
+      this.sawWorkSinceIdle = true;
+    }
+
+    if (result.clearIdleTimer) this.handleClearIdleTimer();
+    if (result.armIdleTimer) this.handleArmIdleTimer();
+    this.applyStatusTransition(result);
+    this.fireIdleEdge(result);
+  }
+
+  /**
+   * Genuine work occurred (gates the onIdle edge). Raw OUTPUT is deliberately EXCLUDED:
+   * a shell rendering its prompt at startup emits output but is not a running command, so
+   * counting it would fire a spurious "done". Work = an input was sent, or an authoritative
+   * probe saw a running child.
+   */
+  private isWorkEvent(event: StatusEvent): boolean {
+    if (event.kind === "input") return true;
+    return (
+      event.kind === "probe" &&
+      event.probe.confidence === "authoritative" &&
+      event.probe.hasRunningChild
+    );
+  }
+
+  /**
+   * P0-2: in fallback mode there is no authoritative busy probe, so genuine work driven
+   * purely by OUTPUT (the legacy script/cmd.exe transport, and every interactive_cli pane
+   * after the P0-1 gate whose turns are not all driven via writeInput) would otherwise reach
+   * the idleTimer with sawWorkSinceIdle=false and the onIdle edge would be suppressed — worse
+   * than today (violates I5). An output-driven Running transition (from a non-Running state)
+   * in fallback mode counts as real work.
+   */
+  private isOutputDrivenWork(event: StatusEvent, result: ReturnType<typeof decideStatus>): boolean {
+    return (
       event.kind === "output" &&
       this.lastConfidence === "fallback" &&
       result.status === "Running" &&
       this.status !== "Running"
-    ) {
-      this.sawWorkSinceIdle = true;
-    }
+    );
+  }
 
-    if (result.clearIdleTimer) {
-      if (this.idleTimer) {
-        clearTimeout(this.idleTimer);
-        this.idleTimer = null;
-      }
-      // Conservative Phase 2: work resumed (the state machine cancelled the pre-idle window) —
-      // the pane is no longer "wrapping up". Clear the humble cooking overlay so a stale label
-      // can't linger (self-correcting: the next quiescence honestly re-arms it). No signal is
-      // emitted on cancel; the Running edge (onRunning) / next snapshot already speak for it.
-      this.quiescing = false;
+  private handleClearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
     }
-    if (result.armIdleTimer) {
-      if (this.idleTimer) clearTimeout(this.idleTimer);
-      // C4: in authoritative mode the idle debounce must outlast at least one
-      // probe interval, otherwise an idleTimeoutMs < probeIntervalMs can fire
-      // "done" before the next authoritative tick has a chance to re-confirm a
-      // reappearing child — a spurious onIdle. Floor the effective debounce at
-      // probeIntervalMs there. Fallback mode is pure quiescence, so it keeps the
-      // configured timeout verbatim — except interactive_cli (agent) panes, which
-      // use the modestly larger agentIdleTimeoutMs so a brief mid-turn pause is less
-      // likely to read as premature 'done' (Conservative Phase 2 safeguard, fact [F]).
-      const fallbackIdleMs =
-        this.runtimeType === "interactive_cli" ? this.agentIdleTimeoutMs : this.idleTimeoutMs;
-      const effectiveIdleMs =
-        this.lastConfidence === "authoritative"
-          ? Math.max(this.idleTimeoutMs, this.probeIntervalMs)
-          : fallbackIdleMs;
-      this.idleTimer = setTimeout(() => {
-        this.idleTimer = null;
-        this.applyStatusEvent({ kind: "idleTimer" });
-      }, effectiveIdleMs);
-      // Conservative Phase 2: this is the pre-idle "cooking…" edge. The state machine just
-      // armed the debounce while the pane is still Running — fire onQuiescing exactly once on
-      // the false->armed transition (the fallback path re-arms on every chunk, so the once-guard
-      // prevents flapping; the PaneSignalBus 3s debounce is a second backstop on the model leg).
-      // This adds NO new judgement about doneness — it only observes the window idle already owns.
-      if (!this.quiescing) {
-        this.quiescing = true;
-        if (this.onQuiescing) this.onQuiescing(this.terminalId);
-      }
-    }
+    // Conservative Phase 2: work resumed (the state machine cancelled the pre-idle window) —
+    // the pane is no longer "wrapping up". Clear the humble cooking overlay so a stale label
+    // can't linger (self-correcting: the next quiescence honestly re-arms it). No signal is
+    // emitted on cancel; the Running edge (onRunning) / next snapshot already speak for it.
+    this.quiescing = false;
+  }
 
-    if (result.status !== this.status) {
-      // Phase 1 "ears": capture the PRIOR status so the Running edge is exact. A transition
-      // INTO Running from any non-Running status (Idle or Exited won't reach here — Exited
-      // returns early at the top of applyStatusEvent) is a genuine "beginning" — fire
-      // onRunning exactly once on the edge. Running->Running probe/output ticks never reach
-      // this block (result.status === this.status), so there is no re-fire. NOT gated on
-      // sawWorkSinceIdle (unlike onIdle): a beginning has no spurious-done risk.
-      const prevStatus = this.status;
-      this.status = result.status;
-      this.lastStatusChangeAt = Date.now();
-      if (result.status === "Running" && prevStatus !== "Running" && this.onRunning) {
-        this.onRunning(this.terminalId);
-      }
+  /** Compute the effective idle debounce for the armIdleTimer path (authoritative floor vs fallback). */
+  private effectiveIdleMs(): number {
+    // C4: in authoritative mode the idle debounce must outlast at least one probe interval,
+    // otherwise an idleTimeoutMs < probeIntervalMs can fire "done" before the next authoritative
+    // tick re-confirms a reappearing child — a spurious onIdle. Floor at probeIntervalMs there.
+    // Fallback mode keeps the configured timeout verbatim — except interactive_cli (agent) panes,
+    // which use the modestly larger agentIdleTimeoutMs so a brief mid-turn pause is less likely to
+    // read as premature 'done' (Conservative Phase 2 safeguard, fact [F]).
+    if (this.lastConfidence === "authoritative") {
+      return Math.max(this.idleTimeoutMs, this.probeIntervalMs);
     }
-    if (result.fireOnIdle) {
-      // Only a Running→Idle edge that followed genuine work is a real "done".
-      const realDone = this.sawWorkSinceIdle;
-      this.sawWorkSinceIdle = false;
-      if (realDone && this.onIdle) {
-        this.onIdle(this.terminalId);
-      }
+    return this.runtimeType === "interactive_cli" ? this.agentIdleTimeoutMs : this.idleTimeoutMs;
+  }
+
+  private handleArmIdleTimer(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.applyStatusEvent({ kind: "idleTimer" });
+    }, this.effectiveIdleMs());
+    // Conservative Phase 2: this is the pre-idle "cooking…" edge. The state machine just
+    // armed the debounce while the pane is still Running — fire onQuiescing exactly once on
+    // the false->armed transition (the fallback path re-arms on every chunk, so the once-guard
+    // prevents flapping; the PaneSignalBus 3s debounce is a second backstop on the model leg).
+    // This adds NO new judgement about doneness — it only observes the window idle already owns.
+    if (!this.quiescing) {
+      this.quiescing = true;
+      if (this.onQuiescing) this.onQuiescing(this.terminalId);
+    }
+  }
+
+  private applyStatusTransition(result: ReturnType<typeof decideStatus>): void {
+    if (result.status === this.status) return;
+    // Phase 1 "ears": capture the PRIOR status so the Running edge is exact. A transition
+    // INTO Running from any non-Running status (Idle or Exited won't reach here — Exited
+    // returns early at the top of applyStatusEvent) is a genuine "beginning" — fire
+    // onRunning exactly once on the edge. Running->Running probe/output ticks never reach
+    // this block (result.status === this.status), so there is no re-fire. NOT gated on
+    // sawWorkSinceIdle (unlike onIdle): a beginning has no spurious-done risk.
+    const prevStatus = this.status;
+    this.status = result.status;
+    this.lastStatusChangeAt = Date.now();
+    if (result.status === "Running" && prevStatus !== "Running" && this.onRunning) {
+      this.onRunning(this.terminalId);
+    }
+  }
+
+  private fireIdleEdge(result: ReturnType<typeof decideStatus>): void {
+    if (!result.fireOnIdle) return;
+    // Only a Running→Idle edge that followed genuine work is a real "done".
+    const realDone = this.sawWorkSinceIdle;
+    this.sawWorkSinceIdle = false;
+    if (realDone && this.onIdle) {
+      this.onIdle(this.terminalId);
     }
   }
 
@@ -1379,42 +1424,49 @@ export class OrchestratorManager {
         ...newSettings.announcements
       };
     }
-    if (newSettings.advanced) {
-      this.settings.advanced = { ...this.settings.advanced, ...newSettings.advanced };
-      // 2S.1: mirror loadSettings exactly — deep-merge the capability matrix so a PUT carrying a
-      // PARTIAL capabilityGates map layers ON TOP of the defaults instead of REPLACING the whole
-      // matrix (which made every unmentioned capability resolve through the permissive
-      // `globalGate ?? "Auto"` fallback — fail-open). Only runs when the update actually carries
-      // a gates map; a gates-free advanced update leaves the existing matrix untouched.
-      if (newSettings.advanced.capabilityGates) {
-        this.settings.advanced.capabilityGates = {
-          ...DEFAULT_CAPABILITY_GATES,
-          ...newSettings.advanced.capabilityGates,
-        };
-      }
-      this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode;
-      if (newSettings.advanced.maxBufferLines !== undefined) {
-        for (const term of Object.values(this.terminals)) {
-          term.maxBufferLines = newSettings.advanced.maxBufferLines;
-        }
-      }
-      if (newSettings.advanced.idleTimeoutMs !== undefined) {
-        for (const term of Object.values(this.terminals)) {
-          term.idleTimeoutMs = newSettings.advanced.idleTimeoutMs;
-        }
-      }
-      // Conservative Phase 2: propagate the agent idle-timing safeguard to live terminals
-      // (only interactive_cli panes consume it on the fallback arm; shell panes ignore it).
-      if (newSettings.advanced.agentIdleTimeoutMs !== undefined) {
-        for (const term of Object.values(this.terminals)) {
-          term.agentIdleTimeoutMs = newSettings.advanced.agentIdleTimeoutMs;
-        }
-      }
-    }
+    if (newSettings.advanced) this.applyAdvancedSettings(newSettings.advanced);
     if (newSettings.secrets) {
       this.settings.secrets = { ...this.settings.secrets, ...newSettings.secrets };
     }
     this.saveSettings();
+  }
+
+  /**
+   * Merge the `advanced` settings section and propagate the live-tunable knobs to every
+   * terminal (extracted from updateSettings, behavior identical). Order is preserved: the
+   * merge, the capabilityGates deep-merge, the globalPermissionsMode mirror, then the three
+   * per-terminal propagations.
+   */
+  private applyAdvancedSettings(advanced: NonNullable<SystemSettings["advanced"]>): void {
+    this.settings.advanced = { ...this.settings.advanced, ...advanced };
+    // 2S.1: mirror loadSettings exactly — deep-merge the capability matrix so a PUT carrying a
+    // PARTIAL capabilityGates map layers ON TOP of the defaults instead of REPLACING the whole
+    // matrix (which made every unmentioned capability resolve through the permissive
+    // `globalGate ?? "Auto"` fallback — fail-open). Only runs when the update actually carries
+    // a gates map; a gates-free advanced update leaves the existing matrix untouched.
+    if (advanced.capabilityGates) {
+      this.settings.advanced.capabilityGates = {
+        ...DEFAULT_CAPABILITY_GATES,
+        ...advanced.capabilityGates,
+      };
+    }
+    this.globalPermissionsMode = this.settings.advanced.globalPermissionsMode;
+    if (advanced.maxBufferLines !== undefined) {
+      this.eachTerminal((term) => { term.maxBufferLines = advanced.maxBufferLines!; });
+    }
+    if (advanced.idleTimeoutMs !== undefined) {
+      this.eachTerminal((term) => { term.idleTimeoutMs = advanced.idleTimeoutMs!; });
+    }
+    // Conservative Phase 2: propagate the agent idle-timing safeguard to live terminals
+    // (only interactive_cli panes consume it on the fallback arm; shell panes ignore it).
+    if (advanced.agentIdleTimeoutMs !== undefined) {
+      this.eachTerminal((term) => { term.agentIdleTimeoutMs = advanced.agentIdleTimeoutMs!; });
+    }
+  }
+
+  /** Apply a mutation to every registered terminal (small helper to keep callers flat). */
+  private eachTerminal(fn: (term: UniversalTerminal) => void): void {
+    for (const term of Object.values(this.terminals)) fn(term);
   }
 
   constructor(opts?: { ledger?: LedgerLike }) {
@@ -1430,28 +1482,34 @@ export class OrchestratorManager {
     this.ledger = opts?.ledger ?? new Ledger();
 
     // Set activeProjectId from ledger or settings
-    const activeCtx = this.ledger.activeProjectId || this.settings.projects?.activeContext || "default_project";
-    const workspacePath = this.settings.projects?.localWorkspacePath || process.cwd();
-    
+    const projects = this.settings.projects;
+    const activeCtx = this.ledger.activeProjectId || projects?.activeContext || "default_project";
+    const workspacePath = projects?.localWorkspacePath || process.cwd();
+
     // Ensure the active project is registered on the ledger
     this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
     this.ledger.switchContext(activeCtx);
 
-    // Restore pane records as INERT metadata only — do NOT auto-spawn on boot.
-    // Auto-spawning every persisted pane launched N real agent processes (and, on the
-    // legacy non-node-pty transport, N visible console windows) on every boot/reconnect,
-    // compounding into a runaway ("a million terminals"). Panes are now reconciled to a
-    // not-running state on load; the operator starts one explicitly via
-    // POST /api/terminals/:id/restart (which creates + starts it on demand).
+    this.reconcilePanesInert(activeCtx);
+  }
+
+  /**
+   * Restore pane records as INERT metadata only — do NOT auto-spawn on boot (extracted from
+   * the constructor, behavior identical). Auto-spawning every persisted pane launched N real
+   * agent processes (and, on the legacy non-node-pty transport, N visible console windows) on
+   * every boot/reconnect, compounding into a runaway ("a million terminals"). Panes are now
+   * reconciled to a not-running state on load; the operator starts one explicitly via
+   * POST /api/terminals/:id/restart (which creates + starts it on demand).
+   */
+  private reconcilePanesInert(activeCtx: string): void {
     const project = this.ledger.getProject(activeCtx);
-    if (project && project.panes) {
-      for (const pane of Object.values(project.panes)) {
-        pane.alive = false;
-        pane.is_busy = false;
-        pane.last_known_state = "Exited";
-      }
-      this.ledger.save(true);
+    if (!project || !project.panes) return;
+    for (const pane of Object.values(project.panes)) {
+      pane.alive = false;
+      pane.is_busy = false;
+      pane.last_known_state = "Exited";
     }
+    this.ledger.save(true);
   }
 
   addTerminal(
@@ -1467,10 +1525,52 @@ export class OrchestratorManager {
       return `Terminal '${terminalId}' already exists.`;
     }
     const realProjId = projectId || this.ledger.activeProjectId || "default_project";
-    const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId);
-    term.idleTimeoutMs = this.settings?.advanced?.idleTimeoutMs ?? term.idleTimeoutMs;
+    const term = this.createConfiguredTerminal(
+      terminalId, cwd, command, toolPreset, permissionsMode, sessionId, realProjId,
+    );
+    // B1 (async spawn): REGISTER SYNCHRONOUSLY, then DEFER the blocking start(). The slot insert,
+    // active-pane election, and ledger sync ALL stay synchronous so (a) the dup/replay guard above
+    // still fires on a rapid replay BEFORE any double-spawn can occur, and (b) create -> active ->
+    // follow-up-command ordering is preserved by callers. Only the PTY boot moves off this tick.
+    this.terminals[terminalId] = term;
+    if (!this.activeId) {
+      this.activeId = terminalId;
+    }
+    this.syncLedger();
+    this.scheduleStart(term);
+    return `Created terminal '${terminalId}' executing '${command}' at '${cwd}'.`;
+  }
+
+  /**
+   * Build a UniversalTerminal, seed its idle-timing knobs from settings, and wire its
+   * lifecycle callbacks (extracted from addTerminal, behavior identical). Does NOT register
+   * or start it — the caller owns slot insertion, active election, sync, and the deferred spawn.
+   */
+  private createConfiguredTerminal(
+    terminalId: string,
+    cwd: string,
+    command: string,
+    toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom",
+    permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
+    sessionId: string,
+    projectId: string,
+  ): UniversalTerminal {
+    const term = new UniversalTerminal(terminalId, cwd, command, toolPreset, permissionsMode, sessionId, projectId);
+    const advanced = this.settings?.advanced;
+    term.idleTimeoutMs = advanced?.idleTimeoutMs ?? term.idleTimeoutMs;
     // Conservative Phase 2: seed the agent (interactive_cli) idle-timing safeguard from settings.
-    term.agentIdleTimeoutMs = this.settings?.advanced?.agentIdleTimeoutMs ?? term.agentIdleTimeoutMs;
+    term.agentIdleTimeoutMs = advanced?.agentIdleTimeoutMs ?? term.agentIdleTimeoutMs;
+    this.wireTerminalCallbacks(term);
+    return term;
+  }
+
+  /**
+   * Forward a terminal's per-pane lifecycle callbacks up to the manager-level subscribers
+   * (extracted from addTerminal, behavior identical). Each forwarder is a no-op when the
+   * corresponding manager-level subscriber is unset. onReady (B1 async spawn) publishes the
+   * phase-2 "ready" pane signal from the manager.
+   */
+  private wireTerminalCallbacks(term: UniversalTerminal): void {
     term.onOutput = (tid, chunk) => {
       if (this.onOutput) this.onOutput(tid, chunk);
     };
@@ -1483,22 +1583,9 @@ export class OrchestratorManager {
     term.onQuiescing = (tid) => {
       if (this.onQuiescing) this.onQuiescing(tid);
     };
-    // B1 (async spawn): forward the per-pane spawn-ready edge up to the manager-level onReady
-    // (the server publishes the phase-2 "ready" pane signal from there).
     term.onReady = (tid) => {
       if (this.onReady) this.onReady(tid);
     };
-    // B1 (async spawn): REGISTER SYNCHRONOUSLY, then DEFER the blocking start(). The slot insert,
-    // active-pane election, and ledger sync ALL stay synchronous so (a) the dup/replay guard above
-    // still fires on a rapid replay BEFORE any double-spawn can occur, and (b) create -> active ->
-    // follow-up-command ordering is preserved by callers. Only the PTY boot moves off this tick.
-    this.terminals[terminalId] = term;
-    if (!this.activeId) {
-      this.activeId = terminalId;
-    }
-    this.syncLedger();
-    this.scheduleStart(term);
-    return `Created terminal '${terminalId}' executing '${command}' at '${cwd}'.`;
   }
 
   /**
@@ -1593,41 +1680,58 @@ export class OrchestratorManager {
   private syncLedger() {
     for (const [id, term] of Object.entries(this.terminals)) {
       const pId = term.projectId || "default_project";
-      let project = this.ledger.getProject(pId);
-      if (!project) {
-        this.ledger.addProject(pId, term.cwd, "Auto-created project");
-        project = this.ledger.getProject(pId);
-      }
-      if (project) {
-        const existingPane = project.panes[id];
-        const meta: PaneMeta = {
-          pane_id: id,
-          name: existingPane?.name || id,
-          runtime_type: existingPane?.runtime_type || term.runtimeType,
-          last_known_state: term.status === "Running" ? "Running active command" : term.status === "Idle" ? "Idle" : "Exited",
-          is_busy: term.status === "Running",
-          alive: term.status !== "Exited",
-          notes: existingPane?.notes || [],
-          // BEAD gpd — PERSIST-WINS: a sync reflects only the LIVE FACTS (status / busy /
-          // alive / session). Operator INTENT — the permission mode and the per-pane
-          // capability-gate override — is authoritative in the ledger and must NOT be
-          // clobbered by whatever the live process happens to hold. Prefer the persisted
-          // value; fall back to the live term only on first registration (no existing
-          // record yet). Covers BOTH permissions_mode AND capabilityGates.
-          permissions_mode: existingPane?.permissions_mode ?? term.permissionsMode,
-          tool_preset: term.toolPreset,
-          session_id: term.sessionId || existingPane?.session_id || "",
-          context_size: term.contextSize,
-          capabilityGates: existingPane?.capabilityGates,
-          // WS-C status-detection fields (design §4.2).
-          last_status_change_at: new Date(term.lastStatusChangeAt).toISOString(),
-          last_command: term.lastCommand || existingPane?.last_command || "",
-          elapsed_ms: Date.now() - term.lastStatusChangeAt
-        };
-        this.ledger.updatePane(pId, meta, false);
-      }
+      const project = this.ensureProject(pId, term.cwd);
+      if (!project) continue;
+      const meta = this.buildPaneMeta(id, term, project.panes[id]);
+      this.ledger.updatePane(pId, meta, false);
     }
     this.ledger.save(false);
+  }
+
+  /** Get the project, auto-creating it on first sight; returns null if creation didn't take. */
+  private ensureProject(pId: string, cwd: string) {
+    const existing = this.ledger.getProject(pId);
+    if (existing) return existing;
+    this.ledger.addProject(pId, cwd, "Auto-created project");
+    return this.ledger.getProject(pId);
+  }
+
+  /** Map a live terminal status to its persisted last_known_state label. */
+  private paneStateLabel(status: string): PaneMeta["last_known_state"] {
+    if (status === "Running") return "Running active command";
+    if (status === "Idle") return "Idle";
+    return "Exited";
+  }
+
+  /**
+   * Build the PaneMeta reconciling LIVE FACTS over the persisted record (extracted from
+   * syncLedger, behavior identical). BEAD gpd — PERSIST-WINS: a sync reflects only the LIVE
+   * FACTS (status / busy / alive / session). Operator INTENT — the permission mode and the
+   * per-pane capability-gate override — is authoritative in the ledger and must NOT be
+   * clobbered by whatever the live process happens to hold. Prefer the persisted value; fall
+   * back to the live term only on first registration (no existing record yet). Covers BOTH
+   * permissions_mode AND capabilityGates.
+   */
+  private buildPaneMeta(id: string, term: UniversalTerminal, existingPane: PaneMeta | undefined): PaneMeta {
+    const prev = existingPane ?? ({} as Partial<PaneMeta>);
+    return {
+      pane_id: id,
+      name: prev.name || id,
+      runtime_type: prev.runtime_type || term.runtimeType,
+      last_known_state: this.paneStateLabel(term.status),
+      is_busy: term.status === "Running",
+      alive: term.status !== "Exited",
+      notes: prev.notes || [],
+      permissions_mode: prev.permissions_mode ?? term.permissionsMode,
+      tool_preset: term.toolPreset,
+      session_id: term.sessionId || prev.session_id || "",
+      context_size: term.contextSize,
+      capabilityGates: prev.capabilityGates,
+      // WS-C status-detection fields (design §4.2).
+      last_status_change_at: new Date(term.lastStatusChangeAt).toISOString(),
+      last_command: term.lastCommand || prev.last_command || "",
+      elapsed_ms: Date.now() - term.lastStatusChangeAt
+    };
   }
 
   getPaneSummary(paneId: string, limit = 20) {

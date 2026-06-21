@@ -151,6 +151,36 @@ const ProposeHandoffParams = z.object({
   rationale: z.string().optional(),
 });
 
+/**
+ * Snapshot the SOURCE pane context (redacted) for propose_handoff: prefer the live pane summary, fall
+ * back to recent command history, else "" (no from_pane). Extracted from the handler to keep the
+ * handler under CC 10 — same redaction, same fallback ordering (behavior-preserving).
+ */
+function captureSourceSummary(ctx: ActionContext, from_pane: string | undefined): string {
+  if (!from_pane) return "";
+  if (ctx.manager.terminals[from_pane]) {
+    return redactSecrets(ctx.manager.getPaneSummary(from_pane, 12));
+  }
+  const hist = loadPaneHistory(ctx.manager, from_pane);
+  return redactSecrets(
+    hist.map((h) => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-8).join("\n")
+  );
+}
+
+/** Build the (redacted) source-context snapshot JSON-serialized for a propose_handoff draft row. */
+function buildSourceContext(
+  ctx: ActionContext,
+  from_pane: string | undefined,
+  rationale: string | undefined,
+): string {
+  return JSON.stringify({
+    from_pane: from_pane ?? null,
+    rationale: rationale ? redactSecrets(String(rationale)) : null,
+    summary: captureSourceSummary(ctx, from_pane) || "[no source context captured]",
+    captured_at: new Date().toISOString(),
+  });
+}
+
 export const proposeHandoff: ActionDef<typeof ProposeHandoffParams> = {
   name: "propose_handoff",
   description:
@@ -167,52 +197,35 @@ export const proposeHandoff: ActionDef<typeof ProposeHandoffParams> = {
     }
     const { to_pane, draft_text, from_pane, rationale } = args;
     const store = ctx.store;
-    let resp: unknown;
     if (!store) {
-      resp = "Error: the persistent store is unavailable; handoffs cannot be created right now.";
-    } else if (!to_pane) {
-      resp = "Error: a target pane (to_pane) is required for a handoff.";
-    } else {
-      const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
-      // source_context: prefer the live pane summary; fall back to command history.
-      let sourceSummary = "";
-      if (from_pane) {
-        if (ctx.manager.terminals[from_pane]) {
-          sourceSummary = redactSecrets(ctx.manager.getPaneSummary(from_pane, 12));
-        } else {
-          const hist = loadPaneHistory(ctx.manager, from_pane);
-          sourceSummary = redactSecrets(
-            hist.map((h) => `${h.command} -> ${h.finalResponse || "executed"}`).slice(-8).join("\n")
-          );
-        }
-      }
-      const sourceContext = {
-        from_pane: from_pane ?? null,
-        rationale: rationale ? redactSecrets(String(rationale)) : null,
-        summary: sourceSummary || "[no source context captured]",
-        captured_at: new Date().toISOString(),
-      };
-      const targetTerm = ctx.manager.terminals[to_pane];
-      const kind: ApprovalKind = targetTerm?.runtimeType === "shell" ? "shell" : "agent_instruction";
-      const h = store.createHandoff({
-        workspace_id: activeProjectId,
-        from_pane: from_pane ?? null,
-        to_pane,
-        kind,
-        composed_prompt: draft_text ?? "",
-        source_context: JSON.stringify(sourceContext),
-        state: "composing",
-      });
-      ctx.broadcast({ type: "handoffs_updated" });
-      resp = {
+      return { kind: "ok", output: "Error: the persistent store is unavailable; handoffs cannot be created right now." };
+    }
+    if (!to_pane) {
+      return { kind: "ok", output: "Error: a target pane (to_pane) is required for a handoff." };
+    }
+    const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+    const targetTerm = ctx.manager.terminals[to_pane];
+    const kind: ApprovalKind = targetTerm?.runtimeType === "shell" ? "shell" : "agent_instruction";
+    const h = store.createHandoff({
+      workspace_id: activeProjectId,
+      from_pane: from_pane ?? null,
+      to_pane,
+      kind,
+      composed_prompt: draft_text ?? "",
+      source_context: buildSourceContext(ctx, from_pane, rationale),
+      state: "composing",
+    });
+    ctx.broadcast({ type: "handoffs_updated" });
+    return {
+      kind: "ok",
+      output: {
         handoff_id: h.id,
         state: h.state,
         to_pane: h.to_pane,
         composed_prompt: redactSecrets(h.composed_prompt),
         message: `Drafted handoff ${h.id} to pane ${to_pane} (state: composing). Read the draft back to the operator; revise by voice, then stage and deliver.`,
-      };
-    }
-    return { kind: "ok", output: resp };
+      },
+    };
   },
 };
 
@@ -288,56 +301,71 @@ export const stageHandoff: ActionDef<typeof StageHandoffParams> = {
     }
     const { handoff_id } = args;
     const store = ctx.store;
-    let resp: unknown;
     if (!store) {
-      resp = "Error: the persistent store is unavailable.";
-    } else {
-      const h = store.getHandoff(handoff_id);
-      if (!h) {
-        resp = `Error: handoff ${handoff_id} not found.`;
-      } else {
-        const targetTerm = ctx.manager.terminals[h.to_pane];
-        // bd #70: ungated existence guard (compose_draft is UNGATED) — resolve via the canonical
-        // owning-project lookup so a target pane in a NON-active project isn't wrongly reported as
-        // missing. Usability guard, NOT a gate-decision path (the divergence is intentional).
-        const targetExists = !!targetTerm || !!findPaneOwningProject(ctx.manager, h.to_pane);
-        if (!targetExists) {
-          resp = `Cannot stage: target pane ${h.to_pane} no longer exists.`;
-        } else {
-          // Secret guard. High-confidence leak -> BLOCK; low-confidence -> stage WITH a warning.
-          const scan = classifySecrets(h.composed_prompt);
-          if (scan.confidence === "high") {
-            if (store) {
-              const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
-              store.recordActivity({
-                type: "permission_changed",
-                project_id: activeProjectId,
-                pane_id: h.to_pane,
-                summary: `BLOCKED staging handoff ${handoff_id}: secret detected (${scan.labels.join(", ")})`,
-                payload: { handoff_id, refused: true, secret_labels: scan.labels },
-                handoff_id,
-              });
-            }
-            resp = `Blocked: the composed prompt for handoff ${handoff_id} appears to contain a secret (${scan.labels.join(", ")}). Prompts must never carry secrets — revise it to remove the credential, then stage again.`;
-          } else {
-            const staged = store.updateHandoffState(handoff_id, "staged");
-            ctx.broadcast({ type: "handoffs_updated" });
-            const warn =
-              scan.confidence === "low"
-                ? ` WARNING: the prompt contains a possible credential assignment (${scan.labels.join(", ")}) — confirm it carries no real secret before approving delivery.`
-                : "";
-            resp = {
-              handoff_id,
-              state: staged?.state,
-              message: `Handoff ${handoff_id} is staged for pane ${h.to_pane}. Ask the operator to approve delivery (deliver_handoff).${warn}`,
-            };
-          }
-        }
-      }
+      return { kind: "ok", output: "Error: the persistent store is unavailable." };
     }
-    return { kind: "ok", output: resp };
+    const h = store.getHandoff(handoff_id);
+    if (!h) {
+      return { kind: "ok", output: `Error: handoff ${handoff_id} not found.` };
+    }
+    const targetTerm = ctx.manager.terminals[h.to_pane];
+    // bd #70: ungated existence guard (compose_draft is UNGATED) — resolve via the canonical
+    // owning-project lookup so a target pane in a NON-active project isn't wrongly reported as
+    // missing. Usability guard, NOT a gate-decision path (the divergence is intentional).
+    const targetExists = !!targetTerm || !!findPaneOwningProject(ctx.manager, h.to_pane);
+    if (!targetExists) {
+      return { kind: "ok", output: `Cannot stage: target pane ${h.to_pane} no longer exists.` };
+    }
+    // Secret guard. High-confidence leak -> BLOCK; low-confidence -> stage WITH a warning.
+    const scan = classifySecrets(h.composed_prompt);
+    if (scan.confidence === "high") {
+      recordStageRefusal(ctx, store, handoff_id, h.to_pane, scan.labels);
+      return {
+        kind: "ok",
+        output: `Blocked: the composed prompt for handoff ${handoff_id} appears to contain a secret (${scan.labels.join(", ")}). Prompts must never carry secrets — revise it to remove the credential, then stage again.`,
+      };
+    }
+    const staged = store.updateHandoffState(handoff_id, "staged");
+    ctx.broadcast({ type: "handoffs_updated" });
+    const warn =
+      scan.confidence === "low"
+        ? ` WARNING: the prompt contains a possible credential assignment (${scan.labels.join(", ")}) — confirm it carries no real secret before approving delivery.`
+        : "";
+    return {
+      kind: "ok",
+      output: {
+        handoff_id,
+        state: staged?.state,
+        message: `Handoff ${handoff_id} is staged for pane ${h.to_pane}. Ask the operator to approve delivery (deliver_handoff).${warn}`,
+      },
+    };
   },
 };
+
+/**
+ * Record the audit row for a BLOCKED stage (high-confidence secret). Extracted from stage_handoff so
+ * the handler stays under CC 10. `store` is non-null at the call site (the handler guards it), but the
+ * legacy branch re-checked `if (store)` before recording — preserved here as a defensive guard so the
+ * write semantics stay byte-identical (behavior-preserving).
+ */
+function recordStageRefusal(
+  ctx: ActionContext,
+  store: NonNullable<ActionContext["store"]>,
+  handoff_id: string,
+  to_pane: string,
+  labels: string[],
+): void {
+  if (!store) return;
+  const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+  store.recordActivity({
+    type: "permission_changed",
+    project_id: activeProjectId,
+    pane_id: to_pane,
+    summary: `BLOCKED staging handoff ${handoff_id}: secret detected (${labels.join(", ")})`,
+    payload: { handoff_id, refused: true, secret_labels: labels },
+    handoff_id,
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // read_handoff (server.ts:3217) — UNGATED read; redacted output. readOnly:true.
@@ -534,25 +562,9 @@ export const deliverHandoff: ActionDef<typeof DeliverHandoffParams> = {
         output: `Handoff ${handoff_id} is '${h.state}', not 'staged'. Stage it before delivery.`,
       };
     }
-    if (classifySecrets(h.composed_prompt).confidence === "high") {
-      // Deliver-time backstop: a prompt revised to a secret after staging is still hard-blocked.
-      const scan = classifySecrets(h.composed_prompt);
-      if (store) {
-        const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
-        store.recordActivity({
-          type: "permission_changed",
-          project_id: activeProjectId,
-          pane_id: h.to_pane,
-          summary: `BLOCKED delivery of handoff ${handoff_id}: secret detected (${scan.labels.join(", ")})`,
-          payload: { handoff_id, refused: true, secret_labels: scan.labels },
-          handoff_id,
-        });
-      }
-      return {
-        kind: "ok",
-        output: `Blocked: handoff ${handoff_id}'s prompt appears to contain a secret (${scan.labels.join(", ")}). Revise it to remove the credential before delivery.`,
-      };
-    }
+    // Deliver-time backstop: a prompt revised to a secret after staging is still hard-blocked.
+    const secretBlock = deliverTimeSecretBlock(ctx, store, handoff_id, h.to_pane, h.composed_prompt);
+    if (secretBlock) return secretBlock;
     const outcome = ctx.dispatchProposal({
       sess: ctx.session,
       callId: ctx.callId ?? "",
@@ -563,35 +575,85 @@ export const deliverHandoff: ActionDef<typeof DeliverHandoffParams> = {
       trigger: "handoff delivery",
       capability: "deliver_handoff" as CapabilityGate,
     });
-    // Pure mapping (src/handoffFlow): dispatch outcome -> persisted-row effect.
-    const effect = deliverOutcomeToHandoff(outcome.kind as DeliverDispatchKind);
-    if (effect.kind === "deliver_now") {
-      // Full Auto: the write already landed inside dispatchProposal; flip the row to delivered now.
-      store.updateHandoffState(handoff_id, effect.state, { approved_via: effect.approvedVia });
-      ctx.broadcast({ type: "handoffs_updated" });
-      return { kind: "ok", output: `Delivered handoff ${handoff_id} to pane ${h.to_pane}.` };
-    }
-    if (effect.kind === "await_approval") {
-      // HiTL: persist the gate_approval_id; applyResolution flips to delivered on approve.
-      store.setGateApprovalId(handoff_id, handoff_id);
-      ctx.broadcast({ type: "handoffs_updated" });
-      // Wire: { status:"pending_approval", messageId: handoff_id, pane_id: h.to_pane, prompt: outcome.text }.
-      return {
-        kind: "pending",
-        messageId: handoff_id,
-        summary: outcome.text,
-        extra: { pane_id: h.to_pane, prompt: outcome.text },
-      };
-    }
-    if (effect.kind === "block") {
-      store.updateHandoffState(handoff_id, effect.state);
-      ctx.broadcast({ type: "handoffs_updated" });
-      return { kind: "ok", output: outcome.text };
-    }
-    // effect.kind === "noop" (error | clarify): no row change.
-    return { kind: "ok", output: outcome.text };
+    return applyDeliverOutcome(ctx, store, handoff_id, h.to_pane, outcome.text, outcome.kind);
   },
 };
+
+/**
+ * Map the dispatch outcome -> persisted-row effect + the ActionResult wire shape, for deliver_handoff.
+ * Extracted from the handler (CC reduction); the row writes / broadcasts / four wire shapes are
+ * byte-identical to the inlined branches (deliver_now / await_approval / block / noop). `deliverOutcomeToHandoff`
+ * is the SAME pure mapping the legacy branch used.
+ */
+function applyDeliverOutcome(
+  ctx: ActionContext,
+  store: NonNullable<ActionContext["store"]>,
+  handoff_id: string,
+  to_pane: string,
+  outcomeText: string,
+  outcomeKind: string,
+): ActionResult {
+  // Pure mapping (src/handoffFlow): dispatch outcome -> persisted-row effect.
+  const effect = deliverOutcomeToHandoff(outcomeKind as DeliverDispatchKind);
+  if (effect.kind === "deliver_now") {
+    // Full Auto: the write already landed inside dispatchProposal; flip the row to delivered now.
+    store.updateHandoffState(handoff_id, effect.state, { approved_via: effect.approvedVia });
+    ctx.broadcast({ type: "handoffs_updated" });
+    return { kind: "ok", output: `Delivered handoff ${handoff_id} to pane ${to_pane}.` };
+  }
+  if (effect.kind === "await_approval") {
+    // HiTL: persist the gate_approval_id; applyResolution flips to delivered on approve.
+    store.setGateApprovalId(handoff_id, handoff_id);
+    ctx.broadcast({ type: "handoffs_updated" });
+    // Wire: { status:"pending_approval", messageId: handoff_id, pane_id: to_pane, prompt: outcomeText }.
+    return {
+      kind: "pending",
+      messageId: handoff_id,
+      summary: outcomeText,
+      extra: { pane_id: to_pane, prompt: outcomeText },
+    };
+  }
+  if (effect.kind === "block") {
+    store.updateHandoffState(handoff_id, effect.state);
+    ctx.broadcast({ type: "handoffs_updated" });
+    return { kind: "ok", output: outcomeText };
+  }
+  // effect.kind === "noop" (error | clarify): no row change.
+  return { kind: "ok", output: outcomeText };
+}
+
+/**
+ * Deliver-time secret backstop for deliver_handoff: if the composed prompt is a HIGH-confidence
+ * secret, record the refusal and return the blocked ActionResult; otherwise return null (delivery
+ * proceeds). Extracted to keep the handler under CC 10 — same scan, same audit row, same string. The
+ * legacy branch re-checked `if (store)` before recording; preserved here (store is non-null at the
+ * call site but the guard keeps the write semantics byte-identical).
+ */
+function deliverTimeSecretBlock(
+  ctx: ActionContext,
+  store: NonNullable<ActionContext["store"]>,
+  handoff_id: string,
+  to_pane: string,
+  composed_prompt: string,
+): ActionResult | null {
+  const scan = classifySecrets(composed_prompt);
+  if (scan.confidence !== "high") return null;
+  if (store) {
+    const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+    store.recordActivity({
+      type: "permission_changed",
+      project_id: activeProjectId,
+      pane_id: to_pane,
+      summary: `BLOCKED delivery of handoff ${handoff_id}: secret detected (${scan.labels.join(", ")})`,
+      payload: { handoff_id, refused: true, secret_labels: scan.labels },
+      handoff_id,
+    });
+  }
+  return {
+    kind: "ok",
+    output: `Blocked: handoff ${handoff_id}'s prompt appears to contain a secret (${scan.labels.join(", ")}). Revise it to remove the credential before delivery.`,
+  };
+}
 
 /** All HANDOFF group ActionDefs, in dispatch-anchor order (server.ts:3072-3281). */
 export const HANDOFF_ACTIONS: ActionDef[] = [

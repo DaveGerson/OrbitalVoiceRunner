@@ -321,77 +321,103 @@ export const setCapabilityGate: ActionDef<typeof SetCapabilityGateParams> = {
     // is REFUSED — it must be a deliberate UI act, so a confused/misheard Janus cannot loosen its own
     // restraints. This handler does its OWN directional enforcement; it does NOT call gateOrDefer.
     const { pane_id, capability, gate } = args;
-    const validGates = ["Auto", "Ask", "Off"];
-    let resp: string;
-    if (!validGates.includes(gate)) {
-      resp = `Invalid gate "${gate}". Must be one of: Auto, Ask, Off.`;
-    } else if (
-      isLoosening(
-        ctx.effectiveCapabilityGateFor(pane_id || null, capability as CapabilityGate),
-        gate as GateValue,
-      )
-    ) {
-      const current = ctx.effectiveCapabilityGateFor(pane_id || null, capability as CapabilityGate);
-      resp = `For safety I can't LOOSEN a capability gate by voice (you asked to change '${capability}' from ${current} to ${gate}). Loosening must be done deliberately in the Settings UI. I can TIGHTEN gates by voice anytime.`;
-      if (ctx.store) {
-        const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
-        ctx.store.recordActivity({
-          type: "permission_changed",
-          project_id: activeProjectId,
-          pane_id: pane_id ?? null,
-          summary: `REFUSED voice loosen ${capability} ${current}->${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`,
-          payload: { capability, from: current, to: gate, pane_id: pane_id ?? null, refused: true },
-        });
-      }
-    } else {
-      if (!ctx.manager.settings.advanced.capabilityGates)
-        ctx.manager.settings.advanced.capabilityGates = {};
-      // Stable non-null handle to the global map (the guard above guarantees it exists). The legacy
-      // indexes ctx.manager.settings.advanced.capabilityGates directly under `args: any`; this local
-      // preserves the SAME object reference + write while staying type-correct across the branch.
-      const globalGates: CapabilityGateMap = ctx.manager.settings.advanced.capabilityGates;
-      if (pane_id) {
-        // Resolve the pane's OWNING project (paneOwnership.ts) — the write side of the
-        // owning-project fix: a voice "lock down that pane" for a pane in a NON-active project
-        // used to fail with not-found because only getActiveProject() was consulted.
-        const owned = findPaneOwningProject(ctx.manager, pane_id);
-        if (!owned) {
-          resp = `Pane ${pane_id} not found in any project.`;
-        } else {
-          const { projectId, pane } = owned;
-          const nextGates: CapabilityGateMap = { ...(pane.capabilityGates || {}) };
-          nextGates[capability as CapabilityGate] = gate as GateValue;
-          pane.capabilityGates = nextGates;
-          // Persist via updatePane so the per-pane override survives in BOTH backends (SQLite writes
-          // the capability_gates column; a bare save() would be a no-op there — bead 8sq schema v4).
-          ctx.manager.ledger.updatePane(projectId, pane, true);
-          resp = `Set per-pane gate '${capability}' = ${gate} for pane ${pane_id}.`;
-        }
-      } else {
-        globalGates[capability as CapabilityGate] = gate as GateValue;
-        ctx.manager.saveSettings();
-        resp = `Set global gate '${capability}' = ${gate}.`;
-      }
-      if (ctx.store) {
-        const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
-        ctx.store.recordActivity({
-          type: "permission_changed",
-          project_id: activeProjectId,
-          pane_id: pane_id ?? null,
-          summary: `gate ${capability}=${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`,
-          payload: { capability, gate, pane_id: pane_id ?? null },
-        });
-      }
-      ctx.broadcast({
-        type: "settings_updated",
-        settings: ctx.sanitizeSettingsForClient(ctx.manager.settings),
-      });
+    // ALL outcomes collapse to one ok-shaped { output: <string> } in legacy (invalid-gate,
+    // refused-loosen, pane-not-found, and both successes). Each branch below returns that single shape.
+    if (!VALID_CAPABILITY_GATES.includes(gate)) {
+      return { kind: "ok", output: `Invalid gate "${gate}". Must be one of: Auto, Ask, Off.` };
     }
-    // ALL outcomes collapse to one ok-shaped { output: resp } in legacy (invalid-gate, refused-loosen,
-    // pane-not-found, and both successes). Reproduce that single wire shape verbatim.
-    return { kind: "ok", output: resp };
+    const current = ctx.effectiveCapabilityGateFor(pane_id || null, capability as CapabilityGate);
+    if (isLoosening(current, gate as GateValue)) {
+      return { kind: "ok", output: refuseVoiceLoosen(ctx, pane_id, capability, current, gate) };
+    }
+    return { kind: "ok", output: applyCapabilityGate(ctx, pane_id, capability, gate) };
   },
 };
+
+/** The three valid gate values (set_capability_gate's in-handler `gate` allowlist). */
+const VALID_CAPABILITY_GATES = ["Auto", "Ask", "Off"];
+
+/**
+ * Build the tighten-only LOOSEN refusal string and (best-effort) record the refusal audit row.
+ * Extracted from set_capability_gate so the handler stays under CC 10 — same string, same audit
+ * payload, same store guard (behavior-preserving).
+ */
+function refuseVoiceLoosen(
+  ctx: Parameters<ActionDef<typeof SetCapabilityGateParams>["handler"]>[1],
+  pane_id: string | undefined,
+  capability: string,
+  current: GateValue,
+  gate: string,
+): string {
+  if (ctx.store) {
+    const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+    ctx.store.recordActivity({
+      type: "permission_changed",
+      project_id: activeProjectId,
+      pane_id: pane_id ?? null,
+      summary: `REFUSED voice loosen ${capability} ${current}->${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`,
+      payload: { capability, from: current, to: gate, pane_id: pane_id ?? null, refused: true },
+    });
+  }
+  return `For safety I can't LOOSEN a capability gate by voice (you asked to change '${capability}' from ${current} to ${gate}). Loosening must be done deliberately in the Settings UI. I can TIGHTEN gates by voice anytime.`;
+}
+
+/**
+ * Apply a tighten/equal capability-gate change (per-pane or global), then audit + broadcast. Returns
+ * the operator-facing result string. The per-pane not-found path returns WITHOUT auditing/broadcasting
+ * (faithful to the legacy nested-else, which only audited+broadcast on a successful set). The gate-map
+ * WRITES (nextGates / globalGates) are byte-identical to the inlined branches (behavior-preserving).
+ */
+function applyCapabilityGate(
+  ctx: Parameters<ActionDef<typeof SetCapabilityGateParams>["handler"]>[1],
+  pane_id: string | undefined,
+  capability: string,
+  gate: string,
+): string {
+  if (!ctx.manager.settings.advanced.capabilityGates)
+    ctx.manager.settings.advanced.capabilityGates = {};
+  // Stable non-null handle to the global map (the guard above guarantees it exists). The legacy
+  // indexes ctx.manager.settings.advanced.capabilityGates directly under `args: any`; this local
+  // preserves the SAME object reference + write while staying type-correct across the branch.
+  const globalGates: CapabilityGateMap = ctx.manager.settings.advanced.capabilityGates;
+  let resp: string;
+  if (pane_id) {
+    // Resolve the pane's OWNING project (paneOwnership.ts) — the write side of the owning-project
+    // fix: a voice "lock down that pane" for a pane in a NON-active project used to fail with
+    // not-found because only getActiveProject() was consulted.
+    const owned = findPaneOwningProject(ctx.manager, pane_id);
+    if (!owned) {
+      return `Pane ${pane_id} not found in any project.`;
+    }
+    const { projectId, pane } = owned;
+    const nextGates: CapabilityGateMap = { ...(pane.capabilityGates || {}) };
+    nextGates[capability as CapabilityGate] = gate as GateValue;
+    pane.capabilityGates = nextGates;
+    // Persist via updatePane so the per-pane override survives in BOTH backends (SQLite writes the
+    // capability_gates column; a bare save() would be a no-op there — bead 8sq schema v4).
+    ctx.manager.ledger.updatePane(projectId, pane, true);
+    resp = `Set per-pane gate '${capability}' = ${gate} for pane ${pane_id}.`;
+  } else {
+    globalGates[capability as CapabilityGate] = gate as GateValue;
+    ctx.manager.saveSettings();
+    resp = `Set global gate '${capability}' = ${gate}.`;
+  }
+  if (ctx.store) {
+    const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+    ctx.store.recordActivity({
+      type: "permission_changed",
+      project_id: activeProjectId,
+      pane_id: pane_id ?? null,
+      summary: `gate ${capability}=${gate}${pane_id ? ` (pane ${pane_id})` : " (global)"}`,
+      payload: { capability, gate, pane_id: pane_id ?? null },
+    });
+  }
+  ctx.broadcast({
+    type: "settings_updated",
+    settings: ctx.sanitizeSettingsForClient(ctx.manager.settings),
+  });
+  return resp;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_pane_gates — server.ts:868 (the BULK whole-map per-pane override writer; the operator
@@ -470,33 +496,15 @@ export const setPaneGates: ActionDef<typeof SetPaneGatesParams> = {
     }
     // (B) normalize: only valid {Auto|Ask|Off} entries survive; (C) an empty / all-invalid map clears
     // the override (so the pane falls back to the global default rather than persisting a masking `{}`).
-    const clean: CapabilityGateMap = {};
-    let any = false;
-    if (capability_gates && typeof capability_gates === "object") {
-      for (const [k, v] of Object.entries(capability_gates)) {
-        if (v === "Auto" || v === "Ask" || v === "Off") {
-          (clean as Record<string, GateValue>)[k] = v as GateValue;
-          any = true;
-        }
-      }
-    }
-    pane.capabilityGates = any ? clean : undefined;
+    const clean = normalizePaneGates(capability_gates);
+    const override = clean ?? undefined;
+    pane.capabilityGates = override;
     // (D) Persist via updatePane (the durable path for BOTH backends): the SQLite store writes the
     // capability_gates column (schema v4); a bare ledger.save() would be a SQLite no-op and silently
     // drop the override. Fires on BOTH the set and clear paths.
     ctx.manager.ledger.updatePane(project_id, pane, true);
     // (E) audit — guarded by if(ctx.store) + try/catch (store is null under JANUS_LEDGER_BACKEND=legacy).
-    if (ctx.store) {
-      try {
-        ctx.store.recordActivity({
-          type: "permission_changed",
-          project_id,
-          pane_id,
-          summary: `UI set per-pane gates for ${pane_id} (${any ? Object.keys(clean).length : 0} override(s))`,
-          payload: { action: "set_pane_gates", capabilityGates: any ? clean : null },
-        });
-      } catch { /* store optional */ }
-    }
+    recordPaneGatesActivity(ctx, project_id, pane_id, clean);
     // (F)+(G) re-broadcast on BOTH set and clear so the chips repaint from the new server-resolved
     // posture (the clear path repaints back to the global default — R7).
     ctx.broadcastLedgerUpdate();
@@ -505,6 +513,51 @@ export const setPaneGates: ActionDef<typeof SetPaneGatesParams> = {
     return { kind: "ok", output: { capabilityGates: pane.capabilityGates ?? null } };
   },
 };
+
+/**
+ * Normalize the inbound per-pane gate map: keep ONLY the {Auto|Ask|Off} entries (invalid values are
+ * silently dropped — the inline route's behavior, regression bar #3). Returns the clean map, or null
+ * when nothing valid survived (the CLEAR signal: an empty / all-invalid / absent map clears the
+ * override rather than persisting a masking `{}`). FLAG (locks.ts gate-map-copy, separate hardening
+ * decision): this copies entries by STRING KEY into a plain object — the same prototype-leak class the
+ * standing lesson calls out; left structurally unchanged in this behavior-preserving pass.
+ */
+function normalizePaneGates(capability_gates: unknown): CapabilityGateMap | null {
+  const clean: CapabilityGateMap = {};
+  let any = false;
+  if (capability_gates && typeof capability_gates === "object") {
+    for (const [k, v] of Object.entries(capability_gates)) {
+      if (v === "Auto" || v === "Ask" || v === "Off") {
+        (clean as Record<string, GateValue>)[k] = v as GateValue;
+        any = true;
+      }
+    }
+  }
+  return any ? clean : null;
+}
+
+/**
+ * Best-effort audit row for set_pane_gates (guarded by if(ctx.store) + try/catch — store is null under
+ * JANUS_LEDGER_BACKEND=legacy). `clean` is the normalized map (null on the clear path). Same summary /
+ * payload as the inlined block (behavior-preserving).
+ */
+function recordPaneGatesActivity(
+  ctx: Parameters<ActionDef<typeof SetPaneGatesParams>["handler"]>[1],
+  project_id: string,
+  pane_id: string,
+  clean: CapabilityGateMap | null,
+): void {
+  if (!ctx.store) return;
+  try {
+    ctx.store.recordActivity({
+      type: "permission_changed",
+      project_id,
+      pane_id,
+      summary: `UI set per-pane gates for ${pane_id} (${clean ? Object.keys(clean).length : 0} override(s))`,
+      payload: { action: "set_pane_gates", capabilityGates: clean ?? null },
+    });
+  } catch { /* store optional */ }
+}
 
 /** The "Changing the locks" group, in dispatch order. */
 export const LOCKS_ACTIONS: ActionDef[] = [

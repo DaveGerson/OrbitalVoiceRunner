@@ -119,23 +119,54 @@ function negatorBefore(tokens: string[], i: number): boolean {
   return i > 0 && NEGATORS.has(tokens[i - 1]);
 }
 
+// ── isDeferUtterance, decomposed into one predicate per phrase-table clause ──
+// Each clause-N predicate tests whether the defer phrase ANCHORS at token index `i`. The clauses
+// are EXACTLY those documented on the phrase table above; the dispatcher (isDeferUtterance) runs the
+// short-"later" length guard once, then ORs the per-index clauses across the token stream — so the
+// observable result is byte-identical to the original linear chain, just hand-verifiable per clause.
+
+/** (2) "<me|again|it|that|them|you> later" — "ask me later", "remind me later", "do it later". */
+function isDeferLaterBigram(tokens: string[], i: number): boolean {
+  return tokens[i + 1] === "later" && DEFER_LATER_PRECEDERS.has(tokens[i]) && !negatorBefore(tokens, i);
+}
+
+/** (3) "not now" / "not yet" / "not right now". */
+function isDeferNotNow(tokens: string[], i: number): boolean {
+  if (tokens[i] !== "not") return false;
+  const next = tokens[i + 1];
+  return next === "now" || next === "yet" || (next === "right" && tokens[i + 2] === "now");
+}
+
+/** (4) "hold <on|off|that|it|them>" / "on hold". */
+function isDeferHold(tokens: string[], i: number): boolean {
+  const tok = tokens[i];
+  const next = tokens[i + 1];
+  if (tok === "hold" && next !== undefined && DEFER_HOLD_PARTICLES.has(next) && !negatorBefore(tokens, i)) return true;
+  return tok === "on" && next === "hold";
+}
+
+/** (5) "in a <minute|moment|bit|second|sec|while|few>". */
+function isDeferInAUnit(tokens: string[], i: number): boolean {
+  return tokens[i] === "in" && tokens[i + 1] === "a" && tokens[i + 2] !== undefined && DEFER_IN_A_UNITS.has(tokens[i + 2]);
+}
+
+/** (6) "for now" anchored here, paired with a parking verb ANYWHERE in the utterance. */
+function isDeferForNow(tokens: string[], i: number): boolean {
+  return tokens[i] === "for" && tokens[i + 1] === "now" && tokens.some((t) => DEFER_FOR_NOW_PAIRS.has(t));
+}
+
+/** The per-index defer clauses (2)–(6); clause (1) is the length-guarded short-"later" prefix check. */
+const DEFER_CLAUSES: ReadonlyArray<(tokens: string[], i: number) => boolean> = [
+  isDeferLaterBigram, isDeferNotNow, isDeferHold, isDeferInAUnit, isDeferForNow,
+];
+
 function isDeferUtterance(tokens: string[]): boolean {
   // (1) A short, directive utterance built around "later".
   if (tokens.length <= 3 && tokens.includes("later")) return true;
   for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i];
-    const next = tokens[i + 1];
-    // (2) "<me|again|it|that> later" — "ask me later", "remind me later", "do it later".
-    if (next === "later" && DEFER_LATER_PRECEDERS.has(tok) && !negatorBefore(tokens, i)) return true;
-    // (3) "not now" / "not right now" / "not yet".
-    if (tok === "not" && (next === "now" || next === "yet" || (next === "right" && tokens[i + 2] === "now"))) return true;
-    // (4) "hold <particle>" / "on hold".
-    if (tok === "hold" && next !== undefined && DEFER_HOLD_PARTICLES.has(next) && !negatorBefore(tokens, i)) return true;
-    if (tok === "on" && next === "hold") return true;
-    // (5) "in a <minute|moment|bit|second|few...>".
-    if (tok === "in" && next === "a" && tokens[i + 2] !== undefined && DEFER_IN_A_UNITS.has(tokens[i + 2])) return true;
-    // (6) "for now" paired with a parking verb anywhere in the utterance.
-    if (tok === "for" && next === "now" && tokens.some((t) => DEFER_FOR_NOW_PAIRS.has(t))) return true;
+    for (const clause of DEFER_CLAUSES) {
+      if (clause(tokens, i)) return true;
+    }
   }
   return false;
 }
@@ -160,33 +191,34 @@ function hasNearbyObject(tokens: string[], i: number, window = 2): boolean {
   return false;
 }
 
-/** Extract a target hint (ordinal word or a named fragment after "the"). */
-function extractTargetHint(tokens: string[]): TargetHint | undefined {
-  const hint: TargetHint = {};
+// Fragment STOP words: tokens that can never be part of a by-name target fragment (verbs,
+// negators, object tokens, filler, and the 4D.3 defer-phrase vocabulary so "skip the npm install
+// for now" yields "npm install", never "later"/"hold"/… as a bogus by-name target).
+const FRAGMENT_STOP = new Set([
+  ...APPROVE_VERBS, ...REJECT_VERBS, ...NEGATORS, ...OBJECT_TOKENS,
+  "to", "i", "want", "we", "lets", "let", "please", "and", "but", "actually", "now",
+  "the", "a", "an", "on", "for", "pane", "in", "do", "make", "sure",
+  "later", "hold", "wait", "leave", "park", "pass", "minute", "moment", "bit", "second", "sec",
+  "while", "few", "yet", "again", "right", "maybe", "ask", "remind", "me",
+]);
 
+/** The first ordinal word in the stream maps to its number ("the second one" -> 2; "last" -> -1). */
+function extractOrdinal(tokens: string[]): number | undefined {
   for (const tok of tokens) {
-    if (tok in ORDINAL_WORDS) {
-      hint.ordinal = ORDINAL_WORDS[tok];
-      break;
-    }
+    if (tok in ORDINAL_WORDS) return ORDINAL_WORDS[tok];
   }
+  return undefined;
+}
 
-  // Fragment: the words sitting between a trigger/"the" and a trailing object token
-  // ("approve the npm install command" -> "npm install"). We take the longest run of
-  // non-stopword tokens that are not verbs/negators/objects.
-  const STOP = new Set([
-    ...APPROVE_VERBS, ...REJECT_VERBS, ...NEGATORS, ...OBJECT_TOKENS,
-    "to", "i", "want", "we", "lets", "let", "please", "and", "but", "actually", "now",
-    "the", "a", "an", "on", "for", "pane", "in", "do", "make", "sure",
-    // 4D.3: defer-phrase vocabulary — "skip the npm install for now" must yield fragment
-    // "npm install", never "later"/"hold"/… as a bogus by-name target.
-    "later", "hold", "wait", "leave", "park", "pass", "minute", "moment", "bit", "second", "sec",
-    "while", "few", "yet", "again", "right", "maybe", "ask", "remind", "me",
-  ]);
+/**
+ * Fragment: the LONGEST run of non-stopword tokens ("approve the npm install command" -> "npm
+ * install"). Stop words and ordinal words break a run; the longest run seen wins.
+ */
+function extractFragment(tokens: string[]): string | undefined {
   const frag: string[] = [];
   let best: string[] = [];
   for (const tok of tokens) {
-    if (STOP.has(tok) || tok in ORDINAL_WORDS) {
+    if (FRAGMENT_STOP.has(tok) || tok in ORDINAL_WORDS) {
       if (frag.length > best.length) best = [...frag];
       frag.length = 0;
     } else {
@@ -194,9 +226,101 @@ function extractTargetHint(tokens: string[]): TargetHint | undefined {
     }
   }
   if (frag.length > best.length) best = [...frag];
-  if (best.length) hint.fragment = best.join(" ");
+  return best.length ? best.join(" ") : undefined;
+}
 
+/** Extract a target hint (ordinal word or a named fragment after "the"). */
+function extractTargetHint(tokens: string[]): TargetHint | undefined {
+  const hint: TargetHint = {};
+  const ordinal = extractOrdinal(tokens);
+  if (ordinal !== undefined) hint.ordinal = ordinal;
+  const fragment = extractFragment(tokens);
+  if (fragment) hint.fragment = fragment;
   return hint.ordinal !== undefined || hint.fragment ? hint : undefined;
+}
+
+// Leading-negator directive exclusion set — the approval-domain verbs NEVER become an inferred
+// reject directive ("dont approve" / "dont confirm" stay `none`; only ambient action verbs keep the
+// reject-directive). Spread of APPROVE_STRONG (+ approve/approved) per the P2 symmetry note below.
+const NON_DIRECTIVE_AFTER_NEGATOR = new Set([...APPROVE_STRONG, "approve", "approved"]);
+
+/**
+ * 4D.3 (card-pinned): the bare skip family — "skip" / "skip it|that|this" with NO "for now" rider —
+ * resolves REJECT. (The defer scan already claimed every "skip … for now" form.) Returns the parsed
+ * reject when this anchors, else null to fall through.
+ */
+function tryBareSkip(tokens: string[]): ParsedApproval | null {
+  if (tokens[0] === "skip" && tokens.length <= 2 &&
+      (tokens.length === 1 || ["it", "that", "this"].includes(tokens[1]))) {
+    return { intent: "reject", targetHint: extractTargetHint(tokens) };
+  }
+  return null;
+}
+
+/**
+ * Bare short affirmation/denial ("yes" / "no" / "approved") — the whole utterance (<=2 tokens).
+ * Returns approve/reject/clarify when this short-form resolves, else null to fall through.
+ */
+function tryBareYesNo(tokens: string[]): ParsedApproval | null {
+  if (tokens.length > 2) return null;
+  const hasYes = tokens.some((t) => BARE_YES.has(t));
+  const hasNo = tokens.some((t) => BARE_NO.has(t));
+  if (hasYes && !hasNo) return { intent: "approve" };
+  if (hasNo && !hasYes) return { intent: "reject" };
+  if (hasYes && hasNo) return { intent: "clarify" };
+  return null;
+}
+
+/**
+ * Leading-negator DIRECTIVE: an utterance that STARTS with a CONTRACTED negator immediately followed
+ * by an ambient ACTION verb ("dont run", "dont go", "dont execute") is an explicit REJECT directive
+ * — the ASR apostrophe-drop case (BUG-008). The fully-spelled "do not run it" is deliberately NOT a
+ * directive (design §10 table: -> none).
+ *
+ * P2 (do-not-approve symmetry): the approval-domain verbs are DELIBERATELY excluded
+ * (NON_DIRECTIVE_AFTER_NEGATOR). "Negating approve" is genuinely ambiguous, and "do not approve"
+ * already resolves to `none`; so BOTH "do not approve" and "dont approve" yield `none` (never infer
+ * a reject from a negated approve). Returns the reject directive when it anchors, else null.
+ */
+function tryLeadingNegatorDirective(tokens: string[]): ParsedApproval | null {
+  if (
+    (tokens[0] === "dont" || tokens[0] === "never") &&
+    APPROVE_VERBS.has(tokens[1]) &&
+    !NON_DIRECTIVE_AFTER_NEGATOR.has(tokens[1])
+  ) {
+    return { intent: "reject", targetHint: extractTargetHint(tokens) };
+  }
+  return null;
+}
+
+/** Does the verb at index `i` PAIR (resolve a vote)? Strong verbs always; weak verbs only with a
+ *  nearby object token AND more than the bare verb+pronoun pair (P0-A). */
+function verbPairs(tokens: string[], i: number, tok: string): boolean {
+  const isStrong = STRONG_VERBS.has(tok);
+  return isStrong || (hasNearbyObject(tokens, i) && tokens.length > 2);
+}
+
+/**
+ * The main verb scan: walk the tokens, and for each PAIRED, NON-NEGATED approve/reject trigger flag
+ * its side. STRONG approval-domain verbs trigger on their own; WEAK ambient verbs require explicit
+ * pairing (so "we execute carefully" / bare "execute"/"proceed"/"dispatch" — and the bare
+ * verb+pronoun "send it"/"run it"/"go ahead"/"lets go" — never resolve a vote). A negated trigger is
+ * conservatively suppressed (no double-negative inference).
+ */
+function scanVerbVotes(tokens: string[]): { approve: boolean; reject: boolean } {
+  let approve = false;
+  let reject = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const isApproveVerb = APPROVE_VERBS.has(tok);
+    const isRejectVerb = REJECT_VERBS.has(tok);
+    if (!isApproveVerb && !isRejectVerb) continue;
+    if (!verbPairs(tokens, i, tok)) continue;
+    if (isNegated(tokens, i)) continue;
+    if (isApproveVerb) approve = true;
+    if (isRejectVerb) reject = true;
+  }
+  return { approve, reject };
 }
 
 /**
@@ -217,77 +341,12 @@ export function parseApprovalIntent(transcript: string): ParsedApproval {
     return { intent: "defer", targetHint: extractTargetHint(tokens) };
   }
 
-  // 4D.3 (card-pinned): the bare skip family — "skip" / "skip it|that|this" with NO "for now"
-  // rider — resolves REJECT. (The defer scan above already claimed every "skip … for now" form.)
-  if (tokens[0] === "skip" && tokens.length <= 2 &&
-      (tokens.length === 1 || ["it", "that", "this"].includes(tokens[1]))) {
-    return { intent: "reject", targetHint: extractTargetHint(tokens) };
-  }
+  // The precedence ladder (each guard returns a resolved intent or null to fall through):
+  // bare-skip reject -> bare yes/no -> leading-negator reject directive.
+  const guarded = tryBareSkip(tokens) ?? tryBareYesNo(tokens) ?? tryLeadingNegatorDirective(tokens);
+  if (guarded) return guarded;
 
-  // Bare short affirmation/denial ("yes" / "no" / "approved") — the whole utterance.
-  if (tokens.length <= 2) {
-    const hasYes = tokens.some((t) => BARE_YES.has(t));
-    const hasNo = tokens.some((t) => BARE_NO.has(t));
-    if (hasYes && !hasNo) return { intent: "approve" };
-    if (hasNo && !hasYes) return { intent: "reject" };
-    if (hasYes && hasNo) return { intent: "clarify" };
-  }
-
-  // Leading-negator DIRECTIVE: an utterance that STARTS with a CONTRACTED negator immediately
-  // followed by an ambient ACTION verb ("dont run", "dont go", "dont execute") is an explicit
-  // REJECT directive — this is the ASR apostrophe-drop case (BUG-008: "dont run" must reject).
-  // The fully-spelled "do not run it" is deliberately NOT a directive (design §10 table: -> none).
-  //
-  // P2 (do-not-approve symmetry): we DELIBERATELY exclude the approval-domain verbs (approve /
-  // accept / confirm / ...) from this directive. "Negating approve" is genuinely ambiguous
-  // ("dont approve yet" is not necessarily "reject"), and the spelled form "do not approve"
-  // already resolves to `none` (the approve verb is negated, suppressed below). To remove the
-  // spelled-vs-contracted asymmetry the spec calls out, BOTH "do not approve" and "dont approve"
-  // now yield the SAME intent: `none` (conservative — never infer a reject from a negated
-  // approve). Only ambient action verbs ("run"/"go"/"execute"/...) keep the reject-directive.
-  const NON_DIRECTIVE_AFTER_NEGATOR = new Set([...APPROVE_STRONG, "approve", "approved"]);
-  if (
-    (tokens[0] === "dont" || tokens[0] === "never") &&
-    APPROVE_VERBS.has(tokens[1]) &&
-    !NON_DIRECTIVE_AFTER_NEGATOR.has(tokens[1])
-  ) {
-    return { intent: "reject", targetHint: extractTargetHint(tokens) };
-  }
-
-  let approve = false;
-  let reject = false;
-
-  for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i];
-    const isApproveVerb = APPROVE_VERBS.has(tok);
-    const isRejectVerb = REJECT_VERBS.has(tok);
-    if (!isApproveVerb && !isRejectVerb) continue;
-
-    // STRONG approval-domain verbs trigger on their own; WEAK ambient verbs ALWAYS require
-    // explicit pairing with a nearby object token (so "we execute carefully" — and a bare
-    // "execute" / "proceed" / "dispatch" — does NOT resolve a vote). Bare affirmations
-    // ("yes" / "ok" / "okay") are handled by the BARE_YES block above; we must NOT re-admit
-    // weak verbs here via a length heuristic (P0-A: that over-approved "execute").
-    //
-    // P0-A (cont.): a bare two-word command of the form `[weak verb, bare pronoun]` — "send it",
-    // "run it", "go ahead", "lets go" — is ambient/under-specified, NOT explicit by-name
-    // targeting. The lone pronoun ("it"/"that"/"this") is too weak a signal to resolve a SAFETY
-    // vote on its own, so a WEAK verb only pairs when the utterance carries MORE than that bare
-    // verb+pronoun pair (a real object like "command"/"the install", an ordinal, etc.). Strong
-    // verbs are unaffected ("approve it" stays approve). Result: bare "send it"/"run it"/"go
-    // ahead"/"lets go" -> none (clarify), never an over-approve.
-    const isStrong = STRONG_VERBS.has(tok);
-    const paired = isStrong || (hasNearbyObject(tokens, i) && tokens.length > 2);
-    if (!paired) continue;
-
-    // A NEGATED trigger verb is CONSERVATIVELY suppressed (no resolution) — per the design,
-    // "do not run it" and "I dont want to cancel" both yield no dispatch. We never infer
-    // approval from a double negative.
-    if (isNegated(tokens, i)) continue;
-
-    if (isApproveVerb) approve = true;
-    if (isRejectVerb) reject = true;
-  }
+  const { approve, reject } = scanVerbVotes(tokens);
 
   if (approve && reject) return { intent: "clarify" };
   if (approve) return { intent: "approve", targetHint: extractTargetHint(tokens) };
@@ -316,6 +375,33 @@ export interface TargetResult {
   via?: "fragment" | "ordinal" | "lastAnnounced" | "only";
 }
 
+/**
+ * Resolve a 1-based ordinal hint (-1 = last) to a valid index into a length-`len` list, or null when
+ * out of range. Shared by both selectors so the in/out-of-range decision is one place.
+ */
+function ordinalIndex(ordinal: number, len: number): number | null {
+  const idx = ordinal === -1 ? len - 1 : ordinal - 1;
+  return idx >= 0 && idx < len ? idx : null;
+}
+
+/** Tokenize a fragment hint into its non-empty normalized needle tokens (shared matcher input). */
+function fragmentNeedle(fragment: string): string[] {
+  return normalizeUtterance(fragment).split(" ").filter(Boolean);
+}
+
+/** All entries whose haystack (from `hay`) contains EVERY needle token. */
+function fragmentMatches<T>(items: T[], needleTokens: string[], hay: (item: T) => string): T[] {
+  return items.filter((item) => {
+    const h = normalizeUtterance(hay(item));
+    return needleTokens.every((t) => h.includes(t));
+  });
+}
+
+/** True when `lastAnnouncedId` is set AND still present among the pending entries (never blind FIFO). */
+function hasLastAnnounced(entries: TargetableEntry[], lastAnnouncedId: string | null): lastAnnouncedId is string {
+  return !!lastAnnouncedId && entries.some((e) => e.messageId === lastAnnouncedId);
+}
+
 export function selectApprovalTarget(
   entries: TargetableEntry[],
   hint: TargetHint | undefined,
@@ -331,12 +417,7 @@ export function selectApprovalTarget(
   // nothing must NOT silently approve `lastAnnounced=deploy` — a miss means "I don't know which",
   // which is a clarify, never an over-approve). The single-entry case is handled above.
   if (hint?.fragment) {
-    const needle = normalizeUtterance(hint.fragment);
-    const needleTokens = needle.split(" ").filter(Boolean);
-    const matches = entries.filter((e) => {
-      const hay = normalizeUtterance(`${e.instruction} ${e.terminalId}`);
-      return needleTokens.every((t) => hay.includes(t));
-    });
+    const matches = fragmentMatches(entries, fragmentNeedle(hint.fragment), (e) => `${e.instruction} ${e.terminalId}`);
     if (matches.length === 1) return { messageId: matches[0].messageId, via: "fragment" };
     // 0 matches OR >1 matches, with >1 pending -> the explicit by-name signal is unresolvable.
     return { ambiguous: true };
@@ -344,15 +425,12 @@ export function selectApprovalTarget(
 
   // 2. Ordinal ("the second one", "the last one").
   if (hint?.ordinal !== undefined) {
-    const idx = hint.ordinal === -1 ? entries.length - 1 : hint.ordinal - 1;
-    if (idx >= 0 && idx < entries.length) {
-      return { messageId: entries[idx].messageId, via: "ordinal" };
-    }
-    return { ambiguous: true };
+    const idx = ordinalIndex(hint.ordinal, entries.length);
+    return idx !== null ? { messageId: entries[idx].messageId, via: "ordinal" } : { ambiguous: true };
   }
 
   // 3. The most-recently-announced id (never blind FIFO).
-  if (lastAnnouncedId && entries.some((e) => e.messageId === lastAnnouncedId)) {
+  if (hasLastAnnounced(entries, lastAnnouncedId)) {
     return { messageId: lastAnnouncedId, via: "lastAnnounced" };
   }
 
@@ -394,21 +472,14 @@ export function selectPendingAction(
 
   // Ordinal ("the second one" -> 2; "the last one" -> -1).
   if (hint?.ordinal !== undefined) {
-    const idx = hint.ordinal === -1 ? actions.length - 1 : hint.ordinal - 1;
-    if (idx >= 0 && idx < actions.length) {
-      return { id: actions[idx].id, summary: actions[idx].summary, via: "ordinal" };
-    }
-    return { ambiguous: true };
+    const idx = ordinalIndex(hint.ordinal, actions.length);
+    return idx !== null ? { id: actions[idx].id, summary: actions[idx].summary, via: "ordinal" } : { ambiguous: true };
   }
 
   // Fragment: a PRESENT by-name signal must match EXACTLY one summary; 0 or >1 -> clarify
   // (never silently resolve the wrong action — same conservative posture as selectApprovalTarget).
   if (hint?.fragment) {
-    const needleTokens = normalizeUtterance(hint.fragment).split(" ").filter(Boolean);
-    const matches = actions.filter((a) => {
-      const hay = normalizeUtterance(a.summary);
-      return needleTokens.every((t) => hay.includes(t));
-    });
+    const matches = fragmentMatches(actions, fragmentNeedle(hint.fragment), (a) => a.summary);
     if (matches.length === 1) return { id: matches[0].id, summary: matches[0].summary, via: "fragment" };
     return { ambiguous: true };
   }
