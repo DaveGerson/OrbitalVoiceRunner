@@ -40,7 +40,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 72 -> 66: burndown refactored actions/defs/layouts.applyLayout, dispatch/paneWrite.applyDispatchDecision, memory/pythonClient (createPythonSynthClient/onLine/spawnDaemon), orbital/station.deriveStations under CC 10 and pruned their 1+1+3+1 suppressions.
 // 66 -> 61: burndown refactored eventBus.effectForEvent, announcementBus.pruneAttentionQueue, memory/assembler.assembleBrief, voice/speakGate.shouldSpeak, liveTranscripts.extractTranscripts under CC 10 and pruned their 5 suppressions (1 each).
 // 61 -> 54: burndown refactored actions/defs/{orchestration,dispatch_group,panes_write}, dispatch/joinTracker, handoffFlow, liveGrounding, pendingApprovals under CC 10 and pruned their 7 suppressions (1 each).
-const RATCHET_CEILING = 54;
+// 54 -> 48: quick-win burndown refactored server.validateSettingsPutBody + HistoryManager.doFlush (2 of server's 3) and scripts catalog.renderCatalog / wt-lock.main / verify-live-modeswitch.main / live-smoke-kitchen.main under CC 10; pruned 2 (server 3->1) + 4 (scripts ->0).
+const RATCHET_CEILING = 48;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

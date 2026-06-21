@@ -85,6 +85,120 @@ async function probeAxis(term: UniversalTerminal, name: string, bytes: string): 
   return seen;
 }
 
+// ---------------------------------------------------------------------------
+// Phase helpers — each covers one sequential verification phase of main().
+// ---------------------------------------------------------------------------
+
+/** Phase 1: wait for agy's TUI to appear, watching for an early exit (auth/bad-launch).
+ *  Calls process.exit(3) directly when agy quits before the TUI is established — matching
+ *  the original behaviour. Clears hardKill before exiting so teardown is clean. */
+async function spawnAndAwaitTUI(term: UniversalTerminal, hardKill: ReturnType<typeof setTimeout>): Promise<void> {
+  for (let i = 0; i < STARTUP_MS / 1000; i++) {
+    await sleep(1000);
+    if (term.status === "Exited") {
+      log(`EXITED during startup (t+${i + 1}s) — agy printed and quit (help/auth/bad-launch).`);
+      log(`startup tail: ${JSON.stringify(tail().slice(-400))}`);
+      clearTimeout(hardKill);
+      process.exit(3);
+    }
+  }
+  log(`startup OK  : status=${term.status}, ${stripAnsi(raw).length} cleaned chars`);
+  log(`startup tail: ${JSON.stringify(tail().slice(-400))}`);
+}
+
+/** Phase 2: clear any agy setup prompts (folder-trust / tips screen) with Enter so we
+ *  land in the session before probing. Idempotent — a stray Enter at an empty composer
+ *  does not dispatch a model turn. */
+async function clearSetupPrompts(term: UniversalTerminal): Promise<void> {
+  const ENTER = "\r";
+  for (let k = 0; k < 3; k++) {
+    const screen = tail(14);
+    if (/trust (the contents|this folder)|Navigate|Confirm|press enter|continue|get started/i.test(screen)) {
+      log(`clearing setup prompt (Enter) #${k + 1}`);
+      term.writeRaw(ENTER);
+      await sleep(3500);
+    } else break;
+  }
+  log(`in-session tail: ${JSON.stringify(tail(14).slice(-700))}`);
+}
+
+/** Phase 3: drive the /permissions picker (agy v1.0.5 live-switch mechanism) in read-only
+ *  discovery mode — ESC out WITHOUT committing a permission change. */
+async function probePermissionsPicker(term: UniversalTerminal): Promise<void> {
+  log("=== /permissions picker probe (agy v1.0.5 live-switch mechanism) ===");
+  term.writeRaw("/permissions");
+  await sleep(1800);
+  log(`  typed /permissions: ${JSON.stringify(tail(10).slice(-400))}`);
+  term.writeRaw("\r");
+  await sleep(2800);
+  log(`  picker open?      : ${JSON.stringify(tail(16).slice(-700))}`);
+  const ARROW_DOWN = "\x1b[B";
+  for (let i = 1; i <= 4; i++) {
+    term.writeRaw(ARROW_DOWN);
+    await sleep(1400);
+    log(`  picker ↓ #${i}: ${JSON.stringify(tail(12).slice(-500))}`);
+  }
+  term.writeRaw("\x1b"); // ESC out without committing a permission change
+  await sleep(1200);
+  log(`  after ESC (backed out): ${JSON.stringify(tail(8).slice(-300))}`);
+}
+
+// ---------------------------------------------------------------------------
+// Pure verdict helpers — no I/O, fully testable.
+// ---------------------------------------------------------------------------
+
+export interface VerdictInfo {
+  distinct: Set<string>;
+  downDistinct: Set<string>;
+  tabDistinct: Set<string>;
+  inconclusive: boolean;
+  downMoved: boolean;
+  tabMoved: boolean;
+}
+
+/** Pure: compute verdict sets and flags from the collected markers.
+ *  Exported so tests/test_verifymodeswitch_complexity_refactor.ts can pin it directly. */
+export function computeVerdictInfo(
+  floorMarker: string | null,
+  axisDown: string[],
+  axisTab: string[],
+): VerdictInfo {
+  const all = [floorMarker ?? "(null)", ...axisDown, ...axisTab];
+  const distinct = new Set(all.filter((m) => m !== "(null)"));
+  const downDistinct = new Set(axisDown.filter((m) => m !== "(null)"));
+  const tabDistinct = new Set(axisTab.filter((m) => m !== "(null)"));
+  const downMoved = downDistinct.size > 1 || (!!floorMarker && downDistinct.size >= 1 && !downDistinct.has(floorMarker));
+  const tabMoved = tabDistinct.size > 1 || (!!floorMarker && tabDistinct.size >= 1 && !tabDistinct.has(floorMarker));
+  const inconclusive = distinct.size <= 1;
+  return { distinct, downDistinct, tabDistinct, inconclusive, downMoved, tabMoved };
+}
+
+/** Print the VERDICT block and RESULT line.  Separated from computeVerdictInfo so the
+ *  pure logic is testable without console side-effects. */
+function printVerdict(v: VerdictInfo): void {
+  log("=== VERDICT ===");
+  log(`  distinct non-null markers overall: ${v.distinct.size}`);
+  log(`  shift+down moved it: ${v.downMoved}`);
+  log(`  shift+tab  moved it: ${v.tabMoved}`);
+  for (const m of v.distinct) log(`    • ${JSON.stringify(m)}`);
+
+  if (v.inconclusive) {
+    log("RESULT: no permission/mode axis responded to shift+down or shift+tab. P5-VERIFIED in an "
+      + "AUTHENTICATED agy v1.0.5 session: there is NO live key-cycle permission axis, and "
+      + "/permissions is a Permission Config Editor (rule scopes), not a session-mode dial. "
+      + "Full-Auto ⇒ relaunch with --dangerously-skip-permissions. readyForLiveCycle=false + "
+      + "restart-resume is CONFIRMED correct. (If you instead saw a login/trust screen above, "
+      + "agy is not signed in / the folder is untrusted — clear those, then re-run.)");
+  } else {
+    log("RESULT: a cycle axis moved the marker — capture the strings above into "
+      + "AntigravityAdapter.parseCurrentMode and reconsider readyForLiveCycle.");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator — calls phases in order, same phase ordering + exit codes as before.
+// ---------------------------------------------------------------------------
+
 async function main() {
   const hardKill = setTimeout(() => { console.error("[p5-agy] HARD TIMEOUT"); process.exit(1); }, HARD_TIMEOUT_MS);
   const cwd = process.cwd();
@@ -102,56 +216,13 @@ async function main() {
   term.start();
   log(`spawned     : pid=${(term as any).shellPid} usingNodePty=${(term as any).usingNodePty}`);
 
-  for (let i = 0; i < STARTUP_MS / 1000; i++) {
-    await sleep(1000);
-    if (term.status === "Exited") {
-      log(`EXITED during startup (t+${i + 1}s) — agy printed and quit (help/auth/bad-launch).`);
-      log(`startup tail: ${JSON.stringify(tail().slice(-400))}`);
-      clearTimeout(hardKill);
-      process.exit(3);
-    }
-  }
-  log(`startup OK  : status=${term.status}, ${stripAnsi(raw).length} cleaned chars`);
-  log(`startup tail: ${JSON.stringify(tail().slice(-400))}`);
-
-  // agy gates a fresh session behind a one-time "Do you trust this folder?" nav-list
-  // (↑/↓ + enter, default = "Yes, I trust this folder") and possibly a tips screen.
-  // Clear setup prompts with Enter so we land IN the session before probing the axis.
-  // Idempotent: once the folder is trusted agy skips it; a stray Enter at an empty
-  // composer is harmless (it does not dispatch a model turn).
-  const ENTER = "\r";
-  for (let k = 0; k < 3; k++) {
-    const screen = tail(14);
-    if (/trust (the contents|this folder)|Navigate|Confirm|press enter|continue|get started/i.test(screen)) {
-      log(`clearing setup prompt (Enter) #${k + 1}`);
-      term.writeRaw(ENTER);
-      await sleep(3500);
-    } else break;
-  }
-  log(`in-session tail: ${JSON.stringify(tail(14).slice(-700))}`);
+  await spawnAndAwaitTUI(term, hardKill);
+  await clearSetupPrompts(term);
 
   const floorMarker = modeMarker();
   log(`floor marker: ${JSON.stringify(floorMarker)}`);
 
-  // agy v1.0.5 added /permissions (a picker), the REAL live-switch mechanism — there is
-  // no shift-key cycle axis. Drive it and capture the option strings, then ESC back out
-  // WITHOUT committing a change (read-only discovery).
-  log("=== /permissions picker probe (agy v1.0.5 live-switch mechanism) ===");
-  term.writeRaw("/permissions");
-  await sleep(1800);
-  log(`  typed /permissions: ${JSON.stringify(tail(10).slice(-400))}`);
-  term.writeRaw("\r");
-  await sleep(2800);
-  log(`  picker open?      : ${JSON.stringify(tail(16).slice(-700))}`);
-  const ARROW_DOWN = "\x1b[B";
-  for (let i = 1; i <= 4; i++) {
-    term.writeRaw(ARROW_DOWN);
-    await sleep(1400);
-    log(`  picker ↓ #${i}: ${JSON.stringify(tail(12).slice(-500))}`);
-  }
-  term.writeRaw("\x1b"); // ESC out without committing a permission change
-  await sleep(1200);
-  log(`  after ESC (backed out): ${JSON.stringify(tail(8).slice(-300))}`);
+  await probePermissionsPicker(term);
 
   log("=== probe axis A: shift+down (ESC[1;2B) — the adapter's assumed axis ===");
   const axisDown = await probeAxis(term, "shift+down", SHIFT_DOWN);
@@ -164,32 +235,11 @@ async function main() {
   // WORKER can crash the process with exit 255 during stop() (the AttachConsole artifact),
   // and a worker-thread throw is NOT catchable from the main thread. Emitting the result
   // first guarantees the finding survives even if the exit code is then clobbered.
-  const all = [floorMarker ?? "(null)", ...axisDown, ...axisTab];
-  const distinct = new Set(all.filter((m) => m !== "(null)"));
-  const downDistinct = new Set(axisDown.filter((m) => m !== "(null)"));
-  const tabDistinct = new Set(axisTab.filter((m) => m !== "(null)"));
-
-  log("=== VERDICT ===");
-  log(`  distinct non-null markers overall: ${distinct.size}`);
-  log(`  shift+down moved it: ${downDistinct.size > 1 || (floorMarker && downDistinct.size >= 1 && !downDistinct.has(floorMarker))}`);
-  log(`  shift+tab  moved it: ${tabDistinct.size > 1 || (floorMarker && tabDistinct.size >= 1 && !tabDistinct.has(floorMarker))}`);
-  for (const m of distinct) log(`    • ${JSON.stringify(m)}`);
-
-  const inconclusive = distinct.size <= 1;
-  if (inconclusive) {
-    log("RESULT: no permission/mode axis responded to shift+down or shift+tab. P5-VERIFIED in an "
-      + "AUTHENTICATED agy v1.0.5 session: there is NO live key-cycle permission axis, and "
-      + "/permissions is a Permission Config Editor (rule scopes), not a session-mode dial. "
-      + "Full-Auto ⇒ relaunch with --dangerously-skip-permissions. readyForLiveCycle=false + "
-      + "restart-resume is CONFIRMED correct. (If you instead saw a login/trust screen above, "
-      + "agy is not signed in / the folder is untrusted — clear those, then re-run.)");
-  } else {
-    log("RESULT: a cycle axis moved the marker — capture the strings above into "
-      + "AntigravityAdapter.parseCurrentMode and reconsider readyForLiveCycle.");
-  }
+  const verdict = computeVerdictInfo(floorMarker, axisDown, axisTab);
+  printVerdict(verdict);
 
   try { await term.stop(); } catch { /* ConPTY teardown noise — ignore */ }
-  process.exit(inconclusive ? 2 : 0);
+  process.exit(verdict.inconclusive ? 2 : 0);
 }
 
 main().catch((e) => { console.error("[p5-agy] ERROR:", e); process.exit(1); });

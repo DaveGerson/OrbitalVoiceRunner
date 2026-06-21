@@ -95,42 +95,52 @@ const KNOWN_CAPABILITY_IDS: ReadonlySet<string> = new Set(CAPABILITY_DEFS.map((d
 /** Validate (and forward-compat-strip) a PUT /api/settings body IN PLACE. Returns a 400-able error
  *  naming the offending field, or ok. Pure over everything except the unknown-gate-key strip.
  *  (Uniform shape, not a discriminated union — this tsconfig is non-strict, so `!r.ok` would not narrow.) */
-export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return { ok: false, error: "Settings body must be a JSON object." };
-  }
-  const advanced = (body as Record<string, unknown>).advanced;
-  if (advanced === undefined) return { ok: true };
-  if (typeof advanced !== "object" || advanced === null || Array.isArray(advanced)) {
-    return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
-  }
-  const adv = advanced as Record<string, unknown>;
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Validate advanced.globalPermissionsMode (when present). Returns null when valid/absent. */
+function validateGlobalModeField(adv: Record<string, unknown>): string | null {
   if (adv.globalPermissionsMode !== undefined &&
       !SettingsGlobalModeSchema.safeParse(adv.globalPermissionsMode).success) {
-    return {
-      ok: false,
-      error: `Invalid settings field 'advanced.globalPermissionsMode': must be one of ${SettingsGlobalModeSchema.options.join(", ")}.`,
-    };
+    return `Invalid settings field 'advanced.globalPermissionsMode': must be one of ${SettingsGlobalModeSchema.options.join(", ")}.`;
   }
+  return null;
+}
+
+/** Validate advanced.capabilityGates (when present). Strips unknown keys in place (forward
+ *  compat); returns an error message string for an invalid value on a KNOWN key, else null. */
+function validateCapabilityGatesField(adv: Record<string, unknown>): string | null {
   const gates = adv.capabilityGates;
-  if (gates !== undefined) {
-    if (typeof gates !== "object" || gates === null || Array.isArray(gates)) {
-      return { ok: false, error: "Invalid settings field 'advanced.capabilityGates': expected an object map of capability -> Auto|Ask|Off." };
+  if (gates === undefined) return null;
+  if (!isPlainObject(gates)) {
+    return "Invalid settings field 'advanced.capabilityGates': expected an object map of capability -> Auto|Ask|Off.";
+  }
+  for (const key of Object.keys(gates)) {
+    if (!KNOWN_CAPABILITY_IDS.has(key)) {
+      delete gates[key]; // unknown capability row: strip, don't 400 (forward compat).
+      continue;
     }
-    const gateMap = gates as Record<string, unknown>;
-    for (const key of Object.keys(gateMap)) {
-      if (!KNOWN_CAPABILITY_IDS.has(key)) {
-        delete gateMap[key]; // unknown capability row: strip, don't 400 (forward compat).
-        continue;
-      }
-      if (!SettingsGateValueSchema.safeParse(gateMap[key]).success) {
-        return {
-          ok: false,
-          error: `Invalid settings field 'advanced.capabilityGates.${key}': must be one of ${SettingsGateValueSchema.options.join(", ")}.`,
-        };
-      }
+    if (!SettingsGateValueSchema.safeParse(gates[key]).success) {
+      return `Invalid settings field 'advanced.capabilityGates.${key}': must be one of ${SettingsGateValueSchema.options.join(", ")}.`;
     }
   }
+  return null;
+}
+
+export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
+  if (!isPlainObject(body)) {
+    return { ok: false, error: "Settings body must be a JSON object." };
+  }
+  const advanced = body.advanced;
+  if (advanced === undefined) return { ok: true };
+  if (!isPlainObject(advanced)) {
+    return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+  }
+  const modeError = validateGlobalModeField(advanced);
+  if (modeError) return { ok: false, error: modeError };
+  const gatesError = validateCapabilityGatesField(advanced);
+  if (gatesError) return { ok: false, error: gatesError };
   return { ok: true };
 }
 
@@ -425,6 +435,30 @@ export class HistoryManager {
     return next;
   }
 
+  /** Read the on-disk multi-pane map for a merge; {} on missing/corrupt (legacy behavior). */
+  private async readDiskMapForMerge(filePath: string): Promise<Record<string, HistoryEntry[]>> {
+    try {
+      const data = await fs.promises.readFile(filePath, "utf-8");
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // missing/corrupt file: start fresh (legacy behavior)
+    }
+    return {};
+  }
+
+  /** Atomic: write a unique sibling tmp, then rename over the live file. */
+  private async atomicWrite(filePath: string, allHistory: Record<string, HistoryEntry[]>): Promise<void> {
+    const tmpPath = `${filePath}.${process.pid}.${++this.tmpSeq}.tmp`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(allHistory, null, 2), "utf-8");
+    try {
+      await fs.promises.rename(tmpPath, filePath);
+    } catch (e) {
+      try { await fs.promises.unlink(tmpPath); } catch { /* best-effort cleanup */ }
+      throw e;
+    }
+  }
+
   private async doFlush(filePath: string): Promise<void> {
     const perFile = this.dirty.get(filePath);
     if (!perFile || perFile.size === 0) {
@@ -435,25 +469,10 @@ export class HistoryManager {
     this.firstDirtyAt.delete(filePath); // mutations during the flush open a new linger window
 
     // Merge over the on-disk file so out-of-band writers' OTHER pane keys survive.
-    let allHistory: Record<string, HistoryEntry[]> = {};
-    try {
-      const data = await fs.promises.readFile(filePath, "utf-8");
-      const parsed = JSON.parse(data);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) allHistory = parsed;
-    } catch {
-      // missing/corrupt file: start fresh (legacy behavior)
-    }
+    const allHistory = await this.readDiskMapForMerge(filePath);
     for (const [terminalId, entries] of snapshot) allHistory[terminalId] = entries;
 
-    // Atomic: write a unique sibling tmp, then rename over the live file.
-    const tmpPath = `${filePath}.${process.pid}.${++this.tmpSeq}.tmp`;
-    await fs.promises.writeFile(tmpPath, JSON.stringify(allHistory, null, 2), "utf-8");
-    try {
-      await fs.promises.rename(tmpPath, filePath);
-    } catch (e) {
-      try { await fs.promises.unlink(tmpPath); } catch { /* best-effort cleanup */ }
-      throw e;
-    }
+    await this.atomicWrite(filePath, allHistory);
 
     // Clear ONLY keys not re-dirtied during the async write (saveHistory always installs
     // a new array, so reference equality is exact).
