@@ -65,25 +65,30 @@ interface ProcRec {
   state: string;
 }
 
+/** Parse a single /proc/[pid]/stat line into a ProcRec, or null if malformed. */
+function parseOneProcRecord(raw: string): ProcRec | null {
+  const line = raw.trim();
+  if (!line) return null;
+  const open = line.indexOf("(");
+  const close = line.lastIndexOf(")");
+  if (open < 0 || close < 0 || close < open) return null;
+  const pid = parseInt(line.slice(0, open).trim(), 10);
+  if (!Number.isFinite(pid)) return null;
+  const comm = line.slice(open + 1, close);
+  // After ')': state ppid pgrp session tty_nr tpgid ...
+  const f = line.slice(close + 1).trim().split(/\s+/);
+  const ppid = parseInt(f[1], 10);
+  if (!Number.isFinite(ppid)) return null;
+  const pgrp = parseInt(f[2], 10);
+  const tpgid = parseInt(f[5], 10);
+  return { pid, ppid, pgrp: pgrp || 0, tpgid: Number.isFinite(tpgid) ? tpgid : -1, comm, state: f[0] || "" };
+}
+
 function parseProcRecords(entries: string[]): ProcRec[] {
   const out: ProcRec[] = [];
   for (const raw of entries) {
-    const line = raw.trim();
-    if (!line) continue;
-    const open = line.indexOf("(");
-    const close = line.lastIndexOf(")");
-    if (open < 0 || close < 0 || close < open) continue;
-    const pid = parseInt(line.slice(0, open).trim(), 10);
-    if (!Number.isFinite(pid)) continue;
-    const comm = line.slice(open + 1, close);
-    // After ')': state ppid pgrp session tty_nr tpgid ...
-    const f = line.slice(close + 1).trim().split(/\s+/);
-    const state = f[0] || "";
-    const ppid = parseInt(f[1], 10);
-    const pgrp = parseInt(f[2], 10);
-    const tpgid = parseInt(f[5], 10);
-    if (!Number.isFinite(ppid)) continue;
-    out.push({ pid, ppid, pgrp: pgrp || 0, tpgid: Number.isFinite(tpgid) ? tpgid : -1, comm, state });
+    const rec = parseOneProcRecord(raw);
+    if (rec) out.push(rec);
   }
   return out;
 }
@@ -166,9 +171,11 @@ export function parseProcTree(entries: string[], shellPid: number): boolean {
  * the parser still tracks the tree but cannot identify a shell, so it falls back
  * to "any foreground descendant other than the root ⇒ busy".
  */
-export function parsePsTree(rawText: string, shellPid: number): boolean {
-  interface Rec { pid: number; ppid: number; stat: string; comm: string; }
-  const recs: Rec[] = [];
+interface PsRec { pid: number; ppid: number; stat: string; comm: string; }
+
+/** Parse `ps -o pid=,ppid=,stat=,comm=` lines into records (comm optional). */
+function parsePsRecords(rawText: string): PsRec[] {
+  const recs: PsRec[] = [];
   for (const rawLine of rawText.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -177,11 +184,32 @@ export function parsePsTree(rawText: string, shellPid: number): boolean {
     const pid = parseInt(parts[0], 10);
     const ppid = parseInt(parts[1], 10);
     if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
-    const stat = parts[2] || "";
     const commRaw = parts.slice(3).join(" ");
     const comm = (commRaw.split("/").pop() || commRaw).toLowerCase();
-    recs.push({ pid, ppid, stat, comm });
+    recs.push({ pid, ppid, stat: parts[2] || "", comm });
   }
+  return recs;
+}
+
+/**
+ * Verdict for a single ps record in the descendant tree:
+ *  - `false` ⇒ a foreground shell at its prompt ⇒ idle (decisive)
+ *  - `true`  ⇒ (no-comm fallback) a non-root foreground descendant ⇒ busy (decisive)
+ *  - `null`  ⇒ no verdict from this record; keep scanning
+ * Mirrors the original inline branch exactly (a foreground non-shell with comm
+ * info is non-decisive — the loop falls through to the busy-biased default).
+ */
+function psRecVerdict(r: PsRec, haveComm: boolean, shellPid: number): boolean | null {
+  if (!r.stat.includes("+")) return null; // not the controlling-tty foreground group
+  if (haveComm) {
+    return SHELL_COMMS.has(r.comm) ? false : null; // foreground shell ⇒ idle; else keep looking
+  }
+  // No comm available: a foreground descendant other than the root ⇒ busy.
+  return r.pid !== shellPid ? true : null;
+}
+
+export function parsePsTree(rawText: string, shellPid: number): boolean {
+  const recs = parsePsRecords(rawText);
   if (recs.length === 0) return false;
 
   // Build descendant set rooted at shellPid (inclusive).
@@ -190,15 +218,8 @@ export function parsePsTree(rawText: string, shellPid: number): boolean {
   const haveComm = recs.some(r => r.comm.length > 0);
   for (const r of recs) {
     if (!members.has(r.pid)) continue;
-    const isForeground = r.stat.includes("+");
-    if (!isForeground) continue;
-    if (haveComm) {
-      if (SHELL_COMMS.has(r.comm)) return false; // foreground shell at prompt ⇒ idle
-    } else {
-      // No comm available: a foreground descendant other than the root means a
-      // command is running.
-      if (r.pid !== shellPid) return true;
-    }
+    const verdict = psRecVerdict(r, haveComm, shellPid);
+    if (verdict !== null) return verdict;
   }
   // With comm info: no foreground shell found ⇒ busy. Without comm: no non-root
   // foreground process found ⇒ idle.
@@ -268,34 +289,37 @@ function splitCsvLine(line: string): string[] {
  *    no longer mis-pairs with the next record's fields. (CIM blocks carry no Name
  *    in the committed fixtures, so a descendant with unknown Name reads busy.)
  */
-export function parseProcessList(rawText: string, shellPid: number): boolean {
+/**
+ * PREFERRED CSV branch: parse rows under a header carrying ProcessId +
+ * ParentProcessId (+ optional Name) columns. Quote-aware (RFC-4180) so a Name
+ * containing a comma does not shift columns and drop a row (C3).
+ */
+function parseWinCsvRecords(lines: string[], header: string): WinProcRec[] {
   const recs: WinProcRec[] = [];
-  const rawLines = rawText.split(/\r?\n/);
-  const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
-
-  // PREFERRED: CSV header containing both ProcessId and ParentProcessId columns.
-  const header = lines.find(l => /ProcessId/i.test(l) && /ParentProcessId/i.test(l) && l.includes(","));
-  if (header) {
-    const cols = splitCsvLine(header).map(c => c.replace(/^"|"$/g, ""));
-    const pidIdx = cols.findIndex(c => /^ProcessId$/i.test(c));
-    const ppidIdx = cols.findIndex(c => /^ParentProcessId$/i.test(c));
-    const nameIdx = cols.findIndex(c => /^Name$/i.test(c));
-    for (const line of lines) {
-      if (line === header) continue;
-      const cells = splitCsvLine(line);
-      if (cells.length <= Math.max(pidIdx, ppidIdx)) continue;
-      const pid = parseInt(cells[pidIdx], 10);
-      const ppid = parseInt(cells[ppidIdx], 10);
-      if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
-      const name = nameIdx >= 0 && nameIdx < cells.length ? cells[nameIdx] : "";
-      recs.push({ pid, ppid, name });
-    }
-    return treeHasNonShellDescendant(recs, shellPid);
+  const cols = splitCsvLine(header).map(c => c.replace(/^"|"$/g, ""));
+  const pidIdx = cols.findIndex(c => /^ProcessId$/i.test(c));
+  const ppidIdx = cols.findIndex(c => /^ParentProcessId$/i.test(c));
+  const nameIdx = cols.findIndex(c => /^Name$/i.test(c));
+  for (const line of lines) {
+    if (line === header) continue;
+    const cells = splitCsvLine(line);
+    if (cells.length <= Math.max(pidIdx, ppidIdx)) continue;
+    const pid = parseInt(cells[pidIdx], 10);
+    const ppid = parseInt(cells[ppidIdx], 10);
+    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
+    const name = nameIdx >= 0 && nameIdx < cells.length ? cells[nameIdx] : "";
+    recs.push({ pid, ppid, name });
   }
+  return recs;
+}
 
-  // Legacy CIM "Key : Value" Format-List blocks. Use the BLANK LINE as the
-  // record boundary (deterministic) rather than guessing from a repeated key,
-  // which mis-pairs when a record lacks one of the two fields.
+/**
+ * Legacy CIM "Key : Value" Format-List blocks. The BLANK LINE is the
+ * authoritative record boundary (deterministic) rather than guessing from a
+ * repeated key, which mis-pairs when a record lacks one of the two fields (P2).
+ */
+function parseWinCimRecords(rawLines: string[]): WinProcRec[] {
+  const recs: WinProcRec[] = [];
   let curPid: number | null = null;
   let curPpid: number | null = null;
   let curName = "";
@@ -322,6 +346,17 @@ export function parseProcessList(rawText: string, shellPid: number): boolean {
     if (nameMatch) curName = nameMatch[1].trim();
   }
   flush();
+  return recs;
+}
+
+export function parseProcessList(rawText: string, shellPid: number): boolean {
+  const rawLines = rawText.split(/\r?\n/);
+  const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
+
+  // PREFERRED: CSV header containing both ProcessId and ParentProcessId columns;
+  // otherwise fall back to the legacy CIM "Key : Value" block parser.
+  const header = lines.find(l => /ProcessId/i.test(l) && /ParentProcessId/i.test(l) && l.includes(","));
+  const recs = header ? parseWinCsvRecords(lines, header) : parseWinCimRecords(rawLines);
   return treeHasNonShellDescendant(recs, shellPid);
 }
 

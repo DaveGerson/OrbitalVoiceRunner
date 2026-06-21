@@ -213,11 +213,6 @@
       "count": 1
     }
   },
-  "src/statusProbe.ts": {
-    "complexity": {
-      "count": 3
-    }
-  },
   "src/store/migrate.ts": {
     "complexity": {
       "count": 1
