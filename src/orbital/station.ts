@@ -82,42 +82,98 @@ function findWorkspace(ledger: Record<string, Workspace>, paneId: string): Works
   return undefined;
 }
 
+/** Resolve the workspace/pane context for a terminal id (membership + skin + project id). */
+function resolvePaneContext(ledger: Record<string, Workspace>, t: Terminal) {
+  const ws = findWorkspace(ledger, t.id);
+  const pane = ws?.panes?.[t.id];
+  const projId = ws?.id ?? "";
+  const skin = skinForProject(projId || t.id);
+  return { ws, pane, projId, skin };
+}
+
+/** Context-budget derivation: clamped fill, formatted label, and filled pips. */
+function deriveContext(ctx: number) {
+  const fill = Math.max(0, Math.min(1, ctx / CONTEXT_BUDGET));
+  return {
+    contextFill: fill,
+    contextLabel: `${formatTokens(ctx)} ctx`,
+    contextPips: Math.round(fill * PIP_COUNT),
+  };
+}
+
+/** Project identity columns (name + skin), with the Unassigned fallback. */
+function deriveProjectFields(ctx2: ReturnType<typeof resolvePaneContext>) {
+  const { ws, projId, skin } = ctx2;
+  return {
+    project: projId,
+    projectName: ws?.name ?? "Unassigned",
+    projectColor: skin.color,
+    projectEmoji: skin.emoji,
+  };
+}
+
+// Fallback chains for the coalescing-heavy scalar columns. Each `||`/`??`
+// ladder lives in its own tiny pure helper so no single function carries the
+// combined branch count — identical results to the original inline expressions.
+type PaneCtx = ReturnType<typeof resolvePaneContext>;
+
+const stationName = (t: Terminal, { pane }: PaneCtx): string => pane?.name || t.id;
+
+const stationPreset = (t: Terminal, { pane }: PaneCtx): ToolPreset =>
+  (t.tool_preset || pane?.tool_preset || "Custom") as ToolPreset;
+
+const stationScribble = (t: Terminal, { pane }: PaneCtx): string =>
+  pane?.last_command || t.command || "";
+
+const stationCwd = (t: Terminal, { ws }: PaneCtx): string => t.cwd || ws?.directory || "~";
+
+const stationMode = (t: Terminal, { pane }: PaneCtx): Station["mode"] =>
+  t.permissions_mode ?? pane?.permissions_mode;
+
+/**
+ * Fallback-chained scalar fields. Each chain delegates to a single-purpose
+ * helper above so this assembler — and buildStation — stay flat.
+ */
+function deriveFallbackFields(t: Terminal, ctx2: PaneCtx) {
+  return {
+    name: stationName(t, ctx2),
+    toolPreset: stationPreset(t, ctx2),
+    scribble: stationScribble(t, ctx2),
+    cwd: stationCwd(t, ctx2),
+    elapsed: formatElapsed(ctx2.pane?.elapsed_ms),
+    mode: stationMode(t, ctx2),
+  };
+}
+
+/** Shape a single Station from a terminal + its resolved ledger context. */
+function buildStation(
+  t: Terminal,
+  ctx2: ReturnType<typeof resolvePaneContext>,
+  needsInput: boolean,
+): Station {
+  const ctx = t.context_size ?? ctx2.pane?.context_size ?? 0;
+  return {
+    id: t.id,
+    ...deriveProjectFields(ctx2),
+    status: toStatus(t, needsInput),
+    chef: chefForPane(t.id) as ChefKey,
+    ...deriveFallbackFields(t, ctx2),
+    ...deriveContext(ctx),
+    outputTail: tail(t.output),
+    needsInput,
+    posture: t.posture,
+  };
+}
+
 export function deriveStations(
   terminals: Terminal[],
   ledger: Record<string, Workspace>,
   pendingCommands: PendingCommand[],
 ): Station[] {
   const needsByPane = new Set(pendingCommands.map((c) => c.terminalId));
-  return terminals.map((t) => {
-    const ws = findWorkspace(ledger, t.id);
-    const pane = ws?.panes?.[t.id];
-    const projId = ws?.id ?? "";
-    const skin = skinForProject(projId || t.id);
-    const ctx = t.context_size ?? pane?.context_size ?? 0;
-    const fill = Math.max(0, Math.min(1, ctx / CONTEXT_BUDGET));
-    const needsInput = needsByPane.has(t.id);
-    return {
-      id: t.id,
-      project: projId,
-      projectName: ws?.name ?? "Unassigned",
-      projectColor: skin.color,
-      projectEmoji: skin.emoji,
-      name: pane?.name || t.id,
-      status: toStatus(t, needsInput),
-      toolPreset: (t.tool_preset || pane?.tool_preset || "Custom") as ToolPreset,
-      chef: chefForPane(t.id) as ChefKey,
-      scribble: pane?.last_command || t.command || "",
-      cwd: t.cwd || ws?.directory || "~",
-      elapsed: formatElapsed(pane?.elapsed_ms),
-      contextFill: fill,
-      contextLabel: `${formatTokens(ctx)} ctx`,
-      contextPips: Math.round(fill * PIP_COUNT),
-      outputTail: tail(t.output),
-      needsInput,
-      posture: t.posture,
-      mode: t.permissions_mode ?? pane?.permissions_mode,
-    };
-  });
+  return terminals.map((t) =>
+    buildStation(t, resolvePaneContext(ledger, t), needsByPane.has(t.id)),
+  );
 }
 
 /** Distinct projects present on the board, in a stable order, with pane/running counts. */

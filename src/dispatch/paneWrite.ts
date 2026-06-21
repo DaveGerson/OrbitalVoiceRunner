@@ -116,53 +116,57 @@ export function applyDispatchDecision(
   deps: DispatchDeps,
   conn: DispatchConn
 ): DispatchOutcome {
-  const {
-    manager,
-    pendingApprovals,
-    broadcast,
-    addCommand,
-    redactSecrets,
-    getPaneSummary,
-    posturePayloadForPane,
-    announcementBus,
-    approvalTtlMs,
-    getActivePaneId,
-    isPaneActiveForWrite: isActive,
-    targetId,
-    instruction,
-    capability,
-    kind,
-    trigger,
-    effectiveMode,
-    pendingId,
-    callId,
-    term,
-  } = deps;
-
   // forceStage: a Full-Auto write becomes a staged approval (strictly more restrictive; never less).
   // Computed BEFORE the guard below so the guard-skip can key on it structurally.
   const effectiveDecision: ProposalDecision =
     deps.forceStage && decision.type === "auto_execute" ? { type: "pending_approval" } : decision;
 
-  // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so the
-  // operator can SEE and improve the command before it lands (HiTL). A proposal for any other pane is
-  // refused here — never written, in ANY policy mode — and Janus is told to ask for a switch. This sits
-  // ABOVE the effective-mode gate on purpose. (architecture step 5.) GOVERNED by conn.enforceActivePaneGuard:
-  // voice enforces it (Janus proposal); REST skips it (operator-directed click — design §5 row 3).
-  // forceStage (dispatch_to_panes fan-out) skips the clarify INSTEAD of the guard's protection: the
-  // downgrade above guarantees nothing auto-executes, so every off-focus write still surfaces to the
-  // operator as a pending approval before it can land — the property the guard exists to protect.
-  // The skip is keyed on the DOWNGRADED decision (not the flag alone), so the coupling is structural:
-  // if a refactor ever drops the downgrade, the skip condition fails and the guard re-engages.
-  const forceStagedSafely = deps.forceStage === true && effectiveDecision.type !== "auto_execute";
-  if (conn.enforceActivePaneGuard && !forceStagedSafely) {
-    const activePaneId = getActivePaneId();
-    if (!isActive(activePaneId, targetId)) {
-      return { kind: "clarify", text: inactivePaneClarify(activePaneId, targetId) };
-    }
+  const refusal = activePaneGuardRefusal(effectiveDecision, deps, conn);
+  if (refusal) {
+    return refusal;
   }
 
-  const safeInstr = redactSecrets(instruction);
+  return applyEffect(effectiveDecision, deps, conn);
+}
+
+/**
+ * Step 5 (single active pane): Janus may only propose to the pane the operator has open, so the
+ * operator can SEE and improve the command before it lands (HiTL). A proposal for any other pane is
+ * refused here — never written, in ANY policy mode — and Janus is told to ask for a switch. This sits
+ * ABOVE the effective-mode gate on purpose. (architecture step 5.) GOVERNED by conn.enforceActivePaneGuard:
+ * voice enforces it (Janus proposal); REST skips it (operator-directed click — design §5 row 3).
+ * forceStage (dispatch_to_panes fan-out) skips the clarify INSTEAD of the guard's protection: the
+ * auto_execute→pending downgrade guarantees nothing auto-executes, so every off-focus write still
+ * surfaces to the operator as a pending approval before it can land — the property the guard exists to
+ * protect. The skip is keyed on the DOWNGRADED decision (not the flag alone), so the coupling is
+ * structural: if a refactor ever drops the downgrade, the skip condition fails and the guard re-engages.
+ *
+ * Returns the clarify outcome when the off-focus write is refused, or null to proceed.
+ */
+function activePaneGuardRefusal(
+  effectiveDecision: ProposalDecision,
+  deps: DispatchDeps,
+  conn: DispatchConn
+): DispatchOutcome | null {
+  const forceStagedSafely = deps.forceStage === true && effectiveDecision.type !== "auto_execute";
+  if (!conn.enforceActivePaneGuard || forceStagedSafely) {
+    return null;
+  }
+  const activePaneId = deps.getActivePaneId();
+  if (deps.isPaneActiveForWrite(activePaneId, deps.targetId)) {
+    return null;
+  }
+  return { kind: "clarify", text: inactivePaneClarify(activePaneId, deps.targetId) };
+}
+
+/** The post-guard [apply effect] switch — fire the matching effect for the resolved decision. */
+function applyEffect(
+  effectiveDecision: ProposalDecision,
+  deps: DispatchDeps,
+  conn: DispatchConn
+): DispatchOutcome {
+  const { broadcast, targetId, instruction, capability } = deps;
+  const safeInstr = deps.redactSecrets(instruction);
 
   switch (effectiveDecision.type) {
     case "error_no_pane":
@@ -179,45 +183,76 @@ export function applyDispatchDecision(
       broadcast({ type: "command_blocked", terminalId: targetId, cmd: safeInstr, reason: "Read-Only policy enforced." });
       return { kind: "blocked", text: `Error: Write execution block is active. Pane ${targetId} is Read-Only.` };
     case "auto_execute":
-      // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live process
-      // until it is restarted. `paneExists` is true for such a pane, so guard the immediate Full-Auto
-      // write: if there is no live terminal, refuse instead of crashing on `term!.writeInput`. (The
-      // pending-approval path re-checks liveness at resolve time.)
-      if (!term) {
-        return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
-      }
-      addCommand(targetId, instruction);
-      term.writeInput(instruction);
-      broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
-      return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
-    case "pending_approval": {
-      // WS-E.1 two-phase: store a serializable pending entry + the session in the side-map, mark it
-      // announced for targeting, and let the caller answer call.id NON-BLOCKINGLY.
-      const pSummary = redactSecrets(getPaneSummary(targetId, 5));
-      const rationale = { trigger: redactSecrets(trigger), summary: pSummary };
-      const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now(), capability };
-      pendingApprovals.add(record, conn.sess, {
-        workspaceId: manager.ledger.activeProjectId || "default_project",
-        ttlMs: approvalTtlMs,
-      });
-      // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
-      // 1C.1: the REAL approval_pending kind — this used to borrow kind:"exited" for its severity,
-      // which rendered "Pane 'x' exited." for a healthy pane awaiting approval.
-      announcementBus.enqueue({ kind: "approval_pending", terminalId: targetId, summary: "Awaiting your approval." });
-      // rbh: enrich the approval frame with the TARGET pane's EFFECTIVE posture so the dialog can show
-      // "into what posture am I approving this write?". posturePayloadForPane is frozen-aware on main, so
-      // the approval path needs no separate frozen fix (only the action path did). All additive optional
-      // fields — older clients ignore them; the harness-fed e2e specs degrade.
-      const approvalPosture = posturePayloadForPane(targetId);
-      conn.notifyPending({
-        type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale,
-        effective_gates: approvalPosture.effective_gates,
-        posture: approvalPosture.posture,
-        effective_mode: effectiveMode,
-        capability,
-      });
-      const verb = kind === "agent_instruction" ? "direct pane" : "run on pane";
-      return { kind: "pending", text: `Pending approval: ${verb} ${targetId} — "${safeInstr}". Read it back to the operator and ask them to approve or reject.` };
-    }
+      return applyAutoExecute(deps, safeInstr);
+    case "pending_approval":
+      return applyPendingApproval(deps, conn, safeInstr);
   }
+}
+
+/** auto_execute arm — immediate Full-Auto write (guards the inert/ledger-only pane). */
+function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcome {
+  const { broadcast, addCommand, targetId, instruction, term } = deps;
+  // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live process
+  // until it is restarted. `paneExists` is true for such a pane, so guard the immediate Full-Auto
+  // write: if there is no live terminal, refuse instead of crashing on `term!.writeInput`. (The
+  // pending-approval path re-checks liveness at resolve time.)
+  if (!term) {
+    return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+  }
+  addCommand(targetId, instruction);
+  term.writeInput(instruction);
+  broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
+  return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
+}
+
+/** pending_approval arm — stage a serializable record + session and notify NON-BLOCKINGLY. */
+function applyPendingApproval(
+  deps: DispatchDeps,
+  conn: DispatchConn,
+  safeInstr: string
+): DispatchOutcome {
+  const {
+    manager,
+    pendingApprovals,
+    redactSecrets,
+    getPaneSummary,
+    posturePayloadForPane,
+    announcementBus,
+    approvalTtlMs,
+    targetId,
+    instruction,
+    capability,
+    kind,
+    trigger,
+    effectiveMode,
+    pendingId,
+    callId,
+  } = deps;
+  // WS-E.1 two-phase: store a serializable pending entry + the session in the side-map, mark it
+  // announced for targeting, and let the caller answer call.id NON-BLOCKINGLY.
+  const pSummary = redactSecrets(getPaneSummary(targetId, 5));
+  const rationale = { trigger: redactSecrets(trigger), summary: pSummary };
+  const record: PendingApproval = { messageId: pendingId, instruction, kind, terminalId: targetId, callId, rationale, timestamp: Date.now(), capability };
+  pendingApprovals.add(record, conn.sess, {
+    workspaceId: manager.ledger.activeProjectId || "default_project",
+    ttlMs: approvalTtlMs,
+  });
+  // WS-D path: approval arrival is a high-severity attention source (earcon + stack).
+  // 1C.1: the REAL approval_pending kind — this used to borrow kind:"exited" for its severity,
+  // which rendered "Pane 'x' exited." for a healthy pane awaiting approval.
+  announcementBus.enqueue({ kind: "approval_pending", terminalId: targetId, summary: "Awaiting your approval." });
+  // rbh: enrich the approval frame with the TARGET pane's EFFECTIVE posture so the dialog can show
+  // "into what posture am I approving this write?". posturePayloadForPane is frozen-aware on main, so
+  // the approval path needs no separate frozen fix (only the action path did). All additive optional
+  // fields — older clients ignore them; the harness-fed e2e specs degrade.
+  const approvalPosture = posturePayloadForPane(targetId);
+  conn.notifyPending({
+    type: "approval_pending", messageId: pendingId, cmd: safeInstr, instruction: safeInstr, kind, terminalId: targetId, rationale,
+    effective_gates: approvalPosture.effective_gates,
+    posture: approvalPosture.posture,
+    effective_mode: effectiveMode,
+    capability,
+  });
+  const verb = kind === "agent_instruction" ? "direct pane" : "run on pane";
+  return { kind: "pending", text: `Pending approval: ${verb} ${targetId} — "${safeInstr}". Read it back to the operator and ask them to approve or reject.` };
 }

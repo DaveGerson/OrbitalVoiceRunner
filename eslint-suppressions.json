@@ -39,11 +39,6 @@
       "count": 1
     }
   },
-  "src/actions/defs/layouts.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/actions/defs/orchestration.ts": {
     "complexity": {
       "count": 1
@@ -92,11 +87,6 @@
       "count": 1
     }
   },
-  "src/dispatch/paneWrite.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/e2e/harness.ts": {
     "react-hooks/exhaustive-deps": {
       "count": 1
@@ -125,11 +115,6 @@
   "src/memory/assembler.ts": {
     "complexity": {
       "count": 1
-    }
-  },
-  "src/memory/pythonClient.ts": {
-    "complexity": {
-      "count": 3
     }
   },
   "src/orbital/KitchenRadio.tsx": {
@@ -161,11 +146,6 @@
     }
   },
   "src/orbital/primitives.tsx": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/orbital/station.ts": {
     "complexity": {
       "count": 1
     }

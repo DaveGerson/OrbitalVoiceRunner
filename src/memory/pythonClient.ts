@@ -93,19 +93,39 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** Coalesce raw opts to a fully-defaulted config (kept out of createPythonSynthClient so its
+ *  per-field `??` branches don't inflate that function's cyclomatic complexity). Each field is
+ *  resolved via a per-key `?? default` table so there is no per-field branch in any one function:
+ *  `??` is applied uniformly inside a single reduce, preserving the exact "undefined → default"
+ *  semantics of the original inline coalescing (including falsy-but-defined values passing through). */
+function resolveOpts(opts: PythonSynthClientOpts) {
+  const defaults = {
+    spawnImpl: realSpawn,
+    existsSync: fs.existsSync,
+    platform: process.platform,
+    env: process.env,
+    log: ((l: string) => console.error(l)) as (line: string) => void,
+    requestExpiryMs: 2000,
+    pingTimeoutMs: 1500,
+    backoffBaseMs: 250,
+    backoffMaxMs: 2000,
+    breakerThreshold: 3,
+    breakerWindowMs: 10_000,
+    cooldownMs: 60_000,
+  };
+  const out = { ...defaults };
+  for (const k of Object.keys(defaults) as (keyof typeof defaults)[]) {
+    const v = (opts as unknown as Record<string, unknown>)[k];
+    if (v !== undefined && v !== null) (out as Record<string, unknown>)[k] = v;
+  }
+  return out;
+}
+
 export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynthClient {
-  const spawnImpl = opts.spawnImpl ?? realSpawn;
-  const existsSync = opts.existsSync ?? fs.existsSync;
-  const platform = opts.platform ?? process.platform;
-  const env = opts.env ?? process.env;
-  const log = opts.log ?? ((l: string) => console.error(l));
-  const requestExpiryMs = opts.requestExpiryMs ?? 2000;
-  const pingTimeoutMs = opts.pingTimeoutMs ?? 1500;
-  const backoffBaseMs = opts.backoffBaseMs ?? 250;
-  const backoffMaxMs = opts.backoffMaxMs ?? 2000;
-  const breakerThreshold = opts.breakerThreshold ?? 3;
-  const breakerWindowMs = opts.breakerWindowMs ?? 10_000;
-  const cooldownMs = opts.cooldownMs ?? 60_000;
+  const {
+    spawnImpl, existsSync, platform, env, log, requestExpiryMs, pingTimeoutMs,
+    backoffBaseMs, backoffMaxMs, breakerThreshold, breakerWindowMs, cooldownMs,
+  } = resolveOpts(opts);
   let consecutiveFails = 0;
   let firstFailAt = 0;
   let breakerUntil = 0;          // epoch ms; 0 = breaker closed
@@ -134,21 +154,16 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
   }
   function clearPingTimer() { if (pingTimer) { clearTimeout(pingTimer); pingTimer = null; } }
 
-  function onLine(line: string) {
-    line = line.trim();
-    if (!line) return;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { log(`[synth] skip unparseable stdout line`); return; }
-    const id = obj?.id;
-    if (id === "__ping__") {
-      if (PingResponseSchema.safeParse(obj).success) {
-        ready = true; discovering = false; attempt = 0; consecutiveFails = 0; firstFailAt = 0; clearPingTimer();
-        log(`[synth] ping ok (synthVersion=${obj?.synthVersion ?? "?"})`);
-      } else {
-        log(`[synth] ping rejected (v/shape mismatch)`); // the ping-timeout drives the candidate advance
-      }
-      return;
+  function handlePong(obj: any) {
+    if (PingResponseSchema.safeParse(obj).success) {
+      ready = true; discovering = false; attempt = 0; consecutiveFails = 0; firstFailAt = 0; clearPingTimer();
+      log(`[synth] ping ok (synthVersion=${obj?.synthVersion ?? "?"})`);
+    } else {
+      log(`[synth] ping rejected (v/shape mismatch)`); // the ping-timeout drives the candidate advance
     }
+  }
+
+  function handleResponse(id: any, obj: any) {
     const p = pending.get(id);
     if (!p) return; // late/expired — ignore defensively
     pending.delete(id);
@@ -156,6 +171,16 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     const parsed = SynthesizeResponseSchema.safeParse(obj);
     if (parsed.success && parsed.data.ok) p.resolve({ ok: true, brief: parsed.data.brief });
     else p.resolve({ ok: false });
+  }
+
+  function onLine(line: string) {
+    line = line.trim();
+    if (!line) return;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { log(`[synth] skip unparseable stdout line`); return; }
+    const id = obj?.id;
+    if (id === "__ping__") { handlePong(obj); return; }
+    handleResponse(id, obj);
   }
 
   function spawnBlocked(): boolean { return Date.now() < breakerUntil; } // breaker OPEN ⇒ fallback-only
@@ -187,15 +212,13 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     if (respawnTimer && typeof (respawnTimer as any).unref === "function") (respawnTimer as any).unref();
   }
 
-  function spawnDaemon() {
-    if (disposed || !synthDir || cands.length === 0) return;
-    if (spawnBlocked()) return;
-    const c = cands[candIndex % cands.length];
-    const script = nodePath.join(synthDir, "synthesizer", "__main__.py");
+  /** Spawn the candidate's child; on a thrown spawn, tear down and return null. */
+  function trySpawnChild(c: InterpreterCandidate): any {
+    const script = nodePath.join(synthDir!, "synthesizer", "__main__.py");
     const args = [...c.baseArgs, "-X", "utf8", "-u", script];
     try {
-      child = spawnImpl(c.cmd, args, {
-        cwd: synthDir,
+      return spawnImpl(c.cmd, args, {
+        cwd: synthDir!,
         env: { ...env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
         stdio: ["pipe", "pipe", "pipe"],
         // NEVER shell:true — argv array only (invariant I9).
@@ -203,8 +226,12 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     } catch (e) {
       log(`[synth] spawn failed for "${c.cmd}": ${(e as Error).message}`);
       onDown("spawn-threw");
-      return;
+      return null;
     }
+  }
+
+  /** Wire stdout line-framing + stderr logging + exit/error teardown onto the live child. */
+  function wireChildStreams() {
     // Belt-and-suspenders: unref the child so a forgotten dispose() can't pin the event loop.
     // Optional-chained — the fake child in tests has no unref.
     child.unref?.();
@@ -216,12 +243,26 @@ export function createPythonSynthClient(opts: PythonSynthClientOpts): PythonSynt
     child.stderr?.on("data", (d: Buffer) => log(`[synth:py] ${d.toString("utf-8").trimEnd()}`));
     child.on("exit", () => onDown("exit"));
     child.on("error", () => onDown("error"));
+  }
+
+  /** Arm the handshake deadline and send the ping that validates interpreter+script+version. */
+  function sendHandshake() {
     // Handshake: ping validates interpreter + script + protocol version in one round-trip.
     // If no valid pong lands within pingTimeoutMs, advance to the next candidate (D4 discovery).
     pingTimer = setTimeout(() => { if (!ready) onDown("ping-timeout"); }, pingTimeoutMs);
     if (pingTimer && typeof (pingTimer as any).unref === "function") (pingTimer as any).unref();
     try { child.stdin?.write(JSON.stringify({ id: "__ping__", v: WIRE_VERSION, op: "ping" }) + "\n"); }
     catch { onDown("stdin-write-failed"); }
+  }
+
+  function spawnDaemon() {
+    if (disposed || !synthDir || cands.length === 0) return;
+    if (spawnBlocked()) return;
+    const c = cands[candIndex % cands.length];
+    child = trySpawnChild(c);
+    if (!child) return;
+    wireChildStreams();
+    sendHandshake();
   }
 
   spawnDaemon(); // eager pre-warm

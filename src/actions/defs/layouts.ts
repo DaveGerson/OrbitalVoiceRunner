@@ -128,6 +128,122 @@ const ApplyLayoutParams = z.object({
   layout_id: z.string(),
 });
 
+/** Buckets a layout-apply produces, in narration order. */
+interface ApplyTally {
+  spawned: string[];
+  deferred: string[];
+  blocked: string[];
+  skipped: string[];
+}
+
+/**
+ * Build the spawn closure for one layout pane — IDENTICAL effect to the inline closure it
+ * replaced: addTerminal with the stored command/preset/mode (project-dir then process.cwd()
+ * fallback when the stored cwd is empty), then the ledger + terminals_updated broadcasts.
+ */
+function makeSpawnPane(
+  ctx: Parameters<ActionDef<typeof ApplyLayoutParams>["handler"]>[1],
+  p: LayoutPane,
+  resolvedCwd: string,
+  activeProjectId: string,
+): () => string {
+  return (): string => {
+    ctx.manager.addTerminal(
+      p.id,
+      resolvedCwd,
+      p.command,
+      p.preset,
+      p.permissionsMode as any,
+      "",
+      activeProjectId,
+    );
+    ctx.broadcastLedgerUpdate();
+    ctx.broadcast({ type: "terminals_updated" });
+    return p.id;
+  };
+}
+
+/**
+ * Route a single Ask-deferred pane through gateOrDefer("create_pane") and bucket the outcome —
+ * VERBATIM extraction of the inner `if (planned.disposition === "defer")` block.
+ */
+function applyDeferredPane(
+  ctx: Parameters<ActionDef<typeof ApplyLayoutParams>["handler"]>[1],
+  p: LayoutPane,
+  resolvedCwd: string,
+  activeProjectId: string,
+  layoutName: string,
+  spawnPane: () => string,
+  tally: ApplyTally,
+): void {
+  const g = ctx.gateOrDefer(
+    "create_pane",
+    p.id,
+    `Create pane ${p.id} (layout ${layoutName})`,
+    spawnPane,
+    {
+      ...(ctx.versionStamp ?? {}),
+      origin: "recipe",
+      paneId: p.id,
+      cwd: resolvedCwd,
+      command: p.command,
+      toolPreset: p.preset,
+      permissionsMode: p.permissionsMode,
+      projectId: activeProjectId,
+    }
+  );
+  if (g.disposition === "deferred") tally.deferred.push(p.id);
+  else if (g.disposition === "forbidden") tally.blocked.push(p.id);
+  else tally.spawned.push(spawnPane());
+}
+
+/**
+ * Apply one planned pane into the tally — VERBATIM extraction of the per-pane loop body
+ * (skip-existing / block / defensive missing-row guard / defer / Auto spawn).
+ */
+function applyPlannedPane(
+  ctx: Parameters<ActionDef<typeof ApplyLayoutParams>["handler"]>[1],
+  planned: { paneId: string; disposition: string },
+  paneById: Map<string, LayoutPane>,
+  proj: { directory: string },
+  activeProjectId: string,
+  layoutName: string,
+  tally: ApplyTally,
+): void {
+  if (planned.disposition === "skip-existing") {
+    tally.skipped.push(planned.paneId);
+    return;
+  }
+  if (planned.disposition === "block") {
+    tally.blocked.push(planned.paneId);
+    return;
+  }
+  const p = paneById.get(planned.paneId);
+  // Defensive: planRecipeApply only emits ids from its input, but layout.panes comes from
+  // operator-editable persisted JSON — never crash the apply on a malformed row.
+  if (!p) {
+    tally.blocked.push(planned.paneId);
+    return;
+  }
+  const resolvedCwd = p.cwd || proj.directory || process.cwd();
+  const spawnPane = makeSpawnPane(ctx, p, resolvedCwd, activeProjectId);
+  if (planned.disposition === "defer") {
+    applyDeferredPane(ctx, p, resolvedCwd, activeProjectId, layoutName, spawnPane, tally);
+  } else {
+    tally.spawned.push(spawnPane());
+  }
+}
+
+/** Compose the apply narration — VERBATIM extraction of the trailing parts[] assembly. */
+function narrateApply(layoutName: string, activeProjectId: string, tally: ApplyTally): string {
+  const parts: string[] = [`Layout '${layoutName}' applied to project ${activeProjectId}.`];
+  if (tally.spawned.length) parts.push(`Spawned: ${tally.spawned.join(", ")}.`);
+  if (tally.deferred.length) parts.push(`Awaiting confirmation (gated Ask): ${tally.deferred.join(", ")}.`);
+  if (tally.skipped.length) parts.push(`Already running (skipped): ${tally.skipped.join(", ")}.`);
+  if (tally.blocked.length) parts.push(`Blocked by policy: ${tally.blocked.join(", ")}.`);
+  return parts.join(" ");
+}
+
 export const applyLayout: ActionDef<typeof ApplyLayoutParams> = {
   name: "apply_layout",
   description:
@@ -164,70 +280,11 @@ export const applyLayout: ActionDef<typeof ApplyLayoutParams> = {
       };
     }
     const paneById = new Map(layout.panes.map((p) => [p.id, p]));
-    const spawned: string[] = [];
-    const deferred: string[] = [];
-    const blocked: string[] = [];
-    const skipped: string[] = [];
+    const tally: ApplyTally = { spawned: [], deferred: [], blocked: [], skipped: [] };
     for (const planned of plan.panes) {
-      if (planned.disposition === "skip-existing") {
-        skipped.push(planned.paneId);
-        continue;
-      }
-      if (planned.disposition === "block") {
-        blocked.push(planned.paneId);
-        continue;
-      }
-      const p = paneById.get(planned.paneId);
-      // Defensive: planRecipeApply only emits ids from its input, but layout.panes comes from
-      // operator-editable persisted JSON — never crash the apply on a malformed row.
-      if (!p) {
-        blocked.push(planned.paneId);
-        continue;
-      }
-      const spawnPane = (): string => {
-        ctx.manager.addTerminal(
-          p.id,
-          p.cwd || proj.directory || process.cwd(),
-          p.command,
-          p.preset,
-          p.permissionsMode as any,
-          "",
-          activeProjectId,
-        );
-        ctx.broadcastLedgerUpdate();
-        ctx.broadcast({ type: "terminals_updated" });
-        return p.id;
-      };
-      if (planned.disposition === "defer") {
-        const g = ctx.gateOrDefer(
-          "create_pane",
-          p.id,
-          `Create pane ${p.id} (layout ${layout.name})`,
-          spawnPane,
-          {
-            ...(ctx.versionStamp ?? {}),
-            origin: "recipe",
-            paneId: p.id,
-            cwd: p.cwd || proj.directory || process.cwd(),
-            command: p.command,
-            toolPreset: p.preset,
-            permissionsMode: p.permissionsMode,
-            projectId: activeProjectId,
-          }
-        );
-        if (g.disposition === "deferred") deferred.push(p.id);
-        else if (g.disposition === "forbidden") blocked.push(p.id);
-        else spawned.push(spawnPane());
-      } else {
-        spawned.push(spawnPane());
-      }
+      applyPlannedPane(ctx, planned, paneById, proj, activeProjectId, layout.name, tally);
     }
-    const parts: string[] = [`Layout '${layout.name}' applied to project ${activeProjectId}.`];
-    if (spawned.length) parts.push(`Spawned: ${spawned.join(", ")}.`);
-    if (deferred.length) parts.push(`Awaiting confirmation (gated Ask): ${deferred.join(", ")}.`);
-    if (skipped.length) parts.push(`Already running (skipped): ${skipped.join(", ")}.`);
-    if (blocked.length) parts.push(`Blocked by policy: ${blocked.join(", ")}.`);
-    return { kind: "ok", output: parts.join(" ") };
+    return { kind: "ok", output: narrateApply(layout.name, activeProjectId, tally) };
   },
 };
 
