@@ -1,9 +1,4 @@
 {
-  "scripts/smoke-handoff.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "server.ts": {
     "complexity": {
       "count": 1
@@ -80,11 +75,6 @@
       "count": 1
     }
   },
-  "src/orbital/useFocusTrap.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
   "src/orbital/useOrbitalData.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 3
@@ -106,11 +96,6 @@
   "src/orbital/views/Pass.tsx": {
     "complexity": {
       "count": 3
-    }
-  },
-  "src/store/migrate.ts": {
-    "complexity": {
-      "count": 1
     }
   }
 }

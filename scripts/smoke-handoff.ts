@@ -34,10 +34,12 @@
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
+import { fileURLToPath } from "url";
 import { UniversalTerminal } from "../src/terminal";
 import { JanusStore } from "../src/store/sqliteStore";
 import { decideProposal } from "../src/pendingApprovals";
 import { deliverOutcomeToHandoff } from "../src/handoffFlow";
+import type { Handoff } from "../src/types";
 
 // A distinctive sentinel embedded in the prompt. The PTY echoes typed input into the line
 // buffer, so this exact token MUST appear in the post-delivery stream if the composed prompt
@@ -51,6 +53,167 @@ const TARGET = "smoke-handoff-target";
 
 function log(...a: any[]) { console.log("[smoke]", ...a); }
 function fail(msg: string): never { console.log("[smoke] FAIL:", msg); throw new Error(msg); }
+
+// ---------------------------------------------------------------------------
+// Pure helpers — extractable and unit-testable without a live server/PTY
+// ---------------------------------------------------------------------------
+
+/** Strip ANSI escape sequences from a string. */
+export function stripAnsi(s: string): string {
+  return s.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1B[()][AB0]/g, "");
+}
+
+/**
+ * Assert that the PTY stream captured after delivery contains the sentinel.
+ * Pure: no I/O side effects, throws on failure.
+ */
+export function assertPtyDelivery(streamedAfter: string, bytesAfter: number, sentinel: string): void {
+  if (bytesAfter === 0) {
+    fail("composed_prompt was NOT submitted — zero PTY output after delivery.");
+  }
+  // Strip ANSI escape sequences before searching (the TUI interleaves cursor/color codes).
+  const cleaned = stripAnsi(streamedAfter);
+  if (!cleaned.includes(sentinel)) {
+    fail(`delivery NOT confirmed: sentinel "${sentinel}" never echoed back in ${bytesAfter} post-delivery bytes — the composed prompt did not land in the PTY input line (redraw churn alone cannot prove delivery).`);
+  }
+}
+
+/**
+ * Assert the handoff row final state and ordered event trail in the store.
+ * Pure: reads store, throws on failure, no other side effects.
+ */
+export function assertPersistence(store: JanusStore, hId: string): void {
+  const finalRow = store.getHandoff(hId);
+  if (!finalRow) fail("handoff row missing after delivery.");
+  if (finalRow!.state !== "delivered") fail(`final state expected 'delivered', got '${finalRow!.state}'`);
+  if (!finalRow!.delivered_at) fail("delivered_at not set.");
+  if (finalRow!.revision_count !== 1) fail(`final revision_count expected 1, got ${finalRow!.revision_count}`);
+
+  const events = store.getEvents({ type: "handoff" }).filter(e => (e.payload && e.payload.handoff_id) === hId);
+  const transitions = events.map(e => e.payload.to);
+  log(`HANDOFF event trail (to-states): ${JSON.stringify(transitions)}`);
+  assertTransitionOrder(transitions, hId);
+  for (const e of events) {
+    if (e.handoff_id !== hId) fail(`event ${e.id} has handoff_id='${e.handoff_id}', expected '${hId}'`);
+  }
+}
+
+/**
+ * Assert the four expected transitions appear in order.
+ * Pure: no I/O, throws on failure.
+ */
+export function assertTransitionOrder(transitions: string[], hId: string): void {
+  const expected = ["composing", "revising", "staged", "delivered"];
+  // createHandoff emits to:'composing'; revise emits to:'revising'; stage to:'staged'; deliver to:'delivered'.
+  for (const want of expected) {
+    if (!transitions.includes(want)) {
+      fail(`missing transition event to '${want}' (trail=${JSON.stringify(transitions)})`);
+    }
+  }
+  // ordering: composing before revising before staged before delivered
+  const idx = (s: string) => transitions.indexOf(s);
+  if (!(idx("composing") < idx("revising") && idx("revising") < idx("staged") && idx("staged") < idx("delivered"))) {
+    fail(`transition events out of order: ${JSON.stringify(transitions)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration helpers — async phases extracted from main
+// ---------------------------------------------------------------------------
+
+/** Wait for the PTY startup phase; fail if pane exited or produced no output. */
+async function waitForStartup(
+  term: UniversalTerminal,
+  startupMs: number,
+  getStats: () => { bytes: number; sawStartup: boolean },
+): Promise<void> {
+  for (let i = 0; i < startupMs / 1000; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    log(`t+${i + 1}s status=${term.status} bytes=${getStats().bytes}`);
+  }
+  if (term.status === "Exited") { await term.stop(); fail("target pane exited during startup — not a live session."); }
+  if (!getStats().sawStartup) { await term.stop(); fail("target pane produced no startup output (TUI never came up)."); }
+  log(`startup OK — status=${term.status}, ${getStats().bytes} bytes of TUI output.`);
+}
+
+/** Run the handoff state machine (create → revise → stage) and return the staged row. */
+async function runHandoffMachine(store: JanusStore, term: UniversalTerminal, prompt: string): Promise<Handoff> {
+  const h = store.createHandoff({
+    workspace_id: WORKSPACE,
+    to_pane: TARGET,
+    kind: "agent_instruction",
+    composed_prompt: prompt,
+    state: "composing",
+  });
+  log(`createHandoff -> ${h.id} state=${h.state} revision_count=${h.revision_count}`);
+  if (h.state !== "composing") { await term.stop(); fail(`expected state 'composing', got '${h.state}'`); }
+
+  const revised = store.updateHandoffCargo(h.id, prompt);
+  if (!revised || revised.revision_count !== 1) { await term.stop(); fail(`expected revision_count 1 after revise, got ${revised?.revision_count}`); }
+  log(`revise_handoff -> revision_count=${revised.revision_count} state=${revised.state}`);
+
+  const staged = store.updateHandoffState(h.id, "staged");
+  if (!staged || staged.state !== "staged" || !staged.staged_at) { await term.stop(); fail(`stage failed; state=${staged?.state} staged_at=${staged?.staged_at}`); }
+  log(`stage_handoff -> state=${staged.state} staged_at=${staged.staged_at}`);
+  return staged;
+}
+
+/** The narrowed deliver_now effect shape — only reachable on the Full-Auto approved path. */
+type DeliverNowEffect = { kind: "deliver_now"; state: "delivered"; approvedVia: "full_auto" };
+
+/**
+ * Verify the gate decision and effect for the Full-Auto approved path.
+ * Returns the narrowed deliver_now effect so the caller can drive the PTY write + row flip.
+ */
+async function assertGateAndEffect(term: UniversalTerminal, prompt: string): Promise<DeliverNowEffect> {
+  const decision = decideProposal({
+    kind: "agent_instruction",
+    instruction: prompt,
+    effectiveMode: "Full Auto",
+    runtimeType: "interactive_cli",
+    paneExists: true,
+    allowlist: new Set<string>(),
+    capability: "deliver_handoff",
+    gate: "Auto",
+  });
+  log(`gate decision (deliver_handoff, Full Auto, gate=Auto) -> ${decision.type}`);
+  if (decision.type !== "auto_execute") { await term.stop(); fail(`expected auto_execute on the approved path, got ${decision.type}`); }
+
+  const dispatchKind = decision.type === "auto_execute" ? "executed" : "pending";
+  const effect = deliverOutcomeToHandoff(dispatchKind);
+  log(`deliverOutcomeToHandoff(${dispatchKind}) -> ${effect.kind}`);
+  if (effect.kind !== "deliver_now") { await term.stop(); fail(`expected deliver_now effect on Full-Auto path, got ${effect.kind}`); }
+  // TypeScript narrows effect to DeliverNowEffect here after the fail() guard above.
+  return effect as DeliverNowEffect;
+}
+
+/** Deliver the composed_prompt into the PTY and flip the store row; return the delivered row. */
+async function deliverAndFlip(
+  term: UniversalTerminal,
+  store: JanusStore,
+  staged: Handoff,
+  effect: DeliverNowEffect,
+  setPhase: (p: "post-deliver") => void,
+): Promise<Handoff> {
+  setPhase("post-deliver");
+  log(`delivering composed_prompt into the live PTY via writeInput(): "${staged.composed_prompt}"`);
+  term.writeInput(staged.composed_prompt);
+  const delivered = store.updateHandoffState(staged.id, effect.state, { approved_via: effect.approvedVia });
+  if (!delivered || delivered.state !== "delivered" || !delivered.delivered_at) { await term.stop(); fail(`delivered flip failed; state=${delivered?.state}`); }
+  log(`updateHandoffState -> state=${delivered.state} delivered_at=${delivered.delivered_at} approved_via=${delivered.approved_via}`);
+  return delivered;
+}
+
+/** Remove the temp SQLite files (wal/shm included); ignores missing-file errors. */
+function cleanupDb(dbPath: string): void {
+  try { fs.unlinkSync(dbPath); } catch {}
+  try { fs.unlinkSync(dbPath + "-wal"); } catch {}
+  try { fs.unlinkSync(dbPath + "-shm"); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// main — orchestrates the phases; CC stays low because logic lives in helpers
+// ---------------------------------------------------------------------------
 
 async function main() {
   // (1) temp DB + store
@@ -75,119 +238,43 @@ async function main() {
   term.start();
   log(`spawned: usingNodePty=${(term as any).usingNodePty} pid=${(term as any).shellPid}`);
 
-  for (let i = 0; i < STARTUP_MS / 1000; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    log(`t+${i + 1}s status=${term.status} bytes=${bytesStartup}`);
-  }
-  if (term.status === "Exited") { await term.stop(); fail("target pane exited during startup — not a live session."); }
-  if (!sawStartup) { await term.stop(); fail("target pane produced no startup output (TUI never came up)."); }
-  log(`startup OK — status=${term.status}, ${bytesStartup} bytes of TUI output.`);
+  // (3) wait for startup
+  await waitForStartup(term, STARTUP_MS, () => ({ bytes: bytesStartup, sawStartup }));
 
-  // (4) run the Handoff machine against the store
-  const h = store.createHandoff({
-    workspace_id: WORKSPACE,
-    to_pane: TARGET,
-    kind: "agent_instruction",
-    composed_prompt: PROMPT,
-    state: "composing",
-  });
-  log(`createHandoff -> ${h.id} state=${h.state} revision_count=${h.revision_count}`);
-  if (h.state !== "composing") { await term.stop(); fail(`expected state 'composing', got '${h.state}'`); }
+  // (4) run the Handoff state machine
+  const staged = await runHandoffMachine(store, term, PROMPT);
 
-  // revise once (assert revision_count incremented)
-  const revised = store.updateHandoffCargo(h.id, PROMPT);
-  if (!revised || revised.revision_count !== 1) { await term.stop(); fail(`expected revision_count 1 after revise, got ${revised?.revision_count}`); }
-  log(`revise_handoff -> revision_count=${revised.revision_count} state=${revised.state}`);
+  // (5) gate decision + effect
+  const effect = await assertGateAndEffect(term, PROMPT);
 
-  // stage
-  const staged = store.updateHandoffState(h.id, "staged");
-  if (!staged || staged.state !== "staged" || !staged.staged_at) { await term.stop(); fail(`stage failed; state=${staged?.state} staged_at=${staged?.staged_at}`); }
-  log(`stage_handoff -> state=${staged.state} staged_at=${staged.staged_at}`);
-
-  // (5) simulate the GATED delivery with the gate SET TO ALLOW (Full Auto).
-  // Prove the SAME decision spine the server uses resolves to auto_execute here.
-  const decision = decideProposal({
-    kind: "agent_instruction",
-    instruction: PROMPT,
-    effectiveMode: "Full Auto",
-    runtimeType: "interactive_cli",
-    paneExists: true,
-    allowlist: new Set<string>(),
-    capability: "deliver_handoff",
-    gate: "Auto",
-  });
-  log(`gate decision (deliver_handoff, Full Auto, gate=Auto) -> ${decision.type}`);
-  if (decision.type !== "auto_execute") { await term.stop(); fail(`expected auto_execute on the approved path, got ${decision.type}`); }
-
-  // (5b) Drive the SAME deliver-mapping the server uses (src/handoffFlow.deliverOutcomeToHandoff),
-  // mapping the auto_execute decision to the dispatch outcome kind the server would produce
-  // ("executed" for Full Auto). This closes G3 in the smoke: the row flip is governed by the real
-  // mapping function, not a hardcoded "delivered" literal.
-  const dispatchKind = decision.type === "auto_execute" ? "executed" : "pending";
-  const effect = deliverOutcomeToHandoff(dispatchKind);
-  log(`deliverOutcomeToHandoff(${dispatchKind}) -> ${effect.kind}`);
-  if (effect.kind !== "deliver_now") { await term.stop(); fail(`expected deliver_now effect on Full-Auto path, got ${effect.kind}`); }
-
-  // approved path: land the composed prompt VERBATIM in the live PTY, then flip the row via the
-  // effect the mapping prescribed (effect.state / effect.approvedVia — not a hardcoded value).
-  phase = "post-deliver";
-  log(`delivering composed_prompt into the live PTY via writeInput(): "${PROMPT}"`);
-  term.writeInput(staged.composed_prompt);
-  const delivered = store.updateHandoffState(h.id, effect.state, { approved_via: effect.approvedVia });
-  if (!delivered || delivered.state !== "delivered" || !delivered.delivered_at) { await term.stop(); fail(`delivered flip failed; state=${delivered?.state}`); }
-  log(`updateHandoffState -> state=${delivered.state} delivered_at=${delivered.delivered_at} approved_via=${delivered.approved_via}`);
+  // (5b) deliver: PTY write + row flip
+  const _delivered = await deliverAndFlip(term, store, staged, effect, (p) => { phase = p; });
 
   // (6) wait for the model round-trip
   await new Promise((r) => setTimeout(r, RESPONSE_MS));
   await term.stop();
 
   // (7) ASSERT the prompt actually LANDED in the PTY — by CONTENT, not just byte count.
-  // The PTY echoes typed input, so the distinctive sentinel must appear in the stream that came
-  // back after delivery. A bare bytes>0 check can be satisfied by TUI redraw churn (cursor/status
-  // bar); requiring the sentinel proves the composed prompt itself was submitted into the pane.
-  if (bytesAfter === 0) { fail("composed_prompt was NOT submitted — zero PTY output after delivery."); }
-  // Strip ANSI escape sequences before searching (the TUI interleaves cursor/color codes).
-  const cleaned = streamedAfter.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1B[()][AB0]/g, "");
-  if (!cleaned.includes(SENTINEL)) {
-    fail(`delivery NOT confirmed: sentinel "${SENTINEL}" never echoed back in ${bytesAfter} post-delivery bytes — the composed prompt did not land in the PTY input line (redraw churn alone cannot prove delivery).`);
-  }
+  assertPtyDelivery(streamedAfter, bytesAfter, SENTINEL);
   log(`PTY delivery CONFIRMED — sentinel "${SENTINEL}" echoed back (${bytesAfter} bytes streamed after delivery).`);
 
   // (8) ASSERT persistence: row state + the ordered HANDOFF event trail.
-  const finalRow = store.getHandoff(h.id);
-  if (!finalRow) fail("handoff row missing after delivery.");
-  if (finalRow!.state !== "delivered") fail(`final state expected 'delivered', got '${finalRow!.state}'`);
-  if (!finalRow!.delivered_at) fail("delivered_at not set.");
-  if (finalRow!.revision_count !== 1) fail(`final revision_count expected 1, got ${finalRow!.revision_count}`);
-
-  const events = store.getEvents({ type: "handoff" }).filter(e => (e.payload && e.payload.handoff_id) === h.id);
-  const transitions = events.map(e => e.payload.to);
-  log(`HANDOFF event trail (to-states): ${JSON.stringify(transitions)}`);
-  const expected = ["composing", "revising", "staged", "delivered"];
-  // createHandoff emits to:'composing'; revise emits to:'revising'; stage to:'staged'; deliver to:'delivered'.
-  for (const want of expected) {
-    if (!transitions.includes(want)) fail(`missing transition event to '${want}' (trail=${JSON.stringify(transitions)})`);
-  }
-  // ordering: composing before revising before staged before delivered
-  const idx = (s: string) => transitions.indexOf(s);
-  if (!(idx("composing") < idx("revising") && idx("revising") < idx("staged") && idx("staged") < idx("delivered"))) {
-    fail(`transition events out of order: ${JSON.stringify(transitions)}`);
-  }
-  for (const e of events) {
-    if (e.handoff_id !== h.id) fail(`event ${e.id} has handoff_id='${e.handoff_id}', expected '${h.id}'`);
-  }
+  assertPersistence(store, staged.id);
   log(`persistence OK — state=delivered, delivered_at set, revision_count=1, ordered trail composing->revising->staged->delivered with matching handoff_id.`);
 
   store.close();
-  try { fs.unlinkSync(dbPath); } catch {}
-  try { fs.unlinkSync(dbPath + "-wal"); } catch {}
-  try { fs.unlinkSync(dbPath + "-shm"); } catch {}
+  cleanupDb(dbPath);
 
   log("PASS: PTY received the composed prompt AND the handoff persisted with the correct state-transition trail.");
   process.exit(0);
 }
 
-main().catch((e) => {
-  console.error("[smoke] ERROR:", e?.message || e);
-  process.exit(1);
-});
+// Run only when executed directly (not when imported by tests).
+// This guards against the module being import-unsafe: exported pure helpers can now be imported
+// without spawning a live PTY or a real claude process.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    console.error("[smoke] ERROR:", e?.message || e);
+    process.exit(1);
+  });
+}

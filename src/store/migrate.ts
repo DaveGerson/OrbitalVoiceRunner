@@ -42,47 +42,79 @@ export function migrateFromObjects(
 ): void {
   const tx = store.db.transaction(() => {
     const now = Date.now();
-    const ledger = input.ledger ?? {};
-    for (const ws of Object.values<any>(ledger.workspaces ?? {})) {
-      store.saveWorkspace({ id: ws.id, name: ws.name ?? "", directory: ws.directory ?? "",
-        summary: ws.summary ?? "", key_terms: ws.keyTerms ?? [], created_at: now, updated_at: now });
-      for (const note of (ws.notes ?? [])) store.addNote(ws.id, String(note), { type:"note", author:"user" });
-      for (const p of Object.values<any>(ws.panes ?? {})) {
-        store.savePane({ pane_id: p.pane_id, workspace_id: ws.id, name: p.name ?? "",
-          runtime_type: p.runtime_type ?? "", tool_preset: p.tool_preset ?? "Custom",
-          permissions_mode: p.permissions_mode ?? "Human-in-the-Loop", session_id: p.session_id ?? "",
-          last_known_state: p.last_known_state ?? "Idle", is_busy: !!p.is_busy, alive: !!p.alive,
-          context_size: p.context_size ?? 0, last_status_change_at: p.last_status_change_at ?? null,
-          last_command: p.last_command ?? null, scrollback_path: p.scrollback_path ?? null,
-          created_at: now, updated_at: now });
-        for (const note of (p.notes ?? [])) store.addNote(ws.id, String(note), { paneId: p.pane_id, type:"note", author:"user" });
-      }
-    }
-    if (ledger.activeProjectId) store.setKV("activeProjectId", String(ledger.activeProjectId));
-    if (ledger.watchRules) store.setKV("watchRules", JSON.stringify(ledger.watchRules));
-    if (ledger.plans) store.setKV("plans", JSON.stringify(ledger.plans));
-
-    // Secrets-at-rest hardening: NEVER import secrets.* into the durable store. The Gemini API key
-    // is an in-memory-only secret (director decision 2026-06-05); flattening secrets.geminiApiKey
-    // into settings_kv is exactly what leaked the key into .janus.db on the 2026-06-05 boot. Migrate
-    // every non-secret setting unchanged.
-    flatten(input.settings ?? {}, "").forEach(([k, v]) => {
-      if (k === "secrets" || k.startsWith("secrets.")) return;
-      store.saveSettings(k, typeof v === "string" ? v : JSON.stringify(v));
-    });
-
-    for (const [paneId, entries] of Object.entries<any>(input.history ?? {})) {
-      for (const e of (entries as any[])) {
-        store.appendEvent({ type: EVENT_TYPES.COMMAND_OUTCOME, pane_id: paneId,
-          ts: e.timestamp ?? now, summary: e.finalResponse ?? "",
-          payload: { command: e.command, output: e.output } });
-      }
-    }
+    importLedger(store, input.ledger ?? {}, now);
+    importSettings(store, input.settings ?? {});
+    importHistory(store, input.history ?? {}, now);
     store.appendEvent({ type: EVENT_TYPES.COMMAND_OUTCOME, summary: "migrated from JSON", ts: now, payload: { migration: true } });
     // 3V.5: the migration marker commits ATOMICALLY with the import (see migrateOnBootIfNeeded).
     if (opts?.markMigratedAt) store.setKV(LEDGER_MIGRATED_KEY, opts.markMigratedAt);
   });
   tx();
+}
+
+/** Identity/config half of the pane row — same field defaults / `??` coalescing as before. */
+function buildPaneIdentity(wsId: string, p: any): any {
+  return { pane_id: p.pane_id, workspace_id: wsId, name: p.name ?? "",
+    runtime_type: p.runtime_type ?? "", tool_preset: p.tool_preset ?? "Custom",
+    permissions_mode: p.permissions_mode ?? "Human-in-the-Loop", session_id: p.session_id ?? "" };
+}
+
+/** Runtime-state half of the pane row — same field defaults / `??` coalescing as before. */
+function buildPaneState(p: any, now: number): any {
+  return { last_known_state: p.last_known_state ?? "Idle", is_busy: !!p.is_busy, alive: !!p.alive,
+    context_size: p.context_size ?? 0, last_status_change_at: p.last_status_change_at ?? null,
+    last_command: p.last_command ?? null, scrollback_path: p.scrollback_path ?? null,
+    created_at: now, updated_at: now };
+}
+
+/** Build the pane row exactly as before — same fields, same order, same defaults. */
+function buildPaneRecord(wsId: string, p: any, now: number): any {
+  return { ...buildPaneIdentity(wsId, p), ...buildPaneState(p, now) };
+}
+
+/** Import one pane (with its notes) under workspace `wsId`. Same DDL/ordering as before. */
+function importPane(store: JanusStore, wsId: string, p: any, now: number): void {
+  store.savePane(buildPaneRecord(wsId, p, now));
+  for (const note of (p.notes ?? [])) store.addNote(wsId, String(note), { paneId: p.pane_id, type:"note", author:"user" });
+}
+
+/** Import one workspace (with its notes + panes). Same ordering/DDL/defaults as before. */
+function importWorkspace(store: JanusStore, ws: any, now: number): void {
+  store.saveWorkspace({ id: ws.id, name: ws.name ?? "", directory: ws.directory ?? "",
+    summary: ws.summary ?? "", key_terms: ws.keyTerms ?? [], created_at: now, updated_at: now });
+  for (const note of (ws.notes ?? [])) store.addNote(ws.id, String(note), { type:"note", author:"user" });
+  for (const p of Object.values<any>(ws.panes ?? {})) importPane(store, ws.id, p, now);
+}
+
+/** Import the ledger: every workspace (notes/panes) then the three ledger-level KV markers. */
+function importLedger(store: JanusStore, ledger: any, now: number): void {
+  for (const ws of Object.values<any>(ledger.workspaces ?? {})) importWorkspace(store, ws, now);
+  if (ledger.activeProjectId) store.setKV("activeProjectId", String(ledger.activeProjectId));
+  if (ledger.watchRules) store.setKV("watchRules", JSON.stringify(ledger.watchRules));
+  if (ledger.plans) store.setKV("plans", JSON.stringify(ledger.plans));
+}
+
+/** Import settings, flattened, excluding secrets.* (in-memory-only hardening). */
+function importSettings(store: JanusStore, settings: any): void {
+  // Secrets-at-rest hardening: NEVER import secrets.* into the durable store. The Gemini API key
+  // is an in-memory-only secret (director decision 2026-06-05); flattening secrets.geminiApiKey
+  // into settings_kv is exactly what leaked the key into .janus.db on the 2026-06-05 boot. Migrate
+  // every non-secret setting unchanged.
+  flatten(settings, "").forEach(([k, v]) => {
+    if (k === "secrets" || k.startsWith("secrets.")) return;
+    store.saveSettings(k, typeof v === "string" ? v : JSON.stringify(v));
+  });
+}
+
+/** Import history: one command_outcome event per entry, with the same field coalescing. */
+function importHistory(store: JanusStore, history: any, now: number): void {
+  for (const [paneId, entries] of Object.entries<any>(history)) {
+    for (const e of (entries as any[])) {
+      store.appendEvent({ type: EVENT_TYPES.COMMAND_OUTCOME, pane_id: paneId,
+        ts: e.timestamp ?? now, summary: e.finalResponse ?? "",
+        payload: { command: e.command, output: e.output } });
+    }
+  }
 }
 
 function flatten(obj: any, prefix: string): [string, any][] {
