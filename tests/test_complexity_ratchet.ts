@@ -44,7 +44,8 @@ const repoRoot = path.resolve(__dirname, '..');
 // 48 -> 45: burndown refactored store/migrate.ts (migrateFromObjects txn arrow), orbital/useFocusTrap.ts (onKey), scripts/smoke-handoff.ts (main) under CC 10 and pruned their 3 suppressions (1 each).
 // 45 -> 42: burndown refactored .tsx leaves GateChip.GateChipInner, ServiceMode (.map cb), ApprovalDialog under CC 10 (pure helpers + inline render-fns, no new components/hooks) and pruned their 3 suppressions (1 each).
 // 42 -> 34: burndown refactored .tsx leaves ActionConfirmDialog (1), TerminalView.resync (1, helpers moved to CSS-free terminalViewResync.ts), views/Pantry (3: paneOf/ServiceLogLine/ThePantry), views/Pass (3: ThePass/TicketCard/TemplateForm) under CC 10 and pruned their 8 complexity suppressions.
-const RATCHET_CEILING = 34;
+// 34 -> 28: burndown refactored .tsx containers BackOfHouse (1), KitchenRadio (2: KitchenRadio/Bubble), primitives.Button (1), TerminalWindow (2: TerminalWindow/HistoryRow, helpers in terminalWindowHelpers.ts) under CC 10 and pruned their 6 complexity suppressions.
+const RATCHET_CEILING = 28;
 
 function readSuppressions() {
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');

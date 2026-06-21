@@ -24,11 +24,6 @@
       "count": 1
     }
   },
-  "src/orbital/KitchenRadio.tsx": {
-    "complexity": {
-      "count": 2
-    }
-  },
   "src/orbital/OrbitalApp.tsx": {
     "complexity": {
       "count": 1
@@ -40,15 +35,7 @@
     }
   },
   "src/orbital/TerminalWindow.tsx": {
-    "complexity": {
-      "count": 2
-    },
     "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/orbital/primitives.tsx": {
-    "complexity": {
       "count": 1
     }
   },
@@ -58,11 +45,6 @@
     },
     "complexity": {
       "count": 7
-    }
-  },
-  "src/orbital/views/BackOfHouse.tsx": {
-    "complexity": {
-      "count": 1
     }
   }
 }

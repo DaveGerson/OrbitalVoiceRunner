@@ -11,6 +11,79 @@ import { Chip, Icon, VoiceCue } from "./primitives";
 import { useDialog } from "./useFocusTrap";
 import type { TranscriptEntry } from "./useOrbitalData";
 
+// ── Pure helpers (CC burndown) ────────────────────────────────────────────
+
+/** Background color for the status Chip. */
+export function getChipBg(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean): string {
+  if (!live) return "#8a6a4f";
+  if (micBlocked) return "#e23a3a";
+  if (!connected) return "#8a6a4f";
+  if (muted) return "#8a6a4f";
+  return "#e23a3a";
+}
+
+/** Label text for the status Chip. */
+export function getChipLabel(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean, reconnecting: boolean): string {
+  if (!live) return reconnecting ? "…" : "OFF AIR";
+  if (micBlocked) return "MIC BLOCKED";
+  if (!connected) return "TUNING IN…";
+  if (muted) return "MUTED";
+  return "● LIVE";
+}
+
+/** Background color for the mute/unmute button while live. */
+export function getMicBtnBg(micBlocked: boolean, muted: boolean): string {
+  if (micBlocked) return "#ff8a3d";
+  if (muted) return "#fff9ec";
+  return "#4db892";
+}
+
+/** Label text for the mute/unmute button while live. */
+export function getMicBtnLabel(micBlocked: boolean, muted: boolean): string {
+  if (micBlocked) return "Mic's blocked — check browser permissions";
+  if (muted) return "Mic off — tap to talk";
+  return "I'm listening, Chef";
+}
+
+/** Icon name for the mute/unmute button while live. */
+export function getMicBtnIconName(micBlocked: boolean, muted: boolean): string {
+  return muted || micBlocked ? "x" : "spark";
+}
+
+/** Panel background color. */
+export function getPanelBg(dark: boolean): string {
+  return dark ? "#241409" : "#fff4de";
+}
+
+/** Waveform section background color. */
+export function getWaveformSectionBg(dark: boolean): string {
+  return dark ? "#2f1d12" : "#fff9ec";
+}
+
+/** Waveform bar color. */
+export function getWaveformColor(dark: boolean): string {
+  return dark ? "#ffc94a" : "#e23a3a";
+}
+
+/** Mic control section background color. */
+export function getMicControlBg(dark: boolean): string {
+  return dark ? "#2f1d12" : "#fff9ec";
+}
+
+/** Background color for a Bubble message. */
+export function getBubbleBg(me: boolean, dark: boolean): string {
+  if (me) return "#ffc94a";
+  return dark ? "#3a2415" : "#fff9ec";
+}
+
+/** Text color for a Bubble message. */
+export function getBubbleColor(me: boolean, dark: boolean): string {
+  if (me) return INK;
+  return dark ? "#ffe9c7" : INK;
+}
+
+// ── Components ────────────────────────────────────────────────────────────
+
 // 2K.5: the call sheet as a proper dialog — initial focus, focus trap, Escape closes. Split out
 // so the useDialog hook mounts/unmounts with the overlay itself.
 function CallSheet({ dark, stations, onCall, onClose }: {
@@ -81,7 +154,7 @@ function Bubble({ m, dark }: { m: TranscriptEntry; dark: boolean }) {
   const g = m.grounding;
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: me ? "flex-end" : "flex-start", gap: 2 }}>
-      <div style={{ maxWidth: "88%", padding: "7px 11px", borderRadius: 12, border: "2px solid " + INK, background: me ? "#ffc94a" : (dark ? "#3a2415" : "#fff9ec"), color: me ? INK : (dark ? "#ffe9c7" : INK), boxShadow: "2px 2px 0 0 " + INK, fontFamily: "DM Sans", fontSize: 13, fontWeight: me ? 700 : 600, lineHeight: 1.35, borderBottomRightRadius: me ? 3 : 12, borderBottomLeftRadius: me ? 12 : 3 }}>
+      <div style={{ maxWidth: "88%", padding: "7px 11px", borderRadius: 12, border: "2px solid " + INK, background: getBubbleBg(me, dark), color: getBubbleColor(me, dark), boxShadow: "2px 2px 0 0 " + INK, fontFamily: "DM Sans", fontSize: 13, fontWeight: me ? 700 : 600, lineHeight: 1.35, borderBottomRightRadius: me ? 3 : 12, borderBottomLeftRadius: me ? 12 : 3 }}>
         {!me && <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".08em", textTransform: "uppercase", color: "#a8151a", display: "block", marginBottom: 2 }}>Chef de Cuisine</span>}
         {m.text}
         {g && g.sources && g.sources.length > 0 && (
@@ -126,34 +199,11 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
   const [calls, setCalls] = useState(false);
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [transcript]);
 
-  const panelBg = dark ? "#241409" : "#fff4de";
   const listening = live && connected && !muted && !micBlocked;
 
-  return (
-    <aside data-testid="kitchen-radio" style={{ position: "relative", display: "flex", flexDirection: "column", minHeight: 0, background: panelBg, height: "100%", overflow: "hidden" }}>
-      {/* header */}
-      <div style={{ padding: "12px 14px", background: INK, color: "#fff4de", display: "flex", alignItems: "center", gap: 10, borderBottom: "3px solid " + INK }}>
-        <ChefDeCuisineMark size={42} live={listening} />
-        <div style={{ flex: 1, lineHeight: 1.1, minWidth: 0 }}>
-          <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#ffc94a", transform: "rotate(-1.5deg)" }}>"runnin' the line"</div>
-          <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18 }}>Kitchen Radio</div>
-        </div>
-        <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
-        {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
-            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen. */}
-        <Chip bg={!live ? "#8a6a4f" : micBlocked ? "#e23a3a" : !connected ? "#8a6a4f" : muted ? "#8a6a4f" : "#e23a3a"} color="#fff4de" border="#fff4de">
-          {!live ? (reconnecting ? "…" : "OFF AIR") : micBlocked ? "MIC BLOCKED" : !connected ? "TUNING IN…" : muted ? "MUTED" : "● LIVE"}
-        </Chip>
-      </div>
-
-      {/* now-speaking waveform */}
-      <div style={{ padding: "11px 14px", background: dark ? "#2f1d12" : "#fff9ec", borderBottom: "2px solid " + INK, display: "flex", alignItems: "center", gap: 10 }}>
-        <Icon name="chef-hat" size={18} color="#a8151a" />
-        <Waveform active={listening} color={dark ? "#ffc94a" : "#e23a3a"} />
-      </div>
-
-      {/* transcript */}
-      <div ref={scrollRef} data-testid="radio-transcript" style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+  function renderTranscriptBody() {
+    return (
+      <>
         {transcript.length === 0 && (
           <div style={{ margin: "auto", textAlign: "center", fontFamily: "Caveat, cursive", fontSize: 17, color: "#8a6a4f" }}>
             {live ? "listening for you, Chef…" : "tune in the radio to talk to the Chef de Cuisine"}
@@ -165,21 +215,57 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
             <span className="orb-listening-dot" /> listening for you, Chef…
           </div>
         )}
-      </div>
+      </>
+    );
+  }
 
-      {/* mic control */}
-      <div style={{ padding: 12, borderTop: "2px solid " + INK, background: dark ? "#2f1d12" : "#fff9ec" }}>
+  function renderMicControl() {
+    return (
+      <div style={{ padding: 12, borderTop: "2px solid " + INK, background: getMicControlBg(dark) }}>
         {voiceCues && <div style={{ textAlign: "center", marginBottom: 8 }}><VoiceCue phrase="hey Chef, what's on the line?" dark={dark} tone="live" /></div>}
         {!live ? (
           <button data-testid="radio-golive" onClick={onGoLive} style={micBtn("#ffc94a")}>
             <Icon name="spark" size={18} /> {reconnecting ? "Tuning in…" : "Tune in the radio"}
           </button>
         ) : (
-          <button data-testid="radio-mute" onClick={onToggleMute} style={micBtn(micBlocked ? "#ff8a3d" : muted ? "#fff9ec" : "#4db892")}>
-            <Icon name={muted || micBlocked ? "x" : "spark"} size={18} /> {micBlocked ? "Mic's blocked — check browser permissions" : muted ? "Mic off — tap to talk" : "I'm listening, Chef"}
+          <button data-testid="radio-mute" onClick={onToggleMute} style={micBtn(getMicBtnBg(micBlocked, muted))}>
+            <Icon name={getMicBtnIconName(micBlocked, muted)} size={18} /> {getMicBtnLabel(micBlocked, muted)}
           </button>
         )}
       </div>
+    );
+  }
+
+  return (
+    <aside data-testid="kitchen-radio" style={{ position: "relative", display: "flex", flexDirection: "column", minHeight: 0, background: getPanelBg(dark), height: "100%", overflow: "hidden" }}>
+      {/* header */}
+      <div style={{ padding: "12px 14px", background: INK, color: "#fff4de", display: "flex", alignItems: "center", gap: 10, borderBottom: "3px solid " + INK }}>
+        <ChefDeCuisineMark size={42} live={listening} />
+        <div style={{ flex: 1, lineHeight: 1.1, minWidth: 0 }}>
+          <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#ffc94a", transform: "rotate(-1.5deg)" }}>"runnin' the line"</div>
+          <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18 }}>Kitchen Radio</div>
+        </div>
+        <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
+        {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
+            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen. */}
+        <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
+          {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
+        </Chip>
+      </div>
+
+      {/* now-speaking waveform */}
+      <div style={{ padding: "11px 14px", background: getWaveformSectionBg(dark), borderBottom: "2px solid " + INK, display: "flex", alignItems: "center", gap: 10 }}>
+        <Icon name="chef-hat" size={18} color="#a8151a" />
+        <Waveform active={listening} color={getWaveformColor(dark)} />
+      </div>
+
+      {/* transcript */}
+      <div ref={scrollRef} data-testid="radio-transcript" style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+        {renderTranscriptBody()}
+      </div>
+
+      {/* mic control */}
+      {renderMicControl()}
 
       {/* CALL SHEET — what you can say (hands-free reference). 2K.5: a real dialog (focus trap,
           Escape closes). */}

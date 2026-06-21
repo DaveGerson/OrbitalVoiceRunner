@@ -23,6 +23,26 @@ import { useDialog } from "./useFocusTrap";
 import type { Station } from "./station";
 import type { StoredNote } from "../store/types";
 import type { PaneHistoryEntry } from "./useOrbitalData";
+// Pure helpers live in a CSS-free sibling module so unit tests can import them
+// without triggering the xterm/css load that kills the Node test runner.
+export {
+  formatHistoryTimestamp,
+  buildHistoryOutputText,
+  deriveStatusLineText,
+  derive86Title,
+  derive86ButtonStyle,
+  derive86ButtonLabel,
+  resolveNoteTicketKey,
+} from "./terminalWindowHelpers";
+import {
+  formatHistoryTimestamp,
+  buildHistoryOutputText,
+  deriveStatusLineText,
+  derive86Title,
+  derive86ButtonStyle,
+  derive86ButtonLabel,
+  resolveNoteTicketKey,
+} from "./terminalWindowHelpers";
 
 // The control-key strip. Bytes come straight from the SERVER allowlist (RAW_KEY_TABLE in
 // src/rawKeyClass.ts) — importing it (a pure, dep-free table) is the single source of truth, so a
@@ -154,9 +174,8 @@ function usePaneHistory(
 function HistoryRow({ e, dark }: { e: PaneHistoryEntry; dark: boolean }) {
   const [open, setOpen] = useState(false);
   const fg = dark ? "#ffe9c7" : INK;
-  let when = e.timestamp;
-  try { const d = new Date(e.timestamp); if (!isNaN(d.getTime())) when = d.toLocaleTimeString(); } catch { /* raw string */ }
-  const preview = (e.output || "").trim();
+  const when = formatHistoryTimestamp(e.timestamp);
+  const outputText = buildHistoryOutputText(e.output, e.finalResponse);
   return (
     <div data-testid="burner-history-entry" style={{ border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK, overflow: "hidden" }}>
       <button onClick={() => setOpen((o) => !o)} title={open ? "Fold the output back up" : "Peek at what came back"}
@@ -167,8 +186,7 @@ function HistoryRow({ e, dark }: { e: PaneHistoryEntry; dark: boolean }) {
       </button>
       {open && (
         <pre data-testid="burner-history-output" style={{ margin: 0, padding: "8px 10px", borderTop: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: dark ? "#e9d9c0" : "#5b3a23", fontFamily: "JetBrains Mono", fontSize: 10.5, lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 180, overflowY: "auto" }}>
-          {preview ? (preview.length > 4000 ? preview.slice(-4000) : preview) : "(no recorded output)"}
-          {e.finalResponse ? `\n— ${e.finalResponse}` : ""}
+          {outputText}
         </pre>
       )}
     </div>
@@ -271,6 +289,119 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
     onStop();
   };
 
+  // Inline render-helper: the title-bar name section (renaming toggle).
+  // NOT a React component — called directly in JSX, no new fiber identity.
+  const renderTitleBarNameSection = () => {
+    if (renaming) {
+      return (
+        <input data-testid="burner-rename-input" autoFocus value={nameDraft}
+          onChange={(e) => setNameDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") { e.stopPropagation(); renameDone.current = true; setNameDraft(st.name); setRenaming(false); }
+          }}
+          onBlur={commitRename}
+          aria-label="Rename this station"
+          style={{ width: "min(360px, 90%)", padding: "3px 8px", border: "2px solid " + INK, borderRadius: 8, background: "#fff9ec", color: INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16, textAlign: "center", outline: "none" }} />
+      );
+    }
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, minWidth: 0 }}>
+        <span style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{st.name}</span>
+        <button data-testid="burner-rename" onClick={() => { renameDone.current = false; setNameDraft(st.name); setRenaming(true); }} title="Rename this station" aria-label="Rename this station"
+          style={{ display: "grid", placeItems: "center", width: 22, height: 22, padding: 0, borderRadius: 6, border: "1.5px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", flexShrink: 0 }}>
+          <Icon name="ticket" size={11} />
+        </button>
+      </div>
+    );
+  };
+
+  // Inline render-helper: the terminal status dot + label bar.
+  const renderTerminalStatusBar = () => (
+    <div style={{ padding: "7px 14px", borderBottom: "1px solid #ffffff18", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: live ? "#9be3c0" : "#8a6a4f", animation: live ? "orb-pulse 1s var(--ease-bounce) infinite" : "none" }} />
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#c89f74", textTransform: "uppercase", letterSpacing: ".08em" }}>
+        {deriveStatusLineText(st.status, live)}
+      </span>
+      <div style={{ flex: 1 }} />
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f" }}>{rt.burner} station</span>
+    </div>
+  );
+
+  // Inline render-helper: the Order Pad tab content.
+  const renderPadTab = () => (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
+      <textarea data-testid="burner-draft" value={draft.text} onChange={(e) => draft.onChange(e.target.value)}
+        onFocus={() => { draft.focusedRef.current = true; }}
+        onBlur={() => { draft.focusedRef.current = false; }}
+        placeholder={`Write the next order for ${st.name}, or dictate it to the Chef…`}
+        style={{ flex: 1, minHeight: 120, resize: "none", padding: 12, border: "2px solid " + INK, borderRadius: 10, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, lineHeight: 1.5, outline: "none", boxShadow: "inset 2px 2px 0 0 #00000010" }} />
+      {voiceCues && <div style={{ marginTop: 8 }}><VoiceCue phrase="send it to the line" dark={dark} tone="live" /></div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <Button variant="default" size="sm" icon="x" onClick={draft.scrap} style={{ flex: 1, justifyContent: "center" }}>Scrap</Button>
+        <Button variant="primary" size="sm" icon="arrow-right" onClick={onSend} style={{ flex: 1, justifyContent: "center" }}>Send to the line</Button>
+      </div>
+      <div style={{ marginTop: 8, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
+        saved per-pane — your draft waits when you switch stations
+      </div>
+    </div>
+  );
+
+  // Inline render-helper: the Ticket History tab content.
+  // 4U.2: recorded commands (newest first) with fold-out output peek + destructive clear.
+  const renderHistoryTab = () => (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+        {history.entries.length === 0 ? (
+          <div data-testid="burner-history-empty" style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>no orders on this ticket yet, Chef</div>
+        ) : (
+          [...history.entries].reverse().map((e, i) => (
+            <Fragment key={`${e.timestamp}-${history.entries.length - 1 - i}`}><HistoryRow e={e} dark={dark} /></Fragment>
+          ))
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 7, flexShrink: 0, alignItems: "center" }}>
+        <span style={{ flex: 1, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
+          every order this station fired, on the record
+        </span>
+        <Button testId="burner-history-clear" variant={confirmClear ? "primary" : "default"} size="sm" icon="x"
+          disabled={history.entries.length === 0}
+          title={confirmClear ? "This wipes the record for keeps — tap again" : "Clear this station's command history"}
+          onClick={onClearHistory}>{confirmClear ? "Sure, Chef?" : "Clear history"}</Button>
+      </div>
+    </div>
+  );
+
+  // Inline render-helper: the Notes & beads tab content.
+  const renderNotesTab = () => (
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+        {paneNotes.length === 0 ? (
+          <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>nothin' stitched to this pane yet, Chef</div>
+        ) : paneNotes.map((n) => {
+          const k = TICKET_KINDS[resolveNoteTicketKey(n.type)];
+          return (
+            <Fragment key={n.id}>
+              <div data-testid="burner-note" style={{ padding: 9, border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                  <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
+                  <div style={{ flex: 1 }} />
+                  <button data-testid="burner-note-delete" onClick={() => onDeleteNote(n.id)} title="86 this note" style={{ width: 22, height: 20, display: "grid", placeItems: "center", border: "1.5px solid " + INK, borderRadius: 6, background: dark ? "#1a0f08" : "#fff9ec", color: "#e23a3a", cursor: "pointer", padding: 0 }}><Icon name="x" size={11} /></button>
+                </div>
+                <div style={{ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{n.text}</div>
+              </div>
+            </Fragment>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 7, flexShrink: 0 }}>
+        <input data-testid="burner-note-input" value={note} onChange={(e) => setNote(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && note.trim()) { onAddNote(note); setNote(""); } }}
+          placeholder="jot a note for this pane…" style={{ flex: 1, padding: "8px 10px", border: "2px solid " + INK, borderRadius: 8, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, outline: "none" }} />
+        <Button testId="burner-note-add" variant="blueberry" size="sm" icon="plus" disabled={!note.trim()} onClick={() => { onAddNote(note); setNote(""); }}>Bead</Button>
+      </div>
+    </div>
+  );
+
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(42,26,16,.62)", zIndex: 200, display: "grid", placeItems: "center", padding: 24 }}>
       <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={`${st.name} — station terminal`}
@@ -284,25 +415,7 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
             <span style={{ width: 13, height: 13, borderRadius: "50%", background: "#4db892", border: "1.5px solid " + INK }} />
           </div>
           <div style={{ flex: 1, textAlign: "center", lineHeight: 1.1, minWidth: 0 }}>
-            {renaming ? (
-              <input data-testid="burner-rename-input" autoFocus value={nameDraft}
-                onChange={(e) => setNameDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitRename();
-                  if (e.key === "Escape") { e.stopPropagation(); renameDone.current = true; setNameDraft(st.name); setRenaming(false); }
-                }}
-                onBlur={commitRename}
-                aria-label="Rename this station"
-                style={{ width: "min(360px, 90%)", padding: "3px 8px", border: "2px solid " + INK, borderRadius: 8, background: "#fff9ec", color: INK, fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 16, textAlign: "center", outline: "none" }} />
-            ) : (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, minWidth: 0 }}>
-                <span style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{st.name}</span>
-                <button data-testid="burner-rename" onClick={() => { renameDone.current = false; setNameDraft(st.name); setRenaming(true); }} title="Rename this station" aria-label="Rename this station"
-                  style={{ display: "grid", placeItems: "center", width: 22, height: 22, padding: 0, borderRadius: 6, border: "1.5px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", flexShrink: 0 }}>
-                  <Icon name="ticket" size={11} />
-                </button>
-              </div>
-            )}
+            {renderTitleBarNameSection()}
             <div style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: INK, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>#{st.id} · {rt.label} on the {rt.burner} · {st.cwd}</div>
           </div>
           <button data-testid="burner-restart" onClick={onRestart} title="Re-fire this station (restart the process)"
@@ -310,9 +423,9 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
             <Icon name="fire" size={13} color="#e23a3a" /> Re-fire
           </button>
           <button data-testid="burner-86" onClick={on86} data-confirming={confirm86 || undefined}
-            title={st.status === "Exited" ? "86 this station (it already exited — straight to the freezer, recoverable)" : "86 this station (stop the process and freeze it — recoverable)"}
-            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, background: confirm86 ? "#e23a3a" : "#fff4de", color: confirm86 ? "#fff4de" : "#a8151a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
-            <Icon name="x" size={12} /> {confirm86 ? "Sure, Chef? Tap again" : "86 this station"}
+            title={derive86Title(st.status)}
+            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, ...derive86ButtonStyle(confirm86), cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
+            <Icon name="x" size={12} /> {derive86ButtonLabel(confirm86)}
           </button>
           <PostureChip posture={st.posture} mode={st.mode} />
           <StatusBadge status={st.status} />
@@ -321,14 +434,7 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
         <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
           {/* the terminal — the hero */}
           <div style={{ flex: 1.7, minWidth: 0, background: INK, display: "flex", flexDirection: "column", borderRight: "3px solid " + INK }}>
-            <div style={{ padding: "7px 14px", borderBottom: "1px solid #ffffff18", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: live ? "#9be3c0" : "#8a6a4f", animation: live ? "orb-pulse 1s var(--ease-bounce) infinite" : "none" }} />
-              <span style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#c89f74", textTransform: "uppercase", letterSpacing: ".08em" }}>
-                {live ? "live on the burner" : st.status === "Exited" ? "process ended" : st.status === "Needs Input" ? "waiting on you, Chef" : "idle — prompt ready"}
-              </span>
-              <div style={{ flex: 1 }} />
-              <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f" }}>{rt.burner} station</span>
-            </div>
+            {renderTerminalStatusBar()}
             {/* the REAL xterm: backfill scrollback + live raw-chunk stream, grid synced to the PTY */}
             <div data-testid="burner-terminal" style={{ flex: 1, minHeight: 0, position: "relative", padding: 6 }}>
               <TerminalView
@@ -354,73 +460,7 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
               ))}
             </div>
 
-            {tab === "pad" ? (
-              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
-                <textarea data-testid="burner-draft" value={draft.text} onChange={(e) => draft.onChange(e.target.value)}
-                  onFocus={() => { draft.focusedRef.current = true; }}
-                  onBlur={() => { draft.focusedRef.current = false; }}
-                  placeholder={`Write the next order for ${st.name}, or dictate it to the Chef…`}
-                  style={{ flex: 1, minHeight: 120, resize: "none", padding: 12, border: "2px solid " + INK, borderRadius: 10, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, lineHeight: 1.5, outline: "none", boxShadow: "inset 2px 2px 0 0 #00000010" }} />
-                {voiceCues && <div style={{ marginTop: 8 }}><VoiceCue phrase="send it to the line" dark={dark} tone="live" /></div>}
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                  <Button variant="default" size="sm" icon="x" onClick={draft.scrap} style={{ flex: 1, justifyContent: "center" }}>Scrap</Button>
-                  <Button variant="primary" size="sm" icon="arrow-right" onClick={onSend} style={{ flex: 1, justifyContent: "center" }}>Send to the line</Button>
-                </div>
-                <div style={{ marginTop: 8, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
-                  saved per-pane — your draft waits when you switch stations
-                </div>
-              </div>
-            ) : tab === "history" ? (
-              // 4U.2: the ticket history — recorded commands (newest first) with a fold-out output
-              // peek, plus the destructive clear (two-tap; the server's frozen refusal is surfaced).
-              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
-                <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
-                  {history.entries.length === 0 ? (
-                    <div data-testid="burner-history-empty" style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>no orders on this ticket yet, Chef</div>
-                  ) : (
-                    [...history.entries].reverse().map((e, i) => (
-                      <Fragment key={`${e.timestamp}-${history.entries.length - 1 - i}`}><HistoryRow e={e} dark={dark} /></Fragment>
-                    ))
-                  )}
-                </div>
-                <div style={{ display: "flex", gap: 7, flexShrink: 0, alignItems: "center" }}>
-                  <span style={{ flex: 1, fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.1 }}>
-                    every order this station fired, on the record
-                  </span>
-                  <Button testId="burner-history-clear" variant={confirmClear ? "primary" : "default"} size="sm" icon="x"
-                    disabled={history.entries.length === 0}
-                    title={confirmClear ? "This wipes the record for keeps — tap again" : "Clear this station's command history"}
-                    onClick={onClearHistory}>{confirmClear ? "Sure, Chef?" : "Clear history"}</Button>
-                </div>
-              </div>
-            ) : (
-              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
-                <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
-                  {paneNotes.length === 0 ? (
-                    <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#8a6a4f" }}>nothin' stitched to this pane yet, Chef</div>
-                  ) : paneNotes.map((n) => {
-                    const k = TICKET_KINDS[n.type === "warning" ? "bug" : n.type === "todo" ? "todo" : "note"];
-                    return (
-                      <Fragment key={n.id}>
-                        <div data-testid="burner-note" style={{ padding: 9, border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                            <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
-                            <div style={{ flex: 1 }} />
-                            <button data-testid="burner-note-delete" onClick={() => onDeleteNote(n.id)} title="86 this note" style={{ width: 22, height: 20, display: "grid", placeItems: "center", border: "1.5px solid " + INK, borderRadius: 6, background: dark ? "#1a0f08" : "#fff9ec", color: "#e23a3a", cursor: "pointer", padding: 0 }}><Icon name="x" size={11} /></button>
-                          </div>
-                          <div style={{ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{n.text}</div>
-                        </div>
-                      </Fragment>
-                    );
-                  })}
-                </div>
-                <div style={{ display: "flex", gap: 7, flexShrink: 0 }}>
-                  <input data-testid="burner-note-input" value={note} onChange={(e) => setNote(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && note.trim()) { onAddNote(note); setNote(""); } }}
-                    placeholder="jot a note for this pane…" style={{ flex: 1, padding: "8px 10px", border: "2px solid " + INK, borderRadius: 8, background: dark ? "#241409" : "#fff4de", color: fg, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, outline: "none" }} />
-                  <Button testId="burner-note-add" variant="blueberry" size="sm" icon="plus" disabled={!note.trim()} onClick={() => { onAddNote(note); setNote(""); }}>Bead</Button>
-                </div>
-              </div>
-            )}
+            {tab === "pad" ? renderPadTab() : tab === "history" ? renderHistoryTab() : renderNotesTab()}
           </div>
         </div>
       </div>
