@@ -70,11 +70,13 @@ test('complexity suppressions ratchet down: total <= RATCHET_CEILING', () => {
   );
 });
 
-test('cognitive-complexity is advisory and must NOT be suppressed', () => {
+test('cognitive-complexity is a hard gate and must NOT be suppressed', () => {
+  // cognitive-complexity is now `['error', 15]` (a gate, not advisory). It must be FIXED,
+  // never baselined: assert it never appears in the suppressions file.
   const raw = readFileSync(path.join(repoRoot, 'eslint-suppressions.json'), 'utf8');
   assert.ok(
     !/cognitive-complexity/.test(raw),
-    'cognitive-complexity is a `warn` advisory and must stay unsuppressed; found it in eslint-suppressions.json',
+    'cognitive-complexity is an error gate and must stay unsuppressed; found it in eslint-suppressions.json — fix the nesting instead of baselining',
   );
 });
 
@@ -98,5 +100,39 @@ test('production gate flags new over-limit code (complexity error, severity 2)',
   assert.ok(
     errors.length >= 1,
     'production eslint.config.js did not flag over-limit code as a complexity error (severity 2)',
+  );
+});
+
+// Smoke: prove the COGNITIVE gate bites end-to-end at error severity. Cognitive complexity
+// penalizes NESTING depth (unlike McCabe path-count), so this deliberately deeply-nested
+// function scores well over 15. Proves the `['error', 15]` wiring catches unreadable nesting.
+function overcognitiveSource() {
+  return `export function deepnest(a: number): number {
+  let r = 0;
+  if (a > 0) {
+    for (let i = 0; i < a; i++) {
+      if (i % 2 === 0) {
+        while (r < i) {
+          if (r > 3) { r += 2; } else if (r > 1) { r += 1; } else { r -= 1; }
+        }
+      }
+    }
+  }
+  return r;
+}
+`;
+}
+
+test('production gate flags over-cognitive code (cognitive-complexity error, severity 2)', async () => {
+  const eslint = new ESLint({ overrideConfigFile: path.join(repoRoot, 'eslint.config.js') });
+  const [res] = await eslint.lintText(overcognitiveSource(), {
+    filePath: path.join(repoRoot, 'src', '__cognitive_smoke__.ts'),
+  });
+  const errors = (res?.messages ?? []).filter(
+    (m) => m.ruleId === 'sonarjs/cognitive-complexity' && m.severity === 2,
+  );
+  assert.ok(
+    errors.length >= 1,
+    'production eslint.config.js did not flag over-cognitive (deeply-nested) code as a cognitive-complexity error (severity 2)',
   );
 });
