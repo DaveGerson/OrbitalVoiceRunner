@@ -1,22 +1,2 @@
 {
-  "src/components/TerminalView.tsx": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/e2e/harness.ts": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/orbital/TerminalWindow.tsx": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "src/orbital/useOrbitalData.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 3
-    }
-  }
 }

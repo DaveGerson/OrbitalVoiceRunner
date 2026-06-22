@@ -7,6 +7,7 @@
 // rule — we deliberately do NOT adopt its full recommended rule set as policy.
 import tseslint from 'typescript-eslint';
 import sonarjs from 'eslint-plugin-sonarjs';
+import reactHooks from 'eslint-plugin-react-hooks';
 
 export default tseslint.config(
   {
@@ -46,10 +47,13 @@ export default tseslint.config(
     },
     plugins: {
       sonarjs,
+      'react-hooks': reactHooks,
     },
     rules: {
       complexity: ['error', 10],
       'sonarjs/cognitive-complexity': ['warn', 15],
+      'react-hooks/rules-of-hooks': 'error',
+      'react-hooks/exhaustive-deps': 'warn',
     },
   },
 );

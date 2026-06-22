@@ -530,7 +530,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // broadcast frames entirely — both sockets are in the server's broadcast set while the radio is
   // live, and double-handling would double the refetches and duplicate xterm writes.
   // Voice-only frames (audio/transcripts/grounding/channel state) live in the voice effect below.
-  const handleObserveFrame = useCallback((msg: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+  const handleObserveFrame = useCallback((msg: any) => {
     // The original flat switch is replaced by a per-type dispatch table: one tiny handler per frame
     // type, each a thin closure over the same setters. The OBSERVABLE order of setState / refetch /
     // earcon / desktopNote calls inside each handler is byte-identical to the original switch arm; the
@@ -808,7 +808,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       ws.onmessage = (event) => {
         // The /live frame is an untyped JSON blob (same as the classic app's ws.onmessage). Field
         // access is guarded per-case inside handleObserveFrame.
-        let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+        let msg: any;
         try { msg = JSON.parse(event.data); } catch { return; }
         handleObserveFrame(msg);
       };
@@ -903,7 +903,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         startMic(ws, captureCtx);
       };
       ws.onmessage = (event) => {
-        let msg: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+        let msg: any;
         try { msg = JSON.parse(event.data); } catch { return; }
         // Split into the audio/transcript half and the channel-state half so neither arrow trips the
         // complexity gate; the per-case setState/audio ordering is unchanged from the flat switch.
