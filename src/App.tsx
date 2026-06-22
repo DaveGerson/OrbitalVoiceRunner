@@ -1533,8 +1533,10 @@ function AppRaw() {
   };
 
   const GenericPromptModal = () => {
-    if (!promptDialog) return null;
+    // Hook must be called unconditionally (rules-of-hooks): declare state BEFORE the
+    // early return so the hook order is stable whether or not promptDialog is open.
     const [val, setVal] = useState("");
+    if (!promptDialog) return null;
     return (
       <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur flex items-center justify-center p-4">
         <div className="bg-[#111] border border-white/10 p-6 rounded shadow-2xl w-full max-w-sm flex flex-col gap-4">
