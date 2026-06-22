@@ -305,6 +305,7 @@ export function SettingsDialog({
     if (activeTab === "json") {
       setRawJsonStr(JSON.stringify(getCompiledSettings(), null, 2));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- getCompiledSettings is an unstable body fn; the explicit dep list below already enumerates every form-state input it reads.
   }, [
     activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate,
     activeContext, localWorkspacePath, presets, maxBufferLines,

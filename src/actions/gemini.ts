@@ -52,7 +52,6 @@ function unwrap(schema: z.ZodTypeAny): { inner: z.ZodTypeAny; optional: boolean 
   let optional = false;
   // zod 4: wrappers carry `.def.innerType`; optional/default/nullable make a field non-required.
   // Loop because they can nest (e.g. .optional().default()).
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const def = (inner as { def?: { type?: string; innerType?: z.ZodTypeAny } }).def;
     const t = def?.type;

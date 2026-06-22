@@ -126,6 +126,21 @@ type ExecutePlanOutcome =
   | "pane_offline"    // no live term / no pane  -> 400 (parity with inline "node offline")
   | "plan_not_found"  // unknown plan id         -> 404
   | "clarify";        // shell re-route          -> 409
+
+/**
+ * HTTP status map for execute_plan's rest.toHttp — verbatim extraction of the inline ternary chain
+ * (c55.9 §6). A plain object lookup carries zero cognitive complexity; the 200 defensive default
+ * is expressed via the `?? 200` fallback in toHttp for un-stamped outcomes. Values are IDENTICAL
+ * to the original ternary branches.
+ */
+const EXECUTE_PLAN_HTTP_STATUS: Record<ExecutePlanOutcome, number> = {
+  executed:       200,
+  pending:        202,
+  blocked:        403,
+  pane_offline:   400,
+  plan_not_found: 404,
+  clarify:        409,
+};
 export const executePlan: ActionDef<typeof ExecutePlanParams> = {
   name: "execute_plan",
   description: "Starts running a synthesized multi-step plan recipe.",
@@ -149,14 +164,7 @@ export const executePlan: ActionDef<typeof ExecutePlanParams> = {
       const outcome = (result.kind === "ok"
         ? (result.meta as { outcome?: ExecutePlanOutcome } | undefined)?.outcome
         : undefined) as ExecutePlanOutcome | undefined;
-      const status =
-        outcome === "executed" ? 200 :
-        outcome === "pending" ? 202 :
-        outcome === "blocked" ? 403 :
-        outcome === "pane_offline" ? 400 :
-        outcome === "plan_not_found" ? 404 :
-        outcome === "clarify" ? 409 :
-        200; // defensive default (an un-stamped ok)
+      const status = outcome !== undefined ? (EXECUTE_PLAN_HTTP_STATUS[outcome] ?? 200) : 200;
       const body = result.kind === "ok" ? { output: result.output } : { error: "execute_plan failed" };
       return { status, body };
     },

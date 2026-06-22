@@ -750,6 +750,7 @@ function AppRaw() {
       fetchPlans();
     }, 20000);
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once boot + slow safety-net poll; fetch* are unstable body fns, listing them would re-run every render.
   }, []);
 
   useEffect(() => {
@@ -777,12 +778,14 @@ function AppRaw() {
     // Step 6: load the newly-open pane's WIP draft into the Workbench, and refresh the register.
     fetchActiveDraft(activeProjectId, activeTerminalId);
     fetchWipDrafts(activeProjectId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run on pane/project change only; fetch* are unstable body fns called with explicit args, listing them would re-run every render.
   }, [activeTerminalId, activeProjectId]);
 
   // bead bjm: keep the id-bearing notes feed fresh — on project switch and whenever the ledger
   // changes (e.g. a voice-added note broadcasts a ledger_update), so the Chronicle stays in sync.
   useEffect(() => {
     fetchProjectNotes(activeProjectId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh on project/ledger change only; fetchProjectNotes is an unstable body fn called with explicit arg, listing it would re-run every render.
   }, [activeProjectId, ledger]);
 
   useEffect(() => {
@@ -796,6 +799,7 @@ function AppRaw() {
     return () => {
       if (interval) clearInterval(interval);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- (re)start the poll on panel/pane change only; fetchActiveTerminalHistory is an unstable body fn, listing it would re-run every render.
   }, [showHistoryPanel, activeTerminalId]);
 
   useEffect(() => {
@@ -829,6 +833,7 @@ function AppRaw() {
     }
 
     prevTerminalsRef.current = terminals;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- diff is intentionally keyed to terminals changes only; adding recentlyIdled would re-run on its own setState (incl. setTimeout) and re-register timers. Reading the latest recentlyIdled snapshot is fine here.
   }, [terminals]);
 
   const handleApprove = async (messageId: string) => {

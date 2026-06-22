@@ -52,7 +52,6 @@ async function main() {
     else { bytesAfter += chunk.length; responseText += chunk; }
   };
 
-  // eslint-disable-next-line no-control-regex
   const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
 
   log("starting pane (claude)...");
