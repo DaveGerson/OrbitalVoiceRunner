@@ -327,9 +327,19 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
       const A = mgr.terminals["us12r-A"] as any;
       A.idleTimeoutMs = 200;
       A.agentIdleTimeoutMs = 200;
-      // Fixed wait kept on purpose: pure attach-settling BEFORE writeInput; no public "PTY ready"
-      // signal to poll on (readiness is internal write-buffering) and it precedes any status edge.
-      await new Promise((r) => setTimeout(r, 400));
+      // The spawn stamps status="Running" directly (terminal.ts start()) WITHOUT routing through the
+      // onRunning edge — that edge only fires on a non-Running -> Running TRANSITION. So we must let the
+      // freshly-spawned shell taper all the way to Idle FIRST; only then does the burst below produce a
+      // genuine Idle -> Running edge (the invariant this story asserts). Polling for that settle (instead
+      // of a fixed 400ms sleep) closes a load-sensitive race: under CPU pressure the spawn-time Running
+      // window outlived the old fixed wait, writeInput found status already "Running", no edge fired, and
+      // sawRunning stayed false while waitFor(status==="Running") passed trivially against the stale stamp.
+      await waitFor(() => A.status === "Idle", 8000);
+      // The spawn-settle itself is a Running->Idle edge (the shell banner is output-driven work in
+      // fallback mode), so it may have fired onRunning/onIdle once already. Zero the counters here so
+      // the asserts below measure ONLY the taper->burst->finish sequence this story is about.
+      sawRunning = false;
+      idleCount = 0;
       A.writeInput("echo a; sleep 0.25; echo b; sleep 0.5; echo DONE\n");
 
       await waitFor(() => A.status === "Running", 4000);
