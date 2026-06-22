@@ -39,8 +39,19 @@ export async function resolve(specifier, context, nextResolve) {
 }
 export async function load(url, context, nextLoad) {
   if (url.startsWith('data:text/javascript,')) {
-    const source = decodeURIComponent(url.slice('data:text/javascript,'.length));
-    return { format: 'module', source, shortCircuit: true };
+    // node can leak a ?raw query onto this synthetic data: URL (-> export default ""?raw, invalid
+    // JS) — decode only up to the first '?'; the stub sources never contain one.
+    const head = 'data:text/javascript,';
+    const q = url.indexOf('?', head.length);
+    const payload = q === -1 ? url.slice(head.length) : url.slice(head.length, q);
+    return { format: 'module', source: decodeURIComponent(payload), shortCircuit: true };
+  }
+  // tsx strips the ?raw query on TRANSITIVE imports (ServiceMode -> primitives ->
+  // icons.svg?raw), so a bare .svg reaches load and Node dies on the unknown
+  // extension. The resolve guard above only catches the literal '?raw' specifier;
+  // stub the queryless .svg here too so transitive graphs load without Vite.
+  if (url.endsWith('.svg') || url.includes('.svg?')) {
+    return { format: 'module', source: 'export default ""', shortCircuit: true };
   }
   return nextLoad(url, context);
 }
