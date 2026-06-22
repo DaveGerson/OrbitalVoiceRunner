@@ -122,7 +122,7 @@ npm run test:e2e                               # Playwright (auto-starts Vite, ?
 npm run build                                  # vite + esbuild → dist/server.cjs
 npm run smoke:claude                           # live pane smoke (needs authed Claude binary)
 node scripts/check-deps.mjs                     # verify node_modules is in sync with package.json
-npm run complexity                             # cyclomatic gate: eslint complexity<=10 + advisory cognitive; baseline in eslint-suppressions.json (exit 2 = run `npx eslint . --prune-suppressions`)
+npm run complexity                             # lint gates (eslint): McCabe complexity<=10 + cognitive-complexity<=15 + react-hooks/rules-of-hooks (all ERROR). Burndown COMPLETE — eslint-suppressions.json is empty; exit 2 = a stale suppression, run `npx eslint . --prune-suppressions`
 npm run complexity:report                      # churn × complexity hotspot ranking (what to refactor next)
 ```
 
@@ -135,10 +135,13 @@ npm run complexity:report                      # churn × complexity hotspot ran
 >   `sh scripts/install-wt-lock.sh` (they run `node scripts/check-deps.mjs --warn`, fail-open).
 > - The catalog drift guard (`scripts/catalog.ts`) normalizes CRLF→LF before comparing, so it
 >   won't false-fail on Windows; a real drift means the registry changed — run `npm run catalog`.
-> - Complexity (CC ≤ 10) is gated only on NEW/changed code; legacy violations are baselined in
->   `eslint-suppressions.json` and ratcheted down (`RATCHET_CEILING` in
->   `tests/test_complexity_ratchet.ts`). Design, decisions, and the paydown burn-down are in
->   `docs/superpowers/specs/2026-06-19-cyclomatic-complexity.md`.
+> - Lint gates (`eslint.config.js`): McCabe `complexity<=10`, `sonarjs/cognitive-complexity<=15`,
+>   and `react-hooks/rules-of-hooks` are all **errors**; `react-hooks/exhaustive-deps` is advisory
+>   `warn` (the codebase's unstable-body-fn idiom makes erroring it disable-noisy). The complexity
+>   **burndown is COMPLETE**: `eslint-suppressions.json` is empty, `RATCHET_CEILING` is `0`
+>   (`tests/test_complexity_ratchet.ts`), and the whole tree passes at CC ≤ 10 with **zero
+>   suppressions** — any new violation must be FIXED (the ratchet only ever shrinks). Design,
+>   decisions, and the completed burn-down: `docs/superpowers/specs/2026-06-19-cyclomatic-complexity.md`.
 
 ## Architecture Overview
 

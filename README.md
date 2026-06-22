@@ -106,12 +106,13 @@ and `.janus_settings.json` (system settings); both are local runtime files.
 ## Running
 
 ```bash
-npm run dev     # Start the server with Vite middleware at http://localhost:3000
-npm run build   # Build the client (vite) and bundle the server to dist/server.cjs
-npm start       # Run the production build (serves the bundled SPA from dist/)
-npm test        # Run the TypeScript test suites with tsx
-npm run lint    # Type-check with tsc --noEmit
-npm run clean   # Remove build artifacts
+npm run dev         # Start the server with Vite middleware at http://localhost:3000
+npm run build       # Build the client (vite) and bundle the server to dist/server.cjs
+npm start           # Run the production build (serves the bundled SPA from dist/)
+npm test            # Run the TypeScript test suites with tsx
+npm run lint        # Type-check with tsc --noEmit
+npm run complexity  # Lint gates: complexity<=10 + cognitive<=15 + react-hooks/rules-of-hooks (all error)
+npm run clean       # Remove build artifacts
 ```
 
 Open http://localhost:3000, click **Connect**, and grant microphone access. A
