@@ -1,7 +1,10 @@
-// Flat ESLint config (ESM) — cyclomatic-complexity gate + cognitive-complexity advisory.
+// Flat ESLint config (ESM) — complexity gates (McCabe + cognitive) + react-hooks.
 //
-// Gate:     `complexity: ['error', 10]`            (McCabe / NIST limit)
-// Advisory: `sonarjs/cognitive-complexity: ['warn', 15]`
+// Gate: `complexity: ['error', 10]`                  (McCabe / NIST path count)
+// Gate: `sonarjs/cognitive-complexity: ['error', 15]` (human-readability / nesting)
+// Gate: `react-hooks/rules-of-hooks: 'error'`         (hook-order correctness)
+// Advisory: `react-hooks/exhaustive-deps: 'warn'`     (stale-closure hints; the codebase's
+//           unstable-body-fn idiom makes erroring it disable-noisy — kept advisory on purpose)
 //
 // The sonarjs plugin is REGISTERED but we enable ONLY its cognitive-complexity
 // rule — we deliberately do NOT adopt its full recommended rule set as policy.
@@ -51,7 +54,7 @@ export default tseslint.config(
     },
     rules: {
       complexity: ['error', 10],
-      'sonarjs/cognitive-complexity': ['warn', 15],
+      'sonarjs/cognitive-complexity': ['error', 15],
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'warn',
     },
