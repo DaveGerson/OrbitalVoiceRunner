@@ -24,6 +24,10 @@ export default tseslint.config(
       'e2e/**',
       'dist/**',
       'node_modules/**',
+      // Nested git worktrees (.claude/worktrees/<task>) carry foreign/older code — and a
+      // bare `eslint .` from the repo root would otherwise descend into them and lint that
+      // code against this tree's gates, producing false-reds. Never lint .claude/ from root.
+      '.claude/**',
       'stubs/**',
       'public/**',
       'python/**',
