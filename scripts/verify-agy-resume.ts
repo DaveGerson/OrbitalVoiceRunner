@@ -47,7 +47,6 @@ async function runSession(label: string, shellCmd: string, prompt: string, captu
   let raw = "";
   const term = new UniversalTerminal(label, process.cwd(), shellCmd, "Antigravity", "Human-in-the-Loop", "");
   term.onOutput = (_id: string, c: string) => { raw += c; if (raw.length > 250_000) raw = raw.slice(-120_000); };
-  // eslint-disable-next-line no-control-regex
   const clean = (s: string) => s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
   const tail = () => clean(raw).split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-14).join("  ¶  ");
   term.start();

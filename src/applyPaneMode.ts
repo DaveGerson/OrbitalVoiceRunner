@@ -116,6 +116,21 @@ function drainPaneOnPromotion(paneId: string, deps: PaneModeDeps): void {
 }
 
 /**
+ * Check whether a single poll frame confirms convergence to `targetMode`. Uses the step's
+ * expectMarker when present, otherwise the adapter's parseCurrentMode — VERBATIM extraction
+ * of the two inner branches from runLiveSignal's read-after-write poll. Pure: no side-effects.
+ */
+function hasConverged(
+  adapter: PaneLike["adapter"],
+  frame: string,
+  step: { bytes: string; expectMarker?: RegExp },
+  targetMode: Mode,
+): boolean {
+  if (step.expectMarker) return step.expectMarker.test(frame);
+  return adapter.parseCurrentMode(frame) === targetMode;
+}
+
+/**
  * The live-signal execution: write each step's bytes, then poll the pane's recent output until the
  * adapter confirms `targetMode` (or the step's expectMarker matches), bounded by a timeout. Returns
  * true on confirmed convergence, false on timeout (an unconfirmed switch is NEVER reported as success).
@@ -133,15 +148,8 @@ async function runLiveSignal(
     const deadline = Date.now() + timeoutMs;
     let confirmed = false;
     // Read-after-write: poll until the marker / parsed mode confirms, or the deadline passes.
-    // eslint-disable-next-line no-constant-condition
     while (true) {
-      const frame = term.getRecentOutput();
-      if (step.expectMarker) {
-        if (step.expectMarker.test(frame)) { confirmed = true; break; }
-      } else if (adapter.parseCurrentMode(frame) === targetMode) {
-        confirmed = true;
-        break;
-      }
+      if (hasConverged(adapter, term.getRecentOutput(), step, targetMode)) { confirmed = true; break; }
       if (Date.now() >= deadline) break;
       await sleep(pollMs);
     }

@@ -35,11 +35,8 @@ function log(...a: any[]) { console.log("[p5]", ...a); }
 // cursor-move / color redraw noise.
 function stripAnsi(s: string): string {
   return s
-    // eslint-disable-next-line no-control-regex
     .replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "")
-    // eslint-disable-next-line no-control-regex
     .replace(/\x1B\][^\x07]*(\x07|\x1B\\)/g, "")
-    // eslint-disable-next-line no-control-regex
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
 }
 

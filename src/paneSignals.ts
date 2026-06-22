@@ -39,29 +39,36 @@ export function classifyPaneOutput(cleanText: string): OutputClass | null {
   return null;
 }
 
+/**
+ * Verb table for formatPaneSignal — verbatim extraction of the inline ternary chain.
+ * A plain object lookup carries zero cognitive complexity (no branches in the function body).
+ * Each entry is VERBATIM from the original chain; the "exited" default is the fallback below.
+ *
+ * "closed" is the OPERATOR-initiated exit+archive completion (close_pane / UI Exit), distinct
+ * from "exited" (a pane that ended on its own, detected by the state machine). It is turn-gated
+ * in voice/index.ts so the confirmation never talks over the operator.
+ *
+ * "running" is the BEGINNING edge (Phase 1 "ears"). It MUST be in the table: omitting it would
+ * fall through to the "exited" default, mis-narrating a start as an end — actively misleading the model.
+ *
+ * "quiescing" is the Conservative Phase 2 HUMBLE pre-idle nudge: the pane has gone quiet but is NOT
+ * yet declared done (inside the idle-debounce window the state machine already arms). Wording stays
+ * tentative ("appears to be wrapping up") — must NOT read as completion.
+ */
+const PANE_SIGNAL_VERBS: Partial<Record<PaneSignalKind, string>> = {
+  created:   "is up and ready",
+  closed:    "is exited and archived (recoverable)",
+  idle:      "went idle (finished)",
+  error:     "reported an error",
+  prompt:    "is waiting at a prompt",
+  running:   "started working (cooking)",
+  quiescing: "appears to be wrapping up (still cooking — not yet confirmed complete)",
+};
+
 /** Compact, operator-facing text injected into the live session. Mirrors the
  *  approval-narration convention: a user-role nudge the model may speak, then stop. */
 export function formatPaneSignal(s: PaneSignal): string {
-  const verb =
-    s.kind === "created" ? "is up and ready"
-    // "closed" is the OPERATOR-initiated exit+archive completion (close_pane / UI Exit), distinct
-    // from "exited" (a pane that ended on its own, detected by the state machine). It is turn-gated
-    // in voice/index.ts so the confirmation never talks over the operator.
-    : s.kind === "closed" ? "is exited and archived (recoverable)"
-    : s.kind === "idle" ? "went idle (finished)"
-    : s.kind === "error" ? "reported an error"
-    : s.kind === "prompt" ? "is waiting at a prompt"
-    // "running" is the BEGINNING edge (Phase 1 "ears"). It MUST be matched explicitly: the
-    // chain falls through to "exited" for any unhandled kind, so an unmatched "running" would
-    // mis-narrate a start as an end — actively misleading the model.
-    : s.kind === "running" ? "started working (cooking)"
-    // "quiescing" is the Conservative Phase 2 HUMBLE pre-idle nudge: the pane has gone quiet but
-    // is NOT yet declared done (it sits inside the idle-debounce window the state machine already
-    // arms). It MUST be matched explicitly for the same exhaustiveness reason — and it must NOT
-    // read as a completion ('finished'/'done'/'idle') or it would re-introduce the premature-done
-    // problem this phase exists to soften. Wording stays tentative ("appears to be wrapping up").
-    : s.kind === "quiescing" ? "appears to be wrapping up (still cooking — not yet confirmed complete)"
-    : "exited";
+  const verb = PANE_SIGNAL_VERBS[s.kind] ?? "exited";
   const tail = s.detail ? `: ${s.detail}` : "";
   return `PANE STATUS (mention to the operator if relevant, then stop): pane ${s.paneId} ${verb}${tail}`;
 }
