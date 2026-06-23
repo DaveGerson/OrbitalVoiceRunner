@@ -112,38 +112,49 @@ export function fmtErrorRate(rate: number): string {
   return `${Math.round(r * 100)}%`;
 }
 
+// bead apu: the health strip's per-chip skin decisions, pulled out of the component so the JSX stays
+// straight-line (within the complexity gate) and the colour/label logic is unit-testable. Frozen is
+// loud (the brake), a non-zero error rate warms, pending approvals warm, otherwise everything's steady.
+export function healthChipSkins(health: HealthSnapshot, dark: boolean) {
+  const steady = dark ? "#241409" : "#fff9ec";
+  const pending = health.pending_approvals > 0;
+  const errored = health.recent.error_rate > 0;
+  return {
+    steady,
+    frozen: {
+      bg: health.frozen ? "#e23a3a" : "#4db892",
+      color: health.frozen ? "#fff4de" : INK,
+      label: health.frozen ? "frozen — brake on" : "running free",
+    },
+    pending: { bg: pending ? "#ffc94a" : steady, color: pending ? INK : "#8a6a4f" },
+    errors: { bg: errored ? "#ff8a3d" : steady, color: errored ? INK : "#8a6a4f" },
+  };
+}
+
 // bead apu: the health strip — a calm, one-glance observability row at the top of the Pantry.
-// All server truth from GET /api/health (src/actions/defs/observability.ts getHealth). Frozen is
-// loud (the emergency brake), a non-zero error rate warms, otherwise everything reads steady.
+// All server truth from GET /api/health (src/actions/defs/observability.ts getHealth).
 function HealthStrip({ health, dark }: { health: HealthSnapshot; dark: boolean }) {
   const fg = dark ? "#ffe9c7" : INK;
-  const steady = dark ? "#241409" : "#fff9ec";
   const p = health.panes;
-  const errored = health.recent.error_rate > 0;
+  const skin = healthChipSkins(health, dark);
   return (
     <Card dark={dark}>
       <Head dark={dark}>Health — the kitchen at a glance</Head>
       <div data-testid="health-strip" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span data-testid="health-frozen" style={{ display: "inline-flex" }}>
-          <Chip bg={health.frozen ? "#e23a3a" : "#4db892"} color={health.frozen ? "#fff4de" : INK}>
-            {health.frozen ? "frozen — brake on" : "running free"}
-          </Chip>
+          <Chip bg={skin.frozen.bg} color={skin.frozen.color}>{skin.frozen.label}</Chip>
         </span>
         <span data-testid="health-panes" style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 700, color: fg }}>
-          <Chip bg={steady} color="#8a6a4f">{p.total} pane{p.total === 1 ? "" : "s"}</Chip>
-          <Chip bg={steady} color="#8a6a4f">{p.running} running</Chip>
-          <Chip bg={steady} color="#8a6a4f">{p.idle} idle</Chip>
-          <Chip bg={steady} color="#8a6a4f">{p.exited} exited</Chip>
+          <Chip bg={skin.steady} color="#8a6a4f">{p.total} pane{p.total === 1 ? "" : "s"}</Chip>
+          <Chip bg={skin.steady} color="#8a6a4f">{p.running} running</Chip>
+          <Chip bg={skin.steady} color="#8a6a4f">{p.idle} idle</Chip>
+          <Chip bg={skin.steady} color="#8a6a4f">{p.exited} exited</Chip>
         </span>
         <span data-testid="health-pending" style={{ display: "inline-flex" }}>
-          <Chip bg={health.pending_approvals > 0 ? "#ffc94a" : steady} color={health.pending_approvals > 0 ? INK : "#8a6a4f"}>
-            {health.pending_approvals} at the pass
-          </Chip>
+          <Chip bg={skin.pending.bg} color={skin.pending.color}>{health.pending_approvals} at the pass</Chip>
         </span>
         <span data-testid="health-error-rate" style={{ display: "inline-flex" }}>
-          <Chip bg={errored ? "#ff8a3d" : steady} color={errored ? INK : "#8a6a4f"}>
-            {fmtErrorRate(health.recent.error_rate)} errors
-          </Chip>
+          <Chip bg={skin.errors.bg} color={skin.errors.color}>{fmtErrorRate(health.recent.error_rate)} errors</Chip>
         </span>
       </div>
     </Card>

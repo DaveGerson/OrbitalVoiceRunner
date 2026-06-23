@@ -70,7 +70,13 @@ const {
   kindSkinFor,
   resolveLogLabel,
   resolvePid,
+  fmtErrorRate,
+  healthChipSkins,
 } = await import("../src/orbital/views/Pantry.js");
+
+// INK is the kitchen's ink-black constant (../theme) — imported here so the chip-skin assertions
+// pin the exact value the helper returns rather than re-hardcoding the hex.
+const { INK } = await import("../src/orbital/theme.js");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -311,5 +317,60 @@ describe("resolvePid", () => {
   it("selectedProject takes precedence over first-project fallback", () => {
     assert.strictEqual(resolvePid(null, "gamma", projects), "gamma");
     assert.notStrictEqual(resolvePid(null, "gamma", projects), "alpha");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. fmtErrorRate — the health-strip error-rate chip (bead apu)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("fmtErrorRate", () => {
+  it("renders a 0–1 fraction as a whole percent", () => {
+    assert.strictEqual(fmtErrorRate(0.07), "7%");
+    assert.strictEqual(fmtErrorRate(0), "0%");
+    assert.strictEqual(fmtErrorRate(1), "100%");
+    assert.strictEqual(fmtErrorRate(0.125), "13%"); // rounds to nearest
+  });
+  it("clamps out-of-range and coerces a non-finite/non-number to 0%", () => {
+    assert.strictEqual(fmtErrorRate(1.8), "100%");
+    assert.strictEqual(fmtErrorRate(-0.5), "0%");
+    assert.strictEqual(fmtErrorRate(NaN), "0%");
+    assert.strictEqual(fmtErrorRate(undefined as unknown as number), "0%");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. healthChipSkins — per-chip colour/label decisions (bead apu)
+// ─────────────────────────────────────────────────────────────────────────────
+function makeHealth(overrides: Record<string, unknown> = {}): any {
+  return {
+    frozen: false,
+    panes: { total: 0, running: 0, idle: 0, exited: 0 },
+    pending_approvals: 0,
+    recent: { total: 0, errors: 0, error_rate: 0 },
+    memory: { synthesizer: "fallback" },
+    ...overrides,
+  };
+}
+
+describe("healthChipSkins", () => {
+  it("frozen reads loud (red, light fg) with the brake-on label", () => {
+    const s = healthChipSkins(makeHealth({ frozen: true }), false);
+    assert.deepStrictEqual(s.frozen, { bg: "#e23a3a", color: "#fff4de", label: "frozen — brake on" });
+  });
+  it("not frozen reads steady-green with the running-free label", () => {
+    const s = healthChipSkins(makeHealth({ frozen: false }), false);
+    assert.deepStrictEqual(s.frozen, { bg: "#4db892", color: INK, label: "running free" });
+  });
+  it("pending approvals warm to amber when > 0, else steady", () => {
+    assert.strictEqual(healthChipSkins(makeHealth({ pending_approvals: 2 }), false).pending.bg, "#ffc94a");
+    assert.strictEqual(healthChipSkins(makeHealth({ pending_approvals: 0 }), false).pending.bg, "#fff9ec");
+  });
+  it("a non-zero error rate warms to orange, else steady", () => {
+    assert.strictEqual(healthChipSkins(makeHealth({ recent: { total: 1, errors: 1, error_rate: 0.5 } }), false).errors.bg, "#ff8a3d");
+    assert.strictEqual(healthChipSkins(makeHealth({ recent: { total: 1, errors: 0, error_rate: 0 } }), false).errors.bg, "#fff9ec");
+  });
+  it("steady colour follows the dark flag", () => {
+    assert.strictEqual(healthChipSkins(makeHealth(), false).steady, "#fff9ec");
+    assert.strictEqual(healthChipSkins(makeHealth(), true).steady, "#241409");
   });
 });
