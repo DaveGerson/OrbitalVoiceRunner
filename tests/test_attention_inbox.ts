@@ -27,7 +27,10 @@ import { register } from "node:module";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { attentionQueueFromFrame, dismissAttentionOutcome, attentionResolveTarget } from "../src/orbital/useOrbitalDataHelpers";
+import {
+  attentionQueueFromFrame, dismissAttentionOutcome, attentionResolveTarget,
+  isApprovalHere, pendingApprovalBadgeCount, buildAttentionApprovalItem, approvalToPromote,
+} from "../src/orbital/useOrbitalDataHelpers";
 import { dispatchWsMessage, type WsHandlerCtx } from "../src/appHelpers";
 import type { AttentionItem } from "../src/types";
 
@@ -177,6 +180,90 @@ describe("attentionResolveTarget", () => {
     assert.equal(attentionResolveTarget({ type: "exited", messageId: "m" }), null);
     assert.equal(attentionResolveTarget({ type: "idle", messageId: "m" }), null);
     assert.equal(attentionResolveTarget({}), null);
+  });
+});
+
+// ── bead 8xn: focus-routing helpers (modal vs inbox) ─────────────────────────
+// The held-approval router. isApprovalHere decides which surface a frame lands on; the rest carry
+// the inbox leg (badge count, item builder, promotion target) so the hook stays under the gate.
+
+describe("isApprovalHere — the focus router predicate", () => {
+  it("active station AND visible tab → true (the modal pops)", () => {
+    assert.equal(isApprovalHere({ terminalId: "t1" }, "t1", true), true);
+  });
+  it("a DIFFERENT pane is at the station → false (route to inbox)", () => {
+    assert.equal(isApprovalHere({ terminalId: "t1" }, "t2", true), false);
+  });
+  it("the right pane but the tab is HIDDEN → false (fail-closed to inbox)", () => {
+    assert.equal(isApprovalHere({ terminalId: "t1" }, "t1", false), false);
+  });
+  it("no active station (null) → false even when visible (never silently to the modal)", () => {
+    assert.equal(isApprovalHere({ terminalId: "t1" }, null, true), false);
+  });
+  it("a frame with no/empty terminalId → false (cannot route to a station we can't name)", () => {
+    assert.equal(isApprovalHere({}, "t1", true), false);
+    assert.equal(isApprovalHere({ terminalId: "" }, "", true), false); // empty matches nothing, never the modal
+  });
+});
+
+describe("pendingApprovalBadgeCount — the held-approval count", () => {
+  const mk = (over: Partial<AttentionItem>): AttentionItem => ({
+    id: "x", type: "approval", terminalId: "t1", projectId: "p1", message: "m", timestamp: "0", dismissed: false, ...over,
+  });
+  it("counts undismissed approval/confirmation items that carry a messageId", () => {
+    const q = [mk({ id: "a", messageId: "m1" }), mk({ id: "b", type: "confirmation", messageId: "m2" })];
+    assert.equal(pendingApprovalBadgeCount(q), 2);
+  });
+  it("excludes triage items (no messageId), dismissed items, and non-approval types", () => {
+    const q = [
+      mk({ id: "a", messageId: "m1" }),                         // counts
+      mk({ id: "b", messageId: "m2", dismissed: true }),        // dismissed → out
+      mk({ id: "c" }),                                          // approval, no messageId → triage, out
+      mk({ id: "d", type: "exited", messageId: "stray" }),     // non-approval type → out (defense in depth)
+      mk({ id: "e", type: "idle" }),                            // completion → out
+    ];
+    assert.equal(pendingApprovalBadgeCount(q), 1);
+  });
+  it("an empty queue → 0", () => {
+    assert.equal(pendingApprovalBadgeCount([]), 0);
+  });
+});
+
+describe("buildAttentionApprovalItem — the inbox leg of the router", () => {
+  it("maps an approval_pending frame into the AttentionItem shape (deterministic id, stamped messageId)", () => {
+    const item = buildAttentionApprovalItem({ messageId: "msg_9", terminalId: "claude_1", cmd: "rm -rf build" });
+    assert.equal(item.type, "approval");
+    assert.equal(item.messageId, "msg_9");
+    assert.equal(item.terminalId, "claude_1");
+    assert.equal(item.dismissed, false);
+    assert.equal(item.id, "approval:msg_9"); // deterministic → a duplicate broadcast de-dups against itself
+    assert.ok(item.message.includes("claude_1") && item.message.includes("rm -rf build"));
+  });
+  it("the item is genuinely actionable — attentionResolveTarget returns its messageId", () => {
+    const item = buildAttentionApprovalItem({ messageId: "msg_9", terminalId: "t1", cmd: "ls" });
+    assert.equal(attentionResolveTarget(item), "msg_9"); // a real Approve/Deny, not a fake one
+  });
+});
+
+describe("approvalToPromote — one-directional inbox → modal target", () => {
+  const mk = (over: Partial<AttentionItem>): AttentionItem => ({
+    id: "x", type: "approval", terminalId: "t1", projectId: "p1", message: "m", timestamp: "0", dismissed: false, ...over,
+  });
+  it("returns the inbox approval whose station is now active", () => {
+    const q = [mk({ id: "a", messageId: "m1", terminalId: "t1" }), mk({ id: "b", messageId: "m2", terminalId: "t2" })];
+    assert.equal(approvalToPromote(q, "t2")?.id, "b");
+  });
+  it("returns null when no inbox approval matches the active station", () => {
+    const q = [mk({ id: "a", messageId: "m1", terminalId: "t1" })];
+    assert.equal(approvalToPromote(q, "t3"), null);
+  });
+  it("ignores triage items (no messageId) and dismissed items even on the active station", () => {
+    const q = [mk({ id: "a", terminalId: "t1" }), mk({ id: "b", messageId: "m2", terminalId: "t1", dismissed: true })];
+    assert.equal(approvalToPromote(q, "t1"), null); // nothing genuinely held to promote
+  });
+  it("a null active station never promotes (focus ambiguity stays in the inbox)", () => {
+    const q = [mk({ id: "a", messageId: "m1", terminalId: "t1" })];
+    assert.equal(approvalToPromote(q, null), null);
   });
 });
 

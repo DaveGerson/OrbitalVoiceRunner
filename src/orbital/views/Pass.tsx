@@ -11,6 +11,7 @@ import type { Station, StationProject } from "../station";
 import type { StoredNote } from "../../store/types";
 import type { PaneLayout, Plan, AttentionItem } from "../../types";
 import type { TemplateView } from "../useOrbitalData";
+import { pendingApprovalBadgeCount } from "../useOrbitalDataHelpers";
 
 // Map the persisted NoteType onto the design's ticket kinds (the wire only ever stores "note"; the
 // kind chip is a read-time presentation of whatever type the note carries).
@@ -566,6 +567,10 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
   const empty = notes.length === 0 && plans.length === 0 && templates.length === 0 && layouts.length === 0;
   // The inbox count drives the tab badge; only undismissed items are "what needs me".
   const attnCount = attention.filter((i) => !i.dismissed).length;
+  // bead 8xn: of those, how many are HELD APPROVALS (a real Approve/Deny waiting on a messageId) —
+  // distinct from triage. This is the always-on "a pane is silently blocked" safeguard, styled apart
+  // from the generic attention total below.
+  const approvalCount = pendingApprovalBadgeCount(attention);
 
   // Inline render helpers — each owns its own CC budget so ThePass stays ≤10.
 
@@ -581,6 +586,14 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
       <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "0 16px 8px" }}>
         {tabBtn("tickets", "Tickets")}
         {tabBtn("attention", attentionTabLabel(attnCount))}
+        {/* bead 8xn: the held-approval badge — distinct styling (a 🛎 pill) so a silently-blocked pane
+            is always visible, separate from generic triage. Renders only when something is held. */}
+        {approvalCount > 0 && (
+          <span data-testid="pass-approval-badge" data-approval-count={approvalCount}
+            style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 9px", borderRadius: 999, border: "2px solid " + INK, background: "#ff8a3d", color: INK, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, flexShrink: 0 }}>
+            🛎 {approvalCount} need{approvalCount === 1 ? "s" : ""} approval
+          </span>
+        )}
       </div>
     );
   }

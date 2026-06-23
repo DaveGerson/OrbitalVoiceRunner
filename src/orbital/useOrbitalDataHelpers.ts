@@ -345,3 +345,65 @@ export function attentionResolveTarget(item: { type?: string; messageId?: unknow
   if (item.type !== "approval" && item.type !== "confirmation") return null;
   return typeof item.messageId === "string" && item.messageId.length > 0 ? item.messageId : null;
 }
+
+// ── bead 8xn: focus-routed approval delivery (modal vs inbox) ─────────────
+// A held `approval_pending` frame lives on EXACTLY ONE surface, chosen by focus (design
+// 2026-06-23-approval-routing-design.md §"The routing rule"). These pure helpers carry that
+// decision so the hook's frame handler + promotion effect stay flat under the complexity gate.
+
+/**
+ * The router predicate: TRUE iff the operator is demonstrably AT the station the approval is for —
+ * the frame's `terminalId` is the active station AND the tab is visible. Only then does the held
+ * approval pop the blocking modal; otherwise it routes to the attention inbox (the safe, non-
+ * interrupting side). FAIL-CLOSED to inbox: a null/absent active station, a mismatched pane, or a
+ * hidden tab all return false, so the modal only ever appears when we're certain you're there.
+ */
+export function isApprovalHere(frame: { terminalId?: unknown }, activeId: string | null, visible: boolean): boolean {
+  return visible && typeof frame.terminalId === "string" && frame.terminalId.length > 0 && frame.terminalId === activeId;
+}
+
+/**
+ * The always-on "something needs your OK" badge count: the number of UNDISMISSED attention items that
+ * carry a real held request (`attentionResolveTarget` non-null — an approval/confirmation with a
+ * messageId). Distinct from the generic triage count: a suggestion, a dead station, or an idle
+ * completion does NOT count here (nothing to approve). This is the no-timer model's safeguard — a
+ * silently-blocked pane is always visible by its number. Pure: list → count.
+ */
+export function pendingApprovalBadgeCount(queue: AttentionItem[]): number {
+  return queue.filter((i) => !i.dismissed && attentionResolveTarget(i) !== null).length;
+}
+
+/**
+ * Map an `approval_pending` frame into the inbox AttentionItem shape (the INBOX leg of the router).
+ * Stamps `type:"approval"` + the held `messageId` so the row renders a REAL Approve/Deny (e7h's
+ * id-gate), keyed by messageId for resolve-anywhere-clears-everywhere. The id is DETERMINISTIC
+ * (`approval:<messageId>`) so a duplicate broadcast de-dups against itself and the promotion move
+ * stays idempotent. `message` reuses the same cmd text the modal chip shows. Pure: frame → item.
+ */
+export function buildAttentionApprovalItem(msg: Record<string, unknown>): AttentionItem {
+  const messageId = String(msg.messageId ?? "");
+  const terminalId = String(msg.terminalId ?? "");
+  const cmd = typeof msg.cmd === "string" ? msg.cmd : "";
+  return {
+    id: `approval:${messageId}`,
+    type: "approval",
+    terminalId,
+    projectId: typeof msg.projectId === "string" ? msg.projectId : "",
+    message: `${terminalId} needs your ok: ${cmd}`,
+    timestamp: String(Date.now()),
+    dismissed: false,
+    messageId,
+  };
+}
+
+/**
+ * The promotion target: when the active station changes (or the tab regains focus on it), which inbox
+ * item should pop up as the modal? The FIRST undismissed approval/confirmation item (carrying a real
+ * messageId) whose `terminalId` is now the active station, or null when none matches. ONE-DIRECTIONAL
+ * by design — this only ever moves inbox → modal; nothing here moves modal → inbox. Pure so the
+ * effect that runs the actual remove-from-queue + add-to-pendingCommands stays a flat call.
+ */
+export function approvalToPromote(queue: AttentionItem[], activeId: string | null): AttentionItem | null {
+  if (!activeId) return null;
+  return queue.find((i) => !i.dismissed && i.terminalId === activeId && attentionResolveTarget(i) !== null) ?? null;
+}

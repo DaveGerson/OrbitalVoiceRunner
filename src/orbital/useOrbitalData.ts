@@ -31,6 +31,7 @@ import {
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
   dismissAttentionOutcome, attentionResolveTarget, handoffsFromFrame, normalizeHandoffRows, handoffPromptFromReadResponse,
+  isApprovalHere, buildAttentionApprovalItem, approvalToPromote,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -365,6 +366,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // 3C.2: render-fresh mirror so the mock fetchPaneBackfill can read synchronously.
   const terminalsRef = useRef<Terminal[]>([]);
   terminalsRef.current = terminals;
+  // bead 8xn: render-fresh mirror of the inbox so the promotion effect (keyed on activeTerminalId +
+  // a visibilitychange listener) reads the LATEST queue WITHOUT re-subscribing on every queue
+  // mutation — same render-fresh-ref idiom as activeTerminalIdRef / terminalsRef.
+  const attentionQueueRef = useRef<AttentionItem[]>([]);
+  attentionQueueRef.current = attentionQueue;
   // Hands-free earcons are gated behind the "Voice cues" tweak; the ref lets the long-lived WS closure
   // read the latest value. Default on (the brief forbids silent state changes for an eyes-off chef).
   const voiceCuesRef = useRef<boolean>(true);
@@ -715,12 +721,24 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       switch_active_pane: () => { if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId); },
       frozen: () => { earcon("alert"); refetchFrozen(); refetchTerminals(); }, // the All Hands brake — never silent
       stop_all: () => { refetchFrozen(); refetchTerminals(); },
-      // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload (immediate)
-      // so the ApprovalDialog renders at once.
+      // A staged PTY write awaiting HiTL approval. bead 8xn: focus-route it. When the operator is AT
+      // the station (its pane is active AND the tab is visible) it pops the blocking ApprovalDialog
+      // modal (the existing pendingCommands path); otherwise it lands in the attention inbox keyed by
+      // messageId (e7h's id-gate makes the in-inbox Approve/Deny REAL). Either way the bell rings + a
+      // background-tab desktop note fires — a pane needs you on both surfaces. The promotion effect
+      // (below) moves an inbox item to the modal one-directionally when its station regains focus.
       approval_pending: () => {
         playFrameEarcon(); // the bell: a pane needs you (eyes-off) — "alert"
         desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
-        setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
+        const here = isApprovalHere(msg, activeTerminalIdRef.current, document.visibilityState === "visible");
+        if (here) {
+          setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
+        } else if (typeof msg.messageId === "string" && msg.messageId) {
+          // Fail-closed to the inbox: no active station / wrong pane / hidden tab → a quiet, badged
+          // row. Guard on a real messageId so a malformed frame never seeds a fake-approve row.
+          const item = buildAttentionApprovalItem(msg);
+          setAttentionQueue((prev) => prev.some((a) => a.id === item.id || (a.messageId && a.messageId === item.messageId)) ? prev : [...prev, item]);
+        }
       },
       approval_resolved: () => {
         if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
@@ -842,6 +860,28 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     }, POLL_MS);
     return () => clearInterval(iv);
   }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans, refetchAttention]);
+
+  // bead 8xn: PROMOTE an inbox-routed approval to the modal when its station regains the operator's
+  // attention — either the active station changes TO it, or the tab regains focus while it's active.
+  // One-directional (inbox → modal only; never modal → inbox on blur). The move is keyed by messageId
+  // and dedups against pendingCommands, so a concurrent voice/REST resolve can't resurrect it.
+  const promoteApprovalForActive = useCallback(() => {
+    if (document.visibilityState !== "visible") return; // only promote when the operator can see it
+    const item = approvalToPromote(attentionQueueRef.current, activeTerminalIdRef.current);
+    if (!item) return;
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id));         // leave the inbox
+    setPendingCommands((prev) => prev.some((c) => c.messageId === item.messageId)
+      ? prev
+      : [...prev, buildPendingCommand({ messageId: item.messageId, cmd: item.message, terminalId: item.terminalId })]); // pop the modal
+  }, []);
+
+  // Fires on every active-station change (the dep) AND on a tab visibilitychange (the listener).
+  useEffect(() => {
+    promoteApprovalForActive();
+    const onVis = () => promoteApprovalForActive();
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [activeTerminalId, promoteApprovalForActive]);
 
   // Tear down all per-session voice audio (mic capture chain + both AudioContexts). Idempotent.
   const teardownAudio = useCallback(() => {

@@ -222,5 +222,27 @@ export async function injectAttention(
   }, items);
 }
 
+/**
+ * bead 8xn: drive an `approval_pending` frame through the REAL observe-lane switch (injectWsFrame →
+ * handleObserveFrame → the isApprovalHere router), NOT injectPendingApproval (which seeds
+ * pendingCommands DIRECTLY, bypassing the focus-routing branch). This is the ONLY way to exercise the
+ * modal-vs-inbox decision: a frame for the ACTIVE pane (+ visible tab) pops the modal; a frame for a
+ * BACKGROUND pane lands in the attention inbox keyed by messageId.
+ */
+export async function injectApprovalPendingFrame(
+  page: Page,
+  cmd: string,
+  terminalId: string,
+  messageId: string,
+): Promise<void> {
+  await page.evaluate(
+    ([c, t, m]) => window.__ORBITAL_E2E__?.injectWsFrame({
+      type: "approval_pending", cmd: c, terminalId: t, messageId: m,
+      rationale: { trigger: "e2e injected", summary: "Mocked approval_pending for focus-routing e2e." },
+    }),
+    [cmd, terminalId, messageId] as const,
+  );
+}
+
 export const test = base;
 export { expect };

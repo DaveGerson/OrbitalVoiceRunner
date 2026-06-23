@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { armE2EWire } from "./fixtures";
+import { armE2EWire, injectApprovalPendingFrame, switchActivePane, MOCK_TERMINAL_ID, MOCK_TERMINAL_ID_2 } from "./fixtures";
 
 // Wave P5a — HiTL gating in the kitchen. The reused ApprovalDialog (staged PTY write) and
 // ActionConfirmDialog (gated non-PTY action) render from the live pendingCommands/pendingActions,
@@ -114,5 +114,68 @@ test.describe("Orbital Kitchen — approvals (HiTL)", () => {
     await expect(page.getByTestId("approval-dialog")).toContainText("first staged write");
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("approval-dialog")).toHaveCount(0);
+  });
+});
+
+// bead 8xn — FOCUS-ROUTED approval delivery. A held approval lands on EXACTLY ONE surface, chosen by
+// focus: the operator's ACTIVE station (+ a visible tab) pops the blocking ApprovalDialog modal; any
+// OTHER station routes the held approval into the attention inbox keyed by messageId (a real
+// Approve/Deny via e7h's id-gate, NOT a fake one). On return to that station the inbox row promotes
+// one-directionally to the modal, and a held-approval badge keeps a silently-blocked pane visible.
+//
+// CRITICAL: these drive `approval_pending` through injectApprovalPendingFrame (→ injectWsFrame →
+// handleObserveFrame → the isApprovalHere router), NOT injectPendingApproval — the latter seeds
+// pendingCommands directly and would bypass the routing under test. mock_pane_1 is the default active
+// station; mock_pane_2 is seeded as a background station.
+test.describe("Orbital Kitchen — focus-routed approvals (bead 8xn)", () => {
+  test("an approval for the ACTIVE station pops the modal (not the inbox)", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "rm -rf build", MOCK_TERMINAL_ID, "msg_active_1");
+    await expect(page.getByTestId("approval-dialog")).toBeVisible();
+    await expect(page.getByTestId("approval-dialog")).toContainText("rm -rf build");
+    // It must NOT also seed an inbox row — exactly one surface.
+    await expect(page.getByTestId("attn-row")).toHaveCount(0);
+  });
+
+  test("an approval for a BACKGROUND station routes to the inbox with a working Approve (no modal)", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "npm run deploy", MOCK_TERMINAL_ID_2, "msg_bg_1");
+    // No modal — the operator isn't at that station.
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0);
+    // A held-approval badge surfaces the silently-blocked pane.
+    await expect(page.getByTestId("pass-approval-badge")).toHaveAttribute("data-approval-count", "1");
+    // The inbox row is a REAL Approve/Deny (id-gated), and resolving in-inbox clears it without a modal.
+    await page.getByTestId("pass-tab-attention").click();
+    const row = page.getByTestId("attn-row");
+    await expect(row).toHaveAttribute("data-attn-act", "approve");
+    await page.getByTestId("attn-approve").click();
+    await expect(page.getByTestId("toast")).toContainText("Order up"); // the SAME resolver voice/modal use
+    await expect(page.getByTestId("attn-row")).toHaveCount(0);
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0); // never popped a modal
+  });
+
+  test("navigating TO the background station promotes its inbox approval to the modal", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "drop table users", MOCK_TERMINAL_ID_2, "msg_promote_1");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0); // inbox, not modal
+    await page.getByTestId("pass-tab-attention").click();
+    await expect(page.getByTestId("attn-row")).toHaveCount(1);
+    // Walk to that station → the held approval promotes one-directionally to the blocking modal.
+    await switchActivePane(page, MOCK_TERMINAL_ID_2);
+    await expect(page.getByTestId("approval-dialog")).toBeVisible();
+    await expect(page.getByTestId("approval-dialog")).toContainText("drop table users");
+    // and it has LEFT the inbox (no double-surfacing).
+    await expect(page.getByTestId("attn-row")).toHaveCount(0);
+  });
+
+  test("the held-approval badge reflects the count and updates on resolve", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "deploy one", MOCK_TERMINAL_ID_2, "msg_badge_1");
+    await injectApprovalPendingFrame(page, "deploy two", MOCK_TERMINAL_ID_2, "msg_badge_2");
+    await expect(page.getByTestId("pass-approval-badge")).toHaveAttribute("data-approval-count", "2");
+    // Resolve one in the inbox → the badge drops to 1.
+    await page.getByTestId("pass-tab-attention").click();
+    await page.getByTestId("attn-approve").first().click();
+    await expect(page.getByTestId("pass-approval-badge")).toHaveAttribute("data-approval-count", "1");
   });
 });
