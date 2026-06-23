@@ -263,10 +263,11 @@ export const reviseHandoff: ActionDef<typeof ReviseHandoffParams> = {
   capability: "compose_draft",
   readOnly: false,
   // cv2 (D5): voice+rest. The REST twin is the "Revise" handoff-drawer button. Pure ledger op
-  // (updateHandoffCargo) — safe on session:null. Registry-canonical path: PUT /api/handoffs/:handoff_id
-  // (the update verb on a single handoff, sibling of GET /api/handoffs/:handoff_id = read_handoff).
+  // (updateHandoffCargo) — safe on session:null. Registry-canonical path: POST /api/handoffs/:handoff_id/revise
+  // — the POST /api/<resource>/:id/<verb> family the sibling state-transition twins use (stage/reject),
+  // so revise reads as a verb on the single-handoff resource, NOT a REST PUT-replace of the row.
   surfaces: new Set(["voice", "rest"]),
-  rest: { method: "put", path: "/api/handoffs/:handoff_id" },
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/revise" },
   // The drawer PUTs a camelCase body { newDraftText }; the voice key is snake_case. Alias camel->snake
   // only when the snake key is absent (a voice call carrying snake_case is never clobbered).
   coerceArgs: (raw) => {
@@ -568,7 +569,8 @@ export const rejectHandoff: ActionDef<typeof RejectHandoffParams> = {
 //   store null / not found / not-staged / deliver-time secret block -> { output: <string> } (kind:"ok")
 //   deliver_now (Full Auto) -> { output: "Delivered handoff <id> to pane <p>." } (row -> delivered)
 //   await_approval (HiTL)   -> { status:"pending_approval", messageId, pane_id, prompt } (kind:"pending")
-//   block (Read-Only/Off)   -> { output: outcome.text } (row -> blocked_read_only)
+//   block (Read-Only/Off)   -> kind:"blocked" reason:outcome.text (row -> blocked_read_only); VOICE wire
+//                              is byte-identical { output: outcome.text }; REST status-via-kinds -> 403.
 //   noop (error|clarify)    -> { output: outcome.text } (no row change)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -583,7 +585,17 @@ export const deliverHandoff: ActionDef<typeof DeliverHandoffParams> = {
   params: DeliverHandoffParams,
   capability: ALWAYS_ALLOWED, // gate is delegated to dispatchProposal — do NOT double-gate in runAction.
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Deliver" handoff-drawer button. UNLIKE the four pure-
+  // ledger composers, deliver WRITES to a live pane — but it routes through ctx.dispatchProposal, which on
+  // REST is restDispatchProposal (server.ts ~1637), the SAME gated seam execute_plan rides over
+  // POST /api/plans/:id/execute. So the REST path enforces capabilityGates.deliver_handoff at PARITY with
+  // voice (Auto->write / Ask->HiTL pending / Off->block). Status-via-kinds maps the DispatchOutcome to HTTP:
+  // the handler returns kind:"pending" (HiTL -> 202), kind:"blocked" (gate Off/read-only -> 403), or
+  // kind:"ok" (delivered/secret-block/not-staged narration -> 200). No rest.toHttp needed — the default
+  // resultToHttp kind->status map IS the contract. Registry-canonical path: POST .../:handoff_id/deliver
+  // (the POST /api/<resource>/:id/<verb> family, sibling of /stage and /reject).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/deliver" },
   handler: (args, ctx): ActionResult => {
     const { handoff_id } = args;
     const store = ctx.store;
@@ -654,7 +666,10 @@ function applyDeliverOutcome(
   if (effect.kind === "block") {
     store.updateHandoffState(handoff_id, effect.state);
     ctx.broadcast({ type: "handoffs_updated" });
-    return { kind: "ok", output: outcomeText };
+    // status-via-kinds: a gate Off / read-only block returns kind:"blocked" so the REST twin maps to
+    // 403 (resultToHttp). VOICE WIRE IS BYTE-IDENTICAL: voiceResponse maps kind:"blocked" to
+    // { output: result.reason } — the SAME { output: <outcomeText> } shape the legacy kind:"ok" emitted.
+    return { kind: "blocked", reason: outcomeText };
   }
   // effect.kind === "noop" (error | clarify): no row change.
   return { kind: "ok", output: outcomeText };

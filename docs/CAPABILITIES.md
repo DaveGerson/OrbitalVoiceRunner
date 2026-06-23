@@ -25,7 +25,7 @@ These bypass the capability gate entirely — they work even while the system is
 | `create_pane_note` | rest | no | Operator-UI |
 | `create_project_note` | rest | no | Operator-UI |
 | `delete_archived_pane` | rest | no | Permanently delete an archived pane record from the restore tray (operator-UI, ungated) |
-| `deliver_handoff` | voice | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
+| `deliver_handoff` | voice / rest | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 | `edit_note` | rest | no | Operator-UI |
 | `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
 | `get_ledger` | rest | no | Read the full workspaces ledger (project/pane tree the UI loads on page open) |

@@ -19,12 +19,14 @@
  * list_handoffs -> GET /api/handoffs, read_handoff -> GET /api/handoffs/:handoff_id). They are now
  * voice+rest and were REMOVED from the allow-list below (multi-surface tools are never allow-listed).
  *
- * cv2 CONVERGENCE (operator decision D5): the four handoff WRITE composers gained a REST twin at the
- * registry-canonical /api/handoffs paths (propose_handoff -> POST /api/handoffs, revise_handoff -> PUT
- * /api/handoffs/:handoff_id, stage_handoff -> POST .../stage, reject_handoff -> POST .../reject). These
- * are PURE LEDGER ops (no pane write), so they are safe on the session:null REST path — the contract the
- * handoff-drawer buttons consume. They are now voice+rest and were REMOVED from the allow-list. The ONE
- * handoff op that stays voice-only is deliver_handoff (it WRITES to a live pane, gated via dispatchProposal).
+ * cv2 CONVERGENCE (operator decision D5): the FIVE handoff WRITE tools gained a REST twin under the
+ * canonical POST /api/<resource>/:id/<verb> family (propose_handoff -> POST /api/handoffs, revise_handoff
+ * -> POST /api/handoffs/:handoff_id/revise, stage_handoff -> POST .../stage, reject_handoff -> POST
+ * .../reject, deliver_handoff -> POST .../deliver). The first four are PURE LEDGER ops (no pane write),
+ * safe on the session:null REST path. deliver_handoff WRITES to a live pane but routes through
+ * ctx.dispatchProposal (restDispatchProposal on REST — the SAME gated seam execute_plan rides), so its
+ * twin enforces capabilityGates.deliver_handoff at PARITY with voice via status-via-kinds (Auto->200 /
+ * Ask->202 / Off->403). All five are now voice+rest and were REMOVED from the allow-list.
  *
  * 7ep / PERMANENT voice-only reads: get_pane_delta, list_pending_approvals, get_attention_digest stay
  * voice-only BY DESIGN, NOT as convergence residue. get_pane_delta MUTATES a per-pane read cursor (it is
@@ -64,10 +66,11 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
 
   // ── Convergence-track residue: voice-only pane-WRITE choke-points (REST/WS twin is a future item) ─
   propose_command: new Set<Surface>(["voice"]), // dispatchProposal pane-WRITE HiTL path; voice-only today
-  // deliver_handoff stays voice-only AFTER cv2: it is the ONE handoff op that WRITES to a live pane
-  // (gated via dispatchProposal), NOT a pure ledger op like the cv2-converged compose/revise/stage/reject
-  // — so its REST/WS twin remains a distinct future item (HiTL pane-write surface), not part of cv2.
-  deliver_handoff: new Set<Surface>(["voice"]), // staged-handoff delivery (gated via dispatchProposal); voice-only today
+  // cv2 (D5) CONVERGED deliver_handoff too: it WRITES to a live pane, but it routes through
+  // ctx.dispatchProposal (restDispatchProposal on REST — the SAME gated seam execute_plan rides), so its
+  // POST /api/handoffs/:handoff_id/deliver twin enforces capabilityGates.deliver_handoff at PARITY with
+  // voice (Auto->write 200 / Ask->HiTL pending 202 / Off->block 403). It is now voice+rest and MUST NOT be
+  // allow-listed here (isMultiSurface skips it).
 
   // ── PERMANENT voice-only READS (7ep — NOT convergence residue; no REST twin will ever exist) ─────
   // cv1 CONVERGED the six session-INDEPENDENT reads to REST (get_pane_summary, get_pane_command_history,
@@ -95,12 +98,11 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // ── Convergence-track residue: voice-only draft/focus composers (REST/WS twin is a future item) ──
   switch_active_pane: new Set<Surface>(["voice"]),
   update_draft_prompt: new Set<Surface>(["voice"]),
-  // cv2 (D5) CONVERGED the four handoff WRITE composers — propose_handoff (POST /api/handoffs),
-  // revise_handoff (PUT /api/handoffs/:handoff_id), stage_handoff (POST .../stage), reject_handoff
-  // (POST .../reject). They are now voice+rest (the handoff-drawer button contract), so they are
-  // multi-surface and MUST NOT be allow-listed here (isMultiSurface skips them). deliver_handoff stays
-  // voice-only below — it is the ONE handoff op that WRITES to a live pane (gated via dispatchProposal),
-  // not a pure ledger op, so its REST/WS twin is a separate future item.
+  // cv2 (D5) CONVERGED the FIVE handoff WRITE tools — propose_handoff (POST /api/handoffs),
+  // revise_handoff (POST .../:handoff_id/revise), stage_handoff (POST .../stage), reject_handoff
+  // (POST .../reject), deliver_handoff (POST .../deliver). They are now voice+rest (the handoff-drawer
+  // button contract), so they are multi-surface and MUST NOT be allow-listed here (isMultiSurface skips
+  // them). deliver routes through ctx.dispatchProposal (the gated seam), enforcing the gate on REST too.
 
   // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
   set_global_permissions: new Set<Surface>(["voice"]),
