@@ -73,6 +73,42 @@ async function boot(page: Page) {
   await expect(page.getByTestId("kitchen-status")).toContainText("Kitchen open", { timeout: 30_000 });
 }
 
+// CROSS-SPEC HYGIENE: each test below mutates the GLOBAL create_pane gate (Off/Ask/Auto). If a test
+// body throws mid-flight (before its inline restore/stop runs), the shared live server would be left
+// with the gate stuck and orphan panes alive — corrupting the alphabetically-later live_* specs,
+// which all assume create_pane defaults to Ask on this single shared server. This afterEach is the
+// unconditional safety net: it runs on PASS *and* on FAILURE/RETRY. It drives `page.request` (the
+// browser context's APIRequestContext, which carries the auto-seeded auth cookie — the worker-scoped
+// `request` fixture is NOT keyed and every /api call 401s), and Playwright keeps the page alive
+// through afterEach, so the board + gate are reliably reset before the next spec runs.
+test.afterEach(async ({ page }) => {
+  const req = page.request;
+  // (a) restore the global create_pane gate to its default (Ask) for the next spec. Best-effort:
+  //     if the body died before the page rendered (no auth cookie) this throws — swallow it so a
+  //     body failure isn't masked by a cleanup failure; the next spec's own boot reseeds defaults.
+  try {
+    await setCreatePaneGate(req, "Ask");
+  } catch {
+    // page never rendered / server unreachable — leave the body's real failure to surface
+  }
+  // (b) best-effort 86 any pane this file spawned this run (ids: cp-*-${RUN}); already-stopped
+  //     panes (the inline cleanup beat us to it) just no-op, so swallow every stop error.
+  let ids: string[] = [];
+  try {
+    ids = await paneIds(req);
+  } catch {
+    return; // server unreachable — nothing we can clean up
+  }
+  for (const id of ids) {
+    if (!id.startsWith("cp-") || !id.endsWith(`-${RUN}`)) continue;
+    try {
+      await req.post(`/api/projects/${PROJECT_ID}/panes/${id}/stop`);
+    } catch {
+      // already gone / racing inline cleanup — ignore
+    }
+  }
+});
+
 test("create-pane gated Off → 403 and NO phantom pane; gated Auto → 200 and EXACTLY one pane", async ({ page }) => {
   await boot(page);
   const req = page.request;
