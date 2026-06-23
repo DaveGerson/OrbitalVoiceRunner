@@ -23,7 +23,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync, copyFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, platform } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +31,39 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const WT_LOCK = path.join(repoRoot, "scripts", "wt-lock.mjs");
 const PRE_COMMIT = path.join(repoRoot, ".githooks", "pre-commit");
 const BRANCH = "feat/gn4-e2e";
+
+/**
+ * Resolve an ABSOLUTE path to a POSIX shell for running the `#!/bin/sh` pre-commit hook.
+ *
+ * WHY: the hook is a shell script, so it can only run under a POSIX shell. Spawning the bare
+ * binary `sh` fails with ENOENT when this suite runs from a Windows PowerShell-derived env, where
+ * `sh`/`bash` are NOT on PATH — that ENOENT used to false-red the whole unit gate. We instead
+ * resolve the shell explicitly (prefer $SHELL, else probe `sh`/`bash` via `which`/`where`) and, if
+ * none can be found, return null so the hook-dependent tests can `test.skip()` with a clear message
+ * instead of hard-failing.
+ */
+function resolveShell(): string | null {
+  const fromEnv = process.env.SHELL;
+  if (fromEnv && existsSync(fromEnv)) return fromEnv;
+  const probe = platform() === "win32" ? "where" : "which";
+  for (const candidate of ["sh", "bash"]) {
+    const res = spawnSync(probe, [candidate], { encoding: "utf8" });
+    if (res.error || res.status !== 0) continue;
+    const first = (res.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+    if (first && existsSync(first)) return first;
+  }
+  return null;
+}
+
+const SH = resolveShell();
+
+// The two HOOK tests need a POSIX shell to execute the `#!/bin/sh` launcher. When none can be
+// resolved (e.g. a bare Windows env with no Git Bash on PATH), skip them with a clear reason
+// rather than hard-failing the gate. The runLock tests use `node` (always present) and run always.
+const hookTest = SH
+  ? test
+  : (name: string, fn?: (...a: unknown[]) => unknown) =>
+      test.skip(`${name} [no POSIX shell resolved — set $SHELL or put sh/bash on PATH]`, fn as never);
 
 // One shared scratch fixture: a main repo + a linked worktree on `feat/gn4-e2e`. The worktree
 // is where we run the lock as "self"; foreign locks are seeded directly into the shared store.
@@ -44,23 +77,28 @@ function git(args: string[], cwd: string): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-/** Run wt-lock.mjs from `cwd` with extra env; capture exit code + stdout + stderr (never throws). */
+/** Run wt-lock.mjs from `cwd` with extra env; capture exit code + stdout + stderr. */
 function runLock(args: string[], cwd: string, env: Record<string, string> = {}) {
   const res = spawnSync("node", [WT_LOCK, ...args], {
     cwd,
     encoding: "utf8",
     env: { ...process.env, ...env },
   });
+  // FAIL FAST: a spawn error (e.g. ENOENT) must surface loudly, never masquerade as exit 0
+  // (res.status is null on a spawn failure, and `?? 0` would silently green a broken run).
+  if (res.error) throw res.error;
   return { code: res.status ?? 0, out: res.stdout ?? "", err: res.stderr ?? "" };
 }
 
-/** Run the committed pre-commit hook via /bin/sh from `cwd`; capture exit code + streams. */
+/** Run the committed pre-commit hook via the resolved POSIX shell from `cwd`; capture exit + streams. */
 function runHook(cwd: string, env: Record<string, string> = {}) {
-  const res = spawnSync("sh", [PRE_COMMIT], {
+  const res = spawnSync(SH as string, [PRE_COMMIT], {
     cwd,
     encoding: "utf8",
     env: { ...process.env, ...env },
   });
+  // FAIL FAST: surface a spawn error rather than letting `res.status ?? 0` report a phantom exit 0.
+  if (res.error) throw res.error;
   return { code: res.status ?? 0, out: res.stdout ?? "", err: res.stderr ?? "" };
 }
 
@@ -157,7 +195,7 @@ test("strict mode: a foreign live lock BLOCKS the commit (exit 1)", () => {
   assert.match(r.err, /--force/); // tells the operator how to clear a dead lock
 });
 
-test("strict mode: the pre-commit HOOK propagates the block (exit 1)", () => {
+hookTest("strict mode: the pre-commit HOOK propagates the block (exit 1)", () => {
   clearLock();
   seedForeignLock(Date.now());
   const r = runHook(worktree, { JANUS_WT_LOCK: "strict" });
@@ -208,7 +246,7 @@ test("fail-open: a CORRUPT lock file never blocks (check exits 0, acquires)", ()
   assert.equal(rec.branch, BRANCH);
 });
 
-test("fail-open: the hook exits 0 when run outside any git repo", () => {
+hookTest("fail-open: the hook exits 0 when run outside any git repo", () => {
   const nonRepo = path.join(scratch, "not-a-repo");
   mkdirSync(nonRepo, { recursive: true });
   const r = runHook(nonRepo, { JANUS_WT_LOCK: "strict" });
