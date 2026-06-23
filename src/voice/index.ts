@@ -1158,7 +1158,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
           // Dispatch every functionCall in a toolCall message through runToolCall (mints/stamps the turn id
           // and clears the barge-in latch per call, as the inline loop did).
-          const handleToolCalls = async (message: any, session: any): Promise<void> => {
+          const handleToolCalls = async (message: LiveServerMessage, session: any): Promise<void> => {
             if (!message.toolCall) return;
             for (const call of message.toolCall.functionCalls || []) {
               const ixnId = turnId();
@@ -1207,13 +1207,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // the WS-close teardown (see clientWs.on("close")): DETACH (keep survivors for re-announce),
         // null coreState.activeLiveSession behind the identity guard so a stale callback can't clobber a newer
         // session, and broadcast a NEW voice_channel_lost frame. NO reconnect logic (that is PLM4).
-        onerror: (err: any) => {
+        onerror: (err: ErrorEvent) => {
           // Log only the message, NOT the raw error/socket — the live WebSocket's URL carries the API
           // key (?key=…), so dumping the object leaks the key into logs (security hazard).
           console.error("[VOICE] Gemini Live session error — voice channel lost:", err instanceof Error ? err.message : String(err?.message ?? "error"));
           handleSessionLost("error");
         },
-        onclose: (info: any) => {
+        onclose: (info: CloseEvent) => {
           // Log only code/reason, NOT the raw CloseEvent — its kTarget is the live WebSocket whose URL
           // contains the API key (?key=…). Dumping the object leaks the key into logs (security hazard).
           console.warn(`[VOICE] Gemini Live session closed — voice channel lost (code=${info?.code ?? "n/a"}, reason=${info?.reason || "n/a"}).`);

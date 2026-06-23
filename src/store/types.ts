@@ -73,3 +73,64 @@ export interface StoredHandoff {
   terminal_at: number | null;
   expires_at: number | null;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Raw SQLite ROW shapes (bead dbt-typing). better-sqlite3 returns the on-disk
+// representation verbatim: an `INTEGER` boolean column comes back as 0|1 (NOT
+// a JS boolean) and a JSON-encoded `TEXT` column comes back as the raw string.
+// These row interfaces type the `.all()/.get()` reads so the hydrators below
+// (hydratePane / hydrateHandoff and their peers in sqliteStore.ts) replace the
+// blanket `as any` casts with a precise Row -> Stored mapping. They mirror the
+// CREATE TABLE definitions in src/store/schema.ts column-for-column.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** A SQLite-stored boolean: 0 (false) or 1 (true). Hydrators coerce to a real boolean. */
+export type SqlBool = 0 | 1;
+
+/** Raw `panes` row (booleans as 0|1; draft/context/gates are JSON TEXT or null). */
+export interface PaneRow {
+  pane_id: string; workspace_id: string; name: string; runtime_type: string;
+  tool_preset: string; permissions_mode: string; session_id: string;
+  last_known_state: string; is_busy: SqlBool; alive: SqlBool; context_size: number;
+  last_status_change_at: string | null; last_command: string | null;
+  scrollback_path: string | null; created_at: number; updated_at: number;
+  capability_gates?: string | null;
+  draft?: string | null; model_context?: string | null; human_context?: string | null;
+}
+/** Raw `panes_archive` row — a PaneRow plus the archive twins. */
+export interface ArchivedPaneRow extends PaneRow {
+  archived_at: number; archive_reason: string | null;
+}
+/** Raw `projects` row (key_terms is a JSON TEXT array). */
+export interface ProjectRow {
+  id: string; name: string; directory: string; summary: string;
+  key_terms: string; created_at: number; updated_at: number;
+}
+/** Raw `notes` row (1:1 with StoredNote; no coercion needed). */
+export type NoteRow = StoredNote;
+/** Raw `pending_approvals` row (claimed as 0|1). */
+export interface PendingApprovalRow {
+  id: string; session_id: string; workspace_id: string; pane_id: string;
+  command: string; kind: string; rationale: string | null;
+  claimed: SqlBool; timestamp: number; expires_at: number;
+}
+/** Raw `pending_actions` row (claimed as 0|1). */
+export interface PendingActionRow {
+  id: string; capability: string; summary: string; params: string;
+  claimed: SqlBool; timestamp: number; expires_at: number;
+}
+/** Raw `attention` row (dismissed as 0|1; details is JSON TEXT or null). */
+export interface AttentionRow {
+  id: string; type: string; terminal_id: string; project_id: string;
+  message: string; timestamp: number; dismissed: SqlBool; details: string | null;
+}
+/** Raw `handoffs` row. Booleans are absent (none in the table); timestamps may be null. */
+export type HandoffRow = StoredHandoff;
+/** A single-column `value` read (settings_kv / kv). */
+export interface ValueRow { value: string }
+/** A `SELECT COUNT(*) AS n` scalar read. */
+export interface CountRow { n: number }
+/** A bare project-id projection (`SELECT id FROM projects`). */
+export interface IdRow { id: string }
+/** An FTS search hit (`id`, `snippet`, `rank`) — id may arrive as a number from the rowid join. */
+export interface SearchHitRow { id: string | number; snippet: string; rank: number }
