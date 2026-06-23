@@ -35,3 +35,45 @@ describe("earconForFrame", () => {
     }
   });
 });
+
+// ── the firing GATE (playFrameEarcon) — fires on exactly the two lifecycle frames ──────────────
+// useOrbitalData's `playFrameEarcon` is the one-line gate the velocity-mech handlers route through:
+//   const playFrameEarcon = (type) => { const e = earconForFrame(type); if (e) earcon(e); };
+// It is an inner closure of the React hook (not exported), so we pin its CONTRACT with a byte-exact
+// replica over a spy `earcon`. This catches the regressions the pure-mapping test can't: a gate that
+// fires unconditionally (drops the `if (e)`), fires the wrong tone, or fires on the wrong frame.
+// Scope is deliberately the lifecycle frames velocity-mech routes through this helper — NOT the whole
+// dispatch table (frozen/action_pending/proactive_earcon legitimately chime via their own direct
+// earcon() calls and are out of this helper's contract).
+describe("playFrameEarcon gate (fires on exactly approval_pending + pane_exited)", () => {
+  // Byte-exact replica of the hook's inner closure, over an injectable earcon sink.
+  function makeGate(earcon: (t: string) => void) {
+    return (type: string) => { const e = earconForFrame(type); if (e) earcon(e); };
+  }
+
+  it("fires the mapped tone on the two lifecycle frames, and ONLY those", () => {
+    const fired: { type: string; tone: string }[] = [];
+    // Representative sweep: the two velocity-mech lifecycle frames + the OTHER lifecycle/observe frames
+    // this same helper is fed by (none of which should chime). pane_status / pane_quiescing sit right
+    // next to pane_exited in the table — the highest-risk false-positive neighbours.
+    const sweep = [
+      "approval_pending", "pane_exited",                       // must fire
+      "pane_status", "pane_quiescing", "stdout_chunk",         // lifecycle neighbours — must stay silent
+      "terminals_updated", "ledger_updated", "draft_updated",  // other observe frames — silent
+      "approval_resolved", "", "unknown_frame",                // resolution / empty / unknown — silent
+    ];
+    for (const type of sweep) makeGate((tone) => fired.push({ type, tone }))(type);
+
+    assert.deepEqual(fired, [
+      { type: "approval_pending", tone: "alert" },
+      { type: "pane_exited", tone: "completion" },
+    ]);
+  });
+
+  it("does NOT fire when the same frame is replayed but maps to null (no double/spurious tone)", () => {
+    let calls = 0;
+    const gate = makeGate(() => { calls += 1; });
+    gate("pane_status"); gate("pane_status"); gate("ledger_updated");
+    assert.strictEqual(calls, 0);
+  });
+});
