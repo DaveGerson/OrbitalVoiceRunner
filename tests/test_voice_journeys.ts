@@ -6,9 +6,10 @@
 // core (src/gating createGating: gateOrDefer / decideProposal / applyResolution / applyDeferral /
 // reannounceSurvivors), the real voice-intercept path (serverContent.inputTranscription ->
 // parseApprovalIntent -> resolveApprovalByVoice), the real SQLite ledger, and REAL PTY panes
-// (/bin/sh -c bash via node-pty) so "the command executed" means bytes actually landed on a live
-// shell and its OUTPUT proves it (shell arithmetic: `echo approved_$((40+2))` can only print
-// `approved_42` if a real shell evaluated it — the PTY's input echo carries the unexpanded form).
+// (cmd.exe on Windows, /bin/sh -c bash on POSIX, via node-pty) so "the command executed" means
+// bytes actually landed on a live shell and its OUTPUT proves it. See execProbe(): the marker
+// `<verb>_42` only prints if a real shell EXPANDED the pane-env var (%VJ42% / $VJ42) — the PTY's
+// input echo carries the unexpanded reference — so finding it proves execution, not typing.
 //
 // Boot follows the ce7 harness conventions (tests/test_voice_tools.ts / test_notes_recall.ts):
 // JANUS_NO_AUTOSTART=1, tmp cwd isolated BEFORE importing ../server (boot-time store restore reads
@@ -86,6 +87,19 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     session.emit({ serverContent: { inputTranscription: { text } } });
   }
 
+  /** A real-execution probe that runs on the pane's NATIVE shell (cmd.exe on Windows, POSIX
+   *  sh/bash elsewhere) with NO external-binary dependency, so it works across environments.
+   *  before() exports VJ42=42 into the pane env (terminal.ts spawns with {...process.env}); a
+   *  real shell EXPANDS it (`%VJ42%` on cmd.exe, `$VJ42` on POSIX) so the pane OUTPUT contains
+   *  `<verb>_42`. The PTY input-echo carries the UNEXPANDED reference, so finding the marker
+   *  proves EXECUTION, not typing — and `echo` stays the allowlisted first token (a `cmd`/`bash`
+   *  instruction would be re-routed to the agent by the heavy-lifting-shell gate). */
+  function execProbe(verb: string): string {
+    return process.platform === "win32"
+      ? `echo ${verb}_%VJ42%`
+      : `echo ${verb}_\${VJ42}`;
+  }
+
   /** Create a REAL shell pane by VOICE (create_pane, gated Auto for the suite) — the genuine
    *  addTerminal -> node-pty spawn path. Custom preset derives the default shell command (bash on
    *  POSIX), and the create effect makes the new pane the ACTIVE write target (Issue #2 fix), so a
@@ -161,6 +175,10 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
       running.manager.settings.advanced.capabilityGates = {} as any;
     }
     (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
+
+    // execProbe() reads VJ42 from the pane env (panes spawn with {...process.env} — terminal.ts),
+    // so a real shell expands it and the marker `<verb>_42` proves execution. Removed in after().
+    process.env.VJ42 = "42";
   });
 
   after(async () => {
@@ -185,6 +203,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     }
     await teardownServerSuite(running);
     process.chdir(prevCwd);
+    delete process.env.VJ42;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
@@ -195,9 +214,10 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     const paneId = "vj-approve";
     const t = await createShellPane(paneId); // HiTL default; becomes the active pane.
 
-    // $((40+2)) only becomes 42 if a REAL shell evaluates it — the PTY input echo carries the
-    // unexpanded literal, so seeing "approved_42" is proof of execution, not of typing.
-    const instruction = "echo approved_$((40+2))";
+    // The marker "approved_42" only appears if a REAL shell EVALUATED the probe — the PTY input
+    // echo carries the unexpanded form — so seeing it is proof of execution, not of typing.
+    // execProbe() targets the pane's native shell (cmd.exe on Windows, POSIX elsewhere).
+    const instruction = execProbe("approved");
     const { callId, resp } = await propose(paneId, instruction);
 
     // The model got the NON-BLOCKING pending-style tool response (call.id answered exactly once).
@@ -252,7 +272,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     const paneId = "vj-reject";
     const t = await createShellPane(paneId);
 
-    const instruction = "echo rejected_$((40+2))";
+    const instruction = execProbe("rejected");
     const { callId, resp } = await propose(paneId, instruction);
     assert.strictEqual(resp.status, "pending_approval");
     assert.ok(approvals().has(callId));
@@ -295,7 +315,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     const paneId = "vj-defer";
     const t = await createShellPane(paneId);
 
-    const instruction = "echo deferred_$((40+2))";
+    const instruction = execProbe("deferred");
     const { callId, resp } = await propose(paneId, instruction);
     assert.strictEqual(resp.status, "pending_approval");
 
@@ -367,7 +387,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     const paneId = "vj-drop";
     const t = await createShellPane(paneId);
 
-    const instruction = "echo resumed_$((40+2))";
+    const instruction = execProbe("resumed");
     const session1 = live();
     const { callId, resp } = await propose(paneId, instruction);
     assert.strictEqual(resp.status, "pending_approval");
