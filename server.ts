@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
+import type { LiveConnectParameters, Session } from "@google/genai";
 import { WebSocketServer } from "ws";
 import http from "http";
 import dotenv from "dotenv";
@@ -152,7 +153,13 @@ export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: s
 // connector can pre-validate it (bead 9fz). Test/mock connectors installed via setLiveConnector
 // ignore it — that is HOW installMockLive() keeps connecting keylessly while the real path
 // short-circuits a blank key (see realLiveConnector below).
-export type LiveConnector = (ai: GoogleGenAI, params: any, key?: string | null) => Promise<any>;
+//
+// bead dbt-typing: the connector returns a STRUCTURAL `LiveSession` — the public method surface the
+// orchestrator drives — NOT the concrete `@google/genai` `Session` class. `Session` carries private
+// members (`conn`, `apiClient`) that no fake can reproduce, so typing the seam to the class would make
+// every mock un-typeable; the structural handle lets the real `Session` AND the test fakes satisfy it.
+export type LiveSession = Pick<Session, "sendClientContent" | "sendRealtimeInput" | "sendToolResponse" | "close">;
+export type LiveConnector = (ai: GoogleGenAI, params: LiveConnectParameters, key?: string | null) => Promise<LiveSession>;
 
 // bead 9fz: the DEFAULT (real) connector. Pre-validate a BLANK key HERE — at the real-connector
 // boundary — so we never fire a keyless ai.live.connect() that can only close with 1007 ("API key
