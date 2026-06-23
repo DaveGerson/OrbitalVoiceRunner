@@ -669,6 +669,15 @@ function applyDeliverOutcome(
     // status-via-kinds: a gate Off / read-only block returns kind:"blocked" so the REST twin maps to
     // 403 (resultToHttp). VOICE WIRE IS BYTE-IDENTICAL: voiceResponse maps kind:"blocked" to
     // { output: result.reason } — the SAME { output: <outcomeText> } shape the legacy kind:"ok" emitted.
+    //
+    // bd wsm-e2e-pinned-gb4 (BUCKET-3: looks-like-debt-but-correct): the 200-on-voice / 403-on-REST
+    // split is the INTENDED ASYMMETRY of this one ActionResult, NOT a missing-symmetry gap. deliver is a
+    // VOICE-PRIMARY gated action: the voice operator hears a spoken "blocked" narration (a 200-equivalent
+    // sentence, never an error tone), while REST is the escape-hatch surface whose UI twin (the Deliver
+    // drawer button) needs a TRUE HTTP failure to status-branch on, so the SAME kind:"blocked" projects to
+    // 403 there. One kind, two faithful surface renderings — pinned by tests/test_cv2_handoff_rest.ts
+    // ("gate Off (dispatch blocked) -> 403") and gemini.ts resultToToolResponse ({ output: result.reason }).
+    // Do NOT "fix" REST to 200 (it would make the drawer button unable to detect a refused delivery).
     return { kind: "blocked", reason: outcomeText };
   }
   // effect.kind === "noop" (error | clarify): no row change.
