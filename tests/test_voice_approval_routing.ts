@@ -16,7 +16,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { PendingActionStore } from "../src/pendingActions";
-import { shouldRouteUtterance, resolvePendingActionByVoice } from "../src/voiceApprovalRouting";
+import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../src/voiceApprovalRouting";
+import type { TargetableEntry } from "../src/approvalIntent";
 
 function makeDeps() {
   const broadcasts: any[] = [];
@@ -126,5 +127,120 @@ describe("A5 — resolvePendingActionByVoice (real staged-action voice resolutio
     assert.strictEqual(broadcasts.length, 0);
     const text = narrations.at(-1) ?? "";
     assert.ok(text.includes("Create pane A") && text.includes("Set global permissions to Full Auto"));
+  });
+});
+
+// bead 8xn — resolveHeldCommandByVoice: the pure sibling of resolvePendingActionByVoice, for HELD
+// pane-WRITE commands (pendingApprovals / the approval-dialog), keyed by messageId. Behavior is the
+// byte-for-byte extraction of routeApprovalIntent's held-entries branch (src/voice/index.ts): the
+// same parseApprovalIntent → selectApprovalTarget disambiguation, with the PTY/store/broadcast
+// effects injected as `onResolve(messageId, approve)` / `onDefer(messageId)` sinks. The server rewire
+// (test_approvals_wse.ts) pins that the live path still behaves identically.
+function makeHeldDeps() {
+  const narrations: string[] = [];
+  const resolves: { messageId: string; approve: boolean }[] = [];
+  const defers: string[] = [];
+  return {
+    narrations,
+    resolves,
+    defers,
+    deps: {
+      narrate: (t: string) => narrations.push(t),
+      redact: (s: string) => s,
+      onResolve: (messageId: string, approve: boolean) => resolves.push({ messageId, approve }),
+      onDefer: (messageId: string) => defers.push(messageId),
+    },
+  };
+}
+function held(messageId: string, instruction: string, terminalId = "claude_1"): TargetableEntry {
+  return { messageId, instruction, terminalId };
+}
+
+describe("8xn — resolveHeldCommandByVoice (held pane-write voice resolution)", () => {
+  it("a single held command + 'approve' resolves it (messageId, approve=true)", () => {
+    const { resolves, defers, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice("approve", [held("msg_1", "rm -rf build")], null, deps);
+    assert.deepStrictEqual(resolves, [{ messageId: "msg_1", approve: true }]);
+    assert.strictEqual(defers.length, 0);
+  });
+
+  it("'reject' resolves with approve=false", () => {
+    const { resolves, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice("reject", [held("msg_1", "drop table users")], null, deps);
+    assert.deepStrictEqual(resolves, [{ messageId: "msg_1", approve: false }]);
+  });
+
+  it("'later' / 'not now' defers (onDefer), never resolves", () => {
+    for (const u of ["later", "not now", "hold that"]) {
+      const { resolves, defers, deps } = makeHeldDeps();
+      resolveHeldCommandByVoice(u, [held("msg_1", "deploy")], null, deps);
+      assert.deepStrictEqual(defers, ["msg_1"], `"${u}" must defer`);
+      assert.strictEqual(resolves.length, 0, `"${u}" must not resolve`);
+    }
+  });
+
+  it("'none' (ambient speech) and an empty held list are both no-ops", () => {
+    const a = makeHeldDeps();
+    resolveHeldCommandByVoice("the weather is nice", [held("msg_1", "deploy")], null, a.deps);
+    assert.strictEqual(a.resolves.length + a.defers.length + a.narrations.length, 0);
+
+    const b = makeHeldDeps();
+    resolveHeldCommandByVoice("approve", [], null, b.deps);
+    assert.strictEqual(b.resolves.length + b.defers.length + b.narrations.length, 0);
+  });
+
+  it("a 'clarify' utterance (both approve AND reject) reads back the pending count, resolves nothing", () => {
+    const { resolves, narrations, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice("yes no", [held("msg_1", "a"), held("msg_2", "b")], null, deps);
+    assert.strictEqual(resolves.length, 0);
+    const text = narrations.at(-1) ?? "";
+    assert.ok(text.includes("approve and reject"), "asks which they meant");
+    assert.ok(text.includes("2"), "names the pending count");
+  });
+
+  it("multi-held + bare 'approve' (no hint, no lastAnnounced) reads back the redacted list, resolves nothing", () => {
+    const { resolves, defers, narrations, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice(
+      "approve",
+      [held("msg_1", "deploy to prod", "deploy_pane"), held("msg_2", "run migrations", "db_pane")],
+      null,
+      deps,
+    );
+    assert.strictEqual(resolves.length, 0);
+    assert.strictEqual(defers.length, 0);
+    const text = narrations.at(-1) ?? "";
+    assert.ok(text.includes("I have 2 pending"), "reads back the count");
+    assert.ok(text.includes("deploy to prod") && text.includes("run migrations"), "lists both instructions");
+    assert.ok(text.includes("deploy_pane") && text.includes("db_pane"), "names each pane");
+  });
+
+  it("multi-held + a fragment hint resolves the UNIQUE matching target", () => {
+    const { resolves, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice(
+      "approve the migrations one",
+      [held("msg_1", "deploy to prod", "deploy_pane"), held("msg_2", "run migrations", "db_pane")],
+      null,
+      deps,
+    );
+    assert.deepStrictEqual(resolves, [{ messageId: "msg_2", approve: true }]);
+  });
+
+  it("multi-held + lastAnnouncedId resolves the most-recently-announced one", () => {
+    const { resolves, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice(
+      "approve",
+      [held("msg_1", "deploy to prod"), held("msg_2", "run migrations")],
+      "msg_2",
+      deps,
+    );
+    assert.deepStrictEqual(resolves, [{ messageId: "msg_2", approve: true }]);
+  });
+
+  it("a throwing onResolve does NOT propagate is NOT this fn's job — it injects effects; the sink owns try/catch (parity with the server's resolveApprovalByVoice)", () => {
+    // Documents the contract boundary: resolveHeldCommandByVoice only DECIDES + injects; the sink
+    // (resolveApprovalByVoice → applyResolution) carries the claim/redaction/exactly-once guarantees.
+    const { resolves, deps } = makeHeldDeps();
+    resolveHeldCommandByVoice("approve", [held("only", "one thing")], null, deps);
+    assert.deepStrictEqual(resolves, [{ messageId: "only", approve: true }]);
   });
 });

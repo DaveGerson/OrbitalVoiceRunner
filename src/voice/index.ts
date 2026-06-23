@@ -29,10 +29,10 @@ import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/
 import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
-import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
+import { parseApprovalIntent } from "../approvalIntent";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
-import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
+import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
 import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
@@ -966,27 +966,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               });
               return;
             }
-            // Collision/ambiguity in the utterance itself -> clarify, never approve.
-            if (parsed.intent === "clarify") {
-              pushApprovalNarrationDep(session, `I heard both approve and reject — which did you mean for the ${entries.length} pending command${entries.length === 1 ? "" : "s"}?`);
-              return;
-            }
-            const target = selectApprovalTarget(
-              entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
-              parsed.targetHint,
-              pendingApprovals.lastAnnouncedFor(session)
-            );
-            if (target.ambiguous || !target.messageId) {
-              // >1 pending and nothing disambiguates -> clarify, list them.
-              const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
-              pushApprovalNarrationDep(session, `I have ${entries.length} pending: ${list}. Which one?`);
-            } else if (parsed.intent === "defer") {
-              // 4D.3: "later" / "not now" re-arms the TTL window (narration + cap live inside applyDeferral)
-              // — never the claim+delete reject path.
-              applyDeferral(target.messageId);
-            } else {
-              resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
-            }
+            // bead 8xn: the held-entries routing (clarify / disambiguate / defer / approve-reject) is now
+            // the pure `resolveHeldCommandByVoice` (the sibling of resolvePendingActionByVoice above), so
+            // the server and tests run the SAME code. The PTY/store/broadcast effects bind here as sinks:
+            // onResolve -> resolveApprovalByVoice (applyResolution's claim+redaction+broadcast choke-point),
+            // onDefer -> applyDeferral (4D.3 TTL re-arm + cap). narrate/redact mirror the global path.
+            // Behavior is byte-identical to the former inline block (pinned by test_approvals_wse.ts +
+            // test_voice_approval_routing.ts).
+            resolveHeldCommandByVoice(cleanUtter, entries, pendingApprovals.lastAnnouncedFor(session), {
+              narrate: (t) => pushApprovalNarrationDep(session, t),
+              redact: redactSecrets,
+              onResolve: (messageId, approve) => resolveApprovalByVoice(session, messageId, approve),
+              onDefer: (messageId) => applyDeferral(messageId),
+            });
           };
 
           // Process an operator ASR transcript: latch the speak-gate, emit the User transcript frame,
