@@ -224,6 +224,12 @@ export default function OrbitalApp() {
     if (view === "pantry") refetchServiceLog();
   }, [view, refetchServiceLog]);
 
+  // bead apu: the health strip is a status read — refresh it when the Pantry opens (no polling).
+  const refetchHealth = data.refetchHealth;
+  useEffect(() => {
+    if (view === "pantry") refetchHealth();
+  }, [view, refetchHealth]);
+
   // ── inline render helpers — relocate JSX subsections; no new components, no hook changes ──
 
   const renderLineView = (): ReactNode => {
@@ -262,6 +268,7 @@ export default function OrbitalApp() {
       <ThePantry dark={t.dark} projects={projects} stations={stations}
         archived={data.archived}
         serviceLog={data.serviceLog}
+        health={data.healthSnapshot}
         summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
         selectedProject={selectedProject}
         onUpdateSummary={data.updateProjectSummary}

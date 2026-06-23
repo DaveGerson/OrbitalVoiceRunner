@@ -70,6 +70,16 @@ export interface TemplateView {
   updated_at: number;
 }
 
+// bead apu: the one-glance health snapshot GET /api/health returns — mirrors the getHealth
+// handler's output shape (src/actions/defs/observability.ts). All fields server truth.
+export interface HealthSnapshot {
+  frozen: boolean;
+  panes: { total: number; running: number; idle: number; exited: number };
+  pending_approvals: number;
+  recent: { total: number; errors: number; error_rate: number };
+  memory: { synthesizer: string };
+}
+
 // 4U.3: one service-log row — the exact ActionLogRow shape GET /api/action-log returns
 // (src/store/sqliteStore.ts; body is {output:{rows}} via the default resultToHttp map).
 export interface ServiceLogRow {
@@ -170,6 +180,9 @@ export interface OrbitalData {
   /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
   serviceLog: ServiceLogRow[];
   refetchServiceLog: () => void;
+  /** bead apu: the latest one-glance health snapshot from GET /api/health (null until first fetch). */
+  healthSnapshot: HealthSnapshot | null;
+  refetchHealth: () => void;
   /** Journey-expansion C: the cookbook — saved prompt templates (GET /api/templates + templates_updated). */
   templates: TemplateView[];
   /** Journey-expansion C: mise en place — saved pane layouts (GET /api/layouts + layouts_updated). */
@@ -287,6 +300,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
   // 4U.3: the service log (GET /api/action-log rows, newest-first, capped 100).
   const [serviceLog, setServiceLog] = useState<ServiceLogRow[]>([]);
+  // bead apu: the one-glance health snapshot (GET /api/health), refreshed when the Pantry opens.
+  const [healthSnapshot, setHealthSnapshot] = useState<HealthSnapshot | null>(null);
   // Journey-expansion C: the cookbook (prompt templates) + mise en place (pane layouts).
   const [templates, setTemplates] = useState<TemplateView[]>([]);
   const [layouts, setLayouts] = useState<PaneLayout[]>([]);
@@ -473,6 +488,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       const d = await res.json().catch(() => null);
       const rows = d && d.output && Array.isArray(d.output.rows) ? d.output.rows : null;
       if (rows) setServiceLog(rows.slice(0, 100));
+    } catch { /* silent */ }
+  }, []);
+
+  // bead apu: the health snapshot — GET /api/health (default resultToHttp wraps it: {output:{…}}).
+  // Fetched on demand when the Pantry opens (a status read, not a live board), same gating as the
+  // service log: under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
+  const refetchHealth = useCallback(async () => {
+    if (isMockModeRef.current && !isE2EWireArmed()) return;
+    try {
+      const res = await apiFetch("/api/health");
+      if (!res.ok) return;
+      const d = await res.json().catch(() => null);
+      const snap = d && d.output && typeof d.output === "object" ? d.output : null;
+      if (snap) setHealthSnapshot(snap as HealthSnapshot);
     } catch { /* silent */ }
   }, []);
 
@@ -1604,6 +1633,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
+    healthSnapshot, refetchHealth,
     templates, layouts,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,

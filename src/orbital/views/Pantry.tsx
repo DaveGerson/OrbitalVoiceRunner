@@ -8,7 +8,7 @@ import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
 import { INK } from "../theme";
 import { Button, Chip, Icon, Pips, StatusBadge } from "../primitives";
 import type { Station, StationProject } from "../station";
-import type { ArchivedPane, ServiceLogRow } from "../useOrbitalData";
+import type { ArchivedPane, HealthSnapshot, ServiceLogRow } from "../useOrbitalData";
 
 // 4U.3: pull a pane id out of the redacted-args JSON (best-effort, presentation only) so a
 // service-log row can say WHERE it happened. The action log has no pane column; the args do.
@@ -105,6 +105,51 @@ function Head({ children, dark }: { children: ReactNode; dark: boolean }) {
   return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
 }
 
+// bead apu: render the recent-action error rate as a whole-percent chip ("7%"). Clamps the 0–1
+// fraction the handler emits; a degenerate/NaN value reads "0%" rather than blank or "NaN%".
+export function fmtErrorRate(rate: number): string {
+  const r = typeof rate === "number" && Number.isFinite(rate) ? Math.max(0, Math.min(1, rate)) : 0;
+  return `${Math.round(r * 100)}%`;
+}
+
+// bead apu: the health strip — a calm, one-glance observability row at the top of the Pantry.
+// All server truth from GET /api/health (src/actions/defs/observability.ts getHealth). Frozen is
+// loud (the emergency brake), a non-zero error rate warms, otherwise everything reads steady.
+function HealthStrip({ health, dark }: { health: HealthSnapshot; dark: boolean }) {
+  const fg = dark ? "#ffe9c7" : INK;
+  const steady = dark ? "#241409" : "#fff9ec";
+  const p = health.panes;
+  const errored = health.recent.error_rate > 0;
+  return (
+    <Card dark={dark}>
+      <Head dark={dark}>Health — the kitchen at a glance</Head>
+      <div data-testid="health-strip" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span data-testid="health-frozen" style={{ display: "inline-flex" }}>
+          <Chip bg={health.frozen ? "#e23a3a" : "#4db892"} color={health.frozen ? "#fff4de" : INK}>
+            {health.frozen ? "frozen — brake on" : "running free"}
+          </Chip>
+        </span>
+        <span data-testid="health-panes" style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 700, color: fg }}>
+          <Chip bg={steady} color="#8a6a4f">{p.total} pane{p.total === 1 ? "" : "s"}</Chip>
+          <Chip bg={steady} color="#8a6a4f">{p.running} running</Chip>
+          <Chip bg={steady} color="#8a6a4f">{p.idle} idle</Chip>
+          <Chip bg={steady} color="#8a6a4f">{p.exited} exited</Chip>
+        </span>
+        <span data-testid="health-pending" style={{ display: "inline-flex" }}>
+          <Chip bg={health.pending_approvals > 0 ? "#ffc94a" : steady} color={health.pending_approvals > 0 ? INK : "#8a6a4f"}>
+            {health.pending_approvals} at the pass
+          </Chip>
+        </span>
+        <span data-testid="health-error-rate" style={{ display: "inline-flex" }}>
+          <Chip bg={errored ? "#ff8a3d" : steady} color={errored ? INK : "#8a6a4f"}>
+            {fmtErrorRate(health.recent.error_rate)} errors
+          </Chip>
+        </span>
+      </div>
+    </Card>
+  );
+}
+
 /**
  * Resolve which project id to display. Uses an explicit pick when still valid,
  * else the board's selected project, else the first available project.
@@ -119,7 +164,7 @@ export function resolvePid(
   return projects[0]?.id ?? "";
 }
 
-export function ThePantry({ dark, projects, stations, archived, serviceLog, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
+export function ThePantry({ dark, projects, stations, archived, serviceLog, health, summaryOf, selectedProject, onUpdateSummary, onOpenStation, onRestoreArchived, onDeleteArchived }: {
   dark: boolean;
   projects: StationProject[];
   stations: Station[];
@@ -127,6 +172,8 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, summ
   archived: ArchivedPane[];
   /** 4U.3: the service log — recent action-log rows (GET /api/action-log), newest-first. */
   serviceLog: ServiceLogRow[];
+  /** bead apu: the one-glance health snapshot (GET /api/health); null until the first fetch lands. */
+  health: HealthSnapshot | null;
   summaryOf: (projectId: string) => string;
   selectedProject: string;
   onUpdateSummary: (projectId: string, summary: string) => void;
@@ -221,6 +268,13 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, summ
 
   return (
     <div data-testid="pantry" style={{ flex: 1, overflowY: "auto", padding: 24, background: dark ? "#1a0f08" : "var(--cream)", backgroundImage: dark ? "radial-gradient(#3a2415 1px, transparent 1.5px)" : "radial-gradient(#e7cfa0 1px, transparent 1.5px)", backgroundSize: "18px 18px" }}>
+      {/* bead apu: the health strip — global observability (GET /api/health), above the picker */}
+      {health && (
+        <div style={{ maxWidth: 880, marginBottom: 18 }}>
+          <HealthStrip health={health} dark={dark} />
+        </div>
+      )}
+
       {/* project picker */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 18 }}>
         <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: "#8a6a4f" }}>the pantry —</span>
