@@ -96,3 +96,24 @@ test("dbt1: getAttention hydrates dismissed -> boolean and details -> parsed JSO
   assert.deepEqual(got[0].details, { foo: "bar" }, "details round-trips as parsed JSON");
   s.close();
 });
+
+// The false-side of every boolean column is exercised above; this pins the TRUE side (1 -> boolean
+// true) and the null-details default through the ONLY getter whose read surface exposes a flag-set row
+// (getAttention(includeDismissed); the pending_* getters filter claimed=0, so a true row is unreachable
+// there by design). A regression that hard-coded `false` or mishandled a null `details` would pass the
+// false-only test above but fail HERE — that is the gap this pin closes.
+test("dbt1: getAttention hydrates dismissed:1 -> boolean true and null details -> null", () => {
+  const s = seed();
+  const att: StoredAttention = {
+    id: "at2", type: "idle", terminal_id: "t1", project_id: "p1",
+    message: "dismissed, no details", timestamp: 2, dismissed: true, details: null,
+  };
+  s.upsertAttention(att);
+  const got = s.getAttention({ includeDismissed: true });
+  const row = got.find(r => r.id === "at2");
+  assert.ok(row, "the dismissed row is visible when includeDismissed is set");
+  assert.equal(typeof row.dismissed, "boolean");
+  assert.strictEqual(row.dismissed, true, "dismissed:1 hydrates to boolean true, not 1");
+  assert.strictEqual(row.details, null, "null details stays null (no spurious JSON parse)");
+  s.close();
+});
