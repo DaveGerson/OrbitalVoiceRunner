@@ -27,7 +27,7 @@ import { register } from "node:module";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { attentionQueueFromFrame, dismissAttentionOutcome } from "../src/orbital/useOrbitalDataHelpers";
+import { attentionQueueFromFrame, dismissAttentionOutcome, attentionResolveTarget } from "../src/orbital/useOrbitalDataHelpers";
 import { dispatchWsMessage, type WsHandlerCtx } from "../src/appHelpers";
 import type { AttentionItem } from "../src/types";
 
@@ -134,12 +134,21 @@ describe("attentionTabLabel", () => {
 });
 
 describe("attentionActKind", () => {
-  it("approval / confirmation items are gate decisions → approve+deny", () => {
-    assert.equal(attentionActKind({ type: "approval" } as never), "approve");
-    assert.equal(attentionActKind({ type: "confirmation" } as never), "approve");
+  // bead e7h: approval/confirmation is only truly ACTIONABLE (real Approve/Deny) when it carries a
+  // messageId — the id of the held gated request to resolve. Without one it must NOT offer a fake
+  // approve; it degrades to "open" (go to the station + the always-present Dismiss).
+  it("approval / confirmation WITH a messageId → a held gate decision → approve+deny", () => {
+    assert.equal(attentionActKind({ type: "approval", messageId: "m1" } as never), "approve");
+    assert.equal(attentionActKind({ type: "confirmation", messageId: "m2" } as never), "approve");
+  });
+  it("approval / confirmation WITHOUT a messageId → triage-only → open (never a fake approve)", () => {
+    assert.equal(attentionActKind({ type: "approval" } as never), "open");
+    assert.equal(attentionActKind({ type: "confirmation" } as never), "open");
+    assert.equal(attentionActKind({ type: "approval", messageId: "" } as never), "open"); // empty id is not a held request
   });
   it("a finished/idle completion item → jump to the station (nothing to act on)", () => {
     assert.equal(attentionActKind({ type: "idle" } as never), "jump");
+    assert.equal(attentionActKind({ type: "idle", messageId: "m" } as never), "jump"); // a stray id on a non-approval type never makes it approvable
   });
   it("error / exited / build-failed are dead/failed stations → restart", () => {
     assert.equal(attentionActKind({ type: "error" } as never), "restart");
@@ -149,6 +158,25 @@ describe("attentionActKind", () => {
   it("an unknown type degrades to a plain jump (never a dead row)", () => {
     assert.equal(attentionActKind({ type: "mystery" as never } as never), "jump");
     assert.equal(attentionActKind({} as never), "jump");
+  });
+});
+
+// ── bead e7h: attentionResolveTarget — the held-request id-gate the resolver call leans on ───────
+describe("attentionResolveTarget", () => {
+  it("returns the messageId for an approval/confirmation item that carries one", () => {
+    assert.equal(attentionResolveTarget({ type: "approval", messageId: "msg_7" }), "msg_7");
+    assert.equal(attentionResolveTarget({ type: "confirmation", messageId: "msg_8" }), "msg_8");
+  });
+  it("returns null for an approval/confirmation with no (or empty) messageId — nothing to resolve", () => {
+    assert.equal(attentionResolveTarget({ type: "approval" }), null);
+    assert.equal(attentionResolveTarget({ type: "confirmation", messageId: "" }), null);
+    assert.equal(attentionResolveTarget({ type: "approval", messageId: 42 as never }), null); // non-string is not a key
+  });
+  it("returns null for any non-approval type, even if a stray messageId is present", () => {
+    assert.equal(attentionResolveTarget({ type: "error", messageId: "m" }), null);
+    assert.equal(attentionResolveTarget({ type: "exited", messageId: "m" }), null);
+    assert.equal(attentionResolveTarget({ type: "idle", messageId: "m" }), null);
+    assert.equal(attentionResolveTarget({}), null);
   });
 });
 
@@ -250,5 +278,87 @@ describe("dismissAttention optimistic remove + restore", () => {
     const restore = () => { const r = removed; if (r) state.setAttentionQueue((prev) => (prev.some((a) => a.id === r.id) ? prev : [...prev, r])); };
     restore();
     assert.equal(state.get().filter((x) => x.id === "a").length, 1); // exactly one, no dup
+  });
+});
+
+// ── 6. bead e7h: approveAttention / denyAttention — in-inbox resolve via messageId ─────────────
+// Reconstructs the exact id-gated closures the hook runs (src/orbital/useOrbitalData.ts):
+//   approveAttention(item): resolve = attentionResolveTarget(item)
+//     - no messageId  → selectActivePane(item.terminalId); STOP (no resolver, no queue mutation)
+//     - has messageId → optimistically drop the item, then approveCommand(messageId)
+//   denyAttention(item):    same gate, else dismissAttention(item.id) / rejectCommand(messageId)
+// This pins that the SAME POST /api/commands/approve resolver (approveCommand/rejectCommand) is hit
+// with the held-request id, and that a triage-only item never touches the resolver.
+function attnItem(id: string, type: AttentionItem["type"], messageId?: string): AttentionItem {
+  return { id, type, terminalId: "t9", projectId: "p1", message: "needs you", timestamp: "0", dismissed: false, ...(messageId ? { messageId } : {}) };
+}
+function makeResolverSpies() {
+  const calls: string[] = [];
+  let queue: AttentionItem[] = [];
+  const spies = {
+    calls,
+    setQueue: (q: AttentionItem[]) => { queue = q; },
+    getQueue: () => queue,
+    setAttentionQueue: (fn: (prev: AttentionItem[]) => AttentionItem[]) => { queue = fn(queue); },
+    selectActivePane: (paneId: string | null) => calls.push(`select:${paneId}`),
+    approveCommand: (mid: string) => calls.push(`approve:${mid}`),
+    rejectCommand: (mid: string) => calls.push(`reject:${mid}`),
+    dismissAttention: (id: string) => calls.push(`dismiss:${id}`),
+  };
+  // The EXACT closures from useOrbitalData (id gate + optimistic clear).
+  const approveAttention = (it: AttentionItem) => {
+    const mid = attentionResolveTarget(it);
+    if (!mid) { spies.selectActivePane(it.terminalId); return; }
+    spies.setAttentionQueue((prev) => prev.filter((a) => a.id !== it.id));
+    spies.approveCommand(mid);
+  };
+  const denyAttention = (it: AttentionItem) => {
+    const mid = attentionResolveTarget(it);
+    if (!mid) { spies.dismissAttention(it.id); return; }
+    spies.setAttentionQueue((prev) => prev.filter((a) => a.id !== it.id));
+    spies.rejectCommand(mid);
+  };
+  return { spies, approveAttention, denyAttention };
+}
+
+describe("approveAttention / denyAttention (in-inbox resolve)", () => {
+  it("approve on an item WITH a messageId hits approveCommand(messageId) and clears the row", () => {
+    const { spies, approveAttention } = makeResolverSpies();
+    const it = attnItem("a1", "approval", "msg_77");
+    spies.setQueue([it, attnItem("a2", "exited")]);
+    approveAttention(it);
+    assert.deepEqual(spies.calls, ["approve:msg_77"]); // SAME resolver voice uses, keyed by the held id
+    assert.deepEqual(spies.getQueue().map((x) => x.id), ["a2"]); // optimistically cleared
+  });
+  it("deny on an item WITH a messageId hits rejectCommand(messageId) and clears the row", () => {
+    const { spies, denyAttention } = makeResolverSpies();
+    const it = attnItem("a1", "confirmation", "msg_88");
+    spies.setQueue([it]);
+    denyAttention(it);
+    assert.deepEqual(spies.calls, ["reject:msg_88"]);
+    assert.deepEqual(spies.getQueue().map((x) => x.id), []); // cleared
+  });
+  it("approve on a triage-only item (NO messageId) jumps to the station — never calls the resolver", () => {
+    const { spies, approveAttention } = makeResolverSpies();
+    const it = attnItem("a1", "approval"); // no held request
+    spies.setQueue([it]);
+    approveAttention(it);
+    assert.deepEqual(spies.calls, ["select:t9"]); // jump, NOT approve
+    assert.deepEqual(spies.getQueue().map((x) => x.id), ["a1"]); // queue untouched (dismiss button still clears it)
+  });
+  it("deny on a triage-only item (NO messageId) locally dismisses — never calls the resolver", () => {
+    const { spies, denyAttention } = makeResolverSpies();
+    const it = attnItem("a1", "confirmation"); // no held request
+    spies.setQueue([it]);
+    denyAttention(it);
+    assert.deepEqual(spies.calls, ["dismiss:a1"]); // local dismiss, NOT reject
+  });
+  it("an error/idle item never resolves a gate even with a stray messageId (defense in depth)", () => {
+    const { spies, approveAttention, denyAttention } = makeResolverSpies();
+    const err = attnItem("e1", "error", "should_be_ignored");
+    spies.setQueue([err]);
+    approveAttention(err);
+    denyAttention(err);
+    assert.deepEqual(spies.calls, ["select:t9", "dismiss:e1"]); // jump + dismiss, resolver untouched
   });
 });

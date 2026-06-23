@@ -190,5 +190,27 @@ export async function switchActivePane(page: Page, paneId: string): Promise<void
   await page.evaluate((id) => window.__ORBITAL_E2E__?.switchActivePane(id), paneId);
 }
 
+/**
+ * bead e7h: seed the attention inbox by driving a REAL `attention_updated` frame through the
+ * observe-lane switch (injectWsFrame → handleObserveFrame → setAttentionQueue) — the same path the
+ * live socket uses. Each row is a full AttentionItem; pass a `messageId` to make a row resolvable
+ * in-inbox (real Approve/Deny) and omit it for a triage-only row.
+ */
+export async function injectAttention(
+  page: Page,
+  items: { id: string; type: string; terminalId: string; message: string; messageId?: string }[],
+): Promise<void> {
+  await page.evaluate((rows) => {
+    window.__ORBITAL_E2E__?.injectWsFrame({
+      type: "attention_updated",
+      queue: rows.map((r) => ({
+        id: r.id, type: r.type, terminalId: r.terminalId, projectId: "default_project",
+        message: r.message, timestamp: new Date().toISOString(), dismissed: false,
+        ...(r.messageId ? { messageId: r.messageId } : {}),
+      })),
+    });
+  }, items);
+}
+
 export const test = base;
 export { expect };

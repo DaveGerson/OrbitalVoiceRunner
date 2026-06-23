@@ -30,7 +30,7 @@ import {
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
-  dismissAttentionOutcome, handoffsFromFrame, normalizeHandoffRows, handoffPromptFromReadResponse,
+  dismissAttentionOutcome, attentionResolveTarget, handoffsFromFrame, normalizeHandoffRows, handoffPromptFromReadResponse,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -278,6 +278,12 @@ export interface OrbitalData {
   refetchAttention: () => void;
   /** D2: clear one attention item — POST /api/attention/:id/dismiss (dismiss_attention, veto). */
   dismissAttention: (id: string) => void;
+  /** bead e7h: in-inbox Approve — resolve a held gated request by its messageId (same resolver voice
+   *  uses), or jump-to-station for a triage-only item. Optimistically clears the alert. */
+  approveAttention: (item: AttentionItem) => void;
+  /** bead e7h: in-inbox Deny — reject a held gated request by its messageId, or locally dismiss a
+   *  triage-only item. Optimistically clears the alert. */
+  denyAttention: (item: AttentionItem) => void;
   refetchAll: () => void;
   // exposed for the realtime/voice wave to reuse
   wsRef: MutableRefObject<WebSocket | null>;
@@ -1774,6 +1780,26 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     }
   }, [showToast]);
 
+  // bead e7h: in-inbox Approve/Deny. When an attention item carries a held-request messageId
+  // (attentionResolveTarget), resolve it through the SAME POST /api/commands/approve resolver voice
+  // uses (approveCommand/rejectCommand) AND optimistically clear the alert from the inbox. When it
+  // carries NO messageId (a triage-only item) there is nothing to resolve — Approve degrades to a
+  // jump-to-station (the parent wires that) and Deny degrades to a local dismiss. The id gate lives
+  // here so the resolver is NEVER called without a real target.
+  const approveAttention = useCallback((item: AttentionItem) => {
+    const messageId = attentionResolveTarget(item);
+    if (!messageId) { selectActivePane(item.terminalId); return; }
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id)); // optimistic clear
+    approveCommand(messageId);
+  }, [approveCommand, selectActivePane]);
+
+  const denyAttention = useCallback((item: AttentionItem) => {
+    const messageId = attentionResolveTarget(item);
+    if (!messageId) { dismissAttention(item.id); return; }
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id)); // optimistic clear
+    rejectCommand(messageId);
+  }, [rejectCommand, dismissAttention]);
+
   const confirmAction = useCallback(async (actionId: string) => {
     let removed: PendingActionView | undefined;
     setPendingActions((prev) => { removed = prev.find((a) => a.actionId === actionId) ?? removed; return prev.filter((a) => a.actionId !== actionId); });
@@ -1846,7 +1872,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
-    refetchTerminals, refetchLedger, refetchSettings, refetchAttention, dismissAttention, refetchAll,
+    refetchTerminals, refetchLedger, refetchSettings, refetchAttention, dismissAttention, approveAttention, denyAttention, refetchAll,
     wsRef, isMockModeRef,
     setTerminals, setTranscript, setPendingCommands, setPendingActions, setFrozen, setFrozenRunning,
   };

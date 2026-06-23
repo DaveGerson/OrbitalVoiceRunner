@@ -332,3 +332,16 @@ export function dismissAttentionOutcome(status: number, ok: boolean, body: Recor
   if (typeof body.output === "string" && body.output.startsWith("Error:")) return "blocked";
   return "cleared";
 }
+
+/**
+ * bead e7h: the held gated request an attention item resolves, or null when it is triage-only.
+ * Returns the item's `messageId` (the PendingApproval key the POST /api/commands/approve resolver
+ * takes) ONLY for an approval/confirmation item that actually carries one — the SAME id-presence gate
+ * `attentionActKind` uses. Anything else (a suggestion, a dead/exited station, an idle completion, or
+ * an approval/confirmation with no held request) returns null, so the inbox never tries to resolve a
+ * gate that does not exist. A non-string/empty messageId is treated as absent (defensive).
+ */
+export function attentionResolveTarget(item: { type?: string; messageId?: unknown }): string | null {
+  if (item.type !== "approval" && item.type !== "confirmation") return null;
+  return typeof item.messageId === "string" && item.messageId.length > 0 ? item.messageId : null;
+}

@@ -286,10 +286,13 @@ export default function OrbitalApp() {
             onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
             onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
             onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout}
-            /* D2: attention acts. Approve → jump to the station (the real ApprovalDialog lives there);
-               deny → clear the alert; restart → re-fire the dead/failed station; dismiss → clear it. */
-            onApproveAttention={(item) => { data.selectActivePane(item.terminalId); setBurnerId(item.terminalId); }}
-            onDenyAttention={(item) => data.dismissAttention(item.id)}
+            /* bead e7h: attention acts. Approve/Deny resolve a HELD gated request by its messageId
+               through the SAME POST /api/commands/approve resolver voice uses (data.approveAttention /
+               data.denyAttention id-gate that internally); a triage-only item (no messageId) degrades
+               to jump-to-station / local dismiss. We also open the burner on approve so the operator
+               lands on the station. restart → re-fire the dead/failed station; dismiss → clear it. */
+            onApproveAttention={(item) => { data.approveAttention(item); setBurnerId(item.terminalId); }}
+            onDenyAttention={(item) => data.denyAttention(item)}
             onRestartAttention={(id) => data.restartPane(id)}
             onDismissAttention={(id) => data.dismissAttention(id)} />
           <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />

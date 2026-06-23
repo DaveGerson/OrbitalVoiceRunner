@@ -349,6 +349,14 @@ export interface AttentionItem {
   timestamp: string;
   dismissed: boolean;
   details?: any;
+  /**
+   * bead e7h: the id of the HELD gated request this item resolves (a PendingApproval.messageId).
+   * Present ONLY for items that map to a real in-flight approval (e.g. a staged pane WRITE) — those
+   * become genuinely ACTIONABLE from the inbox (Approve/Deny call the SAME POST /api/commands/approve
+   * resolver voice uses). Absent for triage-only items (suggestions, dead/exited stations, idle
+   * completions), which stay Open/Dismiss. The plumbing is ID-GATED: no messageId → no resolve.
+   */
+  messageId?: string;
 }
 
 export interface WatchRule {

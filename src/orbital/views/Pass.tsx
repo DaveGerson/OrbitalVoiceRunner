@@ -45,12 +45,14 @@ export function resolveTemplateInitial(initial?: { name: string; description: st
 }
 
 // ── D2: the Attention ("what needs me") tab ───────────────────────────────────
-// The act a queue row offers, by AttentionItem.type:
-//   approval / confirmation → live items carry no messageId, so they can't resolve a gate yet:
-//     "Open" (go to the station) + "Dismiss". Reserve a true Approve/Deny for a resolvable messageId.
+// The act a queue row offers, by AttentionItem.type AND whether it carries a resolvable messageId:
+//   approval / confirmation WITH a messageId → a HELD gated request: real Approve/Deny that hit the
+//     SAME POST /api/commands/approve resolver voice uses (bead e7h).
+//   approval / confirmation WITHOUT a messageId → a triage-only suggestion (no held request to
+//     resolve): "Open" (go to the station) + "Dismiss". Never a fake approve.
 //   error / exited / build-failed → a dead/failed station: restart (+ jump)
 //   idle (completion) / anything else → nothing to act on: jump to the station
-export type AttentionActKind = "approve" | "restart" | "jump";
+export type AttentionActKind = "approve" | "open" | "restart" | "jump";
 
 /** The Attention tab label: bare "Attention" when nothing's waiting, "Attention • N" otherwise.
  *  A non-positive/garbage count is treated as empty (never renders a stray bullet). */
@@ -58,10 +60,13 @@ export function attentionTabLabel(count: number): string {
   return count > 0 ? `Attention • ${count}` : "Attention";
 }
 
-/** Which act buttons one attention row shows, from its item type. Unknown types degrade to a plain
+/** Which act buttons one attention row shows, from its item type AND its resolvability (bead e7h).
+ *  An approval/confirmation item is only truly ACTIONABLE (real Approve/Deny) when it carries a
+ *  messageId — the id of the held gated request to resolve. Without one it degrades to "open" (go to
+ *  the station + Dismiss), so the inbox never offers a fake approve. Unknown types degrade to a plain
  *  jump so a row is never dead. Keep ≤ the complexity gate (a flat lookup, no nesting). */
-export function attentionActKind(item: { type?: string }): AttentionActKind {
-  if (item.type === "approval" || item.type === "confirmation") return "approve";
+export function attentionActKind(item: { type?: string; messageId?: string }): AttentionActKind {
+  if (item.type === "approval" || item.type === "confirmation") return item.messageId ? "approve" : "open";
   if (item.type === "error" || item.type === "exited" || item.type === "build-failed") return "restart";
   return "jump";
 }
@@ -465,12 +470,22 @@ function AttentionRow({ item, dark, onApprove, onDeny, onRestart, onJump, onDism
   const act = attentionActKind(item);
   // The per-act button set — each arm owns a tiny slice of JSX so the row stays under the gate.
   function renderActs(): ReactNode {
+    // bead e7h: a HELD gated request (messageId present) — real Approve/Deny that resolve it through
+    // the SAME POST /api/commands/approve resolver voice uses. The parent (onApprove/onDeny) reads
+    // item.messageId and calls approveCommand/rejectCommand.
     if (act === "approve") {
       return (
         <>
-          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Go to station" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Open</span></button>
-          <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Dismiss" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
+          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Approve this — let it run" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Approve</span></button>
+          <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Deny this — hold it back" style={{ ...miniBtn(dark), color: "#e23a3a", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Deny</span></button>
         </>
+      );
+    }
+    // A triage-only suggestion (no held request): "Open" the station + "Dismiss" the alert. Honest —
+    // it never claims to resolve a gate, because there is none to resolve.
+    if (act === "open") {
+      return (
+        <button data-testid="attn-open" onClick={() => onApprove(item)} title="Go to the station" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Open</span></button>
       );
     }
     if (act === "restart") {
