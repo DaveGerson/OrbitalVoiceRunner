@@ -22,13 +22,13 @@ import type {
   Plan,
   PaneLayout,
 } from "../types";
-import type { StoredNote } from "../store/types";
+import type { StoredNote, StoredHandoff } from "../store/types";
 import { extractSlots } from "../templates";
 import {
   projectTemplatesFrame, historyEntriesFromFrame, draftTextFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
-  templateClarifyText, templateApplyToast, layoutGatedText,
+  templateClarifyText, templateApplyToast, layoutGatedText, handoffsFromFrame, normalizeHandoffRows,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -174,6 +174,8 @@ export interface OrbitalData {
   templates: TemplateView[];
   /** Journey-expansion C: mise en place — saved pane layouts (GET /api/layouts + layouts_updated). */
   layouts: PaneLayout[];
+  /** j4e1: the line drawer's handoffs (GET /api/handoffs + handoffs_updated frames), redacted server-side. */
+  handoffs: StoredHandoff[];
   // setters / actions
   selectActivePane: (paneId: string | null) => void;
   setGlobalPermissionsMode: (m: GlobalMode) => void;
@@ -218,6 +220,17 @@ export interface OrbitalData {
   deleteLayout: (id: string) => void;
   refetchTemplates: () => void;
   refetchLayouts: () => void;
+  // j4e1: the handoff line-drawer's hero actions. These call the cv2 canonical REST twins
+  // (registry-derived from src/actions/defs/handoff.ts: read_handoff -> GET /api/handoffs/:handoff_id,
+  // so the lifecycle twins are POST /api/handoffs/:handoff_id/<verb>). The board repaints off the
+  // handoffs_updated frame; the post-success refetch is the safety net for a missed frame.
+  /** Deliver a STAGED handoff into the target pane — POST /api/handoffs/:id/deliver (gated: 202/403). */
+  deliverHandoff: (handoffId: string) => void;
+  /** Rewrite a handoff's composed prompt — POST /api/handoffs/:id/revise {new_draft_text} (ungated). */
+  reviseHandoff: (handoffId: string, newDraftText: string) => void;
+  /** Reject/cancel a handoff — POST /api/handoffs/:id/reject (ungated pre-gate flip). */
+  rejectHandoff: (handoffId: string) => void;
+  refetchHandoffs: () => void;
   // 2K.2: per-pane capability-gate override (the Rulebook's pane scope) —
   // PUT /api/projects/:p/panes/:id/capability-gates {capabilityGates}.
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
@@ -290,6 +303,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // Journey-expansion C: the cookbook (prompt templates) + mise en place (pane layouts).
   const [templates, setTemplates] = useState<TemplateView[]>([]);
   const [layouts, setLayouts] = useState<PaneLayout[]>([]);
+  // j4e1: the line drawer's handoffs (GET /api/handoffs + handoffs_updated frames).
+  const [handoffs, setHandoffs] = useState<StoredHandoff[]>([]);
 
   // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
   // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
@@ -462,6 +477,22 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // j4e1: the line drawer's handoffs. list_handoffs has NO toHttp, so GET /api/handoffs rides the
+  // default resultToHttp map → the redacted rows arrive under { output: [...] } (keyed handoff_id).
+  // normalizeHandoffRows coalesces that into the StoredHandoff shape the drawer reads (and equally
+  // adopts a future cv2 full-row payload). Like the board fetchers, a no-op under ?mock=1 (the e2e
+  // drives the board through the handoffs_updated frame, asserting the REST twins on the actions).
+  const refetchHandoffs = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/handoffs");
+      if (!res.ok) return;
+      const d = await res.json().catch(() => null);
+      const rows = Array.isArray(d) ? d : (d && Array.isArray(d.output) ? d.output : null);
+      if (rows) setHandoffs(normalizeHandoffRows(rows));
+    } catch { /* silent */ }
+  }, []);
+
   // 4U.3: the service log — GET /api/action-log (default resultToHttp wraps the rows: {output:{rows}}).
   // Fetched on demand (the Pantry refreshes it when it opens), not on the poll — it's a review
   // surface, not a live board. Under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
@@ -522,7 +553,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchArchive();
     refetchTemplates();
     refetchLayouts();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts]);
+    refetchHandoffs();
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts, refetchHandoffs]);
 
   // ── observe-lane frame handler ───────────────────────────────────────────
   // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
@@ -579,6 +611,10 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       templates_updated: () => { const p = projectTemplatesFrame(msg); if (p) setTemplates(p); else refetchTemplates(); },
       // The frame carries the full layouts array — adopt it directly; degrade to a refetch otherwise.
       layouts_updated: () => { if (Array.isArray(msg.layouts)) setLayouts(msg.layouts); else refetchLayouts(); },
+      // j4e1: the server broadcasts on every handoff lifecycle mutation (compose/revise/stage/deliver/
+      // reject). The cv2 frame carries the full board → adopt it (normalized); the current payload-less
+      // frame yields null → degrade to a refetch (GET /api/handoffs). Mirrors plans_updated.
+      handoffs_updated: () => { const rows = handoffsFromFrame(msg); if (rows) setHandoffs(normalizeHandoffRows(rows)); else refetchHandoffs(); },
       settings_updated: () => {
         if (msg.settings) {
           setSettings(msg.settings as SystemSettings);
@@ -641,7 +677,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     };
     const type = msg?.type;
     if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
-  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchHandoffs, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -1396,6 +1432,60 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't 86 that layout, Chef — try again.", "warn"); }
   }, [refetchLayouts, showToast, mockClientOnly]);
 
+  // ── j4e1: the handoff line-drawer's hero actions (deliver / revise / reject) ──
+  // These call the cv2 canonical REST twins, registry-derived from src/actions/defs/handoff.ts: the
+  // read twin is GET /api/handoffs/:handoff_id, so the lifecycle twins are POST /api/handoffs/:id/<verb>
+  // (the established `POST /api/<resource>/:id/<verb>` convention — cf. /api/plans/:id/execute,
+  // /api/templates/:id/apply, /api/archive/:pane_id/restore). The board repaints off handoffs_updated;
+  // the post-success refetch is the safety net. Honest-feedback: the ack fires only after the server
+  // said ok; a gated deliver may 202 (needs an ok at the pass) / 403 (gated off). Under a human's
+  // plain ?mock=1 these stay client-side; a Playwright-armed page fires the wire so the e2e asserts it.
+
+  // Deliver a STAGED handoff (the GATED hero action; the server gates via dispatchProposal →
+  // 200 delivered / 202 needs-approval / 403 gated off). Mirrors executePlan's status ladder.
+  const deliverHandoff = useCallback(async (handoffId: string) => {
+    if (mockClientOnly()) { showToast("Sent it down the line 🍽", "fire", "execute"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/deliver`, { method: "POST" });
+      if (res.status === 202) { showToast("Delivery queued — needs your ok at the pass 🛎", "warn"); }
+      else if (res.status === 403) { showToast("That delivery's gated off, Chef", "warn"); }
+      else if (!res.ok) {
+        const d = await res.json().catch(() => ({} as Record<string, unknown>));
+        showToast(firstServerMessage(d) || "Couldn't deliver that handoff, Chef — try again.", "warn");
+      } else { showToast("Sent it down the line 🍽", "fire", "execute"); }
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("Couldn't deliver that handoff, Chef — try again.", "warn"); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Revise a handoff's composed prompt (UNGATED co-authoring). Body key is `new_draft_text` (the
+  // revise_handoff schema). A 200 narration is the only success; failures warn honestly.
+  const reviseHandoff = useCallback(async (handoffId: string, newDraftText: string) => {
+    const text = newDraftText.trim();
+    if (!text) return;
+    setHandoffs((prev) => prev.map((h) => (h.id === handoffId ? { ...h, composed_prompt: text, state: "revising", revision_count: h.revision_count + 1 } : h))); // optimistic
+    if (mockClientOnly()) { showToast("Tweaked the handoff ✍️"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/revise`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new_draft_text: text }),
+      });
+      if (!res.ok) { showToast("That revision didn't stick, Chef — try again.", "warn"); refetchHandoffs(); return; }
+      showToast("Tweaked the handoff ✍️");
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("That revision didn't stick, Chef — try again.", "warn"); refetchHandoffs(); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Reject/cancel a handoff (UNGATED pre-gate flip; routes through the gate if a delivery is pending).
+  const rejectHandoff = useCallback(async (handoffId: string) => {
+    setHandoffs((prev) => prev.map((h) => (h.id === handoffId ? { ...h, state: "rejected" } : h))); // optimistic
+    if (mockClientOnly()) { showToast("86'd that handoff", "warn"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/reject`, { method: "POST" });
+      if (!res.ok) { showToast("Couldn't 86 that handoff, Chef — try again.", "warn"); refetchHandoffs(); return; }
+      showToast("86'd that handoff", "warn");
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("Couldn't 86 that handoff, Chef — try again.", "warn"); refetchHandoffs(); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
   // ── 2K.2: per-pane gate override (the Rulebook's pane scope) ─────────────
   // PUT the pane's whole override map (the bulk matrix-editor route, src/actions/defs/locks.ts
   // setPaneGates). res.ok-checked; on failure the ledger is refetched so the segs snap back to truth.
@@ -1604,13 +1694,14 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
-    templates, layouts,
+    templates, layouts, handoffs,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
     executePlan, deletePlan,
     createTemplate, updateTemplate, deleteTemplate, applyTemplate,
     saveLayout, applyLayout, deleteLayout, refetchTemplates, refetchLayouts,
+    deliverHandoff, reviseHandoff, rejectHandoff, refetchHandoffs,
     refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,

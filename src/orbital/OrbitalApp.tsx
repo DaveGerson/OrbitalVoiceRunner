@@ -8,6 +8,7 @@ import { Icon, IconSprite, Mascot } from "./primitives";
 import { TweaksPanel, TweakSection, TweakRadio, TweakToggle, TweakColor } from "./TweaksPanel";
 import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
 import { useOrbitalData } from "./useOrbitalData";
+import { groupHandoffsByPane } from "./useOrbitalDataHelpers";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
@@ -181,6 +182,12 @@ export default function OrbitalApp() {
     [data.terminals, data.ledger, data.pendingCommands],
   );
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
+  // j4e1: the per-station handoff line-drawer wiring — handoffs bucketed by to_pane + the hero-action
+  // callbacks (deliver/revise/reject, which fire the canonical handoff REST twins inside the hook).
+  const handoffWiring = useMemo(() => ({
+    byPane: groupHandoffsByPane(data.handoffs),
+    onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onReject: data.rejectHandoff,
+  }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.rejectHandoff]);
   const running = stations.filter((s) => s.status === "Running").length;
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
@@ -243,7 +250,7 @@ export default function OrbitalApp() {
             onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
             onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
             onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
-          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
+          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
         <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>

@@ -6,6 +6,8 @@ import { INK, RUNTIMES, STATUS } from "./theme";
 import { ChefAvatar, Chip, Pips, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { CHEFS } from "./theme";
 import type { Station } from "./station";
+import type { StoredHandoff } from "../store/types";
+import { StationHandoffDrawer } from "./StationHandoffDrawer";
 import {
   deriveCardColors,
   deriveCardTag,
@@ -21,9 +23,14 @@ import {
 
 const PIP_COUNT = 8;
 
-export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active }: {
+export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onRejectHandoff }: {
   st: Station; accentHex: string; dark: boolean; compact: boolean; tilt?: number;
   onOpen: () => void; layout: "grid" | "rail" | "list"; showCue: boolean; active: boolean;
+  // j4e1 (additive): handoffs bound TO this station + the hero-action callbacks. Omitted → no drawer.
+  handoffs?: StoredHandoff[];
+  onDeliverHandoff?: (id: string) => void;
+  onReviseHandoff?: (id: string, text: string) => void;
+  onRejectHandoff?: (id: string) => void;
 }) {
   const [hover, setHover] = useState(false);
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
@@ -109,6 +116,16 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
     );
   }
 
+  // j4e1: the per-station handoff drawer — the deliver/revise/reject hero surface. Renders only when
+  // this station owns handoffs (to_pane) AND the callbacks are wired; the drawer self-hides otherwise.
+  function renderHandoffDrawer() {
+    if (!handoffs || handoffs.length === 0 || !onDeliverHandoff || !onReviseHandoff || !onRejectHandoff) return null;
+    return (
+      <StationHandoffDrawer handoffs={handoffs}
+        onDeliver={onDeliverHandoff} onRevise={onReviseHandoff} onReject={onRejectHandoff} />
+    );
+  }
+
   function renderVoiceCue() {
     if (!showCue || list) return null;
     return (
@@ -143,6 +160,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
       {renderScribble()}
       {renderOutputPeek()}
       {renderFooter()}
+      {renderHandoffDrawer()}
       {renderVoiceCue()}
     </div>
   );
