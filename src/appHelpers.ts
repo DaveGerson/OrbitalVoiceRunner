@@ -152,6 +152,17 @@ export function heatmapTooltipFields(isAlertActive: boolean, term: Terminal): {
   };
 }
 
+/** Mobile swiper inner status-dot class (the `<span>` inside each swiper button). Four arms:
+ *  alert → amber ping2; running+quiescing → muted amber; running → green; else → yellow.
+ *  Note the custom `animate-ping2` (not `animate-ping`) — verbatim from the inline ternary chain.
+ *  `animate-ping2` is distinct from `animate-ping` on purpose (slower, less aggressive pulse). */
+export function mobileSwiperDotClass(isAlertActive: boolean, term: Pick<Terminal, "status" | "quiescing">): string {
+  if (isAlertActive) return "bg-amber-500 animate-ping2";
+  if (term.status === "Running" && term.quiescing) return "bg-amber-400/70";
+  if (term.status === "Running") return "bg-green-500";
+  return "bg-yellow-500";
+}
+
 /** Mobile swiper button color (App.tsx mobile swiper `.map`). isActive precedence sits between the
  *  alert and the running/idle arms — verbatim from the original if/else-if ladder. */
 export function mobileSwiperColorClass(isAlertActive: boolean, isActive: boolean, term: Terminal): string {

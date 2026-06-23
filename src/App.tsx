@@ -28,6 +28,7 @@ import {
   heatmapTileClasses,
   heatmapTooltipStatus,
   heatmapTooltipFields,
+  mobileSwiperDotClass,
   mobileSwiperColorClass,
   sidebarPaneStatusColor,
   sidebarRowContainerClass,
@@ -2129,11 +2130,8 @@ function AppRaw() {
               }}
               className={`flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-mono border flex items-center gap-1.5 transition-all ${colorClass}`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${
-                isAlertActive ? "bg-amber-500 animate-ping2" :
-                term.status === "Running" && term.quiescing ? "bg-amber-400/70" :
-                term.status === "Running" ? "bg-green-500" : "bg-yellow-500"
-              }`}></span>
+              {/* Burndown: the inner-dot color ladder is the pure helper `mobileSwiperDotClass`. */}
+              <span className={`w-1.5 h-1.5 rounded-full ${mobileSwiperDotClass(isAlertActive, term)}`}></span>
               {(term.id).toUpperCase()}
             </button>
           )
