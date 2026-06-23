@@ -105,10 +105,10 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `apply_prompt_template` | voice / rest | no | Instantiate a saved prompt template (filling its {{slot}} values) into a pane's WIP draft for the operator to review and send |
 | `handoff_context_between_panes` | voice / rest | no | Gather context from a source CLI pane and package summaries/learnings to prime a model agent in another target pane |
-| `propose_handoff` | voice | no | Draft a first-class handoff to a target pane (UNGATED — never touches the pane) |
-| `reject_handoff` | voice | no | Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path) |
-| `revise_handoff` | voice | no | Rewrite a handoff's composed prompt (UNGATED co-authoring; increments revision_count) |
-| `stage_handoff` | voice | no | Freeze a handoff draft and mark it 'staged' (UNGATED; validates the target pane is live) |
+| `propose_handoff` | voice / rest | no | Draft a first-class handoff to a target pane (UNGATED — never touches the pane) |
+| `reject_handoff` | voice / rest | no | Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path) |
+| `revise_handoff` | voice / rest | no | Rewrite a handoff's composed prompt (UNGATED co-authoring; increments revision_count) |
+| `stage_handoff` | voice / rest | no | Freeze a handoff draft and mark it 'staged' (UNGATED; validates the target pane is live) |
 | `update_draft_prompt` | voice | no | Compose or refine the WIP draft prompt for the pane the operator currently has open, so they can review/edit and send it |
 
 ## Open a new pane

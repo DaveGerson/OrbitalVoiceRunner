@@ -188,7 +188,24 @@ export const proposeHandoff: ActionDef<typeof ProposeHandoffParams> = {
   params: ProposeHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Compose" handoff-drawer button. Pure ledger op
+  // (createHandoff snapshot) — safe on session:null (no pane write, no session use). Registry-canonical
+  // path: POST /api/handoffs (the create verb on the /api/handoffs collection list_handoffs reads).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs" },
+  // The drawer POSTs a camelCase body { toPane, draftText, fromPane?, rationale? }; the voice schema
+  // keys are snake_case. Alias camel->snake ONLY when the snake key is absent (a voice call carrying
+  // snake_case is never clobbered) — same pattern as handoff_context_between_panes above.
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.to_pane == null && out.toPane != null) out.to_pane = out.toPane;
+    if (out.draft_text == null && out.draftText != null) out.draft_text = out.draftText;
+    if (out.from_pane == null && out.fromPane != null) out.from_pane = out.fromPane;
+    delete out.toPane;
+    delete out.draftText;
+    delete out.fromPane;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -245,7 +262,19 @@ export const reviseHandoff: ActionDef<typeof ReviseHandoffParams> = {
   params: ReviseHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Revise" handoff-drawer button. Pure ledger op
+  // (updateHandoffCargo) — safe on session:null. Registry-canonical path: PUT /api/handoffs/:handoff_id
+  // (the update verb on a single handoff, sibling of GET /api/handoffs/:handoff_id = read_handoff).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "put", path: "/api/handoffs/:handoff_id" },
+  // The drawer PUTs a camelCase body { newDraftText }; the voice key is snake_case. Alias camel->snake
+  // only when the snake key is absent (a voice call carrying snake_case is never clobbered).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.new_draft_text == null && out.newDraftText != null) out.new_draft_text = out.newDraftText;
+    delete out.newDraftText;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -292,7 +321,11 @@ export const stageHandoff: ActionDef<typeof StageHandoffParams> = {
   params: StageHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Stage" handoff-drawer button. Pure ledger op
+  // (secret-guard + updateHandoffState -> staged) — safe on session:null. Registry-canonical path:
+  // POST /api/handoffs/:handoff_id/stage (a state-transition verb under the single-handoff resource).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/stage" },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -487,7 +520,12 @@ export const rejectHandoff: ActionDef<typeof RejectHandoffParams> = {
   params: RejectHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Reject" handoff-drawer button. Pure ledger op (flip the
+  // row to 'rejected', OR — when a delivery is pending at the gate — route through the SAME applyResolution
+  // claim gate). Safe on session:null (applyResolution reads the pendingApprovals store, not the session).
+  // Registry-canonical path: POST /api/handoffs/:handoff_id/reject (a state-transition verb, sibling of /stage).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/reject" },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
