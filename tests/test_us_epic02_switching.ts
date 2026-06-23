@@ -475,7 +475,9 @@ describe("US-2.4 — the working brief follows focus, stays budgeted, and surviv
     assert.strictEqual(service.synthesizerState(), "fallback", "no python client => fallback synthesizer");
     const brief = await service.synthesizeAsync("pane1", 1000);
     assert.strictEqual(brief.source, "fallback", "the fallback assembler produced the brief");
-    assert.ok(brief.text.length > 0, "the fallback brief is non-empty");
+    // l1c: assert the fallback brief carries the structural ACTIVE PANE anchor (content), not merely
+    // that it is non-empty.
+    assert.match(brief.text, /ACTIVE PANE/, "the fallback brief still anchors on the active pane tier");
     assert.match(brief.text, new RegExp(SENTINEL_B), "the fallback brief carries the active project tier");
   });
 
@@ -492,7 +494,9 @@ describe("US-2.4 — the working brief follows focus, stays budgeted, and surviv
     const brief = service.synthesize("pane1", 1000);
 
     // Project tier degrades (no PROJECT block) but the brief still synthesizes from pane/board/frame.
-    assert.ok(brief.text.length > 0, "the brief is non-empty even with the Project tier absent (anti-rot M8)");
+    // l1c: the meaningful invariant is that the surviving tiers are present (asserted below), so prove
+    // the brief carries BOTH the ACTIVE PANE and FRAME anchors rather than only that it is non-empty.
+    assert.match(brief.text, /ACTIVE PANE[\s\S]*FRAME|FRAME[\s\S]*ACTIVE PANE/, "both surviving tiers present (anti-rot M8)");
     assert.doesNotMatch(brief.text, /PROJECT /, "no PROJECT block when the store yields no project");
     assert.match(brief.text, /ACTIVE PANE/, "the pane tier still anchors the brief");
     assert.match(brief.text, /FRAME/, "the frame tier still present");
