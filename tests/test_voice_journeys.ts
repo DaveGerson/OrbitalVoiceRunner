@@ -27,9 +27,10 @@
 //      command_blocked / approval_resolved frames confirm.
 //   3. DEFER — spoken "not now" (the Phase 4 defer verb, src/approvalIntent.ts): the approval
 //      SURVIVES (TTL re-armed) instead of being claim+deleted, and stays resolvable afterwards.
-//   4. STATUS TRUTH — a REAL busy pane (Full-Auto auto-execute of allowlisted `cat`, which then
-//      holds the tty foreground) + a REAL idle pane; list_panes reports honest busy/idle derived
-//      from the genuine status machine (authoritative /proc probe) — no manual term.status writes.
+//   4. STATUS TRUTH — a REAL busy pane (Full-Auto auto-execute of an allowlisted blocking probe —
+//      `cat` on POSIX, `ping -n 600 127.0.0.1` on Windows; see blockingProbe() — which then holds
+//      the foreground) + a REAL idle pane; list_panes reports honest busy/idle derived from the
+//      genuine status machine (authoritative process-tree probe) — no manual term.status writes.
 //   5. DROP-AND-RESUME — with an approval pending, the Gemini socket dies (emitClose 1006); the
 //      bounded reconnect mints a fresh session, the survivor re-attaches, the resumption digest
 //      ("Welcome back…", gating.reannounceSurvivors) names it, and the approval is still
@@ -84,6 +85,22 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
    *  parseApprovalIntent -> selectApprovalTarget -> resolveApprovalByVoice / applyDeferral. */
   function speak(text: string, session: MockLiveSession = live()): void {
     session.emit({ serverContent: { inputTranscription: { text } } });
+  }
+
+  /** A real-execution BUSY probe that runs on the pane's NATIVE shell with NO PATH-dependent
+   *  external binary, so the "REAL busy pane" half of Journey-4 is portable. POSIX `cat` blocks
+   *  reading the tty; on Windows there is no cmd.exe `cat` builtin and `cat.exe` is NOT on the
+   *  system PATH (only Git Bash provides it) — a clean Windows box prints "cat is not recognized",
+   *  the pane exits to Idle, and the is_busy assertion fails. The Windows analogue is `ping -n 600
+   *  127.0.0.1`: a native binary (C:\Windows\System32\ping.exe, always present) that runs ~600s as a
+   *  genuine non-shell foreground child the authoritative process-tree probe (statusProbe.ts → a
+   *  non-SHELL_COMMS descendant ⇒ busy) reports as Running. NOTE: `timeout /t 600 /nobreak` does NOT
+   *  work here — `timeout.exe` aborts immediately ("Input redirection is not supported") when run
+   *  under a ConPTY where stdin is redirected, so it never blocks; `ping` reads no stdin and is the
+   *  verified choice. `ping` is the allowlisted first token (DEFAULT_SHELL_ALLOWLIST), so it
+   *  auto-executes under Full Auto exactly like `cat`. */
+  function blockingProbe(): string {
+    return process.platform === "win32" ? "ping -n 600 127.0.0.1" : "cat";
   }
 
   /** Create a REAL shell pane by VOICE (create_pane, gated Auto for the suite) — the genuine
@@ -322,12 +339,14 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     await createShellPane("vj-idle");
     await createShellPane("vj-busy", "Full Auto");
 
-    // Drive the busy work through the REAL voice pipe: Full-Auto + allowlisted `cat` auto-executes
-    // (decideProposal -> auto_execute -> term.writeInput). `cat` then blocks reading the tty, so
-    // the pane holds a genuine foreground command the authoritative /proc probe reports as busy.
+    // Drive the busy work through the REAL voice pipe: Full-Auto + the allowlisted blockingProbe()
+    // first token auto-executes (decideProposal -> auto_execute -> term.writeInput). The probe then
+    // blocks in the foreground (POSIX `cat` reading the tty; Windows `ping -n 600 127.0.0.1` as a
+    // native console child — see blockingProbe()), so the pane holds a genuine foreground command the
+    // authoritative probe reports as busy on BOTH platforms (cmd.exe has no `cat`, so this is portable).
     const callId = live().emitToolCall("propose_command", {
       pane_id: "vj-busy",
-      instruction: "cat",
+      instruction: blockingProbe(),
       kind: "shell",
     });
     const out = String(await waitFor(() => mock.responseFor(callId)));
