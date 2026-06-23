@@ -46,6 +46,7 @@ import {
   contextMeterColor,
   classifyMarkdownLine,
   dispatchWsMessage,
+  classifyRawKeyOutcome,
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
 import { buildMockData } from "./mockData";
@@ -989,17 +990,20 @@ function AppRaw() {
       });
       // Nit #3: surface every non-2xx outcome to the operator (no more silent swallow). apiFetch does
       // NOT throw on non-2xx, so branch on status. 403 = gated Off; 202 = deferred (Ask); 409 = the
-      // pane is not active / not running. Each gets an earcon + a transient toast.
-      if (res.status === 202) {
-        playEarcon("execute"); // queued, awaiting operator confirm
-        showRawKeyToast("deferred", "Key Deferred — Awaiting Confirm", `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.`);
-      } else if (res.status === 403) {
-        playEarcon("alert"); // gated Off (NO "error" earcon token exists)
-        showRawKeyToast("blocked", "Key Blocked by Policy", `Pane ${paneId}: this key is gated Off and was not sent.`);
-      } else if (res.status === 409) {
-        playEarcon("alert");
-        const reason = await res.json().then((b) => (b && typeof b.error === "string" ? b.error : "")).catch(() => "");
-        showRawKeyToast("refused", "Key Not Delivered", reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.`);
+      // pane is not active / not running. Each gets an earcon + a transient toast. dbt4: the status
+      // ladder is now classifyRawKeyOutcome (pure, unit-pinned). The earcon is reason-independent, so
+      // it plays BEFORE the 409 json read (original ordering: 409 did playEarcon then await json),
+      // then the 409 reason is resolved and merged into the toast detail.
+      const base = classifyRawKeyOutcome(res.status, paneId, "");
+      if (base) {
+        playEarcon(base.earcon);
+        const detail = res.status === 409
+          ? await res.json()
+              .then((b) => (b && typeof b.error === "string" ? b.error : ""))
+              .catch(() => "")
+              .then((reason) => reason || base.toast.detail)
+          : base.toast.detail;
+        showRawKeyToast(base.toast.tone, base.toast.title, detail);
       }
     } catch (e) {}
   };
