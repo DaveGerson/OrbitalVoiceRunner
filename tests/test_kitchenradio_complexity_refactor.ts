@@ -3,35 +3,21 @@
 // during the cyclomatic-complexity burndown (CC 33→7 for KitchenRadio,
 // CC 13→9 for Bubble).
 //
-// IMPORT STRATEGY: KitchenRadio.tsx → primitives.tsx → icons.svg?raw. The
-// `?raw` Vite query is not understood by the tsx/Node runner. We register a
-// resolve hook (via node:module register()) before doing a dynamic import of
-// the target module, so the SVG stub fires before Node's format-detection fails.
+// IMPORT STRATEGY: KitchenRadio.tsx → primitives.tsx → icons.svg?raw, plus react.
+// The shared stub loader (helpers/viteStubLoader.ts) intercepts those Vite-only /
+// React imports before the dynamic import below, so the module graph loads under
+// the tsx/Node runner without Vite.
 //
 // Runner: npx tsx --test --test-force-exit tests/test_kitchenradio_complexity_refactor.ts
 
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { register } from "node:module";
-import { pathToFileURL } from "node:url";
 
-// Register SVG stub BEFORE any dynamic import of KitchenRadio (which transitively
-// pulls in primitives.tsx → icons.svg?raw).
-register(
-  "data:text/javascript," +
-    encodeURIComponent(
-      `export async function resolve(s,ctx,next){` +
-        `if(s.includes('.svg')){return{url:'data:text/javascript,export%20default%20%22%22%3B',shortCircuit:true};}` +
-        `return next(s,ctx);}` +
-      `export async function load(u,ctx,next){` +
-        // node can leak the ?raw query onto the synthetic data: URL (-> ...";?raw, invalid JS);
-        // decode only up to the first '?'. Also stub a bare .svg that reaches load directly.
-        `if(u.startsWith('data:text/javascript,')){const h='data:text/javascript,';const q=u.indexOf('?',h.length);const p=q===-1?u.slice(h.length):u.slice(h.length,q);return{format:'module',source:decodeURIComponent(p),shortCircuit:true};}` +
-        `if(u.includes('.svg')){return{format:'module',source:'export default ""',shortCircuit:true};}` +
-        `return next(u,ctx);}`,
-    ),
-  pathToFileURL("./"),
-);
+import { registerViteStubs } from "./helpers/viteStubLoader.js";
+
+// Register the shared Vite/React stub loader BEFORE importing the KitchenRadio
+// graph (which transitively pulls in primitives.tsx → icons.svg?raw).
+registerViteStubs();
 
 // Resolved lazily so the hook above is active when the module is first loaded.
 type KRModule = typeof import("../src/orbital/KitchenRadio.js");
