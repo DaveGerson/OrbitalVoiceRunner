@@ -29,7 +29,7 @@ import {
   projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
-  templateClarifyText, templateApplyToast, layoutGatedText,
+  templateClarifyText, templateApplyToast, layoutGatedText, dismissAttentionOutcome,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -1243,8 +1243,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     if (mockClientOnly()) { showToast("Cleared that alert"); return; }
     try {
       const res = await apiFetch(`/api/attention/${id}/dismiss`, { method: "POST" });
-      if (res.status === 403) { restore(); showToast("Dismissing alerts is gated off, Chef", "warn"); return; }
-      if (!res.ok) { restore(); showToast("That didn't go through, Chef — try again.", "warn"); return; }
+      // A dismiss is veto-class: gated-Off does NOT 403, it returns kind:ok -> 200 with an "Error:"-
+      // wrapped output, so a bare 200 is not proof the alert cleared (see dismissAttentionOutcome).
+      const body = res.ok ? await res.json().catch(() => ({} as Record<string, unknown>)) : {};
+      const outcome = dismissAttentionOutcome(res.status, res.ok, body);
+      if (outcome === "blocked") { restore(); showToast("Dismissing alerts is gated off, Chef", "warn"); return; }
+      if (outcome === "failed") { restore(); showToast("That didn't go through, Chef — try again.", "warn"); return; }
       showToast("Cleared that alert");
       if (!isMockModeRef.current) refetchAttention();
     } catch { restore(); showToast("That didn't go through, Chef — try again.", "warn"); }

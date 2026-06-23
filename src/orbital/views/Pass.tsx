@@ -46,7 +46,8 @@ export function resolveTemplateInitial(initial?: { name: string; description: st
 
 // ── D2: the Attention ("what needs me") tab ───────────────────────────────────
 // The act a queue row offers, by AttentionItem.type:
-//   approval / confirmation → a staged gate decision: approve | deny
+//   approval / confirmation → live items carry no messageId, so they can't resolve a gate yet:
+//     "Open" (go to the station) + "Dismiss". Reserve a true Approve/Deny for a resolvable messageId.
 //   error / exited / build-failed → a dead/failed station: restart (+ jump)
 //   idle (completion) / anything else → nothing to act on: jump to the station
 export type AttentionActKind = "approve" | "restart" | "jump";
@@ -467,8 +468,8 @@ function AttentionRow({ item, dark, onApprove, onDeny, onRestart, onJump, onDism
     if (act === "approve") {
       return (
         <>
-          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Approve" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Approve</span></button>
-          <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Deny" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
+          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Go to station" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Open</span></button>
+          <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Dismiss" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
         </>
       );
     }
@@ -505,8 +506,10 @@ function AttentionTab({ items, dark, onApprove, onDeny, onRestart, onJump, onDis
   return (
     <div data-testid="attn-list" style={{ display: "flex", flexDirection: "column", gap: 8, padding: "2px 16px 14px" }}>
       {live.map((it) => (
-        <AttentionRow key={it.id} item={it} dark={dark}
-          onApprove={onApprove} onDeny={onDeny} onRestart={onRestart} onJump={onJump} onDismiss={onDismiss} />
+        <Fragment key={it.id}>
+          <AttentionRow item={it} dark={dark}
+            onApprove={onApprove} onDeny={onDeny} onRestart={onRestart} onJump={onJump} onDismiss={onDismiss} />
+        </Fragment>
       ))}
     </div>
   );

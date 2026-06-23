@@ -168,3 +168,18 @@ export function layoutApplyToast(d: Record<string, unknown>): ToastSpec {
   const applied = out.includes("applied");
   return { msg: out, kind: applied ? "fire" : "warn", earcon: applied ? "execute" : undefined };
 }
+
+/** dismissAttention: classify the REST response into the outcome the hook applies. A dismiss is
+ *  veto-class, so a gated-Off run does NOT 403 — it returns kind:ok → HTTP 200 with a body whose
+ *  `output` starts with "Error:" (the "gated Off … forbidden by policy" narration). So a 200 is NOT
+ *  proof the alert cleared: only a 200 WITHOUT an "Error:"-wrapped output is a real success.
+ *    - status 403 → blocked (restore + warn)
+ *    - !ok        → failed  (restore + warn)
+ *    - 200 with output starting "Error:" → blocked (restore + warn)  ← the gate-off honesty case
+ *    - otherwise  → cleared (success toast) */
+export function dismissAttentionOutcome(status: number, ok: boolean, body: Record<string, unknown>): "cleared" | "blocked" | "failed" {
+  if (status === 403) return "blocked";
+  if (!ok) return "failed";
+  if (typeof body.output === "string" && body.output.startsWith("Error:")) return "blocked";
+  return "cleared";
+}

@@ -12,6 +12,10 @@
 //   3. attentionTabLabel / attentionTabActUnit (src/orbital/views/Pass.tsx) — the tab toggle label
 //      ("Attention" / "Attention • N") and the per-item act-kind resolution (approve/deny/jump/
 //      restart) that drives which buttons a queue row shows.
+//   4. dismissAttentionOutcome (src/orbital/useOrbitalDataHelpers.ts) — the dismiss-response
+//      classifier. A dismiss is veto-class, so gated-Off does NOT 403: it returns kind:ok → HTTP 200
+//      with an "Error:"-wrapped output, which a bare 200-check would mistake for success. Plus the
+//      optimistic-remove + restore wiring the hook runs around it (403 / non-ok / 200-error → restore).
 //
 // PURE: items (1) import the real helper module; (2) imports appHelpers (no React); (3) loads
 // Pass.tsx through the same Node ESM loader-hook shim the Pass complexity test uses (Vite-only
@@ -23,8 +27,9 @@ import { register } from "node:module";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { attentionQueueFromFrame } from "../src/orbital/useOrbitalDataHelpers";
+import { attentionQueueFromFrame, dismissAttentionOutcome } from "../src/orbital/useOrbitalDataHelpers";
 import { dispatchWsMessage, type WsHandlerCtx } from "../src/appHelpers";
+import type { AttentionItem } from "../src/types";
 
 // ── 1. attentionQueueFromFrame — adopt-or-refetch reducer ─────────────────────
 describe("attentionQueueFromFrame", () => {
@@ -158,5 +163,92 @@ describe("attnChip", () => {
   it("an unknown type falls back to a generic pin chip carrying the raw type", () => {
     assert.deepEqual(attnChip("mystery"), { emoji: "📌", label: "mystery", bg: "#8a6a4f" });
     assert.deepEqual(attnChip(""), { emoji: "📌", label: "alert", bg: "#8a6a4f" });
+  });
+});
+
+// ── 4. dismissAttentionOutcome — the dismiss response classifier ──────────────
+// A dismiss is veto-class: gated-Off does NOT 403, it returns kind:ok → HTTP 200 with a body whose
+// `output` starts with "Error:". So a bare 200 is NOT proof the alert cleared. This pins all four arms.
+describe("dismissAttentionOutcome", () => {
+  it("403 (some gate refuses) → blocked", () => {
+    assert.equal(dismissAttentionOutcome(403, false, {}), "blocked");
+  });
+  it("any non-ok status (e.g. 500) → failed", () => {
+    assert.equal(dismissAttentionOutcome(500, false, { error: "boom" }), "failed");
+    assert.equal(dismissAttentionOutcome(404, false, {}), "failed");
+  });
+  it("200 with an 'Error:'-wrapped output (gate-off honesty case) → blocked, NOT a false success", () => {
+    assert.equal(dismissAttentionOutcome(200, true,
+      { output: "Error: the 'dismiss_attention' capability is gated Off; dismissing alerts is forbidden by policy." }),
+      "blocked");
+  });
+  it("a clean 200 (real dismissal narration) → cleared", () => {
+    assert.equal(dismissAttentionOutcome(200, true, { output: "Cleared alert a1." }), "cleared");
+    assert.equal(dismissAttentionOutcome(200, true, {}), "cleared"); // no output is still a real 200
+  });
+});
+
+// ── 5. dismissAttention optimistic-remove + restore wiring ────────────────────
+// Reconstructs the exact closure dismissAttention runs (src/orbital/useOrbitalData.ts): capture the
+// removed item, optimistically drop it, then restore() (idempotently) on a blocked/failed outcome. We
+// drive a fake setState through every outcome the classifier returns and assert the queue end-state.
+function makeQueueState(initial: AttentionItem[]) {
+  let queue = [...initial];
+  const setAttentionQueue = (fn: (prev: AttentionItem[]) => AttentionItem[]) => { queue = fn(queue); };
+  return { get: () => queue, setAttentionQueue };
+}
+function item(id: string): AttentionItem {
+  return { id, type: "exited", terminalId: "t1", projectId: "p1", message: "m", timestamp: "0", dismissed: false };
+}
+// Mirrors the hook's optimistic-remove + outcome-driven restore (only the queue-mutation seam — fetch
+// stubbed to a (status, ok, body) triple the real handler would derive from the REST response).
+function runDismiss(state: ReturnType<typeof makeQueueState>, id: string, status: number, ok: boolean, body: Record<string, unknown>) {
+  let removed: AttentionItem | undefined;
+  state.setAttentionQueue((prev) => { removed = prev.find((a) => a.id === id) ?? removed; return prev.filter((a) => a.id !== id); });
+  const restore = () => { const r = removed; if (r) state.setAttentionQueue((prev) => (prev.some((a) => a.id === r.id) ? prev : [...prev, r])); };
+  const outcome = dismissAttentionOutcome(status, ok, body);
+  if (outcome === "blocked" || outcome === "failed") restore();
+  return outcome;
+}
+
+describe("dismissAttention optimistic remove + restore", () => {
+  it("optimistically removes the item before the response lands", () => {
+    const state = makeQueueState([item("a"), item("b")]);
+    let removed: AttentionItem | undefined;
+    state.setAttentionQueue((prev) => { removed = prev.find((a) => a.id === "a"); return prev.filter((a) => a.id !== "a"); });
+    assert.deepEqual(state.get().map((a) => a.id), ["b"]); // gone immediately
+    assert.equal(removed?.id, "a");
+  });
+  it("restores the item on a 403 (blocked)", () => {
+    const state = makeQueueState([item("a"), item("b")]);
+    assert.equal(runDismiss(state, "a", 403, false, {}), "blocked");
+    assert.deepEqual(state.get().map((x) => x.id).sort(), ["a", "b"]); // restored
+  });
+  it("restores the item on a non-ok status (failed)", () => {
+    const state = makeQueueState([item("a"), item("b")]);
+    assert.equal(runDismiss(state, "a", 500, false, { error: "boom" }), "failed");
+    assert.deepEqual(state.get().map((x) => x.id).sort(), ["a", "b"]); // restored
+  });
+  it("restores the item on a gate-off 200-wrapped 'Error:' body (NOT a false success)", () => {
+    const state = makeQueueState([item("a"), item("b")]);
+    const out = runDismiss(state, "a", 200, true,
+      { output: "Error: the 'dismiss_attention' capability is gated Off; dismissing alerts is forbidden by policy." });
+    assert.equal(out, "blocked");
+    assert.deepEqual(state.get().map((x) => x.id).sort(), ["a", "b"]); // restored, not silently dropped
+  });
+  it("keeps the item removed on a clean 200 (a real dismissal)", () => {
+    const state = makeQueueState([item("a"), item("b")]);
+    assert.equal(runDismiss(state, "a", 200, true, { output: "Cleared alert a." }), "cleared");
+    assert.deepEqual(state.get().map((x) => x.id), ["b"]); // stays gone
+  });
+  it("restore is idempotent — never double-adds if the item is somehow already back", () => {
+    const state = makeQueueState([item("a")]);
+    // simulate the item already restored (e.g. a racing attention_updated frame) before restore() runs
+    let removed: AttentionItem | undefined;
+    state.setAttentionQueue((prev) => { removed = prev.find((a) => a.id === "a"); return prev.filter((a) => a.id !== "a"); });
+    state.setAttentionQueue((prev) => [...prev, item("a")]); // racing re-add
+    const restore = () => { const r = removed; if (r) state.setAttentionQueue((prev) => (prev.some((a) => a.id === r.id) ? prev : [...prev, r])); };
+    restore();
+    assert.equal(state.get().filter((x) => x.id === "a").length, 1); // exactly one, no dup
   });
 });
