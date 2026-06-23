@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
+import { playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
@@ -46,7 +46,10 @@ import {
   contextMeterColor,
   classifyMarkdownLine,
   dispatchWsMessage,
+  classifyRawKeyOutcome,
 } from "./appHelpers";
+import { useLiveSession } from "./hooks/useLiveSession";
+import { buildMockData } from "./mockData";
 
 // Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
 // the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
@@ -448,18 +451,13 @@ function AppRaw() {
     }, 120);
   };
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
-  const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // dbt4: the WS + Web-Audio capture/playback refs and the connect/start/stop/cleanup +
+  // auto-reconnect lifecycle now live in useLiveSession (src/hooks/useLiveSession.ts). isMicMutedRef
+  // and activeTerminalIdRef stay App-owned (App mirrors state into them) and are passed in.
   const isMicMutedRef = useRef(false);
-  const desiredLiveRef = useRef(false);
   // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
@@ -630,13 +628,6 @@ function AppRaw() {
 
   // Restart the live voice session so reconnect-only settings (voice, model, API
   // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
-  const reconnectLive = async () => {
-    if (isLive) {
-      stopLive();
-      setTimeout(() => { startLive(); }, 400);
-    }
-  };
-
   const fetchPendingCommands = async () => {
     if (isMockModeRef.current) return;
     try {
@@ -999,17 +990,20 @@ function AppRaw() {
       });
       // Nit #3: surface every non-2xx outcome to the operator (no more silent swallow). apiFetch does
       // NOT throw on non-2xx, so branch on status. 403 = gated Off; 202 = deferred (Ask); 409 = the
-      // pane is not active / not running. Each gets an earcon + a transient toast.
-      if (res.status === 202) {
-        playEarcon("execute"); // queued, awaiting operator confirm
-        showRawKeyToast("deferred", "Key Deferred — Awaiting Confirm", `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.`);
-      } else if (res.status === 403) {
-        playEarcon("alert"); // gated Off (NO "error" earcon token exists)
-        showRawKeyToast("blocked", "Key Blocked by Policy", `Pane ${paneId}: this key is gated Off and was not sent.`);
-      } else if (res.status === 409) {
-        playEarcon("alert");
-        const reason = await res.json().then((b) => (b && typeof b.error === "string" ? b.error : "")).catch(() => "");
-        showRawKeyToast("refused", "Key Not Delivered", reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.`);
+      // pane is not active / not running. Each gets an earcon + a transient toast. dbt4: the status
+      // ladder is now classifyRawKeyOutcome (pure, unit-pinned). The earcon is reason-independent, so
+      // it plays BEFORE the 409 json read (original ordering: 409 did playEarcon then await json),
+      // then the 409 reason is resolved and merged into the toast detail.
+      const base = classifyRawKeyOutcome(res.status, paneId, "");
+      if (base) {
+        playEarcon(base.earcon);
+        const detail = res.status === 409
+          ? await res.json()
+              .then((b) => (b && typeof b.error === "string" ? b.error : ""))
+              .catch(() => "")
+              .then((reason) => reason || base.toast.detail)
+          : base.toast.detail;
+        showRawKeyToast(base.toast.tone, base.toast.title, detail);
       }
     } catch (e) {}
   };
@@ -1047,163 +1041,53 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const cleanupSocketOnly = () => {
-    // Burndown: each teardown was an identical `if (ref.current) { try { close } catch; ref=null }`.
-    // `disposeRef` performs that exact guarded teardown + null-out for one ref, so the per-ref CC
-    // collapses into a single call. Behavior (which refs, which closer, the null-out) is unchanged.
-    const disposeRef = <T,>(ref: React.MutableRefObject<T | null>, close: (v: T) => void) => {
-      if (ref.current) {
-        try { close(ref.current); } catch (e) {}
-        ref.current = null;
-      }
-    };
-    disposeRef(wsRef, (ws: WebSocket) => ws.close());
-    disposeRef(processorRef, (p: ScriptProcessorNode) => p.disconnect());
-    disposeRef(sourceRef, (s: MediaStreamAudioSourceNode) => s.disconnect());
-    disposeRef(streamRef, (s: MediaStream) => s.getTracks().forEach((track) => track.stop()));
-    disposeRef(voiceCaptureCtxRef, (c: AudioContext) => c.close());
-    disposeRef(voicePlaybackCtxRef, (c: AudioContext) => c.close());
+  // dbt4: the live voice-session lifecycle (ws + audio refs, connect/start/stop/cleanup +
+  // auto-reconnect) lives in useLiveSession. App owns the WS-message routing: onWsMessage builds
+  // the dispatchWsMessage ctx exactly as the former inline ws.onmessage did (same setters/refs/
+  // helpers, same ORDERING), with the connection-local 24kHz playbackCtx threaded in for audio.
+  const onWsMessage = (msg: any, playbackCtx: AudioContext) => {
+    dispatchWsMessage(msg, {
+      playEarcon,
+      triggerDesktopNotification,
+      setPendingCommands,
+      setPendingActions,
+      setActiveTerminalId,
+      setIsBufferFocused,
+      setPromptBuffer,
+      fetchWipDrafts,
+      setTerminals,
+      setFrozen,
+      setFrozenRunning,
+      setLedger,
+      setGlobalPermissionsMode,
+      setSettings,
+      setIsMicMuted,
+      setAutoApprovedNotification,
+      setBlockedNotification,
+      setTranscript,
+      setWsErrorNotification,
+      setProactiveNotifications,
+      setPlans,
+      queueStdoutChunk,
+      fetchTerminals,
+      fetchPlans,
+      fetchActiveTerminalHistory,
+      resetAudioPlayback,
+      playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
+      upsertNotification,
+      effectForEvent,
+      activeTerminalIdRef,
+    });
   };
 
-  const connectLive = async () => {
-    try {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      const captureCtx = new AudioContext({ sampleRate: 16000 });
-      const playbackCtx = new AudioContext({ sampleRate: 24000 });
-      voiceCaptureCtxRef.current = captureCtx;
-      voicePlaybackCtxRef.current = playbackCtx;
-      resetAudioPlayback();
-
-      ws.onopen = async () => {
-        setIsLive(true);
-        setIsReconnecting(false);
-        // Step 5: re-assert the source of truth on (re)connect so the server knows which pane the
-        // operator has open before Janus can propose anything.
-        ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-          streamRef.current = stream;
-          
-          const source = captureCtx.createMediaStreamSource(stream);
-          sourceRef.current = source;
-          const processor = captureCtx.createScriptProcessor(4096, 1, 1);
-          processorRef.current = processor;
-          
-          source.connect(processor);
-          processor.connect(captureCtx.destination);
-
-          processor.onaudioprocess = (e) => {
-            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
-              wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
-            }
-          };
-        } catch (mediaErr) {
-          console.error("Microphone streaming failed to start:", mediaErr);
-        }
-      };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        // WS-D / burndown: the long per-type if/else-if ladder was relocated VERBATIM into the
-        // prototype-safe dispatch table in ./appHelpers (mirroring eventBus.effectForEvent). The
-        // ctx bundles exactly the setters/refs/helpers the original branches captured, so every
-        // branch's setState/side-effect ORDERING is preserved byte-for-byte. The `else` arm's
-        // eventBus fallback (effectForEvent → setter switch + earcon) lives there too.
-        dispatchWsMessage(msg, {
-          playEarcon,
-          triggerDesktopNotification,
-          setPendingCommands,
-          setPendingActions,
-          setActiveTerminalId,
-          setIsBufferFocused,
-          setPromptBuffer,
-          fetchWipDrafts,
-          setTerminals,
-          setFrozen,
-          setFrozenRunning,
-          setLedger,
-          setGlobalPermissionsMode,
-          setSettings,
-          setIsMicMuted,
-          setAutoApprovedNotification,
-          setBlockedNotification,
-          setTranscript,
-          setWsErrorNotification,
-          setProactiveNotifications,
-          setPlans,
-          queueStdoutChunk,
-          fetchTerminals,
-          fetchPlans,
-          fetchActiveTerminalHistory,
-          resetAudioPlayback,
-          playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
-          upsertNotification,
-          effectForEvent,
-          activeTerminalIdRef,
-        });
-      };
-
-      ws.onclose = (event) => {
-        cleanupSocketOnly();
-        
-        // Adaptive auto-reconnection if closure was unexpected from server-side or connection drops
-        if (desiredLiveRef.current) {
-          setIsLive(true);
-          setIsReconnecting(true);
-          
-          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (desiredLiveRef.current) {
-              connectLive();
-            }
-          }, 3000);
-        } else {
-          setIsLive(false);
-          setIsReconnecting(false);
-        }
-      };
-    } catch (e) {
-      console.error("Connection establish failed:", e);
-      cleanupSocketOnly();
-      if (desiredLiveRef.current) {
-        setIsLive(true);
-        setIsReconnecting(true);
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (desiredLiveRef.current) connectLive();
-        }, 3000);
-      } else {
-        setIsLive(false);
-        setIsReconnecting(false);
-      }
-    }
-  };
-
-  const startLive = async () => {
-    desiredLiveRef.current = true;
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    await connectLive();
-  };
-
-  const stopLive = () => {
-    desiredLiveRef.current = false;
-    setIsLive(false);
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    cleanupSocketOnly();
-  };
+  const { wsRef, startLive, stopLive, reconnectLive } = useLiveSession({
+    activeTerminalIdRef,
+    isMicMutedRef,
+    setIsLive,
+    setIsReconnecting,
+    isLive,
+    onWsMessage,
+  });
 
   const generateMockData = () => {
     isMockModeRef.current = !isMockMode;
@@ -1218,119 +1102,14 @@ function AppRaw() {
       return;
     }
 
-    // Turn on mock mode and populate fake data
-    const mockTermId1 = "terminal_mock_1";
-    const mockTermId2 = "terminal_mock_2";
-    const mockTermId3 = "terminal_mock_3";
-    
-    setTerminals([
-      {
-        id: mockTermId1,
-        cwd: "/home/user/workspace/web-app",
-        command: "npm run dev",
-        output: "\\n> web-app@1.0.0 dev\\n> vite\\n\\n  VITE v5.0.0  ready in 150 ms\\n\\n  ➜  Local:   http://localhost:5173/\\n  ➜  Network: use --host to expose",
-        status: "Running",
-        tool_preset: "Claude Code",
-        permissions_mode: "Full Auto",
-        context_size: 450
-      },
-      {
-        id: mockTermId2,
-        cwd: "/home/user/workspace/backend-api",
-        command: "python main.py",
-        output: "Starting server on port 8000...\\nConnecting to db...\\nDatabase connected.",
-        status: "Idle",
-        tool_preset: "Custom",
-        permissions_mode: "Human-in-the-Loop",
-        context_size: 2300
-      },
-      {
-        id: mockTermId3,
-        cwd: "/home/user/workspace/data-pipeline",
-        command: "npm run build",
-        output: "[ERROR] Failed to compile data-pipeline.\\nModuleNotFoundError: No module named 'pandas'\\n\\nError: Command failed with exit code 1.\\nPlease verify your dependencies are installed.",
-        status: "Running",
-        tool_preset: "Claude Code",
-        permissions_mode: "Full Auto",
-        context_size: 1024
-      }
-    ]);
-
-    setLedger({
-      "mock_project_alpha": {
-        id: "mock_project_alpha",
-        name: "Alpha Project",
-        directory: "/home/user/workspace",
-        summary: "This is a mock project to test UI capability.",
-        notes: ["Remember to check API rate limits"],
-        keyTerms: ["react", "vite", "nodejs"],
-        panes: {
-          [mockTermId1]: {
-            pane_id: mockTermId1,
-            name: "React Frontend",
-            runtime_type: "shell",
-            last_known_state: "Running",
-            is_busy: true,
-            alive: true,
-            notes: ["Dev server running"],
-            permissions_mode: "Full Auto",
-            session_id: "mock-sess-1",
-            tool_preset: "Claude Code",
-            context_size: 450
-          },
-          [mockTermId2]: {
-            pane_id: mockTermId2,
-            name: "Python Backend",
-            runtime_type: "shell",
-            last_known_state: "Idle",
-            is_busy: false,
-            alive: true,
-            notes: ["DB Connected"],
-            permissions_mode: "Human-in-the-Loop",
-            session_id: "mock-sess-2",
-            tool_preset: "Custom",
-            context_size: 2300
-          },
-          [mockTermId3]: {
-            pane_id: mockTermId3,
-            name: "Data Pipeline",
-            runtime_type: "shell",
-            last_known_state: "Running",
-            is_busy: true,
-            alive: true,
-            notes: ["Needs to install pandas", "Troubleshoot build failure"],
-            permissions_mode: "Full Auto",
-            session_id: "mock-sess-3",
-            tool_preset: "Claude Code",
-            context_size: 1024
-          }
-        }
-      }
-    });
-
-    setActiveProjectId("mock_project_alpha");
-    
-    setPendingCommands([
-      {
-        messageId: "mock_msg_1",
-        cmd: "npm install tailwindcss",
-        terminalId: mockTermId2,
-        rationale: { trigger: "I need tailwind", summary: "To add styling support to the project." }
-      },
-      {
-        messageId: "mock_msg_2",
-        cmd: "pip install pandas",
-        terminalId: mockTermId3,
-        rationale: { trigger: "Missing module", summary: "To fix the build error shown in the terminal output." }
-      }
-    ]);
-
-    setTranscript([
-      { sender: "User", text: "Please start the development server and prepare the background worker.", timestamp: new Date(Date.now() - 60000) },
-      { sender: "Janus", text: "Understood. I will spin up the React frontend and initialize the Python backend.", timestamp: new Date(Date.now() - 55000) },
-      { sender: "User", text: "Great, also install tailwind on the backend for some reason.", timestamp: new Date(Date.now() - 10000) },
-      { sender: "Janus", text: "I noticed an error in the data pipeline build regarding a missing 'pandas' module. I have proposed a command to install it.", timestamp: new Date(Date.now() - 5000) }
-    ]);
+    // Turn on mock mode and populate fake data. dbt4: the fixture literals were evicted into the
+    // pure buildMockData factory (src/mockData.ts); the setter order here is unchanged.
+    const mock = buildMockData(Date.now());
+    setTerminals(mock.terminals);
+    setLedger(mock.ledger);
+    setActiveProjectId(mock.activeProjectId);
+    setPendingCommands(mock.pendingCommands);
+    setTranscript(mock.transcript);
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);

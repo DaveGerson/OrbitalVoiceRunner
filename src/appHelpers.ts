@@ -9,6 +9,7 @@
 // refactor only RELOCATES computation; it changes nothing observable.
 
 import type { Terminal, PaneMeta } from "./types";
+import type { EarconType } from "./announcementKinds";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status resolution + pane filtering (the `term?.status || (pane.alive ? …)` idiom, repeated
@@ -550,4 +551,41 @@ export function dispatchWsMessage(msg: any, ctx: WsHandlerCtx): void {
   } else {
     handleEventBusFallback(msg, ctx);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Raw-key POST outcome (multi-cli adapter nit #3). The /raw-input route returns 202 (deferred —
+// gate Ask), 403 (blocked — gate Off), or 409 (refused — pane not active / no live process). Each
+// surfaces an earcon + a transient toast. VERBATIM relocation of App.writeControlKey's status
+// ladder so the decision is unit-pinnable; 2xx and any other status -> null (silent success).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type RawKeyToastTone = "blocked" | "deferred" | "refused";
+export interface RawKeyOutcome {
+  earcon: EarconType;
+  toast: { tone: RawKeyToastTone; title: string; detail: string };
+}
+
+/** Map a raw-input response status to its operator feedback. `reason` is the server-supplied 409
+ *  detail (already resolved from res.json by the caller; "" when absent). Null -> no feedback. */
+export function classifyRawKeyOutcome(status: number, paneId: string, reason: string): RawKeyOutcome | null {
+  if (status === 202) {
+    return {
+      earcon: "execute", // queued, awaiting operator confirm
+      toast: { tone: "deferred", title: "Key Deferred — Awaiting Confirm", detail: `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.` },
+    };
+  }
+  if (status === 403) {
+    return {
+      earcon: "alert", // gated Off (NO "error" earcon token exists)
+      toast: { tone: "blocked", title: "Key Blocked by Policy", detail: `Pane ${paneId}: this key is gated Off and was not sent.` },
+    };
+  }
+  if (status === 409) {
+    return {
+      earcon: "alert",
+      toast: { tone: "refused", title: "Key Not Delivered", detail: reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.` },
+    };
+  }
+  return null;
 }
