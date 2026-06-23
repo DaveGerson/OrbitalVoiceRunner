@@ -47,6 +47,11 @@ import {
   classifyMarkdownLine,
   dispatchWsMessage,
   classifyRawKeyOutcome,
+  formatCharCount,
+  formatCharCountLower,
+  formatCompactBytes,
+  formatTokenCount,
+  estimateTokens,
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
 import { buildMockData } from "./mockData";
@@ -1347,7 +1352,7 @@ function AppRaw() {
 
   const totalContextSize = sumContextSize(activeProject?.panes, terminals);
 
-  const totalTokensEstimated = Math.ceil(totalContextSize / 4);
+  const totalTokensEstimated = estimateTokens(totalContextSize);
 
   const renderTerminalHealthHeatmap = () => {
     return (
@@ -2021,10 +2026,10 @@ function AppRaw() {
                 </span>
                 <div className="flex items-center gap-2 mt-1 leading-none select-none">
                   <span className={`text-xs font-mono font-black ${totalContextTextClass(totalContextSize)}`}>
-                    {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`}
+                    {formatCharCountLower(totalContextSize)}
                   </span>
                   <span className="text-xs font-mono opacity-40">
-                    (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+                    (~{formatTokenCount(totalTokensEstimated)} tokens)
                   </span>
                 </div>
                 {/* Context overload bar */}
@@ -2844,7 +2849,7 @@ function AppRaw() {
                           </div>
 
                           <div className="flex justify-between items-center text-xs text-zinc-500 font-mono select-none px-0.5 mt-1">
-                            <span className="flex items-center gap-1"><Database className="w-2.5 h-2.5 text-cyan-400 animate-pulse" /> {contextSize < 1000 ? `${contextSize} B` : `${(contextSize / 1000).toFixed(1)}k c`}</span>
+                            <span className="flex items-center gap-1"><Database className="w-2.5 h-2.5 text-cyan-400 animate-pulse" /> {formatCompactBytes(contextSize)}</span>
                             <span className="uppercase text-zinc-550 border border-white/5 px-1 rounded bg-[#0f0f0f] text-xs tracking-wide font-extrabold">{presetLabel}</span>
                           </div>
 
@@ -2911,10 +2916,10 @@ function AppRaw() {
                               <div className="flex flex-col items-end text-right">
                                 <span className="text-xs font-mono text-cyan-400 flex items-center gap-1 font-bold">
                                   <Database className="w-2.5 h-2.5" />
-                                  {contextSize < 1000 ? `${contextSize} B` : `${(contextSize / 1000).toFixed(1)}k c`}
+                                  {formatCompactBytes(contextSize)}
                                 </span>
                                 <span className="text-xs font-mono text-zinc-550">
-                                  ~{Math.ceil(contextSize / 4)} tkn
+                                  ~{estimateTokens(contextSize)} tkn
                                 </span>
                               </div>
                               <div className="h-6 w-px bg-white/5 hidden md:block"></div>
@@ -3049,7 +3054,7 @@ function AppRaw() {
                             <div className="flex justify-between items-center text-xs font-mono text-zinc-400">
                               <span className="flex items-center gap-1 text-cyan-400"><Database className="w-3 h-3" /> Context Memory</span>
                               <span>
-                                {contextSize < 1000 ? `${contextSize} Chars` : `${(contextSize / 1000).toFixed(1)}k Chars`} (~{Math.ceil(contextSize / 4)} Tokens)
+                                {formatCharCount(contextSize)} (~{estimateTokens(contextSize)} Tokens)
                               </span>
                             </div>
                             <div className="w-full h-1 bg-zinc-950 rounded overflow-hidden" title="Relative fill up to 20k characters memory threshold">
@@ -3299,7 +3304,7 @@ function AppRaw() {
                                 </div>
                                 <div className="flex justify-between">
                                   <span className="truncate max-w-[140px]">Session ID: <span className="text-zinc-400 text-xs">{pane.session_id || "None"}</span></span>
-                                  <span>Context: <span className="text-cyan-400 text-xs font-bold">{pane.context_size < 1000 ? `${pane.context_size} Chars` : `${(pane.context_size / 1000).toFixed(1)}k Chars`}</span></span>
+                                  <span>Context: <span className="text-cyan-400 text-xs font-bold">{formatCharCount(pane.context_size)}</span></span>
                                 </div>
                                 {!isLiveProcess && (
                                   <div className="pt-1.5 flex justify-end">
@@ -3548,7 +3553,7 @@ function AppRaw() {
         <div className="flex gap-6">
           <span className="text-xs font-mono opacity-30">UPTIME: ACTIVE DETECTED</span>
           <span className="text-xs font-mono text-cyan-400 font-bold tracking-wider">
-            CUMULATIVE CONTEXT SIZE: {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`} (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+            CUMULATIVE CONTEXT SIZE: {formatCharCountLower(totalContextSize)} (~{formatTokenCount(totalTokensEstimated)} tokens)
           </span>
         </div>
         <div className="flex gap-4">

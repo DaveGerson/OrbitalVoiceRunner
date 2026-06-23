@@ -597,3 +597,40 @@ export function classifyRawKeyOutcome(status: number, paneId: string, reason: st
   }
   return null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-size / token-count formatters (dbt4 round 2). App.tsx rendered the SAME
+// `n < 1000 ? \`${n} <suffix>\` : \`${(n / 1000).toFixed(1)}k <suffix>\`` ternary at six sites with
+// FOUR distinct suffix spellings, plus the `Math.ceil(n / 4)` token estimate at three. The suffix
+// spellings differ on purpose (capital "Chars"/"k Chars" in detail cards, capital "Chars" but
+// LOWERCASE "k chars" in the header/system bar, "B"/"k c" in the compact density readout, and a bare
+// count for token displays) — so each gets its OWN byte-exact helper rather than a unified one. Every
+// branch/suffix below is a VERBATIM relocation of the inline JSX expression; the rendered text is
+// identical. Pure so they can be unit-pinned without jsdom.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** "<n> Chars" under 1000, else "<n/1000 to 1dp>k Chars" (detailed card + pane-detail row). */
+export function formatCharCount(n: number): string {
+  return n < 1000 ? `${n} Chars` : `${(n / 1000).toFixed(1)}k Chars`;
+}
+
+/** "<n> Chars" under 1000, else "<n/1000 to 1dp>k chars" — note the LOWERCASE "k chars" on the big
+ *  arm (header context readout + system-bar cumulative line). Differs from formatCharCount only there. */
+export function formatCharCountLower(n: number): string {
+  return n < 1000 ? `${n} Chars` : `${(n / 1000).toFixed(1)}k chars`;
+}
+
+/** "<n> B" under 1000, else "<n/1000 to 1dp>k c" (compact + videowall card density readout). */
+export function formatCompactBytes(n: number): string {
+  return n < 1000 ? `${n} B` : `${(n / 1000).toFixed(1)}k c`;
+}
+
+/** Bare "<n>" under 1000, else "<n/1000 to 1dp>k" — no unit suffix (token-count displays). */
+export function formatTokenCount(n: number): string {
+  return n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`;
+}
+
+/** Token estimate: ceil(chars / 4), the 4-chars-per-token approximation used across the cards. */
+export function estimateTokens(n: number): number {
+  return Math.ceil(n / 4);
+}
