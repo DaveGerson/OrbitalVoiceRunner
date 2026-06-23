@@ -378,7 +378,9 @@ export function pendingApprovalBadgeCount(queue: AttentionItem[]): number {
  * Stamps `type:"approval"` + the held `messageId` so the row renders a REAL Approve/Deny (e7h's
  * id-gate), keyed by messageId for resolve-anywhere-clears-everywhere. The id is DETERMINISTIC
  * (`approval:<messageId>`) so a duplicate broadcast de-dups against itself and the promotion move
- * stays idempotent. `message` reuses the same cmd text the modal chip shows. Pure: frame → item.
+ * stays idempotent. `message` is the wrapped DISPLAY label; `rawCmd` preserves the unwrapped command so
+ * the promote-to-modal path can rebuild the PendingCommand with the real instruction (not the label).
+ * Pure: frame → item.
  */
 export function buildAttentionApprovalItem(msg: Record<string, unknown>): AttentionItem {
   const messageId = String(msg.messageId ?? "");
@@ -390,6 +392,7 @@ export function buildAttentionApprovalItem(msg: Record<string, unknown>): Attent
     terminalId,
     projectId: typeof msg.projectId === "string" ? msg.projectId : "",
     message: `${terminalId} needs your ok: ${cmd}`,
+    rawCmd: cmd,
     timestamp: String(Date.now()),
     dismissed: false,
     messageId,

@@ -741,7 +741,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         }
       },
       approval_resolved: () => {
-        if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+        // bead 8xn — "resolve anywhere clears EVERYWHERE." A held approval lives on exactly one
+        // surface (modal pendingCommands OR the focus-routed inbox), so resolving it via voice/REST/
+        // modal/TTL-sweep must drop it from BOTH. The server broadcast carries only the messageId;
+        // clear it from pendingCommands AND any inbox row keyed by it (the inbox row is client-
+        // synthesized and is NOT part of manager.attentionQueue, so attention_updated never clears it).
+        if (msg.messageId) {
+          setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+          setAttentionQueue((prev) => prev.filter((a) => !a.messageId || a.messageId !== msg.messageId));
+        }
         refetchPending();
       },
       // A gated non-PTY mutator staged on the Ask tier — carry the SERVER-resolved effective posture so
@@ -870,9 +878,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     const item = approvalToPromote(attentionQueueRef.current, activeTerminalIdRef.current);
     if (!item) return;
     setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id));         // leave the inbox
+    // Rebuild the PendingCommand from the RAW cmd (item.rawCmd), NOT the wrapped inbox label in
+    // item.message — the ApprovalDialog must render the real instruction, not "<pane> needs your ok: …".
     setPendingCommands((prev) => prev.some((c) => c.messageId === item.messageId)
       ? prev
-      : [...prev, buildPendingCommand({ messageId: item.messageId, cmd: item.message, terminalId: item.terminalId })]); // pop the modal
+      : [...prev, buildPendingCommand({ messageId: item.messageId, cmd: item.rawCmd ?? "", terminalId: item.terminalId })]); // pop the modal
   }, []);
 
   // Fires on every active-station change (the dep) AND on a tab visibilitychange (the listener).

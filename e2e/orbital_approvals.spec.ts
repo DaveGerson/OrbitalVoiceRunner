@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { armE2EWire, injectApprovalPendingFrame, switchActivePane, MOCK_TERMINAL_ID, MOCK_TERMINAL_ID_2 } from "./fixtures";
+import { armE2EWire, injectApprovalPendingFrame, injectApprovalResolvedFrame, switchActivePane, MOCK_TERMINAL_ID, MOCK_TERMINAL_ID_2 } from "./fixtures";
 
 // Wave P5a — HiTL gating in the kitchen. The reused ApprovalDialog (staged PTY write) and
 // ActionConfirmDialog (gated non-PTY action) render from the live pendingCommands/pendingActions,
@@ -177,5 +177,37 @@ test.describe("Orbital Kitchen — focus-routed approvals (bead 8xn)", () => {
     await page.getByTestId("pass-tab-attention").click();
     await page.getByTestId("attn-approve").first().click();
     await expect(page.getByTestId("pass-approval-badge")).toHaveAttribute("data-approval-count", "1");
+  });
+
+  // bead 8xn (round-1 review): "resolve anywhere clears EVERYWHERE." The four tests above only ever
+  // clear the inbox via the inbox Approve button (the one path that works through the optimistic
+  // filter). These two pin the EXACT round-1 failure mode: a held approval routed to the inbox,
+  // resolved on a NON-inbox surface (voice / cross-client REST / modal / TTL sweep — all of which
+  // arrive as the server's `approval_resolved` broadcast), must drop the inbox row AND the badge —
+  // and once cleared, walking to that station must NOT resurrect a zombie modal.
+  test("resolving a routed approval via a NON-inbox path (approval_resolved) clears the inbox row + badge", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "npm run deploy", MOCK_TERMINAL_ID_2, "msg_xsurf_1");
+    await expect(page.getByTestId("pass-approval-badge")).toHaveAttribute("data-approval-count", "1");
+    await page.getByTestId("pass-tab-attention").click();
+    await expect(page.getByTestId("attn-row")).toHaveCount(1);
+    // The server resolves it elsewhere (voice/REST/modal/TTL) → only an approval_resolved frame lands.
+    await injectApprovalResolvedFrame(page, "msg_xsurf_1", "approved");
+    await expect(page.getByTestId("attn-row")).toHaveCount(0);              // inbox row cleared
+    await expect(page.getByTestId("pass-approval-badge")).toHaveCount(0);   // badge gone (renders only when count > 0)
+  });
+
+  test("a routed approval resolved out-of-band does NOT resurrect a zombie modal on return to its station", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectApprovalPendingFrame(page, "drop table users", MOCK_TERMINAL_ID_2, "msg_zombie_1");
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0); // inbox, not modal
+    await page.getByTestId("pass-tab-attention").click();
+    await expect(page.getByTestId("attn-row")).toHaveCount(1);        // the routed row is present
+    // Resolve it out-of-band (voice/REST/modal/TTL) BEFORE the operator returns to the station.
+    await injectApprovalResolvedFrame(page, "msg_zombie_1", "approved");
+    await expect(page.getByTestId("attn-row")).toHaveCount(0);        // no stale inbox row to promote
+    // Walk to that station — the promotion effect must find nothing to resurrect.
+    await switchActivePane(page, MOCK_TERMINAL_ID_2);
+    await expect(page.getByTestId("approval-dialog")).toHaveCount(0); // NO phantom gate
   });
 });

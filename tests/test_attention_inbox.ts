@@ -239,6 +239,11 @@ describe("buildAttentionApprovalItem — the inbox leg of the router", () => {
     assert.equal(item.id, "approval:msg_9"); // deterministic → a duplicate broadcast de-dups against itself
     assert.ok(item.message.includes("claude_1") && item.message.includes("rm -rf build"));
   });
+  it("bead 8xn: preserves the RAW cmd in rawCmd (the unwrapped instruction the promote→modal path needs)", () => {
+    const item = buildAttentionApprovalItem({ messageId: "msg_9", terminalId: "claude_1", cmd: "drop table users" });
+    assert.equal(item.rawCmd, "drop table users"); // NOT the wrapped "claude_1 needs your ok: …" label
+    assert.notEqual(item.rawCmd, item.message); // the label and the command are distinct fields
+  });
   it("the item is genuinely actionable — attentionResolveTarget returns its messageId", () => {
     const item = buildAttentionApprovalItem({ messageId: "msg_9", terminalId: "t1", cmd: "ls" });
     assert.equal(attentionResolveTarget(item), "msg_9"); // a real Approve/Deny, not a fake one
@@ -264,6 +269,81 @@ describe("approvalToPromote — one-directional inbox → modal target", () => {
   it("a null active station never promotes (focus ambiguity stays in the inbox)", () => {
     const q = [mk({ id: "a", messageId: "m1", terminalId: "t1" })];
     assert.equal(approvalToPromote(q, null), null);
+  });
+});
+
+// ── bead 8xn (round-1 review): approval_resolved clears the INBOX, not just the modal ───────────
+// The load-bearing "resolve anywhere clears everywhere" invariant (design §"Resolution parity"). A
+// held approval routed to the inbox is a CLIENT-synthesized row — it is NOT in manager.attentionQueue,
+// and applyResolution broadcasts only approval_resolved (never attention_updated). So the
+// approval_resolved handler must itself drop the inbox row keyed by messageId. We reconstruct the
+// EXACT closures from useOrbitalData (the frame handler + the promotion effect) and pin that:
+//   (a) a resolve via a NON-inbox path (voice/REST/modal/TTL) clears the inbox row + drops the badge;
+//   (b) once cleared, promotion does NOT resurrect it as a fresh modal (issue #2).
+function mkApproval(over: Partial<AttentionItem>): AttentionItem {
+  return { id: "x", type: "approval", terminalId: "t1", projectId: "p1", message: "m", timestamp: "0", dismissed: false, ...over };
+}
+function makeRouterState(initial: AttentionItem[]) {
+  let attentionQueue = [...initial];
+  let pendingCommands: { messageId?: string; cmd?: string; terminalId?: string }[] = [];
+  const setAttentionQueue = (fn: (prev: AttentionItem[]) => AttentionItem[]) => { attentionQueue = fn(attentionQueue); };
+  const setPendingCommands = (fn: (prev: typeof pendingCommands) => typeof pendingCommands) => { pendingCommands = fn(pendingCommands); };
+  // The EXACT approval_resolved closure from useOrbitalData (clears BOTH surfaces by messageId).
+  const onApprovalResolved = (messageId: string) => {
+    setPendingCommands((prev) => prev.filter((c) => c.messageId !== messageId));
+    setAttentionQueue((prev) => prev.filter((a) => !a.messageId || a.messageId !== messageId));
+  };
+  // The EXACT promotion closure (inbox → modal) — rebuilds from rawCmd, dedups against pendingCommands.
+  const promoteForActive = (activeId: string | null) => {
+    const it = approvalToPromote(attentionQueue, activeId);
+    if (!it) return;
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== it.id));
+    setPendingCommands((prev) => prev.some((c) => c.messageId === it.messageId)
+      ? prev
+      : [...prev, { messageId: it.messageId, cmd: it.rawCmd ?? "", terminalId: it.terminalId }]);
+  };
+  return {
+    getQueue: () => attentionQueue, getPending: () => pendingCommands,
+    onApprovalResolved, promoteForActive,
+  };
+}
+
+describe("bead 8xn: approval_resolved clears the inbox (resolve-anywhere-clears-everywhere)", () => {
+  it("a resolve for a routed messageId drops the inbox row (voice/REST/modal/TTL path)", () => {
+    const state = makeRouterState([
+      mkApproval({ id: "approval:m1", messageId: "m1", terminalId: "t2" }),
+      mkApproval({ id: "approval:m2", messageId: "m2", terminalId: "t3" }),
+    ]);
+    state.onApprovalResolved("m1"); // resolved on a NON-inbox surface
+    assert.deepEqual(state.getQueue().map((a) => a.messageId), ["m2"]); // m1's row is gone
+    assert.equal(pendingApprovalBadgeCount(state.getQueue()), 1);       // badge reflects the drop
+  });
+  it("clearing the inbox row also drops the held-approval badge to zero when it was the only one", () => {
+    const state = makeRouterState([mkApproval({ id: "approval:m1", messageId: "m1", terminalId: "t2" })]);
+    assert.equal(pendingApprovalBadgeCount(state.getQueue()), 1); // badge present while held
+    state.onApprovalResolved("m1");
+    assert.equal(pendingApprovalBadgeCount(state.getQueue()), 0); // badge gone
+  });
+  it("a resolve never disturbs a triage row that carries no messageId", () => {
+    const triage = mkApproval({ id: "tri", messageId: undefined, terminalId: "t2", type: "exited" });
+    const state = makeRouterState([mkApproval({ id: "approval:m1", messageId: "m1", terminalId: "t2" }), triage]);
+    state.onApprovalResolved("m1");
+    assert.deepEqual(state.getQueue().map((a) => a.id), ["tri"]); // the triage row survives
+  });
+  it("issue #2: promotion does NOT resurrect an already-resolved approval as a fresh modal", () => {
+    const state = makeRouterState([mkApproval({ id: "approval:m1", messageId: "m1", terminalId: "t2", rawCmd: "drop table users" })]);
+    state.onApprovalResolved("m1");                 // server resolved it (e.g. via voice)
+    state.promoteForActive("t2");                   // operator now walks to that station
+    assert.equal(state.getQueue().length, 0);       // nothing left in the inbox
+    assert.equal(state.getPending().length, 0);     // and NO zombie modal was popped
+  });
+  it("a still-held approval promotes to the modal with the RAW cmd (issue #5 — not the wrapped label)", () => {
+    const item = buildAttentionApprovalItem({ messageId: "m9", terminalId: "t2", cmd: "drop table users" });
+    const state = makeRouterState([item]);
+    state.promoteForActive("t2");
+    assert.equal(state.getQueue().length, 0);                       // left the inbox
+    assert.deepEqual(state.getPending().map((c) => c.cmd), ["drop table users"]); // RAW cmd, no "needs your ok" prefix
+    assert.equal(state.getPending()[0].messageId, "m9");
   });
 });
 

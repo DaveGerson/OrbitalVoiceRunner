@@ -357,6 +357,13 @@ export interface AttentionItem {
    * completions), which stay Open/Dismiss. The plumbing is ID-GATED: no messageId → no resolve.
    */
   messageId?: string;
+  /**
+   * bead 8xn: the RAW staged command (not the wrapped "<pane> needs your ok: <cmd>" display string in
+   * `message`). Present ONLY on inbox-routed held approvals so the promote-to-modal path can rebuild the
+   * PendingCommand with the real instruction — the ApprovalDialog must show the command, not the inbox
+   * label. Absent for triage-only items.
+   */
+  rawCmd?: string;
 }
 
 export interface WatchRule {

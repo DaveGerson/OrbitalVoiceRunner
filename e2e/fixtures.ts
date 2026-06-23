@@ -244,5 +244,23 @@ export async function injectApprovalPendingFrame(
   );
 }
 
+/**
+ * bead 8xn: drive the server's `approval_resolved` broadcast through the REAL observe-lane switch
+ * (injectWsFrame → handleObserveFrame), modelling a resolve on a NON-inbox surface — voice, a
+ * cross-client REST approve/reject, the modal, or a TTL/dead-pane sweep. This is the only way to
+ * exercise "resolve anywhere clears EVERYWHERE": the routed inbox row + held-approval badge must drop
+ * even though the resolve never touched the inbox Approve button.
+ */
+export async function injectApprovalResolvedFrame(
+  page: Page,
+  messageId: string,
+  outcome: "approved" | "rejected" | "drained" = "approved",
+): Promise<void> {
+  await page.evaluate(
+    ([m, o]) => window.__ORBITAL_E2E__?.injectWsFrame({ type: "approval_resolved", messageId: m, outcome: o }),
+    [messageId, outcome] as const,
+  );
+}
+
 export const test = base;
 export { expect };
