@@ -22,7 +22,13 @@ register(
     encodeURIComponent(
       `export async function resolve(s,ctx,next){` +
         `if(s.includes('.svg')){return{url:'data:text/javascript,export%20default%20%22%22%3B',shortCircuit:true};}` +
-        `return next(s,ctx);}`,
+        `return next(s,ctx);}` +
+      `export async function load(u,ctx,next){` +
+        // node can leak the ?raw query onto the synthetic data: URL (-> ...";?raw, invalid JS);
+        // decode only up to the first '?'. Also stub a bare .svg that reaches load directly.
+        `if(u.startsWith('data:text/javascript,')){const h='data:text/javascript,';const q=u.indexOf('?',h.length);const p=q===-1?u.slice(h.length):u.slice(h.length,q);return{format:'module',source:decodeURIComponent(p),shortCircuit:true};}` +
+        `if(u.includes('.svg')){return{format:'module',source:'export default ""',shortCircuit:true};}` +
+        `return next(u,ctx);}`,
     ),
   pathToFileURL("./"),
 );
