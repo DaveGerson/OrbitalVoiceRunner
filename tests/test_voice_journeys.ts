@@ -168,6 +168,11 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     // ONCE at boot (src/gating/index.ts), so this MUST be set before startServer() below; the env
     // value REPLACES the default list, so it must enumerate every token the journeys execute:
     // `echo` (execProbe) and `cat`/`ping` (blockingProbe). Restored in after().
+    //
+    // bd wsm-e2e-pinned-wyv (BUCKET-3: looks-like-debt-but-correct): adding `ping` HERE but NOT to
+    // src/pendingApprovals.ts DEFAULT_SHELL_ALLOWLIST is the INTENDED test-only scoping, not a gap —
+    // this env override is the sanctioned per-process way to widen the allowlist for the suite's
+    // long-blocker probe without ever loosening production. Keep `ping` out of the production default.
     process.env.JANUS_SHELL_ALLOWLIST = "echo,cat,ping";
 
     // Isolate the .janus_* ledger/settings/DB files into a temp cwd BEFORE importing ../server.

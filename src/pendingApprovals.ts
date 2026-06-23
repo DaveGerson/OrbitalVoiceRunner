@@ -99,6 +99,14 @@ export interface PendingApproval {
  * here is NOT executed and NOT dead-ended — it routes to a non-blocking clarify (the model
  * should hand heavy lifting to an agent pane via `kind:"agent_instruction"`).
  * Operator-overridable via `JANUS_SHELL_ALLOWLIST` (comma-separated env).
+ *
+ * bd wsm-e2e-pinned-wyv (BUCKET-3: looks-like-debt-but-correct): `ping` is DELIBERATELY ABSENT
+ * here. It is not read-only/observe-only — under Full Auto it would auto-execute arbitrary-host
+ * pings (unbounded runtime + network egress), so it must NEVER be a production default. The
+ * voice-journey suite (tests/test_voice_journeys.ts) needs a stdin-ignoring long-blocker probe
+ * and scopes `ping` in TEST-ONLY via `JANUS_SHELL_ALLOWLIST` (set in before(), deleted in
+ * after()) — that env override REPLACES this default for the test process only. Do NOT add
+ * `ping` to this list to "match the test"; the asymmetry is the whole point.
  */
 export const DEFAULT_SHELL_ALLOWLIST = [
   "git", "ls", "cat", "pwd", "whoami", "ps", "head", "tail", "grep", "find", "df",
