@@ -95,6 +95,9 @@ export async function injectPendingApproval(
   terminalId = MOCK_TERMINAL_ID,
   posture?: "OPEN" | "GUARDED" | "LOCKED",
 ): Promise<void> {
+  // Capture the approval-dialog count BEFORE injecting so we can wait for +1, serializing
+  // sequential calls even when React batches state updates under parallel-suite load.
+  const before = await page.locator('[data-testid="approval-dialog"]').count();
   await page.evaluate(
     ([c, id, p]) => window.__ORBITAL_E2E__?.injectPendingApproval(
       c as string,
@@ -102,6 +105,13 @@ export async function injectPendingApproval(
       p as "OPEN" | "GUARDED" | "LOCKED" | undefined,
     ),
     [cmd, terminalId, posture] as const,
+  );
+  // Wait until the injected approval is actually rendered before returning, so two sequential
+  // injectPendingApproval() calls serialize deterministically (the second call cannot fire its
+  // evaluate until React has committed the first dialog to the DOM).
+  await page.waitForFunction(
+    (expectedCount) => document.querySelectorAll('[data-testid="approval-dialog"]').length >= expectedCount,
+    before + 1,
   );
 }
 

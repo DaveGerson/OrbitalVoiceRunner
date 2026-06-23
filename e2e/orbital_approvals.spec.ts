@@ -14,10 +14,19 @@ async function gotoKitchen(page: Page) {
   await page.waitForSelector("html[data-e2e-ready='1']");
 }
 
-async function injectPendingApproval(page: Page, cmd: string) {
+async function injectPendingApproval(page: Page, cmd: string, expectedCount?: number) {
+  // When expectedCount is omitted, infer it as (current count + 1) to serialize sequential calls
+  // even when React batches state updates under parallel-suite load (de-flake: 20n).
+  const before = expectedCount !== undefined
+    ? expectedCount - 1
+    : await page.locator('[data-testid="approval-dialog"]').count();
   await page.evaluate(
     (c) => (window as unknown as { __ORBITAL_E2E__?: { injectPendingApproval: (c: string) => void } }).__ORBITAL_E2E__?.injectPendingApproval(c),
     cmd,
+  );
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('[data-testid="approval-dialog"]').length >= n,
+    before + 1,
   );
 }
 async function injectPendingAction(page: Page, capability: string, summary: string) {
