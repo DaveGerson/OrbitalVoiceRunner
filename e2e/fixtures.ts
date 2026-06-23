@@ -13,12 +13,14 @@ declare global {
       injectStdoutChunk: (terminalId: string, chunk: string) => void;
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
       injectGrounding: (queries: string[], sources: { uri: string; title: string }[]) => void;
-      injectPendingApproval: (cmd: string, terminalId?: string) => void;
-      injectPendingAction: (capability: string, summary: string) => void;
+      injectPendingApproval: (cmd: string, terminalId?: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
+      injectPendingAction: (capability: string, summary: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
       injectWipDraft: (paneId: string, text: string) => void;
       simulateDisconnect: () => void;
       simulateReconnect: () => string | null;
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
+      /** bead ahz: seed a MALFORMED posture word (crash-safety regression — chip must degrade, not white-screen). */
+      injectMalformedPosture: (posture: string, effectiveGates?: Record<string, "Auto" | "Ask" | "Off">) => void;
       setFrozenMock: (frozen: boolean, running: string[]) => void;
       switchActivePane: (paneId: string) => void;
       /** 1B.1/1B.5: stage the kitchen's connection truth-states (no real sockets under ?mock=1). */
@@ -87,17 +89,35 @@ export async function injectGrounding(
   );
 }
 
-export async function injectPendingApproval(page: Page, cmd: string, terminalId = MOCK_TERMINAL_ID): Promise<void> {
+export async function injectPendingApproval(
+  page: Page,
+  cmd: string,
+  terminalId = MOCK_TERMINAL_ID,
+  posture?: "OPEN" | "GUARDED" | "LOCKED",
+): Promise<void> {
   await page.evaluate(
-    ([c, id]) => window.__ORBITAL_E2E__?.injectPendingApproval(c, id),
-    [cmd, terminalId] as const,
+    ([c, id, p]) => window.__ORBITAL_E2E__?.injectPendingApproval(
+      c as string,
+      id as string,
+      p as "OPEN" | "GUARDED" | "LOCKED" | undefined,
+    ),
+    [cmd, terminalId, posture] as const,
   );
 }
 
-export async function injectPendingAction(page: Page, capability: string, summary: string): Promise<void> {
+export async function injectPendingAction(
+  page: Page,
+  capability: string,
+  summary: string,
+  posture?: "OPEN" | "GUARDED" | "LOCKED",
+): Promise<void> {
   await page.evaluate(
-    ([c, s]) => window.__ORBITAL_E2E__?.injectPendingAction(c, s),
-    [capability, summary] as const,
+    ([c, s, p]) => window.__ORBITAL_E2E__?.injectPendingAction(
+      c as string,
+      s as string,
+      p as "OPEN" | "GUARDED" | "LOCKED" | undefined,
+    ),
+    [capability, summary, posture] as const,
   );
 }
 
@@ -130,6 +150,25 @@ export async function setPostureMock(
 ): Promise<void> {
   await page.evaluate(
     ([p, g]) => window.__ORBITAL_E2E__?.setPostureMock(p as "OPEN" | "GUARDED" | "LOCKED", g as Record<string, "Auto" | "Ask" | "Off">),
+    [posture, effectiveGates] as const,
+  );
+}
+
+/**
+ * bead ahz: seed a MALFORMED server posture word (one outside OPEN|GUARDED|LOCKED) so the spec can
+ * prove the n2r normalizers degrade the gate chip gracefully instead of throwing during render and
+ * white-screening the cockpit. `effectiveGates` defaults to the harness default mock gates.
+ */
+export async function injectMalformedPosture(
+  page: Page,
+  posture: string,
+  effectiveGates?: Record<string, "Auto" | "Ask" | "Off">,
+): Promise<void> {
+  await page.evaluate(
+    ([p, g]) => window.__ORBITAL_E2E__?.injectMalformedPosture(
+      p as string,
+      g as Record<string, "Auto" | "Ask" | "Off"> | undefined,
+    ),
     [posture, effectiveGates] as const,
   );
 }

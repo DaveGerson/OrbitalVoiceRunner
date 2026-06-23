@@ -40,7 +40,10 @@ test("setDraft replaces text and round-trips PaneDraft shape; updatedBy is prese
   assert.ok(d);
   assert.equal(d!.text, "first cut");
   assert.equal(d!.updatedBy, "operator");
-  assert.ok(typeof d!.updatedAt === "string" && d!.updatedAt.length > 0);
+  // l1c: updatedAt is a real, parseable timestamp — assert it parses to a valid Date, not merely
+  // that it is a non-empty string (a bogus "x" would pass length>0 but is not a timestamp).
+  assert.ok(typeof d!.updatedAt === "string", "updatedAt is a string");
+  assert.ok(!Number.isNaN(Date.parse(d!.updatedAt)), `updatedAt must parse as a date, got ${JSON.stringify(d!.updatedAt)}`);
   // replace, not append
   s.setDraft("p1", "t1", "second cut", "janus");
   assert.equal(s.getDraft("p1", "t1")!.text, "second cut");
@@ -115,7 +118,9 @@ test("addModelContext appends timestamped entries with an optional source", () =
   assert.equal(ctx.model.length, 2);
   assert.equal(ctx.model[0].text, "orientation A");
   assert.equal(ctx.model[0].source, "synthesizer");
-  assert.ok(typeof ctx.model[0].at === "string" && ctx.model[0].at.length > 0);
+  // l1c: the `at` field is a real parseable timestamp, not just any non-empty string.
+  assert.ok(typeof ctx.model[0].at === "string", "model[0].at is a string");
+  assert.ok(!Number.isNaN(Date.parse(ctx.model[0].at)), `model[0].at must parse as a date, got ${JSON.stringify(ctx.model[0].at)}`);
   assert.equal(ctx.model[1].text, "orientation B");
   assert.equal(ctx.model[1].source, undefined);
   // human layer untouched

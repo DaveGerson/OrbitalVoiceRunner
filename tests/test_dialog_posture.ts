@@ -30,9 +30,12 @@ describe("gateSurface — shared dialog/chip posture palette (rbh)", () => {
     for (const p of ALL_POSTURES) {
       const s = POSTURE_STYLE[p];
       assert.ok(s, `POSTURE_STYLE missing entry for ${p}`);
-      assert.ok(typeof s.dot === "string" && s.dot.length > 0, `${p}.dot must be a class string`);
-      assert.ok(typeof s.text === "string" && s.text.length > 0, `${p}.text must be a class string`);
-      assert.ok(typeof s.label === "string" && s.label.length > 0, `${p}.label must be plain language`);
+      // l1c: assert the class strings are the RIGHT KIND of Tailwind token (dot = a bg- color, text =
+      // a text- color), and the label reads like plain language (a multi-word sentence) — content
+      // checks that catch a wrong/blank class, not just non-emptiness.
+      assert.match(s.dot, /\bbg-/, `${p}.dot must be a bg- color class`);
+      assert.match(s.text, /\btext-/, `${p}.text must be a text- color class`);
+      assert.match(s.label, /\w+\s+\w+/, `${p}.label must be plain-language prose`);
     }
     // No keys outside the union (map is exactly the union).
     assert.deepStrictEqual(Object.keys(POSTURE_STYLE).sort(), [...ALL_POSTURES].sort());
@@ -42,8 +45,9 @@ describe("gateSurface — shared dialog/chip posture palette (rbh)", () => {
     for (const g of ALL_GATES) {
       const s = GATE_STYLE[g];
       assert.ok(s, `GATE_STYLE missing entry for ${g}`);
-      assert.ok(typeof s.dot === "string" && s.dot.length > 0, `${g}.dot must be a class string`);
-      assert.ok(typeof s.word === "string" && s.word.length > 0, `${g}.word must be a plain word`);
+      // l1c: dot is a bg- color class; word is a single plain-language word (letters only).
+      assert.match(s.dot, /\bbg-/, `${g}.dot must be a bg- color class`);
+      assert.match(s.word, /^[A-Za-z ]+$/, `${g}.word must be a plain word, got ${JSON.stringify(s.word)}`);
     }
     assert.deepStrictEqual(Object.keys(GATE_STYLE).sort(), [...ALL_GATES].sort());
     // The plain gate-language words the operator reads (no raw Auto/Ask/Off jargon in the dialog rider).

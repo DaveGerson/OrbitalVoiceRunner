@@ -74,8 +74,9 @@ describe("ClaudeAdapter (HIGH confidence — §5)", () => {
     const plan = a.planModeChange("Human-in-the-Loop", "Full Auto");
     assert.strictEqual(plan.kind, "live-signal");
     if (plan.kind !== "live-signal") return;
-    assert.ok(plan.steps.length > 0, "has at least one cycle step");
-    assert.ok(plan.steps.some((s) => s.bytes === SHIFT_TAB), "uses ESC[Z (Shift+Tab) ring byte");
+    // l1c: the Claude adapter emits EXACTLY one ring step (a single Shift+Tab), not merely ">0".
+    assert.strictEqual(plan.steps.length, 1, "emits exactly one cycle step");
+    assert.strictEqual(plan.steps[0].bytes, SHIFT_TAB, "the single step is the ESC[Z (Shift+Tab) ring byte");
   });
 
   it("modeCycleByte is ESC[Z", () => {
