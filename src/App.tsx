@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
+import { playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
@@ -47,6 +47,7 @@ import {
   classifyMarkdownLine,
   dispatchWsMessage,
 } from "./appHelpers";
+import { useLiveSession } from "./hooks/useLiveSession";
 
 // Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
 // the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
@@ -448,18 +449,13 @@ function AppRaw() {
     }, 120);
   };
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
-  const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // dbt4: the WS + Web-Audio capture/playback refs and the connect/start/stop/cleanup +
+  // auto-reconnect lifecycle now live in useLiveSession (src/hooks/useLiveSession.ts). isMicMutedRef
+  // and activeTerminalIdRef stay App-owned (App mirrors state into them) and are passed in.
   const isMicMutedRef = useRef(false);
-  const desiredLiveRef = useRef(false);
   // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
@@ -630,13 +626,6 @@ function AppRaw() {
 
   // Restart the live voice session so reconnect-only settings (voice, model, API
   // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
-  const reconnectLive = async () => {
-    if (isLive) {
-      stopLive();
-      setTimeout(() => { startLive(); }, 400);
-    }
-  };
-
   const fetchPendingCommands = async () => {
     if (isMockModeRef.current) return;
     try {
@@ -1047,163 +1036,53 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const cleanupSocketOnly = () => {
-    // Burndown: each teardown was an identical `if (ref.current) { try { close } catch; ref=null }`.
-    // `disposeRef` performs that exact guarded teardown + null-out for one ref, so the per-ref CC
-    // collapses into a single call. Behavior (which refs, which closer, the null-out) is unchanged.
-    const disposeRef = <T,>(ref: React.MutableRefObject<T | null>, close: (v: T) => void) => {
-      if (ref.current) {
-        try { close(ref.current); } catch (e) {}
-        ref.current = null;
-      }
-    };
-    disposeRef(wsRef, (ws: WebSocket) => ws.close());
-    disposeRef(processorRef, (p: ScriptProcessorNode) => p.disconnect());
-    disposeRef(sourceRef, (s: MediaStreamAudioSourceNode) => s.disconnect());
-    disposeRef(streamRef, (s: MediaStream) => s.getTracks().forEach((track) => track.stop()));
-    disposeRef(voiceCaptureCtxRef, (c: AudioContext) => c.close());
-    disposeRef(voicePlaybackCtxRef, (c: AudioContext) => c.close());
+  // dbt4: the live voice-session lifecycle (ws + audio refs, connect/start/stop/cleanup +
+  // auto-reconnect) lives in useLiveSession. App owns the WS-message routing: onWsMessage builds
+  // the dispatchWsMessage ctx exactly as the former inline ws.onmessage did (same setters/refs/
+  // helpers, same ORDERING), with the connection-local 24kHz playbackCtx threaded in for audio.
+  const onWsMessage = (msg: any, playbackCtx: AudioContext) => {
+    dispatchWsMessage(msg, {
+      playEarcon,
+      triggerDesktopNotification,
+      setPendingCommands,
+      setPendingActions,
+      setActiveTerminalId,
+      setIsBufferFocused,
+      setPromptBuffer,
+      fetchWipDrafts,
+      setTerminals,
+      setFrozen,
+      setFrozenRunning,
+      setLedger,
+      setGlobalPermissionsMode,
+      setSettings,
+      setIsMicMuted,
+      setAutoApprovedNotification,
+      setBlockedNotification,
+      setTranscript,
+      setWsErrorNotification,
+      setProactiveNotifications,
+      setPlans,
+      queueStdoutChunk,
+      fetchTerminals,
+      fetchPlans,
+      fetchActiveTerminalHistory,
+      resetAudioPlayback,
+      playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
+      upsertNotification,
+      effectForEvent,
+      activeTerminalIdRef,
+    });
   };
 
-  const connectLive = async () => {
-    try {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      const captureCtx = new AudioContext({ sampleRate: 16000 });
-      const playbackCtx = new AudioContext({ sampleRate: 24000 });
-      voiceCaptureCtxRef.current = captureCtx;
-      voicePlaybackCtxRef.current = playbackCtx;
-      resetAudioPlayback();
-
-      ws.onopen = async () => {
-        setIsLive(true);
-        setIsReconnecting(false);
-        // Step 5: re-assert the source of truth on (re)connect so the server knows which pane the
-        // operator has open before Janus can propose anything.
-        ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-          streamRef.current = stream;
-          
-          const source = captureCtx.createMediaStreamSource(stream);
-          sourceRef.current = source;
-          const processor = captureCtx.createScriptProcessor(4096, 1, 1);
-          processorRef.current = processor;
-          
-          source.connect(processor);
-          processor.connect(captureCtx.destination);
-
-          processor.onaudioprocess = (e) => {
-            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
-              wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
-            }
-          };
-        } catch (mediaErr) {
-          console.error("Microphone streaming failed to start:", mediaErr);
-        }
-      };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        // WS-D / burndown: the long per-type if/else-if ladder was relocated VERBATIM into the
-        // prototype-safe dispatch table in ./appHelpers (mirroring eventBus.effectForEvent). The
-        // ctx bundles exactly the setters/refs/helpers the original branches captured, so every
-        // branch's setState/side-effect ORDERING is preserved byte-for-byte. The `else` arm's
-        // eventBus fallback (effectForEvent → setter switch + earcon) lives there too.
-        dispatchWsMessage(msg, {
-          playEarcon,
-          triggerDesktopNotification,
-          setPendingCommands,
-          setPendingActions,
-          setActiveTerminalId,
-          setIsBufferFocused,
-          setPromptBuffer,
-          fetchWipDrafts,
-          setTerminals,
-          setFrozen,
-          setFrozenRunning,
-          setLedger,
-          setGlobalPermissionsMode,
-          setSettings,
-          setIsMicMuted,
-          setAutoApprovedNotification,
-          setBlockedNotification,
-          setTranscript,
-          setWsErrorNotification,
-          setProactiveNotifications,
-          setPlans,
-          queueStdoutChunk,
-          fetchTerminals,
-          fetchPlans,
-          fetchActiveTerminalHistory,
-          resetAudioPlayback,
-          playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
-          upsertNotification,
-          effectForEvent,
-          activeTerminalIdRef,
-        });
-      };
-
-      ws.onclose = (event) => {
-        cleanupSocketOnly();
-        
-        // Adaptive auto-reconnection if closure was unexpected from server-side or connection drops
-        if (desiredLiveRef.current) {
-          setIsLive(true);
-          setIsReconnecting(true);
-          
-          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (desiredLiveRef.current) {
-              connectLive();
-            }
-          }, 3000);
-        } else {
-          setIsLive(false);
-          setIsReconnecting(false);
-        }
-      };
-    } catch (e) {
-      console.error("Connection establish failed:", e);
-      cleanupSocketOnly();
-      if (desiredLiveRef.current) {
-        setIsLive(true);
-        setIsReconnecting(true);
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (desiredLiveRef.current) connectLive();
-        }, 3000);
-      } else {
-        setIsLive(false);
-        setIsReconnecting(false);
-      }
-    }
-  };
-
-  const startLive = async () => {
-    desiredLiveRef.current = true;
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    await connectLive();
-  };
-
-  const stopLive = () => {
-    desiredLiveRef.current = false;
-    setIsLive(false);
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    cleanupSocketOnly();
-  };
+  const { wsRef, startLive, stopLive, reconnectLive } = useLiveSession({
+    activeTerminalIdRef,
+    isMicMutedRef,
+    setIsLive,
+    setIsReconnecting,
+    isLive,
+    onWsMessage,
+  });
 
   const generateMockData = () => {
     isMockModeRef.current = !isMockMode;
