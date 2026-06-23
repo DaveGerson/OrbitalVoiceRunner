@@ -10,16 +10,19 @@ import { INK } from "./theme";
 import { Chip, Icon, VoiceCue } from "./primitives";
 import { useDialog } from "./useFocusTrap";
 import type { TranscriptEntry } from "./useOrbitalData";
+import { chipColorForKind, deriveConversationalState } from "./useConversationalState";
 
 // ── Pure helpers (CC burndown) ────────────────────────────────────────────
 
-/** Background color for the status Chip. */
+/**
+ * Background color for the status Chip. Single source of truth (bead m9v): the boolean ladder is
+ * reduced to a discrete ConversationalKind via the same reducer the nav pill uses, then mapped
+ * through chipColorForKind — so the radio chip and the design pill can never paint one state two
+ * colors. The radio chip has no tool-activity input, so toolActive/reconnecting are false here.
+ */
 export function getChipBg(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean): string {
-  if (!live) return "#8a6a4f";
-  if (micBlocked) return "#e23a3a";
-  if (!connected) return "#8a6a4f";
-  if (muted) return "#8a6a4f";
-  return "#e23a3a";
+  const { kind } = deriveConversationalState({ live, micBlocked, connected, muted, reconnecting: false, toolActive: false });
+  return chipColorForKind(kind);
 }
 
 /** Label text for the status Chip. */

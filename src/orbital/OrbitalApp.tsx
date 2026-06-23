@@ -8,7 +8,7 @@ import { Icon, IconSprite, Mascot } from "./primitives";
 import { TweaksPanel, TweakSection, TweakRadio, TweakToggle, TweakColor } from "./TweaksPanel";
 import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
 import { useOrbitalData } from "./useOrbitalData";
-import { useConversationalState, type ConversationalState } from "./useConversationalState";
+import { useConversationalState, chipColorForKind, type ConversationalState } from "./useConversationalState";
 import { groupHandoffsByPane } from "./useOrbitalDataHelpers";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
@@ -72,24 +72,16 @@ function useKitchenChrome() {
 // Velocity-design (D7): the conversational pill — a glanceable read of the voice channel's state,
 // driven by the useConversationalState machine. Only shown once a voice session is requested (off-air
 // has its own "Tune in" affordance in the radio, so the nav stays quiet until the chef is on the air).
-// SEAM: the velocity-mech branch's getChipBg/getChipLabel own the radio chip's color/label; this
-// nav pill keeps a tiny local state→color map so the two surfaces can be reconciled when both land.
-const CONVO_DOT: Record<ConversationalState["kind"], string> = {
-  offline: "#8a6a4f",
-  tuning: "#ffc94a",
-  blocked: "#e23a3a",
-  muted: "#8a6a4f",
-  thinking: "#4b3bb3",
-  listening: "#4db892",
-};
-
+// SEAM (bead m9v): the radio chip (getChipBg) and this nav pill dot now resolve their color through
+// the SAME chipColorForKind map in useConversationalState — single source of truth, so the two
+// surfaces can never paint one state two different colors. No local placeholder map here anymore.
 function ConversationalPill({ state }: { state: ConversationalState }) {
   if (state.kind === "offline") return null; // the radio's own "Tune in" owns the off-air case
   const pulse = state.kind === "tuning" || state.kind === "thinking" || state.kind === "blocked";
   return (
     <div data-testid="convo-pill" data-convo-state={state.kind}
       style={{ display: "flex", alignItems: "center", gap: 7, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
-      <span style={{ width: 8, height: 8, borderRadius: "50%", background: CONVO_DOT[state.kind], border: "1.5px solid " + INK, animation: pulse ? "orb-pulse 1s var(--ease-bounce) infinite" : undefined }} />
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: chipColorForKind(state.kind), border: "1.5px solid " + INK, animation: pulse ? "orb-pulse 1s var(--ease-bounce) infinite" : undefined }} />
       <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", textTransform: "capitalize" }}>{state.label}</span>
     </div>
   );

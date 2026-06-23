@@ -60,6 +60,26 @@ const LABELS: Record<ConversationalKind, string> = {
   listening: "listening",
 };
 
+// SINGLE SOURCE OF TRUTH for chip/pill color (bead m9v). Both surfaces that paint this state — the
+// velocity-mech radio status Chip (getChipBg in KitchenRadio.tsx) and the velocity-design nav pill
+// dot (OrbitalApp's CONVO_DOT, now removed) — resolve through this one map keyed on the discrete
+// kind, so the same state can never render two different colors. The hexes are the canonical values
+// getChipBg pinned during the CC burndown; "thinking" is the design-only rung the radio chip never
+// reaches (it has no tool-activity input), so it keeps its own accent.
+const CHIP_COLORS: Record<ConversationalKind, string> = {
+  offline: "#8a6a4f",
+  tuning: "#8a6a4f",
+  blocked: "#e23a3a",
+  muted: "#8a6a4f",
+  thinking: "#4b3bb3",
+  listening: "#e23a3a",
+};
+
+/** The single source of truth: discrete conversational state → status color (chip bg / pill dot). */
+export function chipColorForKind(kind: ConversationalKind): string {
+  return CHIP_COLORS[kind];
+}
+
 /**
  * Tool-call activity off the transcript — the "activeSources" signal. A tool/grounding call is
  * considered in flight when the FRESHEST turn is a Janus turn that resolved at least one grounded
