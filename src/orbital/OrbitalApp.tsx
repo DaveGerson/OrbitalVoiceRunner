@@ -8,6 +8,7 @@ import { Icon, IconSprite, Mascot } from "./primitives";
 import { TweaksPanel, TweakSection, TweakRadio, TweakToggle, TweakColor } from "./TweaksPanel";
 import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
 import { useOrbitalData } from "./useOrbitalData";
+import { useConversationalState, type ConversationalState } from "./useConversationalState";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
@@ -67,12 +68,40 @@ function useKitchenChrome() {
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected }: {
+// Velocity-design (D7): the conversational pill — a glanceable read of the voice channel's state,
+// driven by the useConversationalState machine. Only shown once a voice session is requested (off-air
+// has its own "Tune in" affordance in the radio, so the nav stays quiet until the chef is on the air).
+// SEAM: the velocity-mech branch's getChipBg/getChipLabel own the radio chip's color/label; this
+// nav pill keeps a tiny local state→color map so the two surfaces can be reconciled when both land.
+const CONVO_DOT: Record<ConversationalState["kind"], string> = {
+  offline: "#8a6a4f",
+  tuning: "#ffc94a",
+  blocked: "#e23a3a",
+  muted: "#8a6a4f",
+  thinking: "#4b3bb3",
+  listening: "#4db892",
+};
+
+function ConversationalPill({ state }: { state: ConversationalState }) {
+  if (state.kind === "offline") return null; // the radio's own "Tune in" owns the off-air case
+  const pulse = state.kind === "tuning" || state.kind === "thinking" || state.kind === "blocked";
+  return (
+    <div data-testid="convo-pill" data-convo-state={state.kind}
+      style={{ display: "flex", alignItems: "center", gap: 7, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: CONVO_DOT[state.kind], border: "1.5px solid " + INK, animation: pulse ? "orb-pulse 1s var(--ease-bounce) infinite" : undefined }} />
+      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", textTransform: "capitalize" }}>{state.label}</span>
+    </div>
+  );
+}
+
+function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected, convo }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
   needsCount: number; onJumpToNeeds: () => void;
   mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
   /** 1B.1: the live /live stream is actually attached — the pill must not claim "Kitchen open" while dark. */
   connected: boolean;
+  /** Velocity-design (D7): the conversational pill's derived state (useConversationalState). */
+  convo: ConversationalState;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -115,6 +144,7 @@ function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJum
           {connected ? <>Kitchen open · {running} on the burner</> : <>Kitchen dark — reconnecting…</>}
         </span>
       </div>
+      <ConversationalPill state={convo} />
       <button data-testid="all-hands" onClick={onPanic} title="Emergency brake" style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 10, border: "2px solid " + INK, background: "#2a1a10", color: "#ffc94a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5, letterSpacing: ".04em", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0, textTransform: "uppercase" }}>
         <Icon name="fire" size={16} color="#e23a3a" /> All Hands
       </button>
@@ -182,6 +212,13 @@ export default function OrbitalApp() {
   );
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
   const running = stations.filter((s) => s.status === "Running").length;
+  // Velocity-design (D7): the conversational pill's state, derived from the voice-channel signals the
+  // data layer already computes + tool-call activity off the transcript (activeSources). Pure machine,
+  // memoized — additive and perf-safe (no per-frame xterm work).
+  const convo = useConversationalState({
+    live: data.isLive, connected: data.voiceConnected, micBlocked: data.micBlocked,
+    muted: data.micMuted, reconnecting: data.voiceReconnecting, transcript: data.transcript,
+  });
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
 
@@ -391,7 +428,7 @@ export default function OrbitalApp() {
         onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
         /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
            lane) — either one being open means the kitchen is genuinely attached. */
-        connected={data.streamConnected || data.voiceConnected} />
+        connected={data.streamConnected || data.voiceConnected} convo={convo} />
 
       {renderLineView()}
       {renderPantryView()}
