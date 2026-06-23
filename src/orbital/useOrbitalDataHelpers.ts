@@ -7,6 +7,7 @@ import { extractSlots } from "../templates";
 import type { EarconType } from "../utils/earcon";
 import type { PendingCommand, PendingActionView, AttentionItem } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
+import type { HandoffState, StoredHandoff } from "../store/types";
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────
 
@@ -98,6 +99,96 @@ export function attentionQueueFromFrame(msg: { queue?: unknown }): AttentionItem
 /** draft_updated: the WIP draft text for a pane (always a string; missing/non-string → ""). */
 export function draftTextFromFrame(msg: { draft?: { text?: unknown } }): string {
   return typeof msg.draft?.text === "string" ? msg.draft.text : "";
+}
+
+/** handoffs_updated (j4e1): the full handoffs board the server broadcasts on every lifecycle mutation.
+ *  Adopt it directly when present, else null so the caller degrades to a refetch (GET /api/handoffs) —
+ *  the SAME adopt-or-refetch contract as plans_updated / templates_updated / history_updated. An empty
+ *  array is a real value (the workspace genuinely has no handoffs), NOT a refetch signal. */
+export function handoffsFromFrame(msg: { handoffs?: unknown }): StoredHandoff[] | null {
+  return Array.isArray(msg.handoffs) ? (msg.handoffs as StoredHandoff[]) : null;
+}
+
+// Tiny field coercers for the handoff normalizer — each keeps the per-field branch OUT of the row
+// builder so `normalizeHandoffRows` stays well under the complexity gate. All pure.
+const hStr = (v: unknown, fallback = ""): string => (typeof v === "string" ? v : fallback);
+const hStrOrNull = (v: unknown): string | null => (typeof v === "string" ? v : null);
+const hNum = (v: unknown, fallback = 0): number => (typeof v === "number" ? v : fallback);
+const hNumOrNull = (v: unknown): number | null => (typeof v === "number" ? v : null);
+
+/** True iff a row carries a usable id (`id` or the REST projection's `handoff_id`) AND a to_pane. */
+function hasUsableHandoffId(r: Record<string, unknown>): boolean {
+  const id = r.id ?? r.handoff_id;
+  return typeof id === "string" && !!id && typeof r.to_pane === "string" && !!r.to_pane;
+}
+
+/** Build ONE StoredHandoff from a raw row (each field through a tiny coercer — see hasUsableHandoffId
+ *  for the precondition). Extracted from normalizeHandoffRows to keep that mapper under the gate. */
+function buildHandoffRow(r: Record<string, unknown>): StoredHandoff {
+  return {
+    id: String(r.id ?? r.handoff_id),
+    workspace_id: hStr(r.workspace_id),
+    from_pane: hStrOrNull(r.from_pane),
+    to_pane: String(r.to_pane),
+    kind: hStr(r.kind, "agent_instruction") as StoredHandoff["kind"],
+    composed_prompt: hStr(r.composed_prompt),
+    source_context: hStr(r.source_context),
+    source_context_refs: hStr(r.source_context_refs),
+    state: hStr(r.state, "composing") as HandoffState,
+    gate_approval_id: hStrOrNull(r.gate_approval_id),
+    approved_by: hStrOrNull(r.approved_by),
+    approved_via: hStrOrNull(r.approved_via),
+    revision_count: hNum(r.revision_count),
+    created_at: hNum(r.created_at),
+    staged_at: hNumOrNull(r.staged_at),
+    delivered_at: hNumOrNull(r.delivered_at),
+    consumed_at: hNumOrNull(r.consumed_at),
+    terminal_at: hNumOrNull(r.terminal_at),
+    expires_at: hNumOrNull(r.expires_at),
+  };
+}
+
+/** Extract the FULL composed_prompt from a read_handoff (GET /api/handoffs/:id) response. The default
+ *  resultToHttp wraps the row under `{ output: {...} }`; a future bare-row shape is tolerated too.
+ *  Returns null for any non-string / missing prompt (the caller then keeps its existing seed). Pure. */
+export function handoffPromptFromReadResponse(d: unknown): string | null {
+  const outer = d as { output?: unknown } | null;
+  const row = (outer && typeof outer.output === "object" && outer.output ? outer.output : d) as { composed_prompt?: unknown } | null;
+  const prompt = row && typeof row === "object" ? row.composed_prompt : null;
+  return typeof prompt === "string" ? prompt : null;
+}
+
+/** Normalize the rows GET /api/handoffs returns into the StoredHandoff-ish shape the drawer reads.
+ *  The list_handoffs REST projection (src/actions/defs/handoff.ts) keys the id as `handoff_id` and
+ *  redacts/slices `composed_prompt`; the cv2 handoffs_updated frame is expected to carry FULL rows
+ *  (`id`). Coalesce `id ?? handoff_id`, default the rest, and DROP any row without a usable id +
+ *  to_pane (a malformed payload must never crash the board). Pure: list→list, no fetch/React. */
+export function normalizeHandoffRows(rows: unknown): StoredHandoff[] {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === "object" && hasUsableHandoffId(r as Record<string, unknown>))
+    .map(buildHandoffRow);
+}
+
+/** Group handoffs by their target station (`to_pane`) for the Line drawer — each station card reads
+ *  off `byPane[stationId]`. Pure: object→object, insertion order preserved per bucket. */
+export function groupHandoffsByPane(handoffs: StoredHandoff[]): Record<string, StoredHandoff[]> {
+  const byPane: Record<string, StoredHandoff[]> = {};
+  for (const h of handoffs) {
+    if (!h || typeof h.to_pane !== "string" || !h.to_pane) continue;
+    (byPane[h.to_pane] ??= []).push(h);
+  }
+  return byPane;
+}
+
+/** The drawer's status chip label per lifecycle state (pure map; unknown states degrade to the raw
+ *  string so the chip never crashes on a state the UI hasn't enumerated). */
+const HANDOFF_STATUS_LABELS: Record<HandoffState, string> = {
+  composing: "Drafting", revising: "Revising", staged: "Staged", delivered: "Delivered",
+  consumed: "Consumed", rejected: "Rejected", expired: "Expired", blocked_read_only: "Blocked",
+};
+export function handoffStatusLabel(state: HandoffState): string {
+  return HANDOFF_STATUS_LABELS[state] ?? state;
 }
 
 /** settings_updated: should we adopt the wire's isMicMuted? Only when it's a boolean AND differs
