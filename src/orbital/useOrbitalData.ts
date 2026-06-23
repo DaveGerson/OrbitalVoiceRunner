@@ -21,14 +21,16 @@ import type {
   SystemSettings,
   Plan,
   PaneLayout,
+  AttentionItem,
 } from "../types";
 import type { StoredNote } from "../store/types";
 import { extractSlots } from "../templates";
 import {
-  projectTemplatesFrame, historyEntriesFromFrame, draftTextFromFrame, shouldAdoptMute,
+  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
+  dismissAttentionOutcome,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -152,6 +154,8 @@ export interface OrbitalData {
   plans: Plan[];
   pendingCommands: PendingCommand[];
   pendingActions: PendingActionView[];
+  /** D2: the attention/"what needs me" inbox (GET /api/attention + attention_updated frames). */
+  attentionQueue: AttentionItem[];
   frozen: boolean;
   frozenRunning: string[];
   transcript: TranscriptEntry[];
@@ -253,6 +257,10 @@ export interface OrbitalData {
   refetchTerminals: () => void;
   refetchLedger: () => void;
   refetchSettings: () => void;
+  /** D2: re-pull the attention inbox (GET /api/attention) — used by the safety-net poll + degrade. */
+  refetchAttention: () => void;
+  /** D2: clear one attention item — POST /api/attention/:id/dismiss (dismiss_attention, veto). */
+  dismissAttention: (id: string) => void;
   refetchAll: () => void;
   // exposed for the realtime/voice wave to reuse
   wsRef: MutableRefObject<WebSocket | null>;
@@ -273,6 +281,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [plans, setPlans] = useState<Plan[]>([]);
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
+  // D2: the attention/"what needs me" inbox (GET /api/attention + attention_updated frames).
+  const [attentionQueue, setAttentionQueue] = useState<AttentionItem[]>([]);
   const [frozen, setFrozen] = useState<boolean>(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
   // 4U.3: seeded from sessionStorage so the radio's record survives a reload (capped 50 below).
@@ -455,6 +465,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // D2: the attention inbox. GET /api/attention returns the raw queue array TOP-LEVEL (the def's
+  // rest.toHttp projection, src/actions/defs/reads.ts getAttentionQueue — same shape as plans). The
+  // ?mock guard mirrors the board fetchers (the harness owns state under ?mock=1; the live frames +
+  // the 20s poll keep it fresh otherwise).
+  const refetchAttention = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/attention");
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setAttentionQueue(rows);
+    } catch { /* silent */ }
+  }, []);
+
   // Journey-expansion C: templates + layouts. Both GETs return the raw array TOP-LEVEL (the defs'
   // rest.toHttp projection, src/actions/defs/{templates,layouts}.ts — list_watch_rules precedent).
   const refetchTemplates = useCallback(async () => {
@@ -547,11 +571,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchPending();
     refetchActions();
     refetchPlans();
+    refetchAttention();
     refetchFrozen();
     refetchArchive();
     refetchTemplates();
     refetchLayouts();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts]);
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchAttention, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts]);
 
   // ── observe-lane frame handler ───────────────────────────────────────────
   // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
@@ -621,6 +646,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // 4U.1: the server broadcasts the full plans board on every plan mutation — adopt it directly;
       // degrade to a refetch otherwise.
       plans_updated: () => { if (Array.isArray(msg.plans)) setPlans(msg.plans); else refetchPlans(); },
+      // D2: the server broadcasts the full attention queue on every queue mutation (observe pushes,
+      // orient dismisses) — adopt it directly; degrade to a refetch when the frame carries no array.
+      attention_updated: () => { const q = attentionQueueFromFrame(msg); if (q) setAttentionQueue(q); else refetchAttention(); },
       // Journey-expansion C: the frame carries the RAW ledger rows (no derived `slots`). Adopt them with
       // slots re-derived through the same pure engine the server projects with (extractSlots).
       templates_updated: () => { const p = projectTemplatesFrame(msg); if (p) setTemplates(p); else refetchTemplates(); },
@@ -688,7 +716,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     };
     const type = msg?.type;
     if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
-  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchAttention, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -762,9 +790,10 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       refetchPending();
       refetchActions();
       refetchPlans();
+      refetchAttention(); // D2: keep the "what needs me" inbox fresh on the safety-net poll too
     }, POLL_MS);
     return () => clearInterval(iv);
-  }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans]);
+  }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans, refetchAttention]);
 
   // Tear down all per-session voice audio (mic capture chain + both AudioContexts). Idempotent.
   const teardownAudio = useCallback(() => {
@@ -1252,6 +1281,27 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't toss that one, Chef — try again.", "warn"); }
   }, [refetchArchive, showToast, mockClientOnly]);
 
+  // D2: dismiss one attention item — POST /api/attention/:id/dismiss (dismiss_attention, veto-class,
+  // Auto by default). Optimistic drop so the inbox clears instantly; the server's attention_updated
+  // frame reconciles the authoritative queue. On a real failure the item is restored and we warn.
+  const dismissAttention = useCallback(async (id: string) => {
+    let removed: AttentionItem | undefined;
+    setAttentionQueue((prev) => { removed = prev.find((a) => a.id === id) ?? removed; return prev.filter((a) => a.id !== id); });
+    const restore = () => { const r = removed; if (r) setAttentionQueue((prev) => (prev.some((a) => a.id === r.id) ? prev : [...prev, r])); };
+    if (mockClientOnly()) { showToast("Cleared that alert"); return; }
+    try {
+      const res = await apiFetch(`/api/attention/${id}/dismiss`, { method: "POST" });
+      // A dismiss is veto-class: gated-Off does NOT 403, it returns kind:ok -> 200 with an "Error:"-
+      // wrapped output, so a bare 200 is not proof the alert cleared (see dismissAttentionOutcome).
+      const body = res.ok ? await res.json().catch(() => ({} as Record<string, unknown>)) : {};
+      const outcome = dismissAttentionOutcome(res.status, res.ok, body);
+      if (outcome === "blocked") { restore(); showToast("Dismissing alerts is gated off, Chef", "warn"); return; }
+      if (outcome === "failed") { restore(); showToast("That didn't go through, Chef — try again.", "warn"); return; }
+      showToast("Cleared that alert");
+      if (!isMockModeRef.current) refetchAttention();
+    } catch { restore(); showToast("That didn't go through, Chef — try again.", "warn"); }
+  }, [refetchAttention, showToast, mockClientOnly]);
+
   // ── 4U.1: plans on The Pass (the classic Spec Buffer's routes, kitchen-toned) ──
   // execute_plan runs step 1 through the gate INSIDE the server (dispatchProposal), so the REST
   // status carries the whole truth: 200 fired / 202 step-1 needs an ok / 403 gated off /
@@ -1647,7 +1697,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
 
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
-    pendingCommands, pendingActions, frozen, frozenRunning, transcript,
+    pendingCommands, pendingActions, attentionQueue, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
@@ -1663,7 +1713,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
-    refetchTerminals, refetchLedger, refetchSettings, refetchAll,
+    refetchTerminals, refetchLedger, refetchSettings, refetchAttention, dismissAttention, refetchAll,
     wsRef, isMockModeRef,
     setTerminals, setTranscript, setPendingCommands, setPendingActions, setFrozen, setFrozenRunning,
   };

@@ -241,14 +241,20 @@ export default function OrbitalApp() {
       <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
         <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: dotBg, backgroundSize: "18px 18px" }}>
-          <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts}
+          <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts} attention={data.attentionQueue}
             stations={stations} activePaneId={data.activeTerminalId}
             jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
             onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
             onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
             onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
             onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
-            onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
+            onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout}
+            /* D2: attention acts. Approve → jump to the station (the real ApprovalDialog lives there);
+               deny → clear the alert; restart → re-fire the dead/failed station; dismiss → clear it. */
+            onApproveAttention={(item) => { data.selectActivePane(item.terminalId); setBurnerId(item.terminalId); }}
+            onDenyAttention={(item) => data.dismissAttention(item.id)}
+            onRestartAttention={(id) => data.restartPane(id)}
+            onDismissAttention={(id) => data.dismissAttention(id)} />
           <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}

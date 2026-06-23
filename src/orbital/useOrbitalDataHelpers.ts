@@ -5,7 +5,7 @@
 // hook then applies. Cyclomatic-complexity burndown only; no logic was changed.
 import { extractSlots } from "../templates";
 import type { EarconType } from "../utils/earcon";
-import type { PendingCommand, PendingActionView } from "../types";
+import type { PendingCommand, PendingActionView, AttentionItem } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────
@@ -85,6 +85,14 @@ export function projectTemplatesFrame(msg: { templates?: unknown }): TemplateVie
  *  without one yields entries:null (which tells the burner to refetch). */
 export function historyEntriesFromFrame(msg: { history?: unknown }): PaneHistoryEntry[] | null {
   return Array.isArray(msg.history) ? (msg.history as PaneHistoryEntry[]) : null;
+}
+
+/** attention_updated: the full attention queue the server broadcasts on every queue mutation
+ *  (push from observe, dismiss from orient). The frame carries the whole array — adopt it directly;
+ *  a frame WITHOUT one yields null, the "degrade to a refetch" signal (mirrors the plans_updated
+ *  adopt-or-refetch idiom). An EMPTY array is real state (a cleared queue), never a refetch. */
+export function attentionQueueFromFrame(msg: { queue?: unknown }): AttentionItem[] | null {
+  return Array.isArray(msg.queue) ? (msg.queue as AttentionItem[]) : null;
 }
 
 /** draft_updated: the WIP draft text for a pane (always a string; missing/non-string → ""). */
@@ -217,4 +225,19 @@ export function layoutApplyToast(d: Record<string, unknown>): ToastSpec {
   const out = (typeof d.output === "string" && d.output ? d.output : "") || "Layout applied 🔥";
   const applied = out.includes("applied");
   return { msg: out, kind: applied ? "fire" : "warn", earcon: applied ? "execute" : undefined };
+}
+
+/** dismissAttention: classify the REST response into the outcome the hook applies. A dismiss is
+ *  veto-class, so a gated-Off run does NOT 403 — it returns kind:ok → HTTP 200 with a body whose
+ *  `output` starts with "Error:" (the "gated Off … forbidden by policy" narration). So a 200 is NOT
+ *  proof the alert cleared: only a 200 WITHOUT an "Error:"-wrapped output is a real success.
+ *    - status 403 → blocked (restore + warn)
+ *    - !ok        → failed  (restore + warn)
+ *    - 200 with output starting "Error:" → blocked (restore + warn)  ← the gate-off honesty case
+ *    - otherwise  → cleared (success toast) */
+export function dismissAttentionOutcome(status: number, ok: boolean, body: Record<string, unknown>): "cleared" | "blocked" | "failed" {
+  if (status === 403) return "blocked";
+  if (!ok) return "failed";
+  if (typeof body.output === "string" && body.output.startsWith("Error:")) return "blocked";
+  return "cleared";
 }
