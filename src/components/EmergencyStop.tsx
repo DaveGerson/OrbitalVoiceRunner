@@ -75,7 +75,7 @@ export function EmergencyStop({ frozen, runningCount, onFreeze, onKill, onReleas
         data-testid="stop-all-trigger"
         onClick={onFreeze}
         title="Freeze Janus and cancel everything in progress (you can release this). Panes keep running."
-        className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:text-red-300 transition-colors cursor-pointer font-mono text-[10px] uppercase tracking-[0.1em] font-bold shrink-0"
+        className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:text-red-300 transition-colors cursor-pointer font-mono text-xs uppercase tracking-[0.1em] font-bold shrink-0"
       >
         <Square className="w-3.5 h-3.5" />
         Stop Everything
@@ -96,7 +96,7 @@ export function EmergencyStop({ frozen, runningCount, onFreeze, onKill, onReleas
         </span>
         <div className="min-w-0">
           <span className="text-red-300 font-mono text-xs uppercase tracking-widest font-bold block leading-none">Frozen — Janus is on hold</span>
-          <span className="text-[10px] text-red-200/70 font-sans block mt-0.5">
+          <span className="text-xs text-red-200/70 font-sans block mt-0.5">
             Everything in progress was cancelled. {runningCount > 0
               ? `${runningCount} pane${runningCount === 1 ? "" : "s"} ${runningCount === 1 ? "is" : "are"} still running.`
               : "No panes are still running."}
@@ -115,7 +115,7 @@ export function EmergencyStop({ frozen, runningCount, onFreeze, onKill, onReleas
             onTouchStart={beginHold}
             onTouchEnd={cancelHold}
             title={`Hold to kill the ${runningCount} running pane${runningCount === 1 ? "" : "s"}. This can't be undone.`}
-            className="relative overflow-hidden flex items-center gap-1.5 px-3 py-1.5 rounded border border-red-500/60 bg-red-600/20 text-red-200 hover:bg-red-600/30 transition-colors cursor-pointer font-mono text-[10px] uppercase tracking-wider font-bold select-none"
+            className="relative overflow-hidden flex items-center gap-1.5 px-3 py-1.5 rounded border border-red-500/60 bg-red-600/20 text-red-200 hover:bg-red-600/30 transition-colors cursor-pointer font-mono text-xs uppercase tracking-wider font-bold select-none"
           >
             {/* Filling ring: a left-to-right progress fill while held. */}
             <span
@@ -132,7 +132,7 @@ export function EmergencyStop({ frozen, runningCount, onFreeze, onKill, onReleas
           data-testid="stop-all-release"
           onClick={onRelease}
           title="Un-freeze Janus. Your safety gates come back exactly as they were. Any panes you killed stay killed."
-          className="px-3 py-1.5 rounded border border-white/20 bg-white/5 text-zinc-200 hover:bg-white/10 hover:text-white transition-colors cursor-pointer font-mono text-[10px] uppercase tracking-wider font-bold"
+          className="px-3 py-1.5 rounded border border-white/20 bg-white/5 text-zinc-200 hover:bg-white/10 hover:text-white transition-colors cursor-pointer font-mono text-xs uppercase tracking-wider font-bold"
         >
           Release
         </button>
