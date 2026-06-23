@@ -103,7 +103,6 @@ export interface PendingApproval {
 export const DEFAULT_SHELL_ALLOWLIST = [
   "git", "ls", "cat", "pwd", "whoami", "ps", "head", "tail", "grep", "find", "df",
   "echo", "which", "env", "date", "uname", "hostname", "wc", "stat", "du", "tree",
-  "ping",
 ];
 
 export function loadShellAllowlist(envValue?: string): Set<string> {

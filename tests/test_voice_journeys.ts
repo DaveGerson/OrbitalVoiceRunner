@@ -113,8 +113,9 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
    *  non-SHELL_COMMS descendant ⇒ busy) reports as Running. NOTE: `timeout /t 600 /nobreak` does NOT
    *  work here — `timeout.exe` aborts immediately ("Input redirection is not supported") when run
    *  under a ConPTY where stdin is redirected, so it never blocks; `ping` reads no stdin and is the
-   *  verified choice. `ping` is the allowlisted first token (DEFAULT_SHELL_ALLOWLIST), so it
-   *  auto-executes under Full Auto exactly like `cat`. */
+   *  verified choice. `ping` is NOT in the production DEFAULT_SHELL_ALLOWLIST (it would auto-execute
+   *  arbitrary-host pings under Full Auto); this suite scopes it via JANUS_SHELL_ALLOWLIST in
+   *  before(), so it auto-executes under Full Auto exactly like `cat`. */
   function blockingProbe(): string {
     return process.platform === "win32" ? "ping -n 600 127.0.0.1" : "cat";
   }
@@ -160,6 +161,14 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     process.env.JANUS_RECONNECT_MAX_ATTEMPTS = "3";
     process.env.JANUS_RECONNECT_BASE_DELAY_MS = "20";
     process.env.JANUS_RECONNECT_MAX_DELAY_MS = "60";
+
+    // Scope the journeys' first-token shell allowlist to THIS suite only — `ping` is NOT in the
+    // production DEFAULT_SHELL_ALLOWLIST (it auto-executes any `ping <host>` under Full Auto:
+    // unbounded runtime + arbitrary network egress). createGating() calls loadShellAllowlist()
+    // ONCE at boot (src/gating/index.ts), so this MUST be set before startServer() below; the env
+    // value REPLACES the default list, so it must enumerate every token the journeys execute:
+    // `echo` (execProbe) and `cat`/`ping` (blockingProbe). Restored in after().
+    process.env.JANUS_SHELL_ALLOWLIST = "echo,cat,ping";
 
     // Isolate the .janus_* ledger/settings/DB files into a temp cwd BEFORE importing ../server.
     prevCwd = process.cwd();
@@ -223,6 +232,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     await teardownServerSuite(running);
     process.chdir(prevCwd);
     delete process.env.VJ42;
+    delete process.env.JANUS_SHELL_ALLOWLIST;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
