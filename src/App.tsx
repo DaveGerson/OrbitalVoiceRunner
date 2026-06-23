@@ -52,6 +52,9 @@ import {
   formatCompactBytes,
   formatTokenCount,
   estimateTokens,
+  resolveCardContextSize,
+  contextMeterPercent,
+  totalContextBarPercent,
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
 import { buildMockData } from "./mockData";
@@ -2036,7 +2039,7 @@ function AppRaw() {
                 <div className="w-24 h-1 bg-zinc-950 rounded-full overflow-hidden mt-1.5" title="Aggregated Sandbox Overload Threshold Indicator">
                   <div
                     className={`h-full transition-all duration-500 ${totalContextBarClass(totalContextSize)}`}
-                    style={{ width: `${Math.min((totalContextSize / 100000) * 100, 100)}%` }}
+                    style={{ width: `${totalContextBarPercent(totalContextSize)}%` }}
                   ></div>
                 </div>
               </div>
@@ -2765,7 +2768,7 @@ function AppRaw() {
                     {filteredPanes.map((pane) => {
                       const term = terminals.find(t => t.id === pane.pane_id);
                       const status = resolvePaneStatus(term, pane);
-                      const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+                      const contextSize = resolveCardContextSize(term, pane);
                       const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
 
                       // Burndown: each grid-mode card body is relocated VERBATIM into a nested render
@@ -2816,7 +2819,7 @@ function AppRaw() {
                       const { primaryColorClass, bgHover, presetLabel } = detailedCardPresetClasses(pane.tool_preset);
 
                       // Context memory warnings/colors
-                      const contextPercent = Math.min((contextSize / 20000) * 100, 100);
+                      const contextPercent = contextMeterPercent(contextSize);
                       const contextColor = contextMeterColor(contextSize);
 
                       const renderVideowallCard = () => (

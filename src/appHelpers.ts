@@ -58,8 +58,7 @@ export function sumContextSize(
   if (!panes) return 0;
   return Object.values(panes).reduce((sum, pane) => {
     const term = terminals.find((t) => t.id === pane.pane_id);
-    const size = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
-    return sum + size;
+    return sum + resolveCardContextSize(term, pane);
   }, 0);
 }
 
@@ -633,4 +632,37 @@ export function formatTokenCount(n: number): string {
 /** Token estimate: ceil(chars / 4), the 4-chars-per-token approximation used across the cards. */
 export function estimateTokens(n: number): number {
   return Math.ceil(n / 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-size resolution + meter-fill percent (dbt4 round 3). App.tsx's grid-card `.map` derived
+// the per-card context size with the SAME `term?.context_size !== undefined ? term.context_size :
+// (pane.context_size || 0)` fallback that `sumContextSize` already reduces over — relocate it so
+// the single-card site and the aggregate share ONE byte-exact derivation. The two meter-fill bars
+// render `Math.min((n / DENOM) * 100, 100)` with DISTINCT denominators (20000 for a per-pane card,
+// 100000 for the header cumulative bar), so each gets its OWN helper rather than a parameterized one
+// — keeping every call site a literal, byte-exact relocation of its inline `Math.min(...)`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The card's effective context size: the live terminal's `context_size` if defined, else the
+ *  ledger pane's (`|| 0`). VERBATIM from the inline `term?.context_size !== undefined ? … : …` at
+ *  the grid-card map; identical to the per-pane term used inside `sumContextSize`'s reducer. */
+export function resolveCardContextSize(
+  term: Pick<Terminal, "context_size"> | undefined,
+  pane: Pick<PaneMeta, "context_size">,
+): number {
+  return term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+}
+
+/** Per-pane context-meter fill %: `Math.min((contextSize / 20000) * 100, 100)`, clamped to 100.
+ *  VERBATIM from the grid detailed/videowall card meter (`contextPercent`). */
+export function contextMeterPercent(contextSize: number): number {
+  return Math.min((contextSize / 20000) * 100, 100);
+}
+
+/** Header cumulative overload-bar fill %: `Math.min((totalContextSize / 100000) * 100, 100)`,
+ *  clamped to 100. VERBATIM from the system-bar inline `Math.min(...)` (note the 100000 denom —
+ *  five-pane budget — distinct from the 20000 per-pane meter). */
+export function totalContextBarPercent(totalContextSize: number): number {
+  return Math.min((totalContextSize / 100000) * 100, 100);
 }
