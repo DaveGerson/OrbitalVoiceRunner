@@ -9,7 +9,7 @@ import { Button, Chip, Icon, VoiceCue } from "../primitives";
 import { useDialog } from "../useFocusTrap";
 import type { Station, StationProject } from "../station";
 import type { StoredNote } from "../../store/types";
-import type { PaneLayout, Plan } from "../../types";
+import type { PaneLayout, Plan, AttentionItem } from "../../types";
 import type { TemplateView } from "../useOrbitalData";
 
 // Map the persisted NoteType onto the design's ticket kinds (the wire only ever stores "note"; the
@@ -42,6 +42,27 @@ export function resolveTemplateInitial(initial?: { name: string; description: st
     description: initial?.description ?? "",
     body: initial?.body ?? "",
   };
+}
+
+// ── D2: the Attention ("what needs me") tab ───────────────────────────────────
+// The act a queue row offers, by AttentionItem.type:
+//   approval / confirmation → a staged gate decision: approve | deny
+//   error / exited / build-failed → a dead/failed station: restart (+ jump)
+//   idle (completion) / anything else → nothing to act on: jump to the station
+export type AttentionActKind = "approve" | "restart" | "jump";
+
+/** The Attention tab label: bare "Attention" when nothing's waiting, "Attention • N" otherwise.
+ *  A non-positive/garbage count is treated as empty (never renders a stray bullet). */
+export function attentionTabLabel(count: number): string {
+  return count > 0 ? `Attention • ${count}` : "Attention";
+}
+
+/** Which act buttons one attention row shows, from its item type. Unknown types degrade to a plain
+ *  jump so a row is never dead. Keep ≤ the complexity gate (a flat lookup, no nesting). */
+export function attentionActKind(item: { type?: string }): AttentionActKind {
+  if (item.type === "approval" || item.type === "confirmation") return "approve";
+  if (item.type === "error" || item.type === "exited" || item.type === "build-failed") return "restart";
+  return "jump";
 }
 
 function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n: StoredNote; dark: boolean; onEdit: (id: string, text: string) => void; onDelete: (id: string) => void; onFirePane: (projectId: string) => void; onJumpToPane: (paneId: string) => void }) {
@@ -417,13 +438,89 @@ function BeadsExplorer({ dark, onClose }: { dark: boolean; onClose: () => void }
   );
 }
 
-export function ThePass({ notes, plans, templates, layouts, stations, activePaneId, jotProjectId, jotProjectName, dark, voiceCues, onAdd, onEdit, onDelete, onFirePane, onJumpToPane, onExecutePlan, onDeletePlan, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onApplyTemplate, onSaveLayout, onApplyLayout, onDeleteLayout }: {
+// ── D2: the Attention inbox tab ───────────────────────────────────────────────
+// One alert row: a per-type chip, the message, and act buttons driven by attentionActKind
+// (approve+deny / restart / jump), plus an always-present Dismiss. Every field is real
+// (AttentionItem from GET /api/attention + attention_updated frames).
+const ATTN_CHIP: Record<string, { emoji: string; label: string; bg: string }> = {
+  error:          { emoji: "🔥", label: "error",     bg: "#e23a3a" },
+  "build-failed": { emoji: "🧱", label: "build",     bg: "#e23a3a" },
+  exited:         { emoji: "💀", label: "exited",    bg: "#a14b4b" },
+  approval:       { emoji: "🛎", label: "approval",  bg: "#ff8a3d" },
+  confirmation:   { emoji: "🛎", label: "confirm",   bg: "#ff8a3d" },
+  idle:           { emoji: "✅", label: "done",      bg: "#4db892" },
+};
+export function attnChip(type: string): { emoji: string; label: string; bg: string } {
+  return ATTN_CHIP[type] ?? { emoji: "📌", label: type || "alert", bg: "#8a6a4f" };
+}
+
+function AttentionRow({ item, dark, onApprove, onDeny, onRestart, onJump, onDismiss }: {
+  item: AttentionItem; dark: boolean;
+  onApprove: (item: AttentionItem) => void; onDeny: (item: AttentionItem) => void;
+  onRestart: (terminalId: string) => void; onJump: (terminalId: string) => void; onDismiss: (id: string) => void;
+}) {
+  const fg = dark ? "#ffe9c7" : INK;
+  const c = attnChip(item.type);
+  const act = attentionActKind(item);
+  // The per-act button set — each arm owns a tiny slice of JSX so the row stays under the gate.
+  function renderActs(): ReactNode {
+    if (act === "approve") {
+      return (
+        <>
+          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Approve" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Approve</span></button>
+          <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Deny" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
+        </>
+      );
+    }
+    if (act === "restart") {
+      return (
+        <button data-testid="attn-restart" onClick={() => onRestart(item.terminalId)} title="Re-fire this station" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Re-fire</span></button>
+      );
+    }
+    return (
+      <button data-testid="attn-jump" onClick={() => onJump(item.terminalId)} title="Jump to this station" style={{ ...monoChip(dark), cursor: "pointer", padding: "2px 8px" }}>#{item.terminalId} ›</button>
+    );
+  }
+  return (
+    <div data-testid="attn-row" data-attn-id={item.id} data-attn-act={act}
+      style={{ display: "flex", alignItems: "center", gap: 9, padding: "9px 11px", border: "2px solid " + INK, borderRadius: 10, background: dark ? "#241409" : "#fff9ec", boxShadow: "2px 2px 0 0 " + INK }}>
+      <Chip bg={c.bg} color={c.bg === "#d4a15a" ? INK : "#fff4de"}>{c.emoji} {c.label}</Chip>
+      <div style={{ flex: 1, minWidth: 0, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.3, wordBreak: "break-word" }}>{item.message}</div>
+      {renderActs()}
+      <button data-testid="attn-dismiss" onClick={() => onDismiss(item.id)} title="Clear this alert" style={miniBtn(dark)}><Icon name="x" size={12} /></button>
+    </div>
+  );
+}
+
+function AttentionTab({ items, dark, onApprove, onDeny, onRestart, onJump, onDismiss }: {
+  items: AttentionItem[]; dark: boolean;
+  onApprove: (item: AttentionItem) => void; onDeny: (item: AttentionItem) => void;
+  onRestart: (terminalId: string) => void; onJump: (terminalId: string) => void; onDismiss: (id: string) => void;
+}) {
+  // Only undismissed items reach the operator — a dismissed item is gone from "what needs me".
+  const live = items.filter((i) => !i.dismissed);
+  if (live.length === 0) {
+    return <div data-testid="attn-empty" style={{ padding: "10px 16px 14px", fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f" }}>nothin' needs you right now — clean board, Chef 😌</div>;
+  }
+  return (
+    <div data-testid="attn-list" style={{ display: "flex", flexDirection: "column", gap: 8, padding: "2px 16px 14px" }}>
+      {live.map((it) => (
+        <AttentionRow key={it.id} item={it} dark={dark}
+          onApprove={onApprove} onDeny={onDeny} onRestart={onRestart} onJump={onJump} onDismiss={onDismiss} />
+      ))}
+    </div>
+  );
+}
+
+export function ThePass({ notes, plans, templates, layouts, attention, stations, activePaneId, jotProjectId, jotProjectName, dark, voiceCues, onAdd, onEdit, onDelete, onFirePane, onJumpToPane, onExecutePlan, onDeletePlan, onCreateTemplate, onUpdateTemplate, onDeleteTemplate, onApplyTemplate, onSaveLayout, onApplyLayout, onDeleteLayout, onApproveAttention, onDenyAttention, onRestartAttention, onDismissAttention }: {
   notes: StoredNote[]; jotProjectId: string | null; jotProjectName: string; dark: boolean; voiceCues: boolean;
   /** 4U.1: voice-built orchestrator plans, surfaced as spec tickets. */
   plans: Plan[];
   /** Journey-expansion C: the cookbook (GET /api/templates) + mise en place (GET /api/layouts). */
   templates: TemplateView[];
   layouts: PaneLayout[];
+  /** D2: the attention/"what needs me" inbox (GET /api/attention + attention_updated frames). */
+  attention: AttentionItem[];
   /** The live board, for the Apply flow's station picker (the active pane pre-selects). */
   stations: Station[];
   activePaneId: string | null;
@@ -437,14 +534,38 @@ export function ThePass({ notes, plans, templates, layouts, stations, activePane
   onSaveLayout: (name: string) => void;
   onApplyLayout: (id: string) => void;
   onDeleteLayout: (id: string) => void;
+  /** D2: attention act callbacks. approve/deny take the whole item (the parent resolves the underlying
+   *  gate decision / station); restart + dismiss take the terminalId / item id. */
+  onApproveAttention: (item: AttentionItem) => void; onDenyAttention: (item: AttentionItem) => void;
+  onRestartAttention: (terminalId: string) => void; onDismissAttention: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [jar, setJar] = useState(false);
+  // D2: which view the pass shows. "tickets" = the classic strip; "attention" = the what-needs-me inbox.
+  const [tab, setTab] = useState<"tickets" | "attention">("tickets");
   const canJot = !!jotProjectId && jotProjectId !== "all";
   const fg = dark ? "#ffe9c7" : INK;
   const empty = notes.length === 0 && plans.length === 0 && templates.length === 0 && layouts.length === 0;
+  // The inbox count drives the tab badge; only undismissed items are "what needs me".
+  const attnCount = attention.filter((i) => !i.dismissed).length;
 
   // Inline render helpers — each owns its own CC budget so ThePass stays ≤10.
+
+  function renderTabToggle(): ReactNode {
+    const tabBtn = (id: "tickets" | "attention", label: string): ReactNode => (
+      <button data-testid={`pass-tab-${id}`} data-active={tab === id || undefined} onClick={() => setTab(id)}
+        style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "5px 11px", borderRadius: 999, border: "2px solid " + INK, cursor: "pointer",
+          background: tab === id ? (dark ? "#1a0f08" : "#fff9ec") : "transparent", color: id === "attention" && attnCount > 0 ? "#e23a3a" : fg, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, opacity: tab === id ? 1 : 0.6 }}>
+        {label}
+      </button>
+    );
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "0 16px 8px" }}>
+        {tabBtn("tickets", "Tickets")}
+        {tabBtn("attention", attentionTabLabel(attnCount))}
+      </div>
+    );
+  }
 
   function renderPassBar(): ReactNode {
     return (
@@ -487,13 +608,30 @@ export function ThePass({ notes, plans, templates, layouts, stations, activePane
     );
   }
 
+  // D2: the toggle earns its space when the pass is open OR there's anything in the inbox; the
+  // tab decides which body renders below it.
+  const showTabs = expanded || attnCount > 0;
+  const renderBody = (): ReactNode => {
+    if (tab === "attention") {
+      return (
+        <AttentionTab items={attention} dark={dark}
+          onApprove={onApproveAttention} onDeny={onDenyAttention}
+          onRestart={onRestartAttention} onJump={onJumpToPane} onDismiss={onDismissAttention} />
+      );
+    }
+    return renderPassTickets();
+  };
+
   return (
     <div data-testid="the-pass" style={{ flexShrink: 0, borderBottom: "3px solid " + INK, background: dark ? "#2f1d12" : "#fff4de" }}>
       {/* the bar */}
       {renderPassBar()}
 
-      {/* the tickets */}
-      {renderPassTickets()}
+      {/* the tab toggle (tickets | attention) */}
+      {showTabs && renderTabToggle()}
+
+      {/* the active tab's body */}
+      {renderBody()}
 
       {jar && <BeadsExplorer dark={dark} onClose={() => setJar(false)} />}
     </div>

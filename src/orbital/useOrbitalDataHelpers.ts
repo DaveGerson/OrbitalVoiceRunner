@@ -4,7 +4,7 @@
 // function here is PURE (no React, no fetch, no setState) — it computes a value or a decision the
 // hook then applies. Cyclomatic-complexity burndown only; no logic was changed.
 import { extractSlots } from "../templates";
-import type { PendingCommand, PendingActionView } from "../types";
+import type { PendingCommand, PendingActionView, AttentionItem } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────
@@ -27,6 +27,14 @@ export function projectTemplatesFrame(msg: { templates?: unknown }): TemplateVie
  *  without one yields entries:null (which tells the burner to refetch). */
 export function historyEntriesFromFrame(msg: { history?: unknown }): PaneHistoryEntry[] | null {
   return Array.isArray(msg.history) ? (msg.history as PaneHistoryEntry[]) : null;
+}
+
+/** attention_updated: the full attention queue the server broadcasts on every queue mutation
+ *  (push from observe, dismiss from orient). The frame carries the whole array — adopt it directly;
+ *  a frame WITHOUT one yields null, the "degrade to a refetch" signal (mirrors the plans_updated
+ *  adopt-or-refetch idiom). An EMPTY array is real state (a cleared queue), never a refetch. */
+export function attentionQueueFromFrame(msg: { queue?: unknown }): AttentionItem[] | null {
+  return Array.isArray(msg.queue) ? (msg.queue as AttentionItem[]) : null;
 }
 
 /** draft_updated: the WIP draft text for a pane (always a string; missing/non-string → ""). */

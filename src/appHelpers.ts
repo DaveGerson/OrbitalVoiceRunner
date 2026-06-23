@@ -369,6 +369,10 @@ export interface WsHandlerCtx {
   setWsErrorNotification: (val: any) => void;
   setProactiveNotifications: (updater: any) => void;
   setPlans: (val: any) => void;
+  /** D2: the attention/"what needs me" queue setter, fed by the eventBus `setAttentionQueue`
+   *  effect (attention_updated frames). OPTIONAL — the classic App.tsx has no attention state, so a
+   *  caller that omits it simply no-ops the setter (the bus earcon still fires). */
+  setAttentionQueue?: (val: any) => void;
   queueStdoutChunk: (terminalId: string, chunk: string) => void;
   fetchTerminals: () => void;
   fetchPlans: () => void;
@@ -503,6 +507,10 @@ function handleEventBusFallback(msg: any, ctx: WsHandlerCtx): void {
   if (!effect) return;
   switch (effect.setter) {
     case "setPlans": ctx.setPlans(msg.plans); break;
+    // D2 (known gap): the eventBus emits setAttentionQueue for attention_updated, but this switch
+    // had no arm for it — the queue silently never updated. Adopt msg.queue (optional setter, so
+    // an attention-less surface like classic App.tsx no-ops; the earcon below still fires).
+    case "setAttentionQueue": ctx.setAttentionQueue?.(msg.queue); break;
     case "fetchTerminals": ctx.fetchTerminals(); break;
     case "fetchPlans": ctx.fetchPlans(); break;
     case "noop": break;
