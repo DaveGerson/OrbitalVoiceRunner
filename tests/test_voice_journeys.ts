@@ -28,9 +28,10 @@
 //      command_blocked / approval_resolved frames confirm.
 //   3. DEFER — spoken "not now" (the Phase 4 defer verb, src/approvalIntent.ts): the approval
 //      SURVIVES (TTL re-armed) instead of being claim+deleted, and stays resolvable afterwards.
-//   4. STATUS TRUTH — a REAL busy pane (Full-Auto auto-execute of allowlisted `cat`, which then
-//      holds the tty foreground) + a REAL idle pane; list_panes reports honest busy/idle derived
-//      from the genuine status machine (authoritative /proc probe) — no manual term.status writes.
+//   4. STATUS TRUTH — a REAL busy pane (Full-Auto auto-execute of an allowlisted blocking probe —
+//      `cat` on POSIX, `ping -n 600 127.0.0.1` on Windows; see blockingProbe() — which then holds
+//      the foreground) + a REAL idle pane; list_panes reports honest busy/idle derived from the
+//      genuine status machine (authoritative process-tree probe) — no manual term.status writes.
 //   5. DROP-AND-RESUME — with an approval pending, the Gemini socket dies (emitClose 1006); the
 //      bounded reconnect mints a fresh session, the survivor re-attaches, the resumption digest
 //      ("Welcome back…", gating.reannounceSurvivors) names it, and the approval is still
@@ -100,6 +101,25 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
       : `echo ${verb}_\${VJ42}`;
   }
 
+  /** A real-execution BUSY probe that runs on the pane's NATIVE shell with NO PATH-dependent
+   *  external binary, so the "REAL busy pane" half of Journey-4 is portable. This is DISTINCT from
+   *  execProbe(): execProbe echoes and EXITS (proof-of-execution); blockingProbe must HOLD the
+   *  foreground so the authoritative process-tree probe reads is_busy=true. POSIX `cat` blocks
+   *  reading the tty; on Windows there is no cmd.exe `cat` builtin and `cat.exe` is NOT on the
+   *  system PATH (only Git Bash provides it) — a clean Windows box prints "cat is not recognized",
+   *  the pane exits to Idle, and the is_busy assertion fails. The Windows analogue is `ping -n 600
+   *  127.0.0.1`: a native binary (C:\Windows\System32\ping.exe, always present) that runs ~600s as a
+   *  genuine non-shell foreground child the authoritative process-tree probe (statusProbe.ts → a
+   *  non-SHELL_COMMS descendant ⇒ busy) reports as Running. NOTE: `timeout /t 600 /nobreak` does NOT
+   *  work here — `timeout.exe` aborts immediately ("Input redirection is not supported") when run
+   *  under a ConPTY where stdin is redirected, so it never blocks; `ping` reads no stdin and is the
+   *  verified choice. `ping` is NOT in the production DEFAULT_SHELL_ALLOWLIST (it would auto-execute
+   *  arbitrary-host pings under Full Auto); this suite scopes it via JANUS_SHELL_ALLOWLIST in
+   *  before(), so it auto-executes under Full Auto exactly like `cat`. */
+  function blockingProbe(): string {
+    return process.platform === "win32" ? "ping -n 600 127.0.0.1" : "cat";
+  }
+
   /** Create a REAL shell pane by VOICE (create_pane, gated Auto for the suite) — the genuine
    *  addTerminal -> node-pty spawn path. Custom preset derives the default shell command (bash on
    *  POSIX), and the create effect makes the new pane the ACTIVE write target (Issue #2 fix), so a
@@ -141,6 +161,14 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     process.env.JANUS_RECONNECT_MAX_ATTEMPTS = "3";
     process.env.JANUS_RECONNECT_BASE_DELAY_MS = "20";
     process.env.JANUS_RECONNECT_MAX_DELAY_MS = "60";
+
+    // Scope the journeys' first-token shell allowlist to THIS suite only — `ping` is NOT in the
+    // production DEFAULT_SHELL_ALLOWLIST (it auto-executes any `ping <host>` under Full Auto:
+    // unbounded runtime + arbitrary network egress). createGating() calls loadShellAllowlist()
+    // ONCE at boot (src/gating/index.ts), so this MUST be set before startServer() below; the env
+    // value REPLACES the default list, so it must enumerate every token the journeys execute:
+    // `echo` (execProbe) and `cat`/`ping` (blockingProbe). Restored in after().
+    process.env.JANUS_SHELL_ALLOWLIST = "echo,cat,ping";
 
     // Isolate the .janus_* ledger/settings/DB files into a temp cwd BEFORE importing ../server.
     prevCwd = process.cwd();
@@ -204,6 +232,7 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     await teardownServerSuite(running);
     process.chdir(prevCwd);
     delete process.env.VJ42;
+    delete process.env.JANUS_SHELL_ALLOWLIST;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
@@ -342,12 +371,14 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     await createShellPane("vj-idle");
     await createShellPane("vj-busy", "Full Auto");
 
-    // Drive the busy work through the REAL voice pipe: Full-Auto + allowlisted `cat` auto-executes
-    // (decideProposal -> auto_execute -> term.writeInput). `cat` then blocks reading the tty, so
-    // the pane holds a genuine foreground command the authoritative /proc probe reports as busy.
+    // Drive the busy work through the REAL voice pipe: Full-Auto + the allowlisted blockingProbe()
+    // first token auto-executes (decideProposal -> auto_execute -> term.writeInput). The probe then
+    // blocks in the foreground (POSIX `cat` reading the tty; Windows `ping -n 600 127.0.0.1` as a
+    // native console child — see blockingProbe()), so the pane holds a genuine foreground command the
+    // authoritative probe reports as busy on BOTH platforms (cmd.exe has no `cat`, so this is portable).
     const callId = live().emitToolCall("propose_command", {
       pane_id: "vj-busy",
-      instruction: "cat",
+      instruction: blockingProbe(),
       kind: "shell",
     });
     const out = String(await waitFor(() => mock.responseFor(callId)));
@@ -359,16 +390,27 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     const deadline = Date.now() + 15000;
     let busyMeta: any;
     let idleMeta: any;
+    let converged = false;
     for (;;) {
       const c = live().emitToolCall("list_panes");
       const tree: any = await waitFor(() => mock.responseFor(c));
       const panes = (Array.isArray(tree) ? tree : []).flatMap((p: any) => p?.panes ?? []);
       busyMeta = panes.find((p: any) => p?.pane_id === "vj-busy");
       idleMeta = panes.find((p: any) => p?.pane_id === "vj-idle");
-      if (busyMeta?.is_busy === true && idleMeta?.is_busy === false) break;
+      if (busyMeta?.is_busy === true && idleMeta?.is_busy === false) { converged = true; break; }
       if (Date.now() > deadline) break;
       await new Promise((r) => setTimeout(r, 400));
     }
+
+    // EXPLICIT cross-platform BUSY trap (bead lmo): the authoritative process-tree probe must read
+    // is_busy=true for a REAL running foreground child within the deadline — POSIX `cat` and Windows
+    // `ping -n 600 127.0.0.1` alike (see blockingProbe()). A deadline break leaves converged=false,
+    // so this fails loudly with "never reported BUSY" instead of a downstream is_busy mismatch.
+    assert.ok(
+      converged,
+      `blockingProbe() never made vj-busy report BUSY before the 15s deadline ` +
+        `(platform=${process.platform}): busy=${JSON.stringify(busyMeta)} idle=${JSON.stringify(idleMeta)}`,
+    );
 
     assert.ok(busyMeta, "list_panes lists the busy pane");
     assert.ok(idleMeta, "list_panes lists the idle pane");
