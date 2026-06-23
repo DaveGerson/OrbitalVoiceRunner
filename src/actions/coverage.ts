@@ -18,8 +18,21 @@
  * get_pane_gates -> .../gates, list_capabilities -> GET /api/capabilities,
  * list_handoffs -> GET /api/handoffs, read_handoff -> GET /api/handoffs/:handoff_id). They are now
  * voice+rest and were REMOVED from the allow-list below (multi-surface tools are never allow-listed).
- * The reads that stay voice-only do so on purpose: get_pane_delta mutates a per-pane read cursor and
- * list_pending_approvals / get_attention_digest are session-scoped (empty on session:null REST).
+ *
+ * cv2 CONVERGENCE (operator decision D5): the FIVE handoff WRITE tools gained a REST twin under the
+ * canonical POST /api/<resource>/:id/<verb> family (propose_handoff -> POST /api/handoffs, revise_handoff
+ * -> POST /api/handoffs/:handoff_id/revise, stage_handoff -> POST .../stage, reject_handoff -> POST
+ * .../reject, deliver_handoff -> POST .../deliver). The first four are PURE LEDGER ops (no pane write),
+ * safe on the session:null REST path. deliver_handoff WRITES to a live pane but routes through
+ * ctx.dispatchProposal (restDispatchProposal on REST — the SAME gated seam execute_plan rides), so its
+ * twin enforces capabilityGates.deliver_handoff at PARITY with voice via status-via-kinds (Auto->200 /
+ * Ask->202 / Off->403). All five are now voice+rest and were REMOVED from the allow-list.
+ *
+ * 7ep / PERMANENT voice-only reads: get_pane_delta, list_pending_approvals, get_attention_digest stay
+ * voice-only BY DESIGN, NOT as convergence residue. get_pane_delta MUTATES a per-pane read cursor (it is
+ * not an idempotent GET); list_pending_approvals + get_attention_digest are SESSION-SCOPED (they read the
+ * per-connection live state, which is always empty on a session:null REST request). A REST twin for any
+ * of the three would be either unsafe (cursor mutation) or vacuous (empty) — so they are permanent.
  */
 
 import type { ActionDef, Surface } from "./types";
@@ -53,18 +66,26 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
 
   // ── Convergence-track residue: voice-only pane-WRITE choke-points (REST/WS twin is a future item) ─
   propose_command: new Set<Surface>(["voice"]), // dispatchProposal pane-WRITE HiTL path; voice-only today
-  deliver_handoff: new Set<Surface>(["voice"]), // staged-handoff delivery (gated via dispatchProposal); voice-only today
+  // cv2 (D5) CONVERGED deliver_handoff too: it WRITES to a live pane, but it routes through
+  // ctx.dispatchProposal (restDispatchProposal on REST — the SAME gated seam execute_plan rides), so its
+  // POST /api/handoffs/:handoff_id/deliver twin enforces capabilityGates.deliver_handoff at PARITY with
+  // voice (Auto->write 200 / Ask->HiTL pending 202 / Off->block 403). It is now voice+rest and MUST NOT be
+  // allow-listed here (isMultiSurface skips it).
 
-  // ── Convergence-track residue: voice-only READS (REST/WS read twin is a future item) ─────────────
-  // cv1 CONVERGED six session-independent reads to REST (get_pane_summary, get_pane_command_history,
-  // get_pane_gates, list_capabilities, list_handoffs, read_handoff) — they are now voice+rest, so they
-  // are multi-surface and MUST NOT be allow-listed here (isMultiSurface skips them). The three that
-  // remain voice-only are NOT session-independent: get_pane_delta mutates a per-pane read cursor (unsafe
-  // as an idempotent GET) and list_pending_approvals / get_attention_digest are session-scoped (always
-  // empty on a session:null REST request).
+  // ── PERMANENT voice-only READS (7ep — NOT convergence residue; no REST twin will ever exist) ─────
+  // cv1 CONVERGED the six session-INDEPENDENT reads to REST (get_pane_summary, get_pane_command_history,
+  // get_pane_gates, list_capabilities, list_handoffs, read_handoff) — now voice+rest, multi-surface, so
+  // they MUST NOT be allow-listed here (isMultiSurface skips them). The three below are PERMANENT
+  // voice-only by design (7ep decided this; the route-cutover for the converged reads is already done):
+  //   - get_pane_delta MUTATES a per-pane read cursor → not an idempotent GET; a REST twin would be unsafe.
+  //   - list_pending_approvals / get_attention_digest are SESSION-SCOPED → they read the per-connection
+  //     live state, which is ALWAYS empty on a session:null REST request; a REST twin would be vacuous.
+  // These are a final decision, not a deferred convergence item — do NOT remove them expecting a twin.
   get_pane_delta: new Set<Surface>(["voice"]),
   list_pending_approvals: new Set<Surface>(["voice"]),
   get_attention_digest: new Set<Surface>(["voice"]),
+  // get_project_notes / search_notes: voice-only model-facing reads (the operator-direct UI reads are the
+  // separate rest-only read_project_notes def). Convergence residue — a REST twin remains a future item.
   get_project_notes: new Set<Surface>(["voice"]),
   search_notes: new Set<Surface>(["voice"]),
 
@@ -77,10 +98,11 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // ── Convergence-track residue: voice-only draft/focus composers (REST/WS twin is a future item) ──
   switch_active_pane: new Set<Surface>(["voice"]),
   update_draft_prompt: new Set<Surface>(["voice"]),
-  propose_handoff: new Set<Surface>(["voice"]),
-  revise_handoff: new Set<Surface>(["voice"]),
-  stage_handoff: new Set<Surface>(["voice"]),
-  reject_handoff: new Set<Surface>(["voice"]),
+  // cv2 (D5) CONVERGED the FIVE handoff WRITE tools — propose_handoff (POST /api/handoffs),
+  // revise_handoff (POST .../:handoff_id/revise), stage_handoff (POST .../stage), reject_handoff
+  // (POST .../reject), deliver_handoff (POST .../deliver). They are now voice+rest (the handoff-drawer
+  // button contract), so they are multi-surface and MUST NOT be allow-listed here (isMultiSurface skips
+  // them). deliver routes through ctx.dispatchProposal (the gated seam), enforcing the gate on REST too.
 
   // ── Convergence-track residue: voice-only locks mutator (REST/WS twin is a future item) ──────────
   set_global_permissions: new Set<Surface>(["voice"]),
@@ -106,6 +128,9 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // ── Phase 1 (deferrable-toggle honesty): archive_pane is the rest-only "archive THIS pane" op (pure
   // ledger move, no process stop). No voice twin BY DESIGN — the voice exit+archive tool is close_pane
   // (which terminates), and bulk exited-archive is clear_exited; standalone archive is operator-UI. ──
+  // cv3 (D5) RATIFIED this REST-only asymmetry as INTENTIONAL & PERMANENT: a voice "archive this pane"
+  // twin would be redundant with close_pane (semantic exit+archive) — the operator already has a voice
+  // path to the same intent, so archive_pane stays rest-only (operator-UI) with NO voice twin.
   archive_pane: new Set<Surface>(["rest"]),
 
   // ── c55 Batch F: NEW rest-only STRUCTURED page-load READS (no voice twin BY DESIGN) ─────────────
@@ -156,9 +181,13 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
 
   // ── c55 Batch G: NEW rest-only watch-rule / plan-delete defs (no voice twin today) ───────────────
   // These converge inline app.{get,post,delete}(...) routes that never had a Gemini voice tool. They are
-  // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description. A voice yes/no twin for
-  // remove_watch_rule / delete_orchestrator_plan (+ a dedicated gate row) is DEFERRED for ratification;
-  // add_watch_rule's matrix row exists (default Ask) but stays reserved until that voice tool lands.
+  // rest-only (surfaces = {'rest'}) so they don't force a voice-tool description.
+  // cv3 (D5) RATIFICATION: the watch-rule READ (list_watch_rules) and the plan/rule DELETES
+  // (remove_watch_rule, delete_orchestrator_plan) stay REST-only by design — these are operator-UI
+  // management ops; a spoken "list my watch rules" / "delete plan X" twin is not planned. The ONE
+  // watch-rule op whose voice twin is still genuinely OPEN (not ratified rest-only) is add_watch_rule:
+  // its matrix row exists (default Ask) but the voice tool is DEFERRED to wsm-e2e-pinned-dvn (decide:
+  // voice twin vs accept) — it is allow-listed here only until that decision lands. See cv3 / dvn.
   list_watch_rules: new Set<Surface>(["rest"]),
   add_watch_rule: new Set<Surface>(["rest"]),
   remove_watch_rule: new Set<Surface>(["rest"]),
