@@ -4,10 +4,24 @@
 // function here is PURE (no React, no fetch, no setState) — it computes a value or a decision the
 // hook then applies. Cyclomatic-complexity burndown only; no logic was changed.
 import { extractSlots } from "../templates";
+import type { EarconType } from "../utils/earcon";
 import type { PendingCommand, PendingActionView } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────
+
+// Frame-type → hands-free earcon (UX_BRIEF §4: eyes-off, a state change with no sound is a bug).
+// Only the two attention-worthy lifecycle frames chime: an open approval (a pane needs you) rings
+// the falling "alert"; a finished pane plays the rising "completion" pair. Everything else is null.
+const FRAME_EARCON: Record<string, EarconType> = {
+  approval_pending: "alert",
+  pane_exited: "completion",
+};
+
+/** The earcon a given observe-lane frame type should play, or null for no tone. */
+export function earconForFrame(type: string): EarconType | null {
+  return Object.hasOwn(FRAME_EARCON, type) ? FRAME_EARCON[type] : null;
+}
 
 /** templates_updated: project the RAW ledger rows the server broadcasts into TemplateView rows,
  *  re-deriving `slots` through the same pure engine the server projects with (extractSlots).
