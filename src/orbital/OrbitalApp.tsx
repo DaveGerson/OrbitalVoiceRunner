@@ -186,8 +186,9 @@ export default function OrbitalApp() {
   // callbacks (deliver/revise/reject, which fire the canonical handoff REST twins inside the hook).
   const handoffWiring = useMemo(() => ({
     byPane: groupHandoffsByPane(data.handoffs),
-    onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onReject: data.rejectHandoff,
-  }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.rejectHandoff]);
+    onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onStage: data.stageHandoff,
+    onReject: data.rejectHandoff, onFetchPrompt: data.fetchHandoffPrompt,
+  }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.stageHandoff, data.rejectHandoff, data.fetchHandoffPrompt]);
   const running = stations.filter((s) => s.status === "Running").length;
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };

@@ -82,6 +82,16 @@ function buildHandoffRow(r: Record<string, unknown>): StoredHandoff {
   };
 }
 
+/** Extract the FULL composed_prompt from a read_handoff (GET /api/handoffs/:id) response. The default
+ *  resultToHttp wraps the row under `{ output: {...} }`; a future bare-row shape is tolerated too.
+ *  Returns null for any non-string / missing prompt (the caller then keeps its existing seed). Pure. */
+export function handoffPromptFromReadResponse(d: unknown): string | null {
+  const outer = d as { output?: unknown } | null;
+  const row = (outer && typeof outer.output === "object" && outer.output ? outer.output : d) as { composed_prompt?: unknown } | null;
+  const prompt = row && typeof row === "object" ? row.composed_prompt : null;
+  return typeof prompt === "string" ? prompt : null;
+}
+
 /** Normalize the rows GET /api/handoffs returns into the StoredHandoff-ish shape the drawer reads.
  *  The list_handoffs REST projection (src/actions/defs/handoff.ts) keys the id as `handoff_id` and
  *  redacts/slices `composed_prompt`; the cv2 handoffs_updated frame is expected to carry FULL rows

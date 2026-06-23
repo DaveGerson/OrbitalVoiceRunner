@@ -18,7 +18,9 @@ export interface HandoffWiring {
   byPane: Record<string, StoredHandoff[]>;
   onDeliver: (id: string) => void;
   onRevise: (id: string, text: string) => void;
+  onStage: (id: string) => void;
   onReject: (id: string) => void;
+  onFetchPrompt: (id: string) => Promise<string | null>;
 }
 
 /** Spread the per-station handoff props onto a StationCard from the wiring bundle (or nothing). */
@@ -28,7 +30,9 @@ function handoffCardProps(wiring: HandoffWiring | undefined, paneId: string) {
     handoffs: wiring.byPane[paneId] ?? [],
     onDeliverHandoff: wiring.onDeliver,
     onReviseHandoff: wiring.onRevise,
+    onStageHandoff: wiring.onStage,
     onRejectHandoff: wiring.onReject,
+    onFetchHandoffPrompt: wiring.onFetchPrompt,
   };
 }
 

@@ -23,14 +23,16 @@ import {
 
 const PIP_COUNT = 8;
 
-export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onRejectHandoff }: {
+export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onStageHandoff, onRejectHandoff, onFetchHandoffPrompt }: {
   st: Station; accentHex: string; dark: boolean; compact: boolean; tilt?: number;
   onOpen: () => void; layout: "grid" | "rail" | "list"; showCue: boolean; active: boolean;
   // j4e1 (additive): handoffs bound TO this station + the hero-action callbacks. Omitted → no drawer.
   handoffs?: StoredHandoff[];
   onDeliverHandoff?: (id: string) => void;
   onReviseHandoff?: (id: string, text: string) => void;
+  onStageHandoff?: (id: string) => void;
   onRejectHandoff?: (id: string) => void;
+  onFetchHandoffPrompt?: (id: string) => Promise<string | null>;
 }) {
   const [hover, setHover] = useState(false);
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
@@ -119,10 +121,11 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
   // j4e1: the per-station handoff drawer — the deliver/revise/reject hero surface. Renders only when
   // this station owns handoffs (to_pane) AND the callbacks are wired; the drawer self-hides otherwise.
   function renderHandoffDrawer() {
-    if (!handoffs || handoffs.length === 0 || !onDeliverHandoff || !onReviseHandoff || !onRejectHandoff) return null;
+    if (!handoffs || handoffs.length === 0 || !onDeliverHandoff || !onReviseHandoff || !onStageHandoff || !onRejectHandoff || !onFetchHandoffPrompt) return null;
     return (
       <StationHandoffDrawer handoffs={handoffs}
-        onDeliver={onDeliverHandoff} onRevise={onReviseHandoff} onReject={onRejectHandoff} />
+        onDeliver={onDeliverHandoff} onRevise={onReviseHandoff} onStage={onStageHandoff}
+        onReject={onRejectHandoff} onFetchPrompt={onFetchHandoffPrompt} />
     );
   }
 
