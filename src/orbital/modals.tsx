@@ -33,7 +33,7 @@ function ModalShell({ dark, accent, mascot, title, scribble, onClose, children, 
 }
 
 function FieldLbl({ children, dark }: { children: ReactNode; dark: boolean }) {
-  return <span style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23" }}>{children}</span>;
+  return <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23" }}>{children}</span>;
 }
 const modalInput = (dark: boolean): CSSProperties => ({ width: "100%", padding: "9px 11px", border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", color: dark ? "#ffe9c7" : INK, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, outline: "none", boxShadow: "inset 2px 2px 0 0 #00000010", boxSizing: "border-box" });
 function Pill({ on, onClick, children, dark }: { on: boolean; onClick: () => void; children: ReactNode; dark: boolean }) {

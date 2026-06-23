@@ -54,12 +54,12 @@ function ServiceLogLine({ r, dark }: { r: ServiceLogRow; dark: boolean }) {
   const kindSkin = kindSkinFor(kind);
   const pane = paneOf(r);
   const msSuffix = typeof r.ms === "number"
-    ? <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{r.ms < 1 ? "<1" : Math.round(r.ms)}ms</span>
+    ? <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", flexShrink: 0 }}>{r.ms < 1 ? "<1" : Math.round(r.ms)}ms</span>
     : null;
   return (
     <div data-testid="service-log-row" style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", borderRadius: 9, border: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff4de" }}>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f", flexShrink: 0, width: 72 }}>{logTime(r.ts)}</span>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", flexShrink: 0, width: 72 }}>{logTime(r.ts)}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
         {resolveLogLabel(r)}{pane ? <span style={{ color: "#8a6a4f", fontWeight: 600 }}> · #{pane}</span> : null}
       </span>
       {r.surface && <Chip bg={dark ? "#241409" : "#fff9ec"} color="#8a6a4f">{r.surface}</Chip>}
@@ -80,10 +80,10 @@ function FreezerRow({ a, dark, onRestore, onDelete }: {
     <div data-testid="freezer-pane" data-pane-id={a.pane_id}
       style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff4de" }}>
       <span style={{ fontSize: 15 }}>🧊</span>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{a.pane_id}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{a.pane_id}</span>
       <span style={{ flex: 1, minWidth: 0 }}>
         <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, color: fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.name || a.pane_id}</span>
-        {a.last_command && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.last_command}</span>}
+        {a.last_command && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.last_command}</span>}
       </span>
       {a.tool_preset && <Chip bg={dark ? "#241409" : "#fff9ec"} color="#8a6a4f">{a.tool_preset}</Chip>}
       <Button testId="freezer-restore" variant="mint" size="sm" icon="play" title="Thaw it — restore this pane to its project" onClick={() => onRestore(a.pane_id)}>Restore</Button>
@@ -102,7 +102,7 @@ function Card({ dark, children, style = {} }: { dark: boolean; children: ReactNo
   return <div style={{ background: dark ? "#241409" : "#fff9ec", border: "2px solid " + INK, borderRadius: 14, padding: 18, boxShadow: "4px 4px 0 0 " + INK, ...style }}>{children}</div>;
 }
 function Head({ children, dark }: { children: ReactNode; dark: boolean }) {
-  return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
+  return <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 10 }}>{children}</div>;
 }
 
 // bead apu: render the recent-action error rate as a whole-percent chip ("7%"). Clamps the 0–1
@@ -212,14 +212,14 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, heal
             <Fragment key={s.id}>
               <button data-testid="pantry-pane" onClick={() => onOpenStation(s.id)}
                 style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff4de", cursor: "pointer", textAlign: "left", width: "100%" }}>
-                <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{s.id}</span>
+                <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: "#8a6a4f", flexShrink: 0 }}>#{s.id}</span>
                 <StatusBadge status={s.status} />
                 <span style={{ flex: 1, minWidth: 0 }}>
                   <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, color: fg, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</span>
-                  {s.scribble && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.scribble}</span>}
+                  {s.scribble && <span style={{ display: "block", fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.scribble}</span>}
                 </span>
                 <Pips steps={8} done={s.contextPips} color={proj!.color} label={s.contextLabel} />
-                <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, color: "#8a6a4f", flexShrink: 0 }}>{s.elapsed}</span>
+                <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", flexShrink: 0 }}>{s.elapsed}</span>
               </button>
             </Fragment>
           ))}
@@ -311,9 +311,9 @@ export function ThePantry({ dark, projects, stations, archived, serviceLog, heal
             <div data-testid="pantry-banner" style={{ display: "flex", alignItems: "center", gap: 14 }}>
               <span style={{ fontSize: 38 }}>{proj.emoji}</span>
               <div style={{ minWidth: 0 }}>
-                <div style={{ fontFamily: "DM Sans", fontSize: 10.5, fontWeight: 800, letterSpacing: ".12em", textTransform: "uppercase", opacity: .85 }}>Project</div>
+                <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, letterSpacing: ".12em", textTransform: "uppercase", opacity: .85 }}>Project</div>
                 <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 30, lineHeight: 1, color: "#fff4de" }}>{proj.name}</div>
-                <div style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, opacity: .9, marginTop: 4 }}>{proj.cwd} · {panes.length} pane{panes.length === 1 ? "" : "s"} · {cooking} cooking</div>
+                <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, opacity: .9, marginTop: 4 }}>{proj.cwd} · {panes.length} pane{panes.length === 1 ? "" : "s"} · {cooking} cooking</div>
               </div>
             </div>
           </Card>

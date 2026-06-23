@@ -30,7 +30,7 @@ function StatusChip({ state }: { state: StoredHandoff["state"] }) {
     <span data-testid="handoff-status" data-state={state} style={{
       display: "inline-flex", alignItems: "center", padding: "1px 8px", borderRadius: 999,
       background: STATUS_BG[state] ?? "#c9a97a", border: "1.5px solid " + INK, color: INK,
-      fontFamily: "DM Sans", fontSize: 9.5, fontWeight: 800, letterSpacing: ".04em", textTransform: "uppercase",
+      fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, letterSpacing: ".04em", textTransform: "uppercase",
     }}>{handoffStatusLabel(state)}</span>
   );
 }
@@ -50,7 +50,7 @@ function HeroButton({ label, emoji, kind, disabled, onClick, testid }: {
       style={{
         display: "inline-flex", alignItems: "center", gap: 4, padding: "5px 11px", borderRadius: 8,
         border: "2px solid " + INK, background: bg, color: INK, cursor: disabled ? "not-allowed" : "pointer",
-        opacity: disabled ? 0.45 : 1, fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5,
+        opacity: disabled ? 0.45 : 1, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12,
         boxShadow: disabled ? "none" : "2px 2px 0 0 " + INK,
       }}>{emoji} {label}</button>
   );
@@ -59,7 +59,7 @@ function HeroButton({ label, emoji, kind, disabled, onClick, testid }: {
 // The textarea style — shared so the editor reads identically wherever it mounts.
 const REVISE_INPUT_STYLE = {
   width: "100%", boxSizing: "border-box" as const, padding: 7, borderRadius: 7, border: "1.5px solid " + INK,
-  fontFamily: "JetBrains Mono", fontSize: 11, resize: "vertical" as const, marginBottom: 7, background: "#fff",
+  fontFamily: "JetBrains Mono", fontSize: 12, resize: "vertical" as const, marginBottom: 7, background: "#fff",
 };
 
 // Save is enabled ONLY when the operator actually changed the (non-empty) text vs. the editor's seed —
@@ -79,7 +79,7 @@ function EditActions({ id, draft, seed, onRevise, onDone }: {
       <HeroButton testid="handoff-revise-save" kind="revise" emoji="✓" label="Save"
         disabled={!isReviseDirty(draft, seed)} onClick={() => { onRevise(id, draft); onDone(false); }} />
       <button data-testid="handoff-revise-cancel" onClick={(e) => { e.stopPropagation(); onDone(true); }}
-        style={{ padding: "5px 11px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5 }}>Cancel</button>
+        style={{ padding: "5px 11px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Cancel</button>
     </>
   );
 }
@@ -130,7 +130,7 @@ function HandoffRow({ h, onDeliver, onRevise, onStage, onReject, onFetchPrompt }
       padding: 9, borderRadius: 9, border: "1.5px solid " + INK, background: "#fff9ec", marginBottom: 8,
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: "#8a6a4f" }}>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: "#8a6a4f" }}>
           {h.from_pane ?? "—"} → {h.to_pane}
         </span>
         <div style={{ flex: 1 }} />
@@ -141,7 +141,7 @@ function HandoffRow({ h, onDeliver, onRevise, onStage, onReject, onFetchPrompt }
           onChange={(e) => setDraft(e.target.value)} rows={3} style={REVISE_INPUT_STYLE} />
       ) : (
         <div data-testid="handoff-summary" style={{
-          fontFamily: "JetBrains Mono", fontSize: 11, color: INK, lineHeight: 1.35, marginBottom: 7,
+          fontFamily: "JetBrains Mono", fontSize: 12, color: INK, lineHeight: 1.35, marginBottom: 7,
           whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 66, overflow: "hidden",
         }}>{h.composed_prompt || "(empty draft)"}</div>
       )}
@@ -179,10 +179,10 @@ export function StationHandoffDrawer({ handoffs, onDeliver, onRevise, onStage, o
         style={{
           display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 999,
           border: "2px solid " + INK, background: active > 0 ? "#ffc94a" : "#fff4de", color: INK,
-          cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11,
+          cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12,
         }}>
         📋 {handoffs.length} handoff{handoffs.length === 1 ? "" : "s"}{active > 0 ? ` · ${active} live` : ""}
-        <span style={{ fontSize: 9 }}>{open ? "▲" : "▼"}</span>
+        <span style={{ fontSize: 12 }}>{open ? "▲" : "▼"}</span>
       </button>
       {open && (
         <div data-testid="handoff-drawer-body" style={{ marginTop: 9 }}>

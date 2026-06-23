@@ -50,7 +50,7 @@ export function EmergencyStop({ onClose, onKill, runningCount }: { onClose: () =
         {stage === 1 ? (
           <div style={{ padding: "22px 24px 26px", textAlign: "center" }}>
             <div style={{ position: "absolute", top: 26, right: 18 }}><Mascot variant="panic" size={92} style={{ animation: "orb-jiggle 0.4s linear infinite" }} /></div>
-            <Chip bg="#e23a3a" color="#fff4de" style={{ fontSize: 11 }}>🚨 emergency brake · stage 1</Chip>
+            <Chip bg="#e23a3a" color="#fff4de" style={{ fontSize: 12 }}>🚨 emergency brake · stage 1</Chip>
             <h2 style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 40, lineHeight: 1, color: "#a8151a", margin: "12px 0 6px", letterSpacing: "-.02em" }}>ALL HANDS!</h2>
             <p style={{ fontFamily: "Caveat, cursive", fontSize: 24, color: "#e23a3a", transform: "rotate(-1.5deg)", margin: "0 0 12px" }}>"86 the line — everybody stop!"</p>
             <p style={{ fontFamily: "DM Sans", fontSize: 14, fontWeight: 600, color: "#5b3a23", maxWidth: 400, margin: "0 auto 18px", lineHeight: 1.45 }}>
@@ -73,7 +73,7 @@ export function EmergencyStop({ onClose, onKill, runningCount }: { onClose: () =
         ) : (
           <div style={{ padding: "26px 24px 28px", textAlign: "center" }}>
             <div style={{ position: "absolute", top: 28, right: 20 }}><Mascot variant="default" size={88} /></div>
-            <Chip bg="#2a1a10" color="#fff4de" style={{ fontSize: 11 }}>kitchen closed · stage 2</Chip>
+            <Chip bg="#2a1a10" color="#fff4de" style={{ fontSize: 12 }}>kitchen closed · stage 2</Chip>
             <h2 style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 38, lineHeight: 1, color: INK, margin: "12px 0 6px" }}>Gas is off.</h2>
             <p style={{ fontFamily: "Caveat, cursive", fontSize: 24, color: "#2f7a5e", transform: "rotate(-1.5deg)", margin: "0 0 14px" }}>"every burner's out, Chef."</p>
             <p style={{ fontFamily: "DM Sans", fontSize: 14, fontWeight: 600, color: "#5b3a23", maxWidth: 380, margin: "0 auto 20px", lineHeight: 1.45 }}>

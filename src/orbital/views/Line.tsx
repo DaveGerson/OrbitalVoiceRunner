@@ -78,16 +78,16 @@ function ProjectSection({ proj, items, dark, compact, layout, onOpen, showCue, a
         <span style={{ fontSize: 24 }}>{proj.emoji}</span>
         <div style={{ lineHeight: 1.05 }}>
           <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 21, letterSpacing: "-.01em" }}>{proj.name}</div>
-          <div style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, opacity: .85, marginTop: 1 }}>{proj.cwd}</div>
+          <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, opacity: .85, marginTop: 1 }}>{proj.cwd}</div>
         </div>
         <div style={{ flex: 1 }} />
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px", borderRadius: 999, background: "#2a1a10", color: "#fff4de", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 10px", borderRadius: 999, background: "#2a1a10", color: "#fff4de", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>
           <span style={{ width: 7, height: 7, borderRadius: "50%", background: running ? "#9be3c0" : "#8a6a4f" }} />{running} running · {items.length} panes
         </span>
         <button onClick={() => onNewPane?.(proj.id)} disabled={!onNewPane} title="Open a new pane in this project" style={{
           display: "flex", alignItems: "center", gap: 4, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK,
           background: "#fff4de", color: INK, cursor: onNewPane ? "pointer" : "not-allowed", opacity: onNewPane ? 1 : 0.5,
-          fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, boxShadow: "2px 2px 0 0 " + INK,
+          fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, boxShadow: "2px 2px 0 0 " + INK,
         }}><Icon name="plus" size={13} /> Pane</button>
       </div>
       <PaneList items={items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} handoffs={handoffs} />
@@ -106,7 +106,7 @@ function ClearExitedChip({ count, onClear }: { count: number; onClear?: () => vo
       style={{
         display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 999,
         border: "2px solid " + INK, background: "#8a6a4f", color: "#fff4de", cursor: "pointer",
-        fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap", boxShadow: "2px 2px 0 0 " + INK,
+        fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", boxShadow: "2px 2px 0 0 " + INK,
       }}>
       🧊 Clear exited · {count}
     </button>
@@ -203,7 +203,7 @@ export function ProjectsSidebar({ stations, projects, selected, setSelected, dar
               <span style={{ fontSize: 17 }}>{p.emoji}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 13.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</div>
-                <div style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, opacity: .8 }}>{p.panes} panes · {running} running</div>
+                <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, opacity: .8 }}>{p.panes} panes · {running} running</div>
               </div>
               {needs && <span style={{ fontSize: 12 }}>🛎</span>}
             </button>

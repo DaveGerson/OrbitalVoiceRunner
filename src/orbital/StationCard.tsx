@@ -46,11 +46,11 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
   function renderHeaderRow() {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 7, paddingLeft: 4 }}>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: sub }}>#{st.id}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: sub }}>#{st.id}</span>
         <span style={{ width: 7, height: 7, borderRadius: 2, background: accentHex, border: "1.5px solid " + INK }} />
-        <span style={{ fontFamily: "DM Sans", fontSize: 10, fontWeight: 800, color: accentHex, letterSpacing: ".06em" }}>{tag}</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, color: accentHex, letterSpacing: ".06em" }}>{tag}</span>
         {active && (
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 7px", borderRadius: 999, background: "#ffc94a", border: "1.5px solid " + INK, fontFamily: "DM Sans", fontSize: 9, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", color: INK }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 7px", borderRadius: 999, background: "#ffc94a", border: "1.5px solid " + INK, fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", color: INK }}>
             <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#e23a3a", animation: "orb-pulse 1s var(--ease-bounce) infinite" }} />active
           </span>
         )}
@@ -70,7 +70,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 4 }}>
           <ChefAvatar chefKey={st.chef} size={20} />
           <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: fg }}>Chef {CHEFS[st.chef].name}</span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 600, color: sub, marginLeft: 2 }}>· {rt.label}</span>
+          <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 600, color: sub, marginLeft: 2 }}>· {rt.label}</span>
         </div>
       </div>
     );
@@ -93,7 +93,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
       <div data-testid="station-peek" style={{ marginTop: 10, background: INK, borderRadius: 8, padding: "7px 10px", overflow: "hidden", maxHeight: 62 }}>
         {st.outputTail.slice(-3).map((l, i) => (
           <div key={i} style={{
-            fontFamily: "JetBrains Mono, monospace", fontSize: 10.5, lineHeight: 1.5,
+            fontFamily: "JetBrains Mono, monospace", fontSize: 12, lineHeight: 1.5,
             color: deriveOutputLineColor(l),
             whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
           }}>{l}</div>
@@ -113,7 +113,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         <Pips steps={PIP_COUNT} done={st.contextPips} color={accentHex} label={st.contextLabel} />
         <div style={{ flex: 1 }} />
         {needs && <Chip bg="#ff8a3d" color="#fff4de">{STATUS["Needs Input"].emoji} at the pass</Chip>}
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: sub }}>{st.elapsed}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: sub }}>{st.elapsed}</span>
       </div>
     );
   }

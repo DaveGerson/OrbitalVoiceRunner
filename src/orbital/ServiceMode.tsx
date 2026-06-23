@@ -63,8 +63,8 @@ function renderButtonLabel(
   return (
     <span style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", lineHeight: 1.05 }}>
       <span>{confirming ? "sure? tap again" : kitchen}</span>
-      {on && !confirming && <span style={{ fontSize: 9, fontWeight: 600, opacity: .8, fontFamily: "JetBrains Mono" }}>{label}</span>}
-      {confirming && <span style={{ fontSize: 9, fontWeight: 600, opacity: .8, fontFamily: "JetBrains Mono" }}>no asking after this</span>}
+      {on && !confirming && <span style={{ fontSize: 12, fontWeight: 600, opacity: .8, fontFamily: "JetBrains Mono" }}>{label}</span>}
+      {confirming && <span style={{ fontSize: 12, fontWeight: 600, opacity: .8, fontFamily: "JetBrains Mono" }}>no asking after this</span>}
     </span>
   );
 }

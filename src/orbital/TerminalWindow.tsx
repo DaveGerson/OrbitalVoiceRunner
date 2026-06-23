@@ -180,12 +180,12 @@ function HistoryRow({ e, dark }: { e: PaneHistoryEntry; dark: boolean }) {
     <div data-testid="burner-history-entry" style={{ border: "2px solid " + INK, borderRadius: 9, background: dark ? "#241409" : "#fff4de", boxShadow: "2px 2px 0 0 " + INK, overflow: "hidden" }}>
       <button onClick={() => setOpen((o) => !o)} title={open ? "Fold the output back up" : "Peek at what came back"}
         style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "8px 10px", border: "none", background: "transparent", cursor: "pointer", textAlign: "left" }}>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 11.5, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.command}</span>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9.5, color: "#8a6a4f", flexShrink: 0 }}>{when}</span>
-        <span style={{ fontFamily: "DM Sans", fontSize: 10, color: "#8a6a4f", transform: open ? "rotate(180deg)" : "none", flexShrink: 0 }}>▾</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: fg, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.command}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", flexShrink: 0 }}>{when}</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 12, color: "#8a6a4f", transform: open ? "rotate(180deg)" : "none", flexShrink: 0 }}>▾</span>
       </button>
       {open && (
-        <pre data-testid="burner-history-output" style={{ margin: 0, padding: "8px 10px", borderTop: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: dark ? "#e9d9c0" : "#5b3a23", fontFamily: "JetBrains Mono", fontSize: 10.5, lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 180, overflowY: "auto" }}>
+        <pre data-testid="burner-history-output" style={{ margin: 0, padding: "8px 10px", borderTop: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: dark ? "#e9d9c0" : "#5b3a23", fontFamily: "JetBrains Mono", fontSize: 12, lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 180, overflowY: "auto" }}>
           {outputText}
         </pre>
       )}
@@ -320,11 +320,11 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   const renderTerminalStatusBar = () => (
     <div style={{ padding: "7px 14px", borderBottom: "1px solid #ffffff18", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
       <span style={{ width: 8, height: 8, borderRadius: "50%", background: live ? "#9be3c0" : "#8a6a4f", animation: live ? "orb-pulse 1s var(--ease-bounce) infinite" : "none" }} />
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: "#c89f74", textTransform: "uppercase", letterSpacing: ".08em" }}>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#c89f74", textTransform: "uppercase", letterSpacing: ".08em" }}>
         {deriveStatusLineText(st.status, live)}
       </span>
       <div style={{ flex: 1 }} />
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8a6a4f" }}>{rt.burner} station</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{rt.burner} station</span>
     </div>
   );
 
@@ -416,15 +416,15 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
           </div>
           <div style={{ flex: 1, textAlign: "center", lineHeight: 1.1, minWidth: 0 }}>
             {renderTitleBarNameSection()}
-            <div style={{ fontFamily: "JetBrains Mono", fontSize: 10.5, color: INK, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>#{st.id} · {rt.label} on the {rt.burner} · {st.cwd}</div>
+            <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: INK, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>#{st.id} · {rt.label} on the {rt.burner} · {st.cwd}</div>
           </div>
           <button data-testid="burner-restart" onClick={onRestart} title="Re-fire this station (restart the process)"
-            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
+            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, background: "#fff4de", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>
             <Icon name="fire" size={13} color="#e23a3a" /> Re-fire
           </button>
           <button data-testid="burner-86" onClick={on86} data-confirming={confirm86 || undefined}
             title={derive86Title(st.status)}
-            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, ...derive86ButtonStyle(confirm86), cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11.5, whiteSpace: "nowrap" }}>
+            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", borderRadius: 8, border: "2px solid " + INK, ...derive86ButtonStyle(confirm86), cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>
             <Icon name="x" size={12} /> {derive86ButtonLabel(confirm86)}
           </button>
           <PostureChip posture={st.posture} mode={st.mode} />

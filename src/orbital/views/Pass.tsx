@@ -77,7 +77,7 @@ function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n
     if (!n.pane_id) return null;
     return (
       <button data-testid="pass-ticket-jump" onClick={() => onJumpToPane(n.pane_id!)} title="Jump to this station"
-        style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#2f1d12" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", cursor: "pointer", fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700 }}>#{n.pane_id} ›</button>
+        style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#2f1d12" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", cursor: "pointer", fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700 }}>#{n.pane_id} ›</button>
     );
   }
 
@@ -87,7 +87,7 @@ function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n
         <Chip bg={k.color} color={k.color === "#d4a15a" ? INK : "#fff4de"}>{k.emoji} {k.label}</Chip>
         {renderJumpButton()}
         <div style={{ flex: 1 }} />
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{ago(n.created_at)}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{ago(n.created_at)}</span>
       </div>
       {editing ? (
         <textarea data-testid="pass-ticket-edit" value={draft} onChange={(e) => setDraft(e.target.value)} autoFocus
@@ -96,7 +96,7 @@ function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n
         <div style={{ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{n.text}</div>
       )}
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-        <span style={{ fontFamily: "DM Sans", fontSize: 9.5, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" }}>— {n.author === "janus" ? "Chef de Cuisine" : "you"}</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" }}>— {n.author === "janus" ? "Chef de Cuisine" : "you"}</span>
         <div style={{ flex: 1 }} />
         {editing ? (
           <>
@@ -105,7 +105,7 @@ function TicketCard({ n, dark, onEdit, onDelete, onFirePane, onJumpToPane }: { n
           </>
         ) : (
           <>
-            {!n.pane_id && <button data-testid="pass-ticket-fire" onClick={() => onFirePane(n.project_id)} title="Fire a pane on this ticket" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Fire a pane</span></button>}
+            {!n.pane_id && <button data-testid="pass-ticket-fire" onClick={() => onFirePane(n.project_id)} title="Fire a pane on this ticket" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Fire a pane</span></button>}
             <button data-testid="pass-ticket-edit-btn" onClick={() => setEditing(true)} title="Amend the ticket" style={miniBtn(dark)}><Icon name="ticket" size={12} /></button>
             <button data-testid="pass-ticket-delete" onClick={() => onDelete(n.id)} title="86 this one" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
           </>
@@ -125,10 +125,10 @@ function fieldStyle(dark: boolean): CSSProperties {
 }
 // Slot / pane-id chips — the same mono pill palette as the ticket's #pane jump chip.
 function monoChip(dark: boolean): CSSProperties {
-  return { display: "inline-flex", alignItems: "center", padding: "1px 6px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", fontFamily: "JetBrains Mono", fontSize: 9.5, fontWeight: 700, whiteSpace: "nowrap" };
+  return { display: "inline-flex", alignItems: "center", padding: "1px 6px", borderRadius: 999, border: "1.5px solid " + INK, background: dark ? "#1a0f08" : "#fff4de", color: dark ? "#9be3c0" : "#2f7a5e", fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" };
 }
 const cardText = (fg: string): CSSProperties => ({ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" });
-const byline: CSSProperties = { fontFamily: "DM Sans", fontSize: 9.5, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" };
+const byline: CSSProperties = { fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" };
 
 // The Phase-2 two-tap inline 86 (SpecTicket's idiom, reusable): first tap arms "Sure, Chef?",
 // auto-resets after 3s; the second tap within the window fires the delete for keeps.
@@ -152,7 +152,7 @@ function Confirm86({ dark, title, testId, onConfirm }: { dark: boolean; title: s
       style={confirming
         ? { ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px" }
         : { ...miniBtn(dark), color: "#e23a3a" }}>
-      {confirming ? <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Sure, Chef?</span> : <Icon name="x" size={12} />}
+      {confirming ? <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Sure, Chef?</span> : <Icon name="x" size={12} />}
     </button>
   );
 }
@@ -175,7 +175,7 @@ function TemplateForm({ dark, initial, testPrefix, onCancel, onSave }: {
       <input data-testid={`${testPrefix}-desc`} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="description (optional)" style={fieldStyle(dark)} />
       <textarea data-testid={`${testPrefix}-body`} value={body} onChange={(e) => setBody(e.target.value)}
         placeholder={"Review the {{branch}} branch focusing on {{focus}}"}
-        style={{ ...fieldStyle(dark), resize: "none", minHeight: 72, fontFamily: "JetBrains Mono", fontSize: 11 }} />
+        style={{ ...fieldStyle(dark), resize: "none", minHeight: 72, fontFamily: "JetBrains Mono", fontSize: 12 }} />
       <div style={{ fontFamily: "Caveat, cursive", fontSize: 13.5, color: "#8a6a4f", lineHeight: 1.2 }}>
         {"{{slot_name}} placeholders become fillable parameters"}
       </div>
@@ -213,7 +213,7 @@ function TemplateApplyForm({ t, dark, stations, activePaneId, onCancel, onApply 
       {t.slots.map((slot) => (
         <input key={slot} data-testid={`pass-template-slot-${slot}`} value={vals[slot] ?? ""}
           onChange={(e) => setVals((v) => ({ ...v, [slot]: e.target.value }))} placeholder={slot}
-          style={{ ...fieldStyle(dark), fontFamily: "JetBrains Mono", fontSize: 11 }} />
+          style={{ ...fieldStyle(dark), fontFamily: "JetBrains Mono", fontSize: 12 }} />
       ))}
       <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
         <button onClick={onCancel} title="Cancel" style={miniBtn(dark)}>✕</button>
@@ -221,7 +221,7 @@ function TemplateApplyForm({ t, dark, stations, activePaneId, onCancel, onApply 
           onClick={() => { if (can) onApply(paneId, t.slots.map((name) => ({ name, value: vals[name] ?? "" }))); }}
           title={can ? "Fill that station's draft (you review and send it there)" : "Pick a station first"}
           style={{ ...miniBtn(dark), background: "#4db892", color: INK, width: "auto", padding: "0 8px", gap: 4, display: "inline-flex", opacity: can ? 1 : 0.5, cursor: can ? "pointer" : "not-allowed" }}>
-          <Icon name="ticket" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Fill the draft</span>
+          <Icon name="ticket" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Fill the draft</span>
         </button>
       </div>
     </div>
@@ -244,7 +244,7 @@ function TemplateTicket({ t, dark, stations, activePaneId, onUpdate, onDelete, o
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <Chip bg="#4db892" color={INK}>🧾 template</Chip>
         <div style={{ flex: 1 }} />
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{t.slots.length ? `${t.slots.length} slot${t.slots.length === 1 ? "" : "s"}` : "no slots"}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{t.slots.length ? `${t.slots.length} slot${t.slots.length === 1 ? "" : "s"}` : "no slots"}</span>
       </div>
       {mode === "edit" ? (
         <TemplateForm dark={dark} initial={{ name: t.name, description: t.description ?? "", body: t.body }} testPrefix="pass-template-edit"
@@ -252,7 +252,7 @@ function TemplateTicket({ t, dark, stations, activePaneId, onUpdate, onDelete, o
       ) : (
         <>
           <div style={cardText(fg)}>{t.name}</div>
-          {!!t.description && <div style={{ ...cardText("#8a6a4f"), fontSize: 11 }}>{t.description}</div>}
+          {!!t.description && <div style={{ ...cardText("#8a6a4f"), fontSize: 12 }}>{t.description}</div>}
           {t.slots.length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
               {t.slots.map((s) => <span key={s} style={monoChip(dark)}>{`{{${s}}}`}</span>)}
@@ -267,7 +267,7 @@ function TemplateTicket({ t, dark, stations, activePaneId, onUpdate, onDelete, o
               <div style={{ flex: 1 }} />
               <button data-testid="pass-template-apply" onClick={() => setMode("apply")} title="Fill a station's draft from this template"
                 style={{ ...miniBtn(dark), background: "#4db892", color: INK, width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}>
-                <Icon name="ticket" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Apply</span>
+                <Icon name="ticket" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Apply</span>
               </button>
               <button data-testid="pass-template-edit-btn" onClick={() => setMode("edit")} title="Amend the template" style={miniBtn(dark)}><Icon name="ticket" size={12} /></button>
               <Confirm86 dark={dark} title="86 this template" testId="pass-template-delete" onConfirm={() => onDelete(t.id)} />
@@ -309,10 +309,10 @@ function LayoutTicket({ l, dark, onApply, onDelete }: {
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <Chip bg="#ff8a3d" color={INK}>🗺 layout</Chip>
         <div style={{ flex: 1 }} />
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{panes.length} pane{panes.length === 1 ? "" : "s"}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{panes.length} pane{panes.length === 1 ? "" : "s"}</span>
       </div>
       <div style={cardText(fg)}>{l.name}</div>
-      {!!l.sourceProjectId && <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#8a6a4f" }}>from {l.sourceProjectId}</div>}
+      {!!l.sourceProjectId && <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>from {l.sourceProjectId}</div>}
       {panes.length > 0 && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
           {panes.map((p) => <span key={p.id} style={monoChip(dark)}>#{p.id}</span>)}
@@ -324,7 +324,7 @@ function LayoutTicket({ l, dark, onApply, onDelete }: {
         <button data-testid="pass-layout-apply" onClick={() => onApply(l.id)}
           title="Set these stations back up (gated like a recipe — may need your ok)"
           style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}>
-          <Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Set it up</span>
+          <Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Set it up</span>
         </button>
         <Confirm86 dark={dark} title="86 this layout" testId="pass-layout-delete" onConfirm={() => onDelete(l.id)} />
       </div>
@@ -385,23 +385,23 @@ function SpecTicket({ p, dark, onExecute, onDelete }: {
         <Chip bg="#4b3bb3" color="#fff4de">📋 spec</Chip>
         <Chip bg={skin.bg} color={skin.fg}>{skin.label}</Chip>
         <div style={{ flex: 1 }} />
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f" }}>{done}/{steps.length} steps</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{done}/{steps.length} steps</span>
       </div>
       <div style={{ fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: fg, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{p.name}</div>
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-        <span style={{ fontFamily: "DM Sans", fontSize: 9.5, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" }}>— Chef de Cuisine</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".05em" }}>— Chef de Cuisine</span>
         <div style={{ flex: 1 }} />
         <button data-testid="pass-spec-fire" onClick={() => onExecute(p.id)}
           title={p.status === "running" ? "Already firing — re-fire step 1" : "Fire this spec (step 1 runs through the gate)"}
           style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}>
-          <Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Fire it</span>
+          <Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Fire it</span>
         </button>
         <button data-testid="pass-spec-delete" onClick={on86} data-confirming={confirming || undefined}
           title={confirming ? "This 86 is for keeps — tap again" : "86 this spec"}
           style={confirming
             ? { ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px" }
             : { ...miniBtn(dark), color: "#e23a3a" }}>
-          {confirming ? <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Sure, Chef?</span> : <Icon name="x" size={12} />}
+          {confirming ? <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Sure, Chef?</span> : <Icon name="x" size={12} />}
         </button>
       </div>
     </div>
@@ -468,14 +468,14 @@ function AttentionRow({ item, dark, onApprove, onDeny, onRestart, onJump, onDism
     if (act === "approve") {
       return (
         <>
-          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Go to station" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Open</span></button>
+          <button data-testid="attn-approve" onClick={() => onApprove(item)} title="Go to station" style={{ ...miniBtn(dark), background: "#4db892", color: "#fff4de", width: "auto", padding: "0 8px" }}><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Open</span></button>
           <button data-testid="attn-deny" onClick={() => onDeny(item)} title="Dismiss" style={{ ...miniBtn(dark), color: "#e23a3a" }}><Icon name="x" size={12} /></button>
         </>
       );
     }
     if (act === "restart") {
       return (
-        <button data-testid="attn-restart" onClick={() => onRestart(item.terminalId)} title="Re-fire this station" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10 }}>Re-fire</span></button>
+        <button data-testid="attn-restart" onClick={() => onRestart(item.terminalId)} title="Re-fire this station" style={{ ...miniBtn(dark), background: "#e23a3a", color: "#fff4de", width: "auto", padding: "0 8px", gap: 4, display: "inline-flex" }}><Icon name="fire" size={11} /><span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12 }}>Re-fire</span></button>
       );
     }
     return (
@@ -581,7 +581,7 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
           {plans.length > 0 && <Chip bg="#4b3bb3" color="#fff4de">{plans.length} spec{pluralSuffix(plans.length)}</Chip>}
           {templates.length > 0 && <Chip bg="#4db892" color={INK}>{templates.length} template{pluralSuffix(templates.length)}</Chip>}
           {layouts.length > 0 && <Chip bg="#ff8a3d" color={INK}>{layouts.length} layout{pluralSuffix(layouts.length)}</Chip>}
-          <span style={{ fontFamily: "DM Sans", fontSize: 11, color: "#8a6a4f", transform: expanded ? "rotate(180deg)" : "none" }}>▾</span>
+          <span style={{ fontFamily: "DM Sans", fontSize: 12, color: "#8a6a4f", transform: expanded ? "rotate(180deg)" : "none" }}>▾</span>
         </button>
         {voiceCues && <VoiceCue phrase="what's on the pass?" dark={dark} />}
         <div style={{ flex: 1 }} />

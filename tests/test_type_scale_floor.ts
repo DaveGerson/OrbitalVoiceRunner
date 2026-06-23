@@ -12,7 +12,7 @@
 //
 // SCOPE: the classic React surface the bead enumerates — App.tsx + src/components/*.tsx. The orbital
 // "kitchen" UI (src/orbital/**) sizes text through inline `style={{ fontSize }}` numerics, a separate
-// mechanism + surface, and is intentionally NOT covered here (tracked as follow-up).
+// mechanism + surface, and is floored by its own guard: tests/test_type_scale_floor_orbital.ts.
 //
 // Runner: npx tsx --test --test-force-exit tests/test_type_scale_floor.ts
 
