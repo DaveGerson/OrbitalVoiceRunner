@@ -31,6 +31,20 @@ export function getChipLabel(live: boolean, micBlocked: boolean, connected: bool
   return "● LIVE";
 }
 
+/**
+ * velocity-mech: the conversational HELPER line that rides alongside the terse status pill — the
+ * chef-voice gloss of what the pill means, so an eyes-off operator hears the state in the kitchen's
+ * voice. Same arg order + branch precedence as getChipLabel/getChipBg (mic-blocked beats tuning beats
+ * muted), so the pill, its color, and this line never disagree about which state is showing.
+ */
+export function getChipHelper(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean, reconnecting: boolean): string {
+  if (!live) return reconnecting ? "Hang tight — gettin' back on air…" : "Off air — tap to tune in, Chef";
+  if (micBlocked) return "Mic's blocked — check browser permissions";
+  if (!connected) return "Tunin' in — one sec…";
+  if (muted) return "Mic's off — tap to talk";
+  return "I'm listening, Chef";
+}
+
 /** Background color for the mute/unmute button while live. */
 export function getMicBtnBg(micBlocked: boolean, muted: boolean): string {
   if (micBlocked) return "#ff8a3d";
@@ -247,10 +261,13 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
         </div>
         <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
         {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
-            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen. */}
-        <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
-          {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
-        </Chip>
+            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen.
+            velocity-mech: the conversational gloss rides the chip as a title (hover/AT readout). */}
+        <span title={getChipHelper(live, micBlocked, connected, muted, reconnecting)} style={{ display: "inline-flex" }}>
+          <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
+            {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
+          </Chip>
+        </span>
       </div>
 
       {/* now-speaking waveform */}

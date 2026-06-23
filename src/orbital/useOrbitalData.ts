@@ -28,7 +28,7 @@ import {
   projectTemplatesFrame, historyEntriesFromFrame, draftTextFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
-  templateClarifyText, templateApplyToast, layoutGatedText,
+  templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -560,6 +560,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // live, and double-handling would double the refetches and duplicate xterm writes.
   // Voice-only frames (audio/transcripts/grounding/channel state) live in the voice effect below.
   const handleObserveFrame = useCallback((msg: any) => {
+    // velocity-mech: play the hands-free earcon this RAW frame maps to (approval_pending → "alert";
+    // pane_transition with transition:"exited" → "completion"; null = no tone). Delegates to the
+    // pure `playObserveEarcon` decide-and-fire gate — the SAME routing the unit test pins with a spy
+    // earcon — over the voice-cues-gated `earcon` sink.
+    const playFrameEarcon = () => playObserveEarcon(msg, earcon);
     // The original flat switch is replaced by a per-type dispatch table: one tiny handler per frame
     // type, each a thin closure over the same setters. The OBSERVABLE order of setState / refetch /
     // earcon / desktopNote calls inside each handler is byte-identical to the original switch arm; the
@@ -585,6 +590,19 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       pane_quiescing: () => {
         if (typeof msg.terminalId === "string") {
           setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, quiescing: true } : t)));
+        }
+      },
+      // velocity-mech: the server's REAL pane-exit signal. A finished pane does NOT broadcast a
+      // `pane_exited` frame (there is none) — it rides `pane_transition` with transition:"exited"
+      // (src/observe/index.ts ~580). Only the "exited" transition chimes the rising "completion"
+      // earcon (UX_BRIEF §4 — an eyes-off chef must hear a finished pane) and patches status in place
+      // (mirroring the pane_status arm). Every other transition (idle/prompt/error/build-failed) is a
+      // no-op here: those edges already drive the board through their own broadcasts.
+      pane_transition: () => {
+        if (!isPaneExitedFrame(msg)) return;
+        playFrameEarcon(); // "completion" — work finished
+        if (typeof msg.terminalId === "string") {
+          setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, status: "Exited", quiescing: false } : t)));
         }
       },
       // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit). Stash the
@@ -624,7 +642,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload (immediate)
       // so the ApprovalDialog renders at once.
       approval_pending: () => {
-        earcon("alert"); // the bell: a pane needs you (eyes-off)
+        playFrameEarcon(); // the bell: a pane needs you (eyes-off) — "alert"
         desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
         setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
       },

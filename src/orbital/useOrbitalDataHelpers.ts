@@ -4,10 +4,68 @@
 // function here is PURE (no React, no fetch, no setState) — it computes a value or a decision the
 // hook then applies. Cyclomatic-complexity burndown only; no logic was changed.
 import { extractSlots } from "../templates";
+import type { EarconType } from "../utils/earcon";
 import type { PendingCommand, PendingActionView } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────
+
+// Frame-type → hands-free earcon (UX_BRIEF §4: eyes-off, a state change with no sound is a bug).
+// Only the two attention-worthy lifecycle frames chime: an open approval (a pane needs you) rings
+// the falling "alert"; a finished pane plays the rising "completion" pair. Everything else is null.
+//
+// IMPORTANT — frame shapes the server ACTUALLY emits (verified against src/observe/index.ts):
+//   • `approval_pending` is a real top-level frame type → maps straight here.
+//   • a finished pane does NOT broadcast a `pane_exited` frame (there is none). The exit edge
+//     rides `pane_transition` with `transition:"exited"` (observe/index.ts ~580). So the completion
+//     tone is keyed on that transition value in `earconForObserveFrame`, NOT on a frame type here.
+const FRAME_EARCON: Record<string, EarconType> = {
+  approval_pending: "alert",
+};
+
+/** The earcon a given observe-lane frame TYPE should play, or null for no tone. Type-keyed only —
+ *  payload-dependent frames (pane_transition) are resolved by `earconForObserveFrame` below. */
+export function earconForFrame(type: string): EarconType | null {
+  return Object.hasOwn(FRAME_EARCON, type) ? FRAME_EARCON[type] : null;
+}
+
+/** A raw observe-lane frame as far as the earcon decision cares: a `type` discriminant plus an
+ *  optional `transition` rider (carried only by `pane_transition`). The index signature keeps real
+ *  wider frames (terminalId/cmd/status/…) assignable without excess-property friction. */
+export interface ObserveFrame { type?: unknown; transition?: unknown; [k: string]: unknown }
+
+/** velocity-mech: the hands-free earcon a RAW observe frame should play, or null for no tone. This is
+ *  the production decision the hook routes every observe frame through — it understands both the
+ *  type-keyed frames (approval_pending → "alert") AND the payload-keyed `pane_transition` frame the
+ *  server really emits on a pane exit (transition:"exited" → "completion"). Pure, so it pins the
+ *  REAL contract without mounting the hook. Mirrors the server's emitted shape exactly:
+ *    { type:"pane_transition", terminalId, transition:"idle"|"prompt"|"error"|"build-failed"|"exited" }
+ */
+export function earconForObserveFrame(msg: ObserveFrame): EarconType | null {
+  if (msg?.type === "pane_transition") {
+    return msg.transition === "exited" ? "completion" : null;
+  }
+  return typeof msg?.type === "string" ? earconForFrame(msg.type) : null;
+}
+
+/** velocity-mech: TRUE for the exact `pane_transition` frame that means "a pane finished" — the only
+ *  observe frame that carries the in-place status:"Exited" patch (mirrors the pane_status arm). */
+export function isPaneExitedFrame(msg: ObserveFrame): boolean {
+  return msg?.type === "pane_transition" && msg.transition === "exited";
+}
+
+/** velocity-mech: the actual "decide + fire" gate the hook's observe handler routes its earcons
+ *  through — resolve the frame's earcon and ring it (skipping null). Pure over an injected sink, so a
+ *  spy-`earcon` test pins the REAL firing behaviour (right tone on approval_pending /
+ *  pane_transition(exited); silence on every neighbour) without mounting the React hook. The `earcon`
+ *  sink the hook passes is already voice-cues-gated, so this never bypasses that. */
+export function playObserveEarcon(
+  msg: ObserveFrame,
+  earcon: (type: EarconType) => void,
+): void {
+  const e = earconForObserveFrame(msg);
+  if (e) earcon(e);
+}
 
 /** templates_updated: project the RAW ledger rows the server broadcasts into TemplateView rows,
  *  re-deriving `slots` through the same pure engine the server projects with (extractSlots).
