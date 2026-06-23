@@ -264,7 +264,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     <div className="w-full h-full min-h-[300px] overflow-hidden bg-[#060606] relative rounded-md border border-white/5 group">
       {/* Dynamic zoom tools anchored in top right */}
       <div className="absolute top-3 right-3 z-10 flex items-center gap-1 bg-black/80 backdrop-blur-md px-2 py-1 rounded border border-white/10 opacity-40 group-hover:opacity-100 transition-opacity duration-200">
-        <span className="text-[10px] font-mono opacity-50 px-1 select-none">{fontSize}px</span>
+        <span className="text-xs font-mono opacity-50 px-1 select-none">{fontSize}px</span>
         <button
           onClick={handleZoomOut}
           title="Zoom Out"

@@ -61,7 +61,7 @@ export function CreateTerminalDialog({
       <div className="bg-[#111] border border-white/10 p-6 rounded-xl w-full max-w-md shadow-2xl animate-in zoom-in-95 duration-200 max-h-[90vh] overflow-y-auto">
         <h2 className="text-xs font-mono text-white mb-4 uppercase tracking-widest border-b border-white/10 pb-2 flex justify-between items-center">
           <span>Create New Node Unit</span>
-          <span className="text-[10px] text-zinc-500 font-normal">Harness v1.0.4</span>
+          <span className="text-xs text-zinc-500 font-normal">Harness v1.0.4</span>
         </h2>
         
         <div className="space-y-4 font-mono text-xs">
@@ -116,10 +116,10 @@ export function CreateTerminalDialog({
             <button 
               type="button" 
               onClick={() => setShowModifiers(!showModifiers)}
-              className="w-full flex justify-between items-center text-[10px] uppercase font-bold text-cyan-400 select-none tracking-widest focus:outline-none"
+              className="w-full flex justify-between items-center text-xs uppercase font-bold text-cyan-400 select-none tracking-widest focus:outline-none"
             >
               <span>Startup Modifiers & Options</span>
-              <span className="text-zinc-500 text-[9px]">{showModifiers ? "[HIDE]" : "[SHOW & EDIT]"}</span>
+              <span className="text-zinc-500 text-xs">{showModifiers ? "[HIDE]" : "[SHOW & EDIT]"}</span>
             </button>
 
             {showModifiers && (
@@ -134,8 +134,8 @@ export function CreateTerminalDialog({
                       className="mt-0.5 rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-black cursor-pointer"
                     />
                     <div className="flex flex-col">
-                      <span className="text-[10px] text-zinc-200 font-bold leading-tight">Danger Skip Permissions</span>
-                      <span className="text-[8px] text-zinc-500 mt-0.5">Appends --dangerously-skip-permissions to bypass all checks</span>
+                      <span className="text-xs text-zinc-200 font-bold leading-tight">Danger Skip Permissions</span>
+                      <span className="text-xs text-zinc-500 mt-0.5">Appends --dangerously-skip-permissions to bypass all checks</span>
                     </div>
                   </label>
 
@@ -147,28 +147,28 @@ export function CreateTerminalDialog({
                       className="mt-0.5 rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-black cursor-pointer"
                     />
                     <div className="flex flex-col">
-                      <span className="text-[10px] text-zinc-200 font-bold leading-tight">Session Resume</span>
-                      <span className="text-[8px] text-zinc-500 mt-0.5">Resume buffer automatically with an open terminal text box</span>
+                      <span className="text-xs text-zinc-200 font-bold leading-tight">Session Resume</span>
+                      <span className="text-xs text-zinc-500 mt-0.5">Resume buffer automatically with an open terminal text box</span>
                     </div>
                   </label>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-[10px] text-zinc-500 mb-0.5">Custom Env Variables</label>
+                    <label className="block text-xs text-zinc-500 mb-0.5">Custom Env Variables</label>
                     <input 
                       type="text"
-                      className="w-full bg-black border border-white/10 rounded px-2 py-1 text-white text-[10px] focus:outline-none focus:border-cyan-500"
+                      className="w-full bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
                       value={customEnvVars} 
                       onChange={e => setCustomEnvVars(e.target.value)} 
                       placeholder="DEBUG=1,COLOR=true" 
                     />
                   </div>
                   <div>
-                    <label className="block text-[10px] text-zinc-500 mb-0.5">Node Port Offset</label>
+                    <label className="block text-xs text-zinc-500 mb-0.5">Node Port Offset</label>
                     <input 
                       type="text"
-                      className="w-full bg-black border border-white/10 rounded px-2 py-1 text-white text-[10px] focus:outline-none focus:border-cyan-500"
+                      className="w-full bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
                       value={portOffset} 
                       onChange={e => setPortOffset(e.target.value)} 
                       placeholder="e.g. 8080" 
@@ -181,7 +181,7 @@ export function CreateTerminalDialog({
 
           <div>
             <label className="block text-zinc-500 mb-1">Resulting Command Executed</label>
-            <div className="w-full bg-zinc-950 border border-white/10 p-2.5 rounded text-green-400 font-mono text-[10px] break-all select-all leading-relaxed whitespace-pre-wrap">
+            <div className="w-full bg-zinc-950 border border-white/10 p-2.5 rounded text-green-400 font-mono text-xs break-all select-all leading-relaxed whitespace-pre-wrap">
               {cmd}
             </div>
           </div>

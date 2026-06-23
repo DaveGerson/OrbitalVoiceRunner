@@ -92,7 +92,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
               <h2 className="text-xs font-mono text-white uppercase tracking-widest leading-none">
                 {isEditing ? "Modify Project Context" : "Create New Project Context"}
               </h2>
-              <p className="text-[10px] text-zinc-500 font-mono mt-1">
+              <p className="text-xs text-zinc-500 font-mono mt-1">
                 Configure workspace profiles, working directories, and core terms
               </p>
             </div>
@@ -108,14 +108,14 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-6 space-y-4 text-xs font-mono">
           {error && (
-            <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-[10px] rounded leading-relaxed">
+            <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-400 text-xs rounded leading-relaxed">
               {error}
             </div>
           )}
 
           {/* Project ID */}
           <div className="space-y-1">
-            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-[10px]">
+            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-xs">
               <Hash className="w-3.5 h-3.5 text-cyan-500" />
               Project Context ID (slugified)
             </label>
@@ -129,7 +129,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
               required
             />
             {!isEditing && (
-              <span className="text-[9px] text-zinc-650 leading-none">
+              <span className="text-xs text-zinc-650 leading-none">
                 Unique identifier used in URLs, terminal configs, and backend systems.
               </span>
             )}
@@ -137,7 +137,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
 
           {/* Display Name */}
           <div className="space-y-1">
-            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-[10px]">
+            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-xs">
               <Sparkles className="w-3.5 h-3.5 text-cyan-500" />
               Human-Readable Name
             </label>
@@ -152,7 +152,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
 
           {/* Working Directory */}
           <div className="space-y-1">
-            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-[10px]">
+            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-xs">
               <Folder className="w-3.5 h-3.5 text-cyan-500" />
               CLI Working Directory Path (CWD)
             </label>
@@ -164,14 +164,14 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
               className="w-full bg-black border border-white/10 rounded px-3 py-2 text-white placeholder-zinc-700 font-mono focus:outline-none focus:border-cyan-500"
               required
             />
-            <span className="text-[9px] text-zinc-650 leading-none">
+            <span className="text-xs text-zinc-650 leading-none">
               Default path from which terminal panels and command environments will open.
             </span>
           </div>
 
           {/* Codebase Summary details */}
           <div className="space-y-1">
-            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-[10px]">
+            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-xs">
               <AlignLeft className="w-3.5 h-3.5 text-cyan-500" />
               High-Level Details / Summary Description
             </label>
@@ -186,7 +186,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
 
           {/* Core Codebase Terms */}
           <div className="space-y-1">
-            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-[10px]">
+            <label className="text-zinc-400 flex items-center gap-1.5 font-bold uppercase tracking-wider text-xs">
               <Tags className="w-3.5 h-3.5 text-cyan-500" />
               Key Terms (comma separated tags)
             </label>
@@ -197,7 +197,7 @@ export function ProjectDialog({ onClose, onSave, project }: ProjectDialogProps) 
               placeholder="e.g. React, Express, WebSocket, GeminiAPI"
               className="w-full bg-black border border-white/10 rounded px-3 py-2 text-white placeholder-zinc-700 font-mono focus:outline-none focus:border-cyan-500"
             />
-            <span className="text-[9px] text-zinc-650 leading-none">
+            <span className="text-xs text-zinc-650 leading-none">
               Enter key terms or technologies that characterize this project context.
             </span>
           </div>
