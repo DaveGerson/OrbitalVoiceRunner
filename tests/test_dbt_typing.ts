@@ -38,6 +38,21 @@ test("dbt2: voice live handlers no longer use `any`-typed Gemini envelopes", () 
   assert.equal(/onclose\s*:\s*\(\s*info\s*:\s*any\b/.test(src), false, "onclose info:any survived");
 });
 
+// ── bead ec8: PR #89's as-any sweep typed `message: LiveServerMessage` on the live-session
+// onmessage seam but left the adjacent `session: any` residual. The live session handle is the
+// SDK `Session`; the canonical store (VoiceSessionState.session) and the toolCall dispatch seam
+// (handleToolCalls) must carry that type, not `any`.
+test("ec8: live-session handle is typed `Session`, not `any`", () => {
+  const src = read("src/voice/index.ts");
+  // The SDK Session must be imported (the concrete live-session shape we narrow to).
+  assert.match(src, /import\s*\{[^}]*\bSession\b[^}]*\}\s*from\s*["']@google\/genai["']/, "Session import missing");
+  // The canonical per-connection store must be `Session | null`, not `any`. (Anchor on the field
+  // declaration form `session: <T>;` to avoid matching function params named `session` elsewhere.)
+  assert.match(src, /interface VoiceSessionState\b[\s\S]*?\n\s*session\s*:\s*Session\s*\|\s*null\s*;/, "VoiceSessionState.session is not `Session | null`");
+  // The toolCall dispatch seam (the residual PR #89 left beside message: LiveServerMessage).
+  assert.equal(/handleToolCalls\s*=\s*async\s*\(\s*message\s*:\s*LiveServerMessage\s*,\s*session\s*:\s*any\b/.test(src), false, "handleToolCalls session:any survived");
+});
+
 test("dbt2: server LiveConnector params/return are no longer `any`", () => {
   const src = read("server.ts");
   assert.equal(/export type LiveConnector =[^;]*params:\s*any/.test(src), false, "LiveConnector params:any survived");

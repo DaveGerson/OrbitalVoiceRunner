@@ -25,7 +25,7 @@
  *    function server.ts feeds into attachVoiceSession — gating still never imports voice.
  */
 
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
 import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
@@ -237,7 +237,10 @@ export interface VoiceDeps {
  * a second client gets a fresh, independent session lifecycle (no latent cross-client bleed).
  */
 interface VoiceSessionState {
-  session: any;
+  // The live Gemini handle (the SDK `Session`) for THIS connection, or null before the first
+  // successful connect / after teardown. bead ec8: PR #89's as-any sweep typed the `message`
+  // envelope on the onmessage seam but left this (and the toolCall dispatch param) as `any`.
+  session: Session | null;
   unsubscribePaneSignals: (() => void) | null;
   wsClosed: boolean;
   currentSessionUserUtterance: string;
@@ -1158,7 +1161,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
           // Dispatch every functionCall in a toolCall message through runToolCall (mints/stamps the turn id
           // and clears the barge-in latch per call, as the inline loop did).
-          const handleToolCalls = async (message: LiveServerMessage, session: any): Promise<void> => {
+          const handleToolCalls = async (message: LiveServerMessage, session: Session): Promise<void> => {
             if (!message.toolCall) return;
             for (const call of message.toolCall.functionCalls || []) {
               const ixnId = turnId();
@@ -1199,7 +1202,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             handleGrounding(message);
             relayModelAudio(message);
             relayInterruptAndTurnState(message);
-            await handleToolCalls(message, session);
+            // `session` is the live handle that delivered this message, so it is non-null here; the
+            // guard narrows `Session | null` -> `Session` for the typed dispatch seam (bead ec8).
+            if (session) await handleToolCalls(message, session);
           },
         // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
         // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
