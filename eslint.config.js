@@ -34,6 +34,10 @@ export default tseslint.config(
       '**/*.generated.ts',
       'playwright.config*',
       'vite.config*',
+      // vitest.config.ts / vitest.setup.ts are test-runner config (same class as vite.config*):
+      // infra, not first-party product logic, so they're exempt from the CC gate.
+      'vitest.config*',
+      'vitest.setup*',
       'server.js',
     ],
   },
