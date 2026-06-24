@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { apiFetch } from "../utils/api";
 import { publishChunk } from "../terminalStream";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "../utils/audio";
+import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume, applyOutputDevice } from "../utils/audio";
 import { isEarconType, playEarcon } from "../utils/earcon";
 import { notifyDesktop, requestNotifyPermission } from "../utils/notify";
 import { useE2EHarness, isE2EWireArmed, type TranscriptEntry } from "../e2e/harness";
@@ -1061,6 +1061,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
 
       const captureCtx = new AudioContext({ sampleRate: 16000 });
       const playbackCtx = new AudioContext({ sampleRate: 24000 });
+      applyOutputDevice(playbackCtx);
       captureCtxRef.current = captureCtx;
       playbackCtxRef.current = playbackCtx;
       resetAudioPlayback();

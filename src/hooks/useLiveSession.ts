@@ -14,7 +14,7 @@
 
 import type * as React from "react";
 import { useRef } from "react";
-import { pcmToBase64, resetAudioPlayback } from "../utils/audio";
+import { pcmToBase64, resetAudioPlayback, applyOutputDevice } from "../utils/audio";
 import { disposeRefs, planReconnect } from "./liveSessionLogic";
 
 const RECONNECT_DELAY_MS = 3000;
@@ -94,6 +94,7 @@ export function useLiveSession(params: LiveSessionParams): LiveSession {
 
       const captureCtx = new AudioContext({ sampleRate: 16000 });
       const playbackCtx = new AudioContext({ sampleRate: 24000 });
+      applyOutputDevice(playbackCtx);
       voiceCaptureCtxRef.current = captureCtx;
       voicePlaybackCtxRef.current = playbackCtx;
       resetAudioPlayback();

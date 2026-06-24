@@ -70,5 +70,5 @@ const PANE_SIGNAL_VERBS: Partial<Record<PaneSignalKind, string>> = {
 export function formatPaneSignal(s: PaneSignal): string {
   const verb = PANE_SIGNAL_VERBS[s.kind] ?? "exited";
   const tail = s.detail ? `: ${s.detail}` : "";
-  return `PANE STATUS (mention to the operator if relevant, then stop): pane ${s.paneId} ${verb}${tail}`;
+  return `PANE STATUS UPDATE (context only — do not speak unless the operator asks): pane ${s.paneId} ${verb}${tail}`;
 }

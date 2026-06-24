@@ -1,18 +1,37 @@
-import type { PaneSignal } from "./paneSignals";
+import type { PaneSignal, PaneSignalKind } from "./paneSignals";
 
 type Observer = (signal: PaneSignal) => void;
 
+/** Priority order for cross-kind cooldown bypass — higher number = higher priority.
+ *  error/exited always pass through; lower-priority status signals are suppressed
+ *  during the cross-kind cooldown to prevent the re-announcement loop (bug L1). */
+const KIND_PRIORITY: Record<PaneSignalKind, number> = {
+  closed:    0,
+  prompt:    1,
+  created:   2,
+  quiescing: 3,
+  running:   4,
+  idle:      5,
+  exited:    6,
+  error:     7,
+};
+
 /** Bridges global pane-event callbacks to N per-connection live sessions.
- *  Per-(pane,kind) debounce keeps a chatty pane from spamming the model. */
+ *  Per-(pane,kind) debounce keeps a chatty pane from spamming the model.
+ *  Cross-kind cooldown (L1 fix) prevents status-flap loops (running→idle→running…)
+ *  from each generating a forced spoken turn. */
 export class PaneSignalBus {
   private observers = new Set<Observer>();
   private lastPushAt = new Map<string, number>();
   /** 4D.2: the detail last DELIVERED per (pane,kind) — a different detail inside the window is
    *  genuinely new information and passes through; only identical repeats collapse. */
   private lastDetail = new Map<string, string | undefined>();
+  /** L1: last-delivered timestamp per paneId (ANY kind) for cross-kind cooldown. */
+  private lastPaneSignalAt = new Map<string, number>();
 
   constructor(
     private debounceMs = 3000,
+    private crossKindCooldownMs = 5000,
     private now: () => number = () => Date.now(),
   ) {}
 
@@ -43,8 +62,18 @@ export class PaneSignalBus {
     if (t - last < this.debounceMs && signal.detail === this.lastDetail.get(key)) {
       return false; // identical repeat inside the window -> collapse (anti-spam intent preserved).
     }
+
+    // L1 cross-kind cooldown: if ANY signal for this pane was delivered within the cooldown
+    // window, suppress low-priority kinds to break the status-flap re-announcement loop
+    // (running→quiescing→idle→running…). High-priority kinds (error, exited) always pass.
+    const lastAnyKind = this.lastPaneSignalAt.get(signal.paneId) ?? Number.NEGATIVE_INFINITY;
+    if (t - lastAnyKind < this.crossKindCooldownMs && (KIND_PRIORITY[signal.kind] ?? 0) < KIND_PRIORITY.exited) {
+      return false; // low-priority kind inside cross-kind cooldown -> suppress.
+    }
+
     this.lastPushAt.set(key, t);
     this.lastDetail.set(key, signal.detail);
+    this.lastPaneSignalAt.set(signal.paneId, t);
     for (const observer of this.observers) {
       try { observer(signal); }
       catch (e) { console.error("PaneSignalBus observer failed:", e); }

@@ -9,11 +9,12 @@
 //   • The Boiler Room — advanced PTY/idle plumbing.
 //   • The Recipe Card — the raw live config (read-only mirror).
 //   • Loading Dock / Boss's Office — integrations / budget: disabled placeholders.
-import { Fragment, useState, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { INK, SERVICE_MODES, type ServiceModeId } from "./../theme";
 import { Button, Chip, Icon } from "./../primitives";
 import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS } from "../../gateSurface";
 import { DEFAULT_CAPABILITY_GATES, type SystemSettings, type CapabilityGateMap, type CapabilityGate, type GateValue } from "../../types";
+import { getAudioOutputDevices, getStoredOutputDeviceId, storeOutputDeviceId } from "../../utils/audio";
 
 type RoomId = "rulebook" | "chef" | "walkin" | "boiler" | "recipe" | "dock" | "boss";
 const ROOMS: { id: RoomId; label: string; icon: string; sub: string; live: boolean }[] = [
@@ -149,6 +150,9 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
   setPaneGates?: (projectId: string, paneId: string, gates: Record<string, string>) => void;
 }) {
   const [room, setRoom] = useState<RoomId>("rulebook");
+  const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [outputDeviceId, setOutputDeviceId] = useState(getStoredOutputDeviceId);
+  useEffect(() => { getAudioOutputDevices().then(setOutputDevices); }, []);
   // 2K.2: the Rulebook's scope — "kitchen" (the global map, existing behavior) or one live pane
   // (its override map, PUT to the per-pane capability-gates route). Falls back to kitchen scope
   // if the scoped pane disappears (closed/archived).
@@ -283,6 +287,15 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
               <input data-testid="boh-volume" type="range" min={0} max={100} value={formatVolumeSlider(s.voiceAi.volume)} onChange={(e) => patchVoice({ volume: Number(e.target.value) / 100 })} style={{ width: "100%" }} />
             </label>
           </div>
+          {outputDevices.length > 1 && (
+            <label style={{ display: "block", marginTop: 12 }}>
+              <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", marginBottom: 4 }}>Output device</div>
+              <select data-testid="boh-output-device" value={outputDeviceId} onChange={(e) => { setOutputDeviceId(e.target.value); storeOutputDeviceId(e.target.value); }} style={fieldStyle(dark)}>
+                <option value="">System default</option>
+                {outputDevices.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || `Device ${d.deviceId.slice(0, 8)}`}</option>)}
+              </select>
+            </label>
+          )}
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, cursor: "pointer" }}>
             <input type="checkbox" checked={!!s.voiceAi.groundingEnabled} onChange={(e) => patchVoice({ groundingEnabled: e.target.checked })} />
             <span style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 600, color: fg }}>Let the Chef look things up (web grounding)</span>

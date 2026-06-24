@@ -79,7 +79,7 @@ let lastInteractionId: string | null = null;
 
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot.
 // Exported so in-process integration tests can authenticate without guessing the token.
-export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.createHash("sha256").update(`janus-auth:${process.cwd()}`).digest("hex");
 
 // ── 2S.2: PUT /api/settings body validation ──────────────────────────────────────────────────────
 // The settings body stays a PERMISSIVE passthrough overall (settings carry many shapes — do NOT
@@ -848,7 +848,8 @@ function registerDraftAndSettingsRoutes(
     // bead 9fz (part 2): capture the RAW incoming key BEFORE the masked/sentinel substitution below
     // mutates it, so we can tell a genuinely-new credential from a masked round-trip echo. NEVER logged.
     const incomingGeminiKey: string | null | undefined = newSettings.secrets?.geminiApiKey;
-    if (newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey)) {
+    const keyKeptUnchanged = newSettings.secrets && (newSettings.secrets.geminiApiKey?.includes("••••") || newSettings.secrets.geminiApiKey === "CONFIGURED_IN_ENV" || !newSettings.secrets.geminiApiKey);
+    if (keyKeptUnchanged) {
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
     manager.updateSettings(newSettings);
@@ -863,7 +864,7 @@ function registerDraftAndSettingsRoutes(
     if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
       requestVoiceReconnect();
     }
-    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode });
+    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode, keyKeptUnchanged: !!keyKeptUnchanged });
   });
 }
 
