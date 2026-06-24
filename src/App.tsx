@@ -13,7 +13,6 @@ import { NotificationStack } from "./components/NotificationStack";
 import { GateChip } from "./components/GateChip";
 import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
-import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
@@ -57,6 +56,7 @@ import {
   totalContextBarPercent,
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
+import { useEarcons } from "./classic/hooks/useEarcons";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -118,11 +118,11 @@ function AppRaw() {
 
   // --- Plans state (voice/backend path; the Orchestrate & Alerts GUI tabs were removed) ---
   const [plans, setPlans] = useState<Plan[]>([]);
-  // browserNotificationsEnabled gates triggerDesktopNotification(), which still fires for the
-  // surviving approval / action-pending / auto-approve / blocked notifications. Auto-enabled at
-  // boot when Notification.permission is already "granted". The manual toggle lived in the removed
-  // Alerts tab; desktop notifications now follow the browser's existing permission grant.
-  const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = useState(false);
+  // dbt4: the hands-free non-verbal feedback layer (browserNotificationsEnabled toggle + the
+  // Web-Audio playEarcon player + the gated triggerDesktopNotification wrapper) now lives in
+  // useEarcons (src/classic/hooks/useEarcons.ts). Behavior is byte-identical; the pure notification
+  // gate is pinned in tests/test_earcon_logic.ts.
+  const { playEarcon, triggerDesktopNotification, setBrowserNotificationsEnabled } = useEarcons();
 
   // Archive panel states
   const [archive, setArchive] = useState<any[]>([]);
@@ -136,116 +136,6 @@ function AppRaw() {
     if (archive.length > 0 && archiveWasEmptyRef.current) setShowArchivePanel(true);
     archiveWasEmptyRef.current = archive.length === 0;
   }, [archive.length]);
-
-  // Web Audio Synth Chimes for Hands-Free Feedback
-  const playEarcon = (type: EarconType) => {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      if (type === "completion") {
-        // WS-D (BUG-024): a distinct, short rising two-note so a genuine completion is
-        // audibly distinct from alert/success/execute/chime.
-        const now = ctx.currentTime;
-        osc.type = "triangle";
-        osc.frequency.setValueAtTime(587.33, now); // D5
-        gain.gain.setValueAtTime(0.05, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-        osc.start(now);
-        osc.stop(now + 0.2);
-
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.connect(gain2);
-        gain2.connect(ctx.destination);
-        osc2.type = "triangle";
-        osc2.frequency.setValueAtTime(880, now + 0.12); // A5
-        gain2.gain.setValueAtTime(0.05, now + 0.12);
-        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
-        osc2.start(now + 0.12);
-        osc2.stop(now + 0.12 + 0.24);
-      } else if (type === "alert") {
-        osc.type = "sawtooth";
-        osc.frequency.setValueAtTime(440, ctx.currentTime);
-        gain.gain.setValueAtTime(0.04, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.4);
-
-        setTimeout(() => {
-          const osc2 = ctx.createOscillator();
-          const gain2 = ctx.createGain();
-          osc2.connect(gain2);
-          gain2.connect(ctx.destination);
-          osc2.type = "sawtooth";
-          osc2.frequency.setValueAtTime(554, ctx.currentTime);
-          gain2.gain.setValueAtTime(0.04, ctx.currentTime);
-          gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
-          osc2.start(ctx.currentTime);
-          osc2.stop(ctx.currentTime + 0.4);
-        }, 150);
-      } else if (type === "success") {
-        const now = ctx.currentTime;
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(523.25, now);
-        gain.gain.setValueAtTime(0.06, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
-        osc.start(now);
-        osc.stop(now + 0.55);
-
-        const notes = [659.25, 783.99, 1046.50];
-        notes.forEach((freq, idx) => {
-          const oscN = ctx.createOscillator();
-          const gainN = ctx.createGain();
-          oscN.connect(gainN);
-          gainN.connect(ctx.destination);
-          oscN.type = "sine";
-          oscN.frequency.setValueAtTime(freq, now + (idx + 1) * 0.08);
-          gainN.gain.setValueAtTime(0.06, now + (idx + 1) * 0.08);
-          gainN.gain.exponentialRampToValueAtTime(0.001, now + (idx + 1) * 0.08 + 0.4);
-          oscN.start(now + (idx + 1) * 0.08);
-          oscN.stop(now + (idx + 1) * 0.08 + 0.5);
-        });
-      } else if (type === "execute") {
-        osc.type = "square";
-        osc.frequency.setValueAtTime(880, ctx.currentTime);
-        gain.gain.setValueAtTime(0.02, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.1);
-      } else if (type === "chime") {
-        const now = ctx.currentTime;
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(329.63, now);
-        gain.gain.setValueAtTime(0.05, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
-        osc.start(now);
-        osc.stop(now + 0.62);
-
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.connect(gain2);
-        gain2.connect(ctx.destination);
-        osc2.type = "sine";
-        osc2.frequency.setValueAtTime(493.88, now + 0.1);
-        gain2.gain.setValueAtTime(0.05, now + 0.1);
-        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.1 + 0.5);
-        osc2.start(now + 0.1);
-        osc2.stop(now + 0.1 + 0.62);
-      }
-    } catch (e) {}
-  };
-
-  const triggerDesktopNotification = (title: string, body: string) => {
-    if (browserNotificationsEnabled && "Notification" in window && Notification.permission === "granted") {
-      try {
-        new Notification(title, { body });
-      } catch (e) {}
-    }
-  };
 
   // --- Real-time Synchronous Markdown Prompt Buffer & Voice Agent Workspace States ---
   const [promptBuffer, setPromptBuffer] = useState("");
