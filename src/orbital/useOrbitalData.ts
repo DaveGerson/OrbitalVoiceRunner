@@ -21,14 +21,17 @@ import type {
   SystemSettings,
   Plan,
   PaneLayout,
+  AttentionItem,
 } from "../types";
-import type { StoredNote } from "../store/types";
+import type { StoredNote, StoredHandoff } from "../store/types";
 import { extractSlots } from "../templates";
 import {
-  projectTemplatesFrame, historyEntriesFromFrame, draftTextFromFrame, shouldAdoptMute,
+  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
-  templateClarifyText, templateApplyToast, layoutGatedText,
+  templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
+  dismissAttentionOutcome, attentionResolveTarget, handoffsFromFrame, normalizeHandoffRows, handoffPromptFromReadResponse,
+  isApprovalHere, buildAttentionApprovalItem, approvalToPromote,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -68,6 +71,16 @@ export interface TemplateView {
   slots: string[];
   created_at: number;
   updated_at: number;
+}
+
+// bead apu: the one-glance health snapshot GET /api/health returns — mirrors the getHealth
+// handler's output shape (src/actions/defs/observability.ts). All fields server truth.
+export interface HealthSnapshot {
+  frozen: boolean;
+  panes: { total: number; running: number; idle: number; exited: number };
+  pending_approvals: number;
+  recent: { total: number; errors: number; error_rate: number };
+  memory: { synthesizer: string };
 }
 
 // 4U.3: one service-log row — the exact ActionLogRow shape GET /api/action-log returns
@@ -142,6 +155,8 @@ export interface OrbitalData {
   plans: Plan[];
   pendingCommands: PendingCommand[];
   pendingActions: PendingActionView[];
+  /** D2: the attention/"what needs me" inbox (GET /api/attention + attention_updated frames). */
+  attentionQueue: AttentionItem[];
   frozen: boolean;
   frozenRunning: string[];
   transcript: TranscriptEntry[];
@@ -170,10 +185,15 @@ export interface OrbitalData {
   /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
   serviceLog: ServiceLogRow[];
   refetchServiceLog: () => void;
+  /** bead apu: the latest one-glance health snapshot from GET /api/health (null until first fetch). */
+  healthSnapshot: HealthSnapshot | null;
+  refetchHealth: () => void;
   /** Journey-expansion C: the cookbook — saved prompt templates (GET /api/templates + templates_updated). */
   templates: TemplateView[];
   /** Journey-expansion C: mise en place — saved pane layouts (GET /api/layouts + layouts_updated). */
   layouts: PaneLayout[];
+  /** j4e1: the line drawer's handoffs (GET /api/handoffs + handoffs_updated frames), redacted server-side. */
+  handoffs: StoredHandoff[];
   // setters / actions
   selectActivePane: (paneId: string | null) => void;
   setGlobalPermissionsMode: (m: GlobalMode) => void;
@@ -218,6 +238,21 @@ export interface OrbitalData {
   deleteLayout: (id: string) => void;
   refetchTemplates: () => void;
   refetchLayouts: () => void;
+  // j4e1: the handoff line-drawer's hero actions. These call the cv2 canonical REST twins
+  // (registry-derived from src/actions/defs/handoff.ts: read_handoff -> GET /api/handoffs/:handoff_id,
+  // so the lifecycle twins are POST /api/handoffs/:handoff_id/<verb>). The board repaints off the
+  // handoffs_updated frame; the post-success refetch is the safety net for a missed frame.
+  /** Deliver a STAGED handoff into the target pane — POST /api/handoffs/:id/deliver (gated: 202/403). */
+  deliverHandoff: (handoffId: string) => void;
+  /** Rewrite a handoff's composed prompt — POST /api/handoffs/:id/revise {new_draft_text} (ungated). */
+  reviseHandoff: (handoffId: string, newDraftText: string) => void;
+  /** Stage a composing/revising handoff to `staged` — POST /api/handoffs/:id/stage (ungated). */
+  stageHandoff: (handoffId: string) => void;
+  /** Reject/cancel a handoff — POST /api/handoffs/:id/reject (ungated pre-gate flip). */
+  rejectHandoff: (handoffId: string) => void;
+  /** Read the FULL (untruncated) composed prompt — GET /api/handoffs/:id (revise editor seed). */
+  fetchHandoffPrompt: (handoffId: string) => Promise<string | null>;
+  refetchHandoffs: () => void;
   // 2K.2: per-pane capability-gate override (the Rulebook's pane scope) —
   // PUT /api/projects/:p/panes/:id/capability-gates {capabilityGates}.
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
@@ -240,6 +275,16 @@ export interface OrbitalData {
   refetchTerminals: () => void;
   refetchLedger: () => void;
   refetchSettings: () => void;
+  /** D2: re-pull the attention inbox (GET /api/attention) — used by the safety-net poll + degrade. */
+  refetchAttention: () => void;
+  /** D2: clear one attention item — POST /api/attention/:id/dismiss (dismiss_attention, veto). */
+  dismissAttention: (id: string) => void;
+  /** bead e7h: in-inbox Approve — resolve a held gated request by its messageId (same resolver voice
+   *  uses), or jump-to-station for a triage-only item. Optimistically clears the alert. */
+  approveAttention: (item: AttentionItem) => void;
+  /** bead e7h: in-inbox Deny — reject a held gated request by its messageId, or locally dismiss a
+   *  triage-only item. Optimistically clears the alert. */
+  denyAttention: (item: AttentionItem) => void;
   refetchAll: () => void;
   // exposed for the realtime/voice wave to reuse
   wsRef: MutableRefObject<WebSocket | null>;
@@ -260,6 +305,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [plans, setPlans] = useState<Plan[]>([]);
   const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
   const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
+  // D2: the attention/"what needs me" inbox (GET /api/attention + attention_updated frames).
+  const [attentionQueue, setAttentionQueue] = useState<AttentionItem[]>([]);
   const [frozen, setFrozen] = useState<boolean>(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
   // 4U.3: seeded from sessionStorage so the radio's record survives a reload (capped 50 below).
@@ -287,9 +334,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
   // 4U.3: the service log (GET /api/action-log rows, newest-first, capped 100).
   const [serviceLog, setServiceLog] = useState<ServiceLogRow[]>([]);
+  // bead apu: the one-glance health snapshot (GET /api/health), refreshed when the Pantry opens.
+  const [healthSnapshot, setHealthSnapshot] = useState<HealthSnapshot | null>(null);
   // Journey-expansion C: the cookbook (prompt templates) + mise en place (pane layouts).
   const [templates, setTemplates] = useState<TemplateView[]>([]);
   const [layouts, setLayouts] = useState<PaneLayout[]>([]);
+  // j4e1: the line drawer's handoffs (GET /api/handoffs + handoffs_updated frames).
+  const [handoffs, setHandoffs] = useState<StoredHandoff[]>([]);
 
   // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
   // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
@@ -315,6 +366,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // 3C.2: render-fresh mirror so the mock fetchPaneBackfill can read synchronously.
   const terminalsRef = useRef<Terminal[]>([]);
   terminalsRef.current = terminals;
+  // bead 8xn: render-fresh mirror of the inbox so the promotion effect (keyed on activeTerminalId +
+  // a visibilitychange listener) reads the LATEST queue WITHOUT re-subscribing on every queue
+  // mutation — same render-fresh-ref idiom as activeTerminalIdRef / terminalsRef.
+  const attentionQueueRef = useRef<AttentionItem[]>([]);
+  attentionQueueRef.current = attentionQueue;
   // Hands-free earcons are gated behind the "Voice cues" tweak; the ref lets the long-lived WS closure
   // read the latest value. Default on (the brief forbids silent state changes for an eyes-off chef).
   const voiceCuesRef = useRef<boolean>(true);
@@ -440,6 +496,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // D2: the attention inbox. GET /api/attention returns the raw queue array TOP-LEVEL (the def's
+  // rest.toHttp projection, src/actions/defs/reads.ts getAttentionQueue — same shape as plans). The
+  // ?mock guard mirrors the board fetchers (the harness owns state under ?mock=1; the live frames +
+  // the 20s poll keep it fresh otherwise).
+  const refetchAttention = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/attention");
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (Array.isArray(rows)) setAttentionQueue(rows);
+    } catch { /* silent */ }
+  }, []);
+
   // Journey-expansion C: templates + layouts. Both GETs return the raw array TOP-LEVEL (the defs'
   // rest.toHttp projection, src/actions/defs/{templates,layouts}.ts — list_watch_rules precedent).
   const refetchTemplates = useCallback(async () => {
@@ -462,6 +532,24 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // j4e1: the line drawer's handoffs. list_handoffs has NO toHttp, so GET /api/handoffs rides the
+  // default resultToHttp map → the redacted rows arrive under { output: [...] } (keyed handoff_id).
+  // normalizeHandoffRows coalesces that into the StoredHandoff shape the drawer reads (and equally
+  // adopts a future cv2 full-row payload). The convergence server broadcasts a PAYLOAD-LESS
+  // handoffs_updated frame, so the live spine is ALWAYS this GET refetch — under a Playwright-armed
+  // page the GET fires (3C.3b) so the e2e drives the board exactly as production does (payload-less
+  // frame → GET /api/handoffs); a plain human ?mock=1 page stays fully client-side.
+  const refetchHandoffs = useCallback(async () => {
+    if (isMockModeRef.current && !isE2EWireArmed()) return;
+    try {
+      const res = await apiFetch("/api/handoffs");
+      if (!res.ok) return;
+      const d = await res.json().catch(() => null);
+      const rows = Array.isArray(d) ? d : (d && Array.isArray(d.output) ? d.output : null);
+      if (rows) setHandoffs(normalizeHandoffRows(rows));
+    } catch { /* silent */ }
+  }, []);
+
   // 4U.3: the service log — GET /api/action-log (default resultToHttp wraps the rows: {output:{rows}}).
   // Fetched on demand (the Pantry refreshes it when it opens), not on the poll — it's a review
   // surface, not a live board. Under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
@@ -473,6 +561,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       const d = await res.json().catch(() => null);
       const rows = d && d.output && Array.isArray(d.output.rows) ? d.output.rows : null;
       if (rows) setServiceLog(rows.slice(0, 100));
+    } catch { /* silent */ }
+  }, []);
+
+  // bead apu: the health snapshot — GET /api/health (default resultToHttp wraps it: {output:{…}}).
+  // Fetched on demand when the Pantry opens (a status read, not a live board), same gating as the
+  // service log: under ?mock=1 the GET fires only on a Playwright-armed page (3C.3b).
+  const refetchHealth = useCallback(async () => {
+    if (isMockModeRef.current && !isE2EWireArmed()) return;
+    try {
+      const res = await apiFetch("/api/health");
+      if (!res.ok) return;
+      const d = await res.json().catch(() => null);
+      const snap = d && d.output && typeof d.output === "object" ? d.output : null;
+      if (snap) setHealthSnapshot(snap as HealthSnapshot);
     } catch { /* silent */ }
   }, []);
 
@@ -518,11 +620,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchPending();
     refetchActions();
     refetchPlans();
+    refetchAttention();
     refetchFrozen();
     refetchArchive();
     refetchTemplates();
     refetchLayouts();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts]);
+    refetchHandoffs();
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchAttention, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts, refetchHandoffs]);
 
   // ── observe-lane frame handler ───────────────────────────────────────────
   // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
@@ -531,6 +635,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // live, and double-handling would double the refetches and duplicate xterm writes.
   // Voice-only frames (audio/transcripts/grounding/channel state) live in the voice effect below.
   const handleObserveFrame = useCallback((msg: any) => {
+    // velocity-mech: play the hands-free earcon this RAW frame maps to (approval_pending → "alert";
+    // pane_transition with transition:"exited" → "completion"; null = no tone). Delegates to the
+    // pure `playObserveEarcon` decide-and-fire gate — the SAME routing the unit test pins with a spy
+    // earcon — over the voice-cues-gated `earcon` sink.
+    const playFrameEarcon = () => playObserveEarcon(msg, earcon);
     // The original flat switch is replaced by a per-type dispatch table: one tiny handler per frame
     // type, each a thin closure over the same setters. The OBSERVABLE order of setState / refetch /
     // earcon / desktopNote calls inside each handler is byte-identical to the original switch arm; the
@@ -558,6 +667,19 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
           setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, quiescing: true } : t)));
         }
       },
+      // velocity-mech: the server's REAL pane-exit signal. A finished pane does NOT broadcast a
+      // `pane_exited` frame (there is none) — it rides `pane_transition` with transition:"exited"
+      // (src/observe/index.ts ~580). Only the "exited" transition chimes the rising "completion"
+      // earcon (UX_BRIEF §4 — an eyes-off chef must hear a finished pane) and patches status in place
+      // (mirroring the pane_status arm). Every other transition (idle/prompt/error/build-failed) is a
+      // no-op here: those edges already drive the board through their own broadcasts.
+      pane_transition: () => {
+        if (!isPaneExitedFrame(msg)) return;
+        playFrameEarcon(); // "completion" — work finished
+        if (typeof msg.terminalId === "string") {
+          setTerminals((prev) => prev.map((t) => (t.id === msg.terminalId ? { ...t, status: "Exited", quiescing: false } : t)));
+        }
+      },
       // 2K.3: a pane's WIP draft changed server-side (Janus dictation, another view's edit). Stash the
       // latest text per pane; the Order Pad applies it ONLY while the textarea isn't focused
       // (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
@@ -574,11 +696,18 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // 4U.1: the server broadcasts the full plans board on every plan mutation — adopt it directly;
       // degrade to a refetch otherwise.
       plans_updated: () => { if (Array.isArray(msg.plans)) setPlans(msg.plans); else refetchPlans(); },
+      // D2: the server broadcasts the full attention queue on every queue mutation (observe pushes,
+      // orient dismisses) — adopt it directly; degrade to a refetch when the frame carries no array.
+      attention_updated: () => { const q = attentionQueueFromFrame(msg); if (q) setAttentionQueue(q); else refetchAttention(); },
       // Journey-expansion C: the frame carries the RAW ledger rows (no derived `slots`). Adopt them with
       // slots re-derived through the same pure engine the server projects with (extractSlots).
       templates_updated: () => { const p = projectTemplatesFrame(msg); if (p) setTemplates(p); else refetchTemplates(); },
       // The frame carries the full layouts array — adopt it directly; degrade to a refetch otherwise.
       layouts_updated: () => { if (Array.isArray(msg.layouts)) setLayouts(msg.layouts); else refetchLayouts(); },
+      // j4e1: the server broadcasts on every handoff lifecycle mutation (compose/revise/stage/deliver/
+      // reject). The cv2 frame carries the full board → adopt it (normalized); the current payload-less
+      // frame yields null → degrade to a refetch (GET /api/handoffs). Mirrors plans_updated.
+      handoffs_updated: () => { const rows = handoffsFromFrame(msg); if (rows) setHandoffs(normalizeHandoffRows(rows)); else refetchHandoffs(); },
       settings_updated: () => {
         if (msg.settings) {
           setSettings(msg.settings as SystemSettings);
@@ -592,15 +721,35 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       switch_active_pane: () => { if (typeof msg.paneId === "string") setActiveTerminalId(msg.paneId); },
       frozen: () => { earcon("alert"); refetchFrozen(); refetchTerminals(); }, // the All Hands brake — never silent
       stop_all: () => { refetchFrozen(); refetchTerminals(); },
-      // A staged PTY write awaiting HiTL approval. Append the chip from the broadcast payload (immediate)
-      // so the ApprovalDialog renders at once.
+      // A staged PTY write awaiting HiTL approval. bead 8xn: focus-route it. When the operator is AT
+      // the station (its pane is active AND the tab is visible) it pops the blocking ApprovalDialog
+      // modal (the existing pendingCommands path); otherwise it lands in the attention inbox keyed by
+      // messageId (e7h's id-gate makes the in-inbox Approve/Deny REAL). Either way the bell rings + a
+      // background-tab desktop note fires — a pane needs you on both surfaces. The promotion effect
+      // (below) moves an inbox item to the modal one-directionally when its station regains focus.
       approval_pending: () => {
-        earcon("alert"); // the bell: a pane needs you (eyes-off)
+        playFrameEarcon(); // the bell: a pane needs you (eyes-off) — "alert"
         desktopNote("🛎 At the pass", `${msg.terminalId} needs your ok: ${truncateCmd(msg.cmd)}`); // 2K.6 — background tab only
-        setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
+        const here = isApprovalHere(msg, activeTerminalIdRef.current, document.visibilityState === "visible");
+        if (here) {
+          setPendingCommands((prev) => prev.some((c) => c.messageId === msg.messageId) ? prev : [...prev, buildPendingCommand(msg)]);
+        } else if (typeof msg.messageId === "string" && msg.messageId) {
+          // Fail-closed to the inbox: no active station / wrong pane / hidden tab → a quiet, badged
+          // row. Guard on a real messageId so a malformed frame never seeds a fake-approve row.
+          const item = buildAttentionApprovalItem(msg);
+          setAttentionQueue((prev) => prev.some((a) => a.id === item.id || (a.messageId && a.messageId === item.messageId)) ? prev : [...prev, item]);
+        }
       },
       approval_resolved: () => {
-        if (msg.messageId) setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+        // bead 8xn — "resolve anywhere clears EVERYWHERE." A held approval lives on exactly one
+        // surface (modal pendingCommands OR the focus-routed inbox), so resolving it via voice/REST/
+        // modal/TTL-sweep must drop it from BOTH. The server broadcast carries only the messageId;
+        // clear it from pendingCommands AND any inbox row keyed by it (the inbox row is client-
+        // synthesized and is NOT part of manager.attentionQueue, so attention_updated never clears it).
+        if (msg.messageId) {
+          setPendingCommands((prev) => prev.filter((c) => c.messageId !== msg.messageId));
+          setAttentionQueue((prev) => prev.filter((a) => !a.messageId || a.messageId !== msg.messageId));
+        }
         refetchPending();
       },
       // A gated non-PTY mutator staged on the Ask tier — carry the SERVER-resolved effective posture so
@@ -641,7 +790,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     };
     const type = msg?.type;
     if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
-  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchTemplates, refetchLayouts, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
+  }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchAttention, refetchTemplates, refetchLayouts, refetchHandoffs, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
@@ -715,9 +864,34 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       refetchPending();
       refetchActions();
       refetchPlans();
+      refetchAttention(); // D2: keep the "what needs me" inbox fresh on the safety-net poll too
     }, POLL_MS);
     return () => clearInterval(iv);
-  }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans]);
+  }, [refetchAll, refetchTerminals, refetchLedger, refetchPending, refetchActions, refetchPlans, refetchAttention]);
+
+  // bead 8xn: PROMOTE an inbox-routed approval to the modal when its station regains the operator's
+  // attention — either the active station changes TO it, or the tab regains focus while it's active.
+  // One-directional (inbox → modal only; never modal → inbox on blur). The move is keyed by messageId
+  // and dedups against pendingCommands, so a concurrent voice/REST resolve can't resurrect it.
+  const promoteApprovalForActive = useCallback(() => {
+    if (document.visibilityState !== "visible") return; // only promote when the operator can see it
+    const item = approvalToPromote(attentionQueueRef.current, activeTerminalIdRef.current);
+    if (!item) return;
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id));         // leave the inbox
+    // Rebuild the PendingCommand from the RAW cmd (item.rawCmd), NOT the wrapped inbox label in
+    // item.message — the ApprovalDialog must render the real instruction, not "<pane> needs your ok: …".
+    setPendingCommands((prev) => prev.some((c) => c.messageId === item.messageId)
+      ? prev
+      : [...prev, buildPendingCommand({ messageId: item.messageId, cmd: item.rawCmd ?? "", terminalId: item.terminalId })]); // pop the modal
+  }, []);
+
+  // Fires on every active-station change (the dep) AND on a tab visibilitychange (the listener).
+  useEffect(() => {
+    promoteApprovalForActive();
+    const onVis = () => promoteApprovalForActive();
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [activeTerminalId, promoteApprovalForActive]);
 
   // Tear down all per-session voice audio (mic capture chain + both AudioContexts). Idempotent.
   const teardownAudio = useCallback(() => {
@@ -1205,6 +1379,27 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't toss that one, Chef — try again.", "warn"); }
   }, [refetchArchive, showToast, mockClientOnly]);
 
+  // D2: dismiss one attention item — POST /api/attention/:id/dismiss (dismiss_attention, veto-class,
+  // Auto by default). Optimistic drop so the inbox clears instantly; the server's attention_updated
+  // frame reconciles the authoritative queue. On a real failure the item is restored and we warn.
+  const dismissAttention = useCallback(async (id: string) => {
+    let removed: AttentionItem | undefined;
+    setAttentionQueue((prev) => { removed = prev.find((a) => a.id === id) ?? removed; return prev.filter((a) => a.id !== id); });
+    const restore = () => { const r = removed; if (r) setAttentionQueue((prev) => (prev.some((a) => a.id === r.id) ? prev : [...prev, r])); };
+    if (mockClientOnly()) { showToast("Cleared that alert"); return; }
+    try {
+      const res = await apiFetch(`/api/attention/${id}/dismiss`, { method: "POST" });
+      // A dismiss is veto-class: gated-Off does NOT 403, it returns kind:ok -> 200 with an "Error:"-
+      // wrapped output, so a bare 200 is not proof the alert cleared (see dismissAttentionOutcome).
+      const body = res.ok ? await res.json().catch(() => ({} as Record<string, unknown>)) : {};
+      const outcome = dismissAttentionOutcome(res.status, res.ok, body);
+      if (outcome === "blocked") { restore(); showToast("Dismissing alerts is gated off, Chef", "warn"); return; }
+      if (outcome === "failed") { restore(); showToast("That didn't go through, Chef — try again.", "warn"); return; }
+      showToast("Cleared that alert");
+      if (!isMockModeRef.current) refetchAttention();
+    } catch { restore(); showToast("That didn't go through, Chef — try again.", "warn"); }
+  }, [refetchAttention, showToast, mockClientOnly]);
+
   // ── 4U.1: plans on The Pass (the classic Spec Buffer's routes, kitchen-toned) ──
   // execute_plan runs step 1 through the gate INSIDE the server (dispatchProposal), so the REST
   // status carries the whole truth: 200 fired / 202 step-1 needs an ok / 403 gated off /
@@ -1396,6 +1591,96 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("Couldn't 86 that layout, Chef — try again.", "warn"); }
   }, [refetchLayouts, showToast, mockClientOnly]);
 
+  // ── j4e1: the handoff line-drawer's hero actions (deliver / revise / stage / reject) ──
+  // These call the cv2 canonical handoff REST twins. Each path is an EXPLICIT registry `rest` entry on
+  // its action def (src/actions/defs/handoff.ts) — there is no auto-fallback router; the verb-family
+  // shape POST /api/handoffs/:handoff_id/<verb> is the contract those defs declare, alongside the read
+  // twin GET /api/handoffs/:handoff_id. The board repaints off handoffs_updated;
+  // the post-success refetch is the safety net. Honest-feedback: the ack fires only after the server
+  // said ok; a gated deliver may 202 (needs an ok at the pass) / 403 (gated off). Under a human's
+  // plain ?mock=1 these stay client-side; a Playwright-armed page fires the wire so the e2e asserts it.
+
+  // Deliver a STAGED handoff (the GATED hero action; the server gates via dispatchProposal →
+  // 200 delivered / 202 needs-approval / 403 gated off). Mirrors executePlan's status ladder.
+  const deliverHandoff = useCallback(async (handoffId: string) => {
+    if (mockClientOnly()) { showToast("Sent it down the line 🍽", "fire", "execute"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/deliver`, { method: "POST" });
+      if (res.status === 202) { showToast("Delivery queued — needs your ok at the pass 🛎", "warn"); }
+      else if (res.status === 403) { showToast("That delivery's gated off, Chef", "warn"); }
+      else if (!res.ok) {
+        const d = await res.json().catch(() => ({} as Record<string, unknown>));
+        showToast(firstServerMessage(d) || "Couldn't deliver that handoff, Chef — try again.", "warn");
+      } else { showToast("Sent it down the line 🍽", "fire", "execute"); }
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("Couldn't deliver that handoff, Chef — try again.", "warn"); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Revise a handoff's composed prompt (UNGATED co-authoring). Body key is `new_draft_text` (the
+  // revise_handoff schema). A 200 narration is the only success; failures warn honestly.
+  const reviseHandoff = useCallback(async (handoffId: string, newDraftText: string) => {
+    const text = newDraftText.trim();
+    if (!text) return;
+    // Optimistic: update ONLY composed_prompt. The server's revise (updateHandoffCargo) PRESERVES the
+    // lifecycle state, so flipping to "revising" here would diverge from the authoritative handoffs_updated
+    // frame — let the server frame own `state` (and revision_count).
+    setHandoffs((prev) => prev.map((h) => (h.id === handoffId ? { ...h, composed_prompt: text } : h)));
+    if (mockClientOnly()) { showToast("Tweaked the handoff ✍️"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/revise`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ new_draft_text: text }),
+      });
+      if (!res.ok) { showToast("That revision didn't stick, Chef — try again.", "warn"); refetchHandoffs(); return; }
+      showToast("Tweaked the handoff ✍️");
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("That revision didn't stick, Chef — try again.", "warn"); refetchHandoffs(); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Reject/cancel a handoff (UNGATED pre-gate flip; routes through the gate if a delivery is pending).
+  const rejectHandoff = useCallback(async (handoffId: string) => {
+    setHandoffs((prev) => prev.map((h) => (h.id === handoffId ? { ...h, state: "rejected" } : h))); // optimistic
+    if (mockClientOnly()) { showToast("86'd that handoff", "warn"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/reject`, { method: "POST" });
+      if (!res.ok) { showToast("Couldn't 86 that handoff, Chef — try again.", "warn"); refetchHandoffs(); return; }
+      showToast("86'd that handoff", "warn");
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("Couldn't 86 that handoff, Chef — try again.", "warn"); refetchHandoffs(); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Stage a composing/revising handoff — freezes the draft to `staged`, the ONLY state Deliver accepts
+  // (UNGATED; the server validates the target pane is live + runs the secret guard). Without this the
+  // drawer can never advance a fresh draft to a deliverable row. POST /api/handoffs/:id/stage.
+  const stageHandoff = useCallback(async (handoffId: string) => {
+    if (mockClientOnly()) { showToast("Staged — ready to send 🍳", "fire", "execute"); return; }
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}/stage`, { method: "POST" });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({} as Record<string, unknown>));
+        showToast(firstServerMessage(d) || "Couldn't stage that handoff, Chef — try again.", "warn");
+        refetchHandoffs(); return;
+      }
+      showToast("Staged — ready to send 🍳", "fire", "execute");
+      if (!isMockModeRef.current) refetchHandoffs();
+    } catch { showToast("Couldn't stage that handoff, Chef — try again.", "warn"); refetchHandoffs(); }
+  }, [refetchHandoffs, showToast, mockClientOnly]);
+
+  // Fetch the FULL composed prompt for one handoff (GET /api/handoffs/:id = read_handoff). The list
+  // projection (list_handoffs) truncates composed_prompt to 200 chars + redacts, so the revise editor
+  // MUST seed from this full read or a Save would PUT the capped/redacted text back, corrupting a long
+  // prompt. read_handoff wraps the row under { output: { composed_prompt } } (default resultToHttp).
+  // A plain human ?mock=1 page returns null (no server; the harness owns full rows) — but a
+  // Playwright-armed page DOES fire the GET (3C.3b) so the e2e proves the editor seeds from the FULL
+  // read, not the truncated list row. Any failure also returns null (the caller keeps its seed).
+  const fetchHandoffPrompt = useCallback(async (handoffId: string): Promise<string | null> => {
+    if (isMockModeRef.current && !isE2EWireArmed()) return null;
+    try {
+      const res = await apiFetch(`/api/handoffs/${handoffId}`);
+      if (!res.ok) return null;
+      return handoffPromptFromReadResponse(await res.json().catch(() => null));
+    } catch { return null; }
+  }, []);
+
   // ── 2K.2: per-pane gate override (the Rulebook's pane scope) ─────────────
   // PUT the pane's whole override map (the bulk matrix-editor route, src/actions/defs/locks.ts
   // setPaneGates). res.ok-checked; on failure the ledger is refetched so the segs snap back to truth.
@@ -1545,6 +1830,26 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     }
   }, [showToast]);
 
+  // bead e7h: in-inbox Approve/Deny. When an attention item carries a held-request messageId
+  // (attentionResolveTarget), resolve it through the SAME POST /api/commands/approve resolver voice
+  // uses (approveCommand/rejectCommand) AND optimistically clear the alert from the inbox. When it
+  // carries NO messageId (a triage-only item) there is nothing to resolve — Approve degrades to a
+  // jump-to-station (the parent wires that) and Deny degrades to a local dismiss. The id gate lives
+  // here so the resolver is NEVER called without a real target.
+  const approveAttention = useCallback((item: AttentionItem) => {
+    const messageId = attentionResolveTarget(item);
+    if (!messageId) { selectActivePane(item.terminalId); return; }
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id)); // optimistic clear
+    approveCommand(messageId);
+  }, [approveCommand, selectActivePane]);
+
+  const denyAttention = useCallback((item: AttentionItem) => {
+    const messageId = attentionResolveTarget(item);
+    if (!messageId) { dismissAttention(item.id); return; }
+    setAttentionQueue((prev) => prev.filter((a) => a.id !== item.id)); // optimistic clear
+    rejectCommand(messageId);
+  }, [rejectCommand, dismissAttention]);
+
   const confirmAction = useCallback(async (actionId: string) => {
     let removed: PendingActionView | undefined;
     setPendingActions((prev) => { removed = prev.find((a) => a.actionId === actionId) ?? removed; return prev.filter((a) => a.actionId !== actionId); });
@@ -1600,22 +1905,24 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
 
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
-    pendingCommands, pendingActions, frozen, frozenRunning, transcript,
+    pendingCommands, pendingActions, attentionQueue, frozen, frozenRunning, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
-    templates, layouts,
+    healthSnapshot, refetchHealth,
+    templates, layouts, handoffs,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
     executePlan, deletePlan,
     createTemplate, updateTemplate, deleteTemplate, applyTemplate,
     saveLayout, applyLayout, deleteLayout, refetchTemplates, refetchLayouts,
+    deliverHandoff, reviseHandoff, stageHandoff, rejectHandoff, fetchHandoffPrompt, refetchHandoffs,
     refetchNotes, addNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,
-    refetchTerminals, refetchLedger, refetchSettings, refetchAll,
+    refetchTerminals, refetchLedger, refetchSettings, refetchAttention, dismissAttention, approveAttention, denyAttention, refetchAll,
     wsRef, isMockModeRef,
     setTerminals, setTranscript, setPendingCommands, setPendingActions, setFrozen, setFrozenRunning,
   };

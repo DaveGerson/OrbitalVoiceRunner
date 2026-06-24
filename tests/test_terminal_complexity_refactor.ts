@@ -253,7 +253,13 @@ describe("Phase 7b — UniversalTerminal constructor characterization (pure, no 
 
   it("fresh Claude (supportsSessionPin, no sessionId) gets a generated id and is fresh", () => {
     const t = make("c-claude", "Claude Code", "claude", "");
-    assert.ok(t.sessionId.length > 0, "claude pins a generated session id");
+    // l1c: the Claude adapter pins a generated UUID (randomUUID) — assert the actual UUID shape, not
+    // just a non-empty string, so a regression to a blank/garbage id is caught.
+    assert.match(
+      t.sessionId,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      "claude pins a generated UUID session id",
+    );
     assert.strictEqual((t as any).sessionIsFresh, true);
   });
 });

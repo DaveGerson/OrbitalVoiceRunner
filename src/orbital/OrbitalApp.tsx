@@ -8,6 +8,8 @@ import { Icon, IconSprite, Mascot } from "./primitives";
 import { TweaksPanel, TweakSection, TweakRadio, TweakToggle, TweakColor } from "./TweaksPanel";
 import { useTweaks, mergedDefaults, type Tweaks } from "./useTweaks";
 import { useOrbitalData } from "./useOrbitalData";
+import { useConversationalState, chipColorForKind, type ConversationalState } from "./useConversationalState";
+import { groupHandoffsByPane } from "./useOrbitalDataHelpers";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
@@ -67,12 +69,32 @@ function useKitchenChrome() {
   }, []);
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected }: {
+// Velocity-design (D7): the conversational pill — a glanceable read of the voice channel's state,
+// driven by the useConversationalState machine. Only shown once a voice session is requested (off-air
+// has its own "Tune in" affordance in the radio, so the nav stays quiet until the chef is on the air).
+// SEAM (bead m9v): the radio chip (getChipBg) and this nav pill dot now resolve their color through
+// the SAME chipColorForKind map in useConversationalState — single source of truth, so the two
+// surfaces can never paint one state two different colors. No local placeholder map here anymore.
+function ConversationalPill({ state }: { state: ConversationalState }) {
+  if (state.kind === "offline") return null; // the radio's own "Tune in" owns the off-air case
+  const pulse = state.kind === "tuning" || state.kind === "thinking" || state.kind === "blocked";
+  return (
+    <div data-testid="convo-pill" data-convo-state={state.kind}
+      style={{ display: "flex", alignItems: "center", gap: 7, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: chipColorForKind(state.kind), border: "1.5px solid " + INK, animation: pulse ? "orb-pulse 1s var(--ease-bounce) infinite" : undefined }} />
+      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", textTransform: "capitalize" }}>{state.label}</span>
+    </div>
+  );
+}
+
+function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected, convo }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
   needsCount: number; onJumpToNeeds: () => void;
   mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
   /** 1B.1: the live /live stream is actually attached — the pill must not claim "Kitchen open" while dark. */
   connected: boolean;
+  /** Velocity-design (D7): the conversational pill's derived state (useConversationalState). */
+  convo: ConversationalState;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -115,6 +137,7 @@ function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJum
           {connected ? <>Kitchen open · {running} on the burner</> : <>Kitchen dark — reconnecting…</>}
         </span>
       </div>
+      <ConversationalPill state={convo} />
       <button data-testid="all-hands" onClick={onPanic} title="Emergency brake" style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 10, border: "2px solid " + INK, background: "#2a1a10", color: "#ffc94a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5, letterSpacing: ".04em", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0, textTransform: "uppercase" }}>
         <Icon name="fire" size={16} color="#e23a3a" /> All Hands
       </button>
@@ -181,7 +204,21 @@ export default function OrbitalApp() {
     [data.terminals, data.ledger, data.pendingCommands],
   );
   const projects = useMemo(() => deriveProjects(stations, data.ledger), [stations, data.ledger]);
+  // j4e1: the per-station handoff line-drawer wiring — handoffs bucketed by to_pane + the hero-action
+  // callbacks (deliver/revise/reject, which fire the canonical handoff REST twins inside the hook).
+  const handoffWiring = useMemo(() => ({
+    byPane: groupHandoffsByPane(data.handoffs),
+    onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onStage: data.stageHandoff,
+    onReject: data.rejectHandoff, onFetchPrompt: data.fetchHandoffPrompt,
+  }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.stageHandoff, data.rejectHandoff, data.fetchHandoffPrompt]);
   const running = stations.filter((s) => s.status === "Running").length;
+  // Velocity-design (D7): the conversational pill's state, derived from the voice-channel signals the
+  // data layer already computes + tool-call activity off the transcript (activeSources). Pure machine,
+  // memoized — additive and perf-safe (no per-frame xterm work).
+  const convo = useConversationalState({
+    live: data.isLive, connected: data.voiceConnected, micBlocked: data.micBlocked,
+    muted: data.micMuted, reconnecting: data.voiceReconnecting, transcript: data.transcript,
+  });
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
 
@@ -224,6 +261,12 @@ export default function OrbitalApp() {
     if (view === "pantry") refetchServiceLog();
   }, [view, refetchServiceLog]);
 
+  // bead apu: the health strip is a status read — refresh it when the Pantry opens (no polling).
+  const refetchHealth = data.refetchHealth;
+  useEffect(() => {
+    if (view === "pantry") refetchHealth();
+  }, [view, refetchHealth]);
+
   // ── inline render helpers — relocate JSX subsections; no new components, no hook changes ──
 
   const renderLineView = (): ReactNode => {
@@ -235,15 +278,24 @@ export default function OrbitalApp() {
       <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
         <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: dotBg, backgroundSize: "18px 18px" }}>
-          <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts}
+          <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts} attention={data.attentionQueue}
             stations={stations} activePaneId={data.activeTerminalId}
             jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
             onAdd={(pid, text) => data.addNote(pid, text)} onEdit={(id, text) => data.editNote(id, text, passProjectId ?? undefined)} onDelete={(id) => data.deleteNote(id, passProjectId ?? undefined)}
             onFirePane={(pid) => { setSelectedProject(pid); setNewPaneProj(pid); }} onJumpToPane={(id) => { data.selectActivePane(id); setBurnerId(id); }}
             onExecutePlan={data.executePlan} onDeletePlan={data.deletePlan}
             onCreateTemplate={data.createTemplate} onUpdateTemplate={data.updateTemplate} onDeleteTemplate={data.deleteTemplate} onApplyTemplate={data.applyTemplate}
-            onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout} />
-          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} />
+            onSaveLayout={data.saveLayout} onApplyLayout={data.applyLayout} onDeleteLayout={data.deleteLayout}
+            /* bead e7h: attention acts. Approve/Deny resolve a HELD gated request by its messageId
+               through the SAME POST /api/commands/approve resolver voice uses (data.approveAttention /
+               data.denyAttention id-gate that internally); a triage-only item (no messageId) degrades
+               to jump-to-station / local dismiss. We also open the burner on approve so the operator
+               lands on the station. restart → re-fire the dead/failed station; dismiss → clear it. */
+            onApproveAttention={(item) => { data.approveAttention(item); setBurnerId(item.terminalId); }}
+            onDenyAttention={(item) => data.denyAttention(item)}
+            onRestartAttention={(id) => data.restartPane(id)}
+            onDismissAttention={(id) => data.dismissAttention(id)} />
+          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
         <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
@@ -262,6 +314,7 @@ export default function OrbitalApp() {
       <ThePantry dark={t.dark} projects={projects} stations={stations}
         archived={data.archived}
         serviceLog={data.serviceLog}
+        health={data.healthSnapshot}
         summaryOf={(pid) => (data.ledger[pid]?.summary ?? "")}
         selectedProject={selectedProject}
         onUpdateSummary={data.updateProjectSummary}
@@ -391,7 +444,7 @@ export default function OrbitalApp() {
         onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
         /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
            lane) — either one being open means the kitchen is genuinely attached. */
-        connected={data.streamConnected || data.voiceConnected} />
+        connected={data.streamConnected || data.voiceConnected} convo={convo} />
 
       {renderLineView()}
       {renderPantryView()}

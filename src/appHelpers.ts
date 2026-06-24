@@ -9,6 +9,7 @@
 // refactor only RELOCATES computation; it changes nothing observable.
 
 import type { Terminal, PaneMeta } from "./types";
+import type { EarconType } from "./announcementKinds";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status resolution + pane filtering (the `term?.status || (pane.alive ? …)` idiom, repeated
@@ -57,8 +58,7 @@ export function sumContextSize(
   if (!panes) return 0;
   return Object.values(panes).reduce((sum, pane) => {
     const term = terminals.find((t) => t.id === pane.pane_id);
-    const size = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
-    return sum + size;
+    return sum + resolveCardContextSize(term, pane);
   }, 0);
 }
 
@@ -150,6 +150,17 @@ export function heatmapTooltipFields(isAlertActive: boolean, term: Terminal): {
     commandText: term.command || "idle waiting",
     outputBytes: term.output?.length || 0,
   };
+}
+
+/** Mobile swiper inner status-dot class (the `<span>` inside each swiper button). Four arms:
+ *  alert → amber ping2; running+quiescing → muted amber; running → green; else → yellow.
+ *  Note the custom `animate-ping2` (not `animate-ping`) — verbatim from the inline ternary chain.
+ *  `animate-ping2` is distinct from `animate-ping` on purpose (slower, less aggressive pulse). */
+export function mobileSwiperDotClass(isAlertActive: boolean, term: Pick<Terminal, "status" | "quiescing">): string {
+  if (isAlertActive) return "bg-amber-500 animate-ping2";
+  if (term.status === "Running" && term.quiescing) return "bg-amber-400/70";
+  if (term.status === "Running") return "bg-green-500";
+  return "bg-yellow-500";
 }
 
 /** Mobile swiper button color (App.tsx mobile swiper `.map`). isActive precedence sits between the
@@ -369,6 +380,10 @@ export interface WsHandlerCtx {
   setWsErrorNotification: (val: any) => void;
   setProactiveNotifications: (updater: any) => void;
   setPlans: (val: any) => void;
+  /** D2: the attention/"what needs me" queue setter, fed by the eventBus `setAttentionQueue`
+   *  effect (attention_updated frames). OPTIONAL — the classic App.tsx has no attention state, so a
+   *  caller that omits it simply no-ops the setter (the bus earcon still fires). */
+  setAttentionQueue?: (val: any) => void;
   queueStdoutChunk: (terminalId: string, chunk: string) => void;
   fetchTerminals: () => void;
   fetchPlans: () => void;
@@ -503,6 +518,10 @@ function handleEventBusFallback(msg: any, ctx: WsHandlerCtx): void {
   if (!effect) return;
   switch (effect.setter) {
     case "setPlans": ctx.setPlans(msg.plans); break;
+    // D2 (known gap): the eventBus emits setAttentionQueue for attention_updated, but this switch
+    // had no arm for it — the queue silently never updated. Adopt msg.queue (optional setter, so
+    // an attention-less surface like classic App.tsx no-ops; the earcon below still fires).
+    case "setAttentionQueue": ctx.setAttentionQueue?.(msg.queue); break;
     case "fetchTerminals": ctx.fetchTerminals(); break;
     case "fetchPlans": ctx.fetchPlans(); break;
     case "noop": break;
@@ -550,4 +569,111 @@ export function dispatchWsMessage(msg: any, ctx: WsHandlerCtx): void {
   } else {
     handleEventBusFallback(msg, ctx);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Raw-key POST outcome (multi-cli adapter nit #3). The /raw-input route returns 202 (deferred —
+// gate Ask), 403 (blocked — gate Off), or 409 (refused — pane not active / no live process). Each
+// surfaces an earcon + a transient toast. VERBATIM relocation of App.writeControlKey's status
+// ladder so the decision is unit-pinnable; 2xx and any other status -> null (silent success).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type RawKeyToastTone = "blocked" | "deferred" | "refused";
+export interface RawKeyOutcome {
+  earcon: EarconType;
+  toast: { tone: RawKeyToastTone; title: string; detail: string };
+}
+
+/** Map a raw-input response status to its operator feedback. `reason` is the server-supplied 409
+ *  detail (already resolved from res.json by the caller; "" when absent). Null -> no feedback. */
+export function classifyRawKeyOutcome(status: number, paneId: string, reason: string): RawKeyOutcome | null {
+  if (status === 202) {
+    return {
+      earcon: "execute", // queued, awaiting operator confirm
+      toast: { tone: "deferred", title: "Key Deferred — Awaiting Confirm", detail: `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.` },
+    };
+  }
+  if (status === 403) {
+    return {
+      earcon: "alert", // gated Off (NO "error" earcon token exists)
+      toast: { tone: "blocked", title: "Key Blocked by Policy", detail: `Pane ${paneId}: this key is gated Off and was not sent.` },
+    };
+  }
+  if (status === 409) {
+    return {
+      earcon: "alert",
+      toast: { tone: "refused", title: "Key Not Delivered", detail: reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.` },
+    };
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-size / token-count formatters (dbt4 round 2). App.tsx rendered the SAME
+// `n < 1000 ? \`${n} <suffix>\` : \`${(n / 1000).toFixed(1)}k <suffix>\`` ternary at six sites with
+// FOUR distinct suffix spellings, plus the `Math.ceil(n / 4)` token estimate at three. The suffix
+// spellings differ on purpose (capital "Chars"/"k Chars" in detail cards, capital "Chars" but
+// LOWERCASE "k chars" in the header/system bar, "B"/"k c" in the compact density readout, and a bare
+// count for token displays) — so each gets its OWN byte-exact helper rather than a unified one. Every
+// branch/suffix below is a VERBATIM relocation of the inline JSX expression; the rendered text is
+// identical. Pure so they can be unit-pinned without jsdom.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** "<n> Chars" under 1000, else "<n/1000 to 1dp>k Chars" (detailed card + pane-detail row). */
+export function formatCharCount(n: number): string {
+  return n < 1000 ? `${n} Chars` : `${(n / 1000).toFixed(1)}k Chars`;
+}
+
+/** "<n> Chars" under 1000, else "<n/1000 to 1dp>k chars" — note the LOWERCASE "k chars" on the big
+ *  arm (header context readout + system-bar cumulative line). Differs from formatCharCount only there. */
+export function formatCharCountLower(n: number): string {
+  return n < 1000 ? `${n} Chars` : `${(n / 1000).toFixed(1)}k chars`;
+}
+
+/** "<n> B" under 1000, else "<n/1000 to 1dp>k c" (compact + videowall card density readout). */
+export function formatCompactBytes(n: number): string {
+  return n < 1000 ? `${n} B` : `${(n / 1000).toFixed(1)}k c`;
+}
+
+/** Bare "<n>" under 1000, else "<n/1000 to 1dp>k" — no unit suffix (token-count displays). */
+export function formatTokenCount(n: number): string {
+  return n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`;
+}
+
+/** Token estimate: ceil(chars / 4), the 4-chars-per-token approximation used across the cards. */
+export function estimateTokens(n: number): number {
+  return Math.ceil(n / 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-size resolution + meter-fill percent (dbt4 round 3). App.tsx's grid-card `.map` derived
+// the per-card context size with the SAME `term?.context_size !== undefined ? term.context_size :
+// (pane.context_size || 0)` fallback that `sumContextSize` already reduces over — relocate it so
+// the single-card site and the aggregate share ONE byte-exact derivation. The two meter-fill bars
+// render `Math.min((n / DENOM) * 100, 100)` with DISTINCT denominators (20000 for a per-pane card,
+// 100000 for the header cumulative bar), so each gets its OWN helper rather than a parameterized one
+// — keeping every call site a literal, byte-exact relocation of its inline `Math.min(...)`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The card's effective context size: the live terminal's `context_size` if defined, else the
+ *  ledger pane's (`|| 0`). VERBATIM from the inline `term?.context_size !== undefined ? … : …` at
+ *  the grid-card map; identical to the per-pane term used inside `sumContextSize`'s reducer. */
+export function resolveCardContextSize(
+  term: Pick<Terminal, "context_size"> | undefined,
+  pane: Pick<PaneMeta, "context_size">,
+): number {
+  return term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+}
+
+/** Per-pane context-meter fill %: `Math.min((contextSize / 20000) * 100, 100)`, clamped to 100.
+ *  VERBATIM from the grid detailed/videowall card meter (`contextPercent`). */
+export function contextMeterPercent(contextSize: number): number {
+  return Math.min((contextSize / 20000) * 100, 100);
+}
+
+/** Header cumulative overload-bar fill %: `Math.min((totalContextSize / 100000) * 100, 100)`,
+ *  clamped to 100. VERBATIM from the system-bar inline `Math.min(...)` (note the 100000 denom —
+ *  five-pane budget — distinct from the 20000 per-pane meter). */
+export function totalContextBarPercent(totalContextSize: number): number {
+  return Math.min((totalContextSize / 100000) * 100, 100);
 }

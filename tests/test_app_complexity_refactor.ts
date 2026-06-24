@@ -20,6 +20,7 @@ import {
   heatmapTileClasses,
   heatmapTooltipStatus,
   heatmapTooltipFields,
+  mobileSwiperDotClass,
   mobileSwiperColorClass,
   sidebarPaneStatusColor,
   sidebarRowContainerClass,
@@ -148,6 +149,24 @@ describe("appHelpers — mobileSwiperColorClass precedence", () => {
     assert.strictEqual(mobileSwiperColorClass(false, false, term({ status: "Running" })), "border-green-500/50 text-green-400 bg-green-500/5");
     assert.strictEqual(mobileSwiperColorClass(false, false, term({ status: "Idle" })), "border-yellow-500/50 text-yellow-500 bg-yellow-500/5");
     assert.strictEqual(mobileSwiperColorClass(false, false, term({ status: "Exited" })), "border-zinc-850 text-zinc-500 bg-black/40");
+  });
+});
+
+describe("appHelpers — mobileSwiperDotClass (inner dot, 4-arm, animate-ping2 NOT animate-ping)", () => {
+  it("alert -> amber with animate-ping2 (NOT animate-ping — custom class)", () => {
+    assert.strictEqual(mobileSwiperDotClass(true, term({ status: "Idle" })), "bg-amber-500 animate-ping2");
+    // alert dominates even when running
+    assert.strictEqual(mobileSwiperDotClass(true, term({ status: "Running" })), "bg-amber-500 animate-ping2");
+  });
+  it("running + quiescing -> muted amber (no animation suffix)", () => {
+    assert.strictEqual(mobileSwiperDotClass(false, term({ status: "Running", quiescing: true })), "bg-amber-400/70");
+  });
+  it("running (no quiescing) -> green", () => {
+    assert.strictEqual(mobileSwiperDotClass(false, term({ status: "Running" })), "bg-green-500");
+  });
+  it("idle and exited both fall through to yellow (mobile swiper shows only live panes)", () => {
+    assert.strictEqual(mobileSwiperDotClass(false, term({ status: "Idle" })), "bg-yellow-500");
+    assert.strictEqual(mobileSwiperDotClass(false, term({ status: "Exited" })), "bg-yellow-500");
   });
 });
 

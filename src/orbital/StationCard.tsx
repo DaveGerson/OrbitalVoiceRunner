@@ -6,6 +6,8 @@ import { INK, RUNTIMES, STATUS } from "./theme";
 import { ChefAvatar, Chip, Pips, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { CHEFS } from "./theme";
 import type { Station } from "./station";
+import type { StoredHandoff } from "../store/types";
+import { StationHandoffDrawer } from "./StationHandoffDrawer";
 import {
   deriveCardColors,
   deriveCardTag,
@@ -21,9 +23,16 @@ import {
 
 const PIP_COUNT = 8;
 
-export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active }: {
+export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onStageHandoff, onRejectHandoff, onFetchHandoffPrompt }: {
   st: Station; accentHex: string; dark: boolean; compact: boolean; tilt?: number;
   onOpen: () => void; layout: "grid" | "rail" | "list"; showCue: boolean; active: boolean;
+  // j4e1 (additive): handoffs bound TO this station + the hero-action callbacks. Omitted → no drawer.
+  handoffs?: StoredHandoff[];
+  onDeliverHandoff?: (id: string) => void;
+  onReviseHandoff?: (id: string, text: string) => void;
+  onStageHandoff?: (id: string) => void;
+  onRejectHandoff?: (id: string) => void;
+  onFetchHandoffPrompt?: (id: string) => Promise<string | null>;
 }) {
   const [hover, setHover] = useState(false);
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
@@ -37,11 +46,11 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
   function renderHeaderRow() {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 7, paddingLeft: 4 }}>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: sub }}>#{st.id}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: sub }}>#{st.id}</span>
         <span style={{ width: 7, height: 7, borderRadius: 2, background: accentHex, border: "1.5px solid " + INK }} />
-        <span style={{ fontFamily: "DM Sans", fontSize: 10, fontWeight: 800, color: accentHex, letterSpacing: ".06em" }}>{tag}</span>
+        <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, color: accentHex, letterSpacing: ".06em" }}>{tag}</span>
         {active && (
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 7px", borderRadius: 999, background: "#ffc94a", border: "1.5px solid " + INK, fontFamily: "DM Sans", fontSize: 9, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", color: INK }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 7px", borderRadius: 999, background: "#ffc94a", border: "1.5px solid " + INK, fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", color: INK }}>
             <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#e23a3a", animation: "orb-pulse 1s var(--ease-bounce) infinite" }} />active
           </span>
         )}
@@ -61,7 +70,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 4 }}>
           <ChefAvatar chefKey={st.chef} size={20} />
           <span style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: fg }}>Chef {CHEFS[st.chef].name}</span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 600, color: sub, marginLeft: 2 }}>· {rt.label}</span>
+          <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 600, color: sub, marginLeft: 2 }}>· {rt.label}</span>
         </div>
       </div>
     );
@@ -84,7 +93,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
       <div data-testid="station-peek" style={{ marginTop: 10, background: INK, borderRadius: 8, padding: "7px 10px", overflow: "hidden", maxHeight: 62 }}>
         {st.outputTail.slice(-3).map((l, i) => (
           <div key={i} style={{
-            fontFamily: "JetBrains Mono, monospace", fontSize: 10.5, lineHeight: 1.5,
+            fontFamily: "JetBrains Mono, monospace", fontSize: 12, lineHeight: 1.5,
             color: deriveOutputLineColor(l),
             whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
           }}>{l}</div>
@@ -104,8 +113,19 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         <Pips steps={PIP_COUNT} done={st.contextPips} color={accentHex} label={st.contextLabel} />
         <div style={{ flex: 1 }} />
         {needs && <Chip bg="#ff8a3d" color="#fff4de">{STATUS["Needs Input"].emoji} at the pass</Chip>}
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: sub }}>{st.elapsed}</span>
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: sub }}>{st.elapsed}</span>
       </div>
+    );
+  }
+
+  // j4e1: the per-station handoff drawer — the deliver/revise/reject hero surface. Renders only when
+  // this station owns handoffs (to_pane) AND the callbacks are wired; the drawer self-hides otherwise.
+  function renderHandoffDrawer() {
+    if (!handoffs || handoffs.length === 0 || !onDeliverHandoff || !onReviseHandoff || !onStageHandoff || !onRejectHandoff || !onFetchHandoffPrompt) return null;
+    return (
+      <StationHandoffDrawer handoffs={handoffs}
+        onDeliver={onDeliverHandoff} onRevise={onReviseHandoff} onStage={onStageHandoff}
+        onReject={onRejectHandoff} onFetchPrompt={onFetchHandoffPrompt} />
     );
   }
 
@@ -143,6 +163,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
       {renderScribble()}
       {renderOutputPeek()}
       {renderFooter()}
+      {renderHandoffDrawer()}
       {renderVoiceCue()}
     </div>
   );

@@ -3,6 +3,10 @@ import Database from "better-sqlite3";
 import { applyMigrations } from "./schema";
 import { EVENT_TYPES, type NewEvent, type StoredEvent } from "./eventTypes";
 import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHandoff, HandoffState } from "./types";
+import type {
+  PaneRow, ArchivedPaneRow, ProjectRow, NoteRow, PendingApprovalRow, PendingActionRow,
+  AttentionRow, HandoffRow, ValueRow, CountRow, IdRow, SearchHitRow,
+} from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
 
 /**
@@ -77,8 +81,8 @@ export class JanusStore {
   private persistingArray<T>(key: string, backing: T[]): T[] {
     const flush = () => this.setKV(key, JSON.stringify(backing));
     return new Proxy(backing, {
-      set: (target, prop, value) => { (target as any)[prop] = value; flush(); return true; },
-      deleteProperty: (target, prop) => { delete (target as any)[prop]; flush(); return true; },
+      set: (target, prop, value) => { Reflect.set(target, prop, value); flush(); return true; },
+      deleteProperty: (target, prop) => { Reflect.deleteProperty(target, prop); flush(); return true; },
     });
   }
 
@@ -142,7 +146,7 @@ export class JanusStore {
     if (hasLimit) args.push(filter.limit);
     const rows = this.db.prepare(
       `SELECT * FROM events ${clause} ORDER BY id ASC${hasLimit ? " LIMIT ?" : ""}`
-    ).all(...args) as any[];
+    ).all(...args) as StoredEvent[];
     return rows.map(r => ({ ...r, payload: this.parseJSON(r.payload, {}) }));
   }
 
@@ -153,7 +157,7 @@ export class JanusStore {
 
   // --- getWorkspaces minimal (full CRUD added in Task 5) ---
   getWorkspaces(): Record<string, any> {
-    const rows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as any[];
+    const rows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as ProjectRow[];
     const out: Record<string, any> = {};
     for (const r of rows) out[r.id] = { ...r, key_terms: this.parseJSON(r.key_terms, []) };
     return out;
@@ -224,9 +228,9 @@ export class JanusStore {
     if (filter.paneId) { where.push("pane_id=?"); args.push(filter.paneId); }
     if (filter.type) { where.push("type=?"); args.push(filter.type); }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    return this.db.prepare(
+    return (this.db.prepare(
       `SELECT * FROM notes ${clause} ORDER BY created_at DESC`
-    ).all(...args).map((r:any) => ({ ...r })) as any;
+    ).all(...args) as NoteRow[]).map(r => ({ ...r }));
   }
 
   /** Full-text search across notes + events, ranked by bm25. Pass opts.source to restrict to one
@@ -238,12 +242,12 @@ export class JanusStore {
       `SELECT n.id AS id, n.text AS snippet, bm25(notes_fts) AS rank
        FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
        WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`
-    ).all(query, limit) as any[];
+    ).all(query, limit) as SearchHitRow[];
     const events = opts.source === "note" ? [] : this.db.prepare(
       `SELECT e.id AS id, e.summary AS snippet, bm25(events_fts) AS rank
        FROM events_fts JOIN events e ON e.id = events_fts.rowid
        WHERE events_fts MATCH ? ORDER BY rank LIMIT ?`
-    ).all(query, limit) as any[];
+    ).all(query, limit) as SearchHitRow[];
     const merged = [
       ...notes.map(r => ({ source:"note" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
       ...events.map(r => ({ source:"event" as const, id:String(r.id), snippet:r.snippet, rank:r.rank })),
@@ -268,12 +272,12 @@ export class JanusStore {
     this.db.prepare("DELETE FROM pending_approvals WHERE id=?").run(id);
   }
   getPendingApprovals(sessionId: string): StoredPendingApproval[] {
-    return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as any[])
-      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as PendingApprovalRow[])
+      .map(r => this.hydrateApproval(r));
   }
   getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
-    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
-      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as PendingApprovalRow[])
+      .map(r => this.hydrateApproval(r));
   }
 
   // ── durable deferred actions (bead wsm-e2e-pinned-kzt, schema v5) ─────────────────────────────
@@ -297,18 +301,18 @@ export class JanusStore {
   /** Un-claimed survivors (the boot hydration set). Claimed-but-undeleted rows are excluded so a
    *  mid-resolve crash never re-replays. Ordered by timestamp ASC (== staging order). */
   getPendingActions(): StoredPendingAction[] {
-    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 ORDER BY timestamp ASC").all() as any[])
-      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 ORDER BY timestamp ASC").all() as PendingActionRow[])
+      .map(r => this.hydrateAction(r));
   }
   getExpiredActions(now = Date.now()): StoredPendingAction[] {
-    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as any[])
-      .map(r => ({ ...r, claimed: Boolean(r.claimed) }));
+    return (this.db.prepare("SELECT * FROM pending_actions WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as PendingActionRow[])
+      .map(r => this.hydrateAction(r));
   }
   /** Total pending_actions rows REGARDLESS of claimed/expiry — the boot-prune (bead 1qs) target
    *  surface. getPendingActions/getExpiredActions both filter claimed=0, so a leaked claimed=1 row
    *  is invisible to them; this counts the raw table for retention assertions/observability. */
   countPendingActions(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM pending_actions").get() as any).n as number;
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM pending_actions").get() as CountRow).n;
   }
 
   // ── unified action log (schema v6, PLM2) ────────────────────────────────────────────────────────
@@ -386,12 +390,12 @@ export class JanusStore {
     const sql = opts.includeDismissed
       ? "SELECT * FROM attention ORDER BY timestamp DESC"
       : "SELECT * FROM attention WHERE dismissed=0 ORDER BY timestamp DESC";
-    return (this.db.prepare(sql).all() as any[])
-      .map(r => ({ ...r, dismissed: Boolean(r.dismissed), details: this.parseJSON(r.details, null) }));
+    return (this.db.prepare(sql).all() as AttentionRow[])
+      .map(r => this.hydrateAttention(r));
   }
 
   getSettings(key: string): string | null {
-    const r = this.db.prepare("SELECT value FROM settings_kv WHERE key=?").get(key) as any;
+    const r = this.db.prepare("SELECT value FROM settings_kv WHERE key=?").get(key) as ValueRow | undefined;
     return r?.value ?? null;
   }
   saveSettings(key: string, value: string): void {
@@ -399,7 +403,7 @@ export class JanusStore {
       .run(key, value, Date.now());
   }
   getKV(key: string): string | null {
-    const r = this.db.prepare("SELECT value FROM kv WHERE key=?").get(key) as any;
+    const r = this.db.prepare("SELECT value FROM kv WHERE key=?").get(key) as ValueRow | undefined;
     return r?.value ?? null;
   }
   setKV(key: string, value: string): void {
@@ -449,7 +453,7 @@ export class JanusStore {
   }
 
   getPanes(workspaceId: string): Record<string, StoredPane> {
-    const rows = this.db.prepare("SELECT * FROM panes WHERE workspace_id=? ORDER BY created_at").all(workspaceId) as any[];
+    const rows = this.db.prepare("SELECT * FROM panes WHERE workspace_id=? ORDER BY created_at").all(workspaceId) as PaneRow[];
     const out: Record<string, StoredPane> = {};
     for (const r of rows) out[r.pane_id] = this.hydratePane(r);
     return out;
@@ -459,7 +463,7 @@ export class JanusStore {
     this.recordActivity(
       { type: EVENT_TYPES.PANE_ARCHIVED, project_id: workspaceId, pane_id: paneId, summary: reason ?? "archived" },
       (db) => {
-        const row = db.prepare("SELECT * FROM panes WHERE pane_id=? AND workspace_id=?").get(paneId, workspaceId) as any;
+        const row = db.prepare("SELECT * FROM panes WHERE pane_id=? AND workspace_id=?").get(paneId, workspaceId) as PaneRow | undefined;
         if (!row) return;
         // 2S.3: capability_gates (schema v4) and the v3 columns (draft / model_context /
         // human_context, archive twins added in v8) must be LISTED here — better-sqlite3 silently
@@ -492,7 +496,7 @@ export class JanusStore {
   restorePane(paneId: string, workspaceId: string): StoredPane | null {
     const row = this.db.prepare(
       "SELECT * FROM panes_archive WHERE pane_id=? AND workspace_id=? ORDER BY archived_at DESC LIMIT 1"
-    ).get(paneId, workspaceId) as any;
+    ).get(paneId, workspaceId) as ArchivedPaneRow | undefined;
     if (!row) return null;
     const pane = { ...this.hydratePane(row), alive: false, last_known_state: "Exited" as const };
     this.recordActivity(
@@ -512,10 +516,12 @@ export class JanusStore {
            last_known_state=excluded.last_known_state, updated_at=excluded.updated_at`
       ).run({
         ...pane,
-        capability_gates: pane.capability_gates ?? null,
-        draft: (pane as any).draft ?? null,
-        model_context: (pane as any).model_context ?? "[]",
-        human_context: (pane as any).human_context ?? "[]",
+        // Read the raw TEXT extras off the typed archive `row` (hydratePane carries them through on
+        // the runtime object, but they are not declared on StoredPane — so the row is the typed source).
+        capability_gates: row.capability_gates ?? null,
+        draft: row.draft ?? null,
+        model_context: row.model_context ?? "[]",
+        human_context: row.human_context ?? "[]",
         is_busy: 0, alive: 0, updated_at: Date.now(),
       })
     );
@@ -530,8 +536,8 @@ export class JanusStore {
    */
   listArchived(workspaceId?: string): import("../ledger").ArchivedPane[] {
     const rows = workspaceId
-      ? this.db.prepare("SELECT * FROM panes_archive WHERE workspace_id=? ORDER BY archived_at DESC").all(workspaceId) as any[]
-      : this.db.prepare("SELECT * FROM panes_archive ORDER BY archived_at DESC").all() as any[];
+      ? this.db.prepare("SELECT * FROM panes_archive WHERE workspace_id=? ORDER BY archived_at DESC").all(workspaceId) as ArchivedPaneRow[]
+      : this.db.prepare("SELECT * FROM panes_archive ORDER BY archived_at DESC").all() as ArchivedPaneRow[];
     return rows.map(r => ({
       pane: this.toPaneMeta(this.hydratePane(r)),
       project_id: r.workspace_id,
@@ -556,7 +562,7 @@ export class JanusStore {
   archiveExitedPanes(projectId?: string): number {
     const projectIds = projectId
       ? [projectId]
-      : (this.db.prepare("SELECT id FROM projects").all() as any[]).map(r => r.id);
+      : (this.db.prepare("SELECT id FROM projects").all() as IdRow[]).map(r => r.id);
     let count = 0;
     for (const pId of projectIds) {
       for (const [paneId, sp] of Object.entries(this.getPanes(pId))) {
@@ -570,7 +576,7 @@ export class JanusStore {
   restoreArchivedPane(paneId: string): import("../ledger").ArchivedPane | null {
     const row = this.db.prepare(
       "SELECT * FROM panes_archive WHERE pane_id=? ORDER BY archived_at DESC LIMIT 1"
-    ).get(paneId) as any;
+    ).get(paneId) as ArchivedPaneRow | undefined;
     if (!row) return null;
     const entry: import("../ledger").ArchivedPane = {
       pane: this.toPaneMeta(this.hydratePane(row)),
@@ -595,10 +601,30 @@ export class JanusStore {
     return res.changes > 0;
   }
 
-  private hydratePane(r: any): StoredPane {
-    return { ...r, is_busy: Boolean(r.is_busy), alive: Boolean(r.alive),
+  private hydratePane(r: PaneRow): StoredPane {
+    // The TEXT enum columns are stored as plain strings; the schema's CHECK-less defaults mean only
+    // valid values are ever written, so narrowing them back to their unions here reproduces what the
+    // prior `as any` cast did implicitly — without re-opening the unsafe cast.
+    return { ...r,
+             tool_preset: r.tool_preset as StoredPane["tool_preset"],
+             permissions_mode: r.permissions_mode as StoredPane["permissions_mode"],
+             last_known_state: r.last_known_state as StoredPane["last_known_state"],
+             is_busy: Boolean(r.is_busy), alive: Boolean(r.alive),
              last_status_change_at: r.last_status_change_at ?? null,
              last_command: r.last_command ?? null, scrollback_path: r.scrollback_path ?? null };
+  }
+
+  // Peer hydrators (bead dbt-typing) mirroring hydratePane / hydrateHandoff: map a raw SQLite Row to its
+  // Stored shape, coercing the INTEGER boolean columns (0|1) to real booleans and parsing JSON TEXT.
+  // Behaviour-identical to the prior inline `.map(r => ({ ...r, claimed: Boolean(r.claimed) }))`.
+  private hydrateApproval(r: PendingApprovalRow): StoredPendingApproval {
+    return { ...r, kind: r.kind as StoredPendingApproval["kind"], claimed: Boolean(r.claimed) };
+  }
+  private hydrateAction(r: PendingActionRow): StoredPendingAction {
+    return { ...r, claimed: Boolean(r.claimed) };
+  }
+  private hydrateAttention(r: AttentionRow): import("./types").StoredAttention {
+    return { ...r, dismissed: Boolean(r.dismissed), details: this.parseJSON(r.details, null) };
   }
 
   bootMaintenance(opts: PruneOpts): void {
@@ -625,7 +651,7 @@ export class JanusStore {
   getDraft(projectId: string, paneId: string): import("../types").PaneDraft | null {
     const r = this.db.prepare(
       "SELECT draft FROM panes WHERE pane_id=? AND workspace_id=?"
-    ).get(paneId, projectId) as any;
+    ).get(paneId, projectId) as { draft: string | null } | undefined;
     if (!r) return null;
     return this.parseJSON<import("../types").PaneDraft | null>(r.draft, null);
   }
@@ -658,7 +684,7 @@ export class JanusStore {
   listDrafts(projectId: string): { paneId: string; draft: import("../types").PaneDraft }[] {
     const rows = this.db.prepare(
       "SELECT pane_id, draft FROM panes WHERE workspace_id=? AND draft IS NOT NULL ORDER BY created_at"
-    ).all(projectId) as any[];
+    ).all(projectId) as { pane_id: string; draft: string | null }[];
     const out: { paneId: string; draft: import("../types").PaneDraft }[] = [];
     for (const r of rows) {
       const draft = this.parseJSON<import("../types").PaneDraft | null>(r.draft, null);
@@ -682,7 +708,7 @@ export class JanusStore {
   ): boolean {
     const r = this.db.prepare(
       `SELECT ${column} AS ctx FROM panes WHERE pane_id=? AND workspace_id=?`
-    ).get(paneId, projectId) as any;
+    ).get(paneId, projectId) as { ctx: string | null } | undefined;
     if (!r) return false;
     const entries = this.parseJSON<import("../types").ContextEntry[]>(r.ctx, []);
     const entry: import("../types").ContextEntry = { text, at: new Date().toISOString(), ...(source ? { source } : {}) };
@@ -710,7 +736,7 @@ export class JanusStore {
   } | null {
     const r = this.db.prepare(
       "SELECT model_context, human_context FROM panes WHERE pane_id=? AND workspace_id=?"
-    ).get(paneId, projectId) as any;
+    ).get(paneId, projectId) as { model_context: string | null; human_context: string | null } | undefined;
     if (!r) return null;
     return {
       model: this.parseJSON<import("../types").ContextEntry[]>(r.model_context, []),
@@ -729,10 +755,10 @@ export class JanusStore {
   // PaneMeta -> StoredPane string/number fields with their `?? <default>` fallback, driven off a table
   // so paneMetaFromMeta stays under CC 10 while reproducing the prior per-field defaults verbatim.
   // (Booleans use `!!` and the constants are handled separately below — see paneMetaToStoredPane.)
-  private static readonly PANE_META_DEFAULTS: ReadonlyArray<readonly [keyof StoredPane, string | number]> = [
+  private static readonly PANE_META_DEFAULTS: ReadonlyArray<readonly [keyof StoredPane, string | number | null]> = [
     ["name", ""], ["runtime_type", ""], ["tool_preset", "Custom"],
     ["permissions_mode", "Human-in-the-Loop"], ["session_id", ""], ["last_known_state", "Idle"],
-    ["context_size", 0], ["last_status_change_at", null as any], ["last_command", null as any],
+    ["context_size", 0], ["last_status_change_at", null], ["last_command", null],
   ];
 
   /** Coerce a legacy PaneMeta into the StoredPane savePane expects. Extracted from updatePane verbatim:
@@ -749,7 +775,8 @@ export class JanusStore {
     } as Record<string, unknown>;
     for (const [col, dflt] of JanusStore.PANE_META_DEFAULTS) {
       // `??` so a missing/undefined meta field gets the documented default; present values pass through.
-      sp[col] = (paneMeta as any)[col] ?? dflt;
+      // PaneMeta shares these column names with StoredPane; index via a string-record view (not `any`).
+      sp[col] = (paneMeta as unknown as Record<string, unknown>)[col] ?? dflt;
     }
     return sp as unknown as StoredPane;
   }
@@ -843,13 +870,13 @@ export class JanusStore {
       runtime_type: p.runtime_type,
       // bead 8sq: hydrate the per-pane capability-gate override (schema v4). NULL/absent → undefined
       // (no override; the resolver falls through to the global default).
-      capabilityGates: this.parseJSON<import("../types").CapabilityGateMap | undefined>(p.capability_gates ?? null, undefined as any) || undefined,
+      capabilityGates: this.parseJSON<import("../types").CapabilityGateMap | undefined>(p.capability_gates ?? null, undefined) || undefined,
     } as import("../types").PaneMeta;
   }
 
   /** A single project in the legacy Workspace shape, or null. */
   getProject(id: string): import("../types").Workspace | null {
-    const r = this.db.prepare("SELECT * FROM projects WHERE id=?").get(id) as any;
+    const r = this.db.prepare("SELECT * FROM projects WHERE id=?").get(id) as ProjectRow | undefined;
     if (!r) return null;
     const panes: Record<string, import("../types").PaneMeta> = {};
     for (const [pid, sp] of Object.entries(this.getPanes(id))) {
@@ -906,7 +933,7 @@ export class JanusStore {
    *  the getter trailing reverse() reproduces the legacy per-group ASC lists exactly; pane notes are
    *  keyed `${project_id}\0${pane_id}` (WS_NOTE_KEY_SEP). Maps (not plain objects), so no string-key
    *  prototype-leak surface. */
-  private partitionNotes(noteRows: any[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
+  private partitionNotes(noteRows: NoteRow[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
     const projectNotes = new Map<string, string[]>();
     const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
     for (const n of noteRows) {
@@ -920,8 +947,8 @@ export class JanusStore {
   }
 
   /** Group pane rows by their owning project (workspace_id), preserving row order. Extracted verbatim. */
-  private partitionPanesByProject(paneRows: any[]): Map<string, any[]> {
-    const panesByProject = new Map<string, any[]>();
+  private partitionPanesByProject(paneRows: PaneRow[]): Map<string, PaneRow[]> {
+    const panesByProject = new Map<string, PaneRow[]>();
     for (const r of paneRows) {
       const arr = panesByProject.get(r.workspace_id);
       if (arr) arr.push(r); else panesByProject.set(r.workspace_id, [r]);
@@ -933,8 +960,8 @@ export class JanusStore {
    *  Extracted from the `workspaces` getter verbatim: identical field set, the per-group `.slice()
    *  .reverse()` (DESC->ASC), orphan-pane-note invisibility, and the summary/keyTerms defaults. */
   private assembleWorkspace(
-    r: any,
-    panesByProject: Map<string, any[]>,
+    r: ProjectRow,
+    panesByProject: Map<string, PaneRow[]>,
     projectNotes: Map<string, string[]>,
     paneNotes: Map<string, string[]>,
   ): import("../types").Workspace {
@@ -957,10 +984,10 @@ export class JanusStore {
 
   get workspaces(): Record<string, import("../types").Workspace> {
     const out: Record<string, import("../types").Workspace> = {};
-    const projRows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as any[];
+    const projRows = this.db.prepare("SELECT * FROM projects ORDER BY created_at").all() as ProjectRow[];
     if (projRows.length === 0) return out;
-    const paneRows = this.db.prepare("SELECT * FROM panes ORDER BY created_at").all() as any[];
-    const noteRows = this.db.prepare("SELECT * FROM notes ORDER BY created_at DESC").all() as any[];
+    const paneRows = this.db.prepare("SELECT * FROM panes ORDER BY created_at").all() as PaneRow[];
+    const noteRows = this.db.prepare("SELECT * FROM notes ORDER BY created_at DESC").all() as NoteRow[];
 
     const { projectNotes, paneNotes } = this.partitionNotes(noteRows);
     const panesByProject = this.partitionPanesByProject(paneRows);
@@ -1028,7 +1055,7 @@ export class JanusStore {
     ["delivered_at", null], ["consumed_at", null], ["terminal_at", null], ["expires_at", null],
   ];
 
-  private hydrateHandoff(r: any): StoredHandoff {
+  private hydrateHandoff(r: HandoffRow): StoredHandoff {
     const out = {} as Record<string, unknown>;
     for (const col of JanusStore.HANDOFF_VERBATIM) out[col] = r[col];
     for (const [col, dflt] of JanusStore.HANDOFF_DEFAULTS) out[col] = r[col] ?? dflt;
@@ -1093,7 +1120,7 @@ export class JanusStore {
   }
 
   getHandoff(id: string): StoredHandoff | null {
-    const r = this.db.prepare("SELECT * FROM handoffs WHERE id=?").get(id) as any;
+    const r = this.db.prepare("SELECT * FROM handoffs WHERE id=?").get(id) as HandoffRow | undefined;
     return r ? this.hydrateHandoff(r) : null;
   }
 
@@ -1147,7 +1174,7 @@ export class JanusStore {
     const sets: string[] = ["state=@state"];
     const params: Record<string, any> = { id, state };
     for (const [matchState, col] of JanusStore.HANDOFF_STATE_TS) {
-      if (state === matchState) { sets.push(`${col}=@${col}`); params[col] = (patch as any)[col] ?? now; }
+      if (state === matchState) { sets.push(`${col}=@${col}`); params[col] = patch[col] ?? now; }
     }
     for (const col of JanusStore.HANDOFF_PATCH_COLS) {
       if (patch[col] !== undefined) { sets.push(`${col}=@${col}`); params[col] = patch[col]; }
@@ -1188,7 +1215,7 @@ export class JanusStore {
     if (filter.toPane) { where.push("to_pane=?"); args.push(filter.toPane); }
     if (filter.state) { where.push("state=?"); args.push(filter.state); }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    return (this.db.prepare(`SELECT * FROM handoffs ${clause} ORDER BY created_at DESC`).all(...args) as any[])
+    return (this.db.prepare(`SELECT * FROM handoffs ${clause} ORDER BY created_at DESC`).all(...args) as HandoffRow[])
       .map(r => this.hydrateHandoff(r));
   }
 
@@ -1202,7 +1229,7 @@ export class JanusStore {
         WHERE (state IN ('staged','composing','revising') AND expires_at IS NOT NULL AND expires_at < ?)
            OR (state='delivered' AND delivered_at IS NOT NULL AND delivered_at < ?)
         ORDER BY created_at ASC`
-    ).all(now, now - deliveredStaleMs) as any[];
+    ).all(now, now - deliveredStaleMs) as HandoffRow[];
     return rows.map(r => this.hydrateHandoff(r));
   }
 }

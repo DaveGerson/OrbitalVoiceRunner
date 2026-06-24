@@ -76,6 +76,12 @@ Properties:
   the handler **return `kind:'blocked'`/`kind:'pending'`** instead of a voice-shaped
   `kind:'ok'` narration string — `resultToHttp` already maps those to 403/202. No `toHttp`
   needed; only a handler-kind correction (voice still narrates from the same kinds).
+  - **Intentional surface asymmetry (bd wsm-e2e-pinned-gb4, not debt):** `deliver_handoff`'s
+    blocked branch returns `kind:'blocked'`, which voice renders as a 200-equivalent spoken
+    narration (`{ output: result.reason }`) but REST renders as a **403** — deliver is a
+    voice-primary gated action and REST is the escape-hatch surface whose drawer button must
+    status-branch on a true HTTP failure. Same kind, two faithful renderings; do **not**
+    "symmetrize" REST to 200 (pinned by `tests/test_cv2_handoff_rest.ts`).
 - `toHttp` is reserved strictly for the ~4 READS whose body is a structured array/object.
 
 ## Tier Summary (≈35 twinned routes)

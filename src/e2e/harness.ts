@@ -1,5 +1,8 @@
 import { useEffect, useRef, type MutableRefObject } from "react";
-import type { Terminal, PendingCommand, CapabilityGateMap, Workspace, PaneMeta } from "../types";
+import type { Terminal, PendingCommand, CapabilityGateMap, Workspace, PaneMeta, GateValue, CapabilityGate } from "../types";
+// bead 2j3: the SAME frontend-safe gate-value normalizer the chip/dialogs use — so an unknown
+// capability's seeded gate degrades to the fail-safe Ask rather than leaking undefined into the rider.
+import { normalizeGateValue } from "../gateSurface";
 
 /**
  * E2E test harness — fully isolated from the application internals.
@@ -36,8 +39,19 @@ export interface OrbitalE2EHooks {
   injectTranscript: (sender: "User" | "Janus", text: string) => void;
   /** aqx (build-out): attach grounded queries/sources to the most recent Janus turn (drives the chip). */
   injectGrounding: (queries: string[], sources: { uri: string; title: string }[]) => void;
-  injectPendingApproval: (cmd: string, terminalId?: string) => void;
-  injectPendingAction: (capability: string, summary: string) => void;
+  /**
+   * bead 2j3: an OPTIONAL `posture` rider re-seeds the staged approval with the SERVER-resolved
+   * effective posture (word + the default effective gates) so the ApprovalDialog renders its
+   * "Approving into:" posture rider deterministically under ?mock=1. Omitted → today's bare dialog
+   * (the rider is degrade-safe, hidden when no posture truth was supplied — preserves existing specs).
+   */
+  injectPendingApproval: (cmd: string, terminalId?: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
+  /**
+   * bead 2j3: an OPTIONAL `posture` rider stamps the staged action with the effective posture (word +
+   * the resolved effective gate for `capability`) so the ActionConfirmDialog renders its "Effective on
+   * X:" posture rider deterministically. Omitted → today's bare dialog (rider hidden — degrade-safe).
+   */
+  injectPendingAction: (capability: string, summary: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
   /**
    * U3 (bead wsm-e2e-pinned-dlj): stage a WIP draft for `paneId` so the e2e can exercise the
    * `wipDrafts.length > 0` clause of the Sync Spec tab draft-pending badge independently of
@@ -67,6 +81,15 @@ export interface OrbitalE2EHooks {
    * resolve gates). Replaces the mock terminal's `effective_gates` + `posture` and re-seeds it.
    */
   setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: CapabilityGateMap) => void;
+  /**
+   * bead ahz (n2r crash-safety regression): re-seed the mock pane with a genuinely MALFORMED server
+   * posture word (one that is NOT OPEN | GUARDED | LOCKED). The harness is client-only, so this is the
+   * only way to reproduce the bad-payload condition the n2r normalizers guard. The chip must DEGRADE —
+   * normalize the bad word to GUARDED and surface the calm `gate-chip-degraded` tell in the popover —
+   * NOT throw during render and white-screen the cockpit. `posture` is typed `string` (not PostureWord)
+   * on purpose: the WHOLE point is to feed a value the closed union forbids. ?mock=1-gated test support.
+   */
+  injectMalformedPosture: (posture: string, effectiveGates?: CapabilityGateMap) => void;
   /**
    * bead 8sq (spec §2.C): drive the two-stage STOP-ALL banner. `frozen` toggles the FROZEN banner;
    * `running` sets the still-running pane count the Stage-2 hold-to-fire kill targets.
@@ -113,7 +136,15 @@ export interface OrbitalE2EHooks {
   simulateStreamReconnect: () => void;
 }
 
-export type PendingActionEntry = { actionId: string; capability: string; summary: string };
+export type PendingActionEntry = {
+  actionId: string;
+  capability: string;
+  summary: string;
+  // bead 2j3: OPTIONAL effective-posture rider fields (server truth). Threaded to ActionConfirmDialog
+  // so its "Effective on X:" rider renders under ?mock=1. Absent → degrade-safe bare dialog (D5).
+  posture?: "OPEN" | "GUARDED" | "LOCKED";
+  effective_gate?: GateValue;
+};
 
 /** The application state/handlers the harness wires its injection hooks into. */
 export interface E2EHarnessDeps {
@@ -340,21 +371,28 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
           next[lastJanus] = { ...next[lastJanus], grounding: { queries, sources } };
           return next;
         }),
-      injectPendingApproval: (cmd, terminalId = MOCK_TERMINAL_ID) => {
+      injectPendingApproval: (cmd, terminalId = MOCK_TERMINAL_ID, posture) => {
         const record: PendingCommand = {
           messageId: `mock_${stagedApprovals.length + 1}`,
           cmd,
           terminalId,
           rationale: { trigger: "e2e injected", summary: "Mocked pending approval for e2e." },
+          // bead 2j3: only stamp the posture rider when the caller asked for it — keeps the bare
+          // dialog (and the existing approval.spec cases) unchanged. The effective gates are the
+          // harness default so the rider's write-gate row renders deterministically.
+          ...(posture ? { posture, effective_gates: DEFAULT_MOCK_GATES } : {}),
         };
         stagedApprovals.push(record);
         deps.setPendingCommands((prev) => [...prev, record]);
       },
-      injectPendingAction: (capability, summary) => {
+      injectPendingAction: (capability, summary, posture) => {
         const record: PendingActionEntry = {
           actionId: `mock_act_${stagedActions.length + 1}`,
           capability,
           summary,
+          // bead 2j3: stamp the posture rider only on request. The effective gate is the resolved
+          // gate for `capability` from the harness default map (normalized so an unknown cap → Ask).
+          ...(posture ? { posture, effective_gate: normalizeGateValue(DEFAULT_MOCK_GATES[capability as CapabilityGate]) } : {}),
         };
         stagedActions.push(record);
         deps.setPendingActions((prev) => [...prev, record]);
@@ -396,6 +434,17 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       // assert OPEN / GUARDED / LOCKED + the popover breakdown deterministically.
       setPostureMock: (posture, effectiveGates) => {
         deps.setTerminals([mockTerminal(posture, effectiveGates)]);
+        deps.setActiveTerminalId(MOCK_TERMINAL_ID);
+      },
+
+      // bead ahz: re-seed with a MALFORMED posture word (not in the closed union) to reproduce the
+      // bad-payload render condition. The cast through `unknown` is deliberate — mockTerminal()'s
+      // signature only accepts a valid PostureWord, but the bug under test is a server frame that
+      // VIOLATES that contract. The chip must degrade (normalize → GUARDED + show the calm tell), not
+      // throw. A truthy posture string keeps `activeTerminal.posture &&` true so the chip still mounts.
+      injectMalformedPosture: (posture, effectiveGates = DEFAULT_MOCK_GATES) => {
+        const bad = posture as unknown as "OPEN" | "GUARDED" | "LOCKED";
+        deps.setTerminals([mockTerminal(bad, effectiveGates)]);
         deps.setActiveTerminalId(MOCK_TERMINAL_ID);
       },
 

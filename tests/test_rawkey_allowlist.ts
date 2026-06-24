@@ -123,7 +123,11 @@ function extractFrontendRawKeyValues(src: string): Array<[string, string]> {
   while ((m = pairRe.exec(block[1])) !== null) {
     out.push([m[1], decodeJsStringBody(m[2])]);
   }
-  assert.ok(out.length > 0, "parsed zero entries from the frontend RAW_KEY literal — parser/source drift");
+  // l1c: prove the parser actually decoded the literal — not just "some" entries, but specifically
+  // the load-bearing Enter byte ("\r"). A non-empty-but-garbage parse (e.g. it matched key NAMES but
+  // dropped every value) would slip past a bare length>0 check; this catches that drift.
+  const decodedBytes = out.map(([, bytes]) => bytes);
+  assert.ok(decodedBytes.includes("\r"), `frontend RAW_KEY parse must include the Enter byte; got ${JSON.stringify(out)}`);
   return out;
 }
 

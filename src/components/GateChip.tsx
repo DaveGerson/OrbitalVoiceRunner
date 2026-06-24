@@ -92,13 +92,13 @@ export function isViaFocus(isActivePane: boolean, cap: CapabilityGate, value: Ga
 }
 
 /**
- * className for the chip trigger button — compact flag selects padding + font-size tokens.
- * Extracted to eliminate 2 ternaries from GateChipInner's CC count.
+ * className for the chip trigger button — compact flag selects vertical padding. Font size is the
+ * `text-xs` floor in both modes (5n7 type-scale migration floored the former sub-12px sizes here).
+ * Extracted to eliminate a ternary from GateChipInner's CC count.
  */
 function chipTriggerClassName(style: typeof POSTURE_STYLE[keyof typeof POSTURE_STYLE], compact: boolean): string {
   const py = compact ? "py-0" : "py-0.5";
-  const textSize = compact ? "text-[8px]" : "text-[9px]";
-  return `inline-flex items-center gap-1.5 rounded border px-1.5 ${py} font-mono uppercase tracking-wider ${textSize} font-bold transition-colors cursor-pointer ${style.ring} ${style.text}`;
+  return `inline-flex items-center gap-1.5 rounded border px-1.5 ${py} font-mono uppercase tracking-wider text-xs font-bold transition-colors cursor-pointer ${style.ring} ${style.text}`;
 }
 
 /**
@@ -131,7 +131,7 @@ function renderCapRow(
       <div key={cap} data-testid={`gate-row-${cap}`} data-control="badge" className="flex items-center justify-between gap-2">
         <span className="text-zinc-400 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
         <span className="flex items-center gap-1 shrink-0 text-zinc-500" title="Not a safety gate — always on.">
-          <span className="uppercase normal-case font-sans text-[9px]">Always on</span>
+          <span className="uppercase normal-case font-sans text-xs">Always on</span>
         </span>
       </div>
     );
@@ -197,14 +197,14 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
       {open && (
         <div
           data-testid="gate-chip-popover"
-          className="absolute z-50 top-full right-0 mt-1 w-72 max-h-80 overflow-y-auto rounded-lg border border-white/10 bg-[#0b0b0b] shadow-2xl p-3 font-mono text-[10px] text-zinc-300 animate-in fade-in zoom-in-95 duration-150"
+          className="absolute z-50 top-full right-0 mt-1 w-72 max-h-80 overflow-y-auto rounded-lg border border-white/10 bg-[#0b0b0b] shadow-2xl p-3 font-mono text-xs text-zinc-300 animate-in fade-in zoom-in-95 duration-150"
           onClick={(e) => e.stopPropagation()}
         >
           <div className={`flex items-center gap-2 pb-2 mb-2 border-b border-white/10 ${style.text}`}>
             <span className={`inline-block w-2 h-2 rounded-full ${style.dot}`} />
             <span className="uppercase tracking-widest font-bold">{safePosture}</span>
             {focused && <span className="text-cyan-300" title="Spotlight loosened a write here">★ focused</span>}
-            <span className="ml-auto text-zinc-500 normal-case font-sans text-[9px]">{style.label}</span>
+            <span className="ml-auto text-zinc-500 normal-case font-sans text-xs">{style.label}</span>
           </div>
 
           {/* n2r (D8): calm degraded tell — a malformed posture frame is a transient infra hiccup, not
@@ -212,7 +212,7 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
           {degraded && (
             <div
               data-testid="gate-chip-degraded"
-              className="mb-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-[9px] text-zinc-500 normal-case font-sans leading-snug"
+              className="mb-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-xs text-zinc-500 normal-case font-sans leading-snug"
             >
               Posture unavailable — showing safe default.
             </div>
@@ -220,7 +220,7 @@ function GateChipInner({ effectiveGates, posture, isActivePane = false, compact 
 
           {Object.entries(CAPABILITY_CATEGORIES).map(([category, caps]) => (
             <div key={category} className="mb-2 last:mb-0">
-              <div className="text-[8px] uppercase tracking-widest text-zinc-600 font-bold mb-1">{category}</div>
+              <div className="text-xs uppercase tracking-widest text-zinc-600 font-bold mb-1">{category}</div>
               <div className="space-y-0.5">
                 {caps.map((cap) => renderCapRow(cap, gates, isActivePane))}
               </div>

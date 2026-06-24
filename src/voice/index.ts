@@ -25,14 +25,14 @@
  *    function server.ts feeds into attachVoiceSession — gating still never imports voice.
  */
 
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
 import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
-import { parseApprovalIntent, selectApprovalTarget } from "../approvalIntent";
+import { parseApprovalIntent } from "../approvalIntent";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
-import { shouldRouteUtterance, resolvePendingActionByVoice } from "../voiceApprovalRouting";
+import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
 import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
@@ -237,7 +237,10 @@ export interface VoiceDeps {
  * a second client gets a fresh, independent session lifecycle (no latent cross-client bleed).
  */
 interface VoiceSessionState {
-  session: any;
+  // The live Gemini handle (the SDK `Session`) for THIS connection, or null before the first
+  // successful connect / after teardown. bead ec8: PR #89's as-any sweep typed the `message`
+  // envelope on the onmessage seam but left this (and the toolCall dispatch param) as `any`.
+  session: Session | null;
   unsubscribePaneSignals: (() => void) | null;
   wsClosed: boolean;
   currentSessionUserUtterance: string;
@@ -963,27 +966,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               });
               return;
             }
-            // Collision/ambiguity in the utterance itself -> clarify, never approve.
-            if (parsed.intent === "clarify") {
-              pushApprovalNarrationDep(session, `I heard both approve and reject — which did you mean for the ${entries.length} pending command${entries.length === 1 ? "" : "s"}?`);
-              return;
-            }
-            const target = selectApprovalTarget(
-              entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
-              parsed.targetHint,
-              pendingApprovals.lastAnnouncedFor(session)
-            );
-            if (target.ambiguous || !target.messageId) {
-              // >1 pending and nothing disambiguates -> clarify, list them.
-              const list = entries.map((e, i) => `${i + 1}. "${redactSecrets(e.instruction)}" on pane ${e.terminalId}`).join("; ");
-              pushApprovalNarrationDep(session, `I have ${entries.length} pending: ${list}. Which one?`);
-            } else if (parsed.intent === "defer") {
-              // 4D.3: "later" / "not now" re-arms the TTL window (narration + cap live inside applyDeferral)
-              // — never the claim+delete reject path.
-              applyDeferral(target.messageId);
-            } else {
-              resolveApprovalByVoice(session, target.messageId, parsed.intent === "approve");
-            }
+            // bead 8xn: the held-entries routing (clarify / disambiguate / defer / approve-reject) is now
+            // the pure `resolveHeldCommandByVoice` (the sibling of resolvePendingActionByVoice above), so
+            // the server and tests run the SAME code. The PTY/store/broadcast effects bind here as sinks:
+            // onResolve -> resolveApprovalByVoice (applyResolution's claim+redaction+broadcast choke-point),
+            // onDefer -> applyDeferral (4D.3 TTL re-arm + cap). narrate/redact mirror the global path.
+            // Behavior is byte-identical to the former inline block (pinned by test_approvals_wse.ts +
+            // test_voice_approval_routing.ts).
+            resolveHeldCommandByVoice(cleanUtter, entries, pendingApprovals.lastAnnouncedFor(session), {
+              narrate: (t) => pushApprovalNarrationDep(session, t),
+              redact: redactSecrets,
+              onResolve: (messageId, approve) => resolveApprovalByVoice(session, messageId, approve),
+              onDefer: (messageId) => applyDeferral(messageId),
+            });
           };
 
           // Process an operator ASR transcript: latch the speak-gate, emit the User transcript frame,
@@ -1158,7 +1153,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
           // Dispatch every functionCall in a toolCall message through runToolCall (mints/stamps the turn id
           // and clears the barge-in latch per call, as the inline loop did).
-          const handleToolCalls = async (message: any, session: any): Promise<void> => {
+          const handleToolCalls = async (message: LiveServerMessage, session: Session): Promise<void> => {
             if (!message.toolCall) return;
             for (const call of message.toolCall.functionCalls || []) {
               const ixnId = turnId();
@@ -1199,7 +1194,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             handleGrounding(message);
             relayModelAudio(message);
             relayInterruptAndTurnState(message);
-            await handleToolCalls(message, session);
+            // `session` is the live handle that delivered this message, so it is non-null here; the
+            // guard narrows `Session | null` -> `Session` for the typed dispatch seam (bead ec8).
+            if (session) await handleToolCalls(message, session);
           },
         // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
         // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
@@ -1207,13 +1204,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // the WS-close teardown (see clientWs.on("close")): DETACH (keep survivors for re-announce),
         // null coreState.activeLiveSession behind the identity guard so a stale callback can't clobber a newer
         // session, and broadcast a NEW voice_channel_lost frame. NO reconnect logic (that is PLM4).
-        onerror: (err: any) => {
+        onerror: (err: ErrorEvent) => {
           // Log only the message, NOT the raw error/socket — the live WebSocket's URL carries the API
           // key (?key=…), so dumping the object leaks the key into logs (security hazard).
           console.error("[VOICE] Gemini Live session error — voice channel lost:", err instanceof Error ? err.message : String(err?.message ?? "error"));
           handleSessionLost("error");
         },
-        onclose: (info: any) => {
+        onclose: (info: CloseEvent) => {
           // Log only code/reason, NOT the raw CloseEvent — its kTarget is the live WebSocket whose URL
           // contains the API key (?key=…). Dumping the object leaks the key into logs (security hazard).
           console.warn(`[VOICE] Gemini Live session closed — voice channel lost (code=${info?.code ?? "n/a"}, reason=${info?.reason || "n/a"}).`);

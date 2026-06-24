@@ -12,7 +12,7 @@
 //                                 confirm() in try/catch so a throwing run() can't unwind the voice
 //                                 message handler. (REST already does this; voice did not.)
 
-import { parseApprovalIntent, selectPendingAction, MAX_DEFERRALS } from "./approvalIntent";
+import { parseApprovalIntent, selectPendingAction, selectApprovalTarget, MAX_DEFERRALS, type TargetableEntry } from "./approvalIntent";
 import { ACTION_DEFAULT_TTL_MS } from "./pendingActions";
 
 /** Minimal structural view of the PendingActionStore this resolver needs (keeps it decoupled).
@@ -162,5 +162,79 @@ export function resolvePendingActionByVoice(
     handleApprove(deps, actions, target.id, summary);
   } else {
     handleReject(deps, actions, target.id, summary);
+  }
+}
+
+// ── bead 8xn: resolveHeldCommandByVoice — the held-command sibling of the above ─────────────────────
+// The pure routing logic for a HELD pane-WRITE approval (pendingApprovals / the approval-dialog),
+// extracted byte-for-byte from routeApprovalIntent's `entries.length > 0` branch in src/voice/index.ts
+// so the server and the tests run the SAME code. Where the staged-action resolver owns the
+// PendingActionStore effects directly, this one INJECTS them as sinks (onResolve / onDefer) because
+// the held-command effects (claim + redaction + broadcast inside applyResolution; TTL re-arm inside
+// applyDeferral) bind PTY/store/broadcast state that must stay in voice/index.ts. Mirrors
+// resolvePendingActionByVoice's helper decomposition (narrateHeldClarify / narrateHeldAmbiguous) so
+// each piece stays under the complexity gate.
+
+/** The deps a held-command resolver needs: speak to the operator, redact secrets, and the two
+ *  effect sinks the server binds (resolveApprovalByVoice and applyDeferral, both keyed by messageId). */
+export interface HeldCommandDeps {
+  /** Speak a line to the operator (server.ts injects `(t) => pushApprovalNarration(session, t)`). */
+  narrate: (text: string) => void;
+  /** Redact secrets from any text before it leaves the process (server.ts `redactSecrets`). */
+  redact: (s: string) => string;
+  /** Resolve the held approval by messageId (server.ts `resolveApprovalByVoice` → applyResolution). */
+  onResolve: (messageId: string, approve: boolean) => void;
+  /** Defer the held approval by messageId (server.ts `applyDeferral` — re-arms the TTL window). */
+  onDefer: (messageId: string) => void;
+}
+
+/** clarify — operator said both approve and reject; ask which of the N pending COMMANDS they meant.
+ *  Byte-identical phrasing to the former inline string in routeApprovalIntent. */
+function narrateHeldClarify(narrate: HeldCommandDeps["narrate"], count: number): void {
+  narrate(`I heard both approve and reject — which did you mean for the ${count} pending command${count === 1 ? "" : "s"}?`);
+}
+
+/** ambiguous target — >1 held and nothing disambiguates: read back each redacted instruction + pane.
+ *  Byte-identical to the former inline list-builder in routeApprovalIntent. */
+function narrateHeldAmbiguous(deps: HeldCommandDeps, entries: TargetableEntry[]): void {
+  const { narrate, redact } = deps;
+  const list = entries.map((e, i) => `${i + 1}. "${redact(e.instruction)}" on pane ${e.terminalId}`).join("; ");
+  narrate(`I have ${entries.length} pending: ${list}. Which one?`);
+}
+
+/**
+ * Resolve a hands-free approval/defer utterance against a session's HELD pane-WRITE approvals. The
+ * caller passes the entries (`pendingApprovals.forSession(session)`-shaped) and the last-announced id
+ * so this stays pure/decoupled from the PendingApprovalStore. Precedence + behavior are byte-identical
+ * to the former inline block: clarify reads back the count; an ambiguous target reads back the
+ * redacted list; "later"/"not now" defers (never the reject path); else approve/reject resolves the
+ * unique target. A "none" intent or an empty list is a silent no-op.
+ */
+export function resolveHeldCommandByVoice(
+  utterance: string,
+  entries: TargetableEntry[],
+  lastAnnouncedId: string | null,
+  deps: HeldCommandDeps,
+): void {
+  const parsed = parseApprovalIntent(utterance);
+  if (parsed.intent === "none") return;
+  if (entries.length === 0) return;
+
+  if (parsed.intent === "clarify") {
+    narrateHeldClarify(deps.narrate, entries.length);
+    return;
+  }
+
+  const target = selectApprovalTarget(
+    entries.map((e) => ({ messageId: e.messageId, instruction: e.instruction, terminalId: e.terminalId })),
+    parsed.targetHint,
+    lastAnnouncedId,
+  );
+  if (target.ambiguous || !target.messageId) {
+    narrateHeldAmbiguous(deps, entries);
+  } else if (parsed.intent === "defer") {
+    deps.onDefer(target.messageId);
+  } else {
+    deps.onResolve(target.messageId, parsed.intent === "approve");
   }
 }

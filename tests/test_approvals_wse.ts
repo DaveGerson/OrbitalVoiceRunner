@@ -15,6 +15,7 @@ import {
   isShellAllowed,
   firstShellToken,
   loadShellAllowlist,
+  DEFAULT_SHELL_ALLOWLIST,
   serializePending,
   type PendingApproval,
 } from "../src/pendingApprovals";
@@ -214,6 +215,18 @@ describe("decideProposal — kind / allowlist / mode gate (R1/R2)", () => {
     assert.strictEqual(firstShellToken("git status --short"), "git");
     assert.ok(isShellAllowed("git status", allow));
     assert.ok(!isShellAllowed("rm -rf /", allow));
+  });
+
+  // bd wsm-e2e-pinned-wyv (BUCKET-3): `ping` must STAY OUT of the production default allowlist —
+  // it is not read-only/observe-only (auto-executes arbitrary-host pings under Full Auto). The
+  // voice-journey suite scopes it test-only via JANUS_SHELL_ALLOWLIST; that is the intended
+  // asymmetry. This pin fails loudly if a future "fix" leaks `ping` into the production default.
+  it("ping is NOT in DEFAULT_SHELL_ALLOWLIST (test-only scoping; security-load-bearing)", () => {
+    assert.ok(!DEFAULT_SHELL_ALLOWLIST.includes("ping"), "ping must never be a production default");
+    // And a bare default allowlist (no env override) clarifies/re-routes a ping rather than running it.
+    assert.ok(!isShellAllowed("ping -n 600 127.0.0.1", loadShellAllowlist("")));
+    // The env override is the sanctioned test-only widening: it DOES allow ping for the suite.
+    assert.ok(isShellAllowed("ping -n 600 127.0.0.1", loadShellAllowlist("echo,cat,ping")));
   });
 
   it("agent_instruction on interactive_cli + HiTL -> pending_approval", () => {

@@ -175,3 +175,30 @@ test.describe("Orbital Kitchen — 4U.3 the reviewable past", () => {
     await expect(page.getByTestId("radio-transcript")).toContainText("fire the smoke test on station one");
   });
 });
+
+test.describe("Orbital Kitchen — bead apu: the health strip", () => {
+  test("the Pantry's health strip renders the chips from the real /api/health route", async ({ page }) => {
+    await page.route(/\/api\/health/, (route) =>
+      route.fulfill({
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ output: {
+          frozen: true,
+          panes: { total: 5, running: 2, idle: 2, exited: 1 },
+          pending_approvals: 3,
+          recent: { total: 100, errors: 7, error_rate: 0.07 },
+          memory: { synthesizer: "live" },
+        } }),
+      }));
+    await gotoKitchen(page);
+    const get = page.waitForRequest((r) => /\/api\/health/.test(r.url()) && r.method() === "GET", { timeout: 10_000 });
+    await page.getByTestId("tab-pantry").click();
+    await get;
+    const strip = page.getByTestId("health-strip");
+    await expect(strip).toBeVisible();
+    await expect(page.getByTestId("health-frozen")).toContainText("frozen");
+    await expect(page.getByTestId("health-panes")).toContainText("5"); // total
+    await expect(page.getByTestId("health-panes")).toContainText("2"); // running/idle
+    await expect(page.getByTestId("health-pending")).toContainText("3"); // pending approvals
+    await expect(page.getByTestId("health-error-rate")).toContainText("7%"); // error rate, honestly rendered
+  });
+});

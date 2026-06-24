@@ -103,14 +103,21 @@ test("decision shape { speak, reason, confidence }", () => {
   const d = shouldSpeak("hmm, so what I'm thinking is we should wait", ON);
   assert.strictEqual(typeof d.speak, "boolean");
   assert.strictEqual(typeof d.reason, "string");
-  assert.ok(d.reason.length > 0, "reason must be non-empty");
+  // l1c: the reason is an auditable snake_case TOKEN, optionally qualified with a ":detail" marker
+  // (e.g. "thinking_aloud:hmm") — assert that structured shape, not just non-emptiness, so a
+  // regression to an empty / free-text-sentence reason is caught. This input is textbook
+  // thinking-aloud, so it mutes with a thinking_aloud reason.
+  assert.match(d.reason, /^[a-z][a-z0-9_]+(:[a-z0-9_'-]+)?$/i, `reason should be a snake_case token, got ${JSON.stringify(d.reason)}`);
+  assert.strictEqual(d.speak, false, "textbook thinking-aloud with the gate ON mutes");
   assert.strictEqual(typeof d.confidence, "number");
   assert.ok(d.confidence >= 0 && d.confidence <= 1, "confidence in [0,1]");
 
   // And the flag-off short-circuit carries a reason too (auditable).
   const off = shouldSpeak("anything at all", OFF);
   assert.strictEqual(off.speak, true);
-  assert.ok(off.reason.length > 0);
+  // l1c: the flag-off short-circuit carries the SPECIFIC "gate_disabled" reason (the audit token the
+  // interaction log records), not merely some non-empty string.
+  assert.strictEqual(off.reason, "gate_disabled");
 });
 
 // #7 — ADDRESS/IMPERATIVE OVERRIDES a thinking-aloud marker: "hmm Janus, what's the build doing?"

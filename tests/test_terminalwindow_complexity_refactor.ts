@@ -34,8 +34,9 @@ describe("formatHistoryTimestamp", () => {
   it("returns a locale time string for a valid ISO timestamp", () => {
     const ts = "2024-03-15T10:30:00.000Z";
     const result = formatHistoryTimestamp(ts);
-    // Must differ from the raw input (was formatted) and be a non-empty string
-    assert.ok(typeof result === "string" && result.length > 0);
+    // l1c: a locale time string is specifically H:MM(:SS) — assert it actually looks like a clock
+    // time, not merely that it is some non-empty string.
+    assert.match(result, /\d{1,2}:\d{2}/, `expected a locale time string, got ${JSON.stringify(result)}`);
     // The raw ISO string should no longer be returned verbatim (it gets formatted)
     assert.notEqual(result, ts);
   });
@@ -59,7 +60,7 @@ describe("formatHistoryTimestamp", () => {
     // new Date("1970-01-01T00:00:00.000Z") is a valid date → gets formatted
     const ts = "1970-01-01T00:00:00.000Z";
     const result = formatHistoryTimestamp(ts);
-    assert.ok(typeof result === "string" && result.length > 0);
+    assert.match(result, /\d{1,2}:\d{2}/, `expected a locale time string, got ${JSON.stringify(result)}`); // l1c
     assert.notEqual(result, ts);
   });
 
@@ -67,7 +68,7 @@ describe("formatHistoryTimestamp", () => {
     // Most JS engines can parse "Thu, 01 Jan 2015 00:00:00 GMT"
     const ts = "Thu, 01 Jan 2015 00:00:00 GMT";
     const result = formatHistoryTimestamp(ts);
-    assert.ok(typeof result === "string" && result.length > 0);
+    assert.match(result, /\d{1,2}:\d{2}/, `expected a locale time string, got ${JSON.stringify(result)}`); // l1c
   });
 });
 
@@ -255,19 +256,25 @@ describe("cross-cutting invariants", () => {
     assert.notEqual(l0, l1);
   });
 
-  it("deriveStatusLineText never returns empty string for any combination", () => {
-    const statuses = ["Running", "Idle", "Needs Input", "Exited", "Unknown"];
-    for (const status of statuses) {
-      for (const live of [true, false]) {
-        const text = deriveStatusLineText(status, live);
-        assert.ok(text.length > 0, `expected non-empty text for status=${status} live=${live}`);
-      }
+  it("deriveStatusLineText returns the exact status-specific phrase for each combination", () => {
+    // l1c: assert the ACTUAL phrase the helper emits per branch, not just non-emptiness. When live,
+    // the phrase is always "live on the burner"; otherwise it is keyed by status (Unknown→idle).
+    const offlinePhrase: Record<string, string> = {
+      Running: "idle — prompt ready",
+      Idle: "idle — prompt ready",
+      "Needs Input": "waiting on you, Chef",
+      Exited: "process ended",
+      Unknown: "idle — prompt ready",
+    };
+    for (const status of Object.keys(offlinePhrase)) {
+      assert.equal(deriveStatusLineText(status, true), "live on the burner", `live status=${status}`);
+      assert.equal(deriveStatusLineText(status, false), offlinePhrase[status], `offline status=${status}`);
     }
   });
 
   it("buildHistoryOutputText body never empty for any valid input", () => {
     // Even with undefined output, we always get '(no recorded output)'
-    const result = buildHistoryOutputText(undefined, undefined);
-    assert.ok(result.length > 0);
+    const result = buildHistoryOutputText(undefined, undefined); // l1c: assert the exact placeholder
+    assert.equal(result, "(no recorded output)");
   });
 });

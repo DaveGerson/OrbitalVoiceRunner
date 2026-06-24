@@ -13,12 +13,14 @@ declare global {
       injectStdoutChunk: (terminalId: string, chunk: string) => void;
       injectTranscript: (sender: "User" | "Janus", text: string) => void;
       injectGrounding: (queries: string[], sources: { uri: string; title: string }[]) => void;
-      injectPendingApproval: (cmd: string, terminalId?: string) => void;
-      injectPendingAction: (capability: string, summary: string) => void;
+      injectPendingApproval: (cmd: string, terminalId?: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
+      injectPendingAction: (capability: string, summary: string, posture?: "OPEN" | "GUARDED" | "LOCKED") => void;
       injectWipDraft: (paneId: string, text: string) => void;
       simulateDisconnect: () => void;
       simulateReconnect: () => string | null;
       setPostureMock: (posture: "OPEN" | "GUARDED" | "LOCKED", effectiveGates: Record<string, "Auto" | "Ask" | "Off">) => void;
+      /** bead ahz: seed a MALFORMED posture word (crash-safety regression — chip must degrade, not white-screen). */
+      injectMalformedPosture: (posture: string, effectiveGates?: Record<string, "Auto" | "Ask" | "Off">) => void;
       setFrozenMock: (frozen: boolean, running: string[]) => void;
       switchActivePane: (paneId: string) => void;
       /** 1B.1/1B.5: stage the kitchen's connection truth-states (no real sockets under ?mock=1). */
@@ -87,17 +89,45 @@ export async function injectGrounding(
   );
 }
 
-export async function injectPendingApproval(page: Page, cmd: string, terminalId = MOCK_TERMINAL_ID): Promise<void> {
+export async function injectPendingApproval(
+  page: Page,
+  cmd: string,
+  terminalId = MOCK_TERMINAL_ID,
+  posture?: "OPEN" | "GUARDED" | "LOCKED",
+): Promise<void> {
+  // Capture the approval-dialog count BEFORE injecting so we can wait for +1, serializing
+  // sequential calls even when React batches state updates under parallel-suite load.
+  const before = await page.locator('[data-testid="approval-dialog"]').count();
   await page.evaluate(
-    ([c, id]) => window.__ORBITAL_E2E__?.injectPendingApproval(c, id),
-    [cmd, terminalId] as const,
+    ([c, id, p]) => window.__ORBITAL_E2E__?.injectPendingApproval(
+      c as string,
+      id as string,
+      p as "OPEN" | "GUARDED" | "LOCKED" | undefined,
+    ),
+    [cmd, terminalId, posture] as const,
+  );
+  // Wait until the injected approval is actually rendered before returning, so two sequential
+  // injectPendingApproval() calls serialize deterministically (the second call cannot fire its
+  // evaluate until React has committed the first dialog to the DOM).
+  await page.waitForFunction(
+    (expectedCount) => document.querySelectorAll('[data-testid="approval-dialog"]').length >= expectedCount,
+    before + 1,
   );
 }
 
-export async function injectPendingAction(page: Page, capability: string, summary: string): Promise<void> {
+export async function injectPendingAction(
+  page: Page,
+  capability: string,
+  summary: string,
+  posture?: "OPEN" | "GUARDED" | "LOCKED",
+): Promise<void> {
   await page.evaluate(
-    ([c, s]) => window.__ORBITAL_E2E__?.injectPendingAction(c, s),
-    [capability, summary] as const,
+    ([c, s, p]) => window.__ORBITAL_E2E__?.injectPendingAction(
+      c as string,
+      s as string,
+      p as "OPEN" | "GUARDED" | "LOCKED" | undefined,
+    ),
+    [capability, summary, posture] as const,
   );
 }
 
@@ -134,6 +164,25 @@ export async function setPostureMock(
   );
 }
 
+/**
+ * bead ahz: seed a MALFORMED server posture word (one outside OPEN|GUARDED|LOCKED) so the spec can
+ * prove the n2r normalizers degrade the gate chip gracefully instead of throwing during render and
+ * white-screening the cockpit. `effectiveGates` defaults to the harness default mock gates.
+ */
+export async function injectMalformedPosture(
+  page: Page,
+  posture: string,
+  effectiveGates?: Record<string, "Auto" | "Ask" | "Off">,
+): Promise<void> {
+  await page.evaluate(
+    ([p, g]) => window.__ORBITAL_E2E__?.injectMalformedPosture(
+      p as string,
+      g as Record<string, "Auto" | "Ask" | "Off"> | undefined,
+    ),
+    [posture, effectiveGates] as const,
+  );
+}
+
 /** bead 8sq: drive the two-stage STOP-ALL FROZEN banner (frozen flag + still-running pane count). */
 export async function setFrozenMock(page: Page, frozen: boolean, running: string[] = []): Promise<void> {
   await page.evaluate(
@@ -149,6 +198,68 @@ export async function setFrozenMock(page: Page, frozen: boolean, running: string
  */
 export async function switchActivePane(page: Page, paneId: string): Promise<void> {
   await page.evaluate((id) => window.__ORBITAL_E2E__?.switchActivePane(id), paneId);
+}
+
+/**
+ * bead e7h: seed the attention inbox by driving a REAL `attention_updated` frame through the
+ * observe-lane switch (injectWsFrame → handleObserveFrame → setAttentionQueue) — the same path the
+ * live socket uses. Each row is a full AttentionItem; pass a `messageId` to make a row resolvable
+ * in-inbox (real Approve/Deny) and omit it for a triage-only row.
+ */
+export async function injectAttention(
+  page: Page,
+  items: { id: string; type: string; terminalId: string; message: string; messageId?: string }[],
+): Promise<void> {
+  await page.evaluate((rows) => {
+    window.__ORBITAL_E2E__?.injectWsFrame({
+      type: "attention_updated",
+      queue: rows.map((r) => ({
+        id: r.id, type: r.type, terminalId: r.terminalId, projectId: "default_project",
+        message: r.message, timestamp: new Date().toISOString(), dismissed: false,
+        ...(r.messageId ? { messageId: r.messageId } : {}),
+      })),
+    });
+  }, items);
+}
+
+/**
+ * bead 8xn: drive an `approval_pending` frame through the REAL observe-lane switch (injectWsFrame →
+ * handleObserveFrame → the isApprovalHere router), NOT injectPendingApproval (which seeds
+ * pendingCommands DIRECTLY, bypassing the focus-routing branch). This is the ONLY way to exercise the
+ * modal-vs-inbox decision: a frame for the ACTIVE pane (+ visible tab) pops the modal; a frame for a
+ * BACKGROUND pane lands in the attention inbox keyed by messageId.
+ */
+export async function injectApprovalPendingFrame(
+  page: Page,
+  cmd: string,
+  terminalId: string,
+  messageId: string,
+): Promise<void> {
+  await page.evaluate(
+    ([c, t, m]) => window.__ORBITAL_E2E__?.injectWsFrame({
+      type: "approval_pending", cmd: c, terminalId: t, messageId: m,
+      rationale: { trigger: "e2e injected", summary: "Mocked approval_pending for focus-routing e2e." },
+    }),
+    [cmd, terminalId, messageId] as const,
+  );
+}
+
+/**
+ * bead 8xn: drive the server's `approval_resolved` broadcast through the REAL observe-lane switch
+ * (injectWsFrame → handleObserveFrame), modelling a resolve on a NON-inbox surface — voice, a
+ * cross-client REST approve/reject, the modal, or a TTL/dead-pane sweep. This is the only way to
+ * exercise "resolve anywhere clears EVERYWHERE": the routed inbox row + held-approval badge must drop
+ * even though the resolve never touched the inbox Approve button.
+ */
+export async function injectApprovalResolvedFrame(
+  page: Page,
+  messageId: string,
+  outcome: "approved" | "rejected" | "drained" = "approved",
+): Promise<void> {
+  await page.evaluate(
+    ([m, o]) => window.__ORBITAL_E2E__?.injectWsFrame({ type: "approval_resolved", messageId: m, outcome: o }),
+    [messageId, outcome] as const,
+  );
 }
 
 export const test = base;

@@ -42,7 +42,7 @@ export function NotificationStack({
               ].join(" ")}
             />
             <div className="flex-1 min-w-0">
-              <div className="text-[11px] uppercase tracking-wide text-neutral-400 font-medium">
+              <div className="text-xs uppercase tracking-wide text-neutral-400 font-medium">
                 {n.terminalId}
               </div>
               <div className="text-sm text-neutral-100 break-words">{n.message}</div>

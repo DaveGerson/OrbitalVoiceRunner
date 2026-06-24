@@ -7,7 +7,7 @@ import { INK } from "./theme";
 import { Icon } from "./primitives";
 
 export function TweakSection({ label }: { label: string }) {
-  return <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: "#8a6a4f", padding: "8px 0 2px" }}>{label}</div>;
+  return <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".1em", textTransform: "uppercase", color: "#8a6a4f", padding: "8px 0 2px" }}>{label}</div>;
 }
 
 export function TweakRow({ label, children }: { label: string; children: ReactNode }) {
@@ -31,7 +31,7 @@ export function TweakRadio<T extends string>({ label, value, options, onChange }
             <button key={o} onClick={() => onChange(o)} style={{
               padding: "3px 9px", borderRadius: 5, border: "none", cursor: "pointer",
               background: on ? "#ffc94a" : "transparent", color: on ? INK : "#c89f74",
-              fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "capitalize",
+              fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, textTransform: "capitalize",
             }}>{o}</button>
           );
         })}

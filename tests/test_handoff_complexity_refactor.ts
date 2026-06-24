@@ -306,7 +306,7 @@ describe("handoff refactor — deliverHandoff.handler", () => {
     assert.deepStrictEqual(r.extra, { pane_id: "p1", prompt: "read this back" });
   });
 
-  it("block (blocked outcome) -> output is outcome text + state blocked_read_only", async () => {
+  it("block (blocked outcome) -> kind:'blocked' reason=outcome text + state blocked_read_only", async () => {
     const stateChanges: Array<{ id: string; state: string }> = [];
     const ctx = makeCtx({
       handoffs: { h1: baseRow({ state: "staged" }) },
@@ -314,7 +314,10 @@ describe("handoff refactor — deliverHandoff.handler", () => {
       stateChanges,
     });
     const r = await run(deliverHandoff, { handoff_id: "h1" }, ctx);
-    assert.deepStrictEqual(r, { kind: "ok", output: "read-only blocks" });
+    // cv2: status-via-kinds — the block case now returns kind:"blocked" (NOT kind:"ok") so the REST twin
+    // maps to 403. The VOICE wire is byte-identical: voiceResponse maps kind:"blocked" -> { output: reason }
+    // == the SAME { output: "read-only blocks" } the prior kind:"ok" emitted. The row flip is unchanged.
+    assert.deepStrictEqual(r, { kind: "blocked", reason: "read-only blocks" });
     assert.strictEqual(stateChanges[0].state, "blocked_read_only");
   });
 

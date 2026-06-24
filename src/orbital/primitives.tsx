@@ -41,7 +41,7 @@ export function Chip({ children, color = INK, bg = "#fff9ec", border = INK, styl
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999,
       border: `1.5px solid ${border}`, background: bg, color,
-      fontFamily: "DM Sans, sans-serif", fontSize: 10, fontWeight: 800,
+      fontFamily: "DM Sans, sans-serif", fontSize: 12, fontWeight: 800,
       letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
     }}>{children}</span>
   );
@@ -152,7 +152,7 @@ export function Pips({ steps, done, color, label }: { steps: number; done: numbe
           <div key={i} style={{ width: 9, height: 9, borderRadius: 2, background: i < done ? color : "#f3e4c2", border: "1.5px solid " + INK }} />
         ))}
       </div>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: "#5b3a23" }}>{label ?? `${done}/${steps}`}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 700, color: "#5b3a23" }}>{label ?? `${done}/${steps}`}</span>
     </div>
   );
 }
@@ -165,7 +165,7 @@ export function StatusBadge({ status }: { status: StationStatus }) {
     <span data-testid="status-badge" data-status={status} style={{
       display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 9px 3px 7px", borderRadius: 999,
       border: "1.5px solid " + INK, background: s.color, color: INK,
-      fontFamily: "DM Sans", fontSize: 10, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap",
+      fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap",
     }}>
       <span style={{ width: 7, height: 7, borderRadius: "50%", background: INK, animation: live ? "orb-pulse 1s var(--ease-bounce) infinite" : "none" }} />
       {s.word}
@@ -198,7 +198,7 @@ export function PostureChip({ posture, mode, style = {} }: {
     <span data-testid="posture-chip" data-posture={posture ?? mode} title={skin.tip} style={{
       display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999,
       border: "1.5px solid " + INK, background: skin.bg, color: skin.fg,
-      fontFamily: "DM Sans, sans-serif", fontSize: 9.5, fontWeight: 800,
+      fontFamily: "DM Sans, sans-serif", fontSize: 12, fontWeight: 800,
       letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
     }}>{skin.label}</span>
   );
@@ -212,7 +212,7 @@ export function VoiceCue({ phrase, dark, style = {}, tone = "muted" }: {
   return (
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 4, maxWidth: "100%",
-      fontFamily: "JetBrains Mono, monospace", fontSize: 10, fontWeight: 600, color: c,
+      fontFamily: "JetBrains Mono, monospace", fontSize: 12, fontWeight: 600, color: c,
       letterSpacing: "-.01em", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", ...style,
     }}>
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }} aria-hidden>

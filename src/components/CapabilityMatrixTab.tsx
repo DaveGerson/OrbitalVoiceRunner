@@ -142,13 +142,13 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
   return (
     <div className="space-y-4" data-testid="capability-matrix-tab">
       <div className="border-b border-white/5 pb-2">
-        <h3 className="text-white uppercase text-[10px] tracking-widest font-bold">Safety gates (capability matrix)</h3>
-        <p className="text-[10px] text-zinc-500 mt-0.5">Decide what Janus may do on its own, what it must ask about, and what it can't do at all.</p>
+        <h3 className="text-white uppercase text-xs tracking-widest font-bold">Safety gates (capability matrix)</h3>
+        <p className="text-xs text-zinc-500 mt-0.5">Decide what Janus may do on its own, what it must ask about, and what it can't do at all.</p>
       </div>
 
       {/* Scope selector */}
       <div className="bg-white/[0.01] p-3 rounded-lg border border-white/5 space-y-2">
-        <label className="block text-[9px] uppercase tracking-wider text-zinc-500 font-bold">Editing which gates?</label>
+        <label className="block text-xs uppercase tracking-wider text-zinc-500 font-bold">Editing which gates?</label>
         <select
           data-testid="matrix-scope-select"
           className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white cursor-pointer focus:outline-none focus:border-cyan-500"
@@ -172,15 +172,15 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
             </optgroup>
           )}
         </select>
-        <p className="text-[9px] text-zinc-600">{scopeLabel} {scope.kind === "pane" && savingPane && <span className="text-cyan-400">· saving…</span>}</p>
-        <p className="text-[9px] text-zinc-600">{GATE_HELP}</p>
+        <p className="text-xs text-zinc-600">{scopeLabel} {scope.kind === "pane" && savingPane && <span className="text-cyan-400">· saving…</span>}</p>
+        <p className="text-xs text-zinc-600">{GATE_HELP}</p>
       </div>
 
       {/* Grouped toggles */}
       <div className="space-y-4 max-h-[340px] overflow-y-auto pr-1">
         {Object.entries(CAPABILITY_CATEGORIES).map(([category, caps]) => (
           <div key={category} className="space-y-1.5">
-            <div className="text-[9px] uppercase tracking-widest text-zinc-500 font-bold">{category}</div>
+            <div className="text-xs uppercase tracking-widest text-zinc-500 font-bold">{category}</div>
             {caps.map((cap) => {
               const value = valueOf(cap);
               const isPaneScope = scope.kind === "pane";
@@ -188,14 +188,14 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
               const control = controlForEnforcement(cap);
               return (
                 <div key={cap} data-testid={`matrix-row-${cap}`} data-control={control} className="flex items-center justify-between gap-3 bg-black/40 border border-white/5 rounded px-3 py-1.5">
-                  <span className="text-zinc-300 text-[11px] flex-1 min-w-0 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
+                  <span className="text-zinc-300 text-xs flex-1 min-w-0 truncate" title={CAPABILITY_LABELS[cap]}>{CAPABILITY_LABELS[cap]}</span>
                   <div className="flex items-center gap-1 shrink-0">
                     {/* informational → read-only "Always on" badge (never an interactive control). */}
                     {control === "badge" && (
                       <span
                         data-testid={`matrix-${cap}-badge`}
                         title="This isn't a safety gate — it can't be turned off."
-                        className="px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold rounded border border-white/10 text-zinc-400 bg-white/[0.03]"
+                        className="px-2 py-0.5 text-xs uppercase tracking-wider font-bold rounded border border-white/10 text-zinc-400 bg-white/[0.03]"
                       >
                         Always on
                       </span>
@@ -214,7 +214,7 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
                               data-testid={`matrix-${cap}-${opt.label}`}
                               aria-pressed={selected}
                               onClick={() => setGate(cap, opt.value)}
-                              className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
+                              className={`px-2 py-0.5 text-xs uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
                             >
                               {opt.label}
                             </button>
@@ -236,7 +236,7 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
                               data-testid={`matrix-${cap}-${opt}`}
                               aria-pressed={selected}
                               onClick={() => setGate(cap, opt)}
-                              className={`px-2 py-0.5 text-[9px] uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
+                              className={`px-2 py-0.5 text-xs uppercase tracking-wider font-bold transition-colors cursor-pointer border-r border-white/10 last:border-r-0 ${selected ? p.active : "text-zinc-500 hover:text-zinc-200 hover:bg-white/5"}`}
                             >
                               {p.label}
                             </button>
@@ -253,7 +253,7 @@ export function CapabilityMatrixTab(props: CapabilityMatrixTabProps) {
                         data-testid={`matrix-${cap}-clear`}
                         onClick={() => clearGate(cap)}
                         title="Remove this pane's override (fall back to the global default)"
-                        className="px-1.5 py-0.5 text-[8px] uppercase text-zinc-600 hover:text-zinc-300 cursor-pointer"
+                        className="px-1.5 py-0.5 text-xs uppercase text-zinc-600 hover:text-zinc-300 cursor-pointer"
                       >
                         reset
                       </button>

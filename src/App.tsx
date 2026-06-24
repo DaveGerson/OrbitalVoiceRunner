@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useEffect, useState, useRef } from "react";
 import { Terminal, PendingCommand, PendingActionView, Workspace, PaneMeta, SystemSettings, Plan } from "./types";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
+import { playAudioChunk, resetAudioPlayback, setPlaybackVolume } from "./utils/audio";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ActionConfirmDialog } from "./components/ActionConfirmDialog";
 import { CreateTerminalDialog } from "./components/CreateTerminalDialog";
@@ -28,6 +28,7 @@ import {
   heatmapTileClasses,
   heatmapTooltipStatus,
   heatmapTooltipFields,
+  mobileSwiperDotClass,
   mobileSwiperColorClass,
   sidebarPaneStatusColor,
   sidebarRowContainerClass,
@@ -46,7 +47,18 @@ import {
   contextMeterColor,
   classifyMarkdownLine,
   dispatchWsMessage,
+  classifyRawKeyOutcome,
+  formatCharCount,
+  formatCharCountLower,
+  formatCompactBytes,
+  formatTokenCount,
+  estimateTokens,
+  resolveCardContextSize,
+  contextMeterPercent,
+  totalContextBarPercent,
 } from "./appHelpers";
+import { useLiveSession } from "./hooks/useLiveSession";
+import { buildMockData } from "./mockData";
 
 // Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
 // the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
@@ -67,7 +79,7 @@ const RAW_KEY = {
 // styling; disruptive keys (Ctrl+C, Shift+Tab) carry the warn palette per spec §8.
 function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: string; onKey: (paneId: string, bytes: string) => void; testId?: string }) {
   const navBtn = "p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all";
-  const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-[9px] font-mono uppercase tracking-wider font-bold";
+  const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-xs font-mono uppercase tracking-wider font-bold";
   const press = (bytes: string) => onKey(paneId, bytes);
   return (
     <div className="flex items-center gap-1 flex-wrap" data-testid={testId} role="group" aria-label="Send control key to pane">
@@ -78,11 +90,11 @@ function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: 
       <button type="button" onClick={() => press(RAW_KEY.right)} className={navBtn} title="Send Right arrow"><ArrowRight className="w-3 h-3" /></button>
       <button type="button" onClick={() => press(RAW_KEY.enter)} className={navBtn} title="Send Enter (commit staged line)"><CornerDownLeft className="w-3 h-3" /></button>
       {/* Terminal-ops — always-allowed */}
-      <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
-      <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
+      <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
+      <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
       {/* Paging — always-allowed */}
-      <button type="button" onClick={() => press(RAW_KEY.pageUp)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Page Up">PgUp</button>
-      <button type="button" onClick={() => press(RAW_KEY.pageDown)} className={`${navBtn} text-[9px] font-mono uppercase tracking-wider`} title="Send Page Down">PgDn</button>
+      <button type="button" onClick={() => press(RAW_KEY.pageUp)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Page Up">PgUp</button>
+      <button type="button" onClick={() => press(RAW_KEY.pageDown)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Page Down">PgDn</button>
       {/* Disruptive — gated (warn tint) */}
       <button type="button" onClick={() => press(RAW_KEY.ctrlC)} className={warnBtn} title="Send Ctrl+C (interrupt / emergency brake)">^C</button>
       <button type="button" onClick={() => press(RAW_KEY.shiftTab)} className={warnBtn} title="Send Shift+Tab (cycle agent mode — gated)">⇧Tab</button>
@@ -448,18 +460,13 @@ function AppRaw() {
     }, 120);
   };
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const voiceCaptureCtxRef = useRef<AudioContext | null>(null);
-  const voicePlaybackCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // dbt4: the WS + Web-Audio capture/playback refs and the connect/start/stop/cleanup +
+  // auto-reconnect lifecycle now live in useLiveSession (src/hooks/useLiveSession.ts). isMicMutedRef
+  // and activeTerminalIdRef stay App-owned (App mirrors state into them) and are passed in.
   const isMicMutedRef = useRef(false);
-  const desiredLiveRef = useRef(false);
   // WS-D: mirror of activeTerminalId for the ws.onmessage closure (which captures a stale
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
 
   const isMockModeRef = useRef(false);
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
@@ -630,13 +637,6 @@ function AppRaw() {
 
   // Restart the live voice session so reconnect-only settings (voice, model, API
   // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
-  const reconnectLive = async () => {
-    if (isLive) {
-      stopLive();
-      setTimeout(() => { startLive(); }, 400);
-    }
-  };
-
   const fetchPendingCommands = async () => {
     if (isMockModeRef.current) return;
     try {
@@ -999,17 +999,20 @@ function AppRaw() {
       });
       // Nit #3: surface every non-2xx outcome to the operator (no more silent swallow). apiFetch does
       // NOT throw on non-2xx, so branch on status. 403 = gated Off; 202 = deferred (Ask); 409 = the
-      // pane is not active / not running. Each gets an earcon + a transient toast.
-      if (res.status === 202) {
-        playEarcon("execute"); // queued, awaiting operator confirm
-        showRawKeyToast("deferred", "Key Deferred — Awaiting Confirm", `Pane ${paneId}: the key is queued behind a permission check. Confirm it in the pending tray.`);
-      } else if (res.status === 403) {
-        playEarcon("alert"); // gated Off (NO "error" earcon token exists)
-        showRawKeyToast("blocked", "Key Blocked by Policy", `Pane ${paneId}: this key is gated Off and was not sent.`);
-      } else if (res.status === 409) {
-        playEarcon("alert");
-        const reason = await res.json().then((b) => (b && typeof b.error === "string" ? b.error : "")).catch(() => "");
-        showRawKeyToast("refused", "Key Not Delivered", reason || `Pane ${paneId} is not the active pane (or has no live process). Open it first.`);
+      // pane is not active / not running. Each gets an earcon + a transient toast. dbt4: the status
+      // ladder is now classifyRawKeyOutcome (pure, unit-pinned). The earcon is reason-independent, so
+      // it plays BEFORE the 409 json read (original ordering: 409 did playEarcon then await json),
+      // then the 409 reason is resolved and merged into the toast detail.
+      const base = classifyRawKeyOutcome(res.status, paneId, "");
+      if (base) {
+        playEarcon(base.earcon);
+        const detail = res.status === 409
+          ? await res.json()
+              .then((b) => (b && typeof b.error === "string" ? b.error : ""))
+              .catch(() => "")
+              .then((reason) => reason || base.toast.detail)
+          : base.toast.detail;
+        showRawKeyToast(base.toast.tone, base.toast.title, detail);
       }
     } catch (e) {}
   };
@@ -1047,163 +1050,53 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const cleanupSocketOnly = () => {
-    // Burndown: each teardown was an identical `if (ref.current) { try { close } catch; ref=null }`.
-    // `disposeRef` performs that exact guarded teardown + null-out for one ref, so the per-ref CC
-    // collapses into a single call. Behavior (which refs, which closer, the null-out) is unchanged.
-    const disposeRef = <T,>(ref: React.MutableRefObject<T | null>, close: (v: T) => void) => {
-      if (ref.current) {
-        try { close(ref.current); } catch (e) {}
-        ref.current = null;
-      }
-    };
-    disposeRef(wsRef, (ws: WebSocket) => ws.close());
-    disposeRef(processorRef, (p: ScriptProcessorNode) => p.disconnect());
-    disposeRef(sourceRef, (s: MediaStreamAudioSourceNode) => s.disconnect());
-    disposeRef(streamRef, (s: MediaStream) => s.getTracks().forEach((track) => track.stop()));
-    disposeRef(voiceCaptureCtxRef, (c: AudioContext) => c.close());
-    disposeRef(voicePlaybackCtxRef, (c: AudioContext) => c.close());
+  // dbt4: the live voice-session lifecycle (ws + audio refs, connect/start/stop/cleanup +
+  // auto-reconnect) lives in useLiveSession. App owns the WS-message routing: onWsMessage builds
+  // the dispatchWsMessage ctx exactly as the former inline ws.onmessage did (same setters/refs/
+  // helpers, same ORDERING), with the connection-local 24kHz playbackCtx threaded in for audio.
+  const onWsMessage = (msg: any, playbackCtx: AudioContext) => {
+    dispatchWsMessage(msg, {
+      playEarcon,
+      triggerDesktopNotification,
+      setPendingCommands,
+      setPendingActions,
+      setActiveTerminalId,
+      setIsBufferFocused,
+      setPromptBuffer,
+      fetchWipDrafts,
+      setTerminals,
+      setFrozen,
+      setFrozenRunning,
+      setLedger,
+      setGlobalPermissionsMode,
+      setSettings,
+      setIsMicMuted,
+      setAutoApprovedNotification,
+      setBlockedNotification,
+      setTranscript,
+      setWsErrorNotification,
+      setProactiveNotifications,
+      setPlans,
+      queueStdoutChunk,
+      fetchTerminals,
+      fetchPlans,
+      fetchActiveTerminalHistory,
+      resetAudioPlayback,
+      playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
+      upsertNotification,
+      effectForEvent,
+      activeTerminalIdRef,
+    });
   };
 
-  const connectLive = async () => {
-    try {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      const captureCtx = new AudioContext({ sampleRate: 16000 });
-      const playbackCtx = new AudioContext({ sampleRate: 24000 });
-      voiceCaptureCtxRef.current = captureCtx;
-      voicePlaybackCtxRef.current = playbackCtx;
-      resetAudioPlayback();
-
-      ws.onopen = async () => {
-        setIsLive(true);
-        setIsReconnecting(false);
-        // Step 5: re-assert the source of truth on (re)connect so the server knows which pane the
-        // operator has open before Janus can propose anything.
-        ws.send(JSON.stringify({ type: "set_active_pane", paneId: activeTerminalIdRef.current }));
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-          streamRef.current = stream;
-          
-          const source = captureCtx.createMediaStreamSource(stream);
-          sourceRef.current = source;
-          const processor = captureCtx.createScriptProcessor(4096, 1, 1);
-          processorRef.current = processor;
-          
-          source.connect(processor);
-          processor.connect(captureCtx.destination);
-
-          processor.onaudioprocess = (e) => {
-            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isMicMutedRef.current) {
-              const base64 = pcmToBase64(e.inputBuffer.getChannelData(0));
-              wsRef.current.send(JSON.stringify({ type: "audio", audio: base64 }));
-            }
-          };
-        } catch (mediaErr) {
-          console.error("Microphone streaming failed to start:", mediaErr);
-        }
-      };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        // WS-D / burndown: the long per-type if/else-if ladder was relocated VERBATIM into the
-        // prototype-safe dispatch table in ./appHelpers (mirroring eventBus.effectForEvent). The
-        // ctx bundles exactly the setters/refs/helpers the original branches captured, so every
-        // branch's setState/side-effect ORDERING is preserved byte-for-byte. The `else` arm's
-        // eventBus fallback (effectForEvent → setter switch + earcon) lives there too.
-        dispatchWsMessage(msg, {
-          playEarcon,
-          triggerDesktopNotification,
-          setPendingCommands,
-          setPendingActions,
-          setActiveTerminalId,
-          setIsBufferFocused,
-          setPromptBuffer,
-          fetchWipDrafts,
-          setTerminals,
-          setFrozen,
-          setFrozenRunning,
-          setLedger,
-          setGlobalPermissionsMode,
-          setSettings,
-          setIsMicMuted,
-          setAutoApprovedNotification,
-          setBlockedNotification,
-          setTranscript,
-          setWsErrorNotification,
-          setProactiveNotifications,
-          setPlans,
-          queueStdoutChunk,
-          fetchTerminals,
-          fetchPlans,
-          fetchActiveTerminalHistory,
-          resetAudioPlayback,
-          playAudioChunk: (m: any) => playAudioChunk(playbackCtx, m.audio),
-          upsertNotification,
-          effectForEvent,
-          activeTerminalIdRef,
-        });
-      };
-
-      ws.onclose = (event) => {
-        cleanupSocketOnly();
-        
-        // Adaptive auto-reconnection if closure was unexpected from server-side or connection drops
-        if (desiredLiveRef.current) {
-          setIsLive(true);
-          setIsReconnecting(true);
-          
-          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (desiredLiveRef.current) {
-              connectLive();
-            }
-          }, 3000);
-        } else {
-          setIsLive(false);
-          setIsReconnecting(false);
-        }
-      };
-    } catch (e) {
-      console.error("Connection establish failed:", e);
-      cleanupSocketOnly();
-      if (desiredLiveRef.current) {
-        setIsLive(true);
-        setIsReconnecting(true);
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (desiredLiveRef.current) connectLive();
-        }, 3000);
-      } else {
-        setIsLive(false);
-        setIsReconnecting(false);
-      }
-    }
-  };
-
-  const startLive = async () => {
-    desiredLiveRef.current = true;
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    await connectLive();
-  };
-
-  const stopLive = () => {
-    desiredLiveRef.current = false;
-    setIsLive(false);
-    setIsReconnecting(false);
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    cleanupSocketOnly();
-  };
+  const { wsRef, startLive, stopLive, reconnectLive } = useLiveSession({
+    activeTerminalIdRef,
+    isMicMutedRef,
+    setIsLive,
+    setIsReconnecting,
+    isLive,
+    onWsMessage,
+  });
 
   const generateMockData = () => {
     isMockModeRef.current = !isMockMode;
@@ -1218,119 +1111,14 @@ function AppRaw() {
       return;
     }
 
-    // Turn on mock mode and populate fake data
-    const mockTermId1 = "terminal_mock_1";
-    const mockTermId2 = "terminal_mock_2";
-    const mockTermId3 = "terminal_mock_3";
-    
-    setTerminals([
-      {
-        id: mockTermId1,
-        cwd: "/home/user/workspace/web-app",
-        command: "npm run dev",
-        output: "\\n> web-app@1.0.0 dev\\n> vite\\n\\n  VITE v5.0.0  ready in 150 ms\\n\\n  ➜  Local:   http://localhost:5173/\\n  ➜  Network: use --host to expose",
-        status: "Running",
-        tool_preset: "Claude Code",
-        permissions_mode: "Full Auto",
-        context_size: 450
-      },
-      {
-        id: mockTermId2,
-        cwd: "/home/user/workspace/backend-api",
-        command: "python main.py",
-        output: "Starting server on port 8000...\\nConnecting to db...\\nDatabase connected.",
-        status: "Idle",
-        tool_preset: "Custom",
-        permissions_mode: "Human-in-the-Loop",
-        context_size: 2300
-      },
-      {
-        id: mockTermId3,
-        cwd: "/home/user/workspace/data-pipeline",
-        command: "npm run build",
-        output: "[ERROR] Failed to compile data-pipeline.\\nModuleNotFoundError: No module named 'pandas'\\n\\nError: Command failed with exit code 1.\\nPlease verify your dependencies are installed.",
-        status: "Running",
-        tool_preset: "Claude Code",
-        permissions_mode: "Full Auto",
-        context_size: 1024
-      }
-    ]);
-
-    setLedger({
-      "mock_project_alpha": {
-        id: "mock_project_alpha",
-        name: "Alpha Project",
-        directory: "/home/user/workspace",
-        summary: "This is a mock project to test UI capability.",
-        notes: ["Remember to check API rate limits"],
-        keyTerms: ["react", "vite", "nodejs"],
-        panes: {
-          [mockTermId1]: {
-            pane_id: mockTermId1,
-            name: "React Frontend",
-            runtime_type: "shell",
-            last_known_state: "Running",
-            is_busy: true,
-            alive: true,
-            notes: ["Dev server running"],
-            permissions_mode: "Full Auto",
-            session_id: "mock-sess-1",
-            tool_preset: "Claude Code",
-            context_size: 450
-          },
-          [mockTermId2]: {
-            pane_id: mockTermId2,
-            name: "Python Backend",
-            runtime_type: "shell",
-            last_known_state: "Idle",
-            is_busy: false,
-            alive: true,
-            notes: ["DB Connected"],
-            permissions_mode: "Human-in-the-Loop",
-            session_id: "mock-sess-2",
-            tool_preset: "Custom",
-            context_size: 2300
-          },
-          [mockTermId3]: {
-            pane_id: mockTermId3,
-            name: "Data Pipeline",
-            runtime_type: "shell",
-            last_known_state: "Running",
-            is_busy: true,
-            alive: true,
-            notes: ["Needs to install pandas", "Troubleshoot build failure"],
-            permissions_mode: "Full Auto",
-            session_id: "mock-sess-3",
-            tool_preset: "Claude Code",
-            context_size: 1024
-          }
-        }
-      }
-    });
-
-    setActiveProjectId("mock_project_alpha");
-    
-    setPendingCommands([
-      {
-        messageId: "mock_msg_1",
-        cmd: "npm install tailwindcss",
-        terminalId: mockTermId2,
-        rationale: { trigger: "I need tailwind", summary: "To add styling support to the project." }
-      },
-      {
-        messageId: "mock_msg_2",
-        cmd: "pip install pandas",
-        terminalId: mockTermId3,
-        rationale: { trigger: "Missing module", summary: "To fix the build error shown in the terminal output." }
-      }
-    ]);
-
-    setTranscript([
-      { sender: "User", text: "Please start the development server and prepare the background worker.", timestamp: new Date(Date.now() - 60000) },
-      { sender: "Janus", text: "Understood. I will spin up the React frontend and initialize the Python backend.", timestamp: new Date(Date.now() - 55000) },
-      { sender: "User", text: "Great, also install tailwind on the backend for some reason.", timestamp: new Date(Date.now() - 10000) },
-      { sender: "Janus", text: "I noticed an error in the data pipeline build regarding a missing 'pandas' module. I have proposed a command to install it.", timestamp: new Date(Date.now() - 5000) }
-    ]);
+    // Turn on mock mode and populate fake data. dbt4: the fixture literals were evicted into the
+    // pure buildMockData factory (src/mockData.ts); the setter order here is unchanged.
+    const mock = buildMockData(Date.now());
+    setTerminals(mock.terminals);
+    setLedger(mock.ledger);
+    setActiveProjectId(mock.activeProjectId);
+    setPendingCommands(mock.pendingCommands);
+    setTranscript(mock.transcript);
   };
 
   const activeTerminal = terminals.find(t => t.id === activeTerminalId);
@@ -1556,8 +1344,8 @@ function AppRaw() {
             onKeyDown={e => e.key === 'Enter' && promptDialog.onSubmit(val)}
           />
           <div className="flex justify-end gap-3 mt-2">
-            <button onClick={() => setPromptDialog(null)} className="text-[10px] font-mono uppercase tracking-wider text-white/50 hover:text-white transition">Cancel</button>
-            <button onClick={() => promptDialog.onSubmit(val)} className="text-[10px] font-mono uppercase tracking-wider text-cyan-400 font-bold hover:text-cyan-300 transition">Save</button>
+            <button onClick={() => setPromptDialog(null)} className="text-xs font-mono uppercase tracking-wider text-white/50 hover:text-white transition">Cancel</button>
+            <button onClick={() => promptDialog.onSubmit(val)} className="text-xs font-mono uppercase tracking-wider text-cyan-400 font-bold hover:text-cyan-300 transition">Save</button>
           </div>
         </div>
       </div>
@@ -1568,7 +1356,7 @@ function AppRaw() {
 
   const totalContextSize = sumContextSize(activeProject?.panes, terminals);
 
-  const totalTokensEstimated = Math.ceil(totalContextSize / 4);
+  const totalTokensEstimated = estimateTokens(totalContextSize);
 
   const renderTerminalHealthHeatmap = () => {
     return (
@@ -1580,18 +1368,18 @@ function AppRaw() {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
             </span>
-            <h3 className="text-[11px] font-mono font-bold tracking-widest text-zinc-200 uppercase flex items-center gap-1.5">
+            <h3 className="text-xs font-mono font-bold tracking-widest text-zinc-200 uppercase flex items-center gap-1.5">
               Agent Telemetry Heatmap
             </h3>
           </div>
-          <span className="text-[9px] font-mono text-cyan-400/80 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/10">
+          <span className="text-xs font-mono text-cyan-400/80 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/10">
             {terminals.filter(t => t.status === "Running").length}/{terminals.length} Running
           </span>
         </div>
 
         {/* Heatmap Grid */}
         {terminals.length === 0 ? (
-          <div className="text-[10px] text-zinc-500 font-mono italic text-center py-4 bg-black/20 rounded border border-dashed border-white/5">
+          <div className="text-xs text-zinc-500 font-mono italic text-center py-4 bg-black/20 rounded border border-dashed border-white/5">
             No active agents registered in ledger.
           </div>
         ) : (
@@ -1655,7 +1443,7 @@ function AppRaw() {
                       setHoveredTermId(hoveredTermId === term.id ? null : term.id);
                     }}
                   >
-                    <span className={`text-[10px] font-mono tracking-tight ${textClass}`}>
+                    <span className={`text-xs font-mono tracking-tight ${textClass}`}>
                       T{index + 1}
                     </span>
                     
@@ -1668,7 +1456,7 @@ function AppRaw() {
                     </span>
 
                     {/* Badge showing truncated Name */}
-                    <span className="text-[7.5px] font-mono text-zinc-650 group-hover/tile:text-zinc-400 select-none uppercase truncate max-w-[90%] pointer-events-none mt-0.5 leading-none">
+                    <span className="text-xs font-mono text-zinc-650 group-hover/tile:text-zinc-400 select-none uppercase truncate max-w-[90%] pointer-events-none mt-0.5 leading-none">
                       {term.id.slice(-4)}
                     </span>
                   </div>
@@ -1677,7 +1465,7 @@ function AppRaw() {
             </div>
             
             {/* Visual Legend */}
-            <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[8.5px] font-mono text-zinc-500 pt-1.5 border-t border-white/[0.03]">
+            <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs font-mono text-zinc-500 pt-1.5 border-t border-white/[0.03]">
               <span className="flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
                 Running
@@ -1715,14 +1503,14 @@ function AppRaw() {
           const hasSnippet = currentOutputSnippetLines.length > 0;
 
           return (
-            <div className="absolute top-[102%] left-0 right-0 z-50 bg-[#0d0d0d] border border-cyan-500/30 shadow-[0_4px_24px_rgba(0,0,0,0.85)] rounded-lg p-3.5 text-left font-mono text-[10.5px] leading-relaxed animate-in fade-in slide-in-from-top-1 duration-150">
+            <div className="absolute top-[102%] left-0 right-0 z-50 bg-[#0d0d0d] border border-cyan-500/30 shadow-[0_4px_24px_rgba(0,0,0,0.85)] rounded-lg p-3.5 text-left font-mono text-xs leading-relaxed animate-in fade-in slide-in-from-top-1 duration-150">
               <div className="absolute top-3 right-3 flex gap-1.5">
-                <span className={`text-[8.5px] uppercase tracking-wider px-1.5 py-0.5 rounded font-black ${statusBadgeClass}`}>
+                <span className={`text-xs uppercase tracking-wider px-1.5 py-0.5 rounded font-black ${statusBadgeClass}`}>
                   {statusLabel}
                 </span>
                 <button 
                   onClick={() => setHoveredTermId(null)}
-                  className="text-zinc-500 hover:text-white px-1 font-sans font-bold hover:bg-white/5 rounded text-[11px] leading-none"
+                  className="text-zinc-500 hover:text-white px-1 font-sans font-bold hover:bg-white/5 rounded text-xs leading-none"
                 >
                   ✕
                 </button>
@@ -1734,32 +1522,32 @@ function AppRaw() {
                   <span className={`w-1.5 h-1.5 rounded-full ${dotColorClass}`}></span>
                   NODE: {term.id.toUpperCase()}
                 </h4>
-                <p className="text-[9px] text-zinc-500 -mt-0.5 uppercase tracking-wide">
+                <p className="text-xs text-zinc-500 -mt-0.5 uppercase tracking-wide">
                   Type: {presetText} • Mode: {modeText}
                 </p>
               </div>
 
               {/* Specs Bento List */}
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[9.5px] text-zinc-400 bg-black/40 border border-white/[0.03] p-2 rounded-md mb-2.5">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs text-zinc-400 bg-black/40 border border-white/[0.03] p-2 rounded-md mb-2.5">
                 <div>
-                  <span className="text-zinc-650 uppercase text-[8.5px] block">Active Cwd</span>
+                  <span className="text-zinc-650 uppercase text-xs block">Active Cwd</span>
                   <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.cwd}>{term.cwd}</span>
                 </div>
                 <div>
-                  <span className="text-zinc-650 uppercase text-[8.5px] block">Context memory</span>
+                  <span className="text-zinc-650 uppercase text-xs block">Context memory</span>
                   <span className="text-cyan-400 block font-bold">
                     {contextSizeText}
                   </span>
                 </div>
                 <div className="col-span-2">
-                  <span className="text-zinc-650 uppercase text-[8.5px] block">Active process thread</span>
+                  <span className="text-zinc-650 uppercase text-xs block">Active process thread</span>
                   <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.command}>$ {commandText}</span>
                 </div>
               </div>
 
               {/* last stdout console output panel widget */}
-              <div className="bg-black/80 rounded border border-white/5 p-2 font-mono text-[9px] leading-relaxed text-zinc-500">
-                <div className="text-[8.5px] uppercase tracking-wider text-cyan-500/60 font-semibold mb-1 flex items-center justify-between border-b border-white/[0.04] pb-1 select-none">
+              <div className="bg-black/80 rounded border border-white/5 p-2 font-mono text-xs leading-relaxed text-zinc-500">
+                <div className="text-xs uppercase tracking-wider text-cyan-500/60 font-semibold mb-1 flex items-center justify-between border-b border-white/[0.04] pb-1 select-none">
                   <span>🛰️ Live Stdout Capture</span>
                   <span className="opacity-40">{outputBytes} bytes</span>
                 </div>
@@ -1778,7 +1566,7 @@ function AppRaw() {
 
               {/* Action notice helper */}
               <div className="mt-2 text-right">
-                <span className="text-[8.5px] text-zinc-650 italic">
+                <span className="text-xs text-zinc-650 italic">
                   Tap to lock popup • Hover another tile to swap inspect
                 </span>
               </div>
@@ -1802,13 +1590,13 @@ function AppRaw() {
     // closures are called inline at their original positions.
     const renderWipStrip = () => otherWip.length > 0 && (
       <div className="px-3 py-1.5 bg-black/40 border-b border-white/5 flex items-center gap-1.5 overflow-x-auto select-none">
-        <span className="text-[8px] font-mono uppercase text-zinc-500 shrink-0">WIP elsewhere:</span>
+        <span className="text-xs font-mono uppercase text-zinc-500 shrink-0">WIP elsewhere:</span>
         {otherWip.map((d) => (
           <button
             key={d.paneId}
             onClick={() => setActiveTerminalId(d.paneId)}
             title={d.draft.text.slice(0, 200)}
-            className="shrink-0 px-1.5 py-0.5 text-[9px] font-mono rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20"
+            className="shrink-0 px-1.5 py-0.5 text-xs font-mono rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20"
           >
             {d.paneId} · {d.draft.text.split("\n").filter(Boolean).length}L
           </button>
@@ -1834,7 +1622,7 @@ function AppRaw() {
             {promptBuffer ? (
               <MiniMarkdown text={promptBuffer} />
             ) : (
-              <p className="text-[10px] text-zinc-600 font-mono italic">{activeTerminalId ? "Empty draft. Switch to Edit, speak into the microphone, or ask Janus to draft a prompt for this pane." : "No pane open. Open a pane to compose a prompt for it."}</p>
+              <p className="text-xs text-zinc-600 font-mono italic">{activeTerminalId ? "Empty draft. Switch to Edit, speak into the microphone, or ask Janus to draft a prompt for this pane." : "No pane open. Open a pane to compose a prompt for it."}</p>
             )}
           </div>
         )}
@@ -1843,18 +1631,18 @@ function AppRaw() {
 
     const renderContextBlock = () => activeTerminalId && (
       <div data-testid="pane-context-body" className="px-3 py-2 bg-[#080808] border-t border-white/5 select-none max-h-[160px] overflow-y-auto">
-        <div className="text-[8px] font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
+        <div className="text-xs font-mono uppercase text-zinc-500 mb-1">Context · {activePaneName}</div>
         {(modelCtx.length > 0 || humanCtx.length > 0) ? (
           <div className="space-y-0.5 mb-1.5">
             {modelCtx.slice(-4).map((c, i) => (
-              <div key={`m${i}`} className="text-[9px] font-mono text-sky-300/80 leading-snug">· {c.text}</div>
+              <div key={`m${i}`} className="text-xs font-mono text-sky-300/80 leading-snug">· {c.text}</div>
             ))}
             {humanCtx.slice(-4).map((c, i) => (
-              <div key={`h${i}`} className="text-[9px] font-mono text-emerald-300/90 leading-snug">✎ {c.text}</div>
+              <div key={`h${i}`} className="text-xs font-mono text-emerald-300/90 leading-snug">✎ {c.text}</div>
             ))}
           </div>
         ) : (
-          <div className="text-[9px] font-mono text-zinc-600 italic mb-1.5">No context yet. Add steering notes Janus will read.</div>
+          <div className="text-xs font-mono text-zinc-600 italic mb-1.5">No context yet. Add steering notes Janus will read.</div>
         )}
         <div className="flex gap-1">
           <input
@@ -1862,11 +1650,11 @@ function AppRaw() {
             onChange={(e) => setContextInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") { handleAddHumanContext(contextInput); setContextInput(""); } }}
             placeholder="Add context for this pane…"
-            className="flex-1 bg-black text-[9px] text-zinc-200 px-2 py-1 rounded border border-white/10 focus:outline-none focus:border-emerald-500 font-mono"
+            className="flex-1 bg-black text-xs text-zinc-200 px-2 py-1 rounded border border-white/10 focus:outline-none focus:border-emerald-500 font-mono"
           />
           <button
             onClick={() => { handleAddHumanContext(contextInput); setContextInput(""); }}
-            className="px-2 py-1 text-[9px] font-mono uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 rounded"
+            className="px-2 py-1 text-xs font-mono uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 rounded"
           >
             Add
           </button>
@@ -1881,7 +1669,7 @@ function AppRaw() {
           <h3 className="text-xs font-mono font-bold tracking-wider text-white uppercase truncate">Prompt Draft</h3>
           <span
             data-testid="composer-target-pane"
-            className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate"
+            className="text-xs font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 truncate"
             title="The pane this draft will be sent to"
           >
             → {activePaneName}
@@ -1890,14 +1678,14 @@ function AppRaw() {
         <div className="flex items-center gap-1.5 bg-black/60 p-1 rounded border border-white/10 font-bold select-none">
           <button
             onClick={() => setPromptBufferEditMode("preview")}
-            className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "preview" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
+            className={`px-2 py-0.5 text-xs font-mono rounded transition-colors uppercase ${promptBufferEditMode === "preview" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
           >
             Preview
           </button>
           <button
             data-testid="composer-edit-toggle"
             onClick={() => setPromptBufferEditMode("edit")}
-            className={`px-2 py-0.5 text-[9px] font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
+            className={`px-2 py-0.5 text-xs font-mono rounded transition-colors uppercase ${promptBufferEditMode === "edit" ? "bg-cyan-500/10 text-cyan-400 font-bold" : "text-zinc-500 hover:text-zinc-300"}`}
           >
             Edit
           </button>
@@ -1911,7 +1699,7 @@ function AppRaw() {
         {renderHeaderToolbar()}
 
         {/* Helper Explanation strip */}
-        <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-[8.5px] text-zinc-400 font-mono leading-relaxed">
+        <div className="px-3 py-1.5 bg-cyan-950/10 border-b border-white/[0.03] select-none text-xs text-zinc-400 font-mono leading-relaxed">
           <span className="text-cyan-400 font-extrabold uppercase">Workbench:</span> compose the prompt for the open pane with Janus, then <span className="text-cyan-300 font-bold">Send</span> it. <span className="text-emerald-400/80">Saved per-pane — switching panes never loses your draft.</span>
         </div>
 
@@ -1930,14 +1718,14 @@ function AppRaw() {
             <button
               onClick={() => handlePromptBufferChange(promptBuffer + "\n- [ ] ")}
               disabled={!activeTerminalId}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded disabled:opacity-40"
+              className="px-2 py-1 text-xs font-mono uppercase bg-white/5 border border-white/10 text-zinc-300 hover:text-white rounded disabled:opacity-40"
             >
               + Task
             </button>
             <button
               onClick={() => handlePromptBufferChange("")}
               disabled={!activeTerminalId}
-              className="px-2 py-1 text-[9px] font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded disabled:opacity-40"
+              className="px-2 py-1 text-xs font-mono uppercase bg-red-500/5 hover:bg-red-500/10 border border-red-500/10 hover:border-red-500/20 text-red-400 rounded disabled:opacity-40"
             >
               Clear
             </button>
@@ -1947,7 +1735,7 @@ function AppRaw() {
             data-testid="composer-send"
             onClick={handleSendDraft}
             disabled={!activeTerminalId || !promptBuffer.trim()}
-            className="px-4 py-1.5 text-[10px] font-mono uppercase bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded font-bold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+            className="px-4 py-1.5 text-xs font-mono uppercase bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 rounded font-bold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
             title="Send this prompt to the open pane (operator approval)"
           >
             Send → {activePaneName}
@@ -1968,7 +1756,7 @@ function AppRaw() {
     const draftPending = promptBuffer.trim().length > 0 || wipDrafts.length > 0;
     return (
       <div className="flex bg-black/60 p-1 rounded-t border-t border-l border-r border-white/5 shrink-0 select-none">
-        <div className="flex-1 flex items-center justify-center gap-1.5 py-2 text-[10px] font-mono tracking-wider border-b-2 border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04] relative uppercase">
+        <div className="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-mono tracking-wider border-b-2 border-cyan-400 text-cyan-400 font-extrabold bg-cyan-950/[0.04] relative uppercase">
           <CheckSquare className="w-3.5 h-3.5" />
           <span>Sync Spec</span>
           {draftPending && (
@@ -2070,23 +1858,23 @@ function AppRaw() {
       <div className="fixed top-4 right-4 z-50 space-y-2 pointer-events-none">
         {autoApprovedNotification && (
           <div className="bg-[#111] border border-green-500/30 text-green-400 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-[10px] font-mono uppercase tracking-widest text-green-500">▶ Auto-Approved & Executed</span>
-            <span className="text-[11px] font-mono text-white/90">Node ID: {autoApprovedNotification.terminalId}</span>
-            <pre className="text-[10px] bg-black/40 p-2 rounded text-[#b4b4b4] border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{autoApprovedNotification.cmd}</pre>
+            <span className="text-xs font-mono uppercase tracking-widest text-green-500">▶ Auto-Approved & Executed</span>
+            <span className="text-xs font-mono text-white/90">Node ID: {autoApprovedNotification.terminalId}</span>
+            <pre className="text-xs bg-black/40 p-2 rounded text-[#b4b4b4] border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{autoApprovedNotification.cmd}</pre>
           </div>
         )}
         {blockedNotification && (
           <div className="bg-[#111] border border-red-500/30 text-red-400 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-[10px] font-mono uppercase tracking-widest text-red-500">⛔ Access Blocked (Read-Only)</span>
-            <span className="text-[11px] font-mono text-white/90">Node ID: {blockedNotification.terminalId}</span>
-            <span className="text-[10px] text-zinc-400">Policy: {blockedNotification.reason}</span>
-            <pre className="text-[10px] bg-black/40 p-2 rounded text-zinc-500 border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{blockedNotification.cmd}</pre>
+            <span className="text-xs font-mono uppercase tracking-widest text-red-500">⛔ Access Blocked (Read-Only)</span>
+            <span className="text-xs font-mono text-white/90">Node ID: {blockedNotification.terminalId}</span>
+            <span className="text-xs text-zinc-400">Policy: {blockedNotification.reason}</span>
+            <pre className="text-xs bg-black/40 p-2 rounded text-zinc-500 border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{blockedNotification.cmd}</pre>
           </div>
         )}
         {wsErrorNotification && (
           <div className="bg-[#111] border border-red-500/50 text-red-500 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-[10px] font-mono uppercase tracking-widest text-red-500 font-bold">⛔ Connection / AI Error</span>
-            <span className="text-[11px] font-mono text-white/90">{wsErrorNotification.message}</span>
+            <span className="text-xs font-mono uppercase tracking-widest text-red-500 font-bold">⛔ Connection / AI Error</span>
+            <span className="text-xs font-mono text-white/90">{wsErrorNotification.message}</span>
           </div>
         )}
         {/* Nit #3: raw control-key outcome toast — gated (403) / deferred (202) / refused (409). */}
@@ -2099,12 +1887,12 @@ function AppRaw() {
                 : "border-red-500/30 text-red-400"
             }`}
           >
-            <span className={`text-[10px] font-mono uppercase tracking-widest font-bold ${
+            <span className={`text-xs font-mono uppercase tracking-widest font-bold ${
               rawKeyNotification.tone === "deferred" ? "text-amber-500" : "text-red-500"
             }`}>
               {rawKeyNotification.tone === "deferred" ? "⏳ " : "⛔ "}{rawKeyNotification.title}
             </span>
-            <span className="text-[11px] font-mono text-white/90">{rawKeyNotification.detail}</span>
+            <span className="text-xs font-mono text-white/90">{rawKeyNotification.detail}</span>
           </div>
         )}
       </div>
@@ -2130,7 +1918,7 @@ function AppRaw() {
                 : 'bg-zinc-600'
             }`}></div>
             <h1 className="font-serif italic text-lg lg:text-xl tracking-wide text-white flex items-center gap-2 select-none">
-              Orbital Harness <span className="text-[10px] lg:text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
+              Orbital Harness <span className="text-xs lg:text-xs font-mono font-normal opacity-40">v1.0.4-live</span>
             </h1>
 
             {/* Simplicity Toggle Switch */}
@@ -2139,7 +1927,7 @@ function AppRaw() {
                 setIsSimpleMode(!isSimpleMode);
                 playEarcon("chime");
               }}
-              className={`px-2.5 py-1 text-[9.5px] uppercase font-mono rounded tracking-wider flex items-center gap-1.5 transition-all select-none border cursor-pointer font-bold ${
+              className={`px-2.5 py-1 text-xs uppercase font-mono rounded tracking-wider flex items-center gap-1.5 transition-all select-none border cursor-pointer font-bold ${
                 isSimpleMode 
                   ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.1)]" 
                   : "bg-white/5 border-white/5 text-zinc-500 hover:text-zinc-300 hover:border-white/10"
@@ -2158,7 +1946,7 @@ function AppRaw() {
               {/* Active workers indicator */}
               <div className="flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                <span className="text-[10px] text-zinc-400 font-bold uppercase">
+                <span className="text-xs text-zinc-400 font-bold uppercase">
                   {terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes || {}).filter(p => p.alive).length} RUNNING
                 </span>
               </div>
@@ -2170,7 +1958,7 @@ function AppRaw() {
                   which renders independently. */}
               <div className="flex items-center gap-1.5" title="Pending verification commands (approval queue)">
                 <span className={`w-1.5 h-1.5 rounded-full ${pendingCommands.length > 0 ? "bg-amber-500 shadow-[0_0_6px_#f59e0b] animate-ping" : "bg-zinc-700"}`}></span>
-                <span className={`text-[10px] font-extrabold uppercase ${pendingCommands.length > 0 ? "text-amber-400 font-black animate-pulse" : "text-zinc-500"}`}>
+                <span className={`text-xs font-extrabold uppercase ${pendingCommands.length > 0 ? "text-amber-400 font-black animate-pulse" : "text-zinc-500"}`}>
                   {pendingCommands.length} VERIFY
                 </span>
               </div>
@@ -2183,7 +1971,7 @@ function AppRaw() {
         {(() => (
         <div className="flex items-center gap-4 lg:gap-6 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 shrink-0 hide-scrollbar">
           <div className="flex flex-col">
-            <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest">Global Voice Agent Permission</span>
+            <span className="text-xs font-mono uppercase opacity-40 tracking-widest">Global Voice Agent Permission</span>
             <select
               value={globalPermissionsMode}
               onChange={(e) => handleUpdateGlobalPermissions(e.target.value)}
@@ -2197,7 +1985,7 @@ function AppRaw() {
           </div>
           <div className="w-px h-8 bg-white/10"></div>
           <div className="flex flex-col items-end">
-            <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest">Controls</span>
+            <span className="text-xs font-mono uppercase opacity-40 tracking-widest">Controls</span>
             <div className="flex items-center gap-2 mt-1">
               {/* Connect / Mute+Disconnect — inner IIFE keeps the right-controls IIFE under the gate. */}
               {(() => !isLive ? (
@@ -2227,7 +2015,7 @@ function AppRaw() {
           </div>
           <div className="w-px h-8 bg-white/10"></div>
           <div className="flex flex-col">
-            <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest">Gemini Voice</span>
+            <span className="text-xs font-mono uppercase opacity-40 tracking-widest">Gemini Voice</span>
             <span className={`text-xs font-mono ${geminiVoiceColorClass(isLive, isReconnecting, isMicMuted)}`}>
               {geminiVoiceLabel(isLive, isReconnecting, isMicMuted)}
             </span>
@@ -2236,23 +2024,23 @@ function AppRaw() {
             <>
               <div className="w-px h-8 bg-white/10"></div>
               <div className="flex flex-col items-end">
-                <span className="text-[10px] font-mono uppercase opacity-40 tracking-widest flex items-center gap-1 leading-none select-none">
+                <span className="text-xs font-mono uppercase opacity-40 tracking-widest flex items-center gap-1 leading-none select-none">
                   <Database className="w-2.5 h-2.5 text-cyan-400" />
                   Rigorous Context Memory
                 </span>
                 <div className="flex items-center gap-2 mt-1 leading-none select-none">
                   <span className={`text-xs font-mono font-black ${totalContextTextClass(totalContextSize)}`}>
-                    {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`}
+                    {formatCharCountLower(totalContextSize)}
                   </span>
-                  <span className="text-[9px] font-mono opacity-40">
-                    (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+                  <span className="text-xs font-mono opacity-40">
+                    (~{formatTokenCount(totalTokensEstimated)} tokens)
                   </span>
                 </div>
                 {/* Context overload bar */}
                 <div className="w-24 h-1 bg-zinc-950 rounded-full overflow-hidden mt-1.5" title="Aggregated Sandbox Overload Threshold Indicator">
                   <div
                     className={`h-full transition-all duration-500 ${totalContextBarClass(totalContextSize)}`}
-                    style={{ width: `${Math.min((totalContextSize / 100000) * 100, 100)}%` }}
+                    style={{ width: `${totalContextBarPercent(totalContextSize)}%` }}
                   ></div>
                 </div>
               </div>
@@ -2272,7 +2060,7 @@ function AppRaw() {
               <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${transcript.length > 0 ? "bg-cyan-400" : "bg-zinc-400"}`}></span>
               <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${transcript.length > 0 ? "bg-cyan-500" : "bg-zinc-600"}`}></span>
             </span>
-            <span className="text-[10px] font-mono uppercase tracking-[0.1em] font-bold">Transcripts ({transcript.length})</span>
+            <span className="text-xs font-mono uppercase tracking-[0.1em] font-bold">Transcripts ({transcript.length})</span>
           </button>
           <div className="w-px h-8 bg-white/10"></div>
           {/* bead 8sq: global two-stage emergency STOP-ALL. When frozen, the trigger is replaced by the
@@ -2293,7 +2081,7 @@ function AppRaw() {
             title="System Parameters Settings"
           >
             <Settings className="w-3.5 h-3.5 animate-[spin_10s_linear_infinite]" />
-            <span className="text-[10px] font-mono uppercase tracking-[0.1em] font-bold">Config</span>
+            <span className="text-xs font-mono uppercase tracking-[0.1em] font-bold">Config</span>
           </button>
         </div>
         ))()}
@@ -2319,7 +2107,7 @@ function AppRaw() {
             setActiveTerminalId(null);
             setMobileActiveView("terminal");
           }}
-          className={`flex-shrink-0 px-3 py-1.5 rounded-full text-[10px] font-mono border transition-all ${
+          className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-mono border transition-all ${
             activeTerminalId === null
               ? "bg-cyan-500/15 border-cyan-500 text-cyan-400 font-bold"
               : "bg-white/5 border-white/10 text-zinc-500"
@@ -2340,13 +2128,10 @@ function AppRaw() {
                 setActiveTerminalId(term.id);
                 setMobileActiveView("terminal");
               }}
-              className={`flex-shrink-0 px-3.5 py-1.5 rounded-full text-[10px] font-mono border flex items-center gap-1.5 transition-all ${colorClass}`}
+              className={`flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-mono border flex items-center gap-1.5 transition-all ${colorClass}`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${
-                isAlertActive ? "bg-amber-500 animate-ping2" :
-                term.status === "Running" && term.quiescing ? "bg-amber-400/70" :
-                term.status === "Running" ? "bg-green-500" : "bg-yellow-500"
-              }`}></span>
+              {/* Burndown: the inner-dot color ladder is the pure helper `mobileSwiperDotClass`. */}
+              <span className={`w-1.5 h-1.5 rounded-full ${mobileSwiperDotClass(isAlertActive, term)}`}></span>
               {(term.id).toUpperCase()}
             </button>
           )
@@ -2362,7 +2147,7 @@ function AppRaw() {
           <div className="p-4 flex-1 overflow-y-auto scrollbar-thin min-h-0">
             <button
               onClick={() => setActiveTerminalId(null)}
-              className={`w-full flex items-center justify-between px-3 py-2.5 mb-4 rounded border text-[11px] font-mono tracking-wider transition-all ${
+              className={`w-full flex items-center justify-between px-3 py-2.5 mb-4 rounded border text-xs font-mono tracking-wider transition-all ${
                 activeTerminalId === null
                   ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/30"
                   : "bg-transparent text-zinc-400 border-white/5 hover:border-white/10"
@@ -2372,15 +2157,15 @@ function AppRaw() {
                 <span className={`w-1.5 h-1.5 rounded-full ${activeTerminalId === null ? 'bg-cyan-400 animate-pulse' : 'bg-zinc-500'}`}></span>
                 GRID SUMMARY VIEW
               </span>
-              <span className="text-[9px] opacity-40 px-1 bg-white/5 rounded">ALL</span>
+              <span className="text-xs opacity-40 px-1 bg-white/5 rounded">ALL</span>
             </button>
 
             <div className="mb-5 flex items-center justify-between border border-white/5 bg-black/30 px-3 py-2 rounded">
-              <label className="text-[10px] font-mono uppercase opacity-60">Filter Panes:</label>
+              <label className="text-xs font-mono uppercase opacity-60">Filter Panes:</label>
               <select
                 value={termFilter}
                 onChange={(e) => setTermFilter(e.target.value as "All" | "Running" | "Idle")}
-                className="bg-[#111] text-[10px] font-mono text-zinc-300 border border-white/10 rounded px-1.5 py-1 focus:outline-none focus:border-cyan-500 cursor-pointer"
+                className="bg-[#111] text-xs font-mono text-zinc-300 border border-white/10 rounded px-1.5 py-1 focus:outline-none focus:border-cyan-500 cursor-pointer"
               >
                 <option value="All">All Panes</option>
                 <option value="Running">Running</option>
@@ -2389,10 +2174,10 @@ function AppRaw() {
             </div>
 
             <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-1 select-none">
-              <h2 className="text-[10px] font-mono uppercase opacity-40 tracking-[0.2em]">Workspace Contexts</h2>
+              <h2 className="text-xs font-mono uppercase opacity-40 tracking-[0.2em]">Workspace Contexts</h2>
               <button
                 onClick={handleCreateProject}
-                className="text-[9px] font-mono uppercase text-cyan-400 opacity-60 hover:opacity-100 transition-opacity flex items-center gap-0.5 focus:outline-none"
+                className="text-xs font-mono uppercase text-cyan-400 opacity-60 hover:opacity-100 transition-opacity flex items-center gap-0.5 focus:outline-none"
                 title="Create New Project Context Space"
               >
                 <Plus className="w-2.5 h-2.5" /> NEW
@@ -2409,7 +2194,7 @@ function AppRaw() {
                 const renderPinnedNotes = () => project.notes && project.notes.length > 0 && isActiveProject && (
                   <div className="px-3 py-1 space-y-1 my-2 border-l-2 border-cyan-400/20 ml-2">
                      {project.notes.map((note, idx) => (
-                        <div key={idx} className="text-[10px] opacity-60 text-cyan-100 flex items-start gap-1">
+                        <div key={idx} className="text-xs opacity-60 text-cyan-100 flex items-start gap-1">
                           <span className="opacity-40">-</span><span>{note}</span>
                         </div>
                      ))}
@@ -2418,14 +2203,14 @@ function AppRaw() {
                 const renderProjectDetails = () => isActiveProject && (
                   <div className="pl-3 ml-2 border-l-2 border-white/5 space-y-2 mt-1.5 py-1 select-none">
                     {project.summary && (
-                      <p className="text-[10px] text-zinc-500 leading-relaxed font-mono italic max-w-[210px] break-all">
+                      <p className="text-xs text-zinc-500 leading-relaxed font-mono italic max-w-[210px] break-all">
                         {project.summary}
                       </p>
                     )}
                     {project.keyTerms && project.keyTerms.length > 0 && (
                       <div className="flex flex-wrap gap-1 max-w-[210px]">
                         {project.keyTerms.map((term, idx) => (
-                          <span key={idx} className="bg-cyan-500/5 text-cyan-400/80 border border-cyan-500/10 px-1 py-0.5 rounded text-[8px] font-mono leading-none">
+                          <span key={idx} className="bg-cyan-500/5 text-cyan-400/80 border border-cyan-500/10 px-1 py-0.5 rounded text-xs font-mono leading-none">
                             {term}
                           </span>
                         ))}
@@ -2443,11 +2228,11 @@ function AppRaw() {
                       {(project.name || project.id).toUpperCase()}
                     </div>
                     <div className="flex gap-1.5 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
-                       <button onClick={() => handleEditProject(project)} className="text-[9px] uppercase hover:text-cyan-400 px-1 hover:bg-white/5 rounded" title="Edit workspace details">Edit</button>
-                       <button onClick={() => handleRenameProject(project.id, project.name)} className="text-[9px] uppercase hover:text-cyan-450 text-zinc-500 hover:bg-white/5 px-1 rounded animate-pulse" title="Quick rename space">Rename</button>
-                       <button onClick={() => handleAddProjectNote(project.id)} className="text-[9px] uppercase hover:text-cyan-450 text-zinc-400 hover:bg-white/5 px-1 rounded" title="Append note">Note</button>
+                       <button onClick={() => handleEditProject(project)} className="text-xs uppercase hover:text-cyan-400 px-1 hover:bg-white/5 rounded" title="Edit workspace details">Edit</button>
+                       <button onClick={() => handleRenameProject(project.id, project.name)} className="text-xs uppercase hover:text-cyan-450 text-zinc-500 hover:bg-white/5 px-1 rounded animate-pulse" title="Quick rename space">Rename</button>
+                       <button onClick={() => handleAddProjectNote(project.id)} className="text-xs uppercase hover:text-cyan-450 text-zinc-400 hover:bg-white/5 px-1 rounded" title="Append note">Note</button>
                        {projectList.length > 1 && (
-                         <button onClick={() => handleDeleteProjectPrompt(project.id)} className="text-[9px] uppercase hover:text-red-400 text-zinc-650 px-1 hover:bg-red-500/10 rounded" title="Prune Project Memory">Prune</button>
+                         <button onClick={() => handleDeleteProjectPrompt(project.id)} className="text-xs uppercase hover:text-red-400 text-zinc-650 px-1 hover:bg-red-500/10 rounded" title="Prune Project Memory">Prune</button>
                        )}
                     </div>
                   </div>
@@ -2475,12 +2260,12 @@ function AppRaw() {
                           const statusTitle = isAlertActive ? "Status: Alert (Approval Required)" : `Status: ${pane.last_known_state}`;
                           const renderActiveActions = () => isActive && (
                             <div className="flex px-3 mt-1 pb-1 gap-2 border-b border-white/5">
-                               <button onClick={() => handleRenamePane(project.id, pane.pane_id, pane.name)} className="text-[9px] uppercase hover:text-cyan-400 opacity-60">Rename</button>
-                               <button onClick={() => handleAddPaneNote(project.id, pane.pane_id)} className="text-[9px] uppercase hover:text-cyan-400 opacity-60">Note</button>
+                               <button onClick={() => handleRenamePane(project.id, pane.pane_id, pane.name)} className="text-xs uppercase hover:text-cyan-400 opacity-60">Rename</button>
+                               <button onClick={() => handleAddPaneNote(project.id, pane.pane_id)} className="text-xs uppercase hover:text-cyan-400 opacity-60">Note</button>
                             </div>
                           );
                           const renderActiveNotes = () => isActive && pane.notes && pane.notes.length > 0 && (
-                            <div className="ml-4 pl-2 py-1 mt-1 border-l border-white/5 text-[9px] font-sans text-amber-200/60 leading-relaxed max-w-full italic overflow-hidden break-words">
+                            <div className="ml-4 pl-2 py-1 mt-1 border-l border-white/5 text-xs font-sans text-amber-200/60 leading-relaxed max-w-full italic overflow-hidden break-words">
                                {pane.notes.map((n, idx) => <div key={idx}>• {n}</div>)}
                             </div>
                           );
@@ -2502,12 +2287,12 @@ function AppRaw() {
                                 <span className={`text-xs font-mono truncate flex items-center gap-1.5 ${rowNameClass}`}>
                                   {pane.name}
                                   {isAlertActive && (
-                                    <span className="text-[7px] bg-amber-500 text-black px-1 rounded font-sans font-black uppercase animate-bounce leading-none py-0.5">
+                                    <span className="text-xs bg-amber-500 text-black px-1 rounded font-sans font-black uppercase animate-bounce leading-none py-0.5">
                                       ▲ ALERT
                                     </span>
                                   )}
                                 </span>
-                                {term && <span className="text-[9px] opacity-30 font-mono truncate">{term.cwd}</span>}
+                                {term && <span className="text-xs opacity-30 font-mono truncate">{term.cwd}</span>}
                               </div>
                               <div className="flex items-center gap-2 shrink-0">
                                 {/* bead 8sq: per-pane effective-posture chip (server truth via terminals payload). */}
@@ -2538,11 +2323,11 @@ function AppRaw() {
           <div className="p-4 border-t border-white/5 space-y-3">
             <button
               onClick={() => setShowCreateModal(true)}
-              className="w-full text-center py-2 bg-transparent border border-dashed border-white/20 hover:border-cyan-500/50 hover:text-cyan-400 text-white/60 text-[10px] uppercase tracking-widest transition-colors focus:outline-none"
+              className="w-full text-center py-2 bg-transparent border border-dashed border-white/20 hover:border-cyan-500/50 hover:text-cyan-400 text-white/60 text-xs uppercase tracking-widest transition-colors focus:outline-none"
             >
               + Create Node
             </button>
-            <div className="w-full text-center text-zinc-600 text-[10px] uppercase tracking-widest">
+            <div className="w-full text-center text-zinc-600 text-xs uppercase tracking-widest">
               {terminals.length} Nodes Online
             </div>
           </div>
@@ -2561,10 +2346,10 @@ function AppRaw() {
               <div className="flex-1 flex flex-col overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
                   <div className="flex gap-2 items-center overflow-hidden min-w-0">
-                    <span className="text-[10px] font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
+                    <span className="text-xs font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
                       {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
                     </span>
-                    <span className="text-[10px] font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
+                    <span className="text-xs font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
                       $ {activeTerminal.command}
                     </span>
                     {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
@@ -2587,7 +2372,7 @@ function AppRaw() {
                     )}
                   </div>
                   <div className="flex items-center gap-4 shrink-0">
-                    <span className="text-[10px] font-mono opacity-40 truncate" title={activeTerminal.cwd}>
+                    <span className="text-xs font-mono opacity-40 truncate" title={activeTerminal.cwd}>
                       {activeTerminal.cwd}
                     </span>
                     <button
@@ -2615,7 +2400,7 @@ function AppRaw() {
                         mobile where the sidebar grid control is hidden behind the Menu view. */}
                     <button
                       onClick={() => setActiveTerminalId(null)}
-                      className="flex items-center gap-1 px-2 py-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors text-[10px] font-mono uppercase tracking-wider"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors text-xs font-mono uppercase tracking-wider"
                       title="Back to grid (leave this pane running)"
                     >
                       <Layers className="w-3.5 h-3.5" />
@@ -2625,7 +2410,7 @@ function AppRaw() {
                         the non-destructive middle between Restart and PRUNE (hard delete). */}
                     <button
                       onClick={() => handleStopPane(activeProjectId, activeTerminal.id)}
-                      className="flex items-center gap-1 px-2 py-1 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors text-[10px] font-mono uppercase tracking-wider"
+                      className="flex items-center gap-1 px-2 py-1 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors text-xs font-mono uppercase tracking-wider"
                       title="Exit pane (terminate the process and archive it — recoverable)"
                     >
                       <Square className="w-3.5 h-3.5" />
@@ -2637,7 +2422,7 @@ function AppRaw() {
                     Tab, Esc, Enter, Ctrl+C, Shift+Tab) straight into the pane's PTY. Independent of
                     the mode <select>; Ctrl+C/Shift+Tab carry the warn tint (Shift+Tab is gated). */}
                 <div className="px-2 sm:px-4 lg:px-6 py-1.5 border-b border-white/5 bg-black/30 flex items-center gap-2">
-                  <span className="text-[8.5px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                  <span className="text-xs font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
                   <ControlKeyBar paneId={activeTerminal.id} onKey={writeControlKey} />
                 </div>
                 <div data-testid="terminal-pane" className="flex-1 p-2 sm:p-4 lg:p-6 font-mono text-xs overflow-hidden leading-relaxed bg-[#060606] relative">
@@ -2657,7 +2442,7 @@ function AppRaw() {
                   <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
                     <div className="flex items-center gap-2">
                       <History className="w-4 h-4 text-cyan-400 shrink-0" />
-                      <span className="text-[11px] font-mono tracking-wider text-white uppercase font-bold">Local Pane History</span>
+                      <span className="text-xs font-mono tracking-wider text-white uppercase font-bold">Local Pane History</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <button
@@ -2669,7 +2454,7 @@ function AppRaw() {
                       </button>
                       <button 
                         onClick={clearActiveTerminalHistory} 
-                        className="text-[9px] uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none flex items-center gap-1"
+                        className="text-xs uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none flex items-center gap-1"
                         title="Clear command history"
                       >
                         <Trash2 className="w-2.5 h-2.5" /> Clear
@@ -2683,7 +2468,7 @@ function AppRaw() {
                       {historyList.length === 0 ? (
                         <div className="h-full flex flex-col items-center justify-center text-center p-4">
                           <History className="w-6 h-6 text-zinc-700 mb-2" />
-                          <p className="text-[10px] font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
+                          <p className="text-xs font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
                             No commands recorded in .janus_history.json
                           </p>
                         </div>
@@ -2704,7 +2489,7 @@ function AppRaw() {
                             }`}
                           >
                             <div className="flex items-start justify-between gap-2">
-                              <span className="text-[9px] text-zinc-500 flex items-center gap-1 shrink-0">
+                              <span className="text-xs text-zinc-500 flex items-center gap-1 shrink-0">
                                 <Clock className="w-3 h-3 opacity-60" />
                                 {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                               </span>
@@ -2720,19 +2505,19 @@ function AppRaw() {
                               </button>
                             </div>
                             
-                            <div className="text-[11px] text-zinc-200 break-all font-semibold mt-1 bg-black/40 px-2 py-1.5 rounded border border-white/5 select-text">
+                            <div className="text-xs text-zinc-200 break-all font-semibold mt-1 bg-black/40 px-2 py-1.5 rounded border border-white/5 select-text">
                               $ {entry.command}
                             </div>
 
                             {(entry as any).finalResponse && (
-                              <div className="mt-2 text-[10px] text-zinc-400 font-mono bg-cyan-950/10 border border-cyan-500/15 p-2 rounded flex gap-1.5 items-start">
+                              <div className="mt-2 text-xs text-zinc-400 font-mono bg-cyan-950/10 border border-cyan-500/15 p-2 rounded flex gap-1.5 items-start">
                                 <span className="text-cyan-400 font-bold shrink-0">◇ Outcome Briefing:</span>
                                 <span className="leading-relaxed select-text">{(entry as any).finalResponse}</span>
                               </div>
                             )}
 
                             {entry.output && (
-                              <div className="mt-2 flex items-center justify-between text-[8px] text-cyan-500/80 uppercase tracking-widest leading-none">
+                              <div className="mt-2 flex items-center justify-between text-xs text-cyan-500/80 uppercase tracking-widest leading-none">
                                 <span>{isSelected ? "▲ Hide stdout" : "▼ Read stdout context"}</span>
                                 <span className="opacity-40">{entry.output.length} Chars</span>
                               </div>
@@ -2747,7 +2532,7 @@ function AppRaw() {
                     {selectedHistoryEntry && (
                       <div className="h-1/2 flex flex-col bg-black/60 border-t border-white/5 overflow-hidden shrink-0">
                         <div className="px-3 py-1.5 border-b border-white/5 bg-[#141414] flex items-center justify-between">
-                          <span className="text-[9px] font-mono text-cyan-400 font-bold uppercase tracking-widest">Stdout capture context</span>
+                          <span className="text-xs font-mono text-cyan-400 font-bold uppercase tracking-widest">Stdout capture context</span>
                           <button
                             onClick={() => {
                               navigator.clipboard.writeText(selectedHistoryEntry.output);
@@ -2758,7 +2543,7 @@ function AppRaw() {
                             <Clipboard className="w-3.5 h-3.5" />
                           </button>
                         </div>
-                        <div className="flex-1 overflow-auto p-3 font-mono text-[10px] text-zinc-400 leading-normal scrollbar-thin select-text whitespace-pre-wrap selection:bg-cyan-500/30 selection:text-white">
+                        <div className="flex-1 overflow-auto p-3 font-mono text-xs text-zinc-400 leading-normal scrollbar-thin select-text whitespace-pre-wrap selection:bg-cyan-500/30 selection:text-white">
                           {selectedHistoryEntry.output || "No output captured for this command."}
                         </div>
                       </div>
@@ -2789,7 +2574,7 @@ function AppRaw() {
                   <div className="flex items-center gap-1 bg-black/80 p-1.5 rounded-lg border border-white/10 shrink-0 select-none self-start md:self-auto shadow-inner font-mono">
                     <button
                       onClick={() => setGridDisplayMode("detailed")}
-                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
                         gridDisplayMode === "detailed"
                           ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
                           : "text-zinc-500 hover:text-zinc-300 border border-transparent"
@@ -2800,7 +2585,7 @@ function AppRaw() {
                     </button>
                     <button
                       onClick={() => setGridDisplayMode("compact")}
-                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
                         gridDisplayMode === "compact"
                           ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
                           : "text-zinc-500 hover:text-zinc-300 border border-transparent"
@@ -2811,7 +2596,7 @@ function AppRaw() {
                     </button>
                     <button
                       onClick={() => setGridDisplayMode("videowall")}
-                      className={`px-3 py-1.5 text-[10px] font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
+                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
                         gridDisplayMode === "videowall"
                           ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
                           : "text-zinc-500 hover:text-zinc-300 border border-transparent"
@@ -2822,7 +2607,7 @@ function AppRaw() {
                     </button>
                   </div>
                 ) : (
-                  <div className="text-[10px] bg-cyan-950/10 border border-cyan-500/15 px-3 py-1.5 rounded-lg font-mono text-cyan-300 flex items-center gap-2 select-none">
+                  <div className="text-xs bg-cyan-950/10 border border-cyan-500/15 px-3 py-1.5 rounded-lg font-mono text-cyan-300 flex items-center gap-2 select-none">
                     <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse" />
                     <span>Focus View activated: click any terminal pane below to run commands.</span>
                   </div>
@@ -2832,7 +2617,7 @@ function AppRaw() {
                 {activeProject && countExitedPanes(activeProject.panes, terminals) > 0 && (
                   <button
                     onClick={handleClearExited}
-                    className="text-[10px] font-mono uppercase tracking-wider px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded-lg transition-all flex items-center gap-1.5 shrink-0 select-none"
+                    className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded-lg transition-all flex items-center gap-1.5 shrink-0 select-none"
                     title="Archive all exited panes for this project"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
@@ -2855,7 +2640,7 @@ function AppRaw() {
                       <div className="p-1 rounded bg-cyan-500/10 text-cyan-400">
                         <Mic className="w-4 h-4" />
                       </div>
-                      <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-cyan-400 font-extrabold">LIVE SPEECH SYSTEMS</span>
+                      <span className="text-xs font-mono uppercase tracking-[0.2em] text-cyan-400 font-extrabold">LIVE SPEECH SYSTEMS</span>
                     </div>
                     <h2 className="text-base font-mono text-white tracking-wide font-black">
                       Voice Converse with Project Janus
@@ -2887,7 +2672,7 @@ function AppRaw() {
                       )}
                       
                       <div className="flex flex-col">
-                        <span className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest leading-none">AGENT STATUS</span>
+                        <span className="text-xs font-mono text-zinc-500 uppercase tracking-widest leading-none">AGENT STATUS</span>
                         <span className="text-xs font-mono font-bold text-zinc-200 mt-1">
                           {isLive 
                             ? (isReconnecting ? "AI Reconnecting..." : isMicMuted ? "Muted (Zephyr Listening)" : "Zephyr Voice Agent Live")
@@ -2931,7 +2716,7 @@ function AppRaw() {
 
                 {/* Right Side: Synergy Surfaces Map */}
                 <div className="border-t xl:border-t-0 xl:border-l border-white/5 pt-4 xl:pt-0 xl:pl-6 flex flex-col justify-between gap-3">
-                  <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 select-none">SYNERGY SURFACES DIRECTORY</span>
+                  <span className="text-xs font-mono uppercase tracking-[0.2em] text-zinc-500 select-none">SYNERGY SURFACES DIRECTORY</span>
 
                   {/* Single surface: the Spec Buffer. The Orchestration & Alerts planes were removed
                       along with their helper-panel tabs. */}
@@ -2948,11 +2733,11 @@ function AppRaw() {
                           <CheckSquare className="w-3.5 h-3.5" />
                         </div>
                         <div className="flex flex-col">
-                          <span className="text-[11px] font-mono text-zinc-200 font-bold leading-normal">System Spec Draft</span>
-                          <span className="text-[9px] text-zinc-500 leading-none">Shared Requirements Buffer</span>
+                          <span className="text-xs font-mono text-zinc-200 font-bold leading-normal">System Spec Draft</span>
+                          <span className="text-xs text-zinc-500 leading-none">Shared Requirements Buffer</span>
                         </div>
                       </div>
-                      <span className="text-[9px] font-mono px-1.5 py-0.5 bg-white/5 text-zinc-400 rounded uppercase">
+                      <span className="text-xs font-mono px-1.5 py-0.5 bg-white/5 text-zinc-400 rounded uppercase">
                         {promptBuffer.length > 0 ? `${promptBuffer.length} Chars` : "Empty"}
                       </span>
                     </div>
@@ -2981,7 +2766,7 @@ function AppRaw() {
                     {filteredPanes.map((pane) => {
                       const term = terminals.find(t => t.id === pane.pane_id);
                       const status = resolvePaneStatus(term, pane);
-                      const contextSize = term?.context_size !== undefined ? term.context_size : (pane.context_size || 0);
+                      const contextSize = resolveCardContextSize(term, pane);
                       const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === pane.pane_id);
 
                       // Burndown: each grid-mode card body is relocated VERBATIM into a nested render
@@ -3008,15 +2793,15 @@ function AppRaw() {
                               <h3 className="text-sm font-sans font-bold text-zinc-200 flex items-center gap-2">
                                 {pane.name}
                                 {isAlertActive && (
-                                  <span className="text-[8px] bg-amber-500 text-black px-1.5 py-0.5 rounded font-mono font-black uppercase">ACTION REQUIRED</span>
+                                  <span className="text-xs bg-amber-500 text-black px-1.5 py-0.5 rounded font-mono font-black uppercase">ACTION REQUIRED</span>
                                 )}
                               </h3>
-                              <p className="text-[10px] text-zinc-500 font-mono mt-0.5">Preset: {pane.tool_preset || "Standard Shell"} • ID: {pane.pane_id}</p>
+                              <p className="text-xs text-zinc-500 font-mono mt-0.5">Preset: {pane.tool_preset || "Standard Shell"} • ID: {pane.pane_id}</p>
                             </div>
                           </div>
 
                           <div className="flex items-center gap-4 self-end md:self-auto select-none">
-                            <span className={`text-[11px] font-mono capitalize ${status === "Running" ? "text-green-400 font-black" : "text-zinc-500"}`}>{status.toLowerCase()}</span>
+                            <span className={`text-xs font-mono capitalize ${status === "Running" ? "text-green-400 font-black" : "text-zinc-500"}`}>{status.toLowerCase()}</span>
                             <button
                               onClick={() => setActiveTerminalId(pane.pane_id)}
                               className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-black text-xs font-sans font-bold rounded-lg tracking-wider transition-all cursor-pointer active:scale-95 shadow-md flex items-center gap-1.5"
@@ -3032,7 +2817,7 @@ function AppRaw() {
                       const { primaryColorClass, bgHover, presetLabel } = detailedCardPresetClasses(pane.tool_preset);
 
                       // Context memory warnings/colors
-                      const contextPercent = Math.min((contextSize / 20000) * 100, 100);
+                      const contextPercent = contextMeterPercent(contextSize);
                       const contextColor = contextMeterColor(contextSize);
 
                       const renderVideowallCard = () => (
@@ -3050,13 +2835,13 @@ function AppRaw() {
                           <div className="flex justify-between items-center bg-black/40 p-2 border border-white/5 rounded select-none">
                             <div className="flex items-center gap-1.5 min-w-0">
                               <span className={`w-2 h-2 rounded-full flex-shrink-0 transition-all ${videowallDotClass(isAlertActive, status)}`}></span>
-                              <span className="text-[10px] text-white font-extrabold uppercase truncate">{pane.name}</span>
+                              <span className="text-xs text-white font-extrabold uppercase truncate">{pane.name}</span>
                             </div>
-                            <span className="text-[8px] tracking-widest text-zinc-500 uppercase">{pane.pane_id}</span>
+                            <span className="text-xs tracking-widest text-zinc-500 uppercase">{pane.pane_id}</span>
                           </div>
 
                           {/* Live server security camera feed: terminal output window */}
-                          <div className="my-2 bg-[#050505] text-[#22d3ee]/80 font-mono text-[8.5px] p-2.5 rounded border border-white/[0.04] h-[105px] overflow-y-auto select-text scrollbar-thin scrollbar-thumb-zinc-800 leading-relaxed whitespace-pre-wrap">
+                          <div className="my-2 bg-[#050505] text-[#22d3ee]/80 font-mono text-xs p-2.5 rounded border border-white/[0.04] h-[105px] overflow-y-auto select-text scrollbar-thin scrollbar-thumb-zinc-800 leading-relaxed whitespace-pre-wrap">
                             {term?.output ? (
                               term.output.split("\n").slice(-7).join("\n")
                             ) : (
@@ -3064,21 +2849,21 @@ function AppRaw() {
                             )}
                           </div>
 
-                          <div className="flex justify-between items-center text-[8.5px] text-zinc-500 font-mono select-none px-0.5 mt-1">
-                            <span className="flex items-center gap-1"><Database className="w-2.5 h-2.5 text-cyan-400 animate-pulse" /> {contextSize < 1000 ? `${contextSize} B` : `${(contextSize / 1000).toFixed(1)}k c`}</span>
-                            <span className="uppercase text-zinc-550 border border-white/5 px-1 rounded bg-[#0f0f0f] text-[7.5px] tracking-wide font-extrabold">{presetLabel}</span>
+                          <div className="flex justify-between items-center text-xs text-zinc-500 font-mono select-none px-0.5 mt-1">
+                            <span className="flex items-center gap-1"><Database className="w-2.5 h-2.5 text-cyan-400 animate-pulse" /> {formatCompactBytes(contextSize)}</span>
+                            <span className="uppercase text-zinc-550 border border-white/5 px-1 rounded bg-[#0f0f0f] text-xs tracking-wide font-extrabold">{presetLabel}</span>
                           </div>
 
                           <div className="flex gap-2 mt-2.5 select-none pt-2 border-t border-white/[0.04]">
                             <button
                               onClick={() => handleRestartTerminal(pane.pane_id)}
-                              className="flex-1 py-1 bg-black hover:bg-white/5 border border-white/10 hover:border-white/20 text-zinc-400 hover:text-white rounded text-[8.5px] uppercase font-mono tracking-wider font-extrabold transition-all"
+                              className="flex-1 py-1 bg-black hover:bg-white/5 border border-white/10 hover:border-white/20 text-zinc-400 hover:text-white rounded text-xs uppercase font-mono tracking-wider font-extrabold transition-all"
                             >
                               Restart
                             </button>
                             <button
                               onClick={() => setActiveTerminalId(pane.pane_id)}
-                              className="flex-1 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[8.5px] uppercase font-mono tracking-wider font-extrabold transition-all animate-shimmer"
+                              className="flex-1 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-xs uppercase font-mono tracking-wider font-extrabold transition-all animate-shimmer"
                             >
                               Connect
                             </button>
@@ -3109,16 +2894,16 @@ function AppRaw() {
                                 <h3 className="text-xs font-mono font-bold text-white uppercase truncate">
                                   {pane.name}
                                 </h3>
-                                <span className={`text-[8px] font-mono px-1.5 py-0.2 rounded uppercase ${presetBadgeClass(pane.tool_preset, "bg-zinc-805 text-zinc-500")}`}>
+                                <span className={`text-xs font-mono px-1.5 py-0.2 rounded uppercase ${presetBadgeClass(pane.tool_preset, "bg-zinc-805 text-zinc-500")}`}>
                                   {presetLabel}
                                 </span>
                                 {isAlertActive && (
-                                  <span className="text-[7.5px] bg-amber-500 text-black px-1.5 py-0.2 rounded font-sans font-black uppercase tracking-wider animate-bounce">
+                                  <span className="text-xs bg-amber-500 text-black px-1.5 py-0.2 rounded font-sans font-black uppercase tracking-wider animate-bounce">
                                     ALERT REQUIRED
                                   </span>
                                 )}
                               </div>
-                              <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500 font-mono mt-0.5">
+                              <div className="flex flex-wrap items-center gap-1.5 text-xs text-zinc-500 font-mono mt-0.5">
                                 <span>{pane.pane_id}</span>
                                 <span>•</span>
                                 <span className="truncate max-w-[180px]" title={term?.cwd || "/workspace"}>Cwd: {compactCwdDisplay(term?.cwd)}</span>
@@ -3130,20 +2915,20 @@ function AppRaw() {
                           <div className="flex items-center gap-4 shrink-0 justify-between md:justify-end border-t border-white/[0.04] md:border-0 pt-2.5 md:pt-0">
                             <div className="flex items-center gap-3">
                               <div className="flex flex-col items-end text-right">
-                                <span className="text-[10px] font-mono text-cyan-400 flex items-center gap-1 font-bold">
+                                <span className="text-xs font-mono text-cyan-400 flex items-center gap-1 font-bold">
                                   <Database className="w-2.5 h-2.5" />
-                                  {contextSize < 1000 ? `${contextSize} B` : `${(contextSize / 1000).toFixed(1)}k c`}
+                                  {formatCompactBytes(contextSize)}
                                 </span>
-                                <span className="text-[8px] font-mono text-zinc-550">
-                                  ~{Math.ceil(contextSize / 4)} tkn
+                                <span className="text-xs font-mono text-zinc-550">
+                                  ~{estimateTokens(contextSize)} tkn
                                 </span>
                               </div>
                               <div className="h-6 w-px bg-white/5 hidden md:block"></div>
                               <div className="flex flex-col items-start min-w-[64px]">
-                                <span className={`text-[8.5px] uppercase tracking-wider font-bold ${compactProcessState(status, isAlertActive).className}`}>
+                                <span className={`text-xs uppercase tracking-wider font-bold ${compactProcessState(status, isAlertActive).className}`}>
                                   {compactProcessState(status, isAlertActive).label}
                                 </span>
-                                <span className="text-[8px] text-zinc-550 uppercase font-mono">Process</span>
+                                <span className="text-xs text-zinc-550 uppercase font-mono">Process</span>
                               </div>
                             </div>
 
@@ -3151,7 +2936,7 @@ function AppRaw() {
                             <div className="flex items-center gap-1.5 shrink-0">
                               <button
                                 onClick={() => handleRestartTerminal(pane.pane_id)}
-                                className="p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all text-[9px]"
+                                className="p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all text-xs"
                                 title="Restart Node Engine"
                               >
                                 <RefreshCw className="w-3 h-3" />
@@ -3160,7 +2945,7 @@ function AppRaw() {
                                 onClick={() => {
                                   setActiveTerminalId(pane.pane_id);
                                 }}
-                                className="px-3.5 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[9.5px] font-mono uppercase tracking-wider flex items-center gap-1 active:scale-95 transition-all font-bold select-none h-[34px]"
+                                className="px-3.5 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-xs font-mono uppercase tracking-wider flex items-center gap-1 active:scale-95 transition-all font-bold select-none h-[34px]"
                               >
                                 <TermIcon className="w-3.5 h-3.5" />
                                 CONNECT
@@ -3175,29 +2960,29 @@ function AppRaw() {
                               server's active-pane guard (nit #1). Reuses ControlKeyBar (no duplicated byte
                               map) and carries the raw-key-bar-grid testid. */}
                           <div className="flex items-center gap-2 pt-2 border-t border-white/[0.04]">
-                            <span className="text-[8px] font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
+                            <span className="text-xs font-mono uppercase tracking-[0.15em] text-zinc-600 shrink-0">Keys</span>
                             <ControlKeyBar paneId={pane.pane_id} onKey={writeControlKeyFromGrid} testId="raw-key-bar-grid" />
                           </div>
                         </motion.div>
                       );
 
                       const renderDetailedWarning = () => isAlertActive && (
-                        <div className="mb-4 bg-amber-500/10 border border-amber-500/25 rounded p-2.5 font-mono text-[10px] text-amber-300 animate-pulse">
+                        <div className="mb-4 bg-amber-500/10 border border-amber-500/25 rounded p-2.5 font-mono text-xs text-amber-300 animate-pulse">
                           <span className="font-bold block text-amber-400">🚨 AGENT DISPATCHED WARNING:</span>
-                          <span className="block mt-1 font-mono text-[9.5px] text-white break-all bg-black/50 p-1.5 rounded border border-white/5">
+                          <span className="block mt-1 font-mono text-xs text-white break-all bg-black/50 p-1.5 rounded border border-white/5">
                             {pendingCommands.find(cmd => cmd.terminalId === pane.pane_id)?.cmd}
                           </span>
-                          <span className="block mt-1.5 text-[8.5px] opacity-75">
+                          <span className="block mt-1.5 text-xs opacity-75">
                             Execute with voice "Confirm" or hit the approve trigger below.
                           </span>
                         </div>
                       );
                       const renderDetailedMetadata = () => (
-                        <div className="space-y-2 text-[10px] font-mono text-zinc-400 border-t border-b border-white/[0.04] py-3 my-3">
+                        <div className="space-y-2 text-xs font-mono text-zinc-400 border-t border-b border-white/[0.04] py-3 my-3">
                           <div className="flex items-center justify-between">
                             <span>Session ID</span>
                             <span className="flex items-center gap-1.5 bg-black px-2 py-1 rounded text-zinc-300 border border-white/5">
-                              <span className="text-[9px] font-bold tracking-tight max-w-[150px] truncate">{pane.session_id || "None"}</span>
+                              <span className="text-xs font-bold tracking-tight max-w-[150px] truncate">{pane.session_id || "None"}</span>
                               {pane.session_id && (
                                 <button
                                   onClick={() => handleCopyClipboard(pane.session_id, pane.pane_id)}
@@ -3209,7 +2994,7 @@ function AppRaw() {
                             </span>
                           </div>
                           {copiedId === pane.pane_id && (
-                            <div className="text-right text-[8px] text-green-400 -mt-1 scale-in">Copied!</div>
+                            <div className="text-right text-xs text-green-400 -mt-1 scale-in">Copied!</div>
                           )}
 
                           <div className="flex items-center justify-between">
@@ -3217,7 +3002,7 @@ function AppRaw() {
                             <select
                               value={pane.permissions_mode || "Human-in-the-Loop"}
                               onChange={(e) => handleUpdatePermissions(pane.pane_id, e.target.value)}
-                              className="bg-black text-[10px] text-zinc-300 border border-white/10 rounded px-1 py-0.5 focus:outline-none focus:border-cyan-500 cursor-pointer"
+                              className="bg-black text-xs text-zinc-300 border border-white/10 rounded px-1 py-0.5 focus:outline-none focus:border-cyan-500 cursor-pointer"
                             >
                               <option value="Full Auto">Full Auto</option>
                               <option value="Human-in-the-Loop">Human-in-the-Loop</option>
@@ -3227,7 +3012,7 @@ function AppRaw() {
 
                           <div className="flex items-center justify-between">
                             <span>Process State</span>
-                            <span className={`uppercase font-bold text-[9px] ${status === "Running" ? "text-green-400" : "text-zinc-500"}`}>{status}</span>
+                            <span className={`uppercase font-bold text-xs ${status === "Running" ? "text-green-400" : "text-zinc-500"}`}>{status}</span>
                           </div>
                         </div>
                       );
@@ -3250,15 +3035,15 @@ function AppRaw() {
                                 <h3 className="text-xs font-mono font-bold text-white tracking-widest uppercase flex items-center gap-1.5">
                                   {pane.name}
                                   {isAlertActive && (
-                                    <span className="text-[7px] bg-amber-500 text-black px-1.5 py-0.5 rounded font-sans font-black uppercase tracking-wider animate-bounce">
+                                    <span className="text-xs bg-amber-500 text-black px-1.5 py-0.5 rounded font-sans font-black uppercase tracking-wider animate-bounce">
                                       ▲ ALERT REQUIRED
                                     </span>
                                   )}
                                 </h3>
                               </div>
-                              <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest ml-4 block">{pane.pane_id}</span>
+                              <span className="text-xs font-mono text-zinc-500 uppercase tracking-widest ml-4 block">{pane.pane_id}</span>
                             </div>
-                            <span className={`text-[9px] font-mono px-2 py-0.5 rounded uppercase tracking-wider ${presetBadgeClass(pane.tool_preset, "bg-zinc-800 text-zinc-400")}`}>
+                            <span className={`text-xs font-mono px-2 py-0.5 rounded uppercase tracking-wider ${presetBadgeClass(pane.tool_preset, "bg-zinc-800 text-zinc-400")}`}>
                               {presetLabel}
                             </span>
                           </div>
@@ -3267,10 +3052,10 @@ function AppRaw() {
 
                           {/* Pane Context Size Meter */}
                           <div className="space-y-1 mb-4">
-                            <div className="flex justify-between items-center text-[10px] font-mono text-zinc-400">
+                            <div className="flex justify-between items-center text-xs font-mono text-zinc-400">
                               <span className="flex items-center gap-1 text-cyan-400"><Database className="w-3 h-3" /> Context Memory</span>
                               <span>
-                                {contextSize < 1000 ? `${contextSize} Chars` : `${(contextSize / 1000).toFixed(1)}k Chars`} (~{Math.ceil(contextSize / 4)} Tokens)
+                                {formatCharCount(contextSize)} (~{estimateTokens(contextSize)} Tokens)
                               </span>
                             </div>
                             <div className="w-full h-1 bg-zinc-950 rounded overflow-hidden" title="Relative fill up to 20k characters memory threshold">
@@ -3286,7 +3071,7 @@ function AppRaw() {
                         <div>
                           {/* Pane Notes Area */}
                           <div className="mt-2 bg-black/40 rounded p-2.5 border border-white/[0.02]">
-                            <div className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest mb-1.5 flex justify-between items-center">
+                            <div className="text-xs font-mono text-zinc-500 uppercase tracking-widest mb-1.5 flex justify-between items-center">
                               <span>Node Chronicle</span>
                               <span className="opacity-40">{(activeProjectNotes.filter(n => n.pane_id === pane.pane_id).length || pane.notes?.length || 0)} Entries</span>
                             </div>
@@ -3297,7 +3082,7 @@ function AppRaw() {
                                 const paneChronicle = activeProjectNotes.filter(n => n.pane_id === pane.pane_id);
                                 if (paneChronicle.length > 0) {
                                   return paneChronicle.map((n) => (
-                                    <div key={n.id} className="text-[10px] text-[#e0e0e0]/70 flex items-start gap-1 font-sans group">
+                                    <div key={n.id} className="text-xs text-[#e0e0e0]/70 flex items-start gap-1 font-sans group">
                                       <span className="text-cyan-500/40 select-none font-mono">•</span>
                                       {editingNoteId === n.id ? (
                                         <input
@@ -3310,7 +3095,7 @@ function AppRaw() {
                                             if (e.key === 'Escape') { setEditingNoteId(null); setEditingNoteText(""); }
                                           }}
                                           onBlur={() => handleSaveNoteEdit(n.id)}
-                                          className="flex-1 bg-black text-[10px] border border-cyan-500/40 rounded px-1 py-0.5 text-zinc-200 focus:outline-none"
+                                          className="flex-1 bg-black text-xs border border-cyan-500/40 rounded px-1 py-0.5 text-zinc-200 focus:outline-none"
                                         />
                                       ) : (
                                         <>
@@ -3336,13 +3121,13 @@ function AppRaw() {
                                 }
                                 if (pane.notes && pane.notes.length > 0) {
                                   return pane.notes.map((note, idx) => (
-                                    <div key={idx} className="text-[10px] text-[#e0e0e0]/70 flex items-start gap-1 font-sans">
+                                    <div key={idx} className="text-xs text-[#e0e0e0]/70 flex items-start gap-1 font-sans">
                                       <span className="text-cyan-500/40 select-none font-mono">•</span>
                                       <span>{note}</span>
                                     </div>
                                   ));
                                 }
-                                return <div className="text-[9px] font-mono py-1.5 text-zinc-600 italic">No notes created.</div>;
+                                return <div className="text-xs font-mono py-1.5 text-zinc-600 italic">No notes created.</div>;
                               })()}
                             </div>
                             <div className="flex items-center gap-1 mt-2.5 pt-2 border-t border-white/[0.04]">
@@ -3352,7 +3137,7 @@ function AppRaw() {
                                 value={newNoteInputs[pane.pane_id] || ""}
                                 onChange={(e) => setNewNoteInputs(prev => ({ ...prev, [pane.pane_id]: e.target.value }))}
                                 onKeyDown={(e) => e.key === 'Enter' && handleAddPaneNoteInline(activeProjectId, pane.pane_id)}
-                                className="flex-1 bg-black text-[9px] border border-white/5 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500/50"
+                                className="flex-1 bg-black text-xs border border-white/5 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500/50"
                               />
                               <button
                                 onClick={() => handleAddPaneNoteInline(activeProjectId, pane.pane_id)}
@@ -3367,7 +3152,7 @@ function AppRaw() {
                           <div className="flex gap-2.5 mt-4">
                             <button
                               onClick={() => handleRestartTerminal(pane.pane_id)}
-                              className="flex-1 py-1.5 border border-white/10 hover:border-white/20 text-white rounded text-[10px] font-mono uppercase tracking-wider flex items-center justify-center gap-1"
+                              className="flex-1 py-1.5 border border-white/10 hover:border-white/20 text-white rounded text-xs font-mono uppercase tracking-wider flex items-center justify-center gap-1"
                             >
                               <RefreshCw className="w-3 h-3" />
                               RESTART
@@ -3376,7 +3161,7 @@ function AppRaw() {
                               onClick={() => {
                                 setActiveTerminalId(pane.pane_id);
                               }}
-                              className="flex-1 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-[10px] font-mono uppercase tracking-wider flex items-center justify-center gap-1"
+                              className="flex-1 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded text-xs font-mono uppercase tracking-wider flex items-center justify-center gap-1"
                             >
                               <TermIcon className="w-3 h-3" />
                               CONNECT
@@ -3400,12 +3185,12 @@ function AppRaw() {
                   <div className="w-10 h-10 rounded-full border border-dashed border-white/20 flex items-center justify-center text-zinc-500 mb-4 animate-pulse">
                     <TermIcon className="w-5 h-5" />
                   </div>
-                  <div className="text-[10px] font-mono uppercase text-zinc-500 tracking-[0.2em] mb-3">
+                  <div className="text-xs font-mono uppercase text-zinc-500 tracking-[0.2em] mb-3">
                     No active node modules in project.
                   </div>
                   <button
                     onClick={() => setShowCreateModal(true)}
-                    className="px-4 py-1.5 text-[10px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded tracking-[0.1em]"
+                    className="px-4 py-1.5 text-xs font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded tracking-[0.1em]"
                   >
                     Launch Core Engine Note
                   </button>
@@ -3422,7 +3207,7 @@ function AppRaw() {
                     <FileText className="w-4 h-4 text-cyan-400" />
                     Ledger Artifacts & Memory Registry
                   </h2>
-                  <p className="text-[10px] text-zinc-500 font-mono mt-1">
+                  <p className="text-xs text-zinc-500 font-mono mt-1">
                     Manage and inspect workspace configurations, metadata snapshots, and idle session properties stored in memory.
                   </p>
                 </div>
@@ -3431,10 +3216,10 @@ function AppRaw() {
                   {/* Left: Project Context Entities */}
                   <div className="bg-[#0b0b0b] border border-white/5 rounded-lg p-5 space-y-4">
                     <div className="flex justify-between items-center border-b border-white/5 pb-2">
-                      <span className="text-[11px] font-mono uppercase text-zinc-400 font-bold tracking-wider">Registered Workspaces ({projectList.length})</span>
+                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">Registered Workspaces ({projectList.length})</span>
                       <button 
                         onClick={handleCreateProject}
-                        className="text-[9px] font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 px-2 py-0.5 rounded cursor-pointer"
+                        className="text-xs font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 px-2 py-0.5 rounded cursor-pointer"
                       >
                         + Create Space
                       </button>
@@ -3452,23 +3237,23 @@ function AppRaw() {
                                 <button
                                   onClick={() => handleSwitchProject(p.id)}
                                   disabled={isActive}
-                                  className="text-[9px] text-zinc-400 hover:text-white disabled:opacity-30 disabled:hover:text-zinc-400 cursor-pointer"
+                                  className="text-xs text-zinc-400 hover:text-white disabled:opacity-30 disabled:hover:text-zinc-400 cursor-pointer"
                                 >
                                   [SWITCH]
                                 </button>
                                 {projectList.length > 1 && (
                                   <button
                                     onClick={() => handleDeleteProjectPrompt(p.id)}
-                                    className="text-[9px] text-zinc-500 hover:text-red-400 cursor-pointer"
+                                    className="text-xs text-zinc-500 hover:text-red-400 cursor-pointer"
                                   >
                                     [DELETE]
                                   </button>
                                 )}
                               </div>
                             </div>
-                            <div className="text-[10px] text-zinc-500 mt-1 space-y-1">
+                            <div className="text-xs text-zinc-500 mt-1 space-y-1">
                               <div>Directory: <span className="text-zinc-400 font-bold">{p.directory}</span></div>
-                              <div className="flex justify-between text-[9px] text-zinc-600">
+                              <div className="flex justify-between text-xs text-zinc-600">
                                 <span>Panes registered: {paneKeys.length}</span>
                                 <span>Notes: {p.notes?.length || 0}</span>
                               </div>
@@ -3482,10 +3267,10 @@ function AppRaw() {
                   {/* Right: Selected Workspace Panes & Terminal Session Artifacts */}
                   <div className="bg-[#0b0b0b] border border-white/5 rounded-lg p-5 space-y-4">
                     <div className="flex justify-between items-center border-b border-white/5 pb-2">
-                      <span className="text-[11px] font-mono uppercase text-zinc-400 font-bold tracking-wider">
+                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">
                         Stored Sessions of [{(activeProject?.name || activeProjectId).toUpperCase()}]
                       </span>
-                      <span className="text-[9px] text-zinc-650 font-mono">
+                      <span className="text-xs text-zinc-650 font-mono">
                         {Object.keys(activeProject?.panes || {}).length} snapshots saved
                       </span>
                     </div>
@@ -3499,34 +3284,34 @@ function AppRaw() {
                               <div className="flex justify-between items-center">
                                 <span className="font-bold text-zinc-300">{pane.name}</span>
                                 <div className="flex items-center gap-2">
-                                  <span className={`text-[8px] px-1 py-0.2 rounded font-sans uppercase ${
+                                  <span className={`text-xs px-1 py-0.2 rounded font-sans uppercase ${
                                     isLiveProcess ? "bg-green-500/10 text-green-400" : "bg-zinc-800 text-zinc-500"
                                   }`}>
                                     {isLiveProcess ? "Active RAM" : "Idle Registry"}
                                   </span>
                                   <button
                                     onClick={() => handleDeletePanePrompt(activeProjectId, pane.pane_id)}
-                                    className="text-[9px] text-zinc-500 hover:text-red-400 cursor-pointer"
+                                    className="text-xs text-zinc-500 hover:text-red-400 cursor-pointer"
                                     title="De-register module memory object completely"
                                   >
                                     [PRUNE]
                                   </button>
                                 </div>
                               </div>
-                              <div className="text-[10px] text-zinc-500 mt-1.5 space-y-1">
+                              <div className="text-xs text-zinc-500 mt-1.5 space-y-1">
                                 <div className="flex justify-between">
                                   <span>Preset: <span className="text-zinc-400">{pane.tool_preset}</span></span>
                                   <span>Policy: <span className="text-zinc-400">{pane.permissions_mode}</span></span>
                                 </div>
                                 <div className="flex justify-between">
-                                  <span className="truncate max-w-[140px]">Session ID: <span className="text-zinc-400 text-[9px]">{pane.session_id || "None"}</span></span>
-                                  <span>Context: <span className="text-cyan-400 text-[10px] font-bold">{pane.context_size < 1000 ? `${pane.context_size} Chars` : `${(pane.context_size / 1000).toFixed(1)}k Chars`}</span></span>
+                                  <span className="truncate max-w-[140px]">Session ID: <span className="text-zinc-400 text-xs">{pane.session_id || "None"}</span></span>
+                                  <span>Context: <span className="text-cyan-400 text-xs font-bold">{formatCharCount(pane.context_size)}</span></span>
                                 </div>
                                 {!isLiveProcess && (
                                   <div className="pt-1.5 flex justify-end">
                                     <button
                                       onClick={() => handleRestartTerminal(pane.pane_id)}
-                                      className="text-[9px] text-cyan-400 hover:text-cyan-300 border border-cyan-400/20 px-2 py-0.5 rounded hover:bg-cyan-500/[0.05] cursor-pointer"
+                                      className="text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-400/20 px-2 py-0.5 rounded hover:bg-cyan-500/[0.05] cursor-pointer"
                                     >
                                       Recover & Wake up Engine
                                     </button>
@@ -3537,7 +3322,7 @@ function AppRaw() {
                           );
                         })
                       ) : (
-                        <div className="p-6 text-center text-zinc-600 text-[10px] italic border border-dashed border-white/5 rounded">
+                        <div className="p-6 text-center text-zinc-600 text-xs italic border border-dashed border-white/5 rounded">
                           No pane configuration snapshots saved.
                         </div>
                       )}
@@ -3555,21 +3340,21 @@ function AppRaw() {
                   >
                     <div className="flex items-center gap-2">
                       <Layers className="w-4 h-4 text-zinc-500" />
-                      <span className="text-[11px] font-mono uppercase text-zinc-400 font-bold tracking-wider">Pane Archive</span>
+                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">Pane Archive</span>
                       {archive.length > 0 && (
-                        <span className="text-[9px] font-mono px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded uppercase">{archive.length} archived</span>
+                        <span className="text-xs font-mono px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded uppercase">{archive.length} archived</span>
                       )}
                     </div>
-                    <span className="text-zinc-600 text-[10px] font-mono">{showArchivePanel ? "▲ hide" : "▼ show"}</span>
+                    <span className="text-zinc-600 text-xs font-mono">{showArchivePanel ? "▲ hide" : "▼ show"}</span>
                   </button>
 
                   {showArchivePanel && (
                     <div className="border-t border-white/5 p-5 space-y-3">
-                      <p className="text-[10px] text-zinc-500 font-mono">
+                      <p className="text-xs text-zinc-500 font-mono">
                         Exited panes moved here via "Clear Exited". Restore to bring them back into the ledger, or permanently delete.
                       </p>
                       {archive.length === 0 ? (
-                        <div className="p-6 text-center text-zinc-600 text-[10px] italic border border-dashed border-white/5 rounded">
+                        <div className="p-6 text-center text-zinc-600 text-xs italic border border-dashed border-white/5 rounded">
                           Archive is empty. Clear exited panes to populate it.
                         </div>
                       ) : (
@@ -3579,27 +3364,27 @@ function AppRaw() {
                               <div className="flex-1 min-w-0">
                                 <div className="flex flex-wrap items-center gap-1.5">
                                   <span className="font-bold text-zinc-300 truncate">{item.name}</span>
-                                  <span className="text-[8px] px-1 py-0.2 rounded bg-zinc-800 text-zinc-500 uppercase">{item.tool_preset || "Custom"}</span>
+                                  <span className="text-xs px-1 py-0.2 rounded bg-zinc-800 text-zinc-500 uppercase">{item.tool_preset || "Custom"}</span>
                                 </div>
-                                <div className="text-[9px] text-zinc-500 mt-0.5 space-x-2">
+                                <div className="text-xs text-zinc-500 mt-0.5 space-x-2">
                                   <span>Project: <span className="text-zinc-400">{item.project_id}</span></span>
                                   {item.last_command && <span>Last cmd: <span className="text-zinc-400 truncate max-w-[140px] inline-block align-bottom">{item.last_command}</span></span>}
                                 </div>
-                                <div className="text-[9px] text-zinc-600 mt-0.5">
+                                <div className="text-xs text-zinc-600 mt-0.5">
                                   Archived: {new Date(item.archived_at).toLocaleString()}
                                 </div>
                               </div>
                               <div className="flex gap-2 shrink-0">
                                 <button
                                   onClick={() => handleRestoreArchived(item.pane_id)}
-                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded cursor-pointer transition-colors"
+                                  className="text-xs font-mono uppercase px-2 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded cursor-pointer transition-colors"
                                   title="Restore this pane back into the project ledger"
                                 >
                                   Restore
                                 </button>
                                 <button
                                   onClick={() => handleDeleteArchived(item.pane_id)}
-                                  className="text-[9px] font-mono uppercase px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded cursor-pointer transition-colors"
+                                  className="text-xs font-mono uppercase px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded cursor-pointer transition-colors"
                                   title="Permanently delete this archived pane"
                                 >
                                   <Trash2 className="w-2.5 h-2.5 inline mr-0.5" />
@@ -3613,7 +3398,7 @@ function AppRaw() {
                       <div className="flex justify-end pt-1">
                         <button
                           onClick={fetchArchive}
-                          className="text-[9px] font-mono uppercase text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                          className="text-xs font-mono uppercase text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
                           title="Refresh archive"
                         >
                           <RefreshCw className="w-2.5 h-2.5" /> Refresh
@@ -3657,11 +3442,11 @@ function AppRaw() {
             <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
               <div className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
-                <span className="text-[11px] font-mono tracking-wider text-white uppercase font-bold">Janus Voice Log</span>
+                <span className="text-xs font-mono tracking-wider text-white uppercase font-bold">Janus Voice Log</span>
               </div>
               <button 
                 onClick={() => setTranscript([])} 
-                className="text-[9px] uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none"
+                className="text-xs uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none"
                 title="Clear transcript history"
               >
                 Clear
@@ -3671,7 +3456,7 @@ function AppRaw() {
               {transcript.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center p-4">
                   <div className="w-8 h-8 rounded-full border border-white/5 flex items-center justify-center text-zinc-600 mb-2 font-mono text-xs select-none">?</div>
-                  <p className="text-[10px] font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
+                  <p className="text-xs font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
                     Speak to Janus or trigger a query to stream transcripts...
                   </p>
                 </div>
@@ -3685,7 +3470,7 @@ function AppRaw() {
                       data-sender={item.sender}
                       className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
                     >
-                      <span className="text-[9px] font-mono opacity-30 mb-0.5 select-none uppercase">
+                      <span className="text-xs font-mono opacity-30 mb-0.5 select-none uppercase">
                         {item.sender}
                       </span>
                       <div className={`p-2.5 rounded-lg text-xs leading-relaxed font-sans ${
@@ -3698,7 +3483,7 @@ function AppRaw() {
                       {!isUser && item.grounding && (item.grounding.sources.length > 0 || item.grounding.queries.length > 0) && (
                         <div
                           data-testid="transcript-grounding"
-                          className="mt-1 max-w-full text-[9px] font-mono text-cyan-400/60 leading-relaxed break-words"
+                          className="mt-1 max-w-full text-xs font-mono text-cyan-400/60 leading-relaxed break-words"
                         >
                           <span className="opacity-70 uppercase tracking-wider">grounded via </span>
                           {item.grounding.sources.length > 0 ? (
@@ -3726,7 +3511,7 @@ function AppRaw() {
                 })
               )}
             </div>
-            <div className="p-3 border-t border-white/5 bg-black/40 text-[9px] font-mono text-zinc-500 leading-normal select-none">
+            <div className="p-3 border-t border-white/5 bg-black/40 text-xs font-mono text-zinc-500 leading-normal select-none">
               Derived from client mic input PCM streaming mapping at 16,000 Hz.
             </div>
           </aside>
@@ -3741,14 +3526,14 @@ function AppRaw() {
           className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "terminal" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
         >
           <TermIcon className="w-4 h-4" />
-          <span className="text-[9px] font-mono uppercase tracking-wider">Terminal</span>
+          <span className="text-xs font-mono uppercase tracking-wider">Terminal</span>
         </button>
         <button
           onClick={() => setMobileActiveView("buffer")}
           className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 relative transition-colors focus:outline-none ${mobileActiveView === "buffer" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
         >
           <CheckSquare className="w-4 h-4" />
-          <span className="text-[9px] font-mono uppercase tracking-wider">Sync Buffer</span>
+          <span className="text-xs font-mono uppercase tracking-wider">Sync Buffer</span>
           {promptBuffer.length > 0 && (
             <span className="absolute top-2.5 right-8 w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse"></span>
           )}
@@ -3758,7 +3543,7 @@ function AppRaw() {
           className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "menu" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
         >
           <Layers className="w-4 h-4" />
-          <span className="text-[9px] font-mono uppercase tracking-wider">Projects</span>
+          <span className="text-xs font-mono uppercase tracking-wider">Projects</span>
         </button>
       </div>
       ))()}
@@ -3767,14 +3552,14 @@ function AppRaw() {
       {(() => (
       <div className="bg-black border-t border-white/5 px-6 py-2 flex justify-between items-center shrink-0">
         <div className="flex gap-6">
-          <span className="text-[10px] font-mono opacity-30">UPTIME: ACTIVE DETECTED</span>
-          <span className="text-[10px] font-mono text-cyan-400 font-bold tracking-wider">
-            CUMULATIVE CONTEXT SIZE: {totalContextSize < 1000 ? `${totalContextSize} Chars` : `${(totalContextSize / 1000).toFixed(1)}k chars`} (~{totalTokensEstimated < 1000 ? `${totalTokensEstimated}` : `${(totalTokensEstimated / 1000).toFixed(1)}k`} tokens)
+          <span className="text-xs font-mono opacity-30">UPTIME: ACTIVE DETECTED</span>
+          <span className="text-xs font-mono text-cyan-400 font-bold tracking-wider">
+            CUMULATIVE CONTEXT SIZE: {formatCharCountLower(totalContextSize)} (~{formatTokenCount(totalTokensEstimated)} tokens)
           </span>
         </div>
         <div className="flex gap-4">
-          <span className="text-[10px] font-mono text-cyan-400">[CORE CLOUD SYSTEMS ONLINE]</span>
-          <span className="text-[10px] font-mono opacity-30 uppercase tracking-tighter italic font-bold">Orbital Harness v1.0.4</span>
+          <span className="text-xs font-mono text-cyan-400">[CORE CLOUD SYSTEMS ONLINE]</span>
+          <span className="text-xs font-mono opacity-30 uppercase tracking-tighter italic font-bold">Orbital Harness v1.0.4</span>
         </div>
       </div>
       ))()}
@@ -3811,14 +3596,14 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
       return (
         <div className="min-h-screen bg-[#060606] text-white flex flex-col items-center justify-center p-6 font-mono select-none">
           <div className="w-full max-w-md bg-red-950/20 border border-red-500/30 rounded p-6 shadow-2xl relative animate-in zoom-in duration-250">
-            <div className="absolute top-3 right-3 text-[9px] bg-red-500 text-black px-1.5 rounded font-bold">FAULT</div>
+            <div className="absolute top-3 right-3 text-xs bg-red-500 text-black px-1.5 rounded font-bold">FAULT</div>
             <h1 className="text-sm font-bold uppercase tracking-wider text-red-400 mb-4 flex items-center gap-2">
               ⚠️ Critical Sandbox Error
             </h1>
             <p className="text-xs text-zinc-400 leading-relaxed mb-4">
               The Antigravity application engine encountered an unhandled execution exception. This sandbox remains active.
             </p>
-            <div className="bg-black/60 p-3 rounded text-[10px] text-zinc-500 overflow-x-auto break-all border border-white/5 max-h-40 mb-6 font-mono leading-relaxed">
+            <div className="bg-black/60 p-3 rounded text-xs text-zinc-500 overflow-x-auto break-all border border-white/5 max-h-40 mb-6 font-mono leading-relaxed">
               {this.state.error?.stack || this.state.error?.message || "Unknown Runtime Exception"}
             </div>
             <button
@@ -3855,7 +3640,7 @@ function parseInlines(text: string): React.ReactNode[] {
     }
     if (part.startsWith("`") && part.endsWith("`")) {
       return (
-        <code key={i} className="bg-black/80 px-1.5 py-0.5 rounded border border-white/10 font-mono text-[9px] text-cyan-400">
+        <code key={i} className="bg-black/80 px-1.5 py-0.5 rounded border border-white/10 font-mono text-xs text-cyan-400">
           {part.slice(1, -1)}
         </code>
       );
@@ -3872,7 +3657,7 @@ function MiniMarkdown({ text }: { text: string }) {
   const renderList = (info: ReturnType<typeof classifyMarkdownLine>, idx: number) => (
     <div key={idx} className="flex items-start gap-2.5 text-xs text-zinc-300 ml-4 py-0.5 font-sans leading-relaxed">
       {info.isChecklist ? (
-        <span className={`w-3.5 h-3.5 border rounded flex-shrink-0 flex items-center justify-center text-[8px] tracking-tighter ${
+        <span className={`w-3.5 h-3.5 border rounded flex-shrink-0 flex items-center justify-center text-xs tracking-tighter ${
           info.isChecked ? "bg-cyan-500/20 border-cyan-400 text-cyan-400 font-bold" : "border-white/20 text-transparent bg-black"
         }`}>✓</span>
       ) : (
@@ -3888,7 +3673,7 @@ function MiniMarkdown({ text }: { text: string }) {
         switch (info.kind) {
           case "h4":
             return (
-              <h4 key={idx} className="text-[11px] font-mono font-bold text-cyan-400 uppercase tracking-widest mt-4 mb-2 border-b border-white/5 pb-1">
+              <h4 key={idx} className="text-xs font-mono font-bold text-cyan-400 uppercase tracking-widest mt-4 mb-2 border-b border-white/5 pb-1">
                 {info.text}
               </h4>
             );
@@ -3912,7 +3697,7 @@ function MiniMarkdown({ text }: { text: string }) {
             return <div key={idx} className="h-1.5" />;
           default:
             return (
-              <p key={idx} className="text-[11.5px] text-zinc-400 leading-relaxed py-0.5 font-sans">
+              <p key={idx} className="text-xs text-zinc-400 leading-relaxed py-0.5 font-sans">
                 {parseInlines(info.text)}
               </p>
             );

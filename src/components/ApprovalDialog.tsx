@@ -79,7 +79,7 @@ function renderEffectiveRider(
       data-testid="approval-effective"
       className={`mb-4 rounded border p-2 font-mono ${postureStyle?.ring ?? "border-white/10"}`}
     >
-      <div className="flex items-center gap-2 text-[11px]">
+      <div className="flex items-center gap-2 text-xs">
         <span className="text-zinc-500 uppercase tracking-wider">Approving into:</span>
         {safePosture && postureStyle && (
           <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${postureStyle.text}`}>
@@ -93,7 +93,7 @@ function renderEffectiveRider(
         )}
       </div>
       {gateStyle && (
-        <div className="mt-1 flex items-center gap-2 text-[10px]">
+        <div className="mt-1 flex items-center gap-2 text-xs">
           <span className="text-zinc-400">{capLabel}</span>
           <span className={`inline-flex items-center gap-1 ${gateStyle.text}`}>
             <span className={`inline-block w-1 h-1 rounded-full ${gateStyle.dot}`} />
@@ -109,13 +109,13 @@ function renderEffectiveRider(
 function renderRationale(rationale: { trigger: string; summary: string }): ReactNode {
   return (
     <div className="mb-4 space-y-2 border-l-2 border-zinc-700 pl-3">
-      <div className="text-[10px] font-mono">
+      <div className="text-xs font-mono">
         <span className="text-zinc-500 uppercase tracking-wider block font-bold">Heard trigger / context</span>
         <span className="text-zinc-300 italic">"{rationale.trigger}"</span>
       </div>
-      <div className="text-[10px] font-mono">
+      <div className="text-xs font-mono">
         <span className="text-zinc-500 uppercase tracking-wider block font-bold">Proposed rationale / summary</span>
-        <pre className="text-[9.5px] bg-black/30 p-1.5 rounded border border-white/5 text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto">
+        <pre className="text-xs bg-black/30 p-1.5 rounded border border-white/5 text-zinc-400 whitespace-pre-wrap max-h-24 overflow-y-auto">
            {rationale.summary}
         </pre>
       </div>
@@ -202,7 +202,7 @@ export function ApprovalDialog({
           <div className="flex-1">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-[#d97706]">Proposed Command Execution</h3>
-              <span className="text-[10px] font-mono opacity-40">Target: {terminalId}</span>
+              <span className="text-xs font-mono opacity-40">Target: {terminalId}</span>
             </div>
 
             <p className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">

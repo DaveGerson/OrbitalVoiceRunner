@@ -10,16 +10,19 @@ import { INK } from "./theme";
 import { Chip, Icon, VoiceCue } from "./primitives";
 import { useDialog } from "./useFocusTrap";
 import type { TranscriptEntry } from "./useOrbitalData";
+import { chipColorForKind, deriveConversationalState } from "./useConversationalState";
 
 // ── Pure helpers (CC burndown) ────────────────────────────────────────────
 
-/** Background color for the status Chip. */
+/**
+ * Background color for the status Chip. Single source of truth (bead m9v): the boolean ladder is
+ * reduced to a discrete ConversationalKind via the same reducer the nav pill uses, then mapped
+ * through chipColorForKind — so the radio chip and the design pill can never paint one state two
+ * colors. The radio chip has no tool-activity input, so toolActive/reconnecting are false here.
+ */
 export function getChipBg(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean): string {
-  if (!live) return "#8a6a4f";
-  if (micBlocked) return "#e23a3a";
-  if (!connected) return "#8a6a4f";
-  if (muted) return "#8a6a4f";
-  return "#e23a3a";
+  const { kind } = deriveConversationalState({ live, micBlocked, connected, muted, reconnecting: false, toolActive: false });
+  return chipColorForKind(kind);
 }
 
 /** Label text for the status Chip. */
@@ -29,6 +32,20 @@ export function getChipLabel(live: boolean, micBlocked: boolean, connected: bool
   if (!connected) return "TUNING IN…";
   if (muted) return "MUTED";
   return "● LIVE";
+}
+
+/**
+ * velocity-mech: the conversational HELPER line that rides alongside the terse status pill — the
+ * chef-voice gloss of what the pill means, so an eyes-off operator hears the state in the kitchen's
+ * voice. Same arg order + branch precedence as getChipLabel/getChipBg (mic-blocked beats tuning beats
+ * muted), so the pill, its color, and this line never disagree about which state is showing.
+ */
+export function getChipHelper(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean, reconnecting: boolean): string {
+  if (!live) return reconnecting ? "Hang tight — gettin' back on air…" : "Off air — tap to tune in, Chef";
+  if (micBlocked) return "Mic's blocked — check browser permissions";
+  if (!connected) return "Tunin' in — one sec…";
+  if (muted) return "Mic's off — tap to talk";
+  return "I'm listening, Chef";
 }
 
 /** Background color for the mute/unmute button while live. */
@@ -105,15 +122,15 @@ function CallSheet({ dark, stations, onCall, onClose }: {
         {buildCalls(stations).map((g) => (
           <Fragment key={g.group}>
             <div>
-              <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase", color: g.color, marginBottom: 6 }}>{g.group}</div>
+              <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".1em", textTransform: "uppercase", color: g.color, marginBottom: 6 }}>{g.group}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                 {g.lines.map((l, i) => (
                   <Fragment key={i}>
                     <button data-testid="radio-call" onClick={() => { onCall(l); onClose(); }}
                       style={{ all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: dark ? "#2f1d12" : "#fff9ec", border: "1.5px solid " + INK, borderRadius: 8, boxShadow: "1.5px 1.5px 0 0 " + INK, boxSizing: "border-box" }}>
-                      <VoiceCue phrase={l} dark={dark} tone="live" style={{ fontSize: 11.5 }} />
+                      <VoiceCue phrase={l} dark={dark} tone="live" style={{ fontSize: 12 }} />
                       <div style={{ flex: 1 }} />
-                      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".06em", textTransform: "uppercase", color: "#8a6a4f" }}>say it ›</span>
+                      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".06em", textTransform: "uppercase", color: "#8a6a4f" }}>say it ›</span>
                     </button>
                   </Fragment>
                 ))}
@@ -155,18 +172,18 @@ function Bubble({ m, dark }: { m: TranscriptEntry; dark: boolean }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: me ? "flex-end" : "flex-start", gap: 2 }}>
       <div style={{ maxWidth: "88%", padding: "7px 11px", borderRadius: 12, border: "2px solid " + INK, background: getBubbleBg(me, dark), color: getBubbleColor(me, dark), boxShadow: "2px 2px 0 0 " + INK, fontFamily: "DM Sans", fontSize: 13, fontWeight: me ? 700 : 600, lineHeight: 1.35, borderBottomRightRadius: me ? 3 : 12, borderBottomLeftRadius: me ? 12 : 3 }}>
-        {!me && <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 9, letterSpacing: ".08em", textTransform: "uppercase", color: "#a8151a", display: "block", marginBottom: 2 }}>Chef de Cuisine</span>}
+        {!me && <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".08em", textTransform: "uppercase", color: "#a8151a", display: "block", marginBottom: 2 }}>Chef de Cuisine</span>}
         {m.text}
         {g && g.sources && g.sources.length > 0 && (
           <div data-testid="radio-grounding" style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
-            <span style={{ fontFamily: "JetBrains Mono", fontSize: 8.5, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".06em" }}>grounded via</span>
+            <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".06em" }}>grounded via</span>
             {g.sources.slice(0, 3).map((s, i) => (
-              <a key={i} href={s.uri} target="_blank" rel="noreferrer" title={s.title || s.uri} style={{ fontFamily: "DM Sans", fontSize: 9.5, fontWeight: 700, color: "#2f7a5e", textDecoration: "underline", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title || s.uri}</a>
+              <a key={i} href={s.uri} target="_blank" rel="noreferrer" title={s.title || s.uri} style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#2f7a5e", textDecoration: "underline", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title || s.uri}</a>
             ))}
           </div>
         )}
       </div>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#8a6a4f", padding: "0 4px" }}>{fmtTime(m.timestamp)}</span>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", padding: "0 4px" }}>{fmtTime(m.timestamp)}</span>
     </div>
   );
 }
@@ -245,12 +262,15 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
           <div style={{ fontFamily: "Caveat, cursive", fontSize: 15, color: "#ffc94a", transform: "rotate(-1.5deg)" }}>"runnin' the line"</div>
           <div style={{ fontFamily: "Fraunces, serif", fontWeight: 900, fontSize: 18 }}>Kitchen Radio</div>
         </div>
-        <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
+        <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
         {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
-            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen. */}
-        <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
-          {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
-        </Chip>
+            "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen.
+            velocity-mech: the conversational gloss rides the chip as a title (hover/AT readout). */}
+        <span title={getChipHelper(live, micBlocked, connected, muted, reconnecting)} style={{ display: "inline-flex" }}>
+          <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
+            {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
+          </Chip>
+        </span>
       </div>
 
       {/* now-speaking waveform */}

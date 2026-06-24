@@ -188,7 +188,24 @@ export const proposeHandoff: ActionDef<typeof ProposeHandoffParams> = {
   params: ProposeHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Compose" handoff-drawer button. Pure ledger op
+  // (createHandoff snapshot) — safe on session:null (no pane write, no session use). Registry-canonical
+  // path: POST /api/handoffs (the create verb on the /api/handoffs collection list_handoffs reads).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs" },
+  // The drawer POSTs a camelCase body { toPane, draftText, fromPane?, rationale? }; the voice schema
+  // keys are snake_case. Alias camel->snake ONLY when the snake key is absent (a voice call carrying
+  // snake_case is never clobbered) — same pattern as handoff_context_between_panes above.
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.to_pane == null && out.toPane != null) out.to_pane = out.toPane;
+    if (out.draft_text == null && out.draftText != null) out.draft_text = out.draftText;
+    if (out.from_pane == null && out.fromPane != null) out.from_pane = out.fromPane;
+    delete out.toPane;
+    delete out.draftText;
+    delete out.fromPane;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -245,7 +262,20 @@ export const reviseHandoff: ActionDef<typeof ReviseHandoffParams> = {
   params: ReviseHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Revise" handoff-drawer button. Pure ledger op
+  // (updateHandoffCargo) — safe on session:null. Registry-canonical path: POST /api/handoffs/:handoff_id/revise
+  // — the POST /api/<resource>/:id/<verb> family the sibling state-transition twins use (stage/reject),
+  // so revise reads as a verb on the single-handoff resource, NOT a REST PUT-replace of the row.
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/revise" },
+  // The drawer PUTs a camelCase body { newDraftText }; the voice key is snake_case. Alias camel->snake
+  // only when the snake key is absent (a voice call carrying snake_case is never clobbered).
+  coerceArgs: (raw) => {
+    const out = { ...raw };
+    if (out.new_draft_text == null && out.newDraftText != null) out.new_draft_text = out.newDraftText;
+    delete out.newDraftText;
+    return out;
+  },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -292,7 +322,11 @@ export const stageHandoff: ActionDef<typeof StageHandoffParams> = {
   params: StageHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Stage" handoff-drawer button. Pure ledger op
+  // (secret-guard + updateHandoffState -> staged) — safe on session:null. Registry-canonical path:
+  // POST /api/handoffs/:handoff_id/stage (a state-transition verb under the single-handoff resource).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/stage" },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -487,7 +521,12 @@ export const rejectHandoff: ActionDef<typeof RejectHandoffParams> = {
   params: RejectHandoffParams,
   capability: "compose_draft",
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Reject" handoff-drawer button. Pure ledger op (flip the
+  // row to 'rejected', OR — when a delivery is pending at the gate — route through the SAME applyResolution
+  // claim gate). Safe on session:null (applyResolution reads the pendingApprovals store, not the session).
+  // Registry-canonical path: POST /api/handoffs/:handoff_id/reject (a state-transition verb, sibling of /stage).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/reject" },
   handler: (args, ctx): ActionResult => {
     // PHASE 2 (veto-toggle honesty): compose_draft is veto-class — block on an EXPLICIT Off veto
     // (default Auto → behavior-preserving). ACTION, so STOP-ALL blocks it (no !isFrozen bypass).
@@ -530,7 +569,8 @@ export const rejectHandoff: ActionDef<typeof RejectHandoffParams> = {
 //   store null / not found / not-staged / deliver-time secret block -> { output: <string> } (kind:"ok")
 //   deliver_now (Full Auto) -> { output: "Delivered handoff <id> to pane <p>." } (row -> delivered)
 //   await_approval (HiTL)   -> { status:"pending_approval", messageId, pane_id, prompt } (kind:"pending")
-//   block (Read-Only/Off)   -> { output: outcome.text } (row -> blocked_read_only)
+//   block (Read-Only/Off)   -> kind:"blocked" reason:outcome.text (row -> blocked_read_only); VOICE wire
+//                              is byte-identical { output: outcome.text }; REST status-via-kinds -> 403.
 //   noop (error|clarify)    -> { output: outcome.text } (no row change)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -545,7 +585,17 @@ export const deliverHandoff: ActionDef<typeof DeliverHandoffParams> = {
   params: DeliverHandoffParams,
   capability: ALWAYS_ALLOWED, // gate is delegated to dispatchProposal — do NOT double-gate in runAction.
   readOnly: false,
-  surfaces: new Set(["voice"]),
+  // cv2 (D5): voice+rest. The REST twin is the "Deliver" handoff-drawer button. UNLIKE the four pure-
+  // ledger composers, deliver WRITES to a live pane — but it routes through ctx.dispatchProposal, which on
+  // REST is restDispatchProposal (server.ts ~1637), the SAME gated seam execute_plan rides over
+  // POST /api/plans/:id/execute. So the REST path enforces capabilityGates.deliver_handoff at PARITY with
+  // voice (Auto->write / Ask->HiTL pending / Off->block). Status-via-kinds maps the DispatchOutcome to HTTP:
+  // the handler returns kind:"pending" (HiTL -> 202), kind:"blocked" (gate Off/read-only -> 403), or
+  // kind:"ok" (delivered/secret-block/not-staged narration -> 200). No rest.toHttp needed — the default
+  // resultToHttp kind->status map IS the contract. Registry-canonical path: POST .../:handoff_id/deliver
+  // (the POST /api/<resource>/:id/<verb> family, sibling of /stage and /reject).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/handoffs/:handoff_id/deliver" },
   handler: (args, ctx): ActionResult => {
     const { handoff_id } = args;
     const store = ctx.store;
@@ -616,7 +666,19 @@ function applyDeliverOutcome(
   if (effect.kind === "block") {
     store.updateHandoffState(handoff_id, effect.state);
     ctx.broadcast({ type: "handoffs_updated" });
-    return { kind: "ok", output: outcomeText };
+    // status-via-kinds: a gate Off / read-only block returns kind:"blocked" so the REST twin maps to
+    // 403 (resultToHttp). VOICE WIRE IS BYTE-IDENTICAL: voiceResponse maps kind:"blocked" to
+    // { output: result.reason } — the SAME { output: <outcomeText> } shape the legacy kind:"ok" emitted.
+    //
+    // bd wsm-e2e-pinned-gb4 (BUCKET-3: looks-like-debt-but-correct): the 200-on-voice / 403-on-REST
+    // split is the INTENDED ASYMMETRY of this one ActionResult, NOT a missing-symmetry gap. deliver is a
+    // VOICE-PRIMARY gated action: the voice operator hears a spoken "blocked" narration (a 200-equivalent
+    // sentence, never an error tone), while REST is the escape-hatch surface whose UI twin (the Deliver
+    // drawer button) needs a TRUE HTTP failure to status-branch on, so the SAME kind:"blocked" projects to
+    // 403 there. One kind, two faithful surface renderings — pinned by tests/test_cv2_handoff_rest.ts
+    // ("gate Off (dispatch blocked) -> 403") and gemini.ts resultToToolResponse ({ output: result.reason }).
+    // Do NOT "fix" REST to 200 (it would make the drawer button unable to detect a refused delivery).
+    return { kind: "blocked", reason: outcomeText };
   }
   // effect.kind === "noop" (error | clarify): no row change.
   return { kind: "ok", output: outcomeText };

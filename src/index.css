@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+:root {
+  /* Type-scale floor (bead 5n7 / operator decision D3): the classic UI floors font sizes at 12px
+     via Tailwind `text-xs`. `--text-nano` is the ONE sanctioned sub-floor escape — .625rem (10px),
+     reserved for genuinely load-bearing 10px text and used sparingly via `text-[var(--text-nano)]`.
+     Do NOT change html{font-size}; this var scales with the user's root size like every other rem. */
+  --text-nano: 0.625rem;
+}
+
 @layer utilities {
   .hide-scrollbar::-webkit-scrollbar {
     display: none;

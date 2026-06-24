@@ -17,12 +17,23 @@
 
 import { test } from "node:test";
 import assert from "node:assert";
+import type { GoogleGenAI, LiveConnectParameters } from "@google/genai";
 import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "../src/voiceResumption";
 import {
   realLiveConnector,
   setLiveConnector,
   getLiveConnector,
+  type LiveSession,
 } from "../server";
+
+// Minimal but TYPE-COMPLETE connect params for the connector seam (bead dbt-typing narrowed it to
+// LiveConnectParameters, which requires `callbacks`). The connector short-circuit path under test
+// never invokes a callback, so empty no-op callbacks suffice.
+const MOCK_PARAMS: LiveConnectParameters = { model: "m", callbacks: { onmessage: () => {} } };
+/** A no-op session satisfying the structural LiveSession handle (the 4 public methods the seam returns). */
+function makeStubSession(): LiveSession {
+  return { sendClientContent: () => {}, sendRealtimeInput: () => {}, sendToolResponse: () => {}, close: () => {} };
+}
 
 // ── Part 1: the REAL connector short-circuits a blank key WITHOUT attempting a connect ───────────
 test("realLiveConnector: a BLANK key short-circuits — ai.live.connect is NEVER called", async () => {
@@ -30,22 +41,23 @@ test("realLiveConnector: a BLANK key short-circuits — ai.live.connect is NEVER
     let connectCalls = 0;
     const fakeAi: any = { live: { connect: async () => { connectCalls++; return { fake: true }; } } };
     await assert.rejects(
-      () => realLiveConnector(fakeAi, { model: "m" }, blank as any),
+      () => realLiveConnector(fakeAi, MOCK_PARAMS, blank),
       /no Gemini API key|blank|API key/i,
       `blank key ${JSON.stringify(blank)} must reject at the connector boundary`,
     );
     assert.strictEqual(connectCalls, 0, `blank key ${JSON.stringify(blank)} must NOT reach ai.live.connect`);
-    assert.strictEqual(isBlankApiKey(blank as any), true, "precondition: the key is blank");
+    assert.strictEqual(isBlankApiKey(blank), true, "precondition: the key is blank");
   }
 });
 
 test("realLiveConnector: a NON-blank key DOES attempt the real ai.live.connect (no short-circuit)", async () => {
   let connectCalls = 0;
-  const params = { model: "m" };
-  const fakeAi: any = { live: { connect: async (p: any) => { connectCalls++; assert.strictEqual(p, params); return { live: true }; } } };
+  const params = MOCK_PARAMS;
+  const live = makeStubSession();
+  const fakeAi: any = { live: { connect: async (p: any) => { connectCalls++; assert.strictEqual(p, params); return live; } } };
   const session = await realLiveConnector(fakeAi, params, "AIzaSy-a-real-looking-key");
   assert.strictEqual(connectCalls, 1, "a real key reaches ai.live.connect exactly once");
-  assert.deepStrictEqual(session, { live: true }, "the connector returns the live session verbatim");
+  assert.strictEqual(session, live, "the connector returns the live session verbatim");
 });
 
 // ── Part 1b: a MOCK connector (installed via setLiveConnector) still connects KEYLESSLY ──────────
@@ -53,12 +65,13 @@ test("the MOCK connector path remains functional with NO key (the harness invari
   const prev = getLiveConnector();
   try {
     let mockCalls = 0;
-    setLiveConnector(async (_ai, _params) => { mockCalls++; return { mock: true }; });
+    const mockSession = makeStubSession();
+    setLiveConnector(async (_ai, _params) => { mockCalls++; return mockSession; });
     const connector = getLiveConnector();
     // Invoke exactly as the server would for a keyless mock session — the mock ignores the key arg.
-    const session = await connector({} as any, { model: "m" }, "" as any);
+    const session = await connector({} as unknown as GoogleGenAI, MOCK_PARAMS, "");
     assert.strictEqual(mockCalls, 1, "the mock connector connects even with a blank key");
-    assert.deepStrictEqual(session, { mock: true }, "the mock session is returned");
+    assert.strictEqual(session, mockSession, "the mock session is returned");
   } finally {
     setLiveConnector(prev); // restore the real connector so we never poison a sibling suite.
   }

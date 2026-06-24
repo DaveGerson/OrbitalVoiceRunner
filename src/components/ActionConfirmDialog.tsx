@@ -96,7 +96,7 @@ function renderEffectiveRider(
       data-testid="action-effective"
       className={`mb-3 rounded border p-2 font-mono ${ds.postureStyle?.ring ?? "border-white/10"}`}
     >
-      <div className="flex items-center gap-2 text-[11px]">
+      <div className="flex items-center gap-2 text-xs">
         <span data-testid="action-scope" className="text-zinc-500 uppercase tracking-wider">{ds.scopeLabel}</span>
         {ds.safePosture && ds.postureStyle && (
           <span className={`inline-flex items-center gap-1.5 font-bold uppercase tracking-wider ${ds.postureStyle.text}`}>
@@ -107,7 +107,7 @@ function renderEffectiveRider(
         {ds.postureStyle && <span className="text-zinc-500 normal-case">· {ds.postureStyle.label}</span>}
       </div>
       {ds.gateStyle && (
-        <div className="mt-1 flex items-center gap-2 text-[10px]">
+        <div className="mt-1 flex items-center gap-2 text-xs">
           <span className="text-zinc-400">{ds.capLabel}</span>
           <span className={`inline-flex items-center gap-1 ${ds.gateStyle.text}`}>
             <span className={`inline-block w-1 h-1 rounded-full ${ds.gateStyle.dot}`} />
@@ -122,7 +122,7 @@ function renderEffectiveRider(
 /** Renders the amber divergence "Heads up" paragraph. Called only when showDivergence. */
 function renderDivergenceRider(divergenceText: string): ReactNode {
   return (
-    <p data-testid="action-divergence" className="mb-3 text-[11px] font-mono text-amber-300 bg-amber-950/20 border border-amber-500/30 rounded p-2">
+    <p data-testid="action-divergence" className="mb-3 text-xs font-mono text-amber-300 bg-amber-950/20 border border-amber-500/30 rounded p-2">
       Heads up — {divergenceText}
     </p>
   );
@@ -211,7 +211,7 @@ export function ActionConfirmDialog({
           <div className="flex-1">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-sky-400">Confirm Action</h3>
-              <span data-testid="action-capability" className="text-[10px] font-mono opacity-40">{capability}</span>
+              <span data-testid="action-capability" className="text-xs font-mono opacity-40">{capability}</span>
             </div>
 
             <p data-testid="action-summary" className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">
@@ -222,7 +222,7 @@ export function ActionConfirmDialog({
 
             {showDivergence && renderDivergenceRider(divergenceText)}
 
-            <p className="text-[10px] font-mono text-zinc-500 mb-4">
+            <p className="text-xs font-mono text-zinc-500 mb-4">
               This action is gated <span className="text-sky-400">Ask</span> — Janus staged it but will not apply it until you confirm.
             </p>
 

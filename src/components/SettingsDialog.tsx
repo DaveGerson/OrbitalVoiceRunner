@@ -463,8 +463,8 @@ export function SettingsDialog({
   const renderFormTab = (): React.ReactNode => (
     <div className="flex flex-col lg:flex-row h-full overflow-hidden">
       {/* Form Sidebar Subtabs */}
-      <div className="w-full lg:w-48 bg-black/40 border-b lg:border-b-0 lg:border-r border-white/5 p-2 lg:p-4 flex flex-row lg:flex-col gap-1 shrink-0 font-mono text-[10px] uppercase tracking-wider overflow-x-auto lg:overflow-y-auto items-center lg:items-stretch">
-        <span className="hidden lg:block text-[9px] text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Session Settings</span>
+      <div className="w-full lg:w-48 bg-black/40 border-b lg:border-b-0 lg:border-r border-white/5 p-2 lg:p-4 flex flex-row lg:flex-col gap-1 shrink-0 font-mono text-xs uppercase tracking-wider overflow-x-auto lg:overflow-y-auto items-center lg:items-stretch">
+        <span className="hidden lg:block text-xs text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Session Settings</span>
         <button
           onClick={() => setFormTab("session")}
           className={subTabClass(formTab === "session")}
@@ -474,7 +474,7 @@ export function SettingsDialog({
         </button>
 
         <div className="hidden lg:block h-px bg-white/5 my-2" />
-        <span className="hidden lg:block text-[9px] text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Profiles / Terminal</span>
+        <span className="hidden lg:block text-xs text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Profiles / Terminal</span>
         <button
           onClick={() => setFormTab("profiles")}
           className={subTabClass(formTab === "profiles")}
@@ -484,7 +484,7 @@ export function SettingsDialog({
         </button>
 
         <div className="hidden lg:block h-px bg-white/5 my-2" />
-        <span className="hidden lg:block text-[9px] text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Safety</span>
+        <span className="hidden lg:block text-xs text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Safety</span>
         <button
           onClick={() => setFormTab("gates")}
           data-testid="settings-tab-gates"
@@ -495,7 +495,7 @@ export function SettingsDialog({
         </button>
 
         <div className="hidden lg:block h-px bg-white/5 my-2" />
-        <span className="hidden lg:block text-[9px] text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Subsystems / Plumbing</span>
+        <span className="hidden lg:block text-xs text-zinc-600 px-3 uppercase tracking-widest font-bold mb-1">Subsystems / Plumbing</span>
         <button
           onClick={() => setFormTab("advanced")}
           className={subTabClass(formTab === "advanced")}
@@ -602,20 +602,20 @@ export function SettingsDialog({
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
             {/* Visual status pill */}
-            <span className={`text-[8px] px-2 py-0.5 rounded border flex items-center gap-1 font-mono uppercase tracking-widest ${statusBadgeStyle}`}>
+            <span className={`text-xs px-2 py-0.5 rounded border flex items-center gap-1 font-mono uppercase tracking-widest ${statusBadgeStyle}`}>
               <span className={`w-1 h-1 rounded-full ${dotColor}`} />
               {statusLabel}
             </span>
 
             {numActive > 0 && (
-              <span className="text-[8px] px-2 py-0.5 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-400 font-mono font-bold flex items-center gap-1" title="Memory Context Footprint: Raw Characters (~Estimated Tokens)">
+              <span className="text-xs px-2 py-0.5 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-400 font-mono font-bold flex items-center gap-1" title="Memory Context Footprint: Raw Characters (~Estimated Tokens)">
                 <Database className="w-2.5 h-2.5" />
                 {formatContextFootprint(totalContextSize)}
               </span>
             )}
 
             {isDefault ? (
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 font-sans tracking-wide">Core</span>
+              <span className="text-xs px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 font-sans tracking-wide">Core</span>
             ) : (
               <button
                 type="button"
@@ -628,20 +628,20 @@ export function SettingsDialog({
           </div>
         </div>
         <div className="space-y-2 mt-2">
-          <div className="flex items-center gap-2 bg-black px-2 py-1 rounded border border-white/5 font-mono text-[11px]">
+          <div className="flex items-center gap-2 bg-black px-2 py-1 rounded border border-white/5 font-mono text-xs">
             <Terminal className="w-3 h-3 text-cyan-500 shrink-0" />
             <input
               type="text"
               value={preset.command}
               placeholder="Command instruction"
               onChange={e => handleUpdatePreset(preset.id, { command: e.target.value })}
-              className="bg-transparent w-full focus:outline-none font-mono text-[#a3e635] text-[11px]"
+              className="bg-transparent w-full focus:outline-none font-mono text-[#a3e635] text-xs"
             />
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[9px] text-zinc-400">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-zinc-400">
             <div>
-              <label className="block text-[8px] uppercase tracking-wider text-zinc-500 mb-0.5">Permissions Policy</label>
+              <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">Permissions Policy</label>
               <select
                 value={preset.permissionsMode || "Human-in-the-Loop"}
                 onChange={e => handleUpdatePreset(preset.id, { permissionsMode: e.target.value as any })}
@@ -653,7 +653,7 @@ export function SettingsDialog({
               </select>
             </div>
             <div>
-              <label className="block text-[8px] uppercase tracking-wider text-zinc-500 mb-0.5">Window Layout Type</label>
+              <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">Window Layout Type</label>
               <select
                 value={preset.windowMode || "Standard Split-Pane"}
                 onChange={e => handleUpdatePreset(preset.id, { windowMode: e.target.value as any })}
@@ -667,9 +667,9 @@ export function SettingsDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[9px] text-zinc-400">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-zinc-400">
             <div>
-              <label className="block text-[8px] uppercase tracking-wider text-zinc-500 mb-0.5">Visual Theme Accent</label>
+              <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">Visual Theme Accent</label>
               <select
                 value={preset.visualTheme || "Default Green Mono"}
                 onChange={e => handleUpdatePreset(preset.id, { visualTheme: e.target.value as any })}
@@ -692,16 +692,16 @@ export function SettingsDialog({
                   className="rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-zinc-950 cursor-pointer w-3.5 h-3.5"
                 />
                 <div className="-mt-1">
-                  <span className="text-[9px] text-zinc-300 font-bold block leading-none">Persistent Session</span>
-                  <span className="text-[7px] text-zinc-500 font-mono block leading-none mt-1">Auto-restore on boot</span>
+                  <span className="text-xs text-zinc-300 font-bold block leading-none">Persistent Session</span>
+                  <span className="text-xs text-zinc-500 font-mono block leading-none mt-1">Auto-restore on boot</span>
                 </div>
               </label>
             </div>
           </div>
 
           {/* Startup Configuration Modifiers Setup */}
-          <div className="border border-white/5 rounded-lg bg-black/60 p-2.5 space-y-2 mt-2 font-mono text-[9px]">
-            <div className="text-[8px] text-cyan-400 uppercase font-black tracking-widest border-b border-white/5 pb-1 flex justify-between select-none">
+          <div className="border border-white/5 rounded-lg bg-black/60 p-2.5 space-y-2 mt-2 font-mono text-xs">
+            <div className="text-xs text-cyan-400 uppercase font-black tracking-widest border-b border-white/5 pb-1 flex justify-between select-none">
               <span>Startup Modifiers & Arguments</span>
               <span className="text-zinc-650 font-normal">Harness v1.0.4 Config</span>
             </div>
@@ -715,8 +715,8 @@ export function SettingsDialog({
                   className="rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-[#0c0c0c] cursor-pointer w-3 h-3 text-cyan-500"
                 />
                 <div>
-                  <span className="text-[9px] text-zinc-300 font-bold block">Bypass Permissions</span>
-                  <span className="text-[7px] text-zinc-500 block -mt-0.5">--dangerously-skip-permissions</span>
+                  <span className="text-xs text-zinc-300 font-bold block">Bypass Permissions</span>
+                  <span className="text-xs text-zinc-500 block -mt-0.5">--dangerously-skip-permissions</span>
                 </div>
               </label>
 
@@ -728,31 +728,31 @@ export function SettingsDialog({
                   className="rounded border-zinc-700 text-cyan-500 focus:ring-cyan-500 bg-[#0c0c0c] cursor-pointer w-3 h-3 text-cyan-500"
                 />
                 <div>
-                  <span className="text-[9px] text-zinc-300 font-bold block bg-transparent">Restore Session Frame</span>
-                  <span className="text-[7px] text-zinc-500 block -mt-0.5">--resume-previous-session</span>
+                  <span className="text-xs text-zinc-300 font-bold block bg-transparent">Restore Session Frame</span>
+                  <span className="text-xs text-zinc-500 block -mt-0.5">--resume-previous-session</span>
                 </div>
               </label>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 text-zinc-400 select-none">
               <div>
-                <label className="block text-[7.5px] uppercase tracking-wider text-zinc-500 mb-0.5">Local Port Offset</label>
+                <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">Local Port Offset</label>
                 <input
                   type="text"
                   value={preset.portOffset || ""}
                   placeholder="e.g. 8080"
                   onChange={e => handleUpdatePreset(preset.id, { portOffset: e.target.value })}
-                  className="w-full bg-black border border-white/10 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500 text-[9px] font-mono font-medium"
+                  className="w-full bg-black border border-white/10 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500 text-xs font-mono font-medium"
                 />
               </div>
               <div>
-                <label className="block text-[7.5px] uppercase tracking-wider text-zinc-500 mb-0.5">Injected ENV Overrides</label>
+                <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">Injected ENV Overrides</label>
                 <input
                   type="text"
                   value={preset.customEnvVars || ""}
                   placeholder="DEBUG=1,COLOR=true"
                   onChange={e => handleUpdatePreset(preset.id, { customEnvVars: e.target.value })}
-                  className="w-full bg-black border border-white/10 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500 text-[9px] font-mono font-medium"
+                  className="w-full bg-black border border-white/10 rounded px-2 py-1 text-zinc-300 focus:outline-none focus:border-cyan-500 text-xs font-mono font-medium"
                 />
               </div>
             </div>
@@ -761,17 +761,17 @@ export function SettingsDialog({
           {/* Connected subshell nodes list */}
           {matched.length > 0 && (
             <div className="mt-2.5 border-t border-white/5 pt-2 space-y-1">
-              <label className="text-[8px] uppercase tracking-wider text-zinc-500 font-bold block mb-1 font-mono">Bound Workspace Subshell Nodes</label>
+              <label className="text-xs uppercase tracking-wider text-zinc-500 font-bold block mb-1 font-mono">Bound Workspace Subshell Nodes</label>
               <div className="space-y-1 max-h-24 overflow-y-auto pr-0.5 scrollbar-thin">
                 {matched.map(t => {
                   const isTermAlert = pendingCommands.some(pc => pc.terminalId === t.id);
                   return (
-                    <div key={t.id} className="flex justify-between items-center text-[9px] font-mono bg-[#090909] px-2 py-1 rounded border border-white/5">
+                    <div key={t.id} className="flex justify-between items-center text-xs font-mono bg-[#090909] px-2 py-1 rounded border border-white/5">
                       <span className="text-zinc-300 font-bold">{t.id}</span>
                       <div className="flex items-center gap-2">
-                        <span className="text-[8px] text-zinc-500 select-none truncate max-w-[120px]">{t.cwd}</span>
+                        <span className="text-xs text-zinc-500 select-none truncate max-w-[120px]">{t.cwd}</span>
                         <span className={`w-1.5 h-1.5 rounded-full ${isTermAlert ? "bg-amber-500 animate-ping" : t.status === "Running" ? "bg-green-500 animate-pulse" : t.status === "Idle" ? "bg-yellow-500" : "bg-red-500"}`} />
-                        <span className={`text-[8px] uppercase font-bold leading-none ${isTermAlert ? "text-amber-400 animate-pulse" : t.status === "Running" ? "text-green-400" : "text-zinc-500"}`}>
+                        <span className={`text-xs uppercase font-bold leading-none ${isTermAlert ? "text-amber-400 animate-pulse" : t.status === "Running" ? "text-green-400" : "text-zinc-500"}`}>
                           {isTermAlert ? "Alert / Approval Reqd" : t.status}
                         </span>
                       </div>
@@ -789,8 +789,8 @@ export function SettingsDialog({
   const renderProfilesTab = (): React.ReactNode => (
     <div className="space-y-5">
       <div className="border-b border-white/5 pb-2">
-        <h3 className="text-white uppercase text-[10px] tracking-widest font-bold">Workspace profiles & cli config</h3>
-        <p className="text-[10px] text-zinc-500 mt-0.5">Manage target space directories and terminal shells</p>
+        <h3 className="text-white uppercase text-xs tracking-widest font-bold">Workspace profiles & cli config</h3>
+        <p className="text-xs text-zinc-500 mt-0.5">Manage target space directories and terminal shells</p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-white/[0.01] p-3 rounded-lg border border-white/5">
@@ -816,12 +816,12 @@ export function SettingsDialog({
         <div className="flex justify-between items-center mb-2">
           <div>
             <h4 className="text-zinc-300 font-bold text-xs uppercase tracking-wider">CLI startup shell profiles</h4>
-            <span className="text-[10px] text-zinc-600 block">Available shells when initializing command loops</span>
+            <span className="text-xs text-zinc-600 block">Available shells when initializing command loops</span>
           </div>
           <button
             type="button"
             onClick={handleAddPreset}
-            className="flex items-center gap-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 font-bold px-2 py-1 rounded text-[10px] transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 font-bold px-2 py-1 rounded text-xs transition-colors cursor-pointer"
           >
             <Plus className="w-3 h-3" />
             Add Profile
@@ -843,8 +843,8 @@ export function SettingsDialog({
   const renderSessionTab = (): React.ReactNode => (
     <div className="space-y-4">
       <div className="border-b border-white/5 pb-2">
-        <h3 className="text-white uppercase text-[10px] tracking-widest font-bold">General voice session</h3>
-        <p className="text-[10px] text-zinc-500 mt-0.5">Customize real-time voice, sound, and speaking traits</p>
+        <h3 className="text-white uppercase text-xs tracking-widest font-bold">General voice session</h3>
+        <p className="text-xs text-zinc-500 mt-0.5">Customize real-time voice, sound, and speaking traits</p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -862,7 +862,7 @@ export function SettingsDialog({
             <option value="Kore">Kore (Clear Conversational Female)</option>
             <option value="Fenrir">Fenrir (Crisp Assertive Male)</option>
           </select>
-          <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
+          <span className="text-xs text-zinc-600 mt-1 block">(applies on reconnect)</span>
         </div>
 
         <div>
@@ -908,7 +908,7 @@ export function SettingsDialog({
           <option value="gemini-2.0-flash-exp">gemini-2.0-flash-exp (Experimental Series)</option>
           <option value="gemini-2.5-flash">gemini-2.5-flash (Standard Medium-Fast Model)</option>
         </select>
-        <span className="text-[9px] text-zinc-600 mt-1 block">(applies on reconnect)</span>
+        <span className="text-xs text-zinc-600 mt-1 block">(applies on reconnect)</span>
       </div>
 
       {/* sa4: operator-editable voice system prompt. Blank => DEFAULT_SYSTEM_PROMPT
@@ -922,7 +922,7 @@ export function SettingsDialog({
             data-testid="settings-voice-system-prompt-reset"
             onClick={() => setSystemPrompt("")}
             disabled={!systemPrompt.trim()}
-            className="px-2 py-0.5 rounded text-[10px] tracking-wider font-bold transition-all bg-zinc-500/10 hover:bg-zinc-500/20 text-zinc-300 border border-white/10 hover:border-white/20 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+            className="px-2 py-0.5 rounded text-xs tracking-wider font-bold transition-all bg-zinc-500/10 hover:bg-zinc-500/20 text-zinc-300 border border-white/10 hover:border-white/20 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
             title="Clear the custom prompt and fall back to the built-in default"
           >
             Reset to default
@@ -935,9 +935,9 @@ export function SettingsDialog({
           rows={8}
           spellCheck={false}
           placeholder={DEFAULT_SYSTEM_PROMPT}
-          className="w-full bg-black border border-white/10 rounded px-3 py-2 text-white text-[11px] font-mono leading-relaxed focus:outline-none focus:border-cyan-500 resize-y"
+          className="w-full bg-black border border-white/10 rounded px-3 py-2 text-white text-xs font-mono leading-relaxed focus:outline-none focus:border-cyan-500 resize-y"
         />
-        <span className="text-[9px] text-zinc-600 mt-1 block">
+        <span className="text-xs text-zinc-600 mt-1 block">
           Leave blank to use the built-in default (shown above). Tokens{" "}
           <code className="text-zinc-400">{"{{activeProjectId}}"}</code> and{" "}
           <code className="text-zinc-400">{"{{workspaces}}"}</code> are filled with live values. (applies on reconnect)
@@ -956,8 +956,8 @@ export function SettingsDialog({
           className="mt-0.5 accent-cyan-500 cursor-pointer"
         />
         <span className="min-w-0">
-          <span className="text-zinc-300 font-bold block text-[11px]">Grounded web search (Google)</span>
-          <span className="text-[10px] text-zinc-500 leading-relaxed block">
+          <span className="text-zinc-300 font-bold block text-xs">Grounded web search (Google)</span>
+          <span className="text-xs text-zinc-500 leading-relaxed block">
             Off by default. When on, Janus may search the web to inform its answers; grounded
             turns show their sources in the transcript. Built-in Gemini tool — individual searches
             are not separately approved. (applies on reconnect)
@@ -977,11 +977,11 @@ export function SettingsDialog({
           className="mt-0.5 accent-cyan-500 cursor-pointer"
         />
         <span className="min-w-0">
-          <span className="text-zinc-300 font-bold block text-[11px]">
+          <span className="text-zinc-300 font-bold block text-xs">
             Stay silent while I think{" "}
-            <span className="text-amber-400/70 font-mono text-[9px] tracking-wider">EXPERIMENTAL</span>
+            <span className="text-amber-400/70 font-mono text-xs tracking-wider">EXPERIMENTAL</span>
           </span>
-          <span className="text-[10px] text-zinc-500 leading-relaxed block">
+          <span className="text-xs text-zinc-500 leading-relaxed block">
             Off by default. When on, Janus holds its voice while you think aloud or discuss, and
             speaks when addressed. It errs toward speaking, but may over-mute commands phrased as
             deliberation. (applies on reconnect)
@@ -992,14 +992,14 @@ export function SettingsDialog({
       {/* Reconnect button for voice/model/API key changes */}
       <div className="p-3 bg-cyan-950/20 border border-cyan-500/20 rounded-lg flex items-center justify-between gap-3">
         <div>
-          <span className="text-zinc-300 font-bold block text-[11px]">Apply Voice Session Changes</span>
-          <span className="text-[10px] text-zinc-500">Voice, model, and API key changes take effect after reconnecting.</span>
+          <span className="text-zinc-300 font-bold block text-xs">Apply Voice Session Changes</span>
+          <span className="text-xs text-zinc-500">Voice, model, and API key changes take effect after reconnecting.</span>
         </div>
         <button
           type="button"
           disabled={!isLive}
           onClick={() => onReconnectLive?.()}
-          className="shrink-0 px-3 py-1.5 rounded text-[10px] tracking-wider font-bold transition-all bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:border-cyan-500/50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+          className="shrink-0 px-3 py-1.5 rounded text-xs tracking-wider font-bold transition-all bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 hover:border-cyan-500/50 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           title={!isLive ? "Start a voice session first" : "Reconnect voice session now"}
         >
           {isLive ? "Apply & Reconnect" : "(start a voice session first)"}
@@ -1009,12 +1009,12 @@ export function SettingsDialog({
       <div className="p-3 bg-zinc-950/50 border border-white/5 rounded-lg flex items-center justify-between">
         <div>
           <span className="text-zinc-300 font-bold block">Microphone Live Mute Status</span>
-          <span className="text-[10px] text-zinc-500">Mutes voice inputs instantly. Hotkey: Spacebar toggle.</span>
+          <span className="text-xs text-zinc-500">Mutes voice inputs instantly. Hotkey: Spacebar toggle.</span>
         </div>
         <button
           type="button"
           onClick={() => setIsMicMuted(!isMicMuted)}
-          className={`px-3 py-1.5 rounded text-[10px] tracking-wider font-bold transition-all ${isMicMuted ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30" : "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"}`}
+          className={`px-3 py-1.5 rounded text-xs tracking-wider font-bold transition-all ${isMicMuted ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30" : "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"}`}
         >
           {isMicMuted ? "● MUTED (LIVE SILENCE)" : "● TRANSMITTING VOICE"}
         </button>
@@ -1025,11 +1025,11 @@ export function SettingsDialog({
       <div className="p-3 bg-zinc-950/50 border border-white/5 rounded-lg flex flex-col gap-2">
         <div>
           <span className="text-zinc-300 font-bold block">Proactive Announcement Messages</span>
-          <span className="text-[10px] text-zinc-500">Text shown on completion/error notifications. Use <code className="text-cyan-400">{"{pane}"}</code> and <code className="text-cyan-400">{"{summary}"}</code> placeholders.</span>
+          <span className="text-xs text-zinc-500">Text shown on completion/error notifications. Use <code className="text-cyan-400">{"{pane}"}</code> and <code className="text-cyan-400">{"{summary}"}</code> placeholders.</span>
         </div>
         {ANNOUNCEMENT_TEMPLATE_FIELDS.map(([key, label]) => (
           <div key={key}>
-            <label className="block text-[10px] uppercase tracking-wider text-zinc-500 mb-0.5">{label}</label>
+            <label className="block text-xs uppercase tracking-wider text-zinc-500 mb-0.5">{label}</label>
             <input
               type="text"
               value={announcements[key]}
@@ -1045,8 +1045,8 @@ export function SettingsDialog({
   const renderAdvancedTab = (): React.ReactNode => (
     <div className="space-y-4">
       <div className="border-b border-white/5 pb-2">
-        <h3 className="text-white uppercase text-[10px] tracking-widest font-bold">Advanced Subsystems plumbing</h3>
-        <p className="text-[10px] text-zinc-500 mt-0.5">Control timeouts, buffers, and runtime policies</p>
+        <h3 className="text-white uppercase text-xs tracking-widest font-bold">Advanced Subsystems plumbing</h3>
+        <p className="text-xs text-zinc-500 mt-0.5">Control timeouts, buffers, and runtime policies</p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1065,7 +1065,7 @@ export function SettingsDialog({
             className="w-full bg-black border border-white/10 rounded px-3 py-1.5 text-white"
             value={agentIdleTimeoutMs} onChange={e => setAgentIdleTimeoutMs(Number(e.target.value))} placeholder="3500"
           />
-          <p className="text-[9px] text-zinc-600 mt-0.5">Larger window before an agent pane reads as done (reduces premature "done").</p>
+          <p className="text-xs text-zinc-600 mt-0.5">Larger window before an agent pane reads as done (reduces premature "done").</p>
         </div>
         <div>
           <label className="block text-zinc-400 mb-1">Max Console Cache Buffer Lines</label>
@@ -1123,27 +1123,27 @@ export function SettingsDialog({
       {/* P0b: Memory Synthesizer section */}
       <div className="border border-white/10 rounded-lg p-3 space-y-3 mt-2">
         <div className="border-b border-white/5 pb-2">
-          <h4 className="text-zinc-300 uppercase text-[10px] tracking-widest font-bold">Memory Synthesizer</h4>
-          <p className="text-[10px] text-zinc-500 mt-0.5">Python context synthesizer settings and live health</p>
+          <h4 className="text-zinc-300 uppercase text-xs tracking-widest font-bold">Memory Synthesizer</h4>
+          <p className="text-xs text-zinc-500 mt-0.5">Python context synthesizer settings and live health</p>
         </div>
 
         {/* Live status pill */}
         <div className="flex items-center gap-2">
-          <span className="text-zinc-400 text-[10px]">Live status:</span>
+          <span className="text-zinc-400 text-xs">Live status:</span>
           {memorySynthStatus === "python" && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
               python
             </span>
           )}
           {memorySynthStatus === "fallback" && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
               fallback
             </span>
           )}
           {memorySynthStatus === "unknown" && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-zinc-700/40 text-zinc-400 border border-zinc-600/30">
               <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 inline-block" />
               unknown
             </span>
@@ -1159,8 +1159,8 @@ export function SettingsDialog({
             className="mt-0.5 accent-cyan-500 cursor-pointer"
           />
           <span className="min-w-0">
-            <span className="text-zinc-300 font-bold block text-[11px]">Python Context Synthesizer</span>
-            <span className="text-[10px] text-zinc-500 leading-relaxed block">
+            <span className="text-zinc-300 font-bold block text-xs">Python Context Synthesizer</span>
+            <span className="text-xs text-zinc-500 leading-relaxed block">
               On by default. Strict upgrade — when disabled the system falls back to the
               in-process synthesizer silently. Never a hard dependency; disabling does not
               break memory reads.
@@ -1178,7 +1178,7 @@ export function SettingsDialog({
             onChange={e => { const n = Number(e.target.value); setMemorySynthTimeoutMs(Number.isFinite(n) && n > 0 ? n : 150); }}
             placeholder="150"
           />
-          <p className="text-[9px] text-zinc-600 mt-0.5">Per-call race deadline before fallback (default 150 ms). Increase on high-latency hosts.</p>
+          <p className="text-xs text-zinc-600 mt-0.5">Per-call race deadline before fallback (default 150 ms). Increase on high-latency hosts.</p>
         </div>
       </div>
 
@@ -1187,7 +1187,7 @@ export function SettingsDialog({
           <label className="block text-zinc-400 mb-1">Testing & Simulation</label>
           <button
             onClick={onToggleMockMode}
-            className={`w-full text-center py-2 bg-transparent border border-dashed transition-colors focus:outline-none text-[10px] uppercase tracking-widest font-bold ${
+            className={`w-full text-center py-2 bg-transparent border border-dashed transition-colors focus:outline-none text-xs uppercase tracking-widest font-bold ${
               isMockMode
                 ? "border-amber-500 hover:border-amber-400 text-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.3)]"
                 : "border-white/20 hover:border-amber-500/50 hover:text-amber-400 text-white/60"
@@ -1203,15 +1203,15 @@ export function SettingsDialog({
   const renderSecretsTab = (): React.ReactNode => (
     <div className="space-y-4">
       <div className="border-b border-red-500/10 pb-2">
-        <h3 className="text-rose-400 uppercase text-[10px] tracking-widest font-bold">Secrets Key Cabinet</h3>
-        <p className="text-[10px] text-zinc-500 mt-0.5">Sensitive credentials used exclusively for remote connections</p>
+        <h3 className="text-rose-400 uppercase text-xs tracking-widest font-bold">Secrets Key Cabinet</h3>
+        <p className="text-xs text-zinc-500 mt-0.5">Sensitive credentials used exclusively for remote connections</p>
       </div>
 
       <div className="p-3 bg-zinc-950 border border-white/5 rounded-lg space-y-3">
         <div>
           <label className="block text-zinc-400 mb-1 flex justify-between items-center">
             <span>Google Gemini API Key Secret Token</span>
-            <span className="text-[9px] text-zinc-500 uppercase tracking-widest">Live voice stream only</span>
+            <span className="text-xs text-zinc-500 uppercase tracking-widest">Live voice stream only</span>
           </label>
           <div className="relative flex items-center">
             <input
@@ -1219,7 +1219,7 @@ export function SettingsDialog({
               value={geminiApiKey}
               onChange={e => setGeminiApiKey(e.target.value)}
               placeholder={geminiApiKey ? "CONCURRENTLY CONFIGURED KEY" : "No token key loaded. Enter your AI Studio Key."}
-              className="w-full bg-black border border-white/10 rounded pl-3 pr-10 py-1.5 font-mono text-[11px] text-cyan-400 focus:outline-none focus:border-cyan-500"
+              className="w-full bg-black border border-white/10 rounded pl-3 pr-10 py-1.5 font-mono text-xs text-cyan-400 focus:outline-none focus:border-cyan-500"
             />
             <button
               type="button"
@@ -1234,7 +1234,7 @@ export function SettingsDialog({
 
       <div className="bg-amber-950/10 border border-amber-900/30 rounded-lg p-4 flex gap-3 text-amber-300">
         <AlertCircle className="w-5 h-5 shrink-0 text-amber-400" />
-        <div className="font-sans text-[11px] leading-relaxed space-y-1">
+        <div className="font-sans text-xs leading-relaxed space-y-1">
           <span className="font-mono text-xs font-bold block text-amber-200 uppercase tracking-widest">API Key & Data Routing Disclaimer</span>
           <p>
             This Gemini Key is stored in your configuration and is used to establish server-side WebSocket connections directly to public Gemini Web APIs.
@@ -1249,7 +1249,7 @@ export function SettingsDialog({
 
   const renderJsonTab = (): React.ReactNode => (
     <div className="flex flex-col gap-3 h-full p-6 overflow-hidden">
-      <div className="flex justify-between items-center bg-black/40 px-3 py-2 border border-white/5 rounded-lg shrink-0 text-[10px] text-zinc-400">
+      <div className="flex justify-between items-center bg-black/40 px-3 py-2 border border-white/5 rounded-lg shrink-0 text-xs text-zinc-400">
         <span className="flex items-center gap-1.5 font-sans">
           <AlertCircle className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
           Configurations compile directly to `.janus_settings.json`. Parameters are fully bidirectionally synced.
@@ -1257,7 +1257,7 @@ export function SettingsDialog({
         <div className="flex gap-2">
           <button
             onClick={handleCopyConfig}
-            className="flex bg-cyan-950 text-cyan-400 hover:bg-cyan-900 border border-cyan-800 rounded px-2 py-0.5 items-center gap-1 cursor-pointer transition text-[9px] font-bold"
+            className="flex bg-cyan-950 text-cyan-400 hover:bg-cyan-900 border border-cyan-800 rounded px-2 py-0.5 items-center gap-1 cursor-pointer transition text-xs font-bold"
           >
             {isCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
             {isCopied ? "COPIED" : "COPY RAW"}
@@ -1268,7 +1268,7 @@ export function SettingsDialog({
       {/* Text Area */}
       <div className="flex-1 relative flex flex-col min-h-0">
         <textarea
-          className="w-full flex-1 bg-black text-[#84cc16] border border-white/10 rounded-lg p-4 font-mono text-[11px] leading-relaxed resize-none focus:outline-none focus:border-cyan-500/50"
+          className="w-full flex-1 bg-black text-[#84cc16] border border-white/10 rounded-lg p-4 font-mono text-xs leading-relaxed resize-none focus:outline-none focus:border-cyan-500/50"
           spellCheck="false"
           value={rawJsonStr}
           onChange={e => handleJsonChange(e.target.value)}
@@ -1277,15 +1277,15 @@ export function SettingsDialog({
 
       {/* Validation Feedback */}
       {jsonValidationError ? (
-        <div className="p-2.5 bg-red-950/20 border border-red-950 text-red-400 rounded-lg text-[10px] flex gap-2 items-start leading-relaxed shrink-0">
+        <div className="p-2.5 bg-red-950/20 border border-red-950 text-red-400 rounded-lg text-xs flex gap-2 items-start leading-relaxed shrink-0">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <div>
             <span className="font-bold">JSON Syntax Validation Error:</span>
-            <pre className="mt-1 font-mono text-[9px] bg-red-950/40 p-1 rounded whitespace-pre-wrap">{jsonValidationError}</pre>
+            <pre className="mt-1 font-mono text-xs bg-red-950/40 p-1 rounded whitespace-pre-wrap">{jsonValidationError}</pre>
           </div>
         </div>
       ) : (
-        <div className="p-2.5 bg-green-950/10 border border-green-900/30 text-green-400 rounded-lg text-[10px] flex items-center gap-1.5 shrink-0 font-sans">
+        <div className="p-2.5 bg-green-950/10 border border-green-900/30 text-green-400 rounded-lg text-xs flex items-center gap-1.5 shrink-0 font-sans">
           <Check className="w-4 h-4" />
           <span>Config parameters validated and formatted successfully! Click 'Apply Settings' to trigger update.</span>
         </div>
@@ -1312,13 +1312,13 @@ export function SettingsDialog({
             <h4 className="text-white text-xs font-bold mb-1 flex items-center gap-1">
               <Download className="w-3.5 h-3.5 text-cyan-400" /> Download Config File
             </h4>
-            <p className="text-[10px] text-zinc-500 font-sans leading-relaxed">
+            <p className="text-xs text-zinc-500 font-sans leading-relaxed">
               Download the current configurations as a standalone JSON to seed new project directories instantly.
             </p>
           </div>
           <button
             onClick={handleDownloadConfig}
-            className="w-full mt-4 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/40 rounded text-[10px] tracking-wider uppercase font-bold cursor-pointer"
+            className="w-full mt-4 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/40 rounded text-xs tracking-wider uppercase font-bold cursor-pointer"
           >
             Download janus-config.json
           </button>
@@ -1329,7 +1329,7 @@ export function SettingsDialog({
             <h4 className="text-white text-xs font-bold mb-1 flex items-center gap-1">
               <Upload className="w-3.5 h-3.5 text-cyan-400" /> Upload Parameters JSON
             </h4>
-            <p className="text-[10px] text-zinc-500 font-sans leading-relaxed">
+            <p className="text-xs text-zinc-500 font-sans leading-relaxed">
               Restore parameters or restore developer presets instantly by importing an existing JSON file.
             </p>
           </div>
@@ -1342,7 +1342,7 @@ export function SettingsDialog({
             />
             <button
               type="button"
-              className="w-full py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-white/10 hover:border-white/20 rounded text-[10px] tracking-wider uppercase font-bold"
+              className="w-full py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-white/10 hover:border-white/20 rounded text-xs tracking-wider uppercase font-bold"
             >
               Choose JSON File
             </button>
@@ -1351,8 +1351,8 @@ export function SettingsDialog({
       </div>
 
       {/* Code Snippet Guidance */}
-      <div className="bg-black/40 border border-white/5 rounded-lg p-4 font-mono text-[10px] leading-relaxed space-y-2">
-        <span className="text-zinc-400 uppercase tracking-widest text-[9px] block">Quick Start (Local Run)</span>
+      <div className="bg-black/40 border border-white/5 rounded-lg p-4 font-mono text-xs leading-relaxed space-y-2">
+        <span className="text-zinc-400 uppercase tracking-widest text-xs block">Quick Start (Local Run)</span>
         <p className="text-zinc-500 font-sans">To seed a local environment, place the downloaded file as <code className="text-[#a3e635] bg-black px-1 py-0.5 rounded">.janus_settings.json</code> in this project's root folder and run:</p>
         <div className="bg-black p-3 rounded font-mono text-[#a3e635] border border-white/5 whitespace-pre leading-relaxed">
           {`# Install dependencies\n$ npm install\n\n# Launch backend on port 3000\n$ npm run dev`}
@@ -1371,7 +1371,7 @@ export function SettingsDialog({
             <Settings className="w-5 h-5 text-cyan-400 shrink-0" />
             <div>
               <h2 className="text-sm font-mono text-white uppercase tracking-widest leading-none">Janus Parameters orchestrator config</h2>
-              <p className="text-[10px] text-zinc-500 font-mono mt-1">Configure session context, dynamic CLI profiles, and pipings</p>
+              <p className="text-xs text-zinc-500 font-mono mt-1">Configure session context, dynamic CLI profiles, and pipings</p>
             </div>
           </div>
           <button 
@@ -1383,7 +1383,7 @@ export function SettingsDialog({
         </div>
 
         {/* Tab Controls */}
-        <div className="flex overflow-x-auto bg-black px-4 lg:px-6 border-b border-white/5 shrink-0 font-mono text-[11px] uppercase tracking-wide hide-scrollbar">
+        <div className="flex overflow-x-auto bg-black px-4 lg:px-6 border-b border-white/5 shrink-0 font-mono text-xs uppercase tracking-wide hide-scrollbar">
           <button 
             onClick={() => setActiveTab("form")}
             className={topTabClass(activeTab === "form")}
@@ -1420,7 +1420,7 @@ export function SettingsDialog({
 
         {/* Modal Footer */}
         <div className="px-6 py-4 bg-white/[0.02] border-t border-white/10 flex justify-between items-center shrink-0">
-          <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
+          <div className="flex items-center gap-1.5 text-xs text-zinc-500">
             <HelpCircle className="w-4 h-4 text-zinc-600" />
             <span className="font-sans">Configuration protocol version v1.2.0</span>
           </div>

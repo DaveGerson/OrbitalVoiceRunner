@@ -165,15 +165,41 @@ function buildStation(
   };
 }
 
+// Urgency ordinal per status — lower = more urgent, so it floats to the top of the line.
+// Order (operator brief): Needs Input → Exited → Idle → Running. A pane that needs a human
+// (open approval) is loudest; a dead pane is next (it wants clearing); idle is calm; running
+// is happy. Any unmapped status sorts last (defensive — never reorders a known status above it).
+const URGENCY_ORDER: Record<StationStatus, number> = {
+  "Needs Input": 0,
+  Exited: 1,
+  Idle: 2,
+  Running: 3,
+};
+
+/** The urgency ordinal for a station status (lower = more urgent). */
+export function urgencyRank(status: StationStatus): number {
+  return URGENCY_ORDER[status] ?? Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Stable, non-mutating urgency sort: pending → exited → idle → running. Ties keep input order
+ * (Array.prototype.sort is stable in modern V8/Node), so the memoized board never churns on equal
+ * ranks. Returns a new array; the caller's input is untouched.
+ */
+export function sortStationsByUrgency(stations: Station[]): Station[] {
+  return [...stations].sort((a, b) => urgencyRank(a.status) - urgencyRank(b.status));
+}
+
 export function deriveStations(
   terminals: Terminal[],
   ledger: Record<string, Workspace>,
   pendingCommands: PendingCommand[],
 ): Station[] {
   const needsByPane = new Set(pendingCommands.map((c) => c.terminalId));
-  return terminals.map((t) =>
+  const stations = terminals.map((t) =>
     buildStation(t, resolvePaneContext(ledger, t), needsByPane.has(t.id)),
   );
+  return sortStationsByUrgency(stations);
 }
 
 /** Distinct projects present on the board, in a stable order, with pane/running counts. */

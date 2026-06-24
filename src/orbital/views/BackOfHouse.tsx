@@ -93,7 +93,7 @@ function GateSeg({ value, onChange }: { value: GateValue; onChange: (v: GateValu
         return (
           <Fragment key={g.v}>
             <button data-testid={`gate-${g.v}`} title={g.tip} aria-pressed={on} onClick={() => onChange(g.v)}
-              style={{ padding: "4px 9px", border: "none", borderLeft: i ? "2px solid " + INK : "none", background: on ? g.bg : "transparent", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 11, whiteSpace: "nowrap" }}>
+              style={{ padding: "4px 9px", border: "none", borderLeft: i ? "2px solid " + INK : "none", background: on ? g.bg : "transparent", color: INK, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap" }}>
               {g.v}
             </button>
           </Fragment>
@@ -122,7 +122,7 @@ function Card({ dark, children }: { dark: boolean; children: ReactNode }) {
   return <div style={{ background: dark ? "#241409" : "#fff9ec", border: "2px solid " + INK, borderRadius: 12, padding: 16, marginBottom: 12, boxShadow: "3px 3px 0 0 " + INK }}>{children}</div>;
 }
 function Lbl({ children, dark }: { children: ReactNode; dark: boolean }) {
-  return <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 6 }}>{children}</div>;
+  return <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", color: dark ? "#c89f74" : "#5b3a23", marginBottom: 6 }}>{children}</div>;
 }
 function fieldStyle(dark: boolean): CSSProperties {
   return { width: "100%", padding: "9px 11px", border: "2px solid " + INK, borderRadius: 9, background: dark ? "#1a0f08" : "#fff4de", color: dark ? "#ffe9c7" : INK, fontFamily: "DM Sans", fontSize: 13.5, fontWeight: 600, outline: "none", boxSizing: "border-box" };
@@ -188,7 +188,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
                 <Icon name={r.icon} size={16} color={on ? INK : "#a8151a"} />
                 <span style={{ flex: 1, minWidth: 0 }}>
                   <span style={{ display: "block", fontFamily: "DM Sans", fontWeight: 800, fontSize: 13 }}>{r.label}</span>
-                  <span style={{ display: "block", fontFamily: "DM Sans", fontSize: 10.5, opacity: .7 }}>{r.sub}</span>
+                  <span style={{ display: "block", fontFamily: "DM Sans", fontSize: 12, opacity: .7 }}>{r.sub}</span>
                 </span>
                 {!r.live && <Chip bg={dark ? "#1a0f08" : "#fff9ec"} color="#8a6a4f">soon</Chip>}
               </button>
@@ -222,7 +222,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
               );
             })}
           </div>
-          <div data-testid="rulebook-scope-note" style={{ fontFamily: "DM Sans", fontSize: 11.5, color: "#8a6a4f", marginTop: 8 }}>
+          <div data-testid="rulebook-scope-note" style={{ fontFamily: "DM Sans", fontSize: 12, color: "#8a6a4f", marginTop: 8 }}>
             {scopedPane
               ? <>Tuning <strong>{scopedPane.name}</strong> only — its overrides win; anything you don't touch keeps following the kitchen rule.</>
               : <>Kitchen-wide defaults — every station follows these unless you tune it individually above.</>}
@@ -262,7 +262,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
                   <button data-testid={`boh-mode-${m.id as ServiceModeId}`} aria-pressed={on} onClick={() => setGlobalMode(m.mode)}
                     style={{ flex: 1, minWidth: 150, textAlign: "left", padding: "10px 12px", borderRadius: 10, border: "2px solid " + INK, background: on ? m.color : (dark ? "#1a0f08" : "#fff4de"), color: on ? "#fff4de" : fg, cursor: "pointer", boxShadow: on ? "3px 3px 0 0 " + INK : "none" }}>
                     <div style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 13 }}>{m.kitchen}</div>
-                    <div style={{ fontFamily: "DM Sans", fontSize: 11, opacity: .85 }}>{m.label} · {m.sub}</div>
+                    <div style={{ fontFamily: "DM Sans", fontSize: 12, opacity: .85 }}>{m.label} · {m.sub}</div>
                   </button>
                 </Fragment>
               );
@@ -273,13 +273,13 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
           <Lbl dark={dark}>The Chef's voice</Lbl>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
             <label style={{ flex: 1, minWidth: 160 }}>
-              <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 700, color: "#8a6a4f", marginBottom: 4 }}>Voice</div>
+              <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", marginBottom: 4 }}>Voice</div>
               <select data-testid="boh-voice" value={s.voiceAi.voice} onChange={(e) => patchVoice({ voice: e.target.value })} style={fieldStyle(dark)}>
                 {["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Aoede"].map((v) => <option key={v} value={v}>{v}</option>)}
               </select>
             </label>
             <label style={{ flex: 1, minWidth: 160 }}>
-              <div style={{ fontFamily: "DM Sans", fontSize: 11, fontWeight: 700, color: "#8a6a4f", marginBottom: 4 }}>Volume · {formatVolumePercent(s.voiceAi.volume)}%</div>
+              <div style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#8a6a4f", marginBottom: 4 }}>Volume · {formatVolumePercent(s.voiceAi.volume)}%</div>
               <input data-testid="boh-volume" type="range" min={0} max={100} value={formatVolumeSlider(s.voiceAi.volume)} onChange={(e) => patchVoice({ volume: Number(e.target.value) / 100 })} style={{ width: "100%" }} />
             </label>
           </div>
@@ -322,7 +322,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
               </div>
             </Fragment>
           ))}
-          <div style={{ fontFamily: "DM Sans", fontSize: 11.5, color: "#8a6a4f", marginTop: 4 }}>Saved when you tab out of a field.</div>
+          <div style={{ fontFamily: "DM Sans", fontSize: 12, color: "#8a6a4f", marginTop: 4 }}>Saved when you tab out of a field.</div>
         </Card>
       </Room>
     );
@@ -332,7 +332,7 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
     return (
       <Room emoji="🧾" title="The Recipe Card" sub="the raw config, exactly as the kitchen reads it" color="#4b3bb3">
         <Card dark={dark}>
-          <pre data-testid="boh-recipe" style={{ margin: 0, fontFamily: "JetBrains Mono, monospace", fontSize: 11.5, lineHeight: 1.5, color: fg, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 520, overflowY: "auto" }}>
+          <pre data-testid="boh-recipe" style={{ margin: 0, fontFamily: "JetBrains Mono, monospace", fontSize: 12, lineHeight: 1.5, color: fg, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 520, overflowY: "auto" }}>
             {JSON.stringify(s, null, 2)}
           </pre>
         </Card>
@@ -371,13 +371,13 @@ function WalkInKey({ dark, masked, onSave }: { dark: boolean; masked: string; on
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
         <Chip bg={configured ? "#4db892" : "#e23a3a"} color="#fff4de">{configured ? "● a key is in the walk-in" : "no key yet"}</Chip>
-        {configured && <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, color: "#8a6a4f" }}>{masked === "CONFIGURED_IN_ENV" ? "(from environment)" : masked.slice(0, 6) + "…"}</span>}
+        {configured && <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{masked === "CONFIGURED_IN_ENV" ? "(from environment)" : masked.slice(0, 6) + "…"}</span>}
       </div>
       <div style={{ display: "flex", gap: 8 }}>
         <input data-testid="boh-key-input" type="password" value={val} onChange={(e) => setVal(e.target.value)} placeholder="paste a new key to replace it…" style={{ ...fieldStyle(dark), flex: 1, fontFamily: "JetBrains Mono" }} />
         <Button variant="mint" icon="check" disabled={!val.trim()} onClick={() => { onSave(val.trim()); setVal(""); }}>Stock it</Button>
       </div>
-      <div style={{ fontFamily: "DM Sans", fontSize: 11.5, color: "#8a6a4f", marginTop: 8 }}>Leave blank to keep the current key. Orbital never shows it back to you.</div>
+      <div style={{ fontFamily: "DM Sans", fontSize: 12, color: "#8a6a4f", marginTop: 8 }}>Leave blank to keep the current key. Orbital never shows it back to you.</div>
     </div>
   );
 }
