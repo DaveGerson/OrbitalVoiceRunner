@@ -18,7 +18,8 @@ import { upsertNotification, dismissNotification, ProactiveNotification } from "
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
-import { useE2EHarness } from "./e2e/harness";
+import { useE2EHarness, isE2EWireArmed } from "./e2e/harness";
+import { buildPaneInputFrame } from "./orbital/paneInputClient";
 import { resolveActivePaneMeta } from "./activePaneMeta";
 import {
   resolvePaneStatus,
@@ -2391,6 +2392,11 @@ function AppRaw() {
                     terminalId={activeTerminal.id}
                     backfill={activeTerminal.backfill}
                     onResize={(cols, rows) => handleTerminalResize(activeTerminal.id, cols, rows)}
+                    onInput={(data) => {
+                      if (isMockModeRef.current && !isE2EWireArmed()) return;
+                      const ws = wsRef.current;
+                      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(buildPaneInputFrame(activeTerminal.id, data)));
+                    }}
                   />
                 </div>
               </div>

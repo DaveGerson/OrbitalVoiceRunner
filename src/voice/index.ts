@@ -47,6 +47,7 @@ import {
 import { extractTranscripts } from "../liveTranscripts";
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
+import { applyPaneInputFrame } from "./paneInputFrame";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome } from "../actions/types";
@@ -441,6 +442,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           } else if (msg.type === "draft_edit" && msg.text !== undefined) {
             // Per-pane WIP draft edit (ungated — composing is not a CLI write). Defaults to the active pane.
             applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+          } else if (msg.type === "pane_input") {
+            // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
+            // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.
+            // The helper validates data/pane internally (no dispatch-site precondition — keeps this
+            // already-maxed handler at CC<=10).
+            applyPaneInputFrame(msg, manager, coreState);
           }
         } catch (err) {
           console.warn("Received malformed observe-socket frame, skipping:", err);
@@ -1506,6 +1513,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         } else if (msg.type === "draft_edit" && msg.text !== undefined) {
           // Step 6: operator editing a pane's WIP draft (ungated). Defaults to the active pane.
           applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+        } else if (msg.type === "pane_input") {
+          // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
+          // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.
+          // The helper validates data/pane internally (no dispatch-site precondition — keeps this
+          // already-maxed handler at CC<=10).
+          applyPaneInputFrame(msg, manager, coreState);
         } else if (msg.type === "set_active_pane") {
           handleSetActivePaneFrame(msg);
         } else if (msg.type === "stop_all") {
