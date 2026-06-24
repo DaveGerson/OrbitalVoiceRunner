@@ -15,7 +15,7 @@ import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
@@ -45,7 +45,6 @@ import {
   totalContextTextClass,
   totalContextBarClass,
   contextMeterColor,
-  classifyMarkdownLine,
   dispatchWsMessage,
   classifyRawKeyOutcome,
   formatCharCount,
@@ -59,48 +58,9 @@ import {
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
 import { buildMockData } from "./mockData";
-
-// Raw control-key byte sequences (multi-cli adapter spec §8). Written verbatim to a pane's PTY via
-// the raw-input endpoint. Disruptive keys (Ctrl+C, Shift+Tab) take the amber/warn tint.
-// NOTE (bead 6q5): every value here MUST also exist in the SERVER allowlist RAW_KEY_TABLE
-// (src/rawKeyClass.ts) — the /raw-input route 400s any sequence not in that table. There is no
-// shared import across the client/server build boundary, so the invariant is pinned by the drift
-// guard in tests/test_rawkey_allowlist.ts ("every frontend RAW_KEY value is a member of
-// RAW_KEY_TABLE"). Adding a key here that the server lacks fails that test RED.
-const RAW_KEY = {
-  up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
-  enter: "\r", tab: "\t", esc: "\x1b",
-  pageUp: "\x1b[5~", pageDown: "\x1b[6~",
-  ctrlC: "\x03", shiftTab: "\x1b[Z",
-} as const;
-
-// Compact control-key strip for a pane (arrows / Tab / Esc / Enter / Ctrl+C / Shift+Tab). Each
-// button POSTs its raw bytes through `onKey` (App.writeControlKey). Reuses the existing icon-button
-// styling; disruptive keys (Ctrl+C, Shift+Tab) carry the warn palette per spec §8.
-function ControlKeyBar({ paneId, onKey, testId = "control-key-bar" }: { paneId: string; onKey: (paneId: string, bytes: string) => void; testId?: string }) {
-  const navBtn = "p-2 border border-white/5 hover:border-white/10 hover:bg-white/5 text-zinc-400 hover:text-white rounded active:scale-95 transition-all";
-  const warnBtn = "px-2 py-1 border border-amber-500/30 hover:border-amber-500/50 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded active:scale-95 transition-all text-xs font-mono uppercase tracking-wider font-bold";
-  const press = (bytes: string) => onKey(paneId, bytes);
-  return (
-    <div className="flex items-center gap-1 flex-wrap" data-testid={testId} role="group" aria-label="Send control key to pane">
-      {/* Navigation — always-allowed */}
-      <button type="button" onClick={() => press(RAW_KEY.up)} className={navBtn} title="Send Up arrow"><ArrowUp className="w-3 h-3" /></button>
-      <button type="button" onClick={() => press(RAW_KEY.down)} className={navBtn} title="Send Down arrow"><ArrowDown className="w-3 h-3" /></button>
-      <button type="button" onClick={() => press(RAW_KEY.left)} className={navBtn} title="Send Left arrow"><ArrowLeft className="w-3 h-3" /></button>
-      <button type="button" onClick={() => press(RAW_KEY.right)} className={navBtn} title="Send Right arrow"><ArrowRight className="w-3 h-3" /></button>
-      <button type="button" onClick={() => press(RAW_KEY.enter)} className={navBtn} title="Send Enter (commit staged line)"><CornerDownLeft className="w-3 h-3" /></button>
-      {/* Terminal-ops — always-allowed */}
-      <button type="button" onClick={() => press(RAW_KEY.tab)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Tab">Tab</button>
-      <button type="button" onClick={() => press(RAW_KEY.esc)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Esc (dismiss/cancel)">Esc</button>
-      {/* Paging — always-allowed */}
-      <button type="button" onClick={() => press(RAW_KEY.pageUp)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Page Up">PgUp</button>
-      <button type="button" onClick={() => press(RAW_KEY.pageDown)} className={`${navBtn} text-xs font-mono uppercase tracking-wider`} title="Send Page Down">PgDn</button>
-      {/* Disruptive — gated (warn tint) */}
-      <button type="button" onClick={() => press(RAW_KEY.ctrlC)} className={warnBtn} title="Send Ctrl+C (interrupt / emergency brake)">^C</button>
-      <button type="button" onClick={() => press(RAW_KEY.shiftTab)} className={warnBtn} title="Send Shift+Tab (cycle agent mode — gated)">⇧Tab</button>
-    </div>
-  );
-}
+import { MiniMarkdown } from "./classic/components/MiniMarkdown";
+import { ErrorBoundary } from "./classic/components/ErrorBoundary";
+import { ControlKeyBar } from "./classic/components/ControlKeyBar";
 
 function AppRaw() {
   const [terminals, setTerminals] = useState<Terminal[]>([]);
@@ -3563,146 +3523,6 @@ function AppRaw() {
         </div>
       </div>
       ))()}
-    </div>
-  );
-}
-
-interface ErrorBoundaryProps {
-  children: React.ReactNode;
-}
-
-interface ErrorBoundaryState {
-  hasError: boolean;
-  error: Error | null;
-}
-
-class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState;
-  props: ErrorBoundaryProps;
-
-  constructor(props: ErrorBoundaryProps) {
-    super(props);
-    this.props = props;
-    this.state = { hasError: false, error: null };
-  }
-  static getDerivedStateFromError(error: Error) {
-    return { hasError: true, error };
-  }
-  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.error("[CRITICAL FRONTEND FAULT]", error, errorInfo);
-  }
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="min-h-screen bg-[#060606] text-white flex flex-col items-center justify-center p-6 font-mono select-none">
-          <div className="w-full max-w-md bg-red-950/20 border border-red-500/30 rounded p-6 shadow-2xl relative animate-in zoom-in duration-250">
-            <div className="absolute top-3 right-3 text-xs bg-red-500 text-black px-1.5 rounded font-bold">FAULT</div>
-            <h1 className="text-sm font-bold uppercase tracking-wider text-red-400 mb-4 flex items-center gap-2">
-              ⚠️ Critical Sandbox Error
-            </h1>
-            <p className="text-xs text-zinc-400 leading-relaxed mb-4">
-              The Antigravity application engine encountered an unhandled execution exception. This sandbox remains active.
-            </p>
-            <div className="bg-black/60 p-3 rounded text-xs text-zinc-500 overflow-x-auto break-all border border-white/5 max-h-40 mb-6 font-mono leading-relaxed">
-              {this.state.error?.stack || this.state.error?.message || "Unknown Runtime Exception"}
-            </div>
-            <button
-              onClick={() => window.location.reload()}
-              className="w-full text-center py-2 bg-red-500 text-black hover:bg-red-400 text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer focus:outline-none"
-            >
-              Reboot Application View
-            </button>
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-function parseInlines(text: string): React.ReactNode[] {
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
-  const matches = text.split(regex);
-  return matches.map((part, i) => {
-    if (part.startsWith("**") && part.endsWith("**")) {
-      return (
-        <strong key={i} className="font-bold text-white font-sans">
-          {part.slice(2, -2)}
-        </strong>
-      );
-    }
-    if (part.startsWith("*") && part.endsWith("*")) {
-      return (
-        <span key={i} className="italic text-cyan-200">
-          {part.slice(1, -1)}
-        </span>
-      );
-    }
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return (
-        <code key={i} className="bg-black/80 px-1.5 py-0.5 rounded border border-white/10 font-mono text-xs text-cyan-400">
-          {part.slice(1, -1)}
-        </code>
-      );
-    }
-    return part;
-  }).filter(Boolean) as React.ReactNode[];
-}
-
-function MiniMarkdown({ text }: { text: string }) {
-  const lines = text.split("\n");
-  // Burndown: the per-line startsWith ladder is the PURE classifier `classifyMarkdownLine` (tested).
-  // The list arm's checkbox JSX (its only inline ternaries) is relocated into a nested closure so the
-  // map callback's CC stays under the gate. Rendered output is byte-identical to the original ladder.
-  const renderList = (info: ReturnType<typeof classifyMarkdownLine>, idx: number) => (
-    <div key={idx} className="flex items-start gap-2.5 text-xs text-zinc-300 ml-4 py-0.5 font-sans leading-relaxed">
-      {info.isChecklist ? (
-        <span className={`w-3.5 h-3.5 border rounded flex-shrink-0 flex items-center justify-center text-xs tracking-tighter ${
-          info.isChecked ? "bg-cyan-500/20 border-cyan-400 text-cyan-400 font-bold" : "border-white/20 text-transparent bg-black"
-        }`}>✓</span>
-      ) : (
-        <span className="text-cyan-500 select-none">•</span>
-      )}
-      <span className={info.isChecked ? "line-through text-zinc-650" : ""}>{parseInlines(info.text)}</span>
-    </div>
-  );
-  return (
-    <div className="space-y-1.5 select-text font-sans">
-      {lines.map((line, idx) => {
-        const info = classifyMarkdownLine(line);
-        switch (info.kind) {
-          case "h4":
-            return (
-              <h4 key={idx} className="text-xs font-mono font-bold text-cyan-400 uppercase tracking-widest mt-4 mb-2 border-b border-white/5 pb-1">
-                {info.text}
-              </h4>
-            );
-          case "h3":
-            return (
-              <h3 key={idx} className="text-xs font-mono font-bold text-white uppercase tracking-wider mt-5 mb-2 border-b border-white/10 pb-1">
-                {info.text}
-              </h3>
-            );
-          case "h2":
-            return (
-              <h2 key={idx} className="text-sm font-sans font-black text-white hover:text-cyan-400 uppercase tracking-widest mt-6 mb-3 border-b-2 border-cyan-400/20 pb-1">
-                {info.text}
-              </h2>
-            );
-          case "hr":
-            return <hr key={idx} className="border-white/5 my-4" />;
-          case "list":
-            return renderList(info, idx);
-          case "blank":
-            return <div key={idx} className="h-1.5" />;
-          default:
-            return (
-              <p key={idx} className="text-xs text-zinc-400 leading-relaxed py-0.5 font-sans">
-                {parseInlines(info.text)}
-              </p>
-            );
-        }
-      })}
     </div>
   );
 }

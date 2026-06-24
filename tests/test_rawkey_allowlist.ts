@@ -79,16 +79,18 @@ test("RAW_KEY_TABLE: exposes exactly the 11 vetted byte sequences (canonical sou
 // bead 6q5 — FRONTEND↔SERVER raw-key DRIFT GUARD.
 //
 // There are TWO hand-built raw-key tables: the SERVER allowlist RAW_KEY_TABLE here (src/rawKeyClass.ts,
-// the route's 400-gate) and the FRONTEND control-key-bar table `RAW_KEY` in src/App.tsx. They have no
-// shared source of truth (a shared import would pull a server module into the Vite browser bundle —
-// higher churn, riskier build-graph change), so we pin the invariant instead: EVERY frontend RAW_KEY
-// value must be a MEMBER of the server RAW_KEY_TABLE. If a future frontend-only key add slips in, the
-// server allowlist would 400 it at runtime — this guard turns that latent 400 into a RED unit test.
+// the route's 400-gate) and the FRONTEND control-key-bar table `RAW_KEY` in
+// src/classic/components/ControlKeyBar.tsx (extracted verbatim out of src/App.tsx in dbt4 PR-A).
+// They have no shared source of truth (a shared import would pull a server module into the Vite
+// browser bundle — higher churn, riskier build-graph change), so we pin the invariant instead:
+// EVERY frontend RAW_KEY value must be a MEMBER of the server RAW_KEY_TABLE. If a future frontend-only
+// key add slips in, the server allowlist would 400 it at runtime — this guard turns that latent 400
+// into a RED unit test.
 //
-// We scan App.tsx AS TEXT (same source-as-text pattern as tests/test_no_inline_twins.ts) rather than
-// importing it: App.tsx pulls React/motion/audio/the whole UI tree, none of which a node test can boot.
+// We scan the module AS TEXT (same source-as-text pattern as tests/test_no_inline_twins.ts) rather
+// than importing it: it pulls React/lucide/the UI tree, none of which a node test can boot.
 const here = path.dirname(fileURLToPath(import.meta.url));
-const appSrc = readFileSync(path.join(here, "..", "src", "App.tsx"), "utf8");
+const appSrc = readFileSync(path.join(here, "..", "src", "classic", "components", "ControlKeyBar.tsx"), "utf8");
 
 /**
  * Decode a JS double-quoted string-literal BODY (the chars between the quotes) into its runtime bytes.
@@ -110,12 +112,13 @@ function decodeJsStringBody(body: string): string {
 }
 
 /**
- * Extract the string VALUES from the `const RAW_KEY = { … } as const;` object literal in App.tsx.
- * Returns [name, decodedBytes] pairs. Throws if the literal can't be located (so a rename also fails RED).
+ * Extract the string VALUES from the `const RAW_KEY = { … } as const;` object literal in
+ * src/classic/components/ControlKeyBar.tsx. Returns [name, decodedBytes] pairs. Throws if the
+ * literal can't be located (so a rename also fails RED).
  */
 function extractFrontendRawKeyValues(src: string): Array<[string, string]> {
   const block = /const\s+RAW_KEY\s*=\s*\{([\s\S]*?)\}\s*as const;/.exec(src);
-  assert.ok(block, "could not locate `const RAW_KEY = { … } as const;` in src/App.tsx (renamed?)");
+  assert.ok(block, "could not locate `const RAW_KEY = { … } as const;` in src/classic/components/ControlKeyBar.tsx (renamed?)");
   // Match `name: "….."` pairs; the value is a double-quoted JS string literal (may contain \x.. escapes).
   const pairRe = /(\w+)\s*:\s*"((?:\\.|[^"\\])*)"/g;
   const out: Array<[string, string]> = [];
