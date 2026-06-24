@@ -24,16 +24,15 @@ test.describe("Orbital Kitchen — Back of House", () => {
   });
 
   test("a Rulebook gate change persists via PUT /api/settings", async ({ page }) => {
-    let body: any = null;
-    await page.route(/\/api\/settings$/, (route) => {
-      if (route.request().method() === "PUT") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, settings: {}, globalPermissionsMode: "Human-in-the-Loop" }) });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — see the Walk-In
+    // test for why the shared-`body` idiom races under parallel-worker load (bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/settings$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, settings: {}, globalPermissionsMode: "Human-in-the-Loop" }) }));
     await gotoBoH(page);
     const putReq = page.waitForRequest((r) => /\/api\/settings$/.test(r.url()) && r.method() === "PUT", { timeout: 10_000 });
     // Set write_to_pane to Off ("not in my kitchen").
     await page.getByTestId("rule-write_to_pane").getByTestId("gate-Off").click();
-    await putReq;
+    const body = (await putReq).postDataJSON();
     expect(body?.advanced?.capabilityGates?.write_to_pane).toBe("Off");
     // 1B.3: a successful settings write acks — never a silent maybe.
     await expect(page.getByTestId("toast")).toContainText("Rulebook updated");
@@ -61,17 +60,18 @@ test.describe("Orbital Kitchen — Back of House", () => {
   });
 
   test("the Walk-In takes a new key and stocks it", async ({ page }) => {
-    let body: any = null;
-    await page.route(/\/api\/settings$/, (route) => {
-      if (route.request().method() === "PUT") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, settings: {}, globalPermissionsMode: "Human-in-the-Loop" }) });
-    });
+    // Mock the PUT response; the asserted body is read from the AWAITED request itself (below),
+    // never from a route-handler-captured variable — the route callback and waitForRequest resolve
+    // on independent event streams, so reading a shared `body` after `await putReq` races under
+    // parallel-worker load (the geminiApiKey-undefined flake, bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/settings$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, settings: {}, globalPermissionsMode: "Human-in-the-Loop" }) }));
     await gotoBoH(page);
     await page.getByTestId("boh-room-walkin").click();
     await page.getByTestId("boh-key-input").fill("AIzaTESTKEY123");
     const putReq = page.waitForRequest((r) => /\/api\/settings$/.test(r.url()) && r.method() === "PUT", { timeout: 10_000 });
     await page.getByRole("button", { name: "Stock it" }).click();
-    await putReq;
+    const body = (await putReq).postDataJSON();
     expect(body?.secrets?.geminiApiKey).toBe("AIzaTESTKEY123");
   });
 

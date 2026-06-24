@@ -21,16 +21,16 @@ test.describe("Orbital Kitchen — The Pass", () => {
   });
 
   test("jotting a note adds a ticket and POSTs it", async ({ page }) => {
-    let body: any = null;
-    await page.route(/\/api\/projects\/.+\/notes$/, (route) => {
-      if (route.request().method() === "POST") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — a shared `body`
+    // read after the await races against the route handler under parallel-worker load (bead
+    // wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/projects\/.+\/notes$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
     await gotoKitchen(page);
     const postReq = page.waitForRequest((r) => /\/api\/projects\/.+\/notes$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
     await page.getByTestId("pass-jot-input").fill("rerun the auth tests");
     await page.getByTestId("pass-jot-add").click();
-    await postReq;
+    const body = (await postReq).postDataJSON();
     expect(body?.note).toBe("rerun the auth tests");
     await expect(page.getByTestId("pass-ticket").first()).toContainText("rerun the auth tests");
   });
@@ -51,13 +51,13 @@ test.describe("Orbital Kitchen — The Pass", () => {
   });
 
   test("amending a ticket PUTs the new text", async ({ page }) => {
-    let putBody: any = null;
+    // putBody read from the AWAITED request (below), not a route-captured variable — a shared
+    // variable read after the await races against the route handler under parallel-worker load
+    // (bead wsm-e2e-pinned-3ss).
     await page.route(/\/api\/projects\/.+\/notes$/, (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
-    await page.route(/\/api\/notes\/.+$/, (route) => {
-      if (route.request().method() === "PUT") putBody = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' });
-    });
+    await page.route(/\/api\/notes\/.+$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
     await gotoKitchen(page);
     await page.getByTestId("pass-jot-input").fill("draft note");
     await page.getByTestId("pass-jot-add").click();
@@ -65,7 +65,7 @@ test.describe("Orbital Kitchen — The Pass", () => {
     await page.getByTestId("pass-ticket-edit").fill("amended note");
     const putReq = page.waitForRequest((r) => /\/api\/notes\/.+$/.test(r.url()) && r.method() === "PUT", { timeout: 10_000 });
     await page.getByTestId("pass-ticket-save").click();
-    await putReq;
+    const putBody = (await putReq).postDataJSON();
     expect(putBody?.text).toBe("amended note");
     await expect(page.getByTestId("pass-ticket").first()).toContainText("amended note");
   });

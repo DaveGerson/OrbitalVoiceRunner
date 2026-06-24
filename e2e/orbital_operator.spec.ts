@@ -74,11 +74,11 @@ test.describe("2K.1 — pane lifecycle", () => {
   });
 
   test("Rename PUTs the rename route with the new name", async ({ page }) => {
-    let body: { name?: string } | null = null;
-    await page.route(/\/api\/projects\/.+\/panes\/.+\/rename$/, (route) => {
-      if (route.request().method() === "PUT") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — a shared `body`
+    // read after the await races against the route handler under parallel-worker load (bead
+    // wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/projects\/.+\/panes\/.+\/rename$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
     await gotoKitchen(page);
     await openBurner(page);
 
@@ -89,7 +89,7 @@ test.describe("2K.1 — pane lifecycle", () => {
     await page.getByTestId("burner-rename").click();
     await page.getByTestId("burner-rename-input").fill("Saucier Station");
     await page.getByTestId("burner-rename-input").press("Enter");
-    await putReq;
+    const body = (await putReq).postDataJSON() as { name?: string };
     expect(body?.name).toBe("Saucier Station");
     await expect(page.getByTestId("toast")).toContainText("Saucier Station");
   });
@@ -188,11 +188,11 @@ test.describe("2K.2 — per-pane autonomy", () => {
   });
 
   test("the Rulebook gains a pane scope that PUTs the per-pane capability-gates route", async ({ page }) => {
-    let body: { capabilityGates?: Record<string, string> } | null = null;
-    await page.route(/\/api\/projects\/.+\/panes\/.+\/capability-gates$/, (route) => {
-      if (route.request().method() === "PUT") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"success":true,"capabilityGates":{"create_pane":"Off"}}' });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — the route handler
+    // and waitForRequest resolve on independent event streams, so a shared `body` read after the
+    // await races under parallel-worker load (same root cause as bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/projects\/.+\/panes\/.+\/capability-gates$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"success":true,"capabilityGates":{"create_pane":"Off"}}' }));
     await gotoKitchen(page, "&view=boh");
 
     // whole-kitchen scope is the default (existing behavior)
@@ -205,7 +205,7 @@ test.describe("2K.2 — per-pane autonomy", () => {
       { timeout: 10_000 },
     );
     await page.getByTestId("rule-create_pane").getByTestId("gate-Off").click();
-    await putReq;
+    const body = (await putReq).postDataJSON() as { capabilityGates?: Record<string, string> };
     expect(body?.capabilityGates?.create_pane).toBe("Off");
     await expect(page.getByTestId("toast")).toContainText("Rulebook updated for that station");
   });

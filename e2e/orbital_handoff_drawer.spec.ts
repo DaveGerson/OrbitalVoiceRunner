@@ -94,33 +94,31 @@ test.describe("Orbital Kitchen — the handoff line drawer", () => {
   });
 
   test("Deliver fires POST /api/handoffs/:id/deliver", async ({ page }) => {
-    let delivered: string | null = null;
-    await page.route(/\/api\/handoffs\/.+\/deliver$/, (route) => {
-      delivered = route.request().url();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Delivered."}' });
-    });
+    // URL asserted from the AWAITED request itself (below), never a route-handler-captured var — the
+    // route callback and waitForRequest resolve on independent event streams, so reading a shared
+    // var after `await req` races under parallel-worker load (bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/handoffs\/.+\/deliver$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Delivered."}' }));
     await gotoKitchen(page);
     await seedHandoff(page);
     const card = await openDrawerOn(page, "mock_pane_2");
     const req = page.waitForRequest((r) => /\/api\/handoffs\/.+\/deliver$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
     await card.getByTestId("handoff-deliver").click();
-    await req;
-    expect(delivered).toContain(`/api/handoffs/${HANDOFF_ID}/deliver`);
+    expect((await req).url()).toContain(`/api/handoffs/${HANDOFF_ID}/deliver`);
   });
 
   test("Stage fires POST /api/handoffs/:id/stage (composing → staged)", async ({ page }) => {
-    let staged: string | null = null;
-    await page.route(/\/api\/handoffs\/.+\/stage$/, (route) => {
-      staged = route.request().url();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Staged."}' });
-    });
+    // URL asserted from the AWAITED request itself (below), never a route-handler-captured var — the
+    // route callback and waitForRequest resolve on independent event streams, so reading a shared
+    // var after `await req` races under parallel-worker load (bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/handoffs\/.+\/stage$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Staged."}' }));
     await gotoKitchen(page);
     await seedHandoff(page, { state: "composing" }); // a composing draft is stageable
     const card = await openDrawerOn(page, "mock_pane_2");
     const req = page.waitForRequest((r) => /\/api\/handoffs\/.+\/stage$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
     await card.getByTestId("handoff-stage").click();
-    await req;
-    expect(staged).toContain(`/api/handoffs/${HANDOFF_ID}/stage`);
+    expect((await req).url()).toContain(`/api/handoffs/${HANDOFF_ID}/stage`);
   });
 
   test("Reject fires POST /api/handoffs/:id/reject and flips the chip optimistically", async ({ page }) => {
@@ -137,17 +135,17 @@ test.describe("Orbital Kitchen — the handoff line drawer", () => {
   });
 
   test("Revise seeds from the FULL prompt (read_handoff), not the truncated list row, and POSTs new_draft_text", async ({ page }) => {
-    let body: { new_draft_text?: string } | null = null;
     // read_handoff: GET /api/handoffs/:id → the FULL (untruncated) composed_prompt. MUST be registered
     // before the broad GET /api/handoffs list route so the more-specific :id route wins.
     await page.route(new RegExp(`/api/handoffs/${HANDOFF_ID}$`), (route) => {
       if (route.request().method() !== "GET") return route.fallback();
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ output: { handoff_id: HANDOFF_ID, composed_prompt: FULL_PROMPT } }) });
     });
-    await page.route(/\/api\/handoffs\/.+\/revise$/, (route) => {
-      if (route.request().method() === "POST") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Revised."}' });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — a shared `body`
+    // read after the await races against the route handler under parallel-worker load (bead
+    // wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/handoffs\/.+\/revise$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Revised."}' }));
     await gotoKitchen(page);
     await seedHandoff(page);
     const card = await openDrawerOn(page, "mock_pane_2");
@@ -158,7 +156,7 @@ test.describe("Orbital Kitchen — the handoff line drawer", () => {
     await card.getByTestId("handoff-revise-input").fill("Run only the failing auth tests");
     const req = page.waitForRequest((r) => /\/api\/handoffs\/.+\/revise$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
     await card.getByTestId("handoff-revise-save").click();
-    await req;
+    const body = (await req).postDataJSON() as { new_draft_text?: string };
     expect(body?.new_draft_text).toBe("Run only the failing auth tests");
     // optimistic: the summary reflects the new text
     await expect(card.getByTestId("handoff-summary")).toContainText("Run only the failing auth tests");

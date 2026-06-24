@@ -33,11 +33,11 @@ async function injectPlans(page: Page, plans: unknown[]) {
 
 test.describe("Orbital Kitchen — 4U.1 plans on The Pass", () => {
   test("a voice-built plan renders as a spec ticket and Execute fires the classic route", async ({ page }) => {
-    let executed = "";
-    await page.route(/\/api\/plans\/[^/]+\/execute$/, (route) => {
-      executed = route.request().url();
-      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Started execution"}' });
-    });
+    // URL asserted from the AWAITED request itself (below), never a route-handler-captured var — the
+    // route callback and waitForRequest resolve on independent event streams, so reading a shared
+    // var after `await req` races under parallel-worker load (bead wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/plans\/[^/]+\/execute$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"Started execution"}' }));
     await gotoKitchen(page);
     await injectPlans(page, [MOCK_PLAN]);
     const spec = page.getByTestId("pass-spec");
@@ -46,8 +46,7 @@ test.describe("Orbital Kitchen — 4U.1 plans on The Pass", () => {
     await expect(spec).toContainText("0/2 steps");
     const req = page.waitForRequest((r) => /\/api\/plans\/plan_e2e_1\/execute$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
     await page.getByTestId("pass-spec-fire").click();
-    await req;
-    expect(executed).toContain("/api/plans/plan_e2e_1/execute");
+    expect((await req).url()).toContain("/api/plans/plan_e2e_1/execute");
     await expect(page.getByTestId("toast")).toContainText("Spec's firing");
   });
 

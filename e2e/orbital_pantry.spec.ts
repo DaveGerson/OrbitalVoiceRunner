@@ -22,16 +22,16 @@ test.describe("Orbital Kitchen — The Pantry", () => {
   });
 
   test("editing the About PUTs the project summary", async ({ page }) => {
-    let body: any = null;
-    await page.route(/\/api\/projects\/[^/]+$/, (route) => {
-      if (route.request().method() === "PUT") body = route.request().postDataJSON();
-      route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
-    });
+    // Body read from the AWAITED request (below), not a route-captured variable — a shared `body`
+    // read after the await races against the route handler under parallel-worker load (bead
+    // wsm-e2e-pinned-3ss).
+    await page.route(/\/api\/projects\/[^/]+$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
     await gotoPantry(page);
     const putReq = page.waitForRequest((r) => /\/api\/projects\/[^/]+$/.test(r.url()) && r.method() === "PUT", { timeout: 10_000 });
     await page.getByTestId("pantry-about").fill("Ships the notifications service.");
     await page.getByTestId("pantry-about").blur();
-    await putReq;
+    const body = (await putReq).postDataJSON();
     expect(body?.summary).toBe("Ships the notifications service.");
   });
 
