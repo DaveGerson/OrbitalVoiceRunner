@@ -1,4 +1,4 @@
-name: "CI (lint + unit + e2e)"
+name: "CI (lint + unit + component + e2e)"
 
 on:
   push:
@@ -28,6 +28,29 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+  # The component lane (Vitest + jsdom + RTL): src/**/*.test.tsx React component tests. No
+  # browser/Playwright install needed — jsdom runs headless in Node. Disjoint from the node:test
+  # glob (tests/*.ts), so the two runners never collide.
+  component:
+    name: "component / node22 / ubuntu"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Component tests (Vitest + RTL)
+        run: npm run test:component
 
   # The mock lane (?mock=1 harness, Vite only — no backend): every orbital_*.spec.ts UI flow.
   # Green here proves the client wiring, not the server — the live lane below covers the wire.
