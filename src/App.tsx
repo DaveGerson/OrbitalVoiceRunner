@@ -16,7 +16,6 @@ import { effectForEvent } from "./eventBus";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
-import { publishChunk } from "./terminalStream";
 import { useE2EHarness } from "./e2e/harness";
 import { resolveActivePaneMeta } from "./activePaneMeta";
 import {
@@ -57,6 +56,7 @@ import {
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
 import { useEarcons } from "./classic/hooks/useEarcons";
+import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -254,61 +254,19 @@ function AppRaw() {
     }
   };
 
-  const stdoutBufferRef = useRef<Record<string, string>>({});
-  const animationFrameRef = useRef<number | null>(null);
-
-  const queueStdoutChunk = (terminalId: string, chunk: string) => {
-    // Display lane: stream raw bytes straight into xterm (no React state, no line
-    // cap, no reset thrash). xterm owns the live buffer.
-    publishChunk(terminalId, chunk);
-
-    // Preview lane: keep a capped, ANSI-bearing tail in React state purely to feed
-    // the pane-card text snippets / byte count. This NO LONGER drives xterm, so the
-    // -110 line cap here is harmless (it once forced a full xterm.reset per frame).
-    stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
-
-    if (!animationFrameRef.current) {
-      animationFrameRef.current = requestAnimationFrame(() => {
-        animationFrameRef.current = null;
-        const currentBuffers = { ...stdoutBufferRef.current };
-        stdoutBufferRef.current = {};
-
-        setTerminals((prev) =>
-          prev.map((t) => {
-            const bufMatch = currentBuffers[t.id];
-            if (bufMatch) {
-              const lines = (t.output + bufMatch).split("\n").slice(-110);
-              return { ...t, output: lines.join("\n") };
-            }
-            return t;
-          })
-        );
-      });
-    }
-  };
-
-  // Per-pane debounce + last-sent-grid so a flurry of fit() events (drag-resize)
-  // collapses into one POST, and an unchanged grid never hits the server.
-  const resizeDebounceRef = useRef<Record<string, any>>({});
-  const lastGridRef = useRef<Record<string, string>>({});
-
-  const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
-    // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
-    // where Playwright intercepts the POST to assert the grid-sync round-trip.
-    if (isMockModeRef.current && !e2eActiveRef.current) return;
-    if (!cols || !rows) return;
-    const key = `${cols}x${rows}`;
-    if (lastGridRef.current[terminalId] === key) return;
-    lastGridRef.current[terminalId] = key;
-    clearTimeout(resizeDebounceRef.current[terminalId]);
-    resizeDebounceRef.current[terminalId] = setTimeout(() => {
-      apiFetch(`/api/terminals/${terminalId}/resize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cols, rows }),
-      }).catch(() => { /* pane may have exited; resize is best-effort */ });
-    }, 120);
-  };
+  // dbt4: the rAF-batched stdout preview flush (queueStdoutChunk) + the debounced terminal-resize
+  // POST (handleTerminalResize) now live in useStdoutStream (src/classic/hooks/useStdoutStream.ts).
+  // queueStdoutChunk's identity is preserved and still fed into useE2EHarness below — the harness
+  // injectStdoutChunk contract is unchanged. isMockModeRef + e2eActiveRef are App-owned and threaded
+  // in (e2eActiveRef is created here so the harness, which depends on queueStdoutChunk, can share it).
+  // The pure pieces (the -110 flush slice + the grid-key dedup) are pinned in tests/test_stream_logic.ts.
+  const isMockModeRef = useRef(false);
+  const e2eActiveRef = useRef(false);
+  const { queueStdoutChunk, handleTerminalResize } = useStdoutStream({
+    setTerminals,
+    isMockModeRef,
+    e2eActiveRef,
+  });
 
   // dbt4: the WS + Web-Audio capture/playback refs and the connect/start/stop/cleanup +
   // auto-reconnect lifecycle now live in useLiveSession (src/hooks/useLiveSession.ts). isMicMutedRef
@@ -318,11 +276,12 @@ function AppRaw() {
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
 
-  const isMockModeRef = useRef(false);
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
-  // e2eActiveRef lets the mock-mode-gated resize POST still fire under e2e.
-  const { e2eActiveRef } = useE2EHarness({
+  // e2eActiveRef (App-owned, declared above for useStdoutStream's resize guard) lets the
+  // mock-mode-gated resize POST still fire under e2e; the harness writes into the same ref.
+  useE2EHarness({
     isMockModeRef,
+    e2eActiveRef,
     setIsMockMode,
     setShowTranscriptPanel,
     setTerminals,
