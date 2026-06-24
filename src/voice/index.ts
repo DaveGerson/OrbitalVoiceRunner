@@ -1106,6 +1106,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           const recentProposals = new Map<string, number>();
           const PROPOSAL_DEDUP_WINDOW_MS = 5000;
 
+          const isProposalDuplicate = (name: string, args: Record<string, any>): boolean => {
+            if (name !== "propose_command" || !args) return false;
+            const dedupKey = `${args.pane_id}:${(args.instruction ?? args.command ?? "").trim().toLowerCase()}`;
+            const lastAt = recentProposals.get(dedupKey);
+            const now = Date.now();
+            if (lastAt && now - lastAt < PROPOSAL_DEDUP_WINDOW_MS) return true;
+            recentProposals.set(dedupKey, now);
+            for (const [k, t] of recentProposals) {
+              if (now - t > PROPOSAL_DEDUP_WINDOW_MS * 2) recentProposals.delete(k);
+            }
+            return false;
+          };
+
           // PLM4 (3): PER-DISPATCH IDEMPOTENCY / replay guard. A tool call RE-DELIVERED after a reconnect
           // (Gemini may replay the same functionCall id on a resumed session) must NOT double-apply a
           // SIDE-EFFECTING action. TRUE => this idempotency_key already has a SUCCEEDED action_log row, so
@@ -1150,24 +1163,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
                 });
+              } else if (isProposalDuplicate(name, args)) {
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
+                });
               } else {
-                // L2: content-level dedup for propose_command — same (pane, instruction) within window
-                if (name === "propose_command" && args) {
-                  const dedupKey = `${args.pane_id}:${(args.instruction ?? args.command ?? "").trim().toLowerCase()}`;
-                  const lastAt = recentProposals.get(dedupKey);
-                  const now = Date.now();
-                  if (lastAt && now - lastAt < PROPOSAL_DEDUP_WINDOW_MS) {
-                    session.sendToolResponse({
-                      functionResponses: [{ name, id: call.id, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
-                    });
-                    return;
-                  }
-                  recentProposals.set(dedupKey, now);
-                  // Prune old entries to prevent unbounded growth
-                  for (const [k, t] of recentProposals) {
-                    if (now - t > PROPOSAL_DEDUP_WINDOW_MS * 2) recentProposals.delete(k);
-                  }
-                }
                 const actionCtx: ActionContext = buildActionContext(call.id!, name);
                 const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
                 interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });

@@ -41,6 +41,12 @@ export class PaneSignalBus {
     return () => { this.observers.delete(observer); };
   }
 
+  /** L1: true when a low-priority signal should be suppressed by the cross-kind cooldown. */
+  private isCrossKindSuppressed(paneId: string, kind: PaneSignalKind, t: number): boolean {
+    const lastAnyKind = this.lastPaneSignalAt.get(paneId) ?? Number.NEGATIVE_INFINITY;
+    return t - lastAnyKind < this.crossKindCooldownMs && (KIND_PRIORITY[kind] ?? 0) < KIND_PRIORITY.exited;
+  }
+
   /** Fan out unless this (pane,kind) fired within the debounce window with the SAME detail.
    *  Returns true if delivered, false if dropped (no observers / identical repeat).
    *
@@ -62,13 +68,8 @@ export class PaneSignalBus {
     if (t - last < this.debounceMs && signal.detail === this.lastDetail.get(key)) {
       return false; // identical repeat inside the window -> collapse (anti-spam intent preserved).
     }
-
-    // L1 cross-kind cooldown: if ANY signal for this pane was delivered within the cooldown
-    // window, suppress low-priority kinds to break the status-flap re-announcement loop
-    // (running→quiescing→idle→running…). High-priority kinds (error, exited) always pass.
-    const lastAnyKind = this.lastPaneSignalAt.get(signal.paneId) ?? Number.NEGATIVE_INFINITY;
-    if (t - lastAnyKind < this.crossKindCooldownMs && (KIND_PRIORITY[signal.kind] ?? 0) < KIND_PRIORITY.exited) {
-      return false; // low-priority kind inside cross-kind cooldown -> suppress.
+    if (this.isCrossKindSuppressed(signal.paneId, signal.kind, t)) {
+      return false;
     }
 
     this.lastPushAt.set(key, t);
