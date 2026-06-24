@@ -203,14 +203,14 @@ function buildCalls(stations: { name: string }[]): { group: string; color: strin
   ];
 }
 
-export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBlocked, transcript, voiceCues, stations, onGoLive, onToggleMute, onCall }: {
+export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBlocked, transcript, voiceCues, stations, onGoLive, onStopLive, onToggleMute, onCall }: {
   dark: boolean; live: boolean; muted: boolean; reconnecting: boolean;
   /** 1B.5: the voice /live socket is actually OPEN — "● LIVE" gates on this, not on the click. */
   connected: boolean;
   /** 1B.5: getUserMedia denied/failed — the chip must say MIC BLOCKED, not "I'm listening". */
   micBlocked: boolean;
   transcript: TranscriptEntry[];
-  voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
+  voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onStopLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [calls, setCalls] = useState(false);
@@ -245,9 +245,14 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
             <Icon name="spark" size={18} /> {reconnecting ? "Tuning in…" : "Tune in the radio"}
           </button>
         ) : (
-          <button data-testid="radio-mute" onClick={onToggleMute} style={micBtn(getMicBtnBg(micBlocked, muted))}>
-            <Icon name={getMicBtnIconName(micBlocked, muted)} size={18} /> {getMicBtnLabel(micBlocked, muted)}
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button data-testid="radio-mute" onClick={onToggleMute} style={{ ...micBtn(getMicBtnBg(micBlocked, muted)), flex: 1 }}>
+              <Icon name={getMicBtnIconName(micBlocked, muted)} size={18} /> {getMicBtnLabel(micBlocked, muted)}
+            </button>
+            <button data-testid="radio-stoplive" onClick={onStopLive} style={micBtn("#e23a3a")}>
+              <Icon name="x" size={18} /> Sign off
+            </button>
+          </div>
         )}
       </div>
     );
