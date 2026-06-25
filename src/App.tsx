@@ -60,6 +60,7 @@ import { useLiveSession } from "./hooks/useLiveSession";
 import { useEarcons } from "./classic/hooks/useEarcons";
 import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
+import { useRecentlyIdled } from "./classic/hooks/useRecentlyIdled";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -77,8 +78,10 @@ function AppRaw() {
   // render the effective rider + a divergence "heads up" when nominal ≠ effective (degrade-safe).
   const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const [recentlyIdled, setRecentlyIdled] = useState<Record<string, boolean>>({});
-  const prevTerminalsRef = useRef<Terminal[]>([]);
+  // dbt4: the recently-idled pulse map + its prev-terminals-diff effect now live in useRecentlyIdled
+  // (src/classic/hooks/useRecentlyIdled.ts). Behavior is byte-identical; the pure Running→Idle diff is
+  // split to src/classic/helpers/idleDiff.ts. No harness coupling for setRecentlyIdled.
+  const { recentlyIdled } = useRecentlyIdled({ terminals });
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [editingProject, setEditingProject] = useState<Workspace | null>(null);
@@ -586,41 +589,8 @@ function AppRaw() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh on project/ledger change only; fetchProjectNotes is an unstable body fn called with explicit arg, listing it would re-run every render.
   }, [activeProjectId, ledger]);
 
-  // dbt4: the 5s history-panel poll effect now lives in useTerminalHistory (the hook owns it).
-
-  useEffect(() => {
-    const prev = prevTerminalsRef.current;
-    let hasChanges = false;
-    const nextRecentlyIdled = { ...recentlyIdled };
-
-    terminals.forEach((term) => {
-      const prevTerm = prev.find((p) => p.id === term.id);
-      if (prevTerm && prevTerm.status === "Running" && term.status === "Idle") {
-        nextRecentlyIdled[term.id] = true;
-        hasChanges = true;
-        
-        // Remove animation after 6 seconds (2 heartbeats)
-        setTimeout(() => {
-          setRecentlyIdled(current => {
-            if (!current[term.id]) return current;
-            const updated = { ...current };
-            delete updated[term.id];
-            return updated;
-          });
-        }, 6000);
-      } else if (term.status === "Running" && nextRecentlyIdled[term.id]) {
-        delete nextRecentlyIdled[term.id];
-        hasChanges = true;
-      }
-    });
-
-    if (hasChanges) {
-      setRecentlyIdled(nextRecentlyIdled);
-    }
-
-    prevTerminalsRef.current = terminals;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- diff is intentionally keyed to terminals changes only; adding recentlyIdled would re-run on its own setState (incl. setTimeout) and re-register timers. Reading the latest recentlyIdled snapshot is fine here.
-  }, [terminals]);
+  // dbt4: the 5s history-panel poll effect now lives in useTerminalHistory; the recently-idled
+  // pulse diff + its 6s clear timers now live in useRecentlyIdled (each hook owns its own effect).
 
   const handleApprove = async (messageId: string) => {
     if (isMockModeRef.current) {
