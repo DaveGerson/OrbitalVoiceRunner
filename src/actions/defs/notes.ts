@@ -303,7 +303,7 @@ export const createProjectNote: ActionDef<typeof CreateProjectNoteParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/projects/:project_id/notes" },
   handler: (args, ctx): ActionResult => {
-    ctx.manager.ledger.addNote(args.project_id, args.note);
+    ctx.manager.ledger.addNote(args.project_id, redactSecrets(args.note));
     // Faithful to the inline route: broadcasts unconditionally (the voice add_project_note guards on success). Harmless spurious broadcast if the project is missing.
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note added to project ${args.project_id}.` };
@@ -341,7 +341,7 @@ export const editNote: ActionDef<typeof EditNoteParams> = {
   rest: { method: "put", path: "/api/notes/:note_id" },
   handler: (args, ctx): ActionResult => {
     // Accepted delta: the inline 400 "Missing text" type-guard is superseded by Zod (text: z.string()) upstream.
-    ctx.manager.ledger.amendNote(args.note_id, args.text);
+    ctx.manager.ledger.amendNote(args.note_id, redactSecrets(args.text));
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note ${args.note_id} updated.` };
   },
@@ -373,7 +373,7 @@ export const createPaneNote: ActionDef<typeof CreatePaneNoteParams> = {
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/projects/:project_id/panes/:pane_id/notes" },
   handler: (args, ctx): ActionResult => {
-    ctx.manager.ledger.addPaneNote(args.project_id, args.pane_id, args.note);
+    ctx.manager.ledger.addPaneNote(args.project_id, args.pane_id, redactSecrets(args.note));
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note added to pane ${args.pane_id}.` };
   },
