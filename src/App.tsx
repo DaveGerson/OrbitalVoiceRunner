@@ -59,6 +59,7 @@ import {
 import { useLiveSession } from "./hooks/useLiveSession";
 import { useEarcons } from "./classic/hooks/useEarcons";
 import { useStdoutStream } from "./classic/hooks/useStdoutStream";
+import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -113,9 +114,19 @@ function AppRaw() {
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
-  const [showHistoryPanel, setShowHistoryPanel] = useState<boolean>(false);
-  const [historyList, setHistoryList] = useState<{ command: string; timestamp: string; output: string }[]>([]);
-  const [selectedHistoryEntry, setSelectedHistoryEntry] = useState<{ command: string; timestamp: string; output: string } | null>(null);
+  // dbt4: the active-pane command-history panel state + fetch/clear + the 5s poll effect now live in
+  // useTerminalHistory (src/classic/hooks/useTerminalHistory.ts). Behavior is byte-identical; the pure
+  // poll-arm gate is pinned in src/classic/helpers/historyLogic.ts. No harness coupling for these
+  // setters (E2EHarnessDeps owns setTerminals/setActiveTerminalId/etc., not these).
+  const {
+    showHistoryPanel,
+    setShowHistoryPanel,
+    historyList,
+    selectedHistoryEntry,
+    setSelectedHistoryEntry,
+    fetchActiveTerminalHistory,
+    clearActiveTerminalHistory,
+  } = useTerminalHistory({ activeTerminalId });
   const [hoveredTermId, setHoveredTermId] = useState<string | null>(null);
 
   // --- Plans state (voice/backend path; the Orchestrate & Alerts GUI tabs were removed) ---
@@ -228,33 +239,9 @@ function AppRaw() {
     } catch (e) {}
   };
 
-  const fetchActiveTerminalHistory = async (terminalId: string | null = activeTerminalId) => {
-    if (!terminalId) return;
-    try {
-      const res = await apiFetch(`/api/terminals/${terminalId}/history`);
-      if (res.ok) {
-        const data = await res.json();
-        setHistoryList(data);
-      }
-    } catch (e) {
-      console.error("Failed to load terminal history:", e);
-    }
-  };
-
-  const clearActiveTerminalHistory = async () => {
-    if (!activeTerminalId) return;
-    try {
-      const res = await apiFetch(`/api/terminals/${activeTerminalId}/history/clear`, {
-        method: "POST"
-      });
-      if (res.ok) {
-        setHistoryList([]);
-        setSelectedHistoryEntry(null);
-      }
-    } catch (e) {
-      console.error("Failed to clear terminal history:", e);
-    }
-  };
+  // dbt4: fetchActiveTerminalHistory + clearActiveTerminalHistory moved into useTerminalHistory (see
+  // the destructure above). Other App effects/handlers (the active-pane-change effect, the
+  // history-panel toggle button) still call the hook's returned fetcher with the same order/args.
 
   // dbt4: the rAF-batched stdout preview flush (queueStdoutChunk) + the debounced terminal-resize
   // POST (handleTerminalResize) now live in useStdoutStream (src/classic/hooks/useStdoutStream.ts).
@@ -599,19 +586,7 @@ function AppRaw() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh on project/ledger change only; fetchProjectNotes is an unstable body fn called with explicit arg, listing it would re-run every render.
   }, [activeProjectId, ledger]);
 
-  useEffect(() => {
-    let interval: NodeJS.Timeout | null = null;
-    if (showHistoryPanel && activeTerminalId) {
-      fetchActiveTerminalHistory(activeTerminalId);
-      interval = setInterval(() => {
-        fetchActiveTerminalHistory(activeTerminalId);
-      }, 5000);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- (re)start the poll on panel/pane change only; fetchActiveTerminalHistory is an unstable body fn, listing it would re-run every render.
-  }, [showHistoryPanel, activeTerminalId]);
+  // dbt4: the 5s history-panel poll effect now lives in useTerminalHistory (the hook owns it).
 
   useEffect(() => {
     const prev = prevTerminalsRef.current;
