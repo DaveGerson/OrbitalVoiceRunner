@@ -61,6 +61,7 @@ import { useEarcons } from "./classic/hooks/useEarcons";
 import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
 import { useRecentlyIdled } from "./classic/hooks/useRecentlyIdled";
+import { useComposer } from "./classic/hooks/useComposer";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -153,14 +154,13 @@ function AppRaw() {
     archiveWasEmptyRef.current = archive.length === 0;
   }, [archive.length]);
 
-  // --- Real-time Synchronous Markdown Prompt Buffer & Voice Agent Workspace States ---
-  const [promptBuffer, setPromptBuffer] = useState("");
-  const [isBufferFocused, setIsBufferFocused] = useState(false);
-  const [promptBufferEditMode, setPromptBufferEditMode] = useState<"edit" | "preview">("preview");
-  // Step 6 (the Workbench): the cross-pane WIP draft register, so work composed for one pane is
-  // visible (and never lost) when the operator switches to another.
-  const [wipDrafts, setWipDrafts] = useState<{ paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[]>([]);
-  const [contextInput, setContextInput] = useState("");
+  // dbt4: the Markdown prompt-buffer / WIP-draft composer (promptBuffer / isBufferFocused /
+  // promptBufferEditMode / wipDrafts / contextInput + fetchActiveDraft / fetchWipDrafts +
+  // handlePromptBufferChange / handleSendDraft / handleAddHumanContext) now lives in useComposer
+  // (src/classic/hooks/useComposer.ts). It's CALLED below — after useLiveSession, because
+  // handlePromptBufferChange pushes draft_edit frames over that hook's wsRef. setWipDrafts is returned
+  // and threaded into useE2EHarness (the harness injectWipDraft contract; src/e2e/harness.ts:167).
+  // The pure WS-vs-REST routing gate is pinned in tests/test_composer_logic.ts.
 
   // Mobile layout switcher state: terminal | buffer | menu
   const [mobileActiveView, setMobileActiveView] = useState<"terminal" | "buffer" | "menu">("terminal");
@@ -170,77 +170,6 @@ function AppRaw() {
 
   // Simplicity Mode / Focus View toggler for a clean, non-overloaded experience
   const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
-
-  // Step 6 (the Workbench): the buffer is the ACTIVE pane's persistent WIP draft.
-  const fetchActiveDraft = async (projId = activeProjectId, paneId = activeTerminalId) => {
-    if (!paneId) { setPromptBuffer(""); return; }
-    try {
-      const res = await apiFetch(`/api/panes/${projId}/${paneId}/draft`);
-      if (res.ok) {
-        const data = await res.json();
-        setPromptBuffer(data.draft?.text ?? "");
-      }
-    } catch (e) {
-      console.warn("REST draft fetch failed");
-    }
-  };
-
-  // The cross-pane WIP register (the scalable part of "B").
-  const fetchWipDrafts = async (projId = activeProjectId) => {
-    try {
-      const res = await apiFetch(`/api/projects/${projId}/drafts`);
-      if (res.ok) {
-        const data = await res.json();
-        setWipDrafts(data.drafts || []);
-      }
-    } catch (e) {}
-  };
-
-  const handlePromptBufferChange = (val: string) => {
-    setPromptBuffer(val);
-    if (!activeTerminalId) return;
-    // Edit the active pane's draft (not a CLI write — ungated).
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: "draft_edit",
-        projectId: activeProjectId,
-        paneId: activeTerminalId,
-        text: val
-      }));
-    } else {
-      apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: val })
-      }).catch(() => {});
-    }
-  };
-
-  // Send the draft to the active pane. Operator-direct write (the operator is above the gate):
-  // clicking Send IS the approval, so it writes immediately and clears the draft.
-  const handleSendDraft = async () => {
-    if (!activeTerminalId || !promptBuffer.trim()) return;
-    try {
-      const res = await apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft/send`, { method: "POST" });
-      if (res.ok) {
-        setPromptBuffer("");
-        playEarcon("execute");
-      }
-    } catch (e) {}
-  };
-
-  // Add an operator-typed context entry (the human layer) for the active pane.
-  const handleAddHumanContext = async (text: string) => {
-    if (!activeTerminalId || !text.trim()) return;
-    try {
-      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/context`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, layer: "human" })
-      });
-      fetchLedger();
-    } catch (e) {}
-  };
 
   // dbt4: fetchActiveTerminalHistory + clearActiveTerminalHistory moved into useTerminalHistory (see
   // the destructure above). Other App effects/handlers (the active-pane-change effect, the
@@ -268,25 +197,11 @@ function AppRaw() {
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
 
-  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
-  // e2eActiveRef (App-owned, declared above for useStdoutStream's resize guard) lets the
-  // mock-mode-gated resize POST still fire under e2e; the harness writes into the same ref.
-  useE2EHarness({
-    isMockModeRef,
-    e2eActiveRef,
-    setIsMockMode,
-    setShowTranscriptPanel,
-    setTerminals,
-    setActiveTerminalId,
-    setLedger,
-    queueStdoutChunk,
-    setTranscript,
-    setPendingCommands,
-    setPendingActions,
-    setFrozen,
-    setFrozenRunning,
-    setWipDrafts,
-  });
+  // dbt4: the useE2EHarness({...}) call MOVED DOWN — below useComposer — because the harness deps now
+  // include setWipDrafts (from useComposer), which is declared after useLiveSession. Keeping the call
+  // here would reference setWipDrafts before its const init (TDZ). The harness effect runs post-mount
+  // regardless of declaration order; e2eActiveRef is App-owned (created above for useStdoutStream's
+  // resize guard) and passed in, so nothing downstream depends on the harness running earlier.
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
@@ -852,6 +767,57 @@ function AppRaw() {
     setIsReconnecting,
     isLive,
     onWsMessage,
+  });
+
+  // dbt4: the Markdown prompt-buffer / WIP-draft composer. Called AFTER useLiveSession so it can read
+  // that hook's wsRef (handlePromptBufferChange pushes draft_edit frames over the SAME live socket,
+  // falling back to REST). onWsMessage / the boot + active-pane effects close over the returned
+  // setters/fetchers (deferred execution, so the post-declaration call site is TDZ-safe). setWipDrafts
+  // is threaded into useE2EHarness below (the injectWipDraft harness contract).
+  const {
+    promptBuffer,
+    setPromptBuffer,
+    isBufferFocused,
+    setIsBufferFocused,
+    promptBufferEditMode,
+    setPromptBufferEditMode,
+    wipDrafts,
+    setWipDrafts,
+    contextInput,
+    setContextInput,
+    fetchActiveDraft,
+    fetchWipDrafts,
+    handlePromptBufferChange,
+    handleSendDraft,
+    handleAddHumanContext,
+  } = useComposer({
+    activeProjectId,
+    activeTerminalId,
+    wsRef,
+    playEarcon,
+    fetchLedger,
+  });
+
+  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1. Called HERE (after
+  // useComposer) so its deps can include setWipDrafts — the injectWipDraft harness contract
+  // (src/e2e/harness.ts:167). e2eActiveRef (App-owned, created above for useStdoutStream's resize
+  // guard) lets the mock-mode-gated resize POST still fire under e2e; the harness writes into it.
+  // The 3 harness-wired setters threaded here: setPendingCommands, setPendingActions, setWipDrafts.
+  useE2EHarness({
+    isMockModeRef,
+    e2eActiveRef,
+    setIsMockMode,
+    setShowTranscriptPanel,
+    setTerminals,
+    setActiveTerminalId,
+    setLedger,
+    queueStdoutChunk,
+    setTranscript,
+    setPendingCommands,
+    setPendingActions,
+    setFrozen,
+    setFrozenRunning,
+    setWipDrafts,
   });
 
   const generateMockData = () => {
