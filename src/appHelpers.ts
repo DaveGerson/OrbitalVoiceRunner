@@ -281,6 +281,36 @@ export function geminiVoiceLabel(isLive: boolean, isReconnecting: boolean, isMic
   return isLive ? (isReconnecting ? "RECONNECTING..." : (isMicMuted ? "MUTED" : "LISTENING...")) : "OFFLINE";
 }
 
+/** Synergy-panel "AGENT STATUS" voice label — DISTINCT, longer strings from the header's
+ *  geminiVoiceLabel (which renders "RECONNECTING…"/"MUTED"/"LISTENING…"/"OFFLINE"). The Synergy
+ *  Matrix hero instead renders these full sentences, so they get their OWN byte-exact helper rather
+ *  than reusing geminiVoiceLabel. Verbatim from the inline live/reconnect/mute chain at App.tsx. */
+export function voiceAgentStatusLabel(isLive: boolean, isReconnecting: boolean, isMicMuted: boolean): string {
+  return isLive
+    ? (isReconnecting ? "AI Reconnecting..." : isMicMuted ? "Muted (Zephyr Listening)" : "Zephyr Voice Agent Live")
+    : "Offline (Mic Standby)";
+}
+
+/** Synergy-panel Spec Buffer char-count badge: "<n> Chars" when non-empty, else "Empty".
+ *  Verbatim from the inline `promptBuffer.length > 0 ? … : "Empty"` ternary. */
+export function specBufferBadge(promptBuffer: string): string {
+  return promptBuffer.length > 0 ? `${promptBuffer.length} Chars` : "Empty";
+}
+
+/** Heatmap tooltip "Live Stdout Capture" snippet: the last (up to) 4 trimmed lines of a term's
+ *  output, or [] when there is no output. Verbatim from the inline
+ *  `term.output ? term.output.trim().split("\n").slice(-4) : []`. */
+export function heatmapSnippetLines(output: string | undefined): string[] {
+  return output ? output.trim().split("\n").slice(-4) : [];
+}
+
+/** Transcript grounding source label: the source title if present, else the bare host of its URI
+ *  (scheme + path stripped). Verbatim from the inline
+ *  `s.title || s.uri.replace(/^https?:\/\//, "").replace(/\/.*$/, "")`. */
+export function transcriptSourceLabel(source: { uri: string; title: string }): string {
+  return source.title || source.uri.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+}
+
 /** Total-context-size text class (>80k red, >40k amber, else cyan). Verbatim from the header chain. */
 export function totalContextTextClass(totalContextSize: number): string {
   return totalContextSize > 80000 ? "text-red-400 animate-pulse font-extrabold" : totalContextSize > 40000 ? "text-amber-400 font-bold" : "text-cyan-400";
