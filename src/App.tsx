@@ -62,6 +62,7 @@ import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
 import { useRecentlyIdled } from "./classic/hooks/useRecentlyIdled";
 import { useComposer } from "./classic/hooks/useComposer";
+import { useApprovalsQueue } from "./classic/hooks/useApprovalsQueue";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -73,11 +74,12 @@ function AppRaw() {
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
-  const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
-  // G1: gated non-PTY deferred actions (create_pane / set_*_permissions on the Ask tier).
-  // rbh: PendingActionView carries the SERVER-resolved EFFECTIVE posture so the confirm dialog can
-  // render the effective rider + a divergence "heads up" when nominal ≠ effective (degrade-safe).
-  const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
+  // dbt4: pendingCommands / pendingActions state + fetchPendingCommands + handleApprove / handleReject
+  // / handleConfirmAction / handleCancelAction now live in useApprovalsQueue
+  // (src/classic/hooks/useApprovalsQueue.ts). It's CALLED below — after fetchTerminals is in scope.
+  // setPendingCommands AND setPendingActions are returned and threaded into useE2EHarness (the
+  // injectPendingApproval / injectPendingAction harness contract; src/e2e/harness.ts:161-162). The
+  // pure optimistic-filter decisions are pinned in tests/test_approvals_logic.ts.
   const [showCreateModal, setShowCreateModal] = useState(false);
   // dbt4: the recently-idled pulse map + its prev-terminals-diff effect now live in useRecentlyIdled
   // (src/classic/hooks/useRecentlyIdled.ts). Behavior is byte-identical; the pure Running→Idle diff is
@@ -353,15 +355,8 @@ function AppRaw() {
 
   // Restart the live voice session so reconnect-only settings (voice, model, API
   // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
-  const fetchPendingCommands = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/commands/pending");
-      if (!res.ok) return;
-      const data = await res.json();
-      setPendingCommands(data);
-    } catch (e) {}
-  };
+  // dbt4: fetchPendingCommands moved into useApprovalsQueue (called below). The boot + safety-net poll
+  // effects still call the hook's returned fetcher with the same order/args.
 
   const fetchPlans = async () => {
     if (isMockModeRef.current) return;
@@ -507,69 +502,9 @@ function AppRaw() {
   // dbt4: the 5s history-panel poll effect now lives in useTerminalHistory; the recently-idled
   // pulse diff + its 6s clear timers now live in useRecentlyIdled (each hook owns its own effect).
 
-  const handleApprove = async (messageId: string) => {
-    if (isMockModeRef.current) {
-      const pendingCmd = pendingCommands.find(p => p.messageId === messageId);
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      if (pendingCmd) {
-        setTerminals(prev => prev.map(t => {
-          if (t.id === pendingCmd.terminalId) {
-            return {
-              ...t,
-              status: "Running",
-              command: pendingCmd.cmd,
-              output: t.output + `\n\n> ${pendingCmd.cmd}\n` + (pendingCmd.cmd.includes("tailwindcss") ? "added 1 package, and audited 2 packages in 3s" : "Successfully installed pandas 2.1.0\nDONE"),
-            };
-          }
-          return t;
-        }));
-      }
-      return;
-    }
-    try {
-      await apiFetch("/api/commands/approve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId, approved: true })
-      });
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      setTimeout(fetchTerminals, 500);
-    } catch (e) {}
-  };
-
-  const handleReject = async (messageId: string) => {
-    if (isMockModeRef.current) {
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      return;
-    }
-    try {
-      await apiFetch("/api/commands/approve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId, approved: false })
-      });
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-    } catch (e) {}
-  };
-
-  // G1: confirm/cancel a gated non-PTY deferred action. Optimistically drop from the UI; the
-  // server runs the staged side effect exactly once on confirm (no-ops on a lost race).
-  const handleConfirmAction = async (actionId: string) => {
-    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
-    if (isMockModeRef.current) return;
-    try {
-      await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
-      setTimeout(fetchTerminals, 500);
-    } catch (e) {}
-  };
-
-  const handleCancelAction = async (actionId: string) => {
-    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
-    if (isMockModeRef.current) return;
-    try {
-      await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
-    } catch (e) {}
-  };
+  // dbt4: handleApprove / handleReject / handleConfirmAction / handleCancelAction moved into
+  // useApprovalsQueue (called below). The ApprovalDialog / ActionConfirmDialog call the hook's returned
+  // handlers; the optimistic-filter decisions are split to approvalsLogic (node:test-pinned).
 
   const handleCreateTerminal = async (
     id: string,
@@ -796,6 +731,27 @@ function AppRaw() {
     wsRef,
     playEarcon,
     fetchLedger,
+  });
+
+  // dbt4: the gated-approval / deferred-action queue (pendingCommands / pendingActions +
+  // fetchPendingCommands + the four approve/reject/confirm/cancel handlers). onWsMessage / the boot +
+  // safety-net poll effects close over the returned setters/fetcher/handlers (deferred execution, so
+  // the post-declaration call site is TDZ-safe). setPendingCommands + setPendingActions are threaded
+  // into useE2EHarness below (the injectPendingApproval / injectPendingAction harness contracts).
+  const {
+    pendingCommands,
+    setPendingCommands,
+    pendingActions,
+    setPendingActions,
+    fetchPendingCommands,
+    handleApprove,
+    handleReject,
+    handleConfirmAction,
+    handleCancelAction,
+  } = useApprovalsQueue({
+    isMockModeRef,
+    setTerminals,
+    fetchTerminals,
   });
 
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1. Called HERE (after
