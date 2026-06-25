@@ -61,6 +61,8 @@ import { useEarcons } from "./classic/hooks/useEarcons";
 import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
 import { useRecentlyIdled } from "./classic/hooks/useRecentlyIdled";
+import { useComposer } from "./classic/hooks/useComposer";
+import { useApprovalsQueue } from "./classic/hooks/useApprovalsQueue";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -72,11 +74,12 @@ function AppRaw() {
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
-  const [pendingCommands, setPendingCommands] = useState<PendingCommand[]>([]);
-  // G1: gated non-PTY deferred actions (create_pane / set_*_permissions on the Ask tier).
-  // rbh: PendingActionView carries the SERVER-resolved EFFECTIVE posture so the confirm dialog can
-  // render the effective rider + a divergence "heads up" when nominal ≠ effective (degrade-safe).
-  const [pendingActions, setPendingActions] = useState<PendingActionView[]>([]);
+  // dbt4: pendingCommands / pendingActions state + fetchPendingCommands + handleApprove / handleReject
+  // / handleConfirmAction / handleCancelAction now live in useApprovalsQueue
+  // (src/classic/hooks/useApprovalsQueue.ts). It's CALLED below — after fetchTerminals is in scope.
+  // setPendingCommands AND setPendingActions are returned and threaded into useE2EHarness (the
+  // injectPendingApproval / injectPendingAction harness contract; src/e2e/harness.ts:161-162). The
+  // pure optimistic-filter decisions are pinned in tests/test_approvals_logic.ts.
   const [showCreateModal, setShowCreateModal] = useState(false);
   // dbt4: the recently-idled pulse map + its prev-terminals-diff effect now live in useRecentlyIdled
   // (src/classic/hooks/useRecentlyIdled.ts). Behavior is byte-identical; the pure Running→Idle diff is
@@ -153,14 +156,13 @@ function AppRaw() {
     archiveWasEmptyRef.current = archive.length === 0;
   }, [archive.length]);
 
-  // --- Real-time Synchronous Markdown Prompt Buffer & Voice Agent Workspace States ---
-  const [promptBuffer, setPromptBuffer] = useState("");
-  const [isBufferFocused, setIsBufferFocused] = useState(false);
-  const [promptBufferEditMode, setPromptBufferEditMode] = useState<"edit" | "preview">("preview");
-  // Step 6 (the Workbench): the cross-pane WIP draft register, so work composed for one pane is
-  // visible (and never lost) when the operator switches to another.
-  const [wipDrafts, setWipDrafts] = useState<{ paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } }[]>([]);
-  const [contextInput, setContextInput] = useState("");
+  // dbt4: the Markdown prompt-buffer / WIP-draft composer (promptBuffer / isBufferFocused /
+  // promptBufferEditMode / wipDrafts / contextInput + fetchActiveDraft / fetchWipDrafts +
+  // handlePromptBufferChange / handleSendDraft / handleAddHumanContext) now lives in useComposer
+  // (src/classic/hooks/useComposer.ts). It's CALLED below — after useLiveSession, because
+  // handlePromptBufferChange pushes draft_edit frames over that hook's wsRef. setWipDrafts is returned
+  // and threaded into useE2EHarness (the harness injectWipDraft contract; src/e2e/harness.ts:167).
+  // The pure WS-vs-REST routing gate is pinned in tests/test_composer_logic.ts.
 
   // Mobile layout switcher state: terminal | buffer | menu
   const [mobileActiveView, setMobileActiveView] = useState<"terminal" | "buffer" | "menu">("terminal");
@@ -170,77 +172,6 @@ function AppRaw() {
 
   // Simplicity Mode / Focus View toggler for a clean, non-overloaded experience
   const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
-
-  // Step 6 (the Workbench): the buffer is the ACTIVE pane's persistent WIP draft.
-  const fetchActiveDraft = async (projId = activeProjectId, paneId = activeTerminalId) => {
-    if (!paneId) { setPromptBuffer(""); return; }
-    try {
-      const res = await apiFetch(`/api/panes/${projId}/${paneId}/draft`);
-      if (res.ok) {
-        const data = await res.json();
-        setPromptBuffer(data.draft?.text ?? "");
-      }
-    } catch (e) {
-      console.warn("REST draft fetch failed");
-    }
-  };
-
-  // The cross-pane WIP register (the scalable part of "B").
-  const fetchWipDrafts = async (projId = activeProjectId) => {
-    try {
-      const res = await apiFetch(`/api/projects/${projId}/drafts`);
-      if (res.ok) {
-        const data = await res.json();
-        setWipDrafts(data.drafts || []);
-      }
-    } catch (e) {}
-  };
-
-  const handlePromptBufferChange = (val: string) => {
-    setPromptBuffer(val);
-    if (!activeTerminalId) return;
-    // Edit the active pane's draft (not a CLI write — ungated).
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: "draft_edit",
-        projectId: activeProjectId,
-        paneId: activeTerminalId,
-        text: val
-      }));
-    } else {
-      apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: val })
-      }).catch(() => {});
-    }
-  };
-
-  // Send the draft to the active pane. Operator-direct write (the operator is above the gate):
-  // clicking Send IS the approval, so it writes immediately and clears the draft.
-  const handleSendDraft = async () => {
-    if (!activeTerminalId || !promptBuffer.trim()) return;
-    try {
-      const res = await apiFetch(`/api/panes/${activeProjectId}/${activeTerminalId}/draft/send`, { method: "POST" });
-      if (res.ok) {
-        setPromptBuffer("");
-        playEarcon("execute");
-      }
-    } catch (e) {}
-  };
-
-  // Add an operator-typed context entry (the human layer) for the active pane.
-  const handleAddHumanContext = async (text: string) => {
-    if (!activeTerminalId || !text.trim()) return;
-    try {
-      await apiFetch(`/api/projects/${activeProjectId}/panes/${activeTerminalId}/context`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, layer: "human" })
-      });
-      fetchLedger();
-    } catch (e) {}
-  };
 
   // dbt4: fetchActiveTerminalHistory + clearActiveTerminalHistory moved into useTerminalHistory (see
   // the destructure above). Other App effects/handlers (the active-pane-change effect, the
@@ -268,25 +199,11 @@ function AppRaw() {
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
 
-  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
-  // e2eActiveRef (App-owned, declared above for useStdoutStream's resize guard) lets the
-  // mock-mode-gated resize POST still fire under e2e; the harness writes into the same ref.
-  useE2EHarness({
-    isMockModeRef,
-    e2eActiveRef,
-    setIsMockMode,
-    setShowTranscriptPanel,
-    setTerminals,
-    setActiveTerminalId,
-    setLedger,
-    queueStdoutChunk,
-    setTranscript,
-    setPendingCommands,
-    setPendingActions,
-    setFrozen,
-    setFrozenRunning,
-    setWipDrafts,
-  });
+  // dbt4: the useE2EHarness({...}) call MOVED DOWN — below useComposer — because the harness deps now
+  // include setWipDrafts (from useComposer), which is declared after useLiveSession. Keeping the call
+  // here would reference setWipDrafts before its const init (TDZ). The harness effect runs post-mount
+  // regardless of declaration order; e2eActiveRef is App-owned (created above for useStdoutStream's
+  // resize guard) and passed in, so nothing downstream depends on the harness running earlier.
 
   const fetchTerminals = async () => {
     if (isMockModeRef.current) return;
@@ -438,15 +355,8 @@ function AppRaw() {
 
   // Restart the live voice session so reconnect-only settings (voice, model, API
   // key) take effect. Wired to the Settings dialog's "Apply & Reconnect" button.
-  const fetchPendingCommands = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/commands/pending");
-      if (!res.ok) return;
-      const data = await res.json();
-      setPendingCommands(data);
-    } catch (e) {}
-  };
+  // dbt4: fetchPendingCommands moved into useApprovalsQueue (called below). The boot + safety-net poll
+  // effects still call the hook's returned fetcher with the same order/args.
 
   const fetchPlans = async () => {
     if (isMockModeRef.current) return;
@@ -592,69 +502,9 @@ function AppRaw() {
   // dbt4: the 5s history-panel poll effect now lives in useTerminalHistory; the recently-idled
   // pulse diff + its 6s clear timers now live in useRecentlyIdled (each hook owns its own effect).
 
-  const handleApprove = async (messageId: string) => {
-    if (isMockModeRef.current) {
-      const pendingCmd = pendingCommands.find(p => p.messageId === messageId);
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      if (pendingCmd) {
-        setTerminals(prev => prev.map(t => {
-          if (t.id === pendingCmd.terminalId) {
-            return {
-              ...t,
-              status: "Running",
-              command: pendingCmd.cmd,
-              output: t.output + `\n\n> ${pendingCmd.cmd}\n` + (pendingCmd.cmd.includes("tailwindcss") ? "added 1 package, and audited 2 packages in 3s" : "Successfully installed pandas 2.1.0\nDONE"),
-            };
-          }
-          return t;
-        }));
-      }
-      return;
-    }
-    try {
-      await apiFetch("/api/commands/approve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId, approved: true })
-      });
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      setTimeout(fetchTerminals, 500);
-    } catch (e) {}
-  };
-
-  const handleReject = async (messageId: string) => {
-    if (isMockModeRef.current) {
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-      return;
-    }
-    try {
-      await apiFetch("/api/commands/approve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId, approved: false })
-      });
-      setPendingCommands(prev => prev.filter(item => item.messageId !== messageId));
-    } catch (e) {}
-  };
-
-  // G1: confirm/cancel a gated non-PTY deferred action. Optimistically drop from the UI; the
-  // server runs the staged side effect exactly once on confirm (no-ops on a lost race).
-  const handleConfirmAction = async (actionId: string) => {
-    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
-    if (isMockModeRef.current) return;
-    try {
-      await apiFetch(`/api/actions/${actionId}/confirm`, { method: "POST" });
-      setTimeout(fetchTerminals, 500);
-    } catch (e) {}
-  };
-
-  const handleCancelAction = async (actionId: string) => {
-    setPendingActions(prev => prev.filter(a => a.actionId !== actionId));
-    if (isMockModeRef.current) return;
-    try {
-      await apiFetch(`/api/actions/${actionId}/cancel`, { method: "POST" });
-    } catch (e) {}
-  };
+  // dbt4: handleApprove / handleReject / handleConfirmAction / handleCancelAction moved into
+  // useApprovalsQueue (called below). The ApprovalDialog / ActionConfirmDialog call the hook's returned
+  // handlers; the optimistic-filter decisions are split to approvalsLogic (node:test-pinned).
 
   const handleCreateTerminal = async (
     id: string,
@@ -852,6 +702,78 @@ function AppRaw() {
     setIsReconnecting,
     isLive,
     onWsMessage,
+  });
+
+  // dbt4: the Markdown prompt-buffer / WIP-draft composer. Called AFTER useLiveSession so it can read
+  // that hook's wsRef (handlePromptBufferChange pushes draft_edit frames over the SAME live socket,
+  // falling back to REST). onWsMessage / the boot + active-pane effects close over the returned
+  // setters/fetchers (deferred execution, so the post-declaration call site is TDZ-safe). setWipDrafts
+  // is threaded into useE2EHarness below (the injectWipDraft harness contract).
+  const {
+    promptBuffer,
+    setPromptBuffer,
+    isBufferFocused,
+    setIsBufferFocused,
+    promptBufferEditMode,
+    setPromptBufferEditMode,
+    wipDrafts,
+    setWipDrafts,
+    contextInput,
+    setContextInput,
+    fetchActiveDraft,
+    fetchWipDrafts,
+    handlePromptBufferChange,
+    handleSendDraft,
+    handleAddHumanContext,
+  } = useComposer({
+    activeProjectId,
+    activeTerminalId,
+    wsRef,
+    playEarcon,
+    fetchLedger,
+  });
+
+  // dbt4: the gated-approval / deferred-action queue (pendingCommands / pendingActions +
+  // fetchPendingCommands + the four approve/reject/confirm/cancel handlers). onWsMessage / the boot +
+  // safety-net poll effects close over the returned setters/fetcher/handlers (deferred execution, so
+  // the post-declaration call site is TDZ-safe). setPendingCommands + setPendingActions are threaded
+  // into useE2EHarness below (the injectPendingApproval / injectPendingAction harness contracts).
+  const {
+    pendingCommands,
+    setPendingCommands,
+    pendingActions,
+    setPendingActions,
+    fetchPendingCommands,
+    handleApprove,
+    handleReject,
+    handleConfirmAction,
+    handleCancelAction,
+  } = useApprovalsQueue({
+    isMockModeRef,
+    setTerminals,
+    fetchTerminals,
+  });
+
+  // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1. Called HERE (after
+  // useComposer) so its deps can include setWipDrafts — the injectWipDraft harness contract
+  // (src/e2e/harness.ts:167). e2eActiveRef (App-owned, created above for useStdoutStream's resize
+  // guard) lets the mock-mode-gated resize POST still fire under e2e; the harness writes into it.
+  // The 3 harness-wired setters threaded here: setPendingCommands, setPendingActions, setWipDrafts.
+  useE2EHarness({
+    isMockModeRef,
+    e2eActiveRef,
+    setIsMockMode,
+    setShowTranscriptPanel,
+    setTerminals,
+    setActiveTerminalId,
+    setLedger,
+    queueStdoutChunk,
+    setTranscript,
+    setPendingCommands,
+    setPendingActions,
+    setFrozen,
+    setFrozenRunning,
+    setWipDrafts,
   });
 
   const generateMockData = () => {
