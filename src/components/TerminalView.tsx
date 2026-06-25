@@ -28,9 +28,11 @@ interface TerminalViewProps {
    * `null` → fall back to the latest `backfill` prop.
    */
   fetchBackfill?: () => Promise<string | null>;
+  /** Operator keystrokes typed into this focused pane — raw xterm onData bytes, escape sequences intact. */
+  onInput?: (data: string) => void;
 }
 
-export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill, onResize, resyncKey, fetchBackfill }) => {
+export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill, onResize, resyncKey, fetchBackfill, onInput }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -38,6 +40,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
   // Keep the latest onResize without re-running the mount effect on every render.
   const onResizeRef = useRef<typeof onResize>(onResize);
   onResizeRef.current = onResize;
+  // Same idiom for onInput: the mount effect (deps [terminalId]) must not re-run when the
+  // onInput callback identity changes between renders.
+  const onInputRef = useRef<typeof onInput>(onInput);
+  onInputRef.current = onInput;
   // 3C.2b: latest fetcher/backfill without re-running the mount effect; the resync entry point is
   // installed by the mount effect (it needs the live term) and invoked by the resyncKey effect.
   const fetchBackfillRef = useRef<typeof fetchBackfill>(fetchBackfill);
@@ -108,6 +114,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     });
     // Report the initial fitted grid.
     onResizeRef.current?.(term.cols, term.rows);
+
+    // Operator typing edge: forward raw xterm onData bytes (escape sequences intact) so the
+    // frontend can stream them to the backend PTY. No local echo / convertEol here — the PTY
+    // echoes what it accepts.
+    const inputDisposable = term.onData((data) => {
+      onInputRef.current?.(data);
+    });
 
     // Live lane: raw chunks written DIRECTLY into xterm — no React state, no
     // string accumulation, no line cap. xterm reconstructs the 2D grid itself.
@@ -197,6 +210,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
       resyncRef.current = null;
       unsubscribe();
       resizeDisposable.dispose();
+      inputDisposable.dispose();
       resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener("touchstart", handleTouchStart);

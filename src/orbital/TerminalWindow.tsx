@@ -16,6 +16,7 @@ import { TerminalView } from "../components/TerminalView";
 import { apiFetch } from "../utils/api";
 import { isE2EWireArmed } from "../e2e/harness";
 import { RAW_KEY_TABLE } from "../rawKeyClass";
+import { buildPaneInputFrame } from "./paneInputClient";
 import { INK, RUNTIMES } from "./theme";
 import { Button, Chip, Icon, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { TICKET_KINDS } from "./theme";
@@ -444,6 +445,11 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
                 onResize={(cols, rows) => resizeTerminal(st.id, cols, rows)}
                 resyncKey={streamGeneration}
                 fetchBackfill={fetchBackfill}
+                onInput={(data) => {
+                  if (isMockRef.current && !isE2EWireArmed()) return;
+                  const ws = wsRef.current;
+                  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(buildPaneInputFrame(st.id, data)));
+                }}
               />
             </div>
             <ControlKeyBar paneId={st.id} dark={dark} onKey={writeControlKey} />
