@@ -8,10 +8,9 @@ import { TerminalView } from "./components/TerminalView";
 import { AnimatePresence, motion } from "motion/react";
 import { ProjectDialog } from "./components/ProjectDialog";
 import { NotificationStack } from "./components/NotificationStack";
-import { GateChip } from "./components/GateChip";
 import { effectForEvent } from "./eventBus";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, History, Clock, Check, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
+import { RefreshCw, Database, Shield, Terminal as TermIcon, Clipboard, Plus, Trash2, Check, Sparkles, BookOpen, Play, Activity, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness, isE2EWireArmed } from "./e2e/harness";
@@ -65,6 +64,10 @@ import { WorkspaceSidebar } from "./classic/components/WorkspaceSidebar";
 import { ApprovalQueue } from "./classic/components/ApprovalQueue";
 import { ActionConfirmQueue } from "./classic/components/ActionConfirmQueue";
 import { AppHeader } from "./classic/components/AppHeader";
+import { ActivePaneHeaderBar } from "./classic/components/ActivePaneHeaderBar";
+import { PaneHistorySidebar } from "./classic/components/PaneHistorySidebar";
+import { DashboardHeader } from "./classic/components/DashboardHeader";
+import { ArtifactsRegistryPanel } from "./classic/components/ArtifactsRegistryPanel";
 
 function AppRaw() {
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
@@ -1122,80 +1125,23 @@ function AppRaw() {
             (() => (
             <div className="flex flex-1 flex-row overflow-hidden">
               <div className="flex-1 flex flex-col overflow-hidden">
-                <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
-                  <div className="flex gap-2 items-center overflow-hidden min-w-0">
-                    <span className="text-xs font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
-                      {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
-                    </span>
-                    <span className="text-xs font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
-                      $ {activeTerminal.command}
-                    </span>
-                    {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
-                        payload). Click for the full breakdown in plain language. The shrink-0 wrapper +
-                        the min-w-0/shrink-0 group guards keep the chip from being visually collapsed or
-                        overlapped by the right-hand controls when the header is narrowed (sidebar +
-                        transcript panel open). The e2e opens the popover via dispatchEvent('click'), so
-                        the spec no longer hinges on this layout winning a pixel-level hit-test. */}
-                    {activeTerminal.posture && (
-                      // data-testid: an inert hook so e2e can target THIS (center-header) chip
-                      // specifically — `getByTestId("gate-chip-trigger").first()` resolves to a sidebar
-                      // chip, not this one. Used by the real-pointer clickability regression guard.
-                      <span className="shrink-0" data-testid="gate-chip-header">
-                        <GateChip
-                          effectiveGates={activeTerminal.effective_gates}
-                          posture={activeTerminal.posture}
-                          isActivePane
-                        />
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-4 shrink-0">
-                    <span className="text-xs font-mono opacity-40 truncate" title={activeTerminal.cwd}>
-                      {activeTerminal.cwd}
-                    </span>
-                    <button
-                      onClick={() => {
-                        const nextState = !showHistoryPanel;
-                        setShowHistoryPanel(nextState);
-                        if (nextState) {
-                          fetchActiveTerminalHistory();
-                        }
-                      }}
-                      className={`p-1.5 hover:bg-white/5 rounded transition-colors ${showHistoryPanel ? "text-cyan-400 bg-white/5" : "text-zinc-400 hover:text-white"}`}
-                      title="Toggle Command History Pane"
-                    >
-                      <History className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={() => handleRestartTerminal(activeTerminal.id)}
-                      className="p-1.5 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
-                      title="Restart Node Engine"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                    </button>
-                    {/* B4: back-to-grid — leave the pane view without killing it. Auto-activation
-                        (voice create_pane) drops you into a pane with no header way out; acute on
-                        mobile where the sidebar grid control is hidden behind the Menu view. */}
-                    <button
-                      onClick={() => setActiveTerminalId(null)}
-                      className="flex items-center gap-1 px-2 py-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors text-xs font-mono uppercase tracking-wider"
-                      title="Back to grid (leave this pane running)"
-                    >
-                      <Layers className="w-3.5 h-3.5" />
-                      Grid
-                    </button>
-                    {/* B3: graceful EXIT — terminate this pane's process and archive it (recoverable),
-                        the non-destructive middle between Restart and PRUNE (hard delete). */}
-                    <button
-                      onClick={() => handleStopPane(activeProjectId, activeTerminal.id)}
-                      className="flex items-center gap-1 px-2 py-1 hover:bg-rose-500/10 rounded text-zinc-400 hover:text-rose-400 transition-colors text-xs font-mono uppercase tracking-wider"
-                      title="Exit pane (terminate the process and archive it — recoverable)"
-                    >
-                      <Square className="w-3.5 h-3.5" />
-                      Exit
-                    </button>
-                  </div>
-                </div>
+                {/* Active-pane header bar — extracted to ActivePaneHeaderBar (chunk-6 "terminal-view
+                    + dashboard chrome", section 3). GateChip stays a module import inside it;
+                    data-testid="gate-chip-header" is byte-identical (the real-pointer clickability
+                    guard). setActiveTerminalId is the SAME harness-wired ref — Back-to-Grid still calls
+                    setActiveTerminalId(null). The History-toggle conditional fetch is preserved. */}
+                <ActivePaneHeaderBar
+                  activeProjectMeta={activeProjectMeta}
+                  activePaneMeta={activePaneMeta}
+                  activeTerminal={activeTerminal}
+                  activeProjectId={activeProjectId}
+                  showHistoryPanel={showHistoryPanel}
+                  setShowHistoryPanel={setShowHistoryPanel}
+                  fetchActiveTerminalHistory={fetchActiveTerminalHistory}
+                  handleRestartTerminal={handleRestartTerminal}
+                  setActiveTerminalId={setActiveTerminalId}
+                  handleStopPane={handleStopPane}
+                />
                 {/* Raw control-key bar (multi-cli adapter spec §8): send literal keystrokes (arrows,
                     Tab, Esc, Enter, Ctrl+C, Shift+Tab) straight into the pane's PTY. Independent of
                     the mode <select>; Ctrl+C/Shift+Tab carry the warn tint (Shift+Tab is gated). */}
@@ -1218,196 +1164,40 @@ function AppRaw() {
                 </div>
               </div>
 
-              {/* Collapsible History Sidebar Panel — inner IIFE keeps the terminal-view IIFE's CC
-                  under the gate (the history-list conditionals leave its scope). */}
-              {showHistoryPanel && (() => (
-                <aside className="w-80 border-l border-white/5 bg-[#090909] flex flex-col shrink-0 overflow-hidden">
-                  <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
-                    <div className="flex items-center gap-2">
-                      <History className="w-4 h-4 text-cyan-400 shrink-0" />
-                      <span className="text-xs font-mono tracking-wider text-white uppercase font-bold">Local Pane History</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => fetchActiveTerminalHistory()}
-                        className="p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
-                        title="Reload History"
-                      >
-                        <RefreshCw className="w-3 h-3" />
-                      </button>
-                      <button 
-                        onClick={clearActiveTerminalHistory} 
-                        className="text-xs uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none flex items-center gap-1"
-                        title="Clear command history"
-                      >
-                        <Trash2 className="w-2.5 h-2.5" /> Clear
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex-1 flex flex-col overflow-hidden">
-                    {/* Commands List Area */}
-                    <div className="flex-1 overflow-y-auto p-4 space-y-2.5 scrollbar-thin border-b border-white/5">
-                      {historyList.length === 0 ? (
-                        <div className="h-full flex flex-col items-center justify-center text-center p-4">
-                          <History className="w-6 h-6 text-zinc-700 mb-2" />
-                          <p className="text-xs font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
-                            No commands recorded in .janus_history.json
-                          </p>
-                        </div>
-                      ) : (
-                        [...historyList].reverse().map((entry, idx) => {
-                          // Burndown: the selected-entry predicate (command+timestamp match, with its
-                          // optional chains) was inlined THREE times. Compute it ONCE — same value,
-                          // same three uses — so the map callback's CC drops below the gate.
-                          const isSelected = selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp === entry.timestamp;
-                          return (
-                          <div
-                            key={idx}
-                            onClick={() => setSelectedHistoryEntry(isSelected ? null : entry)}
-                            className={`group border rounded p-2.5 font-mono cursor-pointer transition-all duration-200 text-left ${
-                              isSelected
-                                ? "border-cyan-500/40 bg-cyan-950/[0.08]"
-                                : "border-white/5 bg-[#121212] hover:border-white/10"
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <span className="text-xs text-zinc-500 flex items-center gap-1 shrink-0">
-                                <Clock className="w-3 h-3 opacity-60" />
-                                {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                              </span>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  navigator.clipboard.writeText(entry.command);
-                                }}
-                                className="opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-opacity duration-200"
-                                title="Copy command"
-                              >
-                                <Clipboard className="w-3 h-3" />
-                              </button>
-                            </div>
-                            
-                            <div className="text-xs text-zinc-200 break-all font-semibold mt-1 bg-black/40 px-2 py-1.5 rounded border border-white/5 select-text">
-                              $ {entry.command}
-                            </div>
-
-                            {(entry as any).finalResponse && (
-                              <div className="mt-2 text-xs text-zinc-400 font-mono bg-cyan-950/10 border border-cyan-500/15 p-2 rounded flex gap-1.5 items-start">
-                                <span className="text-cyan-400 font-bold shrink-0">◇ Outcome Briefing:</span>
-                                <span className="leading-relaxed select-text">{(entry as any).finalResponse}</span>
-                              </div>
-                            )}
-
-                            {entry.output && (
-                              <div className="mt-2 flex items-center justify-between text-xs text-cyan-500/80 uppercase tracking-widest leading-none">
-                                <span>{isSelected ? "▲ Hide stdout" : "▼ Read stdout context"}</span>
-                                <span className="opacity-40">{entry.output.length} Chars</span>
-                              </div>
-                            )}
-                          </div>
-                          );
-                        })
-                      )}
-                    </div>
-
-                    {/* Selected stdout reading pane */}
-                    {selectedHistoryEntry && (
-                      <div className="h-1/2 flex flex-col bg-black/60 border-t border-white/5 overflow-hidden shrink-0">
-                        <div className="px-3 py-1.5 border-b border-white/5 bg-[#141414] flex items-center justify-between">
-                          <span className="text-xs font-mono text-cyan-400 font-bold uppercase tracking-widest">Stdout capture context</span>
-                          <button
-                            onClick={() => {
-                              navigator.clipboard.writeText(selectedHistoryEntry.output);
-                            }}
-                            className="p-1 hover:bg-white/5 rounded text-zinc-400 hover:text-white transition-colors"
-                            title="Copy captured context"
-                          >
-                            <Clipboard className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                        <div className="flex-1 overflow-auto p-3 font-mono text-xs text-zinc-400 leading-normal scrollbar-thin select-text whitespace-pre-wrap selection:bg-cyan-500/30 selection:text-white">
-                          {selectedHistoryEntry.output || "No output captured for this command."}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </aside>
-              ))()}
+              {/* Collapsible History Sidebar Panel — extracted to PaneHistorySidebar (chunk-6
+                  "terminal-view + dashboard chrome", section 4). The showHistoryPanel gate STAYS here;
+                  the [...historyList].reverse() ordering + the (entry as any) casts are byte-identical;
+                  the per-row selected predicate is the hoisted historyEntryIsSelected helper.
+                  fetchActiveTerminalHistory / clearActiveTerminalHistory / setSelectedHistoryEntry come
+                  from useTerminalHistory and thread straight through. */}
+              {showHistoryPanel && (
+                <PaneHistorySidebar
+                  historyList={historyList}
+                  selectedHistoryEntry={selectedHistoryEntry}
+                  fetchActiveTerminalHistory={fetchActiveTerminalHistory}
+                  clearActiveTerminalHistory={clearActiveTerminalHistory}
+                  setSelectedHistoryEntry={setSelectedHistoryEntry}
+                />
+              )}
             </div>
             ))()
           ) : (
             /* Dashboard High-Level View — inner IIFE keeps the center-section IIFE's CC under the gate. */
             (() => (
             <div className="flex-1 flex flex-col overflow-y-auto p-4 lg:p-8">
-              <div className="mb-8 select-none flex flex-col md:flex-row md:items-center md:justify-between gap-4 border-b border-white/5 pb-6">
-                <div>
-                  <h1 className="text-xl font-mono text-white tracking-widest uppercase mb-1 flex items-center gap-2">
-                    <Cpu className="w-5 h-5 text-cyan-400 shrink-0" />
-                    Project Terminal Workspace
-                  </h1>
-                  <p className="text-xs text-zinc-500 font-mono">
-                    Active terminal sessions tracking Claude Code, Codex, and Antigravity orchestrator engines.
-                  </p>
-                </div>
-                
-                {/* View switcher or inline Focus mode notice — inner IIFE keeps the dashboard IIFE's
-                    CC under the gate (the 3 grid-mode chains leave its scope). */}
-                {(() => !isSimpleMode ? (
-                  <div className="flex items-center gap-1 bg-black/80 p-1.5 rounded-lg border border-white/10 shrink-0 select-none self-start md:self-auto shadow-inner font-mono">
-                    <button
-                      onClick={() => setGridDisplayMode("detailed")}
-                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                        gridDisplayMode === "detailed"
-                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                      }`}
-                    >
-                      <Laptop className="w-3.5 h-3.5" />
-                      Detailed
-                    </button>
-                    <button
-                      onClick={() => setGridDisplayMode("compact")}
-                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                        gridDisplayMode === "compact"
-                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                      }`}
-                    >
-                      <Smartphone className="w-3.5 h-3.5" />
-                      Compact List
-                    </button>
-                    <button
-                      onClick={() => setGridDisplayMode("videowall")}
-                      className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all uppercase font-bold flex items-center gap-1.5 ${
-                        gridDisplayMode === "videowall"
-                          ? "bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 font-black shadow-sm"
-                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                      }`}
-                    >
-                      <Tv className="w-3.5 h-3.5" />
-                      Video Wall
-                    </button>
-                  </div>
-                ) : (
-                  <div className="text-xs bg-cyan-950/10 border border-cyan-500/15 px-3 py-1.5 rounded-lg font-mono text-cyan-300 flex items-center gap-2 select-none">
-                    <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse" />
-                    <span>Focus View activated: click any terminal pane below to run commands.</span>
-                  </div>
-                ))()}
-                {/* Clear exited panes button — only shown when at least one pane is Exited (the
-                    Exited-count predicate is the pure helper countExitedPanes). */}
-                {activeProject && countExitedPanes(activeProject.panes, terminals) > 0 && (
-                  <button
-                    onClick={handleClearExited}
-                    className="text-xs font-mono uppercase tracking-wider px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded-lg transition-all flex items-center gap-1.5 shrink-0 select-none"
-                    title="Archive all exited panes for this project"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    Clear Exited
-                  </button>
-                )}
-              </div>
+              {/* Dashboard chrome ABOVE the grid — extracted to DashboardHeader (chunk-6 "terminal-view
+                  + dashboard chrome", section 5). The title, the view-mode switcher (its inner IIFE kept
+                  VERBATIM), and the conditional Clear-Exited button. countExitedPanes stays a module
+                  import inside it; setGridDisplayMode is a plain useState setter. The grid itself
+                  (filteredPanes.map + render*Card) stays below, untouched. */}
+              <DashboardHeader
+                isSimpleMode={isSimpleMode}
+                gridDisplayMode={gridDisplayMode}
+                activeProject={activeProject}
+                terminals={terminals}
+                setGridDisplayMode={setGridDisplayMode}
+                handleClearExited={handleClearExited}
+              />
 
               {/* Core Goal: Live Conversation & Synergy Matrix — extracted to the SynergyMatrixPanel
                   leaf (chunk-3). The voice-hub + spec-buffer halves are INTERNAL closures there; the
@@ -1877,218 +1667,29 @@ function AppRaw() {
               );
             })()}
 
-              {/* Artifacts & Memory Registry Panel — inner IIFE keeps the dashboard IIFE's CC under
-                  the gate (the archive/registry conditionals leave its scope). */}
-              {(() => (
-              <div className="mt-12 pt-8 border-t border-white/5 space-y-6">
-                <div>
-                  <h2 className="text-sm font-mono text-white tracking-widest uppercase flex items-center gap-2">
-                    <FileText className="w-4 h-4 text-cyan-400" />
-                    Ledger Artifacts & Memory Registry
-                  </h2>
-                  <p className="text-xs text-zinc-500 font-mono mt-1">
-                    Manage and inspect workspace configurations, metadata snapshots, and idle session properties stored in memory.
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  {/* Left: Project Context Entities */}
-                  <div className="bg-[#0b0b0b] border border-white/5 rounded-lg p-5 space-y-4">
-                    <div className="flex justify-between items-center border-b border-white/5 pb-2">
-                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">Registered Workspaces ({projectList.length})</span>
-                      <button 
-                        onClick={handleCreateProject}
-                        className="text-xs font-mono uppercase bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 px-2 py-0.5 rounded cursor-pointer"
-                      >
-                        + Create Space
-                      </button>
-                    </div>
-
-                    <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
-                      {projectList.map((p) => {
-                        const isActive = p.id === activeProjectId;
-                        const paneKeys = Object.keys(p.panes || {});
-                        return (
-                          <div key={p.id} className={`p-3 rounded border font-mono text-xs transition-colors ${isActive ? "bg-cyan-500/[0.02] border-cyan-500/20" : "bg-black/30 border-white/5"}`}>
-                            <div className="flex justify-between items-center">
-                              <span className={`font-bold ${isActive ? "text-cyan-400" : "text-zinc-400"}`}>{p.name?.toUpperCase() || p.id}</span>
-                              <div className="flex gap-2">
-                                <button
-                                  onClick={() => handleSwitchProject(p.id)}
-                                  disabled={isActive}
-                                  className="text-xs text-zinc-400 hover:text-white disabled:opacity-30 disabled:hover:text-zinc-400 cursor-pointer"
-                                >
-                                  [SWITCH]
-                                </button>
-                                {projectList.length > 1 && (
-                                  <button
-                                    onClick={() => handleDeleteProjectPrompt(p.id)}
-                                    className="text-xs text-zinc-500 hover:text-red-400 cursor-pointer"
-                                  >
-                                    [DELETE]
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                            <div className="text-xs text-zinc-500 mt-1 space-y-1">
-                              <div>Directory: <span className="text-zinc-400 font-bold">{p.directory}</span></div>
-                              <div className="flex justify-between text-xs text-zinc-600">
-                                <span>Panes registered: {paneKeys.length}</span>
-                                <span>Notes: {p.notes?.length || 0}</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Right: Selected Workspace Panes & Terminal Session Artifacts */}
-                  <div className="bg-[#0b0b0b] border border-white/5 rounded-lg p-5 space-y-4">
-                    <div className="flex justify-between items-center border-b border-white/5 pb-2">
-                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">
-                        Stored Sessions of [{(activeProject?.name || activeProjectId).toUpperCase()}]
-                      </span>
-                      <span className="text-xs text-zinc-650 font-mono">
-                        {Object.keys(activeProject?.panes || {}).length} snapshots saved
-                      </span>
-                    </div>
-
-                    <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
-                      {activeProject && Object.values(activeProject.panes || {}).length > 0 ? (
-                        Object.values(activeProject.panes).map((pane) => {
-                          const isLiveProcess = terminals.some(t => t.id === pane.pane_id);
-                          return (
-                            <div key={pane.pane_id} className="p-3 bg-black/30 border border-white/5 rounded font-mono text-xs">
-                              <div className="flex justify-between items-center">
-                                <span className="font-bold text-zinc-300">{pane.name}</span>
-                                <div className="flex items-center gap-2">
-                                  <span className={`text-xs px-1 py-0.2 rounded font-sans uppercase ${
-                                    isLiveProcess ? "bg-green-500/10 text-green-400" : "bg-zinc-800 text-zinc-500"
-                                  }`}>
-                                    {isLiveProcess ? "Active RAM" : "Idle Registry"}
-                                  </span>
-                                  <button
-                                    onClick={() => handleDeletePanePrompt(activeProjectId, pane.pane_id)}
-                                    className="text-xs text-zinc-500 hover:text-red-400 cursor-pointer"
-                                    title="De-register module memory object completely"
-                                  >
-                                    [PRUNE]
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="text-xs text-zinc-500 mt-1.5 space-y-1">
-                                <div className="flex justify-between">
-                                  <span>Preset: <span className="text-zinc-400">{pane.tool_preset}</span></span>
-                                  <span>Policy: <span className="text-zinc-400">{pane.permissions_mode}</span></span>
-                                </div>
-                                <div className="flex justify-between">
-                                  <span className="truncate max-w-[140px]">Session ID: <span className="text-zinc-400 text-xs">{pane.session_id || "None"}</span></span>
-                                  <span>Context: <span className="text-cyan-400 text-xs font-bold">{formatCharCount(pane.context_size)}</span></span>
-                                </div>
-                                {!isLiveProcess && (
-                                  <div className="pt-1.5 flex justify-end">
-                                    <button
-                                      onClick={() => handleRestartTerminal(pane.pane_id)}
-                                      className="text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-400/20 px-2 py-0.5 rounded hover:bg-cyan-500/[0.05] cursor-pointer"
-                                    >
-                                      Recover & Wake up Engine
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <div className="p-6 text-center text-zinc-600 text-xs italic border border-dashed border-white/5 rounded">
-                          No pane configuration snapshots saved.
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Archive Panel — inner IIFE keeps the registry IIFE's CC under the gate (the
-                    archive show/empty conditionals leave its scope). */}
-                {(() => (
-                <div className="mt-6 bg-[#0b0b0b] border border-white/5 rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => setShowArchivePanel(prev => !prev)}
-                    className="w-full flex items-center justify-between px-5 py-3 hover:bg-white/[0.02] transition-colors select-none"
-                  >
-                    <div className="flex items-center gap-2">
-                      <Layers className="w-4 h-4 text-zinc-500" />
-                      <span className="text-xs font-mono uppercase text-zinc-400 font-bold tracking-wider">Pane Archive</span>
-                      {archive.length > 0 && (
-                        <span className="text-xs font-mono px-1.5 py-0.5 bg-zinc-800 text-zinc-400 rounded uppercase">{archive.length} archived</span>
-                      )}
-                    </div>
-                    <span className="text-zinc-600 text-xs font-mono">{showArchivePanel ? "▲ hide" : "▼ show"}</span>
-                  </button>
-
-                  {showArchivePanel && (
-                    <div className="border-t border-white/5 p-5 space-y-3">
-                      <p className="text-xs text-zinc-500 font-mono">
-                        Exited panes moved here via "Clear Exited". Restore to bring them back into the ledger, or permanently delete.
-                      </p>
-                      {archive.length === 0 ? (
-                        <div className="p-6 text-center text-zinc-600 text-xs italic border border-dashed border-white/5 rounded">
-                          Archive is empty. Clear exited panes to populate it.
-                        </div>
-                      ) : (
-                        <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
-                          {archive.map((item) => (
-                            <div key={item.pane_id} className="p-3 bg-black/30 border border-white/5 rounded font-mono text-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                              <div className="flex-1 min-w-0">
-                                <div className="flex flex-wrap items-center gap-1.5">
-                                  <span className="font-bold text-zinc-300 truncate">{item.name}</span>
-                                  <span className="text-xs px-1 py-0.2 rounded bg-zinc-800 text-zinc-500 uppercase">{item.tool_preset || "Custom"}</span>
-                                </div>
-                                <div className="text-xs text-zinc-500 mt-0.5 space-x-2">
-                                  <span>Project: <span className="text-zinc-400">{item.project_id}</span></span>
-                                  {item.last_command && <span>Last cmd: <span className="text-zinc-400 truncate max-w-[140px] inline-block align-bottom">{item.last_command}</span></span>}
-                                </div>
-                                <div className="text-xs text-zinc-600 mt-0.5">
-                                  Archived: {new Date(item.archived_at).toLocaleString()}
-                                </div>
-                              </div>
-                              <div className="flex gap-2 shrink-0">
-                                <button
-                                  onClick={() => handleRestoreArchived(item.pane_id)}
-                                  className="text-xs font-mono uppercase px-2 py-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 hover:border-cyan-500/30 rounded cursor-pointer transition-colors"
-                                  title="Restore this pane back into the project ledger"
-                                >
-                                  Restore
-                                </button>
-                                <button
-                                  onClick={() => handleDeleteArchived(item.pane_id)}
-                                  className="text-xs font-mono uppercase px-2 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 hover:border-red-500/30 rounded cursor-pointer transition-colors"
-                                  title="Permanently delete this archived pane"
-                                >
-                                  <Trash2 className="w-2.5 h-2.5 inline mr-0.5" />
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      <div className="flex justify-end pt-1">
-                        <button
-                          onClick={fetchArchive}
-                          className="text-xs font-mono uppercase text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
-                          title="Refresh archive"
-                        >
-                          <RefreshCw className="w-2.5 h-2.5" /> Refresh
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-                ))()}
-              </div>
-              ))()}
+              {/* Artifacts & Memory Registry Panel — extracted to ArtifactsRegistryPanel (chunk-6
+                  "terminal-view + dashboard chrome", section 2). The two-column workspace/pane register
+                  (formatCharCount stays a module import inside it; the live-pane check is the hoisted
+                  isPaneLive helper) AND the nested Pane Archive (now <ArchivePanel/>, section 1). All
+                  project/pane mutation handlers stay in App and thread down; the archive state + its
+                  restore/delete/refresh handlers thread straight through to ArchivePanel. */}
+              <ArtifactsRegistryPanel
+                projectList={projectList}
+                activeProjectId={activeProjectId}
+                activeProject={activeProject}
+                terminals={terminals}
+                handleCreateProject={handleCreateProject}
+                handleSwitchProject={handleSwitchProject}
+                handleDeleteProjectPrompt={handleDeleteProjectPrompt}
+                handleDeletePanePrompt={handleDeletePanePrompt}
+                handleRestartTerminal={handleRestartTerminal}
+                archive={archive}
+                showArchivePanel={showArchivePanel}
+                setShowArchivePanel={setShowArchivePanel}
+                handleRestoreArchived={handleRestoreArchived}
+                handleDeleteArchived={handleDeleteArchived}
+                fetchArchive={fetchArchive}
+              />
             </div>
             ))()
           )}
