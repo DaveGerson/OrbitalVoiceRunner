@@ -21,3 +21,19 @@ export function shouldSendDraftOverWs(
 ): boolean {
   return !!ws && ws.readyState === openState;
 }
+
+/**
+ * Whether the right-rail "Sync Spec" header should show its draft-pending pulse dot
+ * (sync-spec-draft-badge): true iff the active-pane buffer holds non-whitespace text OR any pane
+ * has a staged WIP draft. Pure mirror of the composer-send enable gate (.trim()).
+ *
+ * NOTE (load-bearing): this predicate INTENTIONALLY differs from the legacy mobile-nav dot, which
+ * gates on raw promptBuffer.length and ignores wipDrafts. Do not "unify" the two — they pin
+ * different surfaces (this one is asserted by e2e/draft_badge.spec.ts).
+ */
+export function computeDraftPending(
+  promptBuffer: string,
+  wipDrafts: { length: number },
+): boolean {
+  return promptBuffer.trim().length > 0 || wipDrafts.length > 0;
+}
