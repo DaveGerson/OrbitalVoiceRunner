@@ -1,0 +1,1114 @@
+{
+  "_generator": "scripts/gen-approval-golden.ts",
+  "_parser": "src/approvalIntent.ts :: parseApprovalIntent",
+  "count": 171,
+  "vectors": [
+    {
+      "transcript": "",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "   ",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "\t\n",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": ".",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "?!",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "um",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "uh huh",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "yes",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "Yes.",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "yep",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "yeah",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "approved",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "ok",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "okay",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "affirmative",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "no",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "No!",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "nope",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "nah",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "negative",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "yes no",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "no yes",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "yes please",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "no thanks",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "ok no",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "skip",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "skip it",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "skip that",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "skip this",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "skip the deploy",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "fragment": "deploy"
+        }
+      }
+    },
+    {
+      "transcript": "later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "maybe later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "do later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "much later please later",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "ask me later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "remind me again later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "do it later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "leave that later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "approve it later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "run that later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "not now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "not yet",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "not right now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "no not now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold on",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold off",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "fragment": "off"
+        }
+      }
+    },
+    {
+      "transcript": "hold that",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold it",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold them",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "on hold",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "hold the deploy",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "please hold on a sec",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a minute",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a moment",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a bit",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a second",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "ordinal": 2
+        }
+      }
+    },
+    {
+      "transcript": "in a sec",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a while",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "in a few",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "give me a minute",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "in a jiffy",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "skip that for now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "leave it for now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "hold the npm install for now",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "fragment": "npm install"
+        }
+      }
+    },
+    {
+      "transcript": "wait on the deploy for now",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "fragment": "deploy"
+        }
+      }
+    },
+    {
+      "transcript": "park the docker build for now",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "fragment": "docker build"
+        }
+      }
+    },
+    {
+      "transcript": "pass for now",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "for now",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "leave it alone for now",
+      "expected": {
+        "intent": "defer",
+        "targetHint": {
+          "fragment": "alone"
+        }
+      }
+    },
+    {
+      "transcript": "dont hold it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not hold that",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont leave it later",
+      "expected": {
+        "intent": "defer"
+      }
+    },
+    {
+      "transcript": "never hold on",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not run it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not run the command",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont run",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "dont go",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "dont execute",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "never run it",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "never go",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "please do not cancel it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "i dont want to cancel",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not approve",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont approve",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont confirm",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not reject it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont reject it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "do not stop the build",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont proceed",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "dont dispatch",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "dont send",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "never run",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "never execute",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "dont cancel",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont stop",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dont skip",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "approve",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "approve.",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "accept",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "accepted",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "confirm",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "confirmed",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "authorize",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "authorized",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "go ahead and approve",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "ahead"
+        }
+      }
+    },
+    {
+      "transcript": "reject",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "rejected",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "deny",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "denied",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "decline",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "discard",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "reject it",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "please reject the command",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "run",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "go",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "stop",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "proceed",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "execute",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "dispatch",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "send",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "cancel",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "abort",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "nevermind",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "run it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "go it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "send it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "go ahead",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "lets go",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "run the command",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "cancel it",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "cancel that",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "stop the build",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "fragment": "build"
+        }
+      }
+    },
+    {
+      "transcript": "abort the deploy",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "fragment": "deploy"
+        }
+      }
+    },
+    {
+      "transcript": "execute the task",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "proceed with it",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "with"
+        }
+      }
+    },
+    {
+      "transcript": "run the npm install command",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "npm install"
+        }
+      }
+    },
+    {
+      "transcript": "cancel the docker deploy",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "fragment": "docker deploy"
+        }
+      }
+    },
+    {
+      "transcript": "approve but reject",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "approve and reject it",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "reject the approve one",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "yes but cancel it",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "approve it but stop",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "confirm and deny",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "accept and decline it",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "approve the first one",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": 1
+        }
+      }
+    },
+    {
+      "transcript": "approve the second one",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": 2
+        }
+      }
+    },
+    {
+      "transcript": "reject the last one",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "ordinal": -1
+        }
+      }
+    },
+    {
+      "transcript": "approve the third command",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": 3
+        }
+      }
+    },
+    {
+      "transcript": "cancel the previous one",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "ordinal": -1
+        }
+      }
+    },
+    {
+      "transcript": "approve the latest one",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": -1
+        }
+      }
+    },
+    {
+      "transcript": "approve the npm install command",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "npm install"
+        }
+      }
+    },
+    {
+      "transcript": "reject the docker deploy",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "fragment": "docker deploy"
+        }
+      }
+    },
+    {
+      "transcript": "approve the first one and reject the second",
+      "expected": {
+        "intent": "clarify"
+      }
+    },
+    {
+      "transcript": "confirm the build step",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "build"
+        }
+      }
+    },
+    {
+      "transcript": "run the migration script please",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "migration script"
+        }
+      }
+    },
+    {
+      "transcript": "approve the test suite one",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "test suite"
+        }
+      }
+    },
+    {
+      "transcript": "Don't run it",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "DON'T GO",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "Approve!",
+      "expected": {
+        "intent": "approve"
+      }
+    },
+    {
+      "transcript": "  reject  ",
+      "expected": {
+        "intent": "reject"
+      }
+    },
+    {
+      "transcript": "yes, approve the deploy",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "deploy"
+        }
+      }
+    },
+    {
+      "transcript": "can't cancel that",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "won't approve",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "approve—the second—one",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": 2
+        }
+      }
+    },
+    {
+      "transcript": "i think we should look at the logs",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "the build is running fine",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "lets talk about the approve button later actually",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "fragment": "talk about"
+        }
+      }
+    },
+    {
+      "transcript": "what does this command do",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "we run tests every morning",
+      "expected": {
+        "intent": "none"
+      }
+    },
+    {
+      "transcript": "the second pane looks idle",
+      "expected": {
+        "intent": "none"
+      }
+    }
+  ]
+}

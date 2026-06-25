@@ -1,5 +1,13 @@
 // src/voiceAckGate.ts — B1 turn-aware two-phase ack GATE (pure).
 //
+// SEAM NOTE (Python⇄TS migration, Inc 1 task 1.9 — KEPT IN TS, do NOT port): this is pure and
+// decision-shaped, so it superficially looks portable — but it decides "speak over the operator NOW?"
+// against a 1500ms barge-in window using a `now` that must reflect the instant of decision. An NDJSON
+// round-trip to a Python daemon would make `now`/`lastOperatorSpeechAt` stale relative to the live
+// audio turn and could approve speaking right as the operator barges in. It stays synchronous +
+// in-process by design. The regression test tests/test_ack_gate_in_process.ts pins this (no seam
+// import; synchronous return). See the seam plan, task 1.9.
+//
 // The B1 spec REQUIRES Janus speak an async-spawn ack ONLY when it will not interrupt the operator.
 // This module is the pure decision core: a function of the turn state derived from the live Gemini
 // signals the server already tracks — operator-speech recency (onOperatorSpeech stamps

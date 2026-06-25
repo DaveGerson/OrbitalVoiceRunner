@@ -30,6 +30,7 @@ import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
+import { parseApprovalIntentShadowed } from "../approvalShadow";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
@@ -1024,7 +1025,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
             // announced targeting (NOT FIFO, NOT substring matching).
-            const parsed = parseApprovalIntent(cleanUtter);
+            // Seam Inc 1 (task 1.6): the single production entry to approval parsing — shadowed so the
+            // Python port observes EVERY routed utterance (including "none", the ambient-speech cases) in
+            // parallel, fire-and-forget, while this TS result stays authoritative. Passthrough (byte-
+            // identical) until the server installs the recorder at boot.
+            const parsed = parseApprovalIntentShadowed(cleanUtter);
             if (parsed.intent === "none") return;
             routeApprovalIntent(parsed, cleanUtter, session);
           };

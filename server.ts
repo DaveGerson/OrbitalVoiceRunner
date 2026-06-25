@@ -46,7 +46,8 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService, createPythonSynthClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
+import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
+import { createApprovalShadowRecorder, installApprovalShadow } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -684,16 +685,27 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
 }
 
-// VERBATIM extraction from startServer (CC paydown). Best-effort, non-fatal construction of the
-// optional warm Python synthesizer client: disabled ⇒ undefined; an init throw is logged and
-// degrades to undefined (permanent fallback). Identical to the inline `if (memoryPythonEnabled) {
-// try { ... } catch { ... } }` block it replaced.
+// Best-effort, non-fatal construction of the optional warm Python daemon: disabled ⇒ undefined; an
+// init throw is logged and degrades to undefined (permanent fallback). Seam Inc 1: builds ONE shared
+// daemon core and BOTH typed facades over it (synth + approval — one multiplexed daemon), and installs
+// the fire-and-forget approval SHADOW recorder. The returned synth client OWNS the shared core, so
+// close()'s `pythonSynthClient?.dispose()` tears the daemon down for both facades.
 function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean): PythonSynthClient | undefined {
-  if (!memoryPythonEnabled) return undefined;
+  if (!memoryPythonEnabled) { installApprovalShadow(null); return undefined; }
   try {
-    return createPythonSynthClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+    const approval = createPythonApprovalClient(core);
+    // SHADOW (task 1.6): Python parses each approval utterance alongside the AUTHORITATIVE TS result,
+    // fire-and-forget — counted, never acted on. Python being slow/absent/wrong is invisible + harmless.
+    installApprovalShadow(createApprovalShadowRecorder({
+      parse: (t) => approval.parse(t),
+      log: (line) => console.error(line),
+      redact: redactSecrets,
+    }));
+    return synthFacadeOverCore(core);
   } catch (e) {
-    console.error("[memory] python synth client init failed (continuing on fallback):", e);
+    console.error("[memory] python daemon client init failed (continuing on fallback):", e);
+    installApprovalShadow(null);
     return undefined;
   }
 }
@@ -1734,7 +1746,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     // Tear down the Python synthesizer daemon — stops the orphaned `python ... __main__.py` per instance.
+    // Disposing the synth facade disposes the SHARED core (seam Inc 1), so the approval facade dies too;
+    // clear the installed shadow recorder so it can't reference the dead core.
     pythonSynthClient?.dispose();
+    installApprovalShadow(null);
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).

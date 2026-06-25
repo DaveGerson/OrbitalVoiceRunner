@@ -11,7 +11,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from synth import synthesize, SYNTH_VERSION  # noqa: E402
+from approval import parse_approval_intent  # noqa: E402
 
+# The NDJSON wire protocol version. MUST stay equal to WIRE_VERSION in src/memory/types.ts — a
+# mismatch makes the ping handshake fail and the daemon is treated as unavailable (fallback). The
+# cross-language equality is guarded by tests/test_wire_version_parity.ts (no silent drift).
 WIRE_VERSION = 1
 
 
@@ -31,6 +35,13 @@ def handle(msg):
         except Exception as e:  # never crash the daemon on one bad request
             return {"id": mid, "v": WIRE_VERSION, "ok": False,
                     "error": {"code": "SYNTH_FAILED", "message": str(e)}}
+    if op == "approval.parse":
+        try:
+            parsed = parse_approval_intent(msg["transcript"])
+            return {"id": mid, "v": WIRE_VERSION, "ok": True, "parsed": parsed}
+        except Exception as e:  # same per-request blast radius as synthesize
+            return {"id": mid, "v": WIRE_VERSION, "ok": False,
+                    "error": {"code": "PARSE_FAILED", "message": str(e)}}
     return {"id": mid, "v": WIRE_VERSION, "ok": False,
             "error": {"code": "BAD_OP", "message": "unknown op: %r" % op}}
 
