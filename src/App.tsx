@@ -63,15 +63,42 @@ import { useTerminalHistory } from "./classic/hooks/useTerminalHistory";
 import { useRecentlyIdled } from "./classic/hooks/useRecentlyIdled";
 import { useComposer } from "./classic/hooks/useComposer";
 import { useApprovalsQueue } from "./classic/hooks/useApprovalsQueue";
+import { useLedgerData } from "./classic/hooks/useLedgerData";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
 import { ControlKeyBar } from "./classic/components/ControlKeyBar";
 
 function AppRaw() {
-  const [terminals, setTerminals] = useState<Terminal[]>([]);
-  const [ledger, setLedger] = useState<Record<string, Workspace>>({});
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
+  // dbt4 (wsm-e2e-pinned-4ib): the ledger-data spine — 9 read-only state slices + the 7 GET fetchers
+  // that populate them — now live in useLedgerData (src/classic/hooks/useLedgerData.ts). Called HERE,
+  // FIRST, because useRecentlyIdled({terminals}) and useStdoutStream({setTerminals}) below consume it.
+  // The boot effect, the 20s safety-net poll, and every mutation handler (POST/PUT/DELETE) STAY in App
+  // (they orchestrate across sibling hooks → a create-order cycle if pulled in). isMockModeRef is
+  // App-owned (the client-only mock gate) and threaded in. setTerminals/setLedger/setFrozen/
+  // setFrozenRunning are 4 of the harness-wired setters (src/e2e/harness.ts). Normalizers are pinned in
+  // tests/test_ledger_data_logic.ts; the boot REST set in src/ledgerData.rest.test.tsx; pixel parity in
+  // e2e/ledger_data_pixel_parity.spec.ts. Catalogue: docs/.../2026-06-24-ledger-data-parity-catalogue.md.
+  const isMockModeRef = useRef(false);
+  const {
+    terminals, setTerminals,
+    ledger, setLedger,
+    settings, setSettings,
+    activeProjectNotes, setActiveProjectNotes,
+    globalPermissionsMode, setGlobalPermissionsMode,
+    frozen, setFrozen,
+    frozenRunning, setFrozenRunning,
+    plans, setPlans,
+    archive, setArchive,
+    fetchTerminals,
+    fetchLedger,
+    fetchProjectNotes,
+    fetchFrozenStatus,
+    fetchSettings,
+    fetchPlans,
+    fetchArchive,
+  } = useLedgerData({ isMockModeRef, activeProjectId });
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null);
   const [termFilter, setTermFilter] = useState<"All" | "Running" | "Idle">("All");
   // dbt4: pendingCommands / pendingActions state + fetchPendingCommands + handleApprove / handleReject
@@ -88,20 +115,14 @@ function AppRaw() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [editingProject, setEditingProject] = useState<Workspace | null>(null);
-  const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [promptDialog, setPromptDialog] = useState<{title: string, placeholder: string, onSubmit: (val: string) => void} | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [newNoteInputs, setNewNoteInputs] = useState<Record<string, string>>({});
-  // bead bjm: id-bearing notes for the active project, fetched from the DOM-render-only feed
-  // (GET /api/projects/:id/notes). The Node Chronicle renders pane-scoped notes from THIS so it can
-  // expose delete/amend controls keyed by note id (the ledger broadcast carries bare strings only).
-  const [activeProjectNotes, setActiveProjectNotes] = useState<{ id: string; project_id: string; pane_id: string | null; text: string; type: string; created_at: number }[]>([]);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const [editingNoteText, setEditingNoteText] = useState("");
   const [isMockMode, setIsMockMode] = useState<boolean>(false);
-  const [globalPermissionsMode, setGlobalPermissionsMode] = useState<"Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit">("Inherit");
   const [autoApprovedNotification, setAutoApprovedNotification] = useState<{terminalId: string, cmd: string} | null>(null);
   const [blockedNotification, setBlockedNotification] = useState<{terminalId: string, cmd: string, reason: string} | null>(null);
   const [wsErrorNotification, setWsErrorNotification] = useState<{message: string} | null>(null);
@@ -111,12 +132,9 @@ function AppRaw() {
   const [rawKeyNotification, setRawKeyNotification] = useState<{ tone: "blocked" | "deferred" | "refused"; title: string; detail: string } | null>(null);
   // WS-D (BUG-024): coalescing proactive-notification stack (one entry per pane+severity).
   const [proactiveNotifications, setProactiveNotifications] = useState<ProactiveNotification[]>([]);
-  // bead 8sq (spec §2.C): two-stage emergency STOP-ALL state. `frozen` = Stage-1 freeze active (Janus
-  // short-circuited to Off + in-flight cancelled; panes still running). `frozenRunning` = the panes
-  // still alive while frozen (the Stage-2 hold-to-fire kill target count). Driven by the `frozen` WS
-  // event + restored from /api/stop-all/status on boot so the banner survives a page reload.
-  const [frozen, setFrozen] = useState(false);
-  const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
+  // bead 8sq (spec §2.C): the two-stage emergency STOP-ALL *state* (`frozen`/`frozenRunning`) now lives
+  // in useLedgerData (restored from /api/stop-all/status on boot). The freeze/kill/release ACTIONS and
+  // the `frozen` WS-event handler stay here in App and write through the returned setters.
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [transcript, setTranscript] = useState<{ sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } }[]>([]);
   const [showTranscriptPanel, setShowTranscriptPanel] = useState(false);
@@ -135,16 +153,13 @@ function AppRaw() {
   } = useTerminalHistory({ activeTerminalId });
   const [hoveredTermId, setHoveredTermId] = useState<string | null>(null);
 
-  // --- Plans state (voice/backend path; the Orchestrate & Alerts GUI tabs were removed) ---
-  const [plans, setPlans] = useState<Plan[]>([]);
   // dbt4: the hands-free non-verbal feedback layer (browserNotificationsEnabled toggle + the
   // Web-Audio playEarcon player + the gated triggerDesktopNotification wrapper) now lives in
   // useEarcons (src/classic/hooks/useEarcons.ts). Behavior is byte-identical; the pure notification
   // gate is pinned in tests/test_earcon_logic.ts.
   const { playEarcon, triggerDesktopNotification, setBrowserNotificationsEnabled } = useEarcons();
 
-  // Archive panel states
-  const [archive, setArchive] = useState<any[]>([]);
+  // Archive panel states (the `archive` list itself now lives in useLedgerData)
   const [showArchivePanel, setShowArchivePanel] = useState(false);
   // A-UI (wsm-e2e-pinned-5h0): auto-expand the Pane Archive the first time it gains content, so a
   // just-exited (terminated + archived, recoverable) pane is immediately discoverable instead of
@@ -183,7 +198,7 @@ function AppRaw() {
   // injectStdoutChunk contract is unchanged. isMockModeRef + e2eActiveRef are App-owned and threaded
   // in (e2eActiveRef is created here so the harness, which depends on queueStdoutChunk, can share it).
   // The pure pieces (the -110 flush slice + the grid-key dedup) are pinned in tests/test_stream_logic.ts.
-  const isMockModeRef = useRef(false);
+  // isMockModeRef is created at the top of AppRaw (it's a useLedgerData param); e2eActiveRef stays here.
   const e2eActiveRef = useRef(false);
   const { queueStdoutChunk, handleTerminalResize } = useStdoutStream({
     setTerminals,
@@ -205,40 +220,8 @@ function AppRaw() {
   // regardless of declaration order; e2eActiveRef is App-owned (created above for useStdoutStream's
   // resize guard) and passed in, so nothing downstream depends on the harness running earlier.
 
-  const fetchTerminals = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/terminals");
-      if (!res.ok) return;
-      const data = await res.json();
-      setTerminals(data);
-    } catch (e) {
-      // Silent catch to prevent 'Failed to fetch' console errors during server restarts
-    }
-  };
-
-  const fetchLedger = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/ledger");
-      if (!res.ok) return;
-      const data = await res.json();
-      setLedger(data);
-    } catch (e) {}
-  };
-
-  // bead bjm: pull the id-bearing notes for a project (DOM-render-only feed). Drives the Node
-  // Chronicle's delete/amend controls. Never forwarded to the live session — model egress goes
-  // through the redacted voice tools only.
-  const fetchProjectNotes = async (projId = activeProjectId) => {
-    if (isMockModeRef.current || !projId) return;
-    try {
-      const res = await apiFetch(`/api/projects/${projId}/notes`);
-      if (!res.ok) return;
-      const data = await res.json();
-      setActiveProjectNotes(Array.isArray(data.notes) ? data.notes : []);
-    } catch (e) {}
-  };
+  // dbt4 (wsm-e2e-pinned-4ib): fetchTerminals / fetchLedger / fetchProjectNotes moved into useLedgerData
+  // (destructured at the top of AppRaw). The note-mutation handlers below still call the returned fetchers.
 
   const handleDeleteNote = async (id: string) => {
     if (isMockModeRef.current) return;
@@ -262,30 +245,8 @@ function AppRaw() {
     fetchLedger();
   };
 
-  // bead 8sq: restore the STOP-ALL freeze state on boot so the FROZEN banner survives a page reload
-  // (the flag is persisted server-side; spec §2.C/§10.3). No-op under mock mode (client-only harness).
-  const fetchFrozenStatus = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/stop-all/status");
-      if (!res.ok) return;
-      const data = await res.json();
-      setFrozen(!!data.frozen);
-      setFrozenRunning(Array.isArray(data.running) ? data.running : []);
-    } catch (e) {}
-  };
-
-  const fetchSettings = async () => {
-    try {
-      const res = await apiFetch("/api/settings");
-      if (!res.ok) return;
-      const data = await res.json();
-      setSettings(data);
-      if (data.advanced) {
-        setGlobalPermissionsMode(data.advanced.globalPermissionsMode);
-      }
-    } catch (e) {}
-  };
+  // dbt4 (wsm-e2e-pinned-4ib): fetchFrozenStatus / fetchSettings moved into useLedgerData. The STOP-ALL
+  // freeze/kill/release actions + the settings PUT handlers below still call the returned setters/fetchers.
 
   // bead 8sq (spec §2.C): the two-stage emergency STOP-ALL. Stage 1 freezes Janus + cancels in-flight
   // (reversible; panes keep running); Stage 2 (hold-to-fire) kills the running PTYs (irreversible);
@@ -358,27 +319,8 @@ function AppRaw() {
   // dbt4: fetchPendingCommands moved into useApprovalsQueue (called below). The boot + safety-net poll
   // effects still call the hook's returned fetcher with the same order/args.
 
-  const fetchPlans = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/plans");
-      if (res.ok) {
-        const data = await res.json();
-        setPlans(data);
-      }
-    } catch (e) {}
-  };
-
-  const fetchArchive = async () => {
-    if (isMockModeRef.current) return;
-    try {
-      const res = await apiFetch("/api/archive");
-      if (res.ok) {
-        const data = await res.json();
-        setArchive(data.archived || []);
-      }
-    } catch (e) {}
-  };
+  // dbt4 (wsm-e2e-pinned-4ib): fetchPlans / fetchArchive moved into useLedgerData. The plan/archive
+  // mutation handlers below (execute/delete/restore/clear-exited) still call the returned fetchers.
 
   const handleClearExited = async () => {
     const exitedCount = activeProject ? countExitedPanes(activeProject.panes, terminals) : 0;
