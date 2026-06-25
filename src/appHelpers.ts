@@ -8,7 +8,7 @@
 // App.tsx — same branches, same byte-exact className strings, same default fall-throughs. The
 // refactor only RELOCATES computation; it changes nothing observable.
 
-import type { Terminal, PaneMeta } from "./types";
+import type { Terminal, PaneMeta, Workspace } from "./types";
 import type { EarconType } from "./announcementKinds";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -706,4 +706,29 @@ export function contextMeterPercent(contextSize: number): number {
  *  five-pane budget — distinct from the 20000 per-pane meter). */
 export function totalContextBarPercent(totalContextSize: number): number {
   return Math.min((totalContextSize / 100000) * 100, 100);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Header brand-strip pure derivations — extracted VERBATIM from the AppHeader brand strip
+// (App.tsx chunk-5 "modal-queues + AppHeader"). Two clean derivations that previously lived
+// inline as JSX template expressions: the live-status dot class and the "N RUNNING" count with
+// its `||` ledger-pane fallback. Relocated so each branch is independently unit-pinnable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The brand live-status dot's className: cyan (pulsing) when live & connected, amber (pulsing)
+ *  when live but reconnecting, zinc when offline. VERBATIM from the inline
+ *  `isLive ? (isReconnecting ? amber : cyan) : zinc` template at the header brand strip. */
+export function headerStatusDotClass(isLive: boolean, isReconnecting: boolean): string {
+  return isLive
+    ? (isReconnecting ? 'bg-amber-500 animate-pulse' : 'bg-cyan-400 animate-pulse')
+    : 'bg-zinc-600';
+}
+
+/** The "N RUNNING" worker count: the live terminals in `Running` status, OR (when that is 0) the
+ *  alive ledger panes of the active project. VERBATIM from the inline
+ *  `terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes ||
+ *  {}).filter(p => p.alive).length` at the header telemetry strip. The `||` fallback is load-bearing:
+ *  with zero live Running terminals it falls through to the ledger's alive-pane count. */
+export function headerRunningCount(terminals: Terminal[], activeProject: Workspace | undefined): number {
+  return terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes || {}).filter(p => p.alive).length;
 }
