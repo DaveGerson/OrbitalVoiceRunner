@@ -14,7 +14,7 @@ import { GateChip } from "./components/GateChip";
 import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
-import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
+import { RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness, isE2EWireArmed } from "./e2e/harness";
@@ -25,9 +25,6 @@ import {
   paneMatchesFilter,
   countExitedPanes,
   sumContextSize,
-  heatmapTileClasses,
-  heatmapTooltipStatus,
-  heatmapTooltipFields,
   mobileSwiperDotClass,
   mobileSwiperColorClass,
   sidebarPaneStatusColor,
@@ -74,6 +71,10 @@ import { FrozenBanner } from "./classic/components/FrozenBanner";
 import { MobileNavBar } from "./classic/components/MobileNavBar";
 import { PromptSynchronizerPanel } from "./classic/components/PromptSynchronizerPanel";
 import { HelperPanelTabHeader } from "./classic/components/HelperPanelTabHeader";
+import { TerminalHealthHeatmap } from "./classic/components/TerminalHealthHeatmap";
+import { SynergyMatrixPanel } from "./classic/components/SynergyMatrixPanel";
+import { TranscriptPanel } from "./classic/components/TranscriptPanel";
+import { SystemStatusBar } from "./classic/components/SystemStatusBar";
 
 function AppRaw() {
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
@@ -961,225 +962,6 @@ function AppRaw() {
 
   const totalTokensEstimated = estimateTokens(totalContextSize);
 
-  const renderTerminalHealthHeatmap = () => {
-    return (
-      <div className="flex flex-col bg-[#090909] border border-white/5 rounded-lg p-4 select-none relative w-full">
-        {/* Title & Stats */}
-        <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-white/[0.04]">
-          <div className="flex items-center gap-1.5">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-            </span>
-            <h3 className="text-xs font-mono font-bold tracking-widest text-zinc-200 uppercase flex items-center gap-1.5">
-              Agent Telemetry Heatmap
-            </h3>
-          </div>
-          <span className="text-xs font-mono text-cyan-400/80 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/10">
-            {terminals.filter(t => t.status === "Running").length}/{terminals.length} Running
-          </span>
-        </div>
-
-        {/* Heatmap Grid */}
-        {terminals.length === 0 ? (
-          <div className="text-xs text-zinc-500 font-mono italic text-center py-4 bg-black/20 rounded border border-dashed border-white/5">
-            No active agents registered in ledger.
-          </div>
-        ) : (
-          <div>
-            <div className="grid grid-cols-5 sm:grid-cols-6 lg:grid-cols-5 xl:grid-cols-8 gap-2 mb-2">
-              {terminals.map((term, index) => {
-                const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === term.id);
-                const isActive = activeTerminalId === term.id;
-                
-                // Determine color classes for tiles
-                let bgClass = "bg-zinc-950";
-                let borderClass = "border-white/5";
-                let textClass = "text-zinc-400";
-                let animateDot = "";
-                let dotColor = "bg-zinc-600";
-
-                if (isAlertActive) {
-                  bgClass = "bg-amber-500/15";
-                  borderClass = "border-amber-500/70 shadow-[0_0_8px_rgba(245,158,11,0.2)]";
-                  textClass = "text-amber-300 font-extrabold";
-                  animateDot = "animate-ping";
-                  dotColor = "bg-amber-500";
-                } else if (term.status === "Running" && term.quiescing) {
-                  // Conservative Phase 2: humble "cooking…" — quiet inside the pre-idle window.
-                  // Muted amber, NOT the emerald "executing" pulse and NOT the yellow "idle".
-                  bgClass = "bg-amber-500/5";
-                  borderClass = "border-amber-500/20";
-                  textClass = "text-amber-400/70";
-                  dotColor = "bg-amber-400/70";
-                } else if (term.status === "Running") {
-                  bgClass = "bg-emerald-500/10";
-                  borderClass = "border-emerald-500/30";
-                  textClass = "text-emerald-400 font-semibold";
-                  animateDot = "animate-pulse";
-                  dotColor = "bg-emerald-500";
-                } else if (term.status === "Idle") {
-                  bgClass = "bg-yellow-500/5";
-                  borderClass = "border-yellow-500/20";
-                  textClass = "text-yellow-500/80";
-                  dotColor = "bg-yellow-500";
-                } else {
-                  bgClass = "bg-red-500/5";
-                  borderClass = "border-red-500/20";
-                  textClass = "text-red-400/80";
-                  dotColor = "bg-red-500";
-                }
-
-                // If currently viewed connected terminal, add cyan glow/override
-                if (isActive) {
-                  borderClass = "border-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.3)]";
-                }
-
-                return (
-                  <div
-                    key={term.id}
-                    className={`h-11 rounded-md border flex flex-col items-center justify-center relative cursor-pointer group/tile transition-all duration-250 select-none ${bgClass} ${borderClass} hover:scale-105 active:scale-95`}
-                    onMouseEnter={() => setHoveredTermId(term.id)}
-                    onMouseLeave={() => setHoveredTermId(null)}
-                    onClick={() => {
-                      // Clicking on heatmap cell toggles tooltip or connects active terminal
-                      setHoveredTermId(hoveredTermId === term.id ? null : term.id);
-                    }}
-                  >
-                    <span className={`text-xs font-mono tracking-tight ${textClass}`}>
-                      T{index + 1}
-                    </span>
-                    
-                    {/* Tiny status indicator dot */}
-                    <span className="absolute top-1.5 right-1.5 flex h-1.5 w-1.5">
-                      {animateDot && (
-                        <span className={`absolute inline-flex h-full w-full rounded-full opacity-75 ${animateDot} ${dotColor}`}></span>
-                      )}
-                      <span className={`relative inline-flex rounded-full h-1.5 w-1.5 ${dotColor}`}></span>
-                    </span>
-
-                    {/* Badge showing truncated Name */}
-                    <span className="text-xs font-mono text-zinc-650 group-hover/tile:text-zinc-400 select-none uppercase truncate max-w-[90%] pointer-events-none mt-0.5 leading-none">
-                      {term.id.slice(-4)}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-            
-            {/* Visual Legend */}
-            <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs font-mono text-zinc-500 pt-1.5 border-t border-white/[0.03]">
-              <span className="flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block"></span>
-                Running
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-yellow-500 inline-block"></span>
-                Idle
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block"></span>
-                Exited
-              </span>
-              <span className="flex items-center gap-1 text-amber-500">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse inline-block"></span>
-                Alert Needed
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* Floating popover/tooltip element when cell hovered, rendering rich diagnostics & last stdout snippet inside! */}
-        {(() => {
-          if (!hoveredTermId) return null;
-          const term = terminals.find(t => t.id === hoveredTermId);
-          if (!term) return null;
-
-          const isAlertActive = pendingCommands.some(cmd => cmd.terminalId === term.id);
-          const currentOutputSnippetLines = term.output ? term.output.trim().split("\n").slice(-4) : [];
-
-          // Burndown: the status-label/badge ladder + the small inline ?:/|| derivations are the
-          // PURE helpers `heatmapTooltipStatus` / `heatmapTooltipFields` (the ternaries genuinely
-          // leave this function's CC scope). `hasSnippet` stays inline (its `?:` is in the JSX).
-          const { statusLabel, statusBadgeClass } = heatmapTooltipStatus(isAlertActive, term);
-          const { dotColorClass, presetText, modeText, contextSizeText, commandText, outputBytes } = heatmapTooltipFields(isAlertActive, term);
-          const hasSnippet = currentOutputSnippetLines.length > 0;
-
-          return (
-            <div className="absolute top-[102%] left-0 right-0 z-50 bg-[#0d0d0d] border border-cyan-500/30 shadow-[0_4px_24px_rgba(0,0,0,0.85)] rounded-lg p-3.5 text-left font-mono text-xs leading-relaxed animate-in fade-in slide-in-from-top-1 duration-150">
-              <div className="absolute top-3 right-3 flex gap-1.5">
-                <span className={`text-xs uppercase tracking-wider px-1.5 py-0.5 rounded font-black ${statusBadgeClass}`}>
-                  {statusLabel}
-                </span>
-                <button 
-                  onClick={() => setHoveredTermId(null)}
-                  className="text-zinc-500 hover:text-white px-1 font-sans font-bold hover:bg-white/5 rounded text-xs leading-none"
-                >
-                  ✕
-                </button>
-              </div>
-
-              {/* Title & Preset Identifier */}
-              <div className="mb-2">
-                <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                  <span className={`w-1.5 h-1.5 rounded-full ${dotColorClass}`}></span>
-                  NODE: {term.id.toUpperCase()}
-                </h4>
-                <p className="text-xs text-zinc-500 -mt-0.5 uppercase tracking-wide">
-                  Type: {presetText} • Mode: {modeText}
-                </p>
-              </div>
-
-              {/* Specs Bento List */}
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs text-zinc-400 bg-black/40 border border-white/[0.03] p-2 rounded-md mb-2.5">
-                <div>
-                  <span className="text-zinc-650 uppercase text-xs block">Active Cwd</span>
-                  <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.cwd}>{term.cwd}</span>
-                </div>
-                <div>
-                  <span className="text-zinc-650 uppercase text-xs block">Context memory</span>
-                  <span className="text-cyan-400 block font-bold">
-                    {contextSizeText}
-                  </span>
-                </div>
-                <div className="col-span-2">
-                  <span className="text-zinc-650 uppercase text-xs block">Active process thread</span>
-                  <span className="text-zinc-300 truncate block whitespace-nowrap" title={term.command}>$ {commandText}</span>
-                </div>
-              </div>
-
-              {/* last stdout console output panel widget */}
-              <div className="bg-black/80 rounded border border-white/5 p-2 font-mono text-xs leading-relaxed text-zinc-500">
-                <div className="text-xs uppercase tracking-wider text-cyan-500/60 font-semibold mb-1 flex items-center justify-between border-b border-white/[0.04] pb-1 select-none">
-                  <span>🛰️ Live Stdout Capture</span>
-                  <span className="opacity-40">{outputBytes} bytes</span>
-                </div>
-                <div className="space-y-0.5 selection:bg-cyan-500/25 selection:text-white overflow-hidden max-h-24">
-                  {hasSnippet ? (
-                    currentOutputSnippetLines.map((line, idx) => (
-                      <div key={idx} className="truncate text-emerald-400/80 leading-normal block whitespace-pre">
-                        {line || " "}
-                      </div>
-                    ))
-                  ) : (
-                    <div className="italic text-zinc-600 py-1 font-mono">No live stream log. Waiting on execute triggers...</div>
-                  )}
-                </div>
-              </div>
-
-              {/* Action notice helper */}
-              <div className="mt-2 text-right">
-                <span className="text-xs text-zinc-650 italic">
-                  Tap to lock popup • Hover another tile to swap inspect
-                </span>
-              </div>
-            </div>
-          );
-        })()}
-      </div>
-    );
-  };
-
   return (
     <div className="flex flex-col h-screen w-full bg-[#050505] text-[#e0e0e0] font-sans overflow-hidden border-t-4 border-[#121212]">
       {/* Modal cluster — inner IIFE keeps AppRaw's CC under the gate (the modal && guards leave its
@@ -1997,125 +1779,21 @@ function AppRaw() {
                 )}
               </div>
 
-              {/* Core Goal: Live Conversation & Synergy Matrix — inner IIFE keeps the dashboard IIFE's
-                  CC under the gate (the live/reconnect/mute chains leave its scope). */}
-              {(() => (
-              <div className="mb-8 grid grid-cols-1 xl:grid-cols-2 gap-6 bg-[#090909] border border-white/5 p-5 rounded-xl shadow-2xl relative overflow-hidden">
-                {/* Glow effect in background */}
-                <div className="absolute top-0 right-0 w-64 h-64 bg-cyan-500/5 rounded-full blur-[100px] pointer-events-none" />
-
-                {/* Left Side: Live Voice Conversation Hub */}
-                <div className="flex flex-col justify-between gap-4">
-                  <div>
-                    <div className="flex items-center gap-2 mb-1.5 select-none">
-                      <div className="p-1 rounded bg-cyan-500/10 text-cyan-400">
-                        <Mic className="w-4 h-4" />
-                      </div>
-                      <span className="text-xs font-mono uppercase tracking-[0.2em] text-cyan-400 font-extrabold">LIVE SPEECH SYSTEMS</span>
-                    </div>
-                    <h2 className="text-base font-mono text-white tracking-wide font-black">
-                      Voice Converse with Project Janus
-                    </h2>
-                    <p className="text-xs text-zinc-400 leading-relaxed font-sans mt-1">
-                      Engage in dynamic, low-latency voice discussions with Janus. Discuss project specifications, trigger workspace playbooks, or coordinate terminal code execution seamlessly.
-                    </p>
-                  </div>
-
-                  {/* Voice state visual feedback card */}
-                  <div className="bg-black/40 border border-white/5 rounded-lg p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 select-none">
-                    <div className="flex items-center gap-3">
-                      {isLive ? (
-                        <div className="flex items-center gap-1 shrink-0">
-                          <span className="w-3 h-3 rounded-full bg-cyan-400 animate-pulse" />
-                          {/* Simulated Equalizer wave */}
-                          <div className="flex items-end gap-0.5 h-4 ml-1">
-                            <span className="w-0.75 bg-cyan-400 rounded-full equalizer-animation-1" style={{ height: '60%' }} />
-                            <span className="w-0.75 bg-cyan-400 rounded-full equalizer-animation-2" style={{ height: '100%' }} />
-                            <span className="w-0.75 bg-cyan-400 rounded-full equalizer-animation-3" style={{ height: '40%' }} />
-                            <span className="w-0.75 bg-cyan-400 rounded-full equalizer-animation-4" style={{ height: '80%' }} />
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="relative flex h-3 w-3 shrink-0">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-zinc-600 opacity-40"></span>
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-zinc-650"></span>
-                        </div>
-                      )}
-                      
-                      <div className="flex flex-col">
-                        <span className="text-xs font-mono text-zinc-500 uppercase tracking-widest leading-none">AGENT STATUS</span>
-                        <span className="text-xs font-mono font-bold text-zinc-200 mt-1">
-                          {isLive 
-                            ? (isReconnecting ? "AI Reconnecting..." : isMicMuted ? "Muted (Zephyr Listening)" : "Zephyr Voice Agent Live")
-                            : "Offline (Mic Standby)"
-                          }
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 select-none self-end sm:self-auto shrink-0">
-                      {!isLive ? (
-                        <button
-                          onClick={startLive}
-                          className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-black font-extrabold text-xs font-mono rounded uppercase tracking-wider transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)] hover:shadow-[0_0_20px_rgba(34,211,238,0.45)] cursor-pointer focus:outline-none"
-                        >
-                          Start Voice Chat
-                        </button>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => setIsMicMuted(!isMicMuted)}
-                            className={`px-3 py-1.5 border text-xs font-mono uppercase tracking-wider rounded font-extrabold transition-all cursor-pointer focus:outline-none ${
-                              isMicMuted 
-                                ? "bg-amber-500/10 border-amber-500/30 text-amber-400" 
-                                : "bg-white/5 border-white/10 text-white hover:bg-white/10"
-                            }`}
-                          >
-                            {isMicMuted ? "Unmute" : "Mute"}
-                          </button>
-                          <button
-                            onClick={stopLive}
-                            className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 hover:border-red-500/30 text-red-400 text-xs font-mono uppercase tracking-wider rounded font-extrabold transition-all cursor-pointer focus:outline-none"
-                          >
-                            Disconnect
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Right Side: Synergy Surfaces Map */}
-                <div className="border-t xl:border-t-0 xl:border-l border-white/5 pt-4 xl:pt-0 xl:pl-6 flex flex-col justify-between gap-3">
-                  <span className="text-xs font-mono uppercase tracking-[0.2em] text-zinc-500 select-none">SYNERGY SURFACES DIRECTORY</span>
-
-                  {/* Single surface: the Spec Buffer. The Orchestration & Alerts planes were removed
-                      along with their helper-panel tabs. */}
-                  <div className="grid grid-cols-1 gap-2.5">
-                    {/* Plane 1: Spec Buffer */}
-                    <div
-                      onClick={() => {
-                        if (window.innerWidth < 1024) setMobileActiveView("buffer");
-                      }}
-                      className="p-2.5 bg-black/40 border border-white/5 hover:border-cyan-500/20 hover:bg-cyan-500/[0.01] rounded-lg transition-all cursor-pointer flex items-center justify-between group select-none"
-                    >
-                      <div className="flex gap-2.5 items-center">
-                        <div className="p-1 rounded bg-[#121212] text-cyan-400 group-hover:text-white font-bold flex items-center justify-center">
-                          <CheckSquare className="w-3.5 h-3.5" />
-                        </div>
-                        <div className="flex flex-col">
-                          <span className="text-xs font-mono text-zinc-200 font-bold leading-normal">System Spec Draft</span>
-                          <span className="text-xs text-zinc-500 leading-none">Shared Requirements Buffer</span>
-                        </div>
-                      </div>
-                      <span className="text-xs font-mono px-1.5 py-0.5 bg-white/5 text-zinc-400 rounded uppercase">
-                        {promptBuffer.length > 0 ? `${promptBuffer.length} Chars` : "Empty"}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              ))()}
+              {/* Core Goal: Live Conversation & Synergy Matrix — extracted to the SynergyMatrixPanel
+                  leaf (chunk-3). The voice-hub + spec-buffer halves are INTERNAL closures there; the
+                  AGENT STATUS label is the new voiceAgentStatusLabel helper (its strings differ from
+                  the header's geminiVoiceLabel), the badge is specBufferBadge. setIsMicMuted is
+                  harness-wired and threaded unchanged. */}
+              <SynergyMatrixPanel
+                isLive={isLive}
+                isReconnecting={isReconnecting}
+                isMicMuted={isMicMuted}
+                promptBuffer={promptBuffer}
+                startLive={startLive}
+                stopLive={stopLive}
+                setIsMicMuted={setIsMicMuted}
+                setMobileActiveView={setMobileActiveView}
+              />
 
               {(() => {
                 const filteredPanes = activeProject && activeProject.panes
@@ -2790,7 +2468,13 @@ function AppRaw() {
         {/* Mobile Active Views */}
         {mobileActiveView === "buffer" && (
           <section className="flex-1 flex flex-col bg-[#080808] p-4 lg:hidden overflow-y-auto h-full gap-4">
-            {renderTerminalHealthHeatmap()}
+            <TerminalHealthHeatmap
+              terminals={terminals}
+              pendingCommands={pendingCommands}
+              activeTerminalId={activeTerminalId}
+              hoveredTermId={hoveredTermId}
+              onHoverTerm={setHoveredTermId}
+            />
             <HelperPanelTabHeader promptBuffer={promptBuffer} wipDrafts={wipDrafts} />
             <PromptSynchronizerPanel
               composer={composer}
@@ -2804,7 +2488,13 @@ function AppRaw() {
         {/* Desktop Helper Panel: Shared Sync Buffer */}
         <aside className="hidden lg:flex w-[400px] shrink-0 border-l border-white/5 bg-black/40 flex-col overflow-hidden max-h-full">
           <div className="p-4 border-b border-white/5 bg-black/10 shrink-0">
-            {renderTerminalHealthHeatmap()}
+            <TerminalHealthHeatmap
+              terminals={terminals}
+              pendingCommands={pendingCommands}
+              activeTerminalId={activeTerminalId}
+              hoveredTermId={hoveredTermId}
+              onHoverTerm={setHoveredTermId}
+            />
           </div>
           <div className="flex-1 flex flex-col p-4 gap-4 overflow-y-auto h-full scrollbar-thin">
             <HelperPanelTabHeader promptBuffer={promptBuffer} wipDrafts={wipDrafts} />
@@ -2817,86 +2507,10 @@ function AppRaw() {
           </div>
         </aside>
 
-        {/* Right side Transcript Log Panel — inner IIFE keeps AppRaw's CC under the gate. */}
-        {showTranscriptPanel && (() => (
-          <aside className="w-80 border-l border-white/5 bg-[#090909] flex flex-col shrink-0">
-            <div className="p-4 border-b border-white/5 flex items-center justify-between select-none">
-              <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
-                <span className="text-xs font-mono tracking-wider text-white uppercase font-bold">Janus Voice Log</span>
-              </div>
-              <button 
-                onClick={() => setTranscript([])} 
-                className="text-xs uppercase font-mono px-2 py-0.5 bg-white/5 hover:bg-red-500/10 hover:text-red-400 text-zinc-500 rounded border border-transparent hover:border-red-500/20 cursor-pointer focus:outline-none"
-                title="Clear transcript history"
-              >
-                Clear
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-3.5 scrollbar-thin">
-              {transcript.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-center p-4">
-                  <div className="w-8 h-8 rounded-full border border-white/5 flex items-center justify-center text-zinc-600 mb-2 font-mono text-xs select-none">?</div>
-                  <p className="text-xs font-mono text-zinc-500 leading-relaxed max-w-[170px] italic">
-                    Speak to Janus or trigger a query to stream transcripts...
-                  </p>
-                </div>
-              ) : (
-                transcript.map((item, idx) => {
-                  const isUser = item.sender === "User";
-                  return (
-                    <div
-                      key={idx}
-                      data-testid="transcript-message"
-                      data-sender={item.sender}
-                      className={`flex flex-col max-w-[90%] ${isUser ? "ml-auto items-end" : "mr-auto items-start"}`}
-                    >
-                      <span className="text-xs font-mono opacity-30 mb-0.5 select-none uppercase">
-                        {item.sender}
-                      </span>
-                      <div className={`p-2.5 rounded-lg text-xs leading-relaxed font-sans ${
-                        isUser 
-                          ? "bg-zinc-850 text-zinc-200 rounded-tr-none border border-white/5" 
-                          : "bg-cyan-950/25 border border-cyan-500/20 text-cyan-200 rounded-tl-none pr-3"
-                      }`}>
-                        {item.text}
-                      </div>
-                      {!isUser && item.grounding && (item.grounding.sources.length > 0 || item.grounding.queries.length > 0) && (
-                        <div
-                          data-testid="transcript-grounding"
-                          className="mt-1 max-w-full text-xs font-mono text-cyan-400/60 leading-relaxed break-words"
-                        >
-                          <span className="opacity-70 uppercase tracking-wider">grounded via </span>
-                          {item.grounding.sources.length > 0 ? (
-                            item.grounding.sources.map((s, i) => (
-                              <span key={i}>
-                                <a
-                                  href={s.uri}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  title={s.uri}
-                                  className="underline decoration-dotted hover:text-cyan-300"
-                                >
-                                  {s.title || s.uri.replace(/^https?:\/\//, "").replace(/\/.*$/, "")}
-                                </a>
-                                {i < item.grounding!.sources.length - 1 ? ", " : ""}
-                              </span>
-                            ))
-                          ) : (
-                            <span className="italic opacity-70">{item.grounding.queries.join("; ")}</span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-            <div className="p-3 border-t border-white/5 bg-black/40 text-xs font-mono text-zinc-500 leading-normal select-none">
-              Derived from client mic input PCM streaming mapping at 16,000 Hz.
-            </div>
-          </aside>
-        ))()}
+        {/* Right side Transcript Log Panel — extracted to the TranscriptPanel leaf (chunk-3). The
+            showTranscriptPanel gate STAYS here; setTranscript is harness-wired (Clear) and fires via
+            onClear unchanged. */}
+        {showTranscriptPanel && <TranscriptPanel transcript={transcript} onClear={() => setTranscript([])} />}
       </main>
 
       {/* Mobile Sticky Touch-friendly Navigation Bar — extracted to the MobileNavBar leaf (chunk-1). */}
@@ -2906,21 +2520,9 @@ function AppRaw() {
         promptBuffer={promptBuffer}
       />
 
-      {/* System Bar — inner IIFE keeps AppRaw's CC under the gate (the size/token ?: leave its scope). */}
-      {(() => (
-      <div className="bg-black border-t border-white/5 px-6 py-2 flex justify-between items-center shrink-0">
-        <div className="flex gap-6">
-          <span className="text-xs font-mono opacity-30">UPTIME: ACTIVE DETECTED</span>
-          <span className="text-xs font-mono text-cyan-400 font-bold tracking-wider">
-            CUMULATIVE CONTEXT SIZE: {formatCharCountLower(totalContextSize)} (~{formatTokenCount(totalTokensEstimated)} tokens)
-          </span>
-        </div>
-        <div className="flex gap-4">
-          <span className="text-xs font-mono text-cyan-400">[CORE CLOUD SYSTEMS ONLINE]</span>
-          <span className="text-xs font-mono opacity-30 uppercase tracking-tighter italic font-bold">Orbital Harness v1.0.4</span>
-        </div>
-      </div>
-      ))()}
+      {/* System Bar — extracted to the SystemStatusBar leaf (chunk-3). formatCharCountLower /
+          formatTokenCount stay module imports there; only the two derived totals are threaded. */}
+      <SystemStatusBar totalContextSize={totalContextSize} totalTokensEstimated={totalTokensEstimated} />
     </div>
   );
 }
