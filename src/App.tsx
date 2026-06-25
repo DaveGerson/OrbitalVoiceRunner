@@ -68,6 +68,10 @@ import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
 import { ControlKeyBar } from "./classic/components/ControlKeyBar";
+import { GenericPromptModal } from "./classic/components/GenericPromptModal";
+import { ToastNotificationStack } from "./classic/components/ToastNotificationStack";
+import { FrozenBanner } from "./classic/components/FrozenBanner";
+import { MobileNavBar } from "./classic/components/MobileNavBar";
 
 function AppRaw() {
   const [activeProjectId, setActiveProjectId] = useState<string>("default_project");
@@ -945,33 +949,6 @@ function AppRaw() {
     setTimeout(() => setCopiedId(null), 1500);
   };
 
-  const GenericPromptModal = () => {
-    // Hook must be called unconditionally (rules-of-hooks): declare state BEFORE the
-    // early return so the hook order is stable whether or not promptDialog is open.
-    const [val, setVal] = useState("");
-    if (!promptDialog) return null;
-    return (
-      <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur flex items-center justify-center p-4">
-        <div className="bg-[#111] border border-white/10 p-6 rounded shadow-2xl w-full max-w-sm flex flex-col gap-4">
-          <h2 className="text-white text-sm font-bold font-mono tracking-wide">{promptDialog.title}</h2>
-          <input 
-            autoFocus
-            type="text" 
-            placeholder={promptDialog.placeholder}
-            value={val}
-            onChange={e => setVal(e.target.value)}
-            className="w-full bg-black border border-white/20 p-2 text-white font-mono text-xs focus:outline-none focus:border-cyan-500"
-            onKeyDown={e => e.key === 'Enter' && promptDialog.onSubmit(val)}
-          />
-          <div className="flex justify-end gap-3 mt-2">
-            <button onClick={() => setPromptDialog(null)} className="text-xs font-mono uppercase tracking-wider text-white/50 hover:text-white transition">Cancel</button>
-            <button onClick={() => promptDialog.onSubmit(val)} className="text-xs font-mono uppercase tracking-wider text-cyan-400 font-bold hover:text-cyan-300 transition">Save</button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
   const activeProject = projectList.find(p => p.id === activeProjectId);
 
   const totalContextSize = sumContextSize(activeProject?.panes, terminals);
@@ -1468,55 +1445,18 @@ function AppRaw() {
         />
       ))}
       
-      <GenericPromptModal />
+      <GenericPromptModal promptDialog={promptDialog} setPromptDialog={setPromptDialog} />
       </>
       ))()}
 
-      {/* Toast Notifications — wrapped in an inline render closure (IIFE) so the per-toast && guards
-          leave AppRaw's CC scope (burndown). JSX/behavior unchanged. */}
-      {(() => (
-      <div className="fixed top-4 right-4 z-50 space-y-2 pointer-events-none">
-        {autoApprovedNotification && (
-          <div className="bg-[#111] border border-green-500/30 text-green-400 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-xs font-mono uppercase tracking-widest text-green-500">▶ Auto-Approved & Executed</span>
-            <span className="text-xs font-mono text-white/90">Node ID: {autoApprovedNotification.terminalId}</span>
-            <pre className="text-xs bg-black/40 p-2 rounded text-[#b4b4b4] border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{autoApprovedNotification.cmd}</pre>
-          </div>
-        )}
-        {blockedNotification && (
-          <div className="bg-[#111] border border-red-500/30 text-red-400 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-xs font-mono uppercase tracking-widest text-red-500">⛔ Access Blocked (Read-Only)</span>
-            <span className="text-xs font-mono text-white/90">Node ID: {blockedNotification.terminalId}</span>
-            <span className="text-xs text-zinc-400">Policy: {blockedNotification.reason}</span>
-            <pre className="text-xs bg-black/40 p-2 rounded text-zinc-500 border border-white/5 whitespace-pre-wrap font-mono mt-1 max-h-24 overflow-y-auto">{blockedNotification.cmd}</pre>
-          </div>
-        )}
-        {wsErrorNotification && (
-          <div className="bg-[#111] border border-red-500/50 text-red-500 p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300">
-            <span className="text-xs font-mono uppercase tracking-widest text-red-500 font-bold">⛔ Connection / AI Error</span>
-            <span className="text-xs font-mono text-white/90">{wsErrorNotification.message}</span>
-          </div>
-        )}
-        {/* Nit #3: raw control-key outcome toast — gated (403) / deferred (202) / refused (409). */}
-        {rawKeyNotification && (
-          <div
-            data-testid="raw-key-notification"
-            className={`bg-[#111] p-4 rounded-lg shadow-xl max-w-sm flex flex-col gap-1 pointer-events-auto animate-in slide-in-from-top-4 duration-300 border ${
-              rawKeyNotification.tone === "deferred"
-                ? "border-amber-500/30 text-amber-400"
-                : "border-red-500/30 text-red-400"
-            }`}
-          >
-            <span className={`text-xs font-mono uppercase tracking-widest font-bold ${
-              rawKeyNotification.tone === "deferred" ? "text-amber-500" : "text-red-500"
-            }`}>
-              {rawKeyNotification.tone === "deferred" ? "⏳ " : "⛔ "}{rawKeyNotification.title}
-            </span>
-            <span className="text-xs font-mono text-white/90">{rawKeyNotification.detail}</span>
-          </div>
-        )}
-      </div>
-      ))()}
+      {/* Toast Notifications — extracted to the ToastNotificationStack leaf (chunk-1). The per-toast
+          && guards (and the raw-key tone→class/glyph derivation) now live there + toastLogic.ts. */}
+      <ToastNotificationStack
+        autoApprovedNotification={autoApprovedNotification}
+        blockedNotification={blockedNotification}
+        wsErrorNotification={wsErrorNotification}
+        rawKeyNotification={rawKeyNotification}
+      />
 
       {/* WS-D (BUG-024): proactive completion/error notification stack */}
       <NotificationStack
@@ -1709,16 +1649,15 @@ function AppRaw() {
       ))()}
 
       {/* bead 8sq: FROZEN banner — Stage-2 hold-to-fire kill + Release (spec §2.C). Renders full-width
-          directly under the header when a Stage-1 freeze is active. */}
-      {frozen && (
-        <EmergencyStop
-          frozen={true}
-          runningCount={frozenRunning.length}
-          onFreeze={handleStopAllFreeze}
-          onKill={handleStopAllKill}
-          onRelease={handleStopAllRelease}
-        />
-      )}
+          directly under the header when a Stage-1 freeze is active. Extracted to FrozenBanner (chunk-1);
+          it keeps the EmergencyStop module import. Same handler trio also feeds the header trigger. */}
+      <FrozenBanner
+        frozen={frozen}
+        frozenRunning={frozenRunning}
+        onFreeze={handleStopAllFreeze}
+        onKill={handleStopAllKill}
+        onRelease={handleStopAllRelease}
+      />
 
       {/* Mobile Terminals Quick Swiper Bar */}
       <div className="lg:hidden flex items-center gap-2 overflow-x-auto px-4 py-2 border-b border-white/5 bg-black/80 scrollbar-none shrink-0 select-none">
@@ -3143,35 +3082,12 @@ function AppRaw() {
         ))()}
       </main>
 
-      {/* Mobile Sticky Touch-friendly Navigation Bar — inner IIFE keeps AppRaw's CC under the gate. */}
-      {(() => (
-      <div className="lg:hidden shrink-0 h-16 bg-black border-t border-white/10 flex items-center justify-around px-2 z-20 select-none">
-        <button
-          onClick={() => setMobileActiveView("terminal")}
-          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "terminal" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
-        >
-          <TermIcon className="w-4 h-4" />
-          <span className="text-xs font-mono uppercase tracking-wider">Terminal</span>
-        </button>
-        <button
-          onClick={() => setMobileActiveView("buffer")}
-          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 relative transition-colors focus:outline-none ${mobileActiveView === "buffer" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
-        >
-          <CheckSquare className="w-4 h-4" />
-          <span className="text-xs font-mono uppercase tracking-wider">Sync Buffer</span>
-          {promptBuffer.length > 0 && (
-            <span className="absolute top-2.5 right-8 w-1.5 h-1.5 bg-cyan-400 rounded-full animate-pulse"></span>
-          )}
-        </button>
-        <button
-          onClick={() => setMobileActiveView("menu")}
-          className={`flex-1 py-1 flex flex-col items-center justify-center gap-1 transition-colors focus:outline-none ${mobileActiveView === "menu" ? "text-cyan-400 font-extrabold" : "text-zinc-500 hover:text-zinc-300"}`}
-        >
-          <Layers className="w-4 h-4" />
-          <span className="text-xs font-mono uppercase tracking-wider">Projects</span>
-        </button>
-      </div>
-      ))()}
+      {/* Mobile Sticky Touch-friendly Navigation Bar — extracted to the MobileNavBar leaf (chunk-1). */}
+      <MobileNavBar
+        mobileActiveView={mobileActiveView}
+        setMobileActiveView={setMobileActiveView}
+        promptBuffer={promptBuffer}
+      />
 
       {/* System Bar — inner IIFE keeps AppRaw's CC under the gate (the size/token ?: leave its scope). */}
       {(() => (
