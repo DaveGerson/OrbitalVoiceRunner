@@ -22,7 +22,7 @@ describe("PaneSignalBus", () => {
 
   it("debounces repeat (pane,kind) within the window but lets other kinds through", () => {
     let now = 1000;
-    const bus = new PaneSignalBus(3000, () => now);
+    const bus = new PaneSignalBus(3000, 0, () => now);
     const seen: string[] = [];
     bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
 
@@ -53,7 +53,7 @@ describe("PaneSignalBus", () => {
   // repeats still collapse — the anti-spam intent).
   it("4D.2: a zero-observer publish does NOT consume the (pane,kind) window", () => {
     let now = 1000;
-    const bus = new PaneSignalBus(3000, () => now);
+    const bus = new PaneSignalBus(3000, 0, () => now);
     // Nobody is listening yet — the signal is lost on the floor, but must not stamp the window.
     assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "boom" }), false, "no observers -> not delivered");
     now += 10; // well inside the window
@@ -66,7 +66,7 @@ describe("PaneSignalBus", () => {
 
   it("4D.2: a same-kind signal with a DIFFERENT detail passes through inside the window", () => {
     let now = 1000;
-    const bus = new PaneSignalBus(3000, () => now);
+    const bus = new PaneSignalBus(3000, 0, () => now);
     const seen: string[] = [];
     bus.subscribe((s) => seen.push(`${s.kind}:${s.detail ?? ""}`));
 
@@ -84,7 +84,7 @@ describe("PaneSignalBus", () => {
 
   it("4D.2: detail-less repeats keep collapsing exactly as before (no regression)", () => {
     let now = 1000;
-    const bus = new PaneSignalBus(3000, () => now);
+    const bus = new PaneSignalBus(3000, 0, () => now);
     const seen: string[] = [];
     bus.subscribe((s) => seen.push(s.kind));
     assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), true);
@@ -131,5 +131,63 @@ describe("PaneSignalBus", () => {
       false,
       "the original published signal was NOT mutated by the defer stamp",
     );
+  });
+
+  // ── L1 fix: cross-kind cooldown prevents status-flap re-announcement loop ──────────────
+  it("L1: cross-kind cooldown suppresses low-priority kinds within the window", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true, "first signal passes");
+    now += 1000; // inside cross-kind cooldown
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), false, "idle suppressed by cross-kind cooldown");
+    now += 1000;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "quiescing" }), false, "quiescing suppressed too");
+
+    assert.deepStrictEqual(seen, ["p1:running"]);
+  });
+
+  it("L1: error and exited always pass through cross-kind cooldown", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true);
+    now += 500;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "error", detail: "boom" }), true, "error passes through cooldown");
+    now += 500;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "exited" }), true, "exited passes through cooldown");
+
+    assert.deepStrictEqual(seen, ["p1:running", "p1:error", "p1:exited"]);
+  });
+
+  it("L1: cross-kind cooldown expires and low-priority kinds pass again", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true);
+    now += 5001; // cross-kind cooldown expired
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), true, "idle passes after cooldown expires");
+
+    assert.deepStrictEqual(seen, ["p1:running", "p1:idle"]);
+  });
+
+  it("L1: cross-kind cooldown is per-pane (different panes are independent)", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const seen: string[] = [];
+    bus.subscribe((s) => seen.push(`${s.paneId}:${s.kind}`));
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true);
+    now += 500;
+    assert.strictEqual(bus.publish({ paneId: "p2", kind: "idle" }), true, "different pane is independent");
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), false, "same pane still in cooldown");
+
+    assert.deepStrictEqual(seen, ["p1:running", "p2:idle"]);
   });
 });

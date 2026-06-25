@@ -302,7 +302,7 @@ export default function OrbitalApp() {
           <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
             connected={data.voiceConnected} micBlocked={data.micBlocked}
             transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
-            onGoLive={data.goLive} onToggleMute={data.toggleMute} onCall={handleCall} />
+            onGoLive={data.goLive} onStopLive={data.stopLive} onToggleMute={data.toggleMute} onCall={handleCall} />
         </aside>
       </div>
     );

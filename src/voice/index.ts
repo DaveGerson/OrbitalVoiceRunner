@@ -1068,9 +1068,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // (the transcript_text frame stays unconditional). With the flag off, muteCurrentModelTurn is
           // always false, so this is byte-for-byte today's path.
           const relayModelAudio = (message: any): void => {
-            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audio && !state.muteCurrentModelTurn) {
-              clientWs.send(JSON.stringify({ type: "audio", audio }));
+            const parts = message.serverContent?.modelTurn?.parts;
+            if (!parts || state.muteCurrentModelTurn) return;
+            for (const part of parts) {
+              const audio = part?.inlineData?.data;
+              if (audio) {
+                clientWs.send(JSON.stringify({ type: "audio", audio }));
+              }
             }
           };
 
@@ -1096,6 +1100,24 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // Run ONE tool call through the registry (idempotency replay-guard, dispatch, the create_pane
           // opening ack), guarded so a handler throw can't escape onmessage. Byte-identical to the inline
           // per-call body of the toolCall loop.
+
+          // L2: content-level idempotency guard for propose_command — collapses duplicate
+          // same-instruction dispatches that arrive with different callIds within a turn.
+          const recentProposals = new Map<string, number>();
+          const PROPOSAL_DEDUP_WINDOW_MS = 5000;
+
+          const isProposalDuplicate = (name: string, args: Record<string, any>): boolean => {
+            if (name !== "propose_command" || !args) return false;
+            const dedupKey = `${args.pane_id}:${(args.instruction ?? args.command ?? "").trim().toLowerCase()}`;
+            const lastAt = recentProposals.get(dedupKey);
+            const now = Date.now();
+            if (lastAt && now - lastAt < PROPOSAL_DEDUP_WINDOW_MS) return true;
+            recentProposals.set(dedupKey, now);
+            for (const [k, t] of recentProposals) {
+              if (now - t > PROPOSAL_DEDUP_WINDOW_MS * 2) recentProposals.delete(k);
+            }
+            return false;
+          };
 
           // PLM4 (3): PER-DISPATCH IDEMPOTENCY / replay guard. A tool call RE-DELIVERED after a reconnect
           // (Gemini may replay the same functionCall id on a resumed session) must NOT double-apply a
@@ -1140,6 +1162,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               if (isReplayShortCircuit(call, name)) {
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
+                });
+              } else if (isProposalDuplicate(name, args)) {
+                session.sendToolResponse({
+                  functionResponses: [{ name, id: call.id, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
                 });
               } else {
                 const actionCtx: ActionContext = buildActionContext(call.id!, name);
@@ -1194,6 +1220,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             if (modelThinking) {
               interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });
               setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
+              // B2: In audio-only mode, modelTurn.parts carries audio (not text), so modelUtterance
+              // is empty. Surface the outputTranscription as the visible transcript text.
+              if (!modelUtterance) handleModelUtterance(modelThinking);
             }
 
             if (userUtterance) handleOperatorUtterance(userUtterance, session);
@@ -1307,7 +1336,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           try {
             justConnected.sendClientContent({
               turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
-              turnComplete: true,
+              turnComplete: false, // L1 fix: inject as passive context, not a forced spoken turn
             });
           } catch (e) {
             console.error("Failed to push pane signal to session:", e);

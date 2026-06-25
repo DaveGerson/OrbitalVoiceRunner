@@ -89,3 +89,28 @@ export function isAudioPlaying(audioCtx: AudioContext | null): boolean {
   const bufferGuardSeconds = 0.2; // 200ms guard to prevent echo bleed-through immediately after speech
   return activeSources.length > 0 || nextStartTime > (audioCtx.currentTime - bufferGuardSeconds);
 }
+
+// B3: output-device picker — setSinkId lets Web Audio route playback to a
+// non-default output (headphones, monitor speakers, etc.).
+const OUTPUT_DEVICE_KEY = "janus-output-device";
+
+export function getStoredOutputDeviceId(): string {
+  try { return localStorage.getItem(OUTPUT_DEVICE_KEY) ?? ""; } catch { return ""; }
+}
+
+export function storeOutputDeviceId(deviceId: string): void {
+  try { localStorage.setItem(OUTPUT_DEVICE_KEY, deviceId); } catch { /* */ }
+}
+
+export async function applyOutputDevice(ctx: AudioContext, deviceId?: string): Promise<void> {
+  const id = deviceId ?? getStoredOutputDeviceId();
+  if (!id || !("setSinkId" in ctx)) return;
+  try { await (ctx as any).setSinkId(id); } catch { /* unsupported or invalid device — fall back to default */ }
+}
+
+export async function getAudioOutputDevices(): Promise<MediaDeviceInfo[]> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === "audiooutput");
+  } catch { return []; }
+}
