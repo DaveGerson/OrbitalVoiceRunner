@@ -732,3 +732,28 @@ export function headerStatusDotClass(isLive: boolean, isReconnecting: boolean): 
 export function headerRunningCount(terminals: Terminal[], activeProject: Workspace | undefined): number {
   return terminals.filter(t => t.status === "Running").length || Object.values(activeProject?.panes || {}).filter(p => p.alive).length;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal-view + dashboard-chrome pure derivations — extracted VERBATIM from the chunk-6 sections
+// of src/App.tsx (ArtifactsRegistryPanel's pane register + PaneHistorySidebar's history list).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Is a ledger pane backed by a LIVE terminal process? VERBATIM from the inline
+ *  `terminals.some(t => t.id === pane.pane_id)` at the ArtifactsRegistryPanel "Active RAM vs Idle
+ *  Registry" derivation (`isLiveProcess`). True ⇒ "Active RAM" (+ no Recover button); false ⇒ "Idle
+ *  Registry" (+ the Recover & Wake button). */
+export function isPaneLive(terminals: Pick<Terminal, "id">[], paneId: string): boolean {
+  return terminals.some((t) => t.id === paneId);
+}
+
+/** Whether a history entry is the currently-selected one. VERBATIM from the inline
+ *  `selectedHistoryEntry?.command === entry.command && selectedHistoryEntry?.timestamp ===
+ *  entry.timestamp` at the PaneHistorySidebar list (computed once per row, used three times: row
+ *  className, the toggle-to-null click, and the "Hide/Read stdout" label). The optional chains are
+ *  load-bearing — a null selection compares `undefined === entry.command` → false on both sides. */
+export function historyEntryIsSelected(
+  selected: { command: string; timestamp: string } | null,
+  entry: { command: string; timestamp: string },
+): boolean {
+  return selected?.command === entry.command && selected?.timestamp === entry.timestamp;
+}
