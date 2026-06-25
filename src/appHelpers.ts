@@ -8,7 +8,8 @@
 // App.tsx — same branches, same byte-exact className strings, same default fall-throughs. The
 // refactor only RELOCATES computation; it changes nothing observable.
 
-import type { Terminal, PaneMeta, Workspace } from "./types";
+import type { Terminal, PaneMeta, Workspace, PendingCommand } from "./types";
+import type { ProjectNote } from "./classic/hooks/useLedgerData";
 import type { EarconType } from "./announcementKinds";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -756,4 +757,57 @@ export function historyEntryIsSelected(
   entry: { command: string; timestamp: string },
 ): boolean {
   return selected?.command === entry.command && selected?.timestamp === entry.timestamp;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pane-grid card derivations — extracted VERBATIM from the per-iteration map body of the dashboard
+// grid IIFE (App.tsx chunk-7 "pane-grid", now <PaneGridSection/>). Each was a genuinely-INLINE
+// expression inside the `.map`/render*Card closures (not yet a named helper), relocated here so the
+// component renders a single call and the BYTE-EXACT value is independently unit-pinnable. The four
+// status/preset/context derivations (resolvePaneStatus / resolveCardContextSize /
+// detailedCardPresetClasses / contextMeterPercent / contextMeterColor / the *DotClass family) were
+// ALREADY helpers and are NOT re-hoisted. Nothing observable differs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Whether ANY pending command targets a pane (the card's `isAlertActive`). VERBATIM from the inline
+ *  `pendingCommands.some(cmd => cmd.terminalId === pane.pane_id)` at the top of the grid `.map`. The
+ *  detailed warning's `pendingCommands.find(...)?.cmd` is a DISTINCT lookup (returns the cmd text, not
+ *  a boolean) and stays inline. */
+export function paneHasPendingCommand(pendingCommands: Pick<PendingCommand, "terminalId">[], paneId: string): boolean {
+  return pendingCommands.some((cmd) => cmd.terminalId === paneId);
+}
+
+/** Whether a pane "just went idle" (drives the compact/detailed dot's `heartbeat-animation` suffix).
+ *  VERBATIM from the inline `recentlyIdled[pane.pane_id]` truthiness check — the caller keeps the
+ *  `? "heartbeat-animation" : ""` ternary, this only normalizes the lookup to a boolean. */
+export function isRecentlyIdled(recentlyIdled: Record<string, boolean>, paneId: string): boolean {
+  return !!recentlyIdled[paneId];
+}
+
+/** The videowall card's "security-camera" tail: the last `n` lines of a terminal's output joined back
+ *  with newlines. VERBATIM from the inline `term.output.split("\n").slice(-7).join("\n")` (n = 7). The
+ *  caller keeps the outer `term?.output ? … : <idle span>` guard — this only runs when output exists. */
+export function tailOutputLines(output: string, n: number): string {
+  return output.split("\n").slice(-n).join("\n");
+}
+
+/** The detailed card's Node Chronicle source selector. VERBATIM precedence from the inline IIFE
+ *  (bead bjm): id-bearing project notes for this pane win; else the ledger's bare-string notes; else
+ *  empty. Returns WHICH source to render (the JSX for each arm stays in the component) so the branch
+ *  lattice is unit-pinnable without jsdom. `"notes"` ⇒ id-bearing (delete/amend controls), `"legacy"`
+ *  ⇒ bare strings, `"empty"` ⇒ the "No notes created." placeholder. */
+export type ChronicleSource =
+  | { kind: "notes"; notes: ProjectNote[] }
+  | { kind: "legacy"; notes: string[] }
+  | { kind: "empty" };
+
+export function chooseChronicleSource(
+  activeProjectNotes: ProjectNote[],
+  paneNotes: string[] | undefined,
+  paneId: string,
+): ChronicleSource {
+  const paneChronicle = activeProjectNotes.filter((n) => n.pane_id === paneId);
+  if (paneChronicle.length > 0) return { kind: "notes", notes: paneChronicle };
+  if (paneNotes && paneNotes.length > 0) return { kind: "legacy", notes: paneNotes };
+  return { kind: "empty" };
 }
