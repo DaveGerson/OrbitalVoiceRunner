@@ -179,6 +179,13 @@ export interface E2EHarnessDeps {
   onWsFrame?: (frame: unknown) => void;
   /** 3C.2 (OPTIONAL — kitchen only): bump the stream generation (models an observe reconnect). */
   bumpStreamGeneration?: () => void;
+  /**
+   * dbt4 (OPTIONAL): an App-owned `e2eActiveRef` to write into, so a sibling hook created BEFORE
+   * the harness (useStdoutStream, which the harness depends on via queueStdoutChunk) can read the
+   * same e2e-active flag the resize guard needs — breaking the create-order cycle. When omitted the
+   * harness owns its own ref exactly as before (no behavior change for any existing caller).
+   */
+  e2eActiveRef?: MutableRefObject<boolean>;
 }
 
 /**
@@ -328,7 +335,10 @@ const DEFAULT_MOCK_GATES: CapabilityGateMap = {
  * gated side effects (e.g. the resize POST) still fire under e2e.
  */
 export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefObject<boolean> } {
-  const e2eActiveRef = useRef(false);
+  // dbt4: prefer an App-injected ref (shared with useStdoutStream's resize guard) so the e2e-active
+  // flag is visible to a hook created before this one; fall back to an own ref (existing behavior).
+  const ownRef = useRef(false);
+  const e2eActiveRef = deps.e2eActiveRef ?? ownRef;
 
   useEffect(() => {
     if (typeof window === "undefined") return;

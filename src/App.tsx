@@ -13,7 +13,6 @@ import { NotificationStack } from "./components/NotificationStack";
 import { GateChip } from "./components/GateChip";
 import { EmergencyStop } from "./components/EmergencyStop";
 import { effectForEvent } from "./eventBus";
-import type { EarconType } from "./announcementKinds";
 import { upsertNotification, dismissNotification, ProactiveNotification } from "./notificationStack";
 import { Mic, MicOff, RefreshCw, Cpu, Database, Shield, Terminal as TermIcon, FileText, Clipboard, Plus, Trash2, Settings, History, Clock, Check, CheckSquare, Layers, Sparkles, Smartphone, Laptop, BookOpen, Play, Square, Activity, Tv, Flame, Send, Pencil } from "lucide-react";
 import { apiFetch } from "./utils/api";
@@ -58,6 +57,8 @@ import {
   totalContextBarPercent,
 } from "./appHelpers";
 import { useLiveSession } from "./hooks/useLiveSession";
+import { useEarcons } from "./classic/hooks/useEarcons";
+import { useStdoutStream } from "./classic/hooks/useStdoutStream";
 import { buildMockData } from "./mockData";
 import { MiniMarkdown } from "./classic/components/MiniMarkdown";
 import { ErrorBoundary } from "./classic/components/ErrorBoundary";
@@ -119,11 +120,11 @@ function AppRaw() {
 
   // --- Plans state (voice/backend path; the Orchestrate & Alerts GUI tabs were removed) ---
   const [plans, setPlans] = useState<Plan[]>([]);
-  // browserNotificationsEnabled gates triggerDesktopNotification(), which still fires for the
-  // surviving approval / action-pending / auto-approve / blocked notifications. Auto-enabled at
-  // boot when Notification.permission is already "granted". The manual toggle lived in the removed
-  // Alerts tab; desktop notifications now follow the browser's existing permission grant.
-  const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = useState(false);
+  // dbt4: the hands-free non-verbal feedback layer (browserNotificationsEnabled toggle + the
+  // Web-Audio playEarcon player + the gated triggerDesktopNotification wrapper) now lives in
+  // useEarcons (src/classic/hooks/useEarcons.ts). Behavior is byte-identical; the pure notification
+  // gate is pinned in tests/test_earcon_logic.ts.
+  const { playEarcon, triggerDesktopNotification, setBrowserNotificationsEnabled } = useEarcons();
 
   // Archive panel states
   const [archive, setArchive] = useState<any[]>([]);
@@ -137,116 +138,6 @@ function AppRaw() {
     if (archive.length > 0 && archiveWasEmptyRef.current) setShowArchivePanel(true);
     archiveWasEmptyRef.current = archive.length === 0;
   }, [archive.length]);
-
-  // Web Audio Synth Chimes for Hands-Free Feedback
-  const playEarcon = (type: EarconType) => {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      if (type === "completion") {
-        // WS-D (BUG-024): a distinct, short rising two-note so a genuine completion is
-        // audibly distinct from alert/success/execute/chime.
-        const now = ctx.currentTime;
-        osc.type = "triangle";
-        osc.frequency.setValueAtTime(587.33, now); // D5
-        gain.gain.setValueAtTime(0.05, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-        osc.start(now);
-        osc.stop(now + 0.2);
-
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.connect(gain2);
-        gain2.connect(ctx.destination);
-        osc2.type = "triangle";
-        osc2.frequency.setValueAtTime(880, now + 0.12); // A5
-        gain2.gain.setValueAtTime(0.05, now + 0.12);
-        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
-        osc2.start(now + 0.12);
-        osc2.stop(now + 0.12 + 0.24);
-      } else if (type === "alert") {
-        osc.type = "sawtooth";
-        osc.frequency.setValueAtTime(440, ctx.currentTime);
-        gain.gain.setValueAtTime(0.04, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.4);
-
-        setTimeout(() => {
-          const osc2 = ctx.createOscillator();
-          const gain2 = ctx.createGain();
-          osc2.connect(gain2);
-          gain2.connect(ctx.destination);
-          osc2.type = "sawtooth";
-          osc2.frequency.setValueAtTime(554, ctx.currentTime);
-          gain2.gain.setValueAtTime(0.04, ctx.currentTime);
-          gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
-          osc2.start(ctx.currentTime);
-          osc2.stop(ctx.currentTime + 0.4);
-        }, 150);
-      } else if (type === "success") {
-        const now = ctx.currentTime;
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(523.25, now);
-        gain.gain.setValueAtTime(0.06, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
-        osc.start(now);
-        osc.stop(now + 0.55);
-
-        const notes = [659.25, 783.99, 1046.50];
-        notes.forEach((freq, idx) => {
-          const oscN = ctx.createOscillator();
-          const gainN = ctx.createGain();
-          oscN.connect(gainN);
-          gainN.connect(ctx.destination);
-          oscN.type = "sine";
-          oscN.frequency.setValueAtTime(freq, now + (idx + 1) * 0.08);
-          gainN.gain.setValueAtTime(0.06, now + (idx + 1) * 0.08);
-          gainN.gain.exponentialRampToValueAtTime(0.001, now + (idx + 1) * 0.08 + 0.4);
-          oscN.start(now + (idx + 1) * 0.08);
-          oscN.stop(now + (idx + 1) * 0.08 + 0.5);
-        });
-      } else if (type === "execute") {
-        osc.type = "square";
-        osc.frequency.setValueAtTime(880, ctx.currentTime);
-        gain.gain.setValueAtTime(0.02, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.1);
-      } else if (type === "chime") {
-        const now = ctx.currentTime;
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(329.63, now);
-        gain.gain.setValueAtTime(0.05, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
-        osc.start(now);
-        osc.stop(now + 0.62);
-
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.connect(gain2);
-        gain2.connect(ctx.destination);
-        osc2.type = "sine";
-        osc2.frequency.setValueAtTime(493.88, now + 0.1);
-        gain2.gain.setValueAtTime(0.05, now + 0.1);
-        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.1 + 0.5);
-        osc2.start(now + 0.1);
-        osc2.stop(now + 0.1 + 0.62);
-      }
-    } catch (e) {}
-  };
-
-  const triggerDesktopNotification = (title: string, body: string) => {
-    if (browserNotificationsEnabled && "Notification" in window && Notification.permission === "granted") {
-      try {
-        new Notification(title, { body });
-      } catch (e) {}
-    }
-  };
 
   // --- Real-time Synchronous Markdown Prompt Buffer & Voice Agent Workspace States ---
   const [promptBuffer, setPromptBuffer] = useState("");
@@ -365,61 +256,19 @@ function AppRaw() {
     }
   };
 
-  const stdoutBufferRef = useRef<Record<string, string>>({});
-  const animationFrameRef = useRef<number | null>(null);
-
-  const queueStdoutChunk = (terminalId: string, chunk: string) => {
-    // Display lane: stream raw bytes straight into xterm (no React state, no line
-    // cap, no reset thrash). xterm owns the live buffer.
-    publishChunk(terminalId, chunk);
-
-    // Preview lane: keep a capped, ANSI-bearing tail in React state purely to feed
-    // the pane-card text snippets / byte count. This NO LONGER drives xterm, so the
-    // -110 line cap here is harmless (it once forced a full xterm.reset per frame).
-    stdoutBufferRef.current[terminalId] = (stdoutBufferRef.current[terminalId] || "") + chunk;
-
-    if (!animationFrameRef.current) {
-      animationFrameRef.current = requestAnimationFrame(() => {
-        animationFrameRef.current = null;
-        const currentBuffers = { ...stdoutBufferRef.current };
-        stdoutBufferRef.current = {};
-
-        setTerminals((prev) =>
-          prev.map((t) => {
-            const bufMatch = currentBuffers[t.id];
-            if (bufMatch) {
-              const lines = (t.output + bufMatch).split("\n").slice(-110);
-              return { ...t, output: lines.join("\n") };
-            }
-            return t;
-          })
-        );
-      });
-    }
-  };
-
-  // Per-pane debounce + last-sent-grid so a flurry of fit() events (drag-resize)
-  // collapses into one POST, and an unchanged grid never hits the server.
-  const resizeDebounceRef = useRef<Record<string, any>>({});
-  const lastGridRef = useRef<Record<string, string>>({});
-
-  const handleTerminalResize = (terminalId: string, cols: number, rows: number) => {
-    // In mock mode there's no backend to resize — EXCEPT under the e2e harness,
-    // where Playwright intercepts the POST to assert the grid-sync round-trip.
-    if (isMockModeRef.current && !e2eActiveRef.current) return;
-    if (!cols || !rows) return;
-    const key = `${cols}x${rows}`;
-    if (lastGridRef.current[terminalId] === key) return;
-    lastGridRef.current[terminalId] = key;
-    clearTimeout(resizeDebounceRef.current[terminalId]);
-    resizeDebounceRef.current[terminalId] = setTimeout(() => {
-      apiFetch(`/api/terminals/${terminalId}/resize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cols, rows }),
-      }).catch(() => { /* pane may have exited; resize is best-effort */ });
-    }, 120);
-  };
+  // dbt4: the rAF-batched stdout preview flush (queueStdoutChunk) + the debounced terminal-resize
+  // POST (handleTerminalResize) now live in useStdoutStream (src/classic/hooks/useStdoutStream.ts).
+  // queueStdoutChunk's identity is preserved and still fed into useE2EHarness below — the harness
+  // injectStdoutChunk contract is unchanged. isMockModeRef + e2eActiveRef are App-owned and threaded
+  // in (e2eActiveRef is created here so the harness, which depends on queueStdoutChunk, can share it).
+  // The pure pieces (the -110 flush slice + the grid-key dedup) are pinned in tests/test_stream_logic.ts.
+  const isMockModeRef = useRef(false);
+  const e2eActiveRef = useRef(false);
+  const { queueStdoutChunk, handleTerminalResize } = useStdoutStream({
+    setTerminals,
+    isMockModeRef,
+    e2eActiveRef,
+  });
 
   // dbt4: the WS + Web-Audio capture/playback refs and the connect/start/stop/cleanup +
   // auto-reconnect lifecycle now live in useLiveSession (src/hooks/useLiveSession.ts). isMicMutedRef
@@ -429,11 +278,12 @@ function AppRaw() {
   // value otherwise) — used to gate the pushed history_updated refresh to the active pane.
   const activeTerminalIdRef = useRef<string | null>(null);
 
-  const isMockModeRef = useRef(false);
   // E2E test harness — fully isolated in ./e2e/harness. No-op unless ?mock=1.
-  // e2eActiveRef lets the mock-mode-gated resize POST still fire under e2e.
-  const { e2eActiveRef } = useE2EHarness({
+  // e2eActiveRef (App-owned, declared above for useStdoutStream's resize guard) lets the
+  // mock-mode-gated resize POST still fire under e2e; the harness writes into the same ref.
+  useE2EHarness({
     isMockModeRef,
+    e2eActiveRef,
     setIsMockMode,
     setShowTranscriptPanel,
     setTerminals,
