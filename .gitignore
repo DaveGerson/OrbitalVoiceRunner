@@ -31,6 +31,9 @@ python/**/__pycache__/
 /blob-report/
 /playwright/.cache/
 e2e-artifacts/
+# Pixel-parity baselines are a Windows-local before/after proof artifact (win32-specific, CI-skipped),
+# not a committed cross-platform golden — see e2e/ledger_data_pixel_parity.spec.ts.
+e2e/*-snapshots/
 
 # Claude Code machine-local settings (not committed)
 .claude/settings.local.json
