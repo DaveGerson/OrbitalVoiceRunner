@@ -246,23 +246,49 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
     emitState(reason); // observability down-edge: child nulled ⇒ state resolves to "fallback" (debounced)
     settleAll(null);
     log(`[synth] daemon down (${reason})`);
-    if (discovering) candIndex = (candIndex + 1) % Math.max(1, cands.length); // try the next interpreter
-    scheduleRespawn();
+    scheduleRespawn(advanceDiscoveryAndShouldSpend());
   }
 
-  function scheduleRespawn() {
+  /** On a daemon-down while still DISCOVERING, advance to the next interpreter candidate and report
+   *  whether THIS failure should spend circuit-breaker budget (F7). A runtime fault (already
+   *  handshaked) always spends. A mid-sweep candidate-advance (e.g. py → python3) is "wrong
+   *  interpreter, try the next", NOT a crash — it spends NOTHING; only a COMPLETED sweep (the index
+   *  wraps back to candidate 0) counts as one failure, so a genuinely-absent interpreter still backs
+   *  off to the breaker cooldown instead of probing candidates in a tight loop forever. */
+  function advanceDiscoveryAndShouldSpend(): boolean {
+    if (!discovering) return true; // runtime fault (post-handshake): always spends budget
+    const next = (candIndex + 1) % Math.max(1, cands.length);
+    candIndex = next;
+    return next === 0; // wrap == every candidate tried once == one discovery failure
+  }
+
+  /** Account one budget-spending failure against the circuit breaker; returns true if it JUST opened
+   *  (caller then arms the cooldown re-probe instead of a backoff respawn). `decay` applies the
+   *  wall-clock streak reset: RUNTIME crashes decay (isolated, time-spread crashes must not open the
+   *  breaker), but DISCOVERY sweeps do NOT — one sweep spans cands.length × backoff and can easily
+   *  exceed breakerWindowMs, so a wall-clock reset there would zero the streak every sweep and the
+   *  breaker could NEVER open for a genuinely-absent interpreter (a respawn loop forever). The
+   *  pong-reset in handlePong is the shared "recovered" signal that ends a streak in both regimes. */
+  function tripBreakerIfExhausted(now: number, decay: boolean): boolean {
+    const stale = firstFailAt !== 0 && now - firstFailAt > breakerWindowMs;
+    if (firstFailAt === 0 || (decay && stale)) { firstFailAt = now; consecutiveFails = 0; }
+    consecutiveFails++;
+    if (consecutiveFails < breakerThreshold) return false;
+    breakerUntil = now + cooldownMs;
+    consecutiveFails = 0; firstFailAt = 0; attempt = 0;
+    log(`[synth] circuit breaker OPEN for ${cooldownMs}ms (fallback-only)`);
+    return true;
+  }
+
+  function scheduleRespawn(spendBudget: boolean) {
     if (disposed || !synthDir || cands.length === 0) return;
     // Never stack respawn timers: clear any pending one before arming a fresh schedule. The
     // generation guard in wireChildStreams already prevents the double-onDown that used to leak one,
     // but this keeps "exactly one pending respawn" true under any future call path.
     if (respawnTimer) { clearTimeout(respawnTimer); respawnTimer = null; }
     const now = Date.now();
-    if (firstFailAt === 0 || now - firstFailAt > breakerWindowMs) { firstFailAt = now; consecutiveFails = 0; }
-    consecutiveFails++;
-    if (consecutiveFails >= breakerThreshold) {
-      breakerUntil = now + cooldownMs;
-      consecutiveFails = 0; firstFailAt = 0; attempt = 0;
-      log(`[synth] circuit breaker OPEN for ${cooldownMs}ms (fallback-only)`);
+    // decay only RUNTIME failures on the wall-clock window; discovery sweeps accumulate (see helper).
+    if (spendBudget && tripBreakerIfExhausted(now, !discovering)) {
       respawnTimer = setTimeout(() => { breakerUntil = 0; discovering = true; candIndex = 0; log("[synth] breaker probe (re-discover)"); spawnDaemon(); }, cooldownMs);
     } else {
       const wait = Math.min(backoffMaxMs, backoffBaseMs * Math.pow(2, attempt++));
