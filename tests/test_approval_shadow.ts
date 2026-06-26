@@ -141,7 +141,7 @@ describe("parseApprovalIntentShadowed (authoritative passthrough)", () => {
     const seen: Array<{ u: string; r: unknown }> = [];
     const rec = createApprovalShadowRecorder({ parse: async () => ({ intent: "approve" }) });
     // wrap record to observe the call without changing behavior
-    const wrapped = { record: (u: string, r: any) => { seen.push({ u, r }); rec.record(u, r); }, stats: rec.stats };
+    const wrapped = { record: (u: string, r: any) => { seen.push({ u, r }); rec.record(u, r); }, resolve: rec.resolve, stats: rec.stats };
     installApprovalShadow(wrapped);
     assert.equal(getApprovalShadow(), wrapped);
 
@@ -154,7 +154,7 @@ describe("parseApprovalIntentShadowed (authoritative passthrough)", () => {
   });
 
   it("a throwing recorder cannot break the authoritative answer", () => {
-    installApprovalShadow({ record: () => { throw new Error("recorder bug"); }, stats: () => ({ compared: 0, match: 0, mismatch: 0, missing: 0 }) });
+    installApprovalShadow({ record: () => { throw new Error("recorder bug"); }, resolve: async (_u, ts) => ts, stats: () => ({ compared: 0, match: 0, mismatch: 0, missing: 0 }) });
     assert.doesNotThrow(() => {
       const got = parseApprovalIntentShadowed("approve");
       assert.deepEqual(got, parseApprovalIntent("approve"));

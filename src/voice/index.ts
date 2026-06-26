@@ -30,7 +30,7 @@ import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
-import { parseApprovalIntentShadowed } from "../approvalShadow";
+import { parseApprovalIntentShadowed, isApprovalPythonPrimary, resolveApprovalIntent } from "../approvalShadow";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
@@ -1025,10 +1025,21 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
             // announced targeting (NOT FIFO, NOT substring matching).
-            // Seam Inc 1 (task 1.6): the single production entry to approval parsing — shadowed so the
-            // Python port observes EVERY routed utterance (including "none", the ambient-speech cases) in
-            // parallel, fire-and-forget, while this TS result stays authoritative. Passthrough (byte-
-            // identical) until the server installs the recorder at boot.
+            // Seam Inc 1 (task 1.6) / Inc 2 (task 2.1, the FLIP): the single production entry to approval
+            // parsing. In SHADOW (default) this is the SYNCHRONOUS, byte-identical shadow tap — Python
+            // observes every routed utterance fire-and-forget while TS stays authoritative. In FLIP mode
+            // (JANUS_APPROVAL_PYTHON_PRIMARY) Python is PRIMARY with the TS twin as the fail-closed floor;
+            // resolution is async (await Python, fall to the floor on miss/timeout), so route the result
+            // from a microtask. resolveApprovalIntent NEVER rejects and NEVER fails open.
+            // Rollout note (reviewed): deferring up to the budget can REORDER routing of rapid-fire votes
+            // vs arrival, but applyResolution's claim() gate keeps it exactly-once + dead-pane-safe
+            // (worst case a clarify, never a wrong-pane resolve) — a benign delta, not a fail-open.
+            if (isApprovalPythonPrimary()) {
+              void resolveApprovalIntent(cleanUtter)
+                .then((parsed) => { if (parsed.intent !== "none") routeApprovalIntent(parsed, cleanUtter, session); })
+                .catch(() => { /* resolveApprovalIntent is fail-closed; never let a stray throw escape the loop */ });
+              return;
+            }
             const parsed = parseApprovalIntentShadowed(cleanUtter);
             if (parsed.intent === "none") return;
             routeApprovalIntent(parsed, cleanUtter, session);

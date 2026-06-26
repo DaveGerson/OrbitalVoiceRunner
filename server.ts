@@ -47,7 +47,7 @@ import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/i
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient } from "./src/memory";
-import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow } from "./src/approvalShadow";
+import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -691,7 +691,9 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
 // the fire-and-forget approval SHADOW recorder. The returned synth client OWNS the shared core, so
 // close()'s `pythonSynthClient?.dispose()` tears the daemon down for both facades.
 function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaemonState?: (state: "python" | "fallback", reason: string) => void): PythonSynthClient | undefined {
-  if (!memoryPythonEnabled) { installApprovalShadow(null); return undefined; }
+  // SHADOW is the only posture with no daemon: there is nothing for Python to be primary OVER, so the
+  // flip is forced OFF on both the disabled and init-failure paths (fail-closed to TS).
+  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); return undefined; }
   try {
     const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), onStateChange: onDaemonState });
     const approval = createPythonApprovalClient(core);
@@ -702,10 +704,18 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
       log: (line) => console.error(line),
       redact: redactSecrets,
     }));
+    // Inc 2 task 2.1 — the FLIP. Default OFF (shadow). JANUS_APPROVAL_PYTHON_PRIMARY=1 makes Python the
+    // PRIMARY approval parser with the TS twin as the fail-closed floor; JANUS_APPROVAL_PRIMARY_TIMEOUT_MS
+    // (optional) tightens/loosens the budget past which a slow daemon falls to the floor (default 600ms).
+    const flipOn = /^(1|true|on|yes)$/i.test((process.env.JANUS_APPROVAL_PYTHON_PRIMARY ?? "").trim());
+    const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
+    setApprovalPythonPrimary(flipOn, flipTimeoutMs);
+    if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
     return synthFacadeOverCore(core);
   } catch (e) {
     console.error("[memory] python daemon client init failed (continuing on fallback):", e);
     installApprovalShadow(null);
+    setApprovalPythonPrimary(false);
     return undefined;
   }
 }
