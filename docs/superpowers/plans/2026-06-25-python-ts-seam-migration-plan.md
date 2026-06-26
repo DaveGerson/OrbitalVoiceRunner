@@ -22,7 +22,7 @@ brainstorm-gated.
   (shadow)          (flip)             (metrics-gated, deferred)
   ship this week    after clean        ├─ retire twin (fallback≈0)
   no dependency     shadow window      ├─ breaker reducer [F5]   ┐
-  ~zero risk        audible degrade    ├─ full contract test [F6]├ opportunistic
+  ~zero risk        observable degrade ├─ full contract test [F6]├ opportunistic
                     Windows live-CI    └─ latency partition [F-HOL]┘
        │
        └────────────────────────────────────────────▶ INC 4
@@ -84,14 +84,14 @@ F6 (envelope + single-source version; contract test deferred) · F9 (sweep + sha
 ## Increment 2 — "Take the dependency"
 
 **Goal:** Flip Python → primary; the TS twin becomes the fail-closed fallback (the floor). Ship the
-trust work that the flip makes load-bearing: audible degradation + observability + Windows live-CI.
+trust work that the flip makes load-bearing: observable degradation + observability + Windows live-CI.
 
 **Entry gate:** Increment 1 merged **and** shadow has run green over an agreed window (length/volume
 set by the operator once real traffic exists). Fallback-rate observable.
 
 **Exit gate (merge gate on the flip PR):** **"twin present + fail-closed verified + degradation
-audible."** Plus the standing green battery (lint/complexity/unit/e2e) and the new live-spawn
-Windows CI smoke passing.
+observable (structured log + warm-up-immune fallback-rate in `health.memory.daemon`)."** Plus the
+standing green battery (lint/complexity/unit/e2e) and the new live-spawn Windows CI smoke passing.
 
 ### Task list
 
@@ -99,21 +99,23 @@ Windows CI smoke passing.
 |---|---|---|---|
 | 2.1 | **Flip to primary.** Python answer is the one acted on; TS twin invoked as fallback on unavailable/timeout/breaker-open/version-mismatch. Twin **NOT deleted** — it is the floor; no separate shim. | F3 | Reviewer signs: floor returns conservative intent (clarify, no auto-resolve) on Python-unavailable; fail-**closed**, never fail-stale/open. |
 | 2.2 | **Observability WS push.** Emit a daemon-state frame on every transition + breaker open/close (reuse `broadcast()`); visual degradation badge; fallback-rate counter (the metric Inc 3 retire gates on). | F8 | Don't over-debounce — a flapping daemon *is* the status. |
-| 2.3 | **Audible degradation (the product law).** Earcon + Kitchen Radio narration on any flip to fallback ("Chef — voice brain on backup"). Visual badge is insufficient for eyes-off. | F8 | UX_BRIEF Principle 7 + #1 anti-pattern. Merge-blocking. |
+| 2.3 | **Observable degradation (backend signal).** Structured transition log + warm-up-immune fallback-rate counter in `health.memory.daemon` on any flip to fallback (no earcon, no narration). The signal feeds the flip/retire decisions, not an operator-facing cue. | F8 | Warm-up-immune so cold-start fallbacks don't poison the rate. |
 | 2.4 | **Windows reliability.** Discovery failures advance `candIndex` **without** spending the breaker budget; live-spawn Windows CI smoke (boot real daemon, assert pong); interpreter pin on top. | F7 | Removes both Windows cold-start failure paths; stops silent CI regression. |
 
 ### Per-finding dispositions absorbed
 
-F3 (floor = retained twin, verify-at-flip, no separate shim) · F8 (observability push + audible
-degradation) · F7 (discovery ≠ breaker budget + live Windows CI smoke).
+F3 (floor = retained twin, verify-at-flip, no separate shim) · F8 (observability push + observable
+degradation — structured log + warm-up-immune fallback-rate in `health.memory.daemon`) · F7
+(discovery ≠ breaker budget + live Windows CI smoke).
 
 ### Risk notes
 
 - **Breaker accounting is safety-sensitive (2.4).** Changing what counts toward the breaker touches
   the floor's availability. Mitigation: discovery-failure exemption is surgical; covered by the new
   Windows live-CI smoke + (if landed) the deferred F5 reducer tests.
-- **Debounce vs. honesty (2.2/2.3).** Too much debounce hides a flapping daemon (violates the law);
-  too little spams the Radio. Tune to "every real transition is audible, transients don't chatter."
+- **Debounce vs. honesty (2.2/2.3).** Too much debounce hides a flapping daemon — a degrading
+  machine *is* the status; too little spams the transition log. Tune so every real transition is
+  logged/counted and transients don't chatter; keep the fallback-rate counter warm-up-immune.
 - **Flip is the first real user-risk moment.** This is why 2.1–2.4 are a single merge gate — none
   ships without the others.
 
@@ -172,7 +174,7 @@ dedicated brainstorm has scoped the first brain consumer.
 |---|---|---|
 | Dual-maintenance window (two-language tables) | 1→3 | Bounded by the metrics-gated retire; any semantics change lands both sides + re-runs the sweep. |
 | Behavior freeze canonizes a TS bug | 1 | Deliberate; corrections are a separate post-parity decision. |
-| Breaker stays timing-coupled through the flip | 1→2 | Shadow can't break the user; flip's audible degradation surfaces flapping; F5 reducer available if metrics demand. |
+| Breaker stays timing-coupled through the flip | 1→2 | Shadow can't break the user; flip's observable degradation (structured transition log + fallback-rate counter) surfaces flapping; F5 reducer available if metrics demand. |
 | "Agreed shadow window" unset | 1→2 | Set by operator once Inc 1 lands and real traffic exists — gated on data, not guessed. |
 
 ---
@@ -198,7 +200,7 @@ dedicated brainstorm has scoped the first brain consumer.
 
 - `seam: flip parseApprovalIntent Python→primary, TS twin→fail-closed floor` — no separate shim; twin is the floor. *(Inc 2)*
 - `seam: observability WS push + fallback-rate counter + degradation badge` — state frame on every transition + breaker open/close. *(Inc 2)*
-- `seam: audible degradation — earcon + Kitchen Radio narration on flip to fallback` — UX Principle 7; merge-blocking. *(Inc 2)*
+- `seam: observable degradation — structured transition log + warm-up-immune fallback-rate in health.memory.daemon on flip to fallback` — no earcon, no narration. *(Inc 2)*
 - `seam: Windows reliability — discovery≠breaker budget + live-spawn Windows CI smoke` — boot real daemon, assert pong; interpreter pin. *(Inc 2)*
 
 **Increment 3 — Retire + harden (deferred, metrics-gated)**
@@ -234,10 +236,10 @@ dedicated brainstorm has scoped the first brain consumer.
    ┌─────────────────────────────────────────────────┐     │ NOT wait on Inc 2/3
    │ INCREMENT 2 · TAKE THE DEPENDENCY (the flip)     │     │
    │   2.1 flip→primary (twin = fail-closed floor)    │     │
-   │   2.2 observability push   2.3 AUDIBLE degrade   │     │
+   │   2.2 observability push   2.3 OBSERVABLE degrade│     │
    │   2.4 Windows live-CI + discovery≠breaker        │     │
    │   MERGE GATE: twin present + fail-closed +       │     │
-   │               degradation audible                │     │
+   │               degradation observable             │     │
    └─────────────────────────────────────────────────┘     │
                  │ fallback-rate ≈ 0 (metrics)              │
                  ▼                                          │

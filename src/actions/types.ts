@@ -287,6 +287,12 @@ export interface ActionContext {
    *  Wired by the server on the REST surface; absent on voice/test paths, where get_health omits/zeros
    *  the shadow field. Read-only — additive, never gates a decision. */
   approvalShadowStats?: () => ShadowStats | null;
+  /** Inc 2 task 2.3 observability: snapshot of the cumulative daemon DEGRADATION counters
+   *  (transitions / msInFallback / currentlyFallback), or null when no tracker is wired. This is the
+   *  POST-first-up, warm-up-immune retire-gate metric — distinct from memorySynthesizerState (the
+   *  instantaneous read). Wired by the server; absent on voice/test paths, where get_health reports
+   *  memory.daemon as null. Read-only — additive, never gates a decision. */
+  daemonStateStats?: () => { transitions: number; msInFallback: number; currentlyFallback: boolean } | null;
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;

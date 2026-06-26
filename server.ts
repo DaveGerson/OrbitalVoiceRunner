@@ -46,7 +46,7 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
+import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient } from "./src/memory";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
@@ -1124,10 +1124,19 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
   // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).
   // Returns the memory service AND the python client (close() disposes the latter).
+  // Inc 2 task 2.3: the OBSERVABLE-DEGRADATION accumulator (warm-up-immune; the retire-gate metric).
+  // Declared just before the subsystem so the daemon_state callback can feed it every transition.
+  const daemonTracker = createDaemonStateTracker();
   const { memory, pythonSynthClient } = createMemorySubsystem(store, (state, reason) => {
     // Inc 2 task 2.2: fan out the daemon up/down transition as an additive, fire-and-forget WS frame.
     // Belt-and-suspenders (emitState already swallows throws): nothing the operator SEES depends on this.
     try { broadcast({ type: "daemon_state", state, reason }); } catch { /* best-effort observability frame */ }
+    // Inc 2 task 2.3: structured transition log + degradation accounting. Same best-effort posture as the
+    // broadcast above — must NEVER throw into the daemon path (nothing the operator sees depends on it).
+    try {
+      console.error(`[synth] daemon_state ${state} (${reason})`);
+      daemonTracker.onTransition(state);
+    } catch { /* best-effort observability accounting */ }
   });
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
@@ -1683,6 +1692,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       // getApprovalShadow() is the process-wide singleton (works on REST/session-null AND voice);
       // stats() returns a fresh copy — read-only, additive, never gates a decision.
       approvalShadowStats: () => getApprovalShadow()?.stats() ?? null,
+      // Inc 2 task 2.3 observability: the cumulative, warm-up-immune daemon-degradation counters for
+      // get_health (transitions / msInFallback / currentlyFallback). Distinct from synthesizerState
+      // (the instantaneous read) — this is the POST-first-up retire-gate metric. Read-only, additive.
+      daemonStateStats: () => daemonTracker.stats(),
       // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,

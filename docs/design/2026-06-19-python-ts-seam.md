@@ -113,8 +113,8 @@ from the critical path to the FIRST merge; they return at the **flip**, where th
    envelope split + single-source `WIRE_VERSION`; port `parseApprovalIntent` **in shadow**; boundary
    golden-master sweep; drop `recipeApply`, keep `voiceAckGate` in TS (+ regression test).
 2. **Take the dependency** (after a clean shadow window) — flip to primary (twin = fail-closed
-   floor); observability push + **audible** degradation; discovery≠breaker-budget + live Windows CI
-   smoke. Merge gate: "twin present + fail-closed verified + degradation audible."
+   floor); observability push + **observable** degradation; discovery≠breaker-budget + live Windows CI
+   smoke. Merge gate: "twin present + fail-closed verified + degradation observable."
 3. **Retire + harden** (deferred, metrics-gated) — retire the twin; then *opportunistically* breaker
    reducer + char tests, full contract test, latency-class partition.
 4. **The brain** (brainstorm-gated) — greenfield agent/planning logic born in Python on the proven
@@ -132,7 +132,7 @@ from the critical path to the FIRST merge; they return at the **flip**, where th
 | `F6` | Envelope split + single-source version now; contract test deferred | 1 / 3 |
 | `F9` | Boundary sweep + shadow-compare; retire twin only when both green | 1→3 |
 | `F3` | Floor = retained twin; verify-at-flip gate; no separate shim | 2 |
-| `F8` | Observability push + audible degradation | 2 |
+| `F8` | Observability push + observable degradation (structured log + warm-up-immune fallback-rate in `health.memory.daemon`) | 2 |
 | `F7` | Discovery ≠ breaker budget + live Windows CI smoke | 2 |
 | `F5` | Breaker reducer + char tests — DEFER (opportunistic) | 3 |
 | `F-HOL` | Latency-class partition — DEFER | 3 |

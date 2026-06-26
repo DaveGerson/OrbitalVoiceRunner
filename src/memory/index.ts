@@ -9,6 +9,7 @@ export { BreadcrumbRing } from "./breadcrumbs";
 export * from "./types";
 export * from "./pythonClient";
 export { createPythonApprovalClient, type PythonApprovalClient } from "./approvalClient";
+export { createDaemonStateTracker, type DaemonStateTracker, type DaemonStateStats } from "./daemonStateTracker";
 
 /** Latest-wins predicate (invariant I3): a brief is only injectable if its pane is still the focus. */
 export function briefIsForActivePane(briefActivePaneId: string | null, currentActivePaneId: string | null): boolean {

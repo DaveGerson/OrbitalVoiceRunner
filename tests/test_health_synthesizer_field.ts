@@ -58,3 +58,31 @@ test("get_health shadow is null when the getter is absent (default-safe)", () =>
   const res: any = getHealth.handler({}, baseCtx());
   assert.equal(res.output.memory.shadow, null);
 });
+
+// ── Inc 2 task 2.3: the additive `daemon` degradation health block ───────────────────────────────────
+
+test("get_health surfaces the daemon degradation stats from the getter (additive)", () => {
+  const res: any = getHealth.handler({}, baseCtx({
+    daemonStateStats: () => ({ transitions: 2, msInFallback: 400, currentlyFallback: false }),
+  }));
+  assert.deepEqual(res.output.memory.daemon, { transitions: 2, msInFallback: 400, currentlyFallback: false });
+  // additivity proof: surfacing daemon must NOT perturb the existing synthesizer or shadow fields
+  assert.equal(res.output.memory.synthesizer, "fallback");
+  assert.equal(res.output.memory.shadow, null);
+});
+
+test("get_health surfaces an OPEN daemon fallback window (currentlyFallback=true)", () => {
+  const res: any = getHealth.handler({}, baseCtx({
+    daemonStateStats: () => ({ transitions: 1, msInFallback: 1200, currentlyFallback: true }),
+  }));
+  assert.equal(res.output.memory.daemon.currentlyFallback, true);
+  assert.equal(res.output.memory.daemon.transitions, 1);
+});
+
+test("get_health daemon is null when the getter is absent (default-safe)", () => {
+  const res: any = getHealth.handler({}, baseCtx());
+  assert.equal(res.output.memory.daemon, null);
+  // and it must not have perturbed the other memory fields
+  assert.equal(res.output.memory.synthesizer, "fallback");
+  assert.equal(res.output.memory.shadow, null);
+});

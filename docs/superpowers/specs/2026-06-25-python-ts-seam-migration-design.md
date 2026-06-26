@@ -25,7 +25,7 @@ The migration philosophy survives the review intact: **Python owns decisions; TS
   floor; it is retired *last*, only after the Python side is proven, never deleted at cutover.
 - **First target:** `parseApprovalIntent` (the voice-approval parser) — not `recipeApply` (the
   gate) or `voiceAckGate` (pure-but-hot). Both of those stay TS permanently.
-- **Sequencing:** the trust work (audible degradation, fail-closed verification, Windows live-CI)
+- **Sequencing:** the trust work (observable degradation, fail-closed verification, Windows live-CI)
   is honored, but sequenced to **Increment 2 (the flip)**, not demanded before the first merge.
 
 **Founder principle driving this:** build a product that makes developers faster and more capable;
@@ -36,7 +36,7 @@ where it bites, not used as an upfront gate.**
 
 ## 2 · The reframe (the logjam-breaker)
 
-The review left a pile of "fix before spec" blockers — observability push, audible degradation,
+The review left a pile of "fix before spec" blockers — observability push, observable degradation,
 Windows live-CI, the fail-closed shim, the breaker reducer extraction, latency-class partitioning.
 Read literally, every one of those is a precondition to the first merge, and the first merge never
 happens.
@@ -54,8 +54,9 @@ In shadow, the Python side is a **silent observer**: it receives the same input,
 answer, and we record `match / mismatch` against the authoritative TS answer. Nothing the operator
 sees or hears depends on Python being up. So the death of the daemon is invisible *and harmless* —
 which is the only context where "invisible" is acceptable. The moment Python's answer can change
-what the operator experiences (the flip), invisibility becomes the cardinal sin again, and the
-audible-degradation + fail-closed work becomes a hard merge gate. That is Increment 2.
+what the operator experiences (the flip), every transition must become **observable** — logged +
+counted — and the observable-degradation + fail-closed work becomes a hard merge gate. That is
+Increment 2.
 
 ---
 
@@ -169,7 +170,7 @@ The two rejected targets fail the litmus and stay TS **permanently** (§7).
    TS authoritative;   Python primary;     metrics-gated:      greenfield agent
    Python observes;    TS twin = fail-     remove the twin     logic born in
    log/count diffs.    closed floor;       once fallback≈0;    Python on the
-   No dependency.      audible degrade.    then opportunistic  proven seam.
+   No dependency.      observable degrade. then opportunistic  proven seam.
                                            hardening.
 ```
 
@@ -179,7 +180,7 @@ The two rejected targets fail the litmus and stay TS **permanently** (§7).
 - **FLIP (Increment 2).** Python becomes the answer the system acts on; TS becomes the fail-closed
   fallback invoked on Python-unavailable / timeout / breaker-open / version-mismatch. The fallback
   is **fail-closed** (returns the conservative intent — `clarify` / no auto-resolve — never reuses a
-  stale answer, never fail-opens to `approve`). The degradation is **spoken** (§8).
+  stale answer, never fail-opens to `approve`). The degradation is **observable** — logged + counted (§8).
 - **RETIRE (Increment 3).** When the observability counter shows fallback-rate ≈ 0 over a window,
   remove the TS twin. Then, and only if a second hot consumer or real metrics demand it, do the
   deferred hardening (breaker reducer, full contract test, latency partition).
@@ -250,20 +251,27 @@ Two non-negotiables, both activated at the **flip** (Increment 2), both merge-bl
   floor must be auditably **fail-closed, never fail-stale** (no reusing the last answer) and never
   fail-open. A reviewer signs that the floor rejects-not-approves on Python-unavailable. There is no
   separate shim to drift — the twin *is* the floor.
-- **Audible degradation (the product law).** Per `docs/orbital-kitchen/UX_BRIEF.md` Principle 7
-  ("speak the consequence, confirm out loud") and §5's #1 anti-pattern ("silent autonomy — act with
-  nothing said/shown"): a daemon flipping `python → fallback` **is itself a silent state change** —
-  the cardinal sin in a hands-free, calmly-trust-the-swarm product. So every flip to fallback must
-  **earcon + narrate into the Kitchen Radio** ("Chef — voice brain on backup, every plate gets a
-  taste"), not merely log or badge. The visual degradation badge is necessary but **insufficient**
-  for an eyes-off operator; the audible cue is the requirement. Observability is a WS push on every
-  transition + breaker open/close, with a fallback-rate counter (the metric the retire decision
-  gates on). Don't debounce so hard it hides a flapping daemon — a degrading machine *is* the status.
+- **Observable degradation (the backend signal).** Every `python → fallback` transition must be
+  **logged (structured) and counted** — not narrated, not earcon'd. The operator is *not*
+  interrupted on a failover. Rationale: (a) UX_BRIEF's "silent autonomy is the cardinal sin" governs
+  **agents acting unannounced**, not infrastructure failing over — an earcon here conflates
+  AGENT autonomy with INFRA failover; (b) the TS twin is a **faithful, temporary floor** (retired in
+  Inc 3), so the operator-visible delta on a flip to fallback is ~nil; (c) a fail-closed fallback
+  yields `clarify` instead of an auto-resolve, so it **already speaks for itself** — the voice asks
+  the operator to confirm. What we need is a BACKEND signal for the *flip* and *retire* decisions,
+  not an operator-facing cue. Observability is a WS push on every transition + breaker open/close,
+  with a **warm-up-immune fallback-rate counter** in `health.memory.daemon` (the metric the retire
+  decision gates on; warm-up-immune so the unavoidable cold-start fallbacks don't poison the rate).
+  Don't debounce so hard it hides a flapping daemon — a degrading machine *is* the status.
 
 > **Note on shadow (Increment 1):** in shadow, Python's death is invisible *and harmless* (TS is
-> authoritative; nothing the operator sees depends on Python). So the audible-degradation law does
-> **not** gate Increment 1 — it gates the flip, the instant Python can change what the operator
-> experiences. This is the whole point of the reframe.
+> authoritative; nothing the operator sees depends on Python). So the observable-degradation
+> contract does **not** gate Increment 1 — it gates the flip, the instant Python can change what the
+> operator experiences. This is the whole point of the reframe.
+>
+> **Note on validation harness:** the `?mock=1` Playwright harness is **client-only** — it cannot
+> reach the server-side shadow tap or the daemon transition signal. Transition/fallback validation
+> is therefore via the **live smoke / server-drive**, not the UI mock.
 
 ---
 
@@ -291,14 +299,15 @@ Implementation-grade. Exit gate: `tsc` + complexity + unit + mock-e2e green. **N
 
 1. **Flip Python → primary [F3].** TS twin becomes the fail-closed fallback (NOT deleted — the twin
    IS the floor; no separate shim).
-2. **Observability + audible degradation [F8].** WS push of daemon state on every transition +
-   breaker open/close; visual badge; **earcon + Kitchen Radio narration** of any flip to fallback;
-   fallback-rate counter.
+2. **Observability + observable degradation [F8].** WS push of daemon state on every transition +
+   breaker open/close; visual badge; **structured transition log + warm-up-immune fallback counter
+   in `health.memory.daemon`** for any flip to fallback (no earcon, no narration).
 3. **Windows reliability [F7].** Discovery failures advance `candIndex` **without** counting against
    the breaker budget; a **live-spawn Windows CI smoke** that boots the real daemon and asserts a
    pong; interpreter pin layered on top.
 
-**Merge gate on the flip PR:** "twin present + fail-closed verified + degradation audible."
+**Merge gate on the flip PR:** "twin present + fail-closed verified + degradation observable (logged
++ fallback-rate in health)."
 
 ### Increment 3 — "Retire + harden" (deferred · metrics-gated · directional)
 
@@ -326,7 +335,7 @@ Greenfield agent / planning logic born in Python on the now-proven seam — the 
 | `F6` | Protocol/schema drift | Envelope split + single-source version **now**; contract test **deferred** | 1 / 3 |
 | `F9` | Parity oracle | Boundary sweep + shadow-compare; retire twin only when **both** green | 1→3 |
 | `F3` | Delete removes the floor | **Floor = retained twin**; verify-at-flip gate; **no separate shim** | 2 |
-| `F8` | Degradation invisible | Observability push + **audible** degradation | 2 |
+| `F8` | Degradation invisible | Observability push + **observable** degradation (structured log + warm-up-immune fallback-rate in `health.memory.daemon`) | 2 |
 | `F7` | Windows cold-start trips breaker | Discovery ≠ breaker budget + **live Windows CI smoke** | 2 |
 | `F5` | Breaker under-tested | Breaker reducer + char tests — **DEFER** (opportunistic) | 3 |
 | `F-HOL` | Head-of-line blocking | Latency-class partition — **DEFER** | 3 |
@@ -362,8 +371,8 @@ not the thing to bet the cutover *on*.
   live-daemon CI assertion, for payload-shape drift.
 - **Breaker reducer + characterization tests deferred to Inc 3 [F5].** The breaker stays as-is
   (timing-coupled, happy-path-tested) through the flip. Acceptable because shadow can't break the
-  user and the flip's audible degradation surfaces flapping; revisited only if a 2nd hot consumer or
-  real metrics demand it.
+  user and the flip's observable degradation (structured transition log + fallback-rate counter)
+  surfaces flapping; revisited only if a 2nd hot consumer or real metrics demand it.
 - **Latency-class partition deferred [F-HOL].** Until a second *hot* op shares the daemon, a single
   serial loop can't starve approvals (only the cold synth shares it, and only in shadow at Inc 1).
   The partition lands in Inc 3 if/when a real same-daemon contention appears.
