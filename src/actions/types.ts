@@ -25,6 +25,7 @@ import type {
 import type { PendingActionStore } from "../pendingActions";
 import type { JanusStore } from "../store/sqliteStore";
 import type { PaneModeResult } from "../applyPaneMode";
+import type { ShadowStats } from "../approvalShadow";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -281,6 +282,11 @@ export interface ActionContext {
    *  available + the breaker is closed, else "fallback"). Wired by the server on the REST surface;
    *  absent on voice/test paths, where get_health reports the safe default "fallback". */
   memorySynthesizerState?: () => "python" | "fallback";
+  /** Inc 2 task 2.2 observability: snapshot of the approval SHADOW diff counters (compared/match/
+   *  mismatch/missing), or null when no recorder is installed (daemon off / memoryPythonEnabled false).
+   *  Wired by the server on the REST surface; absent on voice/test paths, where get_health omits/zeros
+   *  the shadow field. Read-only — additive, never gates a decision. */
+  approvalShadowStats?: () => ShadowStats | null;
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;

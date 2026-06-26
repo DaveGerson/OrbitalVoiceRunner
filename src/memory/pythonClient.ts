@@ -73,6 +73,9 @@ export interface PythonModuleClientOpts {
   backoffBaseMs?: number; backoffMaxMs?: number;
   // Task 5 breaker knobs (declared now so the type is stable across tasks):
   breakerThreshold?: number; breakerWindowMs?: number; cooldownMs?: number;
+  // Inc 2 task 2.2 observability: best-effort transition callback fired ONLY on a real python<->fallback
+  // flip (debounced). Absent ⇒ no-op. Never influences a decision/return/timing; throws are swallowed.
+  onStateChange?: (state: "python" | "fallback", reason: string) => void;
 }
 
 /** Back-compat alias — the synth facade and the generic core take the same options. */
@@ -160,6 +163,7 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
     spawnImpl, existsSync, platform, env, log, requestExpiryMs, pingTimeoutMs,
     backoffBaseMs, backoffMaxMs, breakerThreshold, breakerWindowMs, cooldownMs,
   } = resolveOpts(opts);
+  const onStateChange = opts.onStateChange; // Inc 2 task 2.2: observability transition callback (optional)
   let consecutiveFails = 0;
   let firstFailAt = 0;
   let breakerUntil = 0;          // epoch ms; 0 = breaker closed
@@ -172,6 +176,10 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
 
   let child: any = null;
   let ready = false;             // a ping has ponged with a matching wire version
+  // Inc 2 task 2.2: last emitted observability state (debounce). Seeded "fallback" = the system's TRUE
+  // initial posture (TS authoritative until the daemon pongs), so a never-up daemon stays SILENT and
+  // only a genuine python<->fallback FLIP emits — the frame stream is transitions, not a boot artifact.
+  let lastState: "python" | "fallback" = "fallback";
   let disposed = false;
   let buf = "";
   let seq = 0;
@@ -187,11 +195,21 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
     pending.clear();
   }
   function clearPingTimer() { if (pingTimer) { clearTimeout(pingTimer); pingTimer = null; } }
+  /** Inc 2 task 2.2 observability: fire onStateChange ONLY on a real flip. Computes state EXACTLY as
+   *  state() (`ready && child ? "python" : "fallback"`), debounces on lastState, and swallows throws so
+   *  a buggy callback can NEVER escape into the daemon state machine. Best-effort, fire-and-forget. */
+  function emitState(reason: string) {
+    const s: "python" | "fallback" = ready && child ? "python" : "fallback";
+    if (s === lastState) return;
+    lastState = s;
+    try { onStateChange?.(s, reason); } catch { /* best-effort: a throwing callback must never escape */ }
+  }
 
   function handlePong(obj: any) {
     if (PingResponseSchema.safeParse(obj).success) {
       ready = true; discovering = false; attempt = 0; consecutiveFails = 0; firstFailAt = 0; clearPingTimer();
       log(`[synth] ping ok (synthVersion=${obj?.synthVersion ?? "?"})`);
+      emitState("ping-ok"); // observability up-edge: state resolves to "python" (debounced)
     } else {
       log(`[synth] ping rejected (v/shape mismatch)`); // the ping-timeout drives the candidate advance
     }
@@ -221,6 +239,7 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
     clearPingTimer();
     try { child?.kill(); } catch { /* already dead */ }
     ready = false; child = null;
+    emitState(reason); // observability down-edge: child nulled ⇒ state resolves to "fallback" (debounced)
     settleAll(null);
     log(`[synth] daemon down (${reason})`);
     if (discovering) candIndex = (candIndex + 1) % Math.max(1, cands.length); // try the next interpreter

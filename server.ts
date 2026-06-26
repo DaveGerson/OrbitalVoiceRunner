@@ -47,7 +47,7 @@ import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/i
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
-import { createApprovalShadowRecorder, installApprovalShadow } from "./src/approvalShadow";
+import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -690,10 +690,10 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
 // daemon core and BOTH typed facades over it (synth + approval — one multiplexed daemon), and installs
 // the fire-and-forget approval SHADOW recorder. The returned synth client OWNS the shared core, so
 // close()'s `pythonSynthClient?.dispose()` tears the daemon down for both facades.
-function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean): PythonSynthClient | undefined {
+function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaemonState?: (state: "python" | "fallback", reason: string) => void): PythonSynthClient | undefined {
   if (!memoryPythonEnabled) { installApprovalShadow(null); return undefined; }
   try {
-    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), onStateChange: onDaemonState });
     const approval = createPythonApprovalClient(core);
     // SHADOW (task 1.6): Python parses each approval utterance alongside the AUTHORITATIVE TS result,
     // fire-and-forget — counted, never acted on. Python being slow/absent/wrong is invisible + harmless.
@@ -973,7 +973,7 @@ function listenServer(
 // client so startServer's close() can dispose the daemon. `manager`, `redactSecrets`,
 // `createMemoryService`, `clampMemorySynthTimeoutMs`, and `createPythonSynthClientOrUndefined` are
 // all module-scope; only the connection-bound `store` is injected.
-function createMemorySubsystem(store: JanusStore | null): {
+function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state: "python" | "fallback", reason: string) => void): {
   memory: ReturnType<typeof createMemoryService>;
   pythonSynthClient: PythonSynthClient | undefined;
 } {
@@ -995,7 +995,7 @@ function createMemorySubsystem(store: JanusStore | null): {
   // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
   // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
   const memorySynthTimeoutMs = clampMemorySynthTimeoutMs(manager.settings.advanced?.memorySynthTimeoutMs);
-  const pythonSynthClient: PythonSynthClient | undefined = createPythonSynthClientOrUndefined(memoryPythonEnabled);
+  const pythonSynthClient: PythonSynthClient | undefined = createPythonSynthClientOrUndefined(memoryPythonEnabled, onDaemonState);
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -1124,7 +1124,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
   // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).
   // Returns the memory service AND the python client (close() disposes the latter).
-  const { memory, pythonSynthClient } = createMemorySubsystem(store);
+  const { memory, pythonSynthClient } = createMemorySubsystem(store, (state, reason) => {
+    // Inc 2 task 2.2: fan out the daemon up/down transition as an additive, fire-and-forget WS frame.
+    // Belt-and-suspenders (emitState already swallows throws): nothing the operator SEES depends on this.
+    try { broadcast({ type: "daemon_state", state, reason }); } catch { /* best-effort observability frame */ }
+  });
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
@@ -1675,6 +1679,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       releaseStopAll,
       isFrozen: () => coreState.frozen,
       memorySynthesizerState: () => memory.service.synthesizerState(),
+      // Inc 2 task 2.2 observability: snapshot the approval shadow diff counters for get_health.
+      // getApprovalShadow() is the process-wide singleton (works on REST/session-null AND voice);
+      // stats() returns a fresh copy — read-only, additive, never gates a decision.
+      approvalShadowStats: () => getApprovalShadow()?.stats() ?? null,
       // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,
