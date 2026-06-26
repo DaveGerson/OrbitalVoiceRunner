@@ -73,14 +73,16 @@ function canonical(value: unknown): string {
 }
 
 /** Resolve to the promise's value, or `null` if it has not settled within `ms` (or it rejects). The
- *  underlying promise keeps running — its counters still update — we just stop WAITING for it. The
- *  timer is unref'd so it can never pin the event loop. */
+ *  underlying promise keeps running — its counters still update — we just stop WAITING for it.
+ *  Deliberately NOT unref'd: this timer is short-lived (≤ the flip budget) and is the ONLY thing that
+ *  resolves the race when Python hangs, so it must keep the loop alive until it fires. Unref'ing it let
+ *  `--test-force-exit` beat it in an otherwise-idle test loop (cancelling the test on CI node22); in
+ *  production the loop is always live and a ≤600ms fires-or-clears timer can never pin it. */
 function withTimeout<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (v: T | null) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
     const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, ms);
-    if (typeof (timer as unknown as { unref?: () => void }).unref === "function") (timer as unknown as { unref: () => void }).unref();
     p.then(finish, () => finish(null));
   });
 }
