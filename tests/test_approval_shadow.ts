@@ -110,6 +110,22 @@ describe("createApprovalShadowRecorder", () => {
     await tick();
     assert.equal(rec.stats().missing, 1);
   });
+
+  it("redacts the logged ERROR message too (the .catch path, parity with the mismatch path)", async () => {
+    // A transport/parse error message could conceivably echo the utterance; the error log must run
+    // through the SAME redactor as the mismatch log (single secrets choke-point, both paths).
+    const logs: string[] = [];
+    const rec = createApprovalShadowRecorder({
+      parse: async () => { throw new Error("parse blew up on sk-secret token"); },
+      log: (l) => logs.push(l),
+      redact: (s) => s.replace(/sk-secret/g, "***"),
+    });
+    rec.record("approve sk-secret", { intent: "approve" });
+    await tick();
+    assert.equal(rec.stats().missing, 1);
+    assert.match(logs[0], /error .*\*\*\*/);
+    assert.doesNotMatch(logs[0], /sk-secret/);
+  });
 });
 
 describe("parseApprovalIntentShadowed (authoritative passthrough)", () => {

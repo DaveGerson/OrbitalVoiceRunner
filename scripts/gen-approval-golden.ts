@@ -89,6 +89,9 @@ const GRID: string[] = [
   "approve the npm install command", "reject the docker deploy",
   "approve the first one and reject the second", "confirm the build step",
   "run the migration script please", "approve the test suite one",
+  // both-keys hints (ordinal AND named fragment, single verb -> no collision): locks the
+  // targetHint key-set for the shape the FLIP path depends on (adversarial-review coverage gap).
+  "approve the first npm install", "reject the third migration script",
 
   // ── apostrophe / casing / punctuation normalization ─────────────────────────
   "Don't run it", "DON'T GO", "Approve!", "  reject  ", "yes, approve the deploy",

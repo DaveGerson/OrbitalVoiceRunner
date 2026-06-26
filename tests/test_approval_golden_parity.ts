@@ -36,6 +36,16 @@ describe("approval golden-master parity (TS regression lock)", () => {
     assert.ok(vectors.length >= 100, `expected a dense grid, got ${vectors.length} vectors`);
   });
 
+  it("locks at least one BOTH-KEYS targetHint (ordinal AND fragment) — the FLIP-path shape", () => {
+    // Adversarial-review coverage gap: the parity grid must freeze the key-set for a hint carrying
+    // BOTH an ordinal and a named fragment (e.g. "approve the first npm install"). Without a vector
+    // of this shape, a port that emitted only one of the two keys could pass parity undetected.
+    const bothKeys = vectors.filter(
+      (v) => v.expected?.targetHint?.ordinal !== undefined && !!v.expected?.targetHint?.fragment,
+    );
+    assert.ok(bothKeys.length >= 1, "no ordinal+fragment vector in the grid — regenerate with one");
+  });
+
   it("parseApprovalIntent reproduces every frozen vector exactly", () => {
     const mismatches: string[] = [];
     for (const v of vectors) {

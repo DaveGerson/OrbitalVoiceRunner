@@ -151,3 +151,49 @@ test("absent onStateChange is a safe no-op across ping + exit", async () => {
   assert.equal(core.available(), false);
   core.dispose();
 });
+
+// ── teardown-trigger robustness (adversarial-review nits: double-onDown + oversized line) ──────────
+
+test("a child firing BOTH 'error' and 'exit' counts as ONE failure (no breaker double-count, one respawn)", async () => {
+  // A real OS commonly fires BOTH 'error' (ENOENT/EPIPE) and 'exit' for a single failed child. Before
+  // the generation guard that ran onDown TWICE: consecutiveFails double-incremented (premature breaker)
+  // and a second scheduleRespawn leaked the first timer -> an orphaned, stdin-blocked python process.
+  // With breakerThreshold=2, a SINGLE death must NOT trip the breaker — proving exactly one count.
+  const children: FakeChild[] = [];
+  const logs: string[] = [];
+  const core = createPythonModuleClient({
+    moduleDir: "/repo/src/memory", repoRoot: "/repo", existsSync: () => true,
+    platform: "linux", pingTimeoutMs: 1000, backoffBaseMs: 5, backoffMaxMs: 5,
+    breakerThreshold: 2, breakerWindowMs: 100_000, cooldownMs: 100_000,
+    spawnImpl: (() => { const c = new FakeChild(); children.push(c); return c; }) as any,
+    log: (l) => logs.push(l),
+  });
+  await tick();
+  assert.equal(children.length, 1, "eager pre-warm spawned exactly once");
+  children[0].reply(PONG); // up
+  await tick();
+  children[0].emit("error"); // the pathological pair, back-to-back (same tick)
+  children[0].emit("exit");
+  await tick();
+  await new Promise((r) => setTimeout(r, 25)); // let the single scheduled backoff respawn fire
+  assert.ok(!logs.some((l) => /circuit breaker OPEN/.test(l)),
+    "one death must count once: a threshold-2 breaker must stay CLOSED");
+  assert.equal(children.length, 2, "exactly one respawn (no orphaned second child)");
+  core.dispose();
+});
+
+test("an oversized un-terminated stdout line tears the child down (oversized-line) — OOM backstop", async () => {
+  const child = new FakeChild();
+  const spy: Spy = [];
+  const core = makeCore(child, (s, r) => { spy.push([s, r]); });
+  await tick();
+  child.reply(PONG); // up -> "python"
+  await tick();
+  // a runaway line with NO newline, > MAX_LINE_BYTES (1 MB): the drain loop finds no '\n', the
+  // residual exceeds the cap, and the child is torn down (fallback is always the correct floor).
+  child.stdout.emit("data", Buffer.from("x".repeat(1_100_000)));
+  await tick();
+  assert.deepEqual(spy, [["python", "ping-ok"], ["fallback", "oversized-line"]]);
+  assert.equal(core.available(), false);
+  core.dispose();
+});

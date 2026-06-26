@@ -1,7 +1,7 @@
 {
   "_generator": "scripts/gen-approval-golden.ts",
   "_parser": "src/approvalIntent.ts :: parseApprovalIntent",
-  "count": 171,
+  "count": 173,
   "vectors": [
     {
       "transcript": "",
@@ -1014,6 +1014,26 @@
         "intent": "approve",
         "targetHint": {
           "fragment": "test suite"
+        }
+      }
+    },
+    {
+      "transcript": "approve the first npm install",
+      "expected": {
+        "intent": "approve",
+        "targetHint": {
+          "ordinal": 1,
+          "fragment": "npm install"
+        }
+      }
+    },
+    {
+      "transcript": "reject the third migration script",
+      "expected": {
+        "intent": "reject",
+        "targetHint": {
+          "ordinal": 3,
+          "fragment": "migration script"
         }
       }
     },

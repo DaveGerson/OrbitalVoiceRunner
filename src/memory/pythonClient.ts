@@ -28,6 +28,10 @@ import { z } from "zod";
  *  expiry / daemon-down / dispose). The TYPED FACADES validate the object with their op's schema. */
 export type ModuleResponse = Record<string, unknown> | null;
 
+/** OOM backstop for the stdout line buffer. The protocol is one tiny NDJSON object per line (<1 KB);
+ *  a residual incomplete line past this bound means a wedged/runaway child, so we drop + tear down. */
+const MAX_LINE_BYTES = 1_000_000;
+
 export interface PythonModuleClient {
   /** Send one request for `op` with `payload`; resolves the raw response object, or null on any miss.
    *  NEVER rejects. The caller validates the object against its op-specific schema. */
@@ -248,6 +252,10 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
 
   function scheduleRespawn() {
     if (disposed || !synthDir || cands.length === 0) return;
+    // Never stack respawn timers: clear any pending one before arming a fresh schedule. The
+    // generation guard in wireChildStreams already prevents the double-onDown that used to leak one,
+    // but this keeps "exactly one pending respawn" true under any future call path.
+    if (respawnTimer) { clearTimeout(respawnTimer); respawnTimer = null; }
     const now = Date.now();
     if (firstFailAt === 0 || now - firstFailAt > breakerWindowMs) { firstFailAt = now; consecutiveFails = 0; }
     consecutiveFails++;
@@ -283,17 +291,30 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
 
   /** Wire stdout line-framing + stderr logging + exit/error teardown onto the live child. */
   function wireChildStreams() {
+    // Capture THIS child's identity so every teardown trigger (exit, error, oversized-line) routes
+    // through a single-fire guard: once onDown nulls/replaces `child`, a stale event from the SAME
+    // generation no-ops. A real OS commonly fires BOTH 'error' (ENOENT/EPIPE) and 'exit' for one
+    // failed spawn — without this guard that ran onDown twice (double consecutiveFails → premature
+    // breaker) and overwrote respawnTimer without clearing it → two overlapping respawns → an
+    // orphaned, stdin-blocked python process dispose() never reaps. Generation guard kills all that.
+    const thisChild = child;
+    const down = (reason: string) => { if (child === thisChild) onDown(reason); };
     // Belt-and-suspenders: unref the child so a forgotten dispose() can't pin the event loop.
     // Optional-chained — the fake child in tests has no unref.
-    child.unref?.();
-    child.stdout?.on("data", (d: Buffer) => {
+    thisChild.unref?.();
+    thisChild.stdout?.on("data", (d: Buffer) => {
       buf += d.toString("utf-8");
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) { const line = buf.slice(0, nl); buf = buf.slice(nl + 1); onLine(line); }
+      // A wedged/adversarial child that streams a single un-terminated line would grow `buf`
+      // without bound. After draining every complete line, a too-large RESIDUAL is a runaway line:
+      // drop it and tear the child down (fallback is always correct). The legit protocol is tiny
+      // (<1 KB/line), so MAX_LINE_BYTES is a generous OOM backstop, not a functional limit.
+      if (buf.length > MAX_LINE_BYTES) { buf = ""; down("oversized-line"); }
     });
-    child.stderr?.on("data", (d: Buffer) => log(`[synth:py] ${d.toString("utf-8").trimEnd()}`));
-    child.on("exit", () => onDown("exit"));
-    child.on("error", () => onDown("error"));
+    thisChild.stderr?.on("data", (d: Buffer) => log(`[synth:py] ${d.toString("utf-8").trimEnd()}`));
+    thisChild.on("exit", () => down("exit"));
+    thisChild.on("error", () => down("error"));
   }
 
   /** Arm the handshake deadline and send the ping that validates interpreter+script+version. */

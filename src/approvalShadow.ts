@@ -90,7 +90,9 @@ export function createApprovalShadowRecorder(opts: ApprovalShadowOpts): Approval
         })
         .catch((e: unknown) => {
           stats.missing++;
-          log(`[approval-shadow] error ${e instanceof Error ? e.message : String(e)}`);
+          // Redact like the mismatch log above: a transport/parse error message could conceivably
+          // echo the utterance, and the redactor is the single secrets choke-point for both paths.
+          log(`[approval-shadow] error ${redact(e instanceof Error ? e.message : String(e))}`);
         });
     },
     stats() { return { ...stats }; },
