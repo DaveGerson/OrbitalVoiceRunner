@@ -1032,8 +1032,15 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // resolution is async (await Python, fall to the floor on miss/timeout), so route the result
             // from a microtask. resolveApprovalIntent NEVER rejects and NEVER fails open.
             // Rollout note (reviewed): deferring up to the budget can REORDER routing of rapid-fire votes
-            // vs arrival, but applyResolution's claim() gate keeps it exactly-once + dead-pane-safe
-            // (worst case a clarify, never a wrong-pane resolve) — a benign delta, not a fail-open.
+            // vs arrival, but the reorder lands two SYNCHRONOUS resolveDecision calls on one messageId, and
+            // the atomic claim() gate (pendingApprovals.ts resolveDecision:394-397 / claim:679-692 — durable
+            // SQL `UPDATE...WHERE claimed=0 => changes===1`, single-winner) is ORDER-INDEPENDENT: exactly one
+            // resolve writes, the loser is lost_race/not_found. selectApprovalTarget reads the LIVE entries
+            // post-await and CLARIFIES on ambiguity, so a stale second vote is at worst a not_found no-op or a
+            // clarify — never a double-act or wrong-pane resolve. Benign delta, NOT a fail-open. This is the
+            // same exactly-once invariant locked by tests/test_approvals_wse.ts (two resolves on one id =>
+            // one write) and the resolveDecision/claim() unit locks — a flip-specific test would only
+            // re-exercise the identical synchronous gate (triage: flip-vote-order, accept-as-designed).
             if (isApprovalPythonPrimary()) {
               void resolveApprovalIntent(cleanUtter)
                 .then((parsed) => { if (parsed.intent !== "none") routeApprovalIntent(parsed, cleanUtter, session); })

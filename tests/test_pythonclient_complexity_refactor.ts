@@ -42,6 +42,18 @@ function makeClient(child: FakeChild, over: Record<string, unknown> = {}) {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+/** Poll `pred` every macrotask tick until true or `deadlineMs` elapses. Load-tolerant: proves a
+ *  condition was REACHED without pinning a fixed wall-clock wait (which drifts under scheduler
+ *  jitter). Returns whether the predicate became true before the deadline. */
+async function until(pred: () => boolean, deadlineMs = 2000): Promise<boolean> {
+  const end = Date.now() + deadlineMs;
+  while (Date.now() < end) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return pred();
+}
+
 async function ponged(child: FakeChild) {
   await tick();
   child.reply({ v: 1, ok: true, pong: true, synthVersion: "1.0.0" });
@@ -293,11 +305,16 @@ test("first candidate ping-timeout advances to a second candidate", async () => 
   const children: FakeChild[] = [];
   const client = createPythonSynthClient({
     moduleDir: "/m", repoRoot: "/r", existsSync: () => true, log: () => {},
-    platform: "win32", pingTimeoutMs: 20, backoffBaseMs: 5, backoffMaxMs: 5,
+    // pingTimeoutMs is deliberately wide (200ms): the discovery advance we assert on (line below)
+    // only needs the FIRST child's ping to expire once; an oversized window means the SECOND child
+    // stays alive long enough for reply() to reach it even under heavy scheduler jitter, instead of
+    // self-reaping at its own ping-timeout before the pong lands (the prior 20ms flake).
+    platform: "win32", pingTimeoutMs: 200, backoffBaseMs: 5, backoffMaxMs: 5,
     spawnImpl: (() => { const c = new FakeChild(); children.push(c); return c; }) as any,
   });
-  await new Promise((r) => setTimeout(r, 60));
-  assert.ok(children.length >= 2, "should have spawned a second candidate");
+  // Condition-based wait (no fixed wall-clock bound): prove the first ping-timeout fired and fell
+  // closed by ADVANCING to a second spawn — the real intent of this test.
+  assert.equal(await until(() => children.length >= 2), true, "should have spawned a second candidate");
   children[children.length - 1].reply({ v: 1, ok: true, pong: true, synthVersion: "1.0.0" });
   await tick();
   assert.equal(client.available(), true);
