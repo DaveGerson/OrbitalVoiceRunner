@@ -100,6 +100,21 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
+## Repository Default: Agent Commit + Push Policy
+
+> This section overrides the Conservative default inside the Beads block. The Beads block is
+> issue-tracker scaffolding; git authority is set here.
+
+The default profile for agents on this repo is **team-maintainer-scoped** (not Conservative):
+
+- **In an isolated worktree**, once the full quality gate passes (adversarial review → e2e →
+  loop-until-clean → lint → unit tests → build → smoke where applicable), agents **commit and push
+  to a feature branch** without waiting for explicit approval.
+- **Open a PR** from that branch — the PR is the human review gate.
+- **Direct push to `main` is always prohibited.** Main is reached only via PR merge.
+- **Outside an isolated worktree** (the shared main checkout), fall back to Conservative: report
+  changed files + proposed commands, and wait for approval.
+- An explicit "do not commit / do not push" instruction in the current session still wins.
 
 ## Worktree Isolation (REQUIRED for commit-authorized agents)
 
