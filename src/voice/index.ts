@@ -545,6 +545,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
       try {
         if (!sess) return;
+        // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
+        // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
+        // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
+        memory.service.observeCortexShadow(activeId, Date.now());
         // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
         // synthesizeAsync owns the race + `source` authority and NEVER rejects.
         const brief = await memory.service.synthesizeAsync(activeId, Date.now());

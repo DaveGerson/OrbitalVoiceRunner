@@ -131,3 +131,58 @@ export const ApprovalParseResponseSchema = z.union([
 
 export type WireParsedApproval = z.infer<typeof ParsedApprovalSchema>;
 export type ApprovalParseResponse = z.infer<typeof ApprovalParseResponseSchema>;
+
+// ── cortex.decide op envelope (Inc 4 slice 1, SHADOW) ─────────────────────────────────────────────
+// Request payload: { tiers: MemoryTiers, ctx: CortexCtx, now: number }. Response payload: a curation
+// `decision` (ordered keep/drop/rerank — v1 IDENTITY) + a structured `trace` (the over-document
+// substrate). SHADOW: TS LOGS the trace, never applies the decision. The cortex owns relevance + the
+// char-budget; the synthesizer renders. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
+export interface CortexCtx {
+  activePaneId: string | null;
+  sessionId?: string | null;
+  trigger: string;
+}
+
+export const CortexDecisionSchema = z.object({
+  keep: z.array(z.string()),
+  drop: z.array(z.string()),
+  rerank: z.array(z.string()),
+});
+
+export const CortexTraceSchema = z.object({
+  cortexVersion: z.string(),
+  strategy: z.string(),
+  ruleFired: z.string(),
+  inputs: z.object({
+    activePaneId: z.string().nullable(),
+    sessionId: z.string().nullable().optional(),
+    trigger: z.string().nullable(),
+    tierKeys: z.array(z.string()),
+    tierChars: z.record(z.string(), z.number()),
+  }).passthrough(),
+  output: z.object({
+    orderedKeep: z.array(z.string()),
+    dropped: z.array(z.string()),
+  }).passthrough(),
+  ts: z.number(),
+});
+
+export const CortexDecideResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(true),
+    decision: CortexDecisionSchema,
+    trace: CortexTraceSchema,
+  }),
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string() }),
+  }),
+]);
+
+export type CortexDecision = z.infer<typeof CortexDecisionSchema>;
+export type CortexTrace = z.infer<typeof CortexTraceSchema>;
+export type CortexDecideResponse = z.infer<typeof CortexDecideResponseSchema>;

@@ -46,7 +46,7 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient } from "./src/memory";
+import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient } from "./src/memory";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
@@ -690,10 +690,12 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
 // daemon core and BOTH typed facades over it (synth + approval — one multiplexed daemon), and installs
 // the fire-and-forget approval SHADOW recorder. The returned synth client OWNS the shared core, so
 // close()'s `pythonSynthClient?.dispose()` tears the daemon down for both facades.
-function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaemonState?: (state: "python" | "fallback", reason: string) => void): PythonSynthClient | undefined {
+function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaemonState?: (state: "python" | "fallback", reason: string) => void): { synth: PythonSynthClient | undefined; cortex: PythonCortexClient | undefined } {
+  // Always returns the client bag (fields undefined when disabled/failed) so the caller plain-destructures
+  // without optional chaining (keeps createMemorySubsystem under the CC<=10 gate).
   // SHADOW is the only posture with no daemon: there is nothing for Python to be primary OVER, so the
   // flip is forced OFF on both the disabled and init-failure paths (fail-closed to TS).
-  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); return undefined; }
+  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); return { synth: undefined, cortex: undefined }; }
   try {
     const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), onStateChange: onDaemonState });
     const approval = createPythonApprovalClient(core);
@@ -711,12 +713,14 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
     setApprovalPythonPrimary(flipOn, flipTimeoutMs);
     if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
-    return synthFacadeOverCore(core);
+    // Inc 4 slice 1 (SHADOW): the cortex facade rides the SAME multiplexed core (observe-only — its
+    // decision is logged, never applied). One daemon, many typed facades (synth + approval + cortex).
+    return { synth: synthFacadeOverCore(core), cortex: createPythonCortexClient(core) };
   } catch (e) {
     console.error("[memory] python daemon client init failed (continuing on fallback):", e);
     installApprovalShadow(null);
     setApprovalPythonPrimary(false);
-    return undefined;
+    return { synth: undefined, cortex: undefined };
   }
 }
 
@@ -1005,7 +1009,7 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
   // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
   // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
   const memorySynthTimeoutMs = clampMemorySynthTimeoutMs(manager.settings.advanced?.memorySynthTimeoutMs);
-  const pythonSynthClient: PythonSynthClient | undefined = createPythonSynthClientOrUndefined(memoryPythonEnabled, onDaemonState);
+  const { synth: pythonSynthClient, cortex: cortexClient } = createPythonSynthClientOrUndefined(memoryPythonEnabled, onDaemonState);
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -1016,6 +1020,7 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
     },
     pythonSynthClient,
     memorySynthTimeoutMs,
+    cortexClient,
   );
   return { memory, pythonSynthClient };
 }
