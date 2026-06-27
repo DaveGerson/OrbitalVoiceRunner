@@ -34,6 +34,30 @@ class CortexTest(unittest.TestCase):
     def test_deterministic(self):
         self.assertEqual(cortex.decide(TIERS, CTX, 5), cortex.decide(TIERS, CTX, 5))
 
+    def test_trace_carries_shadow_budget(self):
+        # Inc 4 slice 2: the trace now reports the cortex's own renderer allocation + rendered length.
+        tr = cortex.decide(TIERS, CTX, 123)["trace"]
+        self.assertIn("shadowBudget", tr)
+        self.assertIn("perTierChars", tr["shadowBudget"])
+        self.assertIsInstance(tr["shadowBudget"]["textLen"], int)
+        # Lean: the full rendered text is NOT logged, only its length.
+        self.assertNotIn("text", tr["shadowBudget"])
+
+    def test_shadow_budget_perTierChars_matches_renderer(self):
+        # The trace's shadow allocation equals the independent renderer's perTierChars (same defaults).
+        import synth  # the live oracle  # noqa: E402
+        tr = cortex.decide(TIERS, CTX, 0)["trace"]
+        oracle = synth.synthesize(TIERS, {}, 0)
+        self.assertEqual(tr["shadowBudget"]["perTierChars"], oracle["perTierChars"])
+        self.assertEqual(tr["shadowBudget"]["textLen"], len(oracle["text"]))
+
+    def test_shadow_render_failure_does_not_break_decision(self):
+        # If the shadow render raised, the identity decision + core trace still come back intact;
+        # shadowBudget is simply absent (telemetry is best-effort; the decision is the contract).
+        out = cortex.decide({"breadcrumbs": [123]}, CTX, 0)  # crumb is an int -> .get raises in renderer
+        self.assertEqual(out["decision"]["keep"], ["breadcrumbs"])
+        self.assertNotIn("shadowBudget", out["trace"])
+
     def test_total_on_empty_and_none(self):
         # Must never raise on degenerate (dict/None) shapes.
         self.assertEqual(cortex.decide({}, {}, 0)["decision"]["keep"], [])
