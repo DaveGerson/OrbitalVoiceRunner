@@ -164,6 +164,13 @@ export const CortexTraceSchema = z.object({
     orderedKeep: z.array(z.string()),
     dropped: z.array(z.string()),
   }).passthrough(),
+  // Inc 4 slice 2 (SHADOW, bead wsm-e2e-pinned-5gv): the cortex's OWN renderer budget allocation +
+  // the rendered text LENGTH (not the full text — logs stay lean). Additive/optional so an older
+  // daemon (no shadowBudget) still validates; absent when the shadow render raised. TS stays log-only.
+  shadowBudget: z.object({
+    perTierChars: z.record(z.string(), z.number()),
+    textLen: z.number(),
+  }).optional(),
   ts: z.number(),
 });
 
