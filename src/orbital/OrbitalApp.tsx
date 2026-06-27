@@ -22,6 +22,8 @@ import { ThePantry } from "./views/Pantry";
 import { NewPaneModal, NewProjectModal } from "./modals";
 import { ApprovalDialog } from "../components/ApprovalDialog";
 import { ActionConfirmDialog } from "../components/ActionConfirmDialog";
+import { DaemonStateBadge } from "../components/DaemonStateBadge";
+import type { DaemonState } from "../components/DaemonStateBadge";
 import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
 import {
   resolveStartView, resolveStartProject, getLocationSearch,
@@ -87,7 +89,7 @@ function ConversationalPill({ state }: { state: ConversationalState }) {
   );
 }
 
-function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected, convo }: {
+function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJumpToNeeds, mode, setMode, onPanic, connected, convo, daemonState }: {
   accentHex: string; accentOn: string; view: View; setView: (v: View) => void; running: number;
   needsCount: number; onJumpToNeeds: () => void;
   mode: ServiceModeId; setMode: (id: ServiceModeId) => void; onPanic: () => void;
@@ -95,6 +97,8 @@ function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJum
   connected: boolean;
   /** Velocity-design (D7): the conversational pill's derived state (useConversationalState). */
   convo: ConversationalState;
+  /** A-1a (inc2): the latest daemon_state — shows a subtle badge when the approver is in fallback. */
+  daemonState: DaemonState;
 }) {
   const tabs: { id: View; l: string; i: string }[] = [
     { id: "line", l: "The Line", i: "fire" },
@@ -137,6 +141,8 @@ function TopNav({ accentHex, accentOn, view, setView, running, needsCount, onJum
           {connected ? <>Kitchen open · {running} on the burner</> : <>Kitchen dark — reconnecting…</>}
         </span>
       </div>
+      {/* A-1a (inc2): subtle degraded-state badge — visible only when the Python approver has fallen back. */}
+      <DaemonStateBadge state={daemonState} />
       <ConversationalPill state={convo} />
       <button data-testid="all-hands" onClick={onPanic} title="Emergency brake" style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 10, border: "2px solid " + INK, background: "#2a1a10", color: "#ffc94a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5, letterSpacing: ".04em", boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0, textTransform: "uppercase" }}>
         <Icon name="fire" size={16} color="#e23a3a" /> All Hands
@@ -444,7 +450,7 @@ export default function OrbitalApp() {
         onPanic={() => { data.stopAllFreeze(); setPanic(true); }}
         /* Tuning the radio in REPLACES the observe socket with the voice socket (same broadcast
            lane) — either one being open means the kitchen is genuinely attached. */
-        connected={data.streamConnected || data.voiceConnected} convo={convo} />
+        connected={data.streamConnected || data.voiceConnected} convo={convo} daemonState={data.daemonState} />
 
       {renderLineView()}
       {renderPantryView()}

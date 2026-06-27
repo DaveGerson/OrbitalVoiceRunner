@@ -159,6 +159,8 @@ export interface OrbitalData {
   attentionQueue: AttentionItem[];
   frozen: boolean;
   frozenRunning: string[];
+  /** A-1a (inc2): the latest daemon_state WS frame — "python" = healthy, "fallback" = degraded, null = not yet received. */
+  daemonState: "python" | "fallback" | null;
   transcript: TranscriptEntry[];
   notes: StoredNote[];
   activeTerminalId: string | null;
@@ -309,6 +311,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [attentionQueue, setAttentionQueue] = useState<AttentionItem[]>([]);
   const [frozen, setFrozen] = useState<boolean>(false);
   const [frozenRunning, setFrozenRunning] = useState<string[]>([]);
+  // A-1a (inc2): track the latest daemon_state WS frame — null until the first frame arrives.
+  const [daemonState, setDaemonState] = useState<"python" | "fallback" | null>(null);
   // 4U.3: seeded from sessionStorage so the radio's record survives a reload (capped 50 below).
   const [transcript, setTranscript] = useState<TranscriptEntry[]>(loadStoredTranscript);
   const [notes, setNotes] = useState<StoredNote[]>([]);
@@ -786,6 +790,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       error: () => {
         setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
         setTimeout(() => setToast(null), 4000);
+      },
+      // A-1a (inc2): track daemon up/down transitions for the DaemonStateBadge. Best-effort:
+      // a malformed frame (missing or invalid `state` field) is silently ignored — the badge
+      // stays at its last-known value, which is the safest observable-degradation posture.
+      daemon_state: () => {
+        if (msg.state === "python" || msg.state === "fallback") setDaemonState(msg.state);
       },
     };
     const type = msg?.type;
@@ -1906,7 +1916,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
 
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
-    pendingCommands, pendingActions, attentionQueue, frozen, frozenRunning, transcript,
+    pendingCommands, pendingActions, attentionQueue, frozen, frozenRunning, daemonState, transcript,
     activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
