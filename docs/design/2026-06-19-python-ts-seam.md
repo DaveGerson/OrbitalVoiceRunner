@@ -80,3 +80,65 @@ lower-stakes logic, and only with a fail-closed, low-latency contract.
 - `gating/index.ts` decision core → portable in principle, **deferred** (see above).
 - So the current complexity burndown is unaffected; the seam's payoff is **forward-looking** (the
   new agent layer + opportunistic ports when a pure-logic file is already being touched).
+
+## 2026-06-25 — Operator amendment: shadow-first seam migration (supersedes delete-on-cutover)
+
+> This section AMENDS the ADR above; the body above it is unchanged. After an engineering red-team
+> and a product-persona review (`handover/python-ts-seam-redteam-review.html`), the operator made
+> the final tactical calls below. The full design + plan are the canonical artifacts:
+> **spec** `docs/superpowers/specs/2026-06-25-python-ts-seam-migration-design.md` ·
+> **plan** `docs/superpowers/plans/2026-06-25-python-ts-seam-migration-plan.md`.
+
+### Supersession
+
+The earlier **"delete-on-cutover"** posture (Python = single source of truth + hard dependency, TS
+deleted at cutover; first targets `voiceAckGate` + `recipeApply`; parity harvested-then-deleted
+same-PR) is **superseded as of 2026-06-25.** New posture below.
+
+### The reframe + new posture: `SHADOW → FLIP → RETIRE`
+
+Decouple "ship the port" from "take a hard dependency." The first port ships in **shadow** — Python
+computes alongside the **authoritative TS** and we log/count diffs. This removes observability,
+audible-degradation, Windows-CI, the fail-closed shim, the breaker refactor, and latency-partitioning
+from the critical path to the FIRST merge; they return at the **flip**, where they bite.
+
+- **SHADOW** — Python observes; TS authoritative; no dependency; ~zero user risk.
+- **FLIP** — Python primary; the **retained TS twin is the fail-closed floor** (it IS the floor —
+  no separate shim); degradation is **spoken** (UX Principle 7).
+- **RETIRE** — remove the twin only after metrics prove the Python side (fallback-rate ≈ 0).
+
+### The 4 increments
+
+1. **Prove the seam** (ship this week, no dependency) — one multiplexed daemon + typed facade;
+   envelope split + single-source `WIRE_VERSION`; port `parseApprovalIntent` **in shadow**; boundary
+   golden-master sweep; drop `recipeApply`, keep `voiceAckGate` in TS (+ regression test).
+2. **Take the dependency** (after a clean shadow window) — flip to primary (twin = fail-closed
+   floor); observability push + **observable** degradation; discovery≠breaker-budget + live Windows CI
+   smoke. Merge gate: "twin present + fail-closed verified + degradation observable."
+3. **Retire + harden** (deferred, metrics-gated) — retire the twin; then *opportunistically* breaker
+   reducer + char tests, full contract test, latency-class partition.
+4. **The brain** (brainstorm-gated) — greenfield agent/planning logic born in Python on the proven
+   seam (branches off Increment 1, not the flip).
+
+### Per-finding dispositions (compact)
+
+| ID | Disposition | Inc |
+|---|---|---|
+| `F-TARGET` | Port `parseApprovalIntent` shadow→promote; twin kept | 1→2 |
+| `F1` | Drop `recipeApply` — stays TS (the gate) | 1 |
+| `F2` | Keep `voiceAckGate` in TS + in-process regression test | 1 |
+| `F4` | One multiplexed logic daemon | 1 |
+| `F-API` | Typed facade over a generic core | 1 |
+| `F6` | Envelope split + single-source version now; contract test deferred | 1 / 3 |
+| `F9` | Boundary sweep + shadow-compare; retire twin only when both green | 1→3 |
+| `F3` | Floor = retained twin; verify-at-flip gate; no separate shim | 2 |
+| `F8` | Observability push + observable degradation (structured log + warm-up-immune fallback-rate in `health.memory.daemon`) | 2 |
+| `F7` | Discovery ≠ breaker budget + live Windows CI smoke | 2 |
+| `F5` | Breaker reducer + char tests — DEFER (opportunistic) | 3 |
+| `F-HOL` | Latency-class partition — DEFER | 3 |
+
+### Pointers
+
+Spec: `docs/superpowers/specs/2026-06-25-python-ts-seam-migration-design.md` · Plan:
+`docs/superpowers/plans/2026-06-25-python-ts-seam-migration-plan.md` · Review:
+`handover/python-ts-seam-redteam-review.html`.

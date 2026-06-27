@@ -1,3 +1,9 @@
+// SEAM NOTE (Python⇄TS migration, Inc 1 task 1.8 — DROPPED from scope, permanently TS-resident):
+// `planRecipeApply` is DELIBERATELY excluded from the Python port. It takes live `resolveLayout` /
+// `resolvePane` closures that evaluate the synchronous, fail-closed capability-gate choke-point — it
+// IS the deferred gate (ADR docs/design/2026-06-19-python-ts-seam.md §"Notable deferral"). Those
+// closures cannot cross the NDJSON boundary, and the gate's decision is a security choke-point that
+// must stay synchronous + in-process. Do NOT migrate this to python/. See the seam plan, task 1.8.
 import type { GateValue } from "./types";
 
 export type RecipePaneDisposition = "spawn" | "defer" | "block" | "skip-existing";

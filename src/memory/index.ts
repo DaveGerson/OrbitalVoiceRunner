@@ -1,13 +1,17 @@
 import { WorldModel, type WorldModelDeps } from "./worldModel";
 import { BreadcrumbRing } from "./breadcrumbs";
 import { assembleBrief } from "./assembler";
-import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb } from "./types";
+import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb, type CortexCtx } from "./types";
 import type { PythonSynthClient } from "./pythonClient";
+import type { PythonCortexClient } from "./cortexClient";
 
 export { WorldModel } from "./worldModel";
 export { BreadcrumbRing } from "./breadcrumbs";
 export * from "./types";
 export * from "./pythonClient";
+export { createPythonApprovalClient, type PythonApprovalClient } from "./approvalClient";
+export { createPythonCortexClient, type PythonCortexClient, type CortexResult } from "./cortexClient";
+export { createDaemonStateTracker, type DaemonStateTracker, type DaemonStateStats } from "./daemonStateTracker";
 
 /** Latest-wins predicate (invariant I3): a brief is only injectable if its pane is still the focus. */
 export function briefIsForActivePane(briefActivePaneId: string | null, currentActivePaneId: string | null): boolean {
@@ -20,7 +24,29 @@ export class MemoryService {
     private cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG,
     private pythonClient?: PythonSynthClient,
     private timeoutMs: number = 150,
+    private cortexClient?: PythonCortexClient,
   ) {}
+
+  /** Inc 4 slice 1 (SHADOW): fire-and-forget cortex curation OBSERVATION. Builds the same tiers,
+   *  asks the cortex what it WOULD curate, and LOGS the decision-trace. It NEVER blocks injection,
+   *  NEVER throws, and NEVER applies the decision — parity with today is total (invariants I-P1..I-P3).
+   *  Absent/unavailable client ⇒ a synchronous no-op. The cortex carries no risk; TS is the floor. */
+  observeCortexShadow(activePaneId: string | null, now: number, trigger: string = "brief-inject"): void {
+    const client = this.cortexClient;
+    if (!client || !client.available()) return;
+    try {
+      const tiers = this.wm.getTiers(activePaneId, now);
+      const ctx: CortexCtx = { activePaneId, sessionId: null, trigger };
+      // Fire-and-forget: do NOT await. The facade never rejects, but guard the rejection arm anyway so
+      // an unexpected throw can never surface as an unhandled rejection in the live loop.
+      void client.decide(tiers, ctx, now).then(
+        (res) => { if (res.ok) console.error(`[cortex-shadow] ${JSON.stringify(res.trace)}`); },
+        () => { /* miss — silent; parity preserved */ },
+      );
+    } catch {
+      // getTiers (or a synchronous throw from decide) must never affect injection — swallow.
+    }
+  }
 
   /** Synchronous deterministic fallback — unchanged P0a path (REST/tests + the race else-branch). */
   synthesize(activePaneId: string | null, now: number): SynthesizedBrief {
@@ -76,8 +102,9 @@ export function createMemoryService(
   cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG,
   pythonClient?: PythonSynthClient,
   timeoutMs: number = 150,
+  cortexClient?: PythonCortexClient,
 ): CreatedMemory {
   const breadcrumbs = new BreadcrumbRing(cfg);
   const wm = new WorldModel({ ...deps, breadcrumbs });
-  return { service: new MemoryService(wm, cfg, pythonClient, timeoutMs), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
+  return { service: new MemoryService(wm, cfg, pythonClient, timeoutMs, cortexClient), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
 }

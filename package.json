@@ -20,6 +20,7 @@
     "e2e:install": "playwright install chromium",
     "catalog": "tsx scripts/catalog.ts",
     "smoke:claude": "tsx scripts/smoke-claude-pane.ts",
+    "smoke:daemon": "tsx scripts/smoke-python-daemon.ts",
     "smoke:handoff": "tsx scripts/smoke-handoff.ts",
     "smoke:kitchen": "node scripts/live-smoke-kitchen.mjs",
     "verify:modeswitch": "tsx scripts/verify-live-modeswitch.ts",

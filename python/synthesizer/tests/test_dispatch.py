@@ -43,6 +43,29 @@ class DispatchTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"]["code"], "SYNTH_FAILED")
 
+    def test_approval_parse_returns_parsed(self):
+        r = dispatch.handle({"id": "a1", "v": 1, "op": "approval.parse", "transcript": "approve the second one"})
+        self.assertEqual(r["id"], "a1")
+        self.assertEqual(r["v"], 1)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["parsed"], {"intent": "approve", "targetHint": {"ordinal": 2}})
+
+    def test_approval_parse_bare_none(self):
+        r = dispatch.handle({"id": "a2", "v": 1, "op": "approval.parse", "transcript": "what does this do"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["parsed"], {"intent": "none"})
+
+    def test_approval_parse_missing_transcript_is_caught(self):
+        # No "transcript" key -> KeyError inside the handler; must surface as PARSE_FAILED, never crash.
+        r = dispatch.handle({"id": "a3", "v": 1, "op": "approval.parse"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"]["code"], "PARSE_FAILED")
+
+    def test_approval_parse_bad_version_rejected(self):
+        r = dispatch.handle({"id": "a4", "v": 99, "op": "approval.parse", "transcript": "approve"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"]["code"], "BAD_VERSION")
+
 
 if __name__ == "__main__":
     unittest.main()

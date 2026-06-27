@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>The Python Cortex — Inc 4, Slice 1 (SHADOW scaffold)</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --bg-2: #161b22;
+    --bg-3: #1c2230;
+    --panel: #11161f;
+    --border: #2a313c;
+    --border-soft: #232a35;
+    --ink: #e6edf3;
+    --ink-soft: #aeb9c7;
+    --ink-mute: #7d8896;
+    --accent: #58a6ff;       /* observe / TS */
+    --accent-2: #a371f7;     /* cortex / python */
+    --green: #3fb950;        /* wired / safe */
+    --amber: #d29922;        /* deferred */
+    --rose: #f85149;         /* fail / floor */
+    --teal: #2dd4bf;         /* gemini / brain */
+    --code-bg: #0b0f15;
+    --radius: 12px;
+    --shadow: 0 8px 28px rgba(0,0,0,.45);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 700px at 80% -10%, #1a2030 0%, var(--bg) 55%) fixed;
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  /* ── Header ── */
+  header.hero {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background:
+      linear-gradient(135deg, rgba(163,113,247,.12), rgba(88,166,255,.06) 60%, transparent),
+      var(--panel);
+    padding: 30px 32px;
+    box-shadow: var(--shadow);
+    position: relative;
+    overflow: hidden;
+  }
+  header.hero::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: radial-gradient(420px 220px at 90% 0%, rgba(45,212,191,.10), transparent 70%);
+    pointer-events: none;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin: 0 0 10px;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.12;
+    letter-spacing: -.02em;
+  }
+  h1 .sub { color: var(--ink-soft); font-weight: 500; }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 4px;
+  }
+  .chip {
+    font-family: var(--mono); font-size: 12px;
+    padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-3); color: var(--ink-soft);
+  }
+  .chip.green { color: var(--green); border-color: rgba(63,185,80,.4); background: rgba(63,185,80,.08); }
+  .chip.amber { color: var(--amber); border-color: rgba(210,153,34,.4); background: rgba(210,153,34,.08); }
+  .chip.purple { color: var(--accent-2); border-color: rgba(163,113,247,.4); background: rgba(163,113,247,.08); }
+
+  .bluf {
+    margin-top: 22px;
+    border-left: 3px solid var(--accent-2);
+    background: linear-gradient(90deg, rgba(163,113,247,.08), transparent);
+    padding: 16px 20px;
+    border-radius: 0 8px 8px 0;
+  }
+  .bluf p { margin: 0; color: var(--ink); }
+  .bluf strong { color: #fff; }
+  .bluf .tag { color: var(--accent-2); font-weight: 700; }
+
+  /* ── Sections ── */
+  section { margin-top: 44px; }
+  h2 {
+    font-size: 22px; letter-spacing: -.01em;
+    margin: 0 0 4px; display: flex; align-items: center; gap: 12px;
+  }
+  h2 .num {
+    font-family: var(--mono); font-size: 13px;
+    color: var(--bg); background: var(--accent-2);
+    width: 26px; height: 26px; flex: 0 0 26px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 7px; font-weight: 700;
+  }
+  h2 + .lede { color: var(--ink-soft); margin: 0 0 18px; padding-left: 38px; }
+  h3 { font-size: 15px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: .08em; margin: 22px 0 10px; }
+
+  .panel {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: var(--radius);
+    padding: 22px;
+    box-shadow: var(--shadow);
+  }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14px 24px;
+    font-size: 13px; color: var(--ink-soft);
+    margin-bottom: 18px; padding: 12px 16px;
+    border: 1px dashed var(--border); border-radius: 10px;
+    background: var(--bg-2);
+  }
+  .legend .it { display: inline-flex; align-items: center; gap: 8px; }
+  .swatch { width: 14px; height: 14px; border-radius: 4px; flex: 0 0 14px; }
+  .line-key { width: 28px; height: 0; border-top: 2px solid var(--ink-soft); }
+  .line-key.dashed { border-top: 2px dashed var(--amber); }
+  .line-key.solid-green { border-top: 2px solid var(--green); }
+
+  /* ── SVG diagram frames ── */
+  .diagram { width: 100%; height: auto; display: block; }
+  figcaption {
+    font-size: 13px; color: var(--ink-mute); margin-top: 12px; text-align: center;
+    font-style: italic;
+  }
+
+  /* ── Tables ── */
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  thead th {
+    color: var(--ink-mute); font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody tr:hover { background: rgba(88,166,255,.04); }
+  td.key { font-family: var(--mono); color: var(--accent); white-space: nowrap; font-size: 13px; }
+  td strong { color: #fff; }
+
+  /* ── Invariants ── */
+  .inv-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  .inv {
+    display: grid; grid-template-columns: 64px 1fr; gap: 14px;
+    border: 1px solid var(--border-soft); border-radius: 10px;
+    background: var(--bg-2); padding: 14px 16px;
+  }
+  .inv .id {
+    font-family: var(--mono); font-weight: 700; color: var(--green);
+    align-self: start; font-size: 14px;
+    background: rgba(63,185,80,.1); border: 1px solid rgba(63,185,80,.3);
+    border-radius: 8px; text-align: center; padding: 6px 4px;
+  }
+  .inv p { margin: 0; color: var(--ink-soft); }
+  .inv code { color: var(--accent); }
+
+  /* ── Code blocks ── */
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; overflow-x: auto;
+    font-family: var(--mono); font-size: 13px; line-height: 1.55; color: #cdd9e5;
+    margin: 0;
+  }
+  .tok-key { color: #79c0ff; }
+  .tok-str { color: #a5d6ff; }
+  .tok-num { color: #f0883e; }
+  .tok-bool { color: #ff7b72; }
+  .tok-com { color: #6e7781; font-style: italic; }
+  code.inline {
+    font-family: var(--mono); font-size: .88em;
+    background: var(--bg-3); border: 1px solid var(--border-soft);
+    border-radius: 5px; padding: 1px 6px; color: var(--accent);
+  }
+
+  /* ── Deferred checklist ── */
+  .checklist { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+  .checklist li {
+    display: grid; grid-template-columns: 26px 1fr auto; gap: 12px; align-items: start;
+    border: 1px solid var(--border-soft); border-left: 3px solid var(--amber);
+    background: var(--bg-2); border-radius: 8px; padding: 12px 14px;
+  }
+  .checklist .box {
+    width: 18px; height: 18px; border: 2px solid var(--amber); border-radius: 4px;
+    margin-top: 3px; flex: 0 0 18px;
+  }
+  .checklist .body { color: var(--ink); }
+  .checklist .body small { display: block; color: var(--ink-mute); margin-top: 2px; }
+  .bead {
+    font-family: var(--mono); font-size: 11.5px; color: var(--amber);
+    background: rgba(210,153,34,.1); border: 1px solid rgba(210,153,34,.3);
+    border-radius: 6px; padding: 3px 8px; white-space: nowrap; align-self: start; margin-top: 2px;
+  }
+
+  /* ── One-breath narrator ── */
+  .breath {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, rgba(45,212,191,.08), transparent 60%), var(--panel);
+    padding: 24px 26px; box-shadow: var(--shadow);
+  }
+  .breath p { margin: 0; font-size: 17px; line-height: 1.7; color: var(--ink); }
+  .breath .accent { color: var(--teal); font-weight: 600; }
+
+  footer {
+    margin-top: 50px; padding-top: 20px; border-top: 1px solid var(--border-soft);
+    color: var(--ink-mute); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
+  footer code { font-family: var(--mono); color: var(--ink-soft); }
+
+  a.srclink { color: var(--accent); text-decoration: none; font-family: var(--mono); font-size: 12.5px; }
+  a.srclink:hover { text-decoration: underline; }
+
+  /* ── Responsive ── */
+  @media (max-width: 720px) {
+    .inv { grid-template-columns: 1fr; }
+    .checklist li { grid-template-columns: 26px 1fr; }
+    .bead { grid-column: 2; justify-self: start; }
+    h2 + .lede { padding-left: 0; }
+  }
+
+  /* ── Print ── */
+  @media print {
+    body { background: #fff; color: #111; }
+    .wrap { max-width: none; }
+    .panel, header.hero, .breath { box-shadow: none; border-color: #ccc; background: #fff; }
+    pre { background: #f6f8fa; color: #111; }
+    a.srclink { color: #0550ae; }
+    .chip, .bead, .swatch { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ════════════════ HEADER + BLUF ════════════════ -->
+  <header class="hero">
+    <p class="eyebrow">The Python Cortex · Increment 4 · Slice 1</p>
+    <h1>SHADOW scaffold <span class="sub">— observe &amp; log, zero behavior change</span></h1>
+    <div class="meta-row">
+      <span class="chip purple">Status: approved (SHADOW slice)</span>
+      <span class="chip">Design: 2026-06-27</span>
+      <span class="chip green">Behavior delta: none (byte-identical)</span>
+      <span class="chip amber">Curation &amp; flip: deferred</span>
+    </div>
+
+    <div class="bluf">
+      <p>
+        <strong>The cortex is a <span class="tag">deterministic</span> support layer</strong> that makes the
+        live voice model — <strong>Gemini Live</strong> — more effective despite its limits (weak working
+        memory, imprecise state tracking). Gemini stays the <strong>brain / driver</strong>; the cortex is
+        the deterministic <em>executive prosthetic</em> that does the precise bookkeeping; TypeScript stays
+        the <strong>resilient I/O shell and the fail-closed floor</strong>. <strong>This slice ships the
+        SHADOW scaffold only</strong>: the seam, the <code class="inline">cortex.decide</code> op, the
+        decision-trace contract, and fire-and-forget observation wiring. The cortex <em>observes and logs
+        what it would decide</em>; TypeScript still injects exactly today's brief. v1 logic is an
+        <strong>identity baseline</strong> — the point is the seam + contract + observability, not the
+        intelligence. Every judgment-laden rule is deferred to a bead.
+      </p>
+    </div>
+  </header>
+
+  <!-- ════════════════ 1. OODA LOOP ════════════════ -->
+  <section>
+    <h2><span class="num">1</span> The mental model — an OODA control loop, not a pipeline</h2>
+    <p class="lede">
+      The cortex is the <strong>deterministic half of the "decide" node</strong> in a loop that closes
+      through the world. In SHADOW it is wired only to the <strong>context-curation</strong> arc, and its
+      output is observed — never applied.
+    </p>
+
+    <div class="panel">
+      <div class="legend">
+        <span class="it"><span class="swatch" style="background:var(--accent)"></span> TypeScript (I/O shell · executor · floor)</span>
+        <span class="it"><span class="swatch" style="background:var(--accent-2)"></span> Cortex (deterministic, Python)</span>
+        <span class="it"><span class="swatch" style="background:var(--teal)"></span> Gemini Live (the brain)</span>
+        <span class="it"><span class="line-key solid-green"></span> wired this slice</span>
+        <span class="it"><span class="line-key dashed"></span> deferred / observe-only</span>
+      </div>
+
+      <figure style="margin:0">
+        <svg class="diagram" viewBox="0 0 980 470" role="img"
+             aria-label="OODA control loop: Observe state snapshot to Orient/Decide (Cortex deterministic plus Gemini brain) to Act (TS executor) which mutates the world, emitting events back to Observe.">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#7d8896"/>
+            </marker>
+            <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#3fb950"/>
+            </marker>
+            <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#d29922"/>
+            </marker>
+          </defs>
+
+          <!-- OBSERVE -->
+          <g>
+            <rect x="40" y="60" width="210" height="120" rx="12" fill="#10202f" stroke="#58a6ff" stroke-width="1.5"/>
+            <text x="145" y="88" text-anchor="middle" fill="#58a6ff" font-family="var(--mono)" font-size="12" font-weight="700">OBSERVE</text>
+            <text x="145" y="116" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="600">state snapshot</text>
+            <text x="145" y="140" text-anchor="middle" fill="#aeb9c7" font-size="12.5">worldModel.getTiers</text>
+            <text x="145" y="160" text-anchor="middle" fill="#7d8896" font-size="12">epoch-stamped, pure</text>
+          </g>
+
+          <!-- ORIENT / DECIDE -->
+          <g>
+            <rect x="385" y="40" width="210" height="160" rx="12" fill="#1b1430" stroke="#a371f7" stroke-width="1.5"/>
+            <text x="490" y="66" text-anchor="middle" fill="#a371f7" font-family="var(--mono)" font-size="12" font-weight="700">ORIENT / DECIDE</text>
+            <!-- cortex sub-node -->
+            <rect x="405" y="80" width="170" height="50" rx="8" fill="rgba(163,113,247,.12)" stroke="#a371f7" stroke-width="1"/>
+            <text x="490" y="100" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">CORTEX (determ.)</text>
+            <text x="490" y="118" text-anchor="middle" fill="#cbb9f5" font-size="11.5">keep / drop / rerank</text>
+            <!-- gemini sub-node -->
+            <rect x="405" y="138" width="170" height="46" rx="8" fill="rgba(45,212,191,.10)" stroke="#2dd4bf" stroke-width="1"/>
+            <text x="490" y="158" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">GEMINI (brain)</text>
+            <text x="490" y="175" text-anchor="middle" fill="#9fe9df" font-size="11.5">reasons / drives</text>
+          </g>
+
+          <!-- ACT -->
+          <g>
+            <rect x="730" y="60" width="210" height="120" rx="12" fill="#10202f" stroke="#58a6ff" stroke-width="1.5"/>
+            <text x="835" y="88" text-anchor="middle" fill="#58a6ff" font-family="var(--mono)" font-size="12" font-weight="700">ACT</text>
+            <text x="835" y="114" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="600">TS executor</text>
+            <text x="835" y="138" text-anchor="middle" fill="#aeb9c7" font-size="12.5">inject · connect</text>
+            <text x="835" y="158" text-anchor="middle" fill="#aeb9c7" font-size="12.5">dispatch &#8594; GATE</text>
+          </g>
+
+          <!-- THE WORLD -->
+          <g>
+            <rect x="300" y="350" width="380" height="80" rx="12" fill="#13181f" stroke="#3a4452" stroke-width="1.5"/>
+            <text x="490" y="380" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="700">THE WORLD</text>
+            <text x="490" y="404" text-anchor="middle" fill="#7d8896" font-size="12">panes · sessions · capability gate · live audio</text>
+          </g>
+
+          <!-- (2) Observe -> Decide : context curation, WIRED -->
+          <path d="M250 120 H 385" fill="none" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+          <text x="318" y="108" text-anchor="middle" fill="#3fb950" font-size="11.5" font-weight="600">(2) consult</text>
+          <text x="318" y="136" text-anchor="middle" fill="#3fb950" font-size="10.5">context curation</text>
+
+          <!-- (3) Decide -> Act : DEFERRED (apply / action) -->
+          <path d="M595 120 H 730" fill="none" stroke="#d29922" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrow-amber)"/>
+          <text x="662" y="108" text-anchor="middle" fill="#d29922" font-size="11.5" font-weight="600">(3) apply-if-fresh</text>
+          <text x="662" y="136" text-anchor="middle" fill="#d29922" font-size="10.5">deferred (the flip)</text>
+
+          <!-- (4) Act -> World : actions mutate -->
+          <path d="M835 180 V 300 Q 835 350 730 380 H 680" fill="none" stroke="#7d8896" stroke-width="2" marker-end="url(#arrow)"/>
+          <text x="812" y="270" text-anchor="middle" fill="#aeb9c7" font-size="11.5">(4) actions mutate</text>
+
+          <!-- (1) World -> Observe : events -->
+          <path d="M300 390 H 145 Q 40 390 40 300 V 180" fill="none" stroke="#7d8896" stroke-width="2" marker-end="url(#arrow)"/>
+          <text x="150" y="270" text-anchor="middle" fill="#aeb9c7" font-size="11.5">(1) events</text>
+          <text x="150" y="288" text-anchor="middle" fill="#7d8896" font-size="10.5">pane switch · outcome · health</text>
+        </svg>
+        <figcaption>
+          The cortex consults on the <strong style="color:var(--green)">context-curation arc only</strong> (green, wired).
+          The <strong style="color:var(--amber)">action / apply arc</strong> (amber, dashed) — session &amp; connection
+          management and applying the decision — is deferred.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ════════════════ 2. SHADOW DATA FLOW ════════════════ -->
+  <section>
+    <h2><span class="num">2</span> SHADOW data flow for context — observed, never applied</h2>
+    <p class="lede">
+      Two paths run in parallel from the same world snapshot. The <strong>live path</strong> (TS &#8594;
+      synthesizer &#8594; brief &#8594; Gemini) is <strong>untouched</strong>. The <strong>shadow path</strong>
+      (cortex) is fire-and-forget and ends in a <strong>logged trace</strong> — its output never reaches the
+      injected brief.
+    </p>
+
+    <div class="panel">
+      <div class="legend">
+        <span class="it"><span class="line-key solid-green"></span> live path (applied — today's exact brief)</span>
+        <span class="it"><span class="line-key dashed"></span> shadow path (observe-only — logged, not applied)</span>
+        <span class="it"><span class="swatch" style="background:var(--rose)"></span> fail-closed floor</span>
+      </div>
+
+      <figure style="margin:0">
+        <svg class="diagram" viewBox="0 0 980 430" role="img"
+             aria-label="Shadow data flow. worldModel builds tiers. In parallel: the live path runs synthesizeAsync to a brief sent to Gemini; the shadow path runs cortex.decide whose trace is logged but not applied. If cortex is down, slow, or wrong, the system falls back to today's exact brief.">
+          <defs>
+            <marker id="a2-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#3fb950"/>
+            </marker>
+            <marker id="a2-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#d29922"/>
+            </marker>
+            <marker id="a2-rose" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#f85149"/>
+            </marker>
+          </defs>
+
+          <!-- SOURCE: worldModel -->
+          <rect x="30" y="170" width="170" height="90" rx="11" fill="#10202f" stroke="#58a6ff" stroke-width="1.5"/>
+          <text x="115" y="200" text-anchor="middle" fill="#58a6ff" font-family="var(--mono)" font-size="11.5" font-weight="700">WORLD MODEL (TS)</text>
+          <text x="115" y="224" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="600">candidate tiers</text>
+          <text x="115" y="244" text-anchor="middle" fill="#7d8896" font-size="11">project·pane·breadcrumbs·board·frame</text>
+
+          <!-- fan-out point -->
+          <circle cx="240" cy="215" r="5" fill="#58a6ff"/>
+          <path d="M200 215 H 235" fill="none" stroke="#58a6ff" stroke-width="2"/>
+
+          <!-- ── LIVE PATH (top) ── -->
+          <path d="M240 215 V 110 H 300" fill="none" stroke="#3fb950" stroke-width="2.5" marker-end="url(#a2-green)"/>
+          <rect x="300" y="70" width="200" height="80" rx="11" fill="#10202f" stroke="#3fb950" stroke-width="1.5"/>
+          <text x="400" y="98" text-anchor="middle" fill="#3fb950" font-family="var(--mono)" font-size="11" font-weight="700">LIVE · synthesizeAsync</text>
+          <text x="400" y="120" text-anchor="middle" fill="#e6edf3" font-size="13.5" font-weight="600">budget &#8594; brief</text>
+          <text x="400" y="138" text-anchor="middle" fill="#7d8896" font-size="11">unchanged · TS owns source</text>
+
+          <path d="M500 110 H 600" fill="none" stroke="#3fb950" stroke-width="2.5" marker-end="url(#a2-green)"/>
+          <rect x="600" y="72" width="200" height="76" rx="11" fill="rgba(45,212,191,.10)" stroke="#2dd4bf" stroke-width="1.5"/>
+          <text x="700" y="100" text-anchor="middle" fill="#2dd4bf" font-family="var(--mono)" font-size="11" font-weight="700">GEMINI LIVE</text>
+          <text x="700" y="122" text-anchor="middle" fill="#e6edf3" font-size="13.5" font-weight="600">sendClientContent</text>
+          <text x="700" y="140" text-anchor="middle" fill="#9fe9df" font-size="11">injected brief (the brain)</text>
+
+          <!-- ── SHADOW PATH (bottom) ── -->
+          <path d="M240 215 V 320 H 300" fill="none" stroke="#d29922" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#a2-amber)"/>
+          <rect x="300" y="282" width="200" height="80" rx="11" fill="#1b1430" stroke="#a371f7" stroke-width="1.5"/>
+          <text x="400" y="308" text-anchor="middle" fill="#a371f7" font-family="var(--mono)" font-size="11" font-weight="700">SHADOW · cortex.decide</text>
+          <text x="400" y="330" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">keep / drop / rerank</text>
+          <text x="400" y="348" text-anchor="middle" fill="#cbb9f5" font-size="11">v1 = IDENTITY baseline</text>
+
+          <path d="M500 322 H 600" fill="none" stroke="#d29922" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#a2-amber)"/>
+          <rect x="600" y="284" width="200" height="76" rx="11" fill="#13181f" stroke="#d29922" stroke-width="1.5"/>
+          <text x="700" y="312" text-anchor="middle" fill="#d29922" font-family="var(--mono)" font-size="11" font-weight="700">TRACE &#8594; LOGGED</text>
+          <text x="700" y="334" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="600">[cortex-shadow] …</text>
+          <text x="700" y="352" text-anchor="middle" fill="#7d8896" font-size="11">observed, NOT applied</text>
+
+          <!-- the wall: dropped, never reaches Gemini -->
+          <text x="845" y="318" text-anchor="middle" fill="#f85149" font-size="22" font-weight="700">&#10005;</text>
+          <text x="845" y="338" text-anchor="middle" fill="#f85149" font-size="10">no effect</text>
+
+          <!-- fail-closed floor banner -->
+          <rect x="300" y="390" width="500" height="30" rx="8" fill="rgba(248,81,73,.08)" stroke="#f85149" stroke-width="1.2"/>
+          <text x="550" y="410" text-anchor="middle" fill="#f85149" font-size="12" font-weight="600">cortex down / slow / wrong &#8594; today's exact brief (fail-closed floor)</text>
+          <path d="M400 362 V 390" fill="none" stroke="#f85149" stroke-width="1.5" stroke-dasharray="3 4" marker-end="url(#a2-rose)"/>
+        </svg>
+        <figcaption>
+          The shadow path is built from the <em>same</em> tiers, fired <strong>fire-and-forget</strong>, and
+          terminates in a logged trace. <code class="inline">synthesizeAsync</code> and the injected brief are
+          byte-identical whether the cortex is present, absent, slow, or erroring.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ════════════════ 3. LOCKED DECISIONS ════════════════ -->
+  <section>
+    <h2><span class="num">3</span> Locked design decisions</h2>
+    <p class="lede">From the 2026-06-27 brainstorm. These are settled for the increment; only the deferred
+      items below remain open.</p>
+    <div class="panel" style="padding:6px 8px">
+      <table>
+        <thead>
+          <tr><th style="width:160px">Axis</th><th>Decision</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="key">Gate posture</td>
+            <td><strong>A — "cortex proposes, the gate disposes."</strong> The cortex never enforces and
+              never sits on the synchronous, fail-closed enforcement path. (Not exercised this slice —
+              read/feed only.)</td>
+          </tr>
+          <tr>
+            <td class="key">Role</td>
+            <td><strong>Deterministic support layer.</strong> Gemini reasons; the cortex does the precise,
+              reliable bookkeeping — the executive prosthetic.</td>
+          </tr>
+          <tr>
+            <td class="key">Streaming core</td>
+            <td><strong>Pure-reactive</strong> — a function of the current snapshot. No internal state baked in.</td>
+          </tr>
+          <tr>
+            <td class="key">Decision memory</td>
+            <td><strong>Externalized.</strong> Hysteresis / oscillation-damping is an externalized callable
+              owned by the memory/context module, not baked into the core.</td>
+          </tr>
+          <tr>
+            <td class="key">Feed model</td>
+            <td><strong>Pull-per-event over the existing seam.</strong> The cortex is a stateless consulted
+              transform; risk stays in the resilient TS backend. <em>No second transport.</em></td>
+          </tr>
+          <tr>
+            <td class="key">Curator ↔ budgeter</td>
+            <td><strong>The cortex owns the char-budget; the synthesizer renders.</strong> The cortex is the
+              single logic authority; output is an ordered list. The synthesizer becomes an in-process renderer.</td>
+          </tr>
+          <tr>
+            <td class="key">Observability</td>
+            <td><strong>Over-document via a structured decision-trace.</strong> Every call emits a versioned,
+              structured trace — the substrate for the future shadow trust-gate.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ════════════════ 4. PARITY INVARIANTS ════════════════ -->
+  <section>
+    <h2><span class="num">4</span> Parity invariants (I-P1 … I-P5)</h2>
+    <p class="lede">The guarantees that make "zero behavior change" true. <strong>Enforced by tests</strong>
+      (Python <code class="inline">test_cortex.py</code> + dispatch; TS <code class="inline">test_cortex_client.ts</code>
+      + <code class="inline">test_cortex_shadow_parity.ts</code>; plus the existing wire-version parity test).</p>
+    <div class="inv-grid">
+      <div class="inv">
+        <div class="id">I-P1</div>
+        <p><strong>The brief is identical, cortex or not.</strong> <code>synthesizeAsync</code> output and the
+          injected brief are byte-identical whether the cortex is present, absent, slow, or erroring —
+          <code>synthesizeAsync</code> is untouched.</p>
+      </div>
+      <div class="inv">
+        <div class="id">I-P2</div>
+        <p><strong>Never blocks, never throws.</strong> <code>observeCortexShadow</code> is non-blocking (the
+          caller never awaits) and never throws — an unhandled rejection must never reach the live loop.</p>
+      </div>
+      <div class="inv">
+        <div class="id">I-P3</div>
+        <p><strong>Any miss is a no-op.</strong> Cortex unavailable / timeout / error / off-schema &#8658;
+          zero effect on injection (logged-and-ignored, or an "unavailable" trace).</p>
+      </div>
+      <div class="inv">
+        <div class="id">I-P4</div>
+        <p><strong>Pure &amp; deterministic.</strong> <code>cortex.decide</code> yields an identical decision +
+          trace for identical inputs (modulo <code>ts</code>).</p>
+      </div>
+      <div class="inv">
+        <div class="id">I-P5</div>
+        <p><strong>The daemon survives bad input.</strong> A malformed <code>cortex.decide</code> request
+          returns <code>ok:false</code> and the daemon keeps serving — <code>synthesize</code> /
+          <code>approval.parse</code> still work.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ 5. DECISION-TRACE CONTRACT ════════════════ -->
+  <section>
+    <h2><span class="num">5</span> The decision-trace contract</h2>
+    <p class="lede">Every <code class="inline">cortex.decide</code> call emits a structured, versioned trace
+      (the over-document principle). In SHADOW, TypeScript <strong>logs this and applies nothing</strong>.
+      Shape pulled directly from <code class="inline">python/synthesizer/cortex.py</code>.</p>
+
+    <div class="panel">
+      <h3 style="margin-top:0">Response (success) — wire v1</h3>
+<pre><span class="tok-key">{</span>
+  <span class="tok-str">"id"</span>: <span class="tok-str">"r1"</span>, <span class="tok-str">"v"</span>: <span class="tok-num">1</span>, <span class="tok-str">"ok"</span>: <span class="tok-bool">true</span>,
+  <span class="tok-str">"decision"</span>: <span class="tok-key">{</span>
+    <span class="tok-str">"keep"</span>:   [<span class="tok-str">"project"</span>, <span class="tok-str">"pane"</span>, <span class="tok-str">"breadcrumbs"</span>, <span class="tok-str">"board"</span>, <span class="tok-str">"frame"</span>],  <span class="tok-com">// v1 IDENTITY: all present tiers, input order</span>
+    <span class="tok-str">"drop"</span>:   [],
+    <span class="tok-str">"rerank"</span>: []
+  <span class="tok-key">}</span>,
+  <span class="tok-str">"trace"</span>: <span class="tok-key">{</span>
+    <span class="tok-str">"cortexVersion"</span>: <span class="tok-str">"0.1.0"</span>,
+    <span class="tok-str">"strategy"</span>:      <span class="tok-str">"baseline-identity"</span>,
+    <span class="tok-str">"ruleFired"</span>:     <span class="tok-str">"baseline-identity"</span>,
+    <span class="tok-str">"inputs"</span>: <span class="tok-key">{</span>
+      <span class="tok-str">"activePaneId"</span>: <span class="tok-str">"p1"</span>,
+      <span class="tok-str">"sessionId"</span>:    <span class="tok-bool">null</span>,
+      <span class="tok-str">"trigger"</span>:      <span class="tok-str">"brief-inject"</span>,            <span class="tok-com">// session-start | pane-switch | catch-up | brief-inject</span>
+      <span class="tok-str">"tierKeys"</span>:     [<span class="tok-str">"project"</span>, <span class="tok-str">"pane"</span>, <span class="tok-str">"frame"</span>],
+      <span class="tok-str">"tierChars"</span>:    <span class="tok-key">{</span> <span class="tok-str">"project"</span>: <span class="tok-num">128</span>, <span class="tok-str">"pane"</span>: <span class="tok-num">64</span>, <span class="tok-str">"frame"</span>: <span class="tok-num">32</span> <span class="tok-key">}</span>  <span class="tok-com">// size probe (future budget input)</span>
+    <span class="tok-key">}</span>,
+    <span class="tok-str">"output"</span>: <span class="tok-key">{</span> <span class="tok-str">"orderedKeep"</span>: [<span class="tok-str">"project"</span>, <span class="tok-str">"pane"</span>, <span class="tok-str">"frame"</span>], <span class="tok-str">"dropped"</span>: [] <span class="tok-key">}</span>,
+    <span class="tok-str">"ts"</span>: <span class="tok-num">1234567890</span>                          <span class="tok-com">// = the `now` passed in (epoch-ms)</span>
+  <span class="tok-key">}</span>
+<span class="tok-key">}</span></pre>
+
+      <h3>Failure (daemon survives — TS treats as unavailable)</h3>
+<pre><span class="tok-key">{</span> <span class="tok-str">"id"</span>: <span class="tok-str">"r1"</span>, <span class="tok-str">"v"</span>: <span class="tok-num">1</span>, <span class="tok-str">"ok"</span>: <span class="tok-bool">false</span>,
+  <span class="tok-str">"error"</span>: <span class="tok-key">{</span> <span class="tok-str">"code"</span>: <span class="tok-str">"CORTEX_FAILED"</span>, <span class="tok-str">"message"</span>: <span class="tok-str">"…"</span> <span class="tok-key">}</span> <span class="tok-key">}</span></pre>
+
+      <p style="color:var(--ink-soft); font-size:14px; margin-bottom:0">
+        The TS facade (<code class="inline">createPythonCortexClient(core)</code>) validates this with
+        <code class="inline">CortexDecideResponseSchema</code> and <strong>never rejects</strong>: any miss —
+        unavailable daemon, error response, schema reject, even a rejected request — resolves to
+        <code class="inline">{ ok: false }</code>. The observer logs only on <code class="inline">ok:true</code>.
+      </p>
+    </div>
+  </section>
+
+  <!-- ════════════════ 6. DEFERRED ════════════════ -->
+  <section>
+    <h2><span class="num">6</span> Deferred to beads (tomorrow)</h2>
+    <p class="lede">Everything judgment-laden is explicitly out of this slice. The seam + contract +
+      observability are in; the intelligence and the flip are filed.</p>
+    <ul class="checklist">
+      <li>
+        <span class="box" aria-hidden="true"></span>
+        <span class="body"><strong>Real curation policy</strong> — the actual keep/drop/rerank rules +
+          budget allocation, replacing the identity baseline.</span>
+        <span class="bead">wsm-e2e-pinned-qky</span>
+      </li>
+      <li>
+        <span class="box" aria-hidden="true"></span>
+        <span class="body"><strong>Outcome-triggers + inject-gate</strong> — add command-outcome frames; the
+          diff-gated / debounce / significance policy for <em>when</em> an outcome warrants re-injection.
+          <small>Operator paused here — needs a decision.</small></span>
+        <span class="bead">wsm-e2e-pinned-e6s</span>
+      </li>
+      <li>
+        <span class="box" aria-hidden="true"></span>
+        <span class="body"><strong>The flip + shadow trust-gate</strong> — apply the cortex output as primary
+          (env-gated, TS twin = floor); define the signal that earns the flip.</span>
+        <span class="bead">wsm-e2e-pinned-896</span>
+      </li>
+      <li>
+        <span class="box" aria-hidden="true"></span>
+        <span class="body"><strong>Decision-memory / hysteresis</strong> — the externalized callable in the
+          memory/context module for oscillation damping.</span>
+        <span class="bead">wsm-e2e-pinned-icn</span>
+      </li>
+      <li>
+        <span class="box" aria-hidden="true"></span>
+        <span class="body"><strong>Session / connection-management logic</strong> — hot/hot uptime, per-project
+          warm agents. Interface is shaped now; logic deferred.</span>
+        <span class="bead">wsm-e2e-pinned-z5c</span>
+      </li>
+    </ul>
+  </section>
+
+  <!-- ════════════════ 7. ONE BREATH ════════════════ -->
+  <section>
+    <h2><span class="num">7</span> How it works, in one breath</h2>
+    <div class="breath">
+      <p>
+        When a brief is about to be injected, TypeScript snapshots the world into tiers and — in
+        <span class="accent">parallel, fire-and-forget</span> — hands those same tiers to the Python cortex,
+        which deterministically decides what it <em>would</em> keep, drop, or re-rank (today: an
+        <span class="accent">identity baseline</span> that keeps everything) and emits a structured
+        decision-trace; TypeScript <span class="accent">logs that trace and ignores it</span>, then runs the
+        unchanged synthesizer to build and inject exactly today's brief into Gemini Live. If the cortex is
+        absent, slow, or wrong, nothing happens — the live path never noticed it was there. We're building
+        the nervous system before we let it move a muscle.
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <span>The Python Cortex · Inc 4 · Slice 1 (SHADOW) · design 2026-06-27</span>
+    <span><code>handover/python-cortex-shadow.html</code></span>
+  </footer>
+
+  <div style="margin-top:24px; font-size:12.5px; color:var(--ink-mute)">
+    <strong style="color:var(--ink-soft)">Sources of truth:</strong>
+    <a class="srclink" href="#">docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md</a> ·
+    <a class="srclink" href="#">python/synthesizer/cortex.py</a> ·
+    <a class="srclink" href="#">python/synthesizer/dispatch.py</a> ·
+    <a class="srclink" href="#">src/memory/cortexClient.ts</a> ·
+    <a class="srclink" href="#">src/memory/index.ts (observeCortexShadow)</a> ·
+    <a class="srclink" href="#">src/voice/index.ts (injectMemoryBrief, ~L545)</a>
+  </div>
+
+</div>
+</body>
+</html>

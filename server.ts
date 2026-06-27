@@ -46,7 +46,8 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService, createPythonSynthClient, defaultModuleDir, type PythonSynthClient } from "./src/memory";
+import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient } from "./src/memory";
+import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -684,17 +685,42 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
 }
 
-// VERBATIM extraction from startServer (CC paydown). Best-effort, non-fatal construction of the
-// optional warm Python synthesizer client: disabled ⇒ undefined; an init throw is logged and
-// degrades to undefined (permanent fallback). Identical to the inline `if (memoryPythonEnabled) {
-// try { ... } catch { ... } }` block it replaced.
-function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean): PythonSynthClient | undefined {
-  if (!memoryPythonEnabled) return undefined;
+// Best-effort, non-fatal construction of the optional warm Python daemon: disabled ⇒ undefined; an
+// init throw is logged and degrades to undefined (permanent fallback). Seam Inc 1: builds ONE shared
+// daemon core and BOTH typed facades over it (synth + approval — one multiplexed daemon), and installs
+// the fire-and-forget approval SHADOW recorder. The returned synth client OWNS the shared core, so
+// close()'s `pythonSynthClient?.dispose()` tears the daemon down for both facades.
+function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaemonState?: (state: "python" | "fallback", reason: string) => void): { synth: PythonSynthClient | undefined; cortex: PythonCortexClient | undefined } {
+  // Always returns the client bag (fields undefined when disabled/failed) so the caller plain-destructures
+  // without optional chaining (keeps createMemorySubsystem under the CC<=10 gate).
+  // SHADOW is the only posture with no daemon: there is nothing for Python to be primary OVER, so the
+  // flip is forced OFF on both the disabled and init-failure paths (fail-closed to TS).
+  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); return { synth: undefined, cortex: undefined }; }
   try {
-    return createPythonSynthClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd() });
+    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), onStateChange: onDaemonState });
+    const approval = createPythonApprovalClient(core);
+    // SHADOW (task 1.6): Python parses each approval utterance alongside the AUTHORITATIVE TS result,
+    // fire-and-forget — counted, never acted on. Python being slow/absent/wrong is invisible + harmless.
+    installApprovalShadow(createApprovalShadowRecorder({
+      parse: (t) => approval.parse(t),
+      log: (line) => console.error(line),
+      redact: redactSecrets,
+    }));
+    // Inc 2 task 2.1 — the FLIP. Default OFF (shadow). JANUS_APPROVAL_PYTHON_PRIMARY=1 makes Python the
+    // PRIMARY approval parser with the TS twin as the fail-closed floor; JANUS_APPROVAL_PRIMARY_TIMEOUT_MS
+    // (optional) tightens/loosens the budget past which a slow daemon falls to the floor (default 600ms).
+    const flipOn = /^(1|true|on|yes)$/i.test((process.env.JANUS_APPROVAL_PYTHON_PRIMARY ?? "").trim());
+    const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
+    setApprovalPythonPrimary(flipOn, flipTimeoutMs);
+    if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
+    // Inc 4 slice 1 (SHADOW): the cortex facade rides the SAME multiplexed core (observe-only — its
+    // decision is logged, never applied). One daemon, many typed facades (synth + approval + cortex).
+    return { synth: synthFacadeOverCore(core), cortex: createPythonCortexClient(core) };
   } catch (e) {
-    console.error("[memory] python synth client init failed (continuing on fallback):", e);
-    return undefined;
+    console.error("[memory] python daemon client init failed (continuing on fallback):", e);
+    installApprovalShadow(null);
+    setApprovalPythonPrimary(false);
+    return { synth: undefined, cortex: undefined };
   }
 }
 
@@ -961,7 +987,7 @@ function listenServer(
 // client so startServer's close() can dispose the daemon. `manager`, `redactSecrets`,
 // `createMemoryService`, `clampMemorySynthTimeoutMs`, and `createPythonSynthClientOrUndefined` are
 // all module-scope; only the connection-bound `store` is injected.
-function createMemorySubsystem(store: JanusStore | null): {
+function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state: "python" | "fallback", reason: string) => void): {
   memory: ReturnType<typeof createMemoryService>;
   pythonSynthClient: PythonSynthClient | undefined;
 } {
@@ -983,7 +1009,7 @@ function createMemorySubsystem(store: JanusStore | null): {
   // Clamp at boot: a persisted 0/negative/NaN deadline would fire synthesizeAsync's race timer immediately
   // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
   const memorySynthTimeoutMs = clampMemorySynthTimeoutMs(manager.settings.advanced?.memorySynthTimeoutMs);
-  const pythonSynthClient: PythonSynthClient | undefined = createPythonSynthClientOrUndefined(memoryPythonEnabled);
+  const { synth: pythonSynthClient, cortex: cortexClient } = createPythonSynthClientOrUndefined(memoryPythonEnabled, onDaemonState);
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -994,6 +1020,7 @@ function createMemorySubsystem(store: JanusStore | null): {
     },
     pythonSynthClient,
     memorySynthTimeoutMs,
+    cortexClient,
   );
   return { memory, pythonSynthClient };
 }
@@ -1112,7 +1139,20 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
   // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).
   // Returns the memory service AND the python client (close() disposes the latter).
-  const { memory, pythonSynthClient } = createMemorySubsystem(store);
+  // Inc 2 task 2.3: the OBSERVABLE-DEGRADATION accumulator (warm-up-immune; the retire-gate metric).
+  // Declared just before the subsystem so the daemon_state callback can feed it every transition.
+  const daemonTracker = createDaemonStateTracker();
+  const { memory, pythonSynthClient } = createMemorySubsystem(store, (state, reason) => {
+    // Inc 2 task 2.2: fan out the daemon up/down transition as an additive, fire-and-forget WS frame.
+    // Belt-and-suspenders (emitState already swallows throws): nothing the operator SEES depends on this.
+    try { broadcast({ type: "daemon_state", state, reason }); } catch { /* best-effort observability frame */ }
+    // Inc 2 task 2.3: structured transition log + degradation accounting. Same best-effort posture as the
+    // broadcast above — must NEVER throw into the daemon path (nothing the operator sees depends on it).
+    try {
+      console.error(`[synth] daemon_state ${state} (${reason})`);
+      daemonTracker.onTransition(state);
+    } catch { /* best-effort observability accounting */ }
+  });
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
@@ -1663,6 +1703,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       releaseStopAll,
       isFrozen: () => coreState.frozen,
       memorySynthesizerState: () => memory.service.synthesizerState(),
+      // Inc 2 task 2.2 observability: snapshot the approval shadow diff counters for get_health.
+      // getApprovalShadow() is the process-wide singleton (works on REST/session-null AND voice);
+      // stats() returns a fresh copy — read-only, additive, never gates a decision.
+      approvalShadowStats: () => getApprovalShadow()?.stats() ?? null,
+      // Inc 2 task 2.3 observability: the cumulative, warm-up-immune daemon-degradation counters for
+      // get_health (transitions / msInFallback / currentlyFallback). Distinct from synthesizerState
+      // (the instantaneous read) — this is the POST-first-up retire-gate metric. Read-only, additive.
+      daemonStateStats: () => daemonTracker.stats(),
       // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,
@@ -1734,7 +1782,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     // Tear down the Python synthesizer daemon — stops the orphaned `python ... __main__.py` per instance.
+    // Disposing the synth facade disposes the SHARED core (seam Inc 1), so the approval facade dies too;
+    // clear the installed shadow recorder so it can't reference the dead core.
     pythonSynthClient?.dispose();
+    installApprovalShadow(null);
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).

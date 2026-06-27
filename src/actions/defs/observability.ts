@@ -8,6 +8,32 @@
  */
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
+import type { ShadowStats } from "../../approvalShadow";
+
+/**
+ * Inc 2 task 2.2 observability: derive the additive `shadow` health block from the optional ctx getter.
+ * Takes the GETTER (not its result) so the optional-call (`getter?.()`) branch lives HERE, not in the
+ * health handler (which would otherwise tip over the CC<=10 gate). null when no recorder/getter is wired
+ * (daemon off / memoryPythonEnabled false / voice+test ctx that omits the getter). match_rate divides by
+ * `compared` (= match + mismatch), NOT compared+missing — `missing` is daemon-down noise, not a TS/Python
+ * disagreement (mirrors recent.error_rate's derivation). CC=3.
+ */
+function shadowHealth(getter?: () => ShadowStats | null) {
+  const s = getter?.();
+  if (!s) return null;
+  return { compared: s.compared, match: s.match, mismatch: s.mismatch, missing: s.missing, match_rate: s.compared ? s.match / s.compared : 0 };
+}
+
+/**
+ * Inc 2 task 2.3 observability: derive the additive `daemon` health block from the optional ctx getter.
+ * Takes the GETTER (not its result) so the optional-call (`getter?.()`) branch lives HERE, not in the
+ * health handler (which would otherwise tip over the CC<=10 gate — mirrors shadowHealth above exactly).
+ * null when no tracker is wired (voice/test ctx that omits the getter). The stats it surfaces are the
+ * cumulative, warm-up-immune degradation counters (the retire-gate metric), NOT the instantaneous state.
+ */
+function daemonHealth(getter?: () => { transitions: number; msInFallback: number; currentlyFallback: boolean } | null) {
+  return getter?.() ?? null;
+}
 
 // z.coerce.number so a REST query string ("?limit=50") coerces to a number; voice passes real numbers.
 const ActionLogParams = z.object({
@@ -71,7 +97,7 @@ export const getHealth: ActionDef<typeof HealthParams> = {
         panes,
         pending_approvals: pendingApprovals,
         recent: { total: recentTotal, errors: recentErrors, error_rate: recentTotal ? recentErrors / recentTotal : 0 },
-        memory: { synthesizer: ctx.memorySynthesizerState?.() ?? "fallback" },
+        memory: { synthesizer: ctx.memorySynthesizerState?.() ?? "fallback", shadow: shadowHealth(ctx.approvalShadowStats), daemon: daemonHealth(ctx.daemonStateStats) },
       },
     };
   },

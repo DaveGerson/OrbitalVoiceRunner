@@ -30,6 +30,7 @@ import type { WebSocketServer } from "ws";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
+import { parseApprovalIntentShadowed, isApprovalPythonPrimary, resolveApprovalIntent } from "../approvalShadow";
 import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
@@ -544,6 +545,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
       try {
         if (!sess) return;
+        // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
+        // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
+        // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
+        memory.service.observeCortexShadow(activeId, Date.now());
         // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
         // synthesizeAsync owns the race + `source` authority and NEVER rejects.
         const brief = await memory.service.synthesizeAsync(activeId, Date.now());
@@ -1024,7 +1029,29 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
             // announced targeting (NOT FIFO, NOT substring matching).
-            const parsed = parseApprovalIntent(cleanUtter);
+            // Seam Inc 1 (task 1.6) / Inc 2 (task 2.1, the FLIP): the single production entry to approval
+            // parsing. In SHADOW (default) this is the SYNCHRONOUS, byte-identical shadow tap — Python
+            // observes every routed utterance fire-and-forget while TS stays authoritative. In FLIP mode
+            // (JANUS_APPROVAL_PYTHON_PRIMARY) Python is PRIMARY with the TS twin as the fail-closed floor;
+            // resolution is async (await Python, fall to the floor on miss/timeout), so route the result
+            // from a microtask. resolveApprovalIntent NEVER rejects and NEVER fails open.
+            // Rollout note (reviewed): deferring up to the budget can REORDER routing of rapid-fire votes
+            // vs arrival, but the reorder lands two SYNCHRONOUS resolveDecision calls on one messageId, and
+            // the atomic claim() gate (pendingApprovals.ts resolveDecision:394-397 / claim:679-692 — durable
+            // SQL `UPDATE...WHERE claimed=0 => changes===1`, single-winner) is ORDER-INDEPENDENT: exactly one
+            // resolve writes, the loser is lost_race/not_found. selectApprovalTarget reads the LIVE entries
+            // post-await and CLARIFIES on ambiguity, so a stale second vote is at worst a not_found no-op or a
+            // clarify — never a double-act or wrong-pane resolve. Benign delta, NOT a fail-open. This is the
+            // same exactly-once invariant locked by tests/test_approvals_wse.ts (two resolves on one id =>
+            // one write) and the resolveDecision/claim() unit locks — a flip-specific test would only
+            // re-exercise the identical synchronous gate (triage: flip-vote-order, accept-as-designed).
+            if (isApprovalPythonPrimary()) {
+              void resolveApprovalIntent(cleanUtter)
+                .then((parsed) => { if (parsed.intent !== "none") routeApprovalIntent(parsed, cleanUtter, session); })
+                .catch(() => { /* resolveApprovalIntent is fail-closed; never let a stray throw escape the loop */ });
+              return;
+            }
+            const parsed = parseApprovalIntentShadowed(cleanUtter);
             if (parsed.intent === "none") return;
             routeApprovalIntent(parsed, cleanUtter, session);
           };
