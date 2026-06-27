@@ -1,0 +1,205 @@
+[
+  {
+    "name": "all-tiers-identity",
+    "request": {
+      "id": "gold-a",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": {
+        "project": {
+          "projectId": "proj-1",
+          "name": "OrbitalVoice",
+          "summary": "Voice-driven orchestrator for CLI panes. Manages context synthesis.",
+          "keyTerms": ["pane", "cortex", "seam"],
+          "recentDecisions": ["Use SQLite ledger by default", "Python owns decision logic"]
+        },
+        "pane": {
+          "paneId": "pane-1",
+          "name": "claude",
+          "runtimeType": "claude-cli",
+          "status": "Running",
+          "lastCommand": "npm test",
+          "recent": ["Tests passed", "Lint clean"]
+        },
+        "breadcrumbs": [{"ts": 1000, "paneId": "pane-1", "text": "Implemented cortex decision trace"}],
+        "board": [
+          {"paneId": "pane-1", "name": "claude", "status": "Running"},
+          {"paneId": "pane-2", "name": "bash", "status": "Idle"}
+        ],
+        "frame": {"role": "Janus", "gatePosture": "Auto", "prefs": ["verbosity:low"]}
+      },
+      "ctx": {"activePaneId": "pane-1", "sessionId": "sess-abc", "trigger": "brief-inject"},
+      "now": 9000
+    },
+    "response": {
+      "id": "gold-a",
+      "v": 1,
+      "ok": true,
+      "decision": {
+        "keep": ["project", "pane", "breadcrumbs", "board", "frame"],
+        "drop": [],
+        "rerank": []
+      },
+      "trace": {
+        "cortexVersion": "0.1.0",
+        "strategy": "baseline-identity",
+        "ruleFired": "baseline-identity",
+        "inputs": {
+          "activePaneId": "pane-1",
+          "sessionId": "sess-abc",
+          "trigger": "brief-inject",
+          "tierKeys": ["project", "pane", "breadcrumbs", "board", "frame"],
+          "tierChars": {"project": 252, "pane": 157, "breadcrumbs": 79, "board": 117, "frame": 68}
+        },
+        "output": {
+          "orderedKeep": ["project", "pane", "breadcrumbs", "board", "frame"],
+          "dropped": []
+        },
+        "ts": 9000,
+        "shadowBudget": {
+          "perTierChars": {"project": 160, "pane": 90, "breadcrumbs": 43, "board": 21, "frame": 48},
+          "textLen": 366
+        }
+      }
+    }
+  },
+  {
+    "name": "frame-only-empty-tiers",
+    "request": {
+      "id": "gold-b",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": {
+        "project": null,
+        "pane": null,
+        "breadcrumbs": [],
+        "board": [],
+        "frame": {"role": "Janus", "gatePosture": "Ask", "prefs": []}
+      },
+      "ctx": {"activePaneId": null, "sessionId": null, "trigger": "manual"},
+      "now": 1
+    },
+    "response": {
+      "id": "gold-b",
+      "v": 1,
+      "ok": true,
+      "decision": {"keep": ["frame"], "drop": [], "rerank": []},
+      "trace": {
+        "cortexVersion": "0.1.0",
+        "strategy": "baseline-identity",
+        "ruleFired": "baseline-identity",
+        "inputs": {
+          "activePaneId": null,
+          "sessionId": null,
+          "trigger": "manual",
+          "tierKeys": ["frame"],
+          "tierChars": {"frame": 52}
+        },
+        "output": {"orderedKeep": ["frame"], "dropped": []},
+        "ts": 1,
+        "shadowBudget": {
+          "perTierChars": {"frame": 24},
+          "textLen": 24
+        }
+      }
+    }
+  },
+  {
+    "name": "partial-tiers",
+    "request": {
+      "id": "gold-c",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": {
+        "project": {
+          "projectId": "p2",
+          "name": "Infra",
+          "summary": "Infrastructure project.",
+          "keyTerms": ["deploy"],
+          "recentDecisions": []
+        },
+        "pane": null,
+        "breadcrumbs": [],
+        "board": [],
+        "frame": {"role": "Janus", "gatePosture": "Off", "prefs": []}
+      },
+      "ctx": {"activePaneId": "pane-99", "sessionId": null, "trigger": "keystroke"},
+      "now": 5000
+    },
+    "response": {
+      "id": "gold-c",
+      "v": 1,
+      "ok": true,
+      "decision": {"keep": ["project", "frame"], "drop": [], "rerank": []},
+      "trace": {
+        "cortexVersion": "0.1.0",
+        "strategy": "baseline-identity",
+        "ruleFired": "baseline-identity",
+        "inputs": {
+          "activePaneId": "pane-99",
+          "sessionId": null,
+          "trigger": "keystroke",
+          "tierKeys": ["project", "frame"],
+          "tierChars": {"project": 121, "frame": 52}
+        },
+        "output": {"orderedKeep": ["project", "frame"], "dropped": []},
+        "ts": 5000,
+        "shadowBudget": {
+          "perTierChars": {"project": 54, "frame": 24},
+          "textLen": 79
+        }
+      }
+    }
+  },
+  {
+    "name": "shadow-budget-absent",
+    "request": {
+      "id": "gold-d",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": {"breadcrumbs": [123]},
+      "ctx": {"activePaneId": null, "sessionId": null, "trigger": "test"},
+      "now": 42
+    },
+    "response": {
+      "id": "gold-d",
+      "v": 1,
+      "ok": true,
+      "decision": {"keep": ["breadcrumbs"], "drop": [], "rerank": []},
+      "trace": {
+        "cortexVersion": "0.1.0",
+        "strategy": "baseline-identity",
+        "ruleFired": "baseline-identity",
+        "inputs": {
+          "activePaneId": null,
+          "sessionId": null,
+          "trigger": "test",
+          "tierKeys": ["breadcrumbs"],
+          "tierChars": {"breadcrumbs": 5}
+        },
+        "output": {"orderedKeep": ["breadcrumbs"], "dropped": []},
+        "ts": 42
+      }
+    }
+  },
+  {
+    "name": "cortex-failed-bad-tiers",
+    "request": {
+      "id": "gold-e",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": 123,
+      "ctx": {"activePaneId": null, "sessionId": null, "trigger": "test"},
+      "now": 0
+    },
+    "response": {
+      "id": "gold-e",
+      "v": 1,
+      "ok": false,
+      "error": {
+        "code": "CORTEX_FAILED",
+        "message": "'int' object has no attribute 'get'"
+      }
+    }
+  }
+]
