@@ -181,6 +181,10 @@ describe("resolvePaneCommand", () => {
   });
   it("preserves a configured Custom command verbatim", () => {
     assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "pwsh.exe" }]), "pwsh.exe");
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "  pwsh.exe -NoLogo  " }]), "  pwsh.exe -NoLogo  ");
+  });
+  it("treats a configured whitespace-only command as unresolved", () => {
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "   " }]), undefined);
   });
   it("a preset present but without a command falls through to the default map", () => {
     assert.strictEqual(resolvePaneCommand("Codex", [{ name: "Codex" }]), "codex");

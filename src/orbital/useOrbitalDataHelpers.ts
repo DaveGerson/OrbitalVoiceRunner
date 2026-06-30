@@ -273,8 +273,8 @@ export function globalModeToast(mode: string): string {
 export function resolvePaneCommand(
   toolPreset: string, presets: { name: string; command?: string }[] | undefined,
 ): string | undefined {
-  const configured = presets?.find((p) => p.name === toolPreset)?.command?.trim();
-  if (configured) return configured;
+  const configured = presets?.find((p) => p.name === toolPreset)?.command;
+  if (configured?.trim()) return configured;
   return ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" } as Record<string, string>)[toolPreset];
 }
 
