@@ -35,6 +35,15 @@ function makeClient(child: FakeChild, over: Record<string, unknown> = {}) {
   });
 }
 
+async function until(predicate: () => boolean, timeoutMs = 1000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return predicate();
+}
+
 test("discoverPythonInterpreter honors JANUS_PYTHON override first", () => {
   const cands = discoverPythonInterpreter({ JANUS_PYTHON: "/usr/bin/py3" } as any, "linux");
   assert.equal(cands[0].cmd, "/usr/bin/py3");
@@ -126,8 +135,7 @@ test("falls through to the next interpreter candidate when the first never pings
     spawnImpl: (() => { const c = new FakeChild(); children.push(c); return c; }) as any,
   });
   // first candidate (py -3) spawns but never pings → ping-timeout advances to the next candidate
-  await new Promise((r) => setTimeout(r, 45));
-  assert.ok(children.length >= 2, "should have spawned a second candidate after the ping-timeout");
+  assert.equal(await until(() => children.length >= 2), true, "should have spawned a second candidate after the ping-timeout");
   children[children.length - 1].reply({ v: 1, ok: true, pong: true, synthVersion: "1.0.0" });
   await new Promise((r) => setImmediate(r));
   assert.equal(client.available(), true);
