@@ -25,7 +25,6 @@ These bypass the capability gate entirely — they work even while the system is
 | `create_pane_note` | rest | no | Operator-UI |
 | `create_project_note` | rest | no | Operator-UI |
 | `delete_archived_pane` | rest | no | Permanently delete an archived pane record from the restore tray (operator-UI, ungated) |
-| `deliver_handoff` | voice / rest | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 | `edit_note` | rest | no | Operator-UI |
 | `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
 | `get_ledger` | rest | no | Read the full workspaces ledger (project/pane tree the UI loads on page open) |
@@ -43,6 +42,14 @@ These bypass the capability gate entirely — they work even while the system is
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 | `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
 | `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
+
+## Internally gated actions
+
+These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating in `runAction`. Their handlers still route through the named capability gate before doing privileged work.
+
+| Action | Surfaces | Read-only | Description |
+| --- | --- | --- | --- |
+| `deliver_handoff` | voice / rest | no | Deliver a STAGED handoff into the target pane's live session (GATED by the deliver_handoff capability + the pane's effective mode) |
 
 ## Add an automation rule
 
@@ -341,11 +348,3 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `dispatch_to_panes` | voice / rest | no | Send one instruction (raw text or a prompt template with slot values) to SEVERAL panes at once |
 | `propose_command` | voice | no | Direct work to the pane the operator currently has OPEN (the active pane) |
-
-## Capabilities without actions (matrix-only)
-
-These capability rows exist in the matrix (so they are tunable and reserved) but have no action wired to them in the current registry.
-
-| Capability | Label | Default gate | Category |
-| --- | --- | --- | --- |
-| `deliver_handoff` | Hand a prompt to another pane | Ask | Acting in a pane |
