@@ -7,7 +7,7 @@ on:
 
 jobs:
   ci:
-    name: "lint + unit / node22 / ubuntu"
+    name: "quality gates / node22 / ubuntu"
     runs-on: ubuntu-latest
 
     steps:
