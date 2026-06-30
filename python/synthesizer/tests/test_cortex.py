@@ -139,5 +139,26 @@ class CortexTest(unittest.TestCase):
             % (len(mismatches), "\n".join(mismatches)))
 
 
+    def test_exited_pane_drops_pane_tier(self):
+        tiers = dict(TIERS)
+        tiers["pane"] = {"paneId": "p1", "name": "main", "runtimeType": "claude",
+                         "status": "Exited", "lastCommand": "ls", "recent": ["done"]}
+        out = cortex.decide(tiers, CTX, 0)
+        self.assertNotIn("pane", out["decision"]["keep"])
+        self.assertIn("pane", out["decision"]["drop"])
+        self.assertEqual(out["trace"]["ruleFired"], "exited-pane")
+
+    def test_idle_pane_is_kept(self):
+        tiers = dict(TIERS)
+        tiers["pane"] = {"paneId": "p1", "name": "main", "runtimeType": "claude",
+                         "status": "Idle", "lastCommand": "ls", "recent": ["ok"]}
+        out = cortex.decide(tiers, CTX, 0)
+        self.assertIn("pane", out["decision"]["keep"])      # idle ≈ just-finished ≈ relevant
+        self.assertEqual(out["trace"]["ruleFired"], "baseline-identity")
+
+    def test_cortex_version_is_0_2_0(self):
+        self.assertEqual(cortex.CORTEX_VERSION, "0.2.0")
+
+
 if __name__ == "__main__":
     unittest.main()

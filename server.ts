@@ -46,7 +46,7 @@ import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type Res
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
-import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient } from "./src/memory";
+import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient, type CortexDecisionSink } from "./src/memory";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
@@ -993,6 +993,14 @@ function listenServer(
   });
 }
 
+// B-3 measurement spine: bind the store's fail-soft cortex-decision writer as the SHADOW-tap
+// decisionSink. A null store (legacy ledger / store-init failure) ⇒ undefined ⇒ the tap observes
+// but persists nothing (parity preserved). Extracted from createMemorySubsystem to keep it ≤ CC 10.
+function bindCortexDecisionSink(store: JanusStore | null): CortexDecisionSink | undefined {
+  if (!store) return undefined;
+  return (row) => store.recordCortexDecision(row);
+}
+
 // VERBATIM extraction from startServer (CC paydown). Builds the Memory Synthesis subsystem (P0a
 // in-process anti-rot layer + the optional P0b warm Python synthesizer). Every dependency, default,
 // and null-safe shim is byte-identical to the inline block: the null-store WorldModel shim, the
@@ -1025,6 +1033,10 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
   // (?? does not catch 0), pinning Janus to permanent fallback even with a healthy daemon. Floor to the default.
   const memorySynthTimeoutMs = clampMemorySynthTimeoutMs(manager.settings.advanced?.memorySynthTimeoutMs);
   const { synth: pythonSynthClient, cortex: cortexClient } = createPythonSynthClientOrUndefined(memoryPythonEnabled, onDaemonState);
+  // B-3 measurement spine: persist each cortex decision-trace via the SHADOW tap. The bound store
+  // writer is the decisionSink (null store ⇒ undefined ⇒ the tap observes but persists nothing —
+  // parity preserved). recordCortexDecision swallows + console.errors on any DB fault (fail-soft).
+  const cortexDecisionSink = bindCortexDecisionSink(store);
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -1036,6 +1048,7 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
     pythonSynthClient,
     memorySynthTimeoutMs,
     cortexClient,
+    cortexDecisionSink,
   );
   return { memory, pythonSynthClient };
 }

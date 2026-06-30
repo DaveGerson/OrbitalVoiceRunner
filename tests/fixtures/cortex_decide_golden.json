@@ -41,7 +41,7 @@
         "rerank": []
       },
       "trace": {
-        "cortexVersion": "0.1.0",
+        "cortexVersion": "0.2.0",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -85,7 +85,7 @@
       "ok": true,
       "decision": {"keep": ["frame"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.1.0",
+        "cortexVersion": "0.2.0",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -132,7 +132,7 @@
       "ok": true,
       "decision": {"keep": ["project", "frame"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.1.0",
+        "cortexVersion": "0.2.0",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -167,7 +167,7 @@
       "ok": true,
       "decision": {"keep": ["breadcrumbs"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.1.0",
+        "cortexVersion": "0.2.0",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -199,6 +199,70 @@
       "error": {
         "code": "CORTEX_FAILED",
         "message": "'int' object has no attribute 'get'"
+      }
+    }
+  },
+  {
+    "name": "exited-pane-drops-pane-tier",
+    "request": {
+      "id": "gold-f",
+      "v": 1,
+      "op": "cortex.decide",
+      "tiers": {
+        "project": {
+          "projectId": "proj-1",
+          "name": "OrbitalVoice",
+          "summary": "Voice-driven orchestrator for CLI panes. Manages context synthesis.",
+          "keyTerms": ["pane", "cortex", "seam"],
+          "recentDecisions": ["Use SQLite ledger by default", "Python owns decision logic"]
+        },
+        "pane": {
+          "paneId": "pane-1",
+          "name": "main",
+          "runtimeType": "claude",
+          "status": "Exited",
+          "lastCommand": "ls",
+          "recent": ["done"]
+        },
+        "breadcrumbs": [{"ts": 2000, "paneId": "pane-1", "text": "Ran ls command"}],
+        "board": [
+          {"paneId": "pane-1", "name": "main", "status": "Exited"},
+          {"paneId": "pane-2", "name": "bash", "status": "Running"}
+        ],
+        "frame": {"role": "Janus", "gatePosture": "Auto", "prefs": []}
+      },
+      "ctx": {"activePaneId": "pane-1", "sessionId": "sess-xyz", "trigger": "brief-inject"},
+      "now": 7000
+    },
+    "response": {
+      "id": "gold-f",
+      "v": 1,
+      "ok": true,
+      "decision": {
+        "keep": ["project", "breadcrumbs", "board", "frame"],
+        "drop": ["pane"],
+        "rerank": []
+      },
+      "trace": {
+        "cortexVersion": "0.2.0",
+        "strategy": "exited-pane",
+        "ruleFired": "exited-pane",
+        "inputs": {
+          "activePaneId": "pane-1",
+          "sessionId": "sess-xyz",
+          "trigger": "brief-inject",
+          "tierKeys": ["project", "pane", "breadcrumbs", "board", "frame"],
+          "tierChars": {"project": 252, "pane": 122, "breadcrumbs": 60, "board": 117, "frame": 53}
+        },
+        "output": {
+          "orderedKeep": ["project", "breadcrumbs", "board", "frame"],
+          "dropped": ["pane"]
+        },
+        "ts": 7000,
+        "shadowBudget": {
+          "perTierChars": {"project": 160, "pane": 57, "breadcrumbs": 24, "board": 19, "frame": 25},
+          "textLen": 289
+        }
       }
     }
   }

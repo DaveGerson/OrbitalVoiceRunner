@@ -60,6 +60,41 @@ import { findPaneOwningProject } from "../paneOwnership";
 import type { CreatedMemory } from "../memory";
 import { briefIsForActivePane } from "../memory";
 
+// B-3 measurement spine: the per-injection correlation key. A module-scope monotonic counter mints
+// `inj-<ts>-<seq>` once per injectMemoryBrief; the same id is stamped on the cortex decision-trace
+// (observeCortexShadow) and stashed on the session state (state.lastInjectId) so the Gemini
+// turn-usage capture can join the nearest preceding injection by time. Exported for unit testing.
+let injectSeq = 0;
+export function mintInjectId(): string {
+  return `inj-${Date.now()}-${++injectSeq}`;
+}
+
+/**
+ * B-3 measurement spine (Task 7): capture per-turn Gemini token cost at the turn-complete boundary.
+ * Reads `message.usageMetadata` (top-level on @google/genai LiveServerMessage; fields
+ * promptTokenCount / responseTokenCount / totalTokenCount per UsageMetadata) and persists one
+ * gemini_turn_usage row joined to the nearest preceding injection (`lastInjectId`). Fail-soft: an
+ * absent `usageMetadata`, a null store, or a writer throw is a no-op — the voice turn never blocks.
+ * Exported as a pure unit so the capture is testable without booting a live session.
+ */
+export function captureTurnUsage(message: any, store: JanusStore | null, lastInjectId: string | null): void {
+  const u = message?.usageMetadata;
+  if (!store || !u) return;
+  try {
+    store.recordGeminiTurnUsage({
+      ts: Date.now(),
+      sessionId: null,
+      injectId: lastInjectId ?? null,
+      promptTokens: u.promptTokenCount ?? null,
+      responseTokens: u.responseTokenCount ?? null,
+      totalTokens: u.totalTokenCount ?? null,
+    });
+  } catch (e) {
+    // Measurement must never throw into the voice turn — swallow + log.
+    console.error("[cortex-usage] captureTurnUsage failed:", e);
+  }
+}
+
 /**
  * narrate a SYSTEM EVENT into the live session so the model speaks it to the operator. Pure (no
  * closure state) — exported so gating injects the SAME identity server.ts feeds into attachVoiceSession,
@@ -273,6 +308,10 @@ interface VoiceSessionState {
   // disarmed by the next successful hoist, which then broadcasts voice_channel_restored. A FIRST
   // connect (no prior loss) must NOT announce "restored" — that is exactly what this flag encodes.
   voiceLostSinceLastRestore: boolean;
+  // B-3 measurement spine: the injectId minted by the most recent injectMemoryBrief on THIS
+  // connection. The Gemini turn-usage capture joins each turn's usageMetadata to the nearest
+  // preceding injection by reading this (null until the first brief is injected).
+  lastInjectId: string | null;
 }
 
 /**
@@ -510,6 +549,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       connectGeneration: 0,
       // 2S.5: no loss announced yet on this fresh connection — the first hoist stays silent.
       voiceLostSinceLastRestore: false,
+      // B-3: no brief injected yet on this connection — the turn-usage join has no key until the first.
+      lastInjectId: null,
     };
 
     const turnId = (): string => {
@@ -545,10 +586,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
       try {
         if (!sess) return;
+        // B-3 measurement spine: mint the per-injection correlation key ONCE. It keys the SHADOW
+        // decision row (observed for this trigger regardless of whether the brief is ultimately
+        // injected) and is stashed on session state ONLY AFTER the brief actually reaches Gemini
+        // (below) — so the turn-usage capture joins the nearest preceding ACTUALLY-injected brief,
+        // never one dropped by the pane-switch / empty-text guards.
+        const injectId = mintInjectId();
         // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
         // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
         // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
-        memory.service.observeCortexShadow(activeId, Date.now());
+        memory.service.observeCortexShadow(activeId, Date.now(), "brief-inject", injectId);
         // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
         // synthesizeAsync owns the race + `source` authority and NEVER rejects.
         const brief = await memory.service.synthesizeAsync(activeId, Date.now());
@@ -562,6 +609,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
             turnComplete: true,
           });
+          // Join key: only NOW (the brief actually entered Gemini) does this injection become the
+          // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
+          state.lastInjectId = injectId;
         }
       } catch (e) {
         // The whole body is guarded so the returned promise NEVER rejects — the three fire-and-forget
@@ -1121,6 +1171,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // START of the next operator turn in onOperatorSpeech.)
             if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
               state.muteCurrentModelTurn = false;
+              // B-3 measurement spine (Task 7): capture this turn's Gemini token cost (usageMetadata)
+              // joined to the nearest preceding injection. Fail-soft no-op when usageMetadata is absent.
+              captureTurnUsage(message, store, state.lastInjectId);
             }
           };
 

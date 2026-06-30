@@ -9,7 +9,7 @@ deterministic prosthetic. Spec: docs/superpowers/specs/2026-06-27-python-cortex-
 """
 import json
 
-CORTEX_VERSION = "0.1.0"
+CORTEX_VERSION = "0.2.0"
 
 # Canonical tier order (matches the synthesizer's tier set). Identity preserves this order.
 _TIER_KEYS = ("project", "pane", "breadcrumbs", "board", "frame")
@@ -43,8 +43,18 @@ def _size_probe(value):
         return len(str(value))
 
 
+def _apply_rules(tiers, kept):
+    """Return (keep, drop, rule). v0.2.0 ladder: exited-pane, else identity.
+    `kept` is the present-tier list in canonical order (from decide)."""
+    pane = (tiers or {}).get("pane")
+    if pane and str(pane.get("status", "")).lower() == "exited" and "pane" in kept:
+        keep = [k for k in kept if k != "pane"]
+        return keep, ["pane"], "exited-pane"
+    return list(kept), [], "baseline-identity"
+
+
 def decide(tiers, ctx, now):
-    """Return {"decision": {...}, "trace": {...}}. Identity baseline; deterministic.
+    """Return {"decision": {...}, "trace": {...}}. Deterministic curation ladder.
 
     `tiers`: the MemoryTiers dict. `ctx`: {activePaneId, sessionId?, trigger}. `now`: epoch-ms.
     Total on a dict/None for either arg; the dispatch wrapper guards any other shape (-> CORTEX_FAILED).
@@ -53,12 +63,13 @@ def decide(tiers, ctx, now):
     ctx = ctx or {}
     kept = [k for k in _TIER_KEYS if _present(tiers.get(k))]
     tier_chars = {k: _size_probe(tiers.get(k)) for k in kept}
-    decision = {"keep": list(kept), "drop": [], "rerank": []}
+    keep, drop, rule = _apply_rules(tiers, kept)
+    decision = {"keep": keep, "drop": drop, "rerank": []}
     shadow = _shadow_budget(tiers, ctx)
     trace = {
         "cortexVersion": CORTEX_VERSION,
-        "strategy": "baseline-identity",
-        "ruleFired": "baseline-identity",
+        "strategy": rule,
+        "ruleFired": rule,
         "inputs": {
             "activePaneId": ctx.get("activePaneId"),
             "sessionId": ctx.get("sessionId"),
@@ -66,7 +77,7 @@ def decide(tiers, ctx, now):
             "tierKeys": list(kept),
             "tierChars": tier_chars,
         },
-        "output": {"orderedKeep": list(kept), "dropped": []},
+        "output": {"orderedKeep": keep, "dropped": drop},
         "ts": now,
     }
     if shadow is not None:
