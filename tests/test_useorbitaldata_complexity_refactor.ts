@@ -174,10 +174,13 @@ describe("resolvePaneCommand", () => {
     assert.strictEqual(resolvePaneCommand("Claude Code", []), "claude");
     assert.strictEqual(resolvePaneCommand("Codex", undefined), "codex");
     assert.strictEqual(resolvePaneCommand("Antigravity", []), "antigravity");
-    assert.strictEqual(resolvePaneCommand("Custom", []), "bash");
+    assert.strictEqual(resolvePaneCommand("Custom", []), undefined);
   });
-  it("falls back to bash for an unknown preset", () => {
-    assert.strictEqual(resolvePaneCommand("Mystery", []), "bash");
+  it("leaves an unknown preset unresolved for the server to derive", () => {
+    assert.strictEqual(resolvePaneCommand("Mystery", []), undefined);
+  });
+  it("preserves a configured Custom command verbatim", () => {
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "pwsh.exe" }]), "pwsh.exe");
   });
   it("a preset present but without a command falls through to the default map", () => {
     assert.strictEqual(resolvePaneCommand("Codex", [{ name: "Codex" }]), "codex");

@@ -269,12 +269,13 @@ export function globalModeToast(mode: string): string {
 }
 
 /** createPane: resolve the spawn command for a tool preset — a configured preset's command wins,
- *  else the built-in default for that preset name, else bash. */
+ *  else the built-in default for known preset names; undefined lets the server derive the shell. */
 export function resolvePaneCommand(
   toolPreset: string, presets: { name: string; command?: string }[] | undefined,
-): string {
-  return presets?.find((p) => p.name === toolPreset)?.command
-    || ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity", Custom: "bash" }[toolPreset] ?? "bash");
+): string | undefined {
+  const configured = presets?.find((p) => p.name === toolPreset)?.command?.trim();
+  if (configured) return configured;
+  return ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" } as Record<string, string>)[toolPreset];
 }
 
 /** createPane: the pane id slug (lowercased, non-alnum→dash, trimmed, capped 24) + a 4-char suffix
