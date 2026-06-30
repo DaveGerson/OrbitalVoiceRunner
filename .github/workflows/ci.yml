@@ -23,11 +23,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build
+        run: npm run build
+
+      - name: Complexity lint
+        run: npm run complexity
+
+      - name: Python parity tests
+        run: npm run test:py
+
       - name: Lint (tsc --noEmit)
         run: npm run lint
 
       - name: Unit tests
         run: npm test
+
+      - name: Dependency audit
+        run: npm audit --audit-level=moderate
 
   # The component lane (Vitest + jsdom + RTL): src/**/*.test.tsx React component tests. No
   # browser/Playwright install needed — jsdom runs headless in Node. Disjoint from the node:test
