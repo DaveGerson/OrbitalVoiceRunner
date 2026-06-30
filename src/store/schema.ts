@@ -274,6 +274,40 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       ALTER TABLE panes_archive ADD COLUMN human_context TEXT NOT NULL DEFAULT '[]';
     `);
   },
+  // v9 (B-3 cortex measurement spine): two append-only observability tables that join
+  // every cortex decision and each Gemini turn's token cost to the injection that caused
+  // them.  `inject_id` is a per-injection key minted in injectMemoryBrief (Task 6).
+  // `applied` distinguishes SHADOW (counterfactual, 0) from a future realized flip (1).
+  // Purely additive (new tables + indexes only) — safe on an already-migrated DB.
+  (db) => {
+    db.exec(`
+      CREATE TABLE cortex_decision (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        inject_id TEXT,
+        session_id TEXT,
+        active_pane_id TEXT,
+        trigger TEXT,
+        rule_fired TEXT,
+        applied INTEGER NOT NULL DEFAULT 0,   -- 0 = SHADOW (counterfactual), 1 = applied (post-flip)
+        trace_json TEXT NOT NULL
+      );
+      CREATE INDEX idx_cortex_decision_ts        ON cortex_decision(ts);
+      CREATE INDEX idx_cortex_decision_inject_id ON cortex_decision(inject_id);
+
+      CREATE TABLE gemini_turn_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        session_id TEXT,
+        inject_id TEXT,                        -- nearest preceding injection, by time
+        prompt_tokens INTEGER,
+        response_tokens INTEGER,
+        total_tokens INTEGER
+      );
+      CREATE INDEX idx_gemini_turn_usage_ts        ON gemini_turn_usage(ts);
+      CREATE INDEX idx_gemini_turn_usage_inject_id ON gemini_turn_usage(inject_id);
+    `);
+  },
 ];
 
 /** Apply any migrations whose version is greater than the DB's current user_version. */

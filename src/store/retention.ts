@@ -8,6 +8,10 @@ export interface PruneOpts {
   scrollbackDirs: string[];   // dirs to scan for orphaned .janus_scrollback_*.log
   /** action_log TTL in days (4E.3c). Default 30. See ACTION_LOG_TTL_DAYS. */
   actionLogTtlDays?: number;
+  /** cortex_decision TTL in days (B-3 spine). Default 30. */
+  cortexDecisionTtlDays?: number;
+  /** gemini_turn_usage TTL in days (B-3 spine). Default 30. */
+  geminiTurnUsageTtlDays?: number;
 }
 
 /**
@@ -52,6 +56,13 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     // 4E.3c: action_log had NO retention at all. TTL default 30d — see ACTION_LOG_TTL_DAYS
     // for why that is safely above the PLM4 idempotency replay window.
     db.prepare("DELETE FROM action_log WHERE ts < ?").run(opts.now - (opts.actionLogTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+    // B-3 measurement spine: cortex_decision + gemini_turn_usage are append-only observability
+    // tables with no replay requirement — 30d TTL keeps enough history for trend analysis while
+    // bounding unbounded growth. Only runs if the tables exist (v9+ DB).
+    try {
+      db.prepare("DELETE FROM cortex_decision WHERE ts < ?").run(opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+      db.prepare("DELETE FROM gemini_turn_usage WHERE ts < ?").run(opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+    } catch { /* pre-v9 DB: tables absent, skip */ }
   });
   tx();
   // Orphaned scrollback sweep: delete .log files not referenced by any live or archived pane.
@@ -87,6 +98,10 @@ export interface SweepOpts {
   archiveTtlDays: number;
   /** action_log TTL in days. Default ACTION_LOG_TTL_DAYS (30 — ≥ the PLM4 replay window). */
   actionLogTtlDays?: number;
+  /** cortex_decision TTL in days (B-3 spine). Default 30. */
+  cortexDecisionTtlDays?: number;
+  /** gemini_turn_usage TTL in days (B-3 spine). Default 30. */
+  geminiTurnUsageTtlDays?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
 }
@@ -104,6 +119,8 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
   const evCutoff = opts.now - opts.eventsTtlDays * day;
   const arCutoff = opts.now - opts.archiveTtlDays * day;
   const alCutoff = opts.now - (opts.actionLogTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
+  const cdCutoff = opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
+  const gtuCutoff = opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
   const pendingCutoff = opts.now - PENDING_PRUNE_GRACE_MS;
 
   const deleted: Record<string, number> = {};
@@ -137,6 +154,16 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
   step("action_log",
     "DELETE FROM action_log WHERE id IN (SELECT id FROM action_log WHERE ts < ? ORDER BY id LIMIT ?)",
     [alCutoff]);
+  // B-3 spine: measurement tables pruned on same cadence as action_log. Guard with try/catch
+  // so a pre-v9 DB (tables absent) just skips these steps gracefully.
+  try {
+    step("cortex_decision",
+      "DELETE FROM cortex_decision WHERE id IN (SELECT id FROM cortex_decision WHERE ts < ? ORDER BY id LIMIT ?)",
+      [cdCutoff]);
+    step("gemini_turn_usage",
+      "DELETE FROM gemini_turn_usage WHERE id IN (SELECT id FROM gemini_turn_usage WHERE ts < ? ORDER BY id LIMIT ?)",
+      [gtuCutoff]);
+  } catch { /* pre-v9 DB: tables absent, skip */ }
 
   return { deleted, more };
 }

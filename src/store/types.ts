@@ -134,3 +134,14 @@ export interface CountRow { n: number }
 export interface IdRow { id: string }
 /** An FTS search hit (`id`, `snippet`, `rank`) — id may arrive as a number from the rowid join. */
 export interface SearchHitRow { id: string | number; snippet: string; rank: number }
+/** Raw `cortex_decision` row (schema v9, B-3 spine). `applied` is a SQLite boolean (0|1). */
+export interface CortexDecisionRow {
+  id: number; ts: number; inject_id: string | null; session_id: string | null;
+  active_pane_id: string | null; trigger: string | null; rule_fired: string | null;
+  applied: SqlBool; trace_json: string;
+}
+/** Raw `gemini_turn_usage` row (schema v9, B-3 spine). Token counts are nullable (field absent ⇒ null). */
+export interface GeminiTurnUsageRow {
+  id: number; ts: number; session_id: string | null; inject_id: string | null;
+  prompt_tokens: number | null; response_tokens: number | null; total_tokens: number | null;
+}
