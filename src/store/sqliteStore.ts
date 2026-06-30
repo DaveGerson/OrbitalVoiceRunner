@@ -1232,4 +1232,79 @@ export class JanusStore {
     ).all(now, now - deliveredStaleMs) as HandoffRow[];
     return rows.map(r => this.hydrateHandoff(r));
   }
+
+  // ── B-3 cortex measurement spine (schema v9) ────────────────────────────────────────────────────
+  // Fail-soft writers: measurement must NEVER throw into the caller. Each prepared INSERT mirrors
+  // the recordAction style (named params, store-stamped ts optional). Read helpers follow the
+  // getActionLog pattern (since filter, most-recent-first, default limit 100).
+
+  /** Append one cortex decision trace row. Fail-soft: swallows + console.error on any DB error. */
+  recordCortexDecision(row: {
+    ts: number;
+    injectId: string | null;
+    sessionId: string | null;
+    activePaneId: string | null;
+    trigger: string;
+    ruleFired: string;
+    applied: boolean;
+    traceJson: string;
+  }): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO cortex_decision(ts,inject_id,session_id,active_pane_id,trigger,rule_fired,applied,trace_json)
+         VALUES(@ts,@inject_id,@session_id,@active_pane_id,@trigger,@rule_fired,@applied,@trace_json)`
+      ).run({
+        ts: row.ts,
+        inject_id: row.injectId,
+        session_id: row.sessionId,
+        active_pane_id: row.activePaneId,
+        trigger: row.trigger,
+        rule_fired: row.ruleFired,
+        applied: row.applied ? 1 : 0,
+        trace_json: row.traceJson,
+      });
+    } catch (e) {
+      console.error("[store] recordCortexDecision failed:", e);
+    }
+  }
+
+  /** Read cortex decision rows (most-recent-first) at or after `sinceTs`. Default limit 100. */
+  getCortexDecisions(sinceTs: number, limit = 100): import("./types").CortexDecisionRow[] {
+    return this.db.prepare(
+      `SELECT * FROM cortex_decision WHERE ts >= ? ORDER BY id DESC LIMIT ?`
+    ).all(sinceTs, limit) as import("./types").CortexDecisionRow[];
+  }
+
+  /** Append one Gemini turn usage row. Fail-soft: swallows + console.error on any DB error. */
+  recordGeminiTurnUsage(row: {
+    ts: number;
+    sessionId: string | null;
+    injectId: string | null;
+    promptTokens: number | null;
+    responseTokens: number | null;
+    totalTokens: number | null;
+  }): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO gemini_turn_usage(ts,session_id,inject_id,prompt_tokens,response_tokens,total_tokens)
+         VALUES(@ts,@session_id,@inject_id,@prompt_tokens,@response_tokens,@total_tokens)`
+      ).run({
+        ts: row.ts,
+        session_id: row.sessionId,
+        inject_id: row.injectId,
+        prompt_tokens: row.promptTokens,
+        response_tokens: row.responseTokens,
+        total_tokens: row.totalTokens,
+      });
+    } catch (e) {
+      console.error("[store] recordGeminiTurnUsage failed:", e);
+    }
+  }
+
+  /** Read Gemini turn usage rows (most-recent-first) at or after `sinceTs`. Default limit 100. */
+  getGeminiTurnUsages(sinceTs: number, limit = 100): import("./types").GeminiTurnUsageRow[] {
+    return this.db.prepare(
+      `SELECT * FROM gemini_turn_usage WHERE ts >= ? ORDER BY id DESC LIMIT ?`
+    ).all(sinceTs, limit) as import("./types").GeminiTurnUsageRow[];
+  }
 }
