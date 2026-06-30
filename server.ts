@@ -48,6 +48,7 @@ import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient } from "./src/memory";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
+import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 
@@ -685,6 +686,18 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
 }
 
+// Inc 4 task B-1 — the CORTEX FLIP boot wiring. Default OFF (full-tier floor). JANUS_CORTEX_PRIMARY=1
+// makes the cortex the PRIMARY context-curation authority (synthesizeAsync renders ONLY the tiers it
+// keeps); JANUS_CORTEX_PRIMARY_TIMEOUT_MS (optional) tightens/loosens the budget past which a slow
+// cortex falls to the full-tier floor (default 300ms). Reversible at runtime; floor = the synth/
+// assembler. Extracted from createPythonSynthClientOrUndefined to keep that host under the CC<=10 gate.
+function applyCortexFlipFromEnv(): void {
+  const cortexFlipOn = /^(1|true|on|yes)$/i.test((process.env.JANUS_CORTEX_PRIMARY ?? "").trim());
+  const cortexFlipTimeoutMs = Number(process.env.JANUS_CORTEX_PRIMARY_TIMEOUT_MS) || undefined;
+  setCortexPrimary(cortexFlipOn, cortexFlipTimeoutMs);
+  if (cortexFlipOn) console.error(`[synth] cortex curation: PYTHON-PRIMARY (flip ON, floor=full-tier synth, budget=${cortexFlipTimeoutMs ?? 300}ms)`);
+}
+
 // Best-effort, non-fatal construction of the optional warm Python daemon: disabled ⇒ undefined; an
 // init throw is logged and degrades to undefined (permanent fallback). Seam Inc 1: builds ONE shared
 // daemon core and BOTH typed facades over it (synth + approval — one multiplexed daemon), and installs
@@ -695,7 +708,7 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
   // without optional chaining (keeps createMemorySubsystem under the CC<=10 gate).
   // SHADOW is the only posture with no daemon: there is nothing for Python to be primary OVER, so the
   // flip is forced OFF on both the disabled and init-failure paths (fail-closed to TS).
-  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); return { synth: undefined, cortex: undefined }; }
+  if (!memoryPythonEnabled) { installApprovalShadow(null); setApprovalPythonPrimary(false); setCortexPrimary(false); return { synth: undefined, cortex: undefined }; }
   try {
     const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), onStateChange: onDaemonState });
     const approval = createPythonApprovalClient(core);
@@ -713,6 +726,7 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
     setApprovalPythonPrimary(flipOn, flipTimeoutMs);
     if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
+    applyCortexFlipFromEnv(); // Inc 4 task B-1 — the CORTEX FLIP (default OFF; extracted to hold CC<=10).
     // Inc 4 slice 1 (SHADOW): the cortex facade rides the SAME multiplexed core (observe-only — its
     // decision is logged, never applied). One daemon, many typed facades (synth + approval + cortex).
     return { synth: synthFacadeOverCore(core), cortex: createPythonCortexClient(core) };
@@ -720,6 +734,7 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     console.error("[memory] python daemon client init failed (continuing on fallback):", e);
     installApprovalShadow(null);
     setApprovalPythonPrimary(false);
+    setCortexPrimary(false);
     return { synth: undefined, cortex: undefined };
   }
 }
@@ -1711,6 +1726,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       // get_health (transitions / msInFallback / currentlyFallback). Distinct from synthesizerState
       // (the instantaneous read) — this is the POST-first-up retire-gate metric. Read-only, additive.
       daemonStateStats: () => daemonTracker.stats(),
+      // Inc 4 task B-4 observability: the cortex FLIP fall-to-floor rate (the RETIRE-gate metric),
+      // surfaced at health.memory.daemon.cortexFallbackRate. getCortexFallbackStats() is the
+      // process-wide singleton; warm-up-immune. Read-only, additive, never gates a decision.
+      cortexFallbackStats: () => getCortexFallbackStats(),
       // c55 Batch F: the STOP-ALL boot-restore snapshot (get_stop_all_status) + the list_panes flat
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,

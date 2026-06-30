@@ -293,6 +293,12 @@ export interface ActionContext {
    *  instantaneous read). Wired by the server; absent on voice/test paths, where get_health reports
    *  memory.daemon as null. Read-only — additive, never gates a decision. */
   daemonStateStats?: () => { transitions: number; msInFallback: number; currentlyFallback: boolean } | null;
+  /** Seam Inc 4 task B-4 observability: the cortex FLIP fall-to-floor rate (fallbackRate ∈ [0,1]), or
+   *  null when no cortex client is wired. Warm-up-immune (mirrors daemonStateStats firstUp): a miss
+   *  before the cortex's first successful curation is cold-start, not a regression. This is the
+   *  RETIRE-gate metric for the synth path — surfaced at health.memory.daemon.cortexFallbackRate.
+   *  Wired by the server; absent on voice/test paths. Read-only — additive, never gates a decision. */
+  cortexFallbackStats?: () => { fallbackRate: number } | null;
   /** Write the active pane (switch_active_pane records the new focus, server.ts:2626). `null` clears
    *  focus when no pane is open. Pure focus move — never a CLI write. */
   setActivePane: (paneId: string | null) => void;
