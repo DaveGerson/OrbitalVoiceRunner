@@ -8,6 +8,7 @@ import assert from "node:assert";
 import { JanusStore } from "../src/store/sqliteStore";
 import { MemoryService, DEFAULT_MEMORY_CONFIG } from "../src/memory";
 import type { PythonCortexClient, CortexResult } from "../src/memory/cortexClient";
+import { mintInjectId } from "../src/voice";
 
 function seed(): JanusStore {
   const s = new JanusStore(":memory:");
@@ -212,4 +213,30 @@ test("Task 5: no sink configured ⇒ observeCortexShadow is a silent no-op (pari
   const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500);
   assert.doesNotThrow(() => s.observeCortexShadow("p1", 9, "brief-inject", "inj-y"));
   await flushMicrotasks();
+});
+
+// ── Task 6: injectId minting + threading ──────────────────────────────────────
+
+test("Task 6: mintInjectId returns a non-null inj-prefixed id and is monotonic", () => {
+  const a = mintInjectId();
+  const b = mintInjectId();
+  assert.ok(a, "mintInjectId must return a non-empty id");
+  assert.match(a, /^inj-\d+-\d+$/, "id shape is inj-<ts>-<seq>");
+  assert.notStrictEqual(a, b, "back-to-back ids must differ (monotonic seq)");
+  // the trailing seq strictly increases
+  const seqA = Number(a.split("-").pop());
+  const seqB = Number(b.split("-").pop());
+  assert.ok(seqB > seqA, `seq must strictly increase (${seqA} -> ${seqB})`);
+});
+
+test("Task 6: an injectId threaded as observeCortexShadow's 4th arg lands on the persisted row", async () => {
+  // End-to-end of the join: minting an id and passing it through the SHADOW tap persists it.
+  const rows: any[] = [];
+  const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500, (r: any) => rows.push(r));
+  const injectId = mintInjectId();
+  s.observeCortexShadow("p1", Date.now(), "brief-inject", injectId);
+  await flushMicrotasks();
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rows[0].injectId, injectId, "the minted injectId reaches the decision row");
+  assert.notStrictEqual(rows[0].injectId, null);
 });
