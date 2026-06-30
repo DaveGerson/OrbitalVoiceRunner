@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { WorldModel, type WorldModelDeps } from "./worldModel";
 import { BreadcrumbRing } from "./breadcrumbs";
 import { assembleBrief } from "./assembler";
@@ -5,6 +6,9 @@ import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type B
 import type { PythonSynthClient } from "./pythonClient";
 import type { PythonCortexClient } from "./cortexClient";
 import { isCortexPrimary, resolveWithCortex, cortexPrimaryTimeoutMs } from "./cortexShadow";
+
+/** Default quiet-window for cortex hysteresis (ms). Same hash within this window → suppress. */
+export const DEFAULT_CORTEX_QUIET_WINDOW_MS = 500;
 
 export { WorldModel } from "./worldModel";
 export { BreadcrumbRing } from "./breadcrumbs";
@@ -20,23 +24,47 @@ export function briefIsForActivePane(briefActivePaneId: string | null, currentAc
 }
 
 export class MemoryService {
+  // B-6 hysteresis: suppress duplicate cortex fires within the quiet window (default 500 ms).
+  private _lastSnapshotHash: string | null = null;
+  private _lastCortexFiredAt: number = 0;
+
   constructor(
     private wm: WorldModel,
     private cfg: MemoryConfig = DEFAULT_MEMORY_CONFIG,
     private pythonClient?: PythonSynthClient,
     private timeoutMs: number = 150,
     private cortexClient?: PythonCortexClient,
+    private quietWindowMs: number = DEFAULT_CORTEX_QUIET_WINDOW_MS,
   ) {}
+
+  /** Cheap 16-hex-char SHA-256 fingerprint of a tiers snapshot. Used for hysteresis gating only. */
+  private _snapshotHash(tiers: MemoryTiers): string {
+    return createHash("sha256").update(JSON.stringify(tiers)).digest("hex").slice(0, 16);
+  }
+
+  /** B-6: returns true and updates state if the cortex should fire for this snapshot+timestamp.
+   *  Suppresses when hash unchanged AND elapsed time is within the quiet window. */
+  private _shouldFireCortex(tiers: MemoryTiers, now: number): boolean {
+    const hash = this._snapshotHash(tiers);
+    const elapsed = now - this._lastCortexFiredAt;
+    if (this._lastSnapshotHash === hash && elapsed < this.quietWindowMs) return false;
+    this._lastSnapshotHash = hash;
+    this._lastCortexFiredAt = now;
+    return true;
+  }
 
   /** Inc 4 slice 1 (SHADOW): fire-and-forget cortex curation OBSERVATION. Builds the same tiers,
    *  asks the cortex what it WOULD curate, and LOGS the decision-trace. It NEVER blocks injection,
    *  NEVER throws, and NEVER applies the decision — parity with today is total (invariants I-P1..I-P3).
-   *  Absent/unavailable client ⇒ a synchronous no-op. The cortex carries no risk; TS is the floor. */
+   *  Absent/unavailable client ⇒ a synchronous no-op. The cortex carries no risk; TS is the floor.
+   *  B-6 hysteresis: back-to-back calls with the identical snapshot within quietWindowMs are suppressed
+   *  (fire-and-forget efficiency guard; zero effect on synthesizeAsync or the rendered brief). */
   observeCortexShadow(activePaneId: string | null, now: number, trigger: string = "brief-inject"): void {
     const client = this.cortexClient;
     if (!client || !client.available()) return;
     try {
       const tiers = this.wm.getTiers(activePaneId, now);
+      if (!this._shouldFireCortex(tiers, now)) return;
       const ctx: CortexCtx = { activePaneId, sessionId: null, trigger };
       // Fire-and-forget: do NOT await. The facade never rejects, but guard the rejection arm anyway so
       // an unexpected throw can never surface as an unhandled rejection in the live loop.
