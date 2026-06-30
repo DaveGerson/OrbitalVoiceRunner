@@ -8,13 +8,30 @@ import assert from "node:assert/strict";
 import { MemoryService, DEFAULT_MEMORY_CONFIG } from "../src/memory";
 import type { PythonCortexClient, CortexResult } from "../src/memory/cortexClient";
 
+// ── helpers ──────────────────────────────────────────────────────────────────────────────────────
+/** Build a counting cortex client. `count.n` increments on each `decide` call. */
+function countingCortex(count: { n: number }): PythonCortexClient {
+  return {
+    available: () => true,
+    decide: async (): Promise<CortexResult> => {
+      count.n += 1;
+      return {
+        ok: true, decision: { keep: ["frame"], drop: [], rerank: [] },
+        trace: { cortexVersion: "0.1.0", strategy: "baseline-identity", ruleFired: "baseline-identity",
+          inputs: { activePaneId: "p1", sessionId: null, trigger: "brief-inject", tierKeys: ["frame"], tierChars: { frame: 1 } },
+          output: { orderedKeep: ["frame"], dropped: [] }, ts: 0 },
+      };
+    },
+  };
+}
+
 const TIERS: any = { project: null, pane: null, board: [], frame: { role: "Janus", gatePosture: "Auto", prefs: [] }, breadcrumbs: [] };
 // A fake WorldModel: synthesizeAsync + observeCortexShadow both call this.wm.getTiers(activeId, now).
 const fakeWm: any = { getTiers: () => TIERS };
 
-function svc(cortex?: PythonCortexClient): MemoryService {
+function svc(cortex?: PythonCortexClient, quietWindowMs?: number): MemoryService {
   // no pythonClient ⇒ synthesizeAsync uses the deterministic in-process fallback (assembleBrief).
-  return new MemoryService(fakeWm, DEFAULT_MEMORY_CONFIG, undefined, 150, cortex);
+  return new MemoryService(fakeWm, DEFAULT_MEMORY_CONFIG, undefined, 150, cortex, quietWindowMs);
 }
 
 const cortexOk: PythonCortexClient = {
@@ -54,4 +71,46 @@ test("I-P3: a throwing/rejecting cortex does not perturb the brief", async () =>
 test("I-P2b: observeCortexShadow returns synchronously (void, non-blocking)", () => {
   const r = svc(cortexOk).observeCortexShadow("p1", 0);
   assert.equal(r, undefined);
+});
+
+// ── B-6 hysteresis tests ─────────────────────────────────────────────────────────────────────────
+
+test("B-6: back-to-back identical snapshot within window calls decide exactly once", () => {
+  // Use a large quietWindowMs so the second call is definitely within the window.
+  const count = { n: 0 };
+  const s = svc(countingCortex(count), 10_000);
+  s.observeCortexShadow("p1", 0);   // first call: fires
+  s.observeCortexShadow("p1", 100); // same tiers, 100 ms later, well within 10 s window → suppressed
+  // Promises are micro-tasks; yield to let them settle before asserting.
+  return new Promise<void>((resolve) => setImmediate(() => {
+    assert.equal(count.n, 1, "decide must be called exactly once for back-to-back identical snapshots");
+    resolve();
+  }));
+});
+
+test("B-6: different snapshot within window fires a second decide call", () => {
+  const count = { n: 0 };
+  const TIERS2: any = { ...TIERS, frame: { role: "Janus", gatePosture: "Ask", prefs: [] } };
+  const fakeWm2: any = {
+    getTiers: (_id: unknown, _now: unknown) => count.n === 0 ? TIERS : TIERS2,
+  };
+  const s = new MemoryService(fakeWm2, DEFAULT_MEMORY_CONFIG, undefined, 150, countingCortex(count), 10_000);
+  s.observeCortexShadow("p1", 0);   // fires → count = 1, hash of TIERS stored
+  s.observeCortexShadow("p1", 100); // different snapshot → fires → count = 2
+  return new Promise<void>((resolve) => setImmediate(() => {
+    assert.equal(count.n, 2, "decide must fire again when the snapshot changes");
+    resolve();
+  }));
+});
+
+test("B-6: same hash after window expiry fires again", () => {
+  // quietWindowMs = 200; second call at t=300 (300 > 200) → fires.
+  const count = { n: 0 };
+  const s = svc(countingCortex(count), 200);
+  s.observeCortexShadow("p1", 0);   // fires (t=0)
+  s.observeCortexShadow("p1", 300); // same hash, t=300, elapsed=300 > 200 ms → fires
+  return new Promise<void>((resolve) => setImmediate(() => {
+    assert.equal(count.n, 2, "decide must re-fire after the quiet window expires");
+    resolve();
+  }));
 });
