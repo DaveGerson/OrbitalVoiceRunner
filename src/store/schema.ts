@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
