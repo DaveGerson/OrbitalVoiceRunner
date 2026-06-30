@@ -70,6 +70,32 @@ export function mintInjectId(): string {
 }
 
 /**
+ * B-3 measurement spine (Task 7): capture per-turn Gemini token cost at the turn-complete boundary.
+ * Reads `message.usageMetadata` (top-level on @google/genai LiveServerMessage; fields
+ * promptTokenCount / responseTokenCount / totalTokenCount per UsageMetadata) and persists one
+ * gemini_turn_usage row joined to the nearest preceding injection (`lastInjectId`). Fail-soft: an
+ * absent `usageMetadata`, a null store, or a writer throw is a no-op — the voice turn never blocks.
+ * Exported as a pure unit so the capture is testable without booting a live session.
+ */
+export function captureTurnUsage(message: any, store: JanusStore | null, lastInjectId: string | null): void {
+  const u = message?.usageMetadata;
+  if (!store || !u) return;
+  try {
+    store.recordGeminiTurnUsage({
+      ts: Date.now(),
+      sessionId: null,
+      injectId: lastInjectId ?? null,
+      promptTokens: u.promptTokenCount ?? null,
+      responseTokens: u.responseTokenCount ?? null,
+      totalTokens: u.totalTokenCount ?? null,
+    });
+  } catch (e) {
+    // Measurement must never throw into the voice turn — swallow + log.
+    console.error("[cortex-usage] captureTurnUsage failed:", e);
+  }
+}
+
+/**
  * narrate a SYSTEM EVENT into the live session so the model speaks it to the operator. Pure (no
  * closure state) — exported so gating injects the SAME identity server.ts feeds into attachVoiceSession,
  * keeping gating free of any voice import. The definition moved here from server.ts (dec-5).
@@ -1141,6 +1167,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // START of the next operator turn in onOperatorSpeech.)
             if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
               state.muteCurrentModelTurn = false;
+              // B-3 measurement spine (Task 7): capture this turn's Gemini token cost (usageMetadata)
+              // joined to the nearest preceding injection. Fail-soft no-op when usageMetadata is absent.
+              captureTurnUsage(message, store, state.lastInjectId);
             }
           };
 

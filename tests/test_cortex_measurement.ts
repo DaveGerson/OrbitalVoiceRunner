@@ -8,7 +8,7 @@ import assert from "node:assert";
 import { JanusStore } from "../src/store/sqliteStore";
 import { MemoryService, DEFAULT_MEMORY_CONFIG } from "../src/memory";
 import type { PythonCortexClient, CortexResult } from "../src/memory/cortexClient";
-import { mintInjectId } from "../src/voice";
+import { mintInjectId, captureTurnUsage } from "../src/voice";
 
 function seed(): JanusStore {
   const s = new JanusStore(":memory:");
@@ -239,4 +239,64 @@ test("Task 6: an injectId threaded as observeCortexShadow's 4th arg lands on the
   assert.strictEqual(rows.length, 1);
   assert.strictEqual(rows[0].injectId, injectId, "the minted injectId reaches the decision row");
   assert.notStrictEqual(rows[0].injectId, null);
+});
+
+// ── Task 7: capture Gemini usageMetadata at turn-complete ─────────────────────
+
+/** Minimal store stub capturing recordGeminiTurnUsage rows. */
+function usageStub() {
+  const rows: any[] = [];
+  return { rows, recordGeminiTurnUsage: (row: any) => { rows.push(row); } };
+}
+
+test("Task 7: a turn with usageMetadata records one row with the counts + injectId", () => {
+  const store = usageStub();
+  const message: any = {
+    serverContent: { turnComplete: true },
+    usageMetadata: { promptTokenCount: 10, responseTokenCount: 5, totalTokenCount: 15 },
+  };
+  captureTurnUsage(message, store as any, "inj-77");
+  assert.strictEqual(store.rows.length, 1, "exactly one usage row");
+  const row = store.rows[0];
+  assert.strictEqual(row.injectId, "inj-77");
+  assert.strictEqual(row.promptTokens, 10);
+  assert.strictEqual(row.responseTokens, 5);
+  assert.strictEqual(row.totalTokens, 15);
+  assert.strictEqual(typeof row.ts, "number");
+});
+
+test("Task 7: usageMetadata under generationComplete is captured too", () => {
+  const store = usageStub();
+  const message: any = {
+    serverContent: { generationComplete: true },
+    usageMetadata: { promptTokenCount: 1, responseTokenCount: 2, totalTokenCount: 3 },
+  };
+  captureTurnUsage(message, store as any, null);
+  assert.strictEqual(store.rows.length, 1);
+  assert.strictEqual(store.rows[0].injectId, null, "no prior injection ⇒ null join key");
+  assert.strictEqual(store.rows[0].totalTokens, 3);
+});
+
+test("Task 7: a turn WITHOUT usageMetadata is a no-op", () => {
+  const store = usageStub();
+  captureTurnUsage({ serverContent: { turnComplete: true } } as any, store as any, "inj-1");
+  assert.strictEqual(store.rows.length, 0, "no usageMetadata ⇒ nothing recorded");
+});
+
+test("Task 7: partial usageMetadata maps missing counts to null", () => {
+  const store = usageStub();
+  captureTurnUsage({ usageMetadata: { promptTokenCount: 7 } } as any, store as any, "inj-2");
+  assert.strictEqual(store.rows.length, 1);
+  assert.strictEqual(store.rows[0].promptTokens, 7);
+  assert.strictEqual(store.rows[0].responseTokens, null);
+  assert.strictEqual(store.rows[0].totalTokens, null);
+});
+
+test("Task 7: a null store is a safe no-op (legacy ledger)", () => {
+  assert.doesNotThrow(() => captureTurnUsage({ usageMetadata: { totalTokenCount: 9 } } as any, null, "inj-3"));
+});
+
+test("Task 7: a throwing store writer does not surface (fail-soft)", () => {
+  const badStore: any = { recordGeminiTurnUsage: () => { throw new Error("db boom"); } };
+  assert.doesNotThrow(() => captureTurnUsage({ usageMetadata: { totalTokenCount: 9 } } as any, badStore, "inj-4"));
 });
