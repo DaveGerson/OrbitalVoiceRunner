@@ -85,6 +85,53 @@ jobs:
           path: test-results/
           retention-days: 7
 
+  # Python daemon smoke / Windows: boots the REAL interpreter on windows-latest and exercises the
+  # stdio NDJSON round-trip end-to-end. Exit 0 = pass, exit 1 = FAIL (interpreter present but
+  # daemon broken — job fails), exit 2 = SKIP (no interpreter at all — job passes). The PowerShell
+  # step inspects $LASTEXITCODE explicitly so exit-2 is not misread as failure.
+  python-smoke-windows:
+    name: "python smoke / windows-latest"
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Python 3.12
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python daemon smoke (exit 1 = FAIL, exit 2 = SKIP)
+        shell: pwsh
+        env:
+          # Pin the interpreter to the EXACT python setup-python installed. Without this, discovery
+          # tries the Windows `py -3` launcher first (registry scan + may resolve to a different
+          # interpreter), and on a cold runner the first spawn of every candidate can blow the ping
+          # deadline before Defender finishes scanning the new process image. JANUS_PYTHON collapses
+          # discovery to one known-good, on-PATH candidate (src/memory/pythonClient.ts
+          # discoverPythonInterpreter), so the smoke spends its whole window on the right interpreter.
+          JANUS_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        run: |
+          Write-Output "[smoke:daemon] JANUS_PYTHON=$env:JANUS_PYTHON"
+          npm run smoke:daemon
+          $code = $LASTEXITCODE
+          if ($code -eq 2) {
+            Write-Output "[smoke:daemon] exit 2 — no Python interpreter found, treating as SKIP (job passes)"
+            exit 0
+          }
+          exit $code
+
   # The live lane (PW_LIVE=1): the REAL `tsx server.ts` on a fresh temp JANUS_DB — pane
   # creation through the capability gate, stop-all, drafts, real PTY spawns. No Gemini key
   # needed (the lane never opens a voice session). Serial specs, generous timeouts.
