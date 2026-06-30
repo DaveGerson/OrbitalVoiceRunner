@@ -1,9 +1,10 @@
 import { WorldModel, type WorldModelDeps } from "./worldModel";
 import { BreadcrumbRing } from "./breadcrumbs";
 import { assembleBrief } from "./assembler";
-import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb, type CortexCtx } from "./types";
+import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb, type CortexCtx, type MemoryTiers } from "./types";
 import type { PythonSynthClient } from "./pythonClient";
 import type { PythonCortexClient } from "./cortexClient";
+import { isCortexPrimary, resolveWithCortex, cortexPrimaryTimeoutMs } from "./cortexShadow";
 
 export { WorldModel } from "./worldModel";
 export { BreadcrumbRing } from "./breadcrumbs";
@@ -53,11 +54,28 @@ export class MemoryService {
     return assembleBrief(this.wm.getTiers(activePaneId, now), this.cfg, now);
   }
 
+  /** B-1 FLIP (default OFF): when the cortex is PRIMARY and available, ask it which tiers survive,
+   *  render ONLY those, and stamp `source: "cortex-primary"`. Returns null on ANY miss (flag off,
+   *  unavailable, timeout, ok:false, throw) so the caller falls through to the full-tier floor UNCHANGED
+   *  — the parity guarantee while the flag is off (the branch is never even entered). */
+  private async cortexCuratedBrief(tiers: MemoryTiers, activePaneId: string | null, now: number): Promise<SynthesizedBrief | null> {
+    const cortex = this.cortexClient;
+    if (!isCortexPrimary() || !cortex || !cortex.available()) return null;
+    const ctx: CortexCtx = { activePaneId, sessionId: null, trigger: "brief-inject" };
+    const filtered = await resolveWithCortex(tiers, ctx, now, cortex, cortexPrimaryTimeoutMs());
+    if (!filtered) return null;
+    return { ...assembleBrief(filtered, this.cfg, now), source: "cortex-primary" };
+  }
+
   /** P0b: race the Python daemon (≤timeoutMs) against the in-process floor; TS owns `source` (I1/I4). */
   async synthesizeAsync(activePaneId: string | null, now: number): Promise<SynthesizedBrief> {
     try {
       const tiers = this.wm.getTiers(activePaneId, now);
       const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
+      // B-1: cortex-primary curation (default OFF). On a clean hit this REPLACES the synth race below
+      // (the cortex already curated the tiers); on any miss it returns null and we fall through.
+      const curated = await this.cortexCuratedBrief(tiers, activePaneId, now);
+      if (curated) return curated;
       const client = this.pythonClient;
       if (!client || !client.available()) return fallback();
       // In-flight rule: the awaited race DEPENDS on this ceiling to settle if the daemon request

@@ -35,6 +35,23 @@ function daemonHealth(getter?: () => { transitions: number; msInFallback: number
   return getter?.() ?? null;
 }
 
+/**
+ * Seam Inc 4 task B-4 observability: merge the cortex FLIP fall-to-floor rate ONTO the daemon block so
+ * the plan path `health.memory.daemon.cortexFallbackRate` resolves. Takes both GETTERS (not their
+ * results) so the optional-call branches live HERE, keeping the health handler under the CC<=10 gate
+ * (mirrors daemonHealth / shadowHealth exactly). When the daemon block is null (no tracker wired) but
+ * the cortex getter is present, surface a minimal `{ cortexFallbackRate }` so the metric is never lost.
+ */
+function daemonHealthWithCortex(
+  daemonGetter?: () => { transitions: number; msInFallback: number; currentlyFallback: boolean } | null,
+  cortexGetter?: () => { fallbackRate: number } | null,
+) {
+  const daemon = daemonHealth(daemonGetter);
+  const cortex = cortexGetter?.();
+  if (!cortex) return daemon;
+  return { ...(daemon ?? {}), cortexFallbackRate: cortex.fallbackRate };
+}
+
 // z.coerce.number so a REST query string ("?limit=50") coerces to a number; voice passes real numbers.
 const ActionLogParams = z.object({
   limit: z.coerce.number().optional(),
@@ -97,7 +114,7 @@ export const getHealth: ActionDef<typeof HealthParams> = {
         panes,
         pending_approvals: pendingApprovals,
         recent: { total: recentTotal, errors: recentErrors, error_rate: recentTotal ? recentErrors / recentTotal : 0 },
-        memory: { synthesizer: ctx.memorySynthesizerState?.() ?? "fallback", shadow: shadowHealth(ctx.approvalShadowStats), daemon: daemonHealth(ctx.daemonStateStats) },
+        memory: { synthesizer: ctx.memorySynthesizerState?.() ?? "fallback", shadow: shadowHealth(ctx.approvalShadowStats), daemon: daemonHealthWithCortex(ctx.daemonStateStats, ctx.cortexFallbackStats) },
       },
     };
   },

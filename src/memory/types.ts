@@ -46,7 +46,7 @@ export interface SynthesizedBrief {
   text: string;
   perTierChars: Record<string, number>;
   activePaneId: string | null;
-  source: "fallback" | "python";  // P0a always "fallback"
+  source: "fallback" | "python" | "cortex-primary";  // P0a "fallback"; "cortex-primary" = cortex FLIP (B-1)
 }
 
 export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
