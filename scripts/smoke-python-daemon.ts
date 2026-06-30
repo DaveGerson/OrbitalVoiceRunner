@@ -24,6 +24,15 @@ import { DEFAULT_MEMORY_CONFIG, type MemoryTiers } from "../src/memory/types";
 const FRAME = { role: "Janus", gatePosture: "Auto", prefs: [] };
 const TIERS: MemoryTiers = { project: null, pane: null, board: [], frame: FRAME, breadcrumbs: [] };
 
+// Cold-start tolerance for THIS diagnostic only (never production — the live client keeps its snappy
+// 1500ms default so real callers fall back fast). On a fresh Windows CI runner the FIRST spawn of an
+// interpreter pays Defender's real-time scan of the new process image (seconds), which blew the stock
+// 1500ms handshake deadline → 4× ping-timeout → RED. A generous per-spawn deadline lets the one cold
+// spawn pong; the wider availability window leaves headroom for a single warm retry. With JANUS_PYTHON
+// pinned (CI), discovery is one candidate, so these govern that single known-good interpreter.
+const SMOKE_PING_TIMEOUT_MS = 10_000;
+const SMOKE_AVAILABLE_TIMEOUT_MS = 30_000;
+
 function log(line: string): void { process.stdout.write(line + "\n"); }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -101,6 +110,10 @@ export interface SmokeDeps {
   // with a fake child WITHOUT a real python/ tree on disk — otherwise resolveSynthDir returns null and
   // the client never spawns, masking the present-but-no-pong path under test.
   existsSync?: (p: string) => boolean;
+  // Cold-start timeouts (injectable so the unit test drives the present-but-no-pong FAIL path fast
+  // instead of waiting the full generous window). Defaults are the CI-tolerant constants above.
+  pingTimeoutMs?: number;        // per-spawn handshake deadline handed to the daemon core
+  availableTimeoutMs?: number;   // how long main() waits for the first valid pong before FAIL
 }
 
 const DEFAULT_DEPS: SmokeDeps = {
@@ -109,6 +122,8 @@ const DEFAULT_DEPS: SmokeDeps = {
   cwd: process.cwd,
   spawnImpl: realSpawn,
   discover: discoverPythonInterpreter,
+  pingTimeoutMs: SMOKE_PING_TIMEOUT_MS,
+  availableTimeoutMs: SMOKE_AVAILABLE_TIMEOUT_MS,
 };
 
 /**
@@ -132,6 +147,7 @@ function buildCore(deps: SmokeDeps): {
     repoRoot: deps.cwd(),
     env: deps.env,
     platform: deps.platform,
+    pingTimeoutMs: deps.pingTimeoutMs ?? SMOKE_PING_TIMEOUT_MS, // CI cold-start tolerance (diagnostic only; see constant above)
     ...(deps.existsSync ? { existsSync: deps.existsSync } : {}), // undefined ⇒ client's real-fs default (npm lane unchanged)
     spawnImpl: ((cmd: string, args: readonly string[], spawnOpts: object) => {
       const child = deps.spawnImpl(cmd, args as string[], spawnOpts as Parameters<typeof realSpawn>[2]);
@@ -182,7 +198,7 @@ export async function main(deps: SmokeDeps = DEFAULT_DEPS): Promise<number> {
   const approval = createPythonApprovalClient(core);
   const failures: string[] = [];
   try {
-    if (!(await waitAvailable(core, 8000))) {
+    if (!(await waitAvailable(core, deps.availableTimeoutMs ?? SMOKE_AVAILABLE_TIMEOUT_MS))) {
       log("[smoke:daemon] FAIL — daemon never became available (no valid pong). Is python on PATH?");
       return 1; // interpreter present but no valid pong — broken daemon, FAIL (1), NOT skip. (We
       //           only reach here AFTER the zero-candidate gate above passed, so an interpreter

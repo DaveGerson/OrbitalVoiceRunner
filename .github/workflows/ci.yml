@@ -107,13 +107,23 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12
+        id: setup-python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Python daemon smoke (exit 1 = FAIL, exit 2 = SKIP)
         shell: pwsh
+        env:
+          # Pin the interpreter to the EXACT python setup-python installed. Without this, discovery
+          # tries the Windows `py -3` launcher first (registry scan + may resolve to a different
+          # interpreter), and on a cold runner the first spawn of every candidate can blow the ping
+          # deadline before Defender finishes scanning the new process image. JANUS_PYTHON collapses
+          # discovery to one known-good, on-PATH candidate (src/memory/pythonClient.ts
+          # discoverPythonInterpreter), so the smoke spends its whole window on the right interpreter.
+          JANUS_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: |
+          Write-Output "[smoke:daemon] JANUS_PYTHON=$env:JANUS_PYTHON"
           npm run smoke:daemon
           $code = $LASTEXITCODE
           if ($code -eq 2) {

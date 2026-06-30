@@ -70,6 +70,10 @@ const baseDeps = (over: Partial<SmokeDeps>): SmokeDeps => ({
   spawnImpl: (() => new FakeChild()) as never,
   discover: () => ONE_CANDIDATE,
   existsSync: () => true,       // pretend python/synthesizer/__main__.py exists so the client spawns
+  // Keep the FAIL-path (silent child) test fast: the production lane uses generous CI cold-start
+  // windows, but with fakes there is nothing to wait for, so drive the timeouts small here.
+  pingTimeoutMs: 200,
+  availableTimeoutMs: 1500,
   ...over,
 });
 
@@ -86,7 +90,7 @@ test("(a) no interpreter at all → exit 2 (SKIP, never 1)", async () => {
 
 test("(b) interpreter PRESENT but daemon never pongs → exit 1 (FAIL, NOT skip) — the s18 fix", { timeout: 30_000 }, async () => {
   // discover finds a candidate, but the fake child stays SILENT → the ping handshake times out and
-  // waitAvailable(core, 8000) returns false. Before the fix this returned 2 (mis-skip); it must be 1.
+  // waitAvailable(core, availableTimeoutMs) returns false. Before the fix this returned 2 (mis-skip); it must be 1.
   const code = await main(baseDeps({
     // every spawn (eager + any respawn) hands back a silent fake → no valid pong ever
     spawnImpl: (() => new FakeChild()) as never,
