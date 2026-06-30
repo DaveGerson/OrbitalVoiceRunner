@@ -586,11 +586,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
       try {
         if (!sess) return;
-        // B-3 measurement spine: mint the per-injection correlation key ONCE and stash it on the
-        // session state so the Gemini turn-usage capture (relayInterruptAndTurnState) joins the
-        // nearest preceding injection by time. Threaded into the SHADOW tap below as the decision key.
+        // B-3 measurement spine: mint the per-injection correlation key ONCE. It keys the SHADOW
+        // decision row (observed for this trigger regardless of whether the brief is ultimately
+        // injected) and is stashed on session state ONLY AFTER the brief actually reaches Gemini
+        // (below) — so the turn-usage capture joins the nearest preceding ACTUALLY-injected brief,
+        // never one dropped by the pane-switch / empty-text guards.
         const injectId = mintInjectId();
-        state.lastInjectId = injectId;
         // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
         // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
         // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
@@ -608,6 +609,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
             turnComplete: true,
           });
+          // Join key: only NOW (the brief actually entered Gemini) does this injection become the
+          // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
+          state.lastInjectId = injectId;
         }
       } catch (e) {
         // The whole body is guarded so the returned promise NEVER rejects — the three fire-and-forget
