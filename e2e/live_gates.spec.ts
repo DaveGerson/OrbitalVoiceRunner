@@ -154,10 +154,13 @@ test("the override governs the live gate: Auto re-fires immediately, Ask defers 
   await expect(actionDialog).toHaveCount(0, { timeout: 15_000 });
   await expect(paneCard(page)).toHaveCount(1); // the station survived its gated re-fire
 
-  // ── cleanup: 86 the (live) pane — two-tap confirm — so the shared board is left clean ──
+  // ── cleanup: 86 the pane so the shared board is left clean. A still-running pane arms the
+  //    two-tap confirm; a pane that has already exited takes the one-tap freezer path. ──
   await expect(page.getByTestId("burner")).toBeVisible();
-  await page.getByTestId("burner-86").click();
-  await expect(page.getByTestId("burner-86")).toContainText("Sure, Chef?");
-  await page.getByTestId("burner-86").click();
+  const btn86 = page.getByTestId("burner-86");
+  await btn86.click();
+  if ((await btn86.count()) > 0 && (await btn86.getAttribute("data-confirming")) !== null) {
+    await btn86.click();
+  }
   await expect(paneCard(page)).toHaveCount(0, { timeout: 30_000 });
 });
