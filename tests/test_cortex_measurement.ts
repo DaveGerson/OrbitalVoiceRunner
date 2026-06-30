@@ -6,6 +6,8 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { JanusStore } from "../src/store/sqliteStore";
+import { MemoryService, DEFAULT_MEMORY_CONFIG } from "../src/memory";
+import type { PythonCortexClient, CortexResult } from "../src/memory/cortexClient";
 
 function seed(): JanusStore {
   const s = new JanusStore(":memory:");
@@ -134,4 +136,80 @@ test("inject_id ties a cortex decision to a gemini turn (join sanity)", () => {
   assert.strictEqual(usages.length, 1, "one usage for inj-42");
   assert.strictEqual(usages[0].total_tokens, 280);
   s.close();
+});
+
+// ── Task 5: observeCortexShadow persists the decision via the sink ────────────
+
+const EXITED_TIERS: any = {
+  project: null,
+  pane: { paneId: "p1", name: "main", runtimeType: "claude", status: "Exited", lastCommand: "ls", recent: ["done"] },
+  board: [],
+  frame: { role: "Janus", gatePosture: "Auto", prefs: [] },
+  breadcrumbs: [],
+};
+const exitedWm: any = { getTiers: () => EXITED_TIERS };
+
+/** Fake cortex echoing an `exited-pane` decision (pane dropped). */
+function exitedPaneCortex(): PythonCortexClient {
+  return {
+    available: () => true,
+    decide: async (): Promise<CortexResult> => ({
+      ok: true,
+      decision: { keep: ["project", "frame"], drop: ["pane"], rerank: [] },
+      trace: {
+        cortexVersion: "0.2.0", strategy: "rule", ruleFired: "exited-pane",
+        inputs: { activePaneId: "p1", sessionId: null, trigger: "brief-inject", tierKeys: ["pane", "frame"], tierChars: { pane: 10, frame: 1 } },
+        output: { orderedKeep: ["project", "frame"], dropped: ["pane"] }, ts: 0,
+      } as any,
+    }),
+  };
+}
+
+/** Flush microtasks so a fire-and-forget `.then(...)` sink call settles before asserting. */
+function flushMicrotasks(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+test("Task 5: observeCortexShadow calls the decisionSink with the decision row", async () => {
+  const rows: any[] = [];
+  const sink = (row: any) => { rows.push(row); };
+  const now = 1_700_000_000_500;
+  const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500, sink);
+
+  s.observeCortexShadow("p1", now, "brief-inject", "inj-1");
+  await flushMicrotasks();
+
+  assert.strictEqual(rows.length, 1, "the sink must receive exactly one row");
+  const row = rows[0];
+  assert.strictEqual(row.injectId, "inj-1");
+  assert.strictEqual(row.ts, now);
+  assert.strictEqual(row.activePaneId, "p1");
+  assert.strictEqual(row.trigger, "brief-inject");
+  assert.strictEqual(row.ruleFired, "exited-pane");
+  assert.strictEqual(row.applied, false, "SHADOW decisions are never applied");
+  assert.strictEqual(row.sessionId, null, "ctx.sessionId is null on the SHADOW tap");
+  assert.match(row.traceJson, /"ruleFired":"exited-pane"/, "traceJson carries the serialized trace");
+});
+
+test("Task 5: a null injectId still records (sink receives injectId=null)", async () => {
+  const rows: any[] = [];
+  const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500, (r: any) => rows.push(r));
+  s.observeCortexShadow("p1", 42); // default trigger, default null injectId
+  await flushMicrotasks();
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rows[0].injectId, null);
+  assert.strictEqual(rows[0].trigger, "brief-inject");
+});
+
+test("Task 5: a throwing sink does not surface into observeCortexShadow (still never throws)", async () => {
+  const badSink = () => { throw new Error("sink boom"); };
+  const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500, badSink);
+  assert.doesNotThrow(() => s.observeCortexShadow("p1", 7, "brief-inject", "inj-x"));
+  await flushMicrotasks(); // the sink throw happens in the .then microtask; must not become an unhandled rejection
+});
+
+test("Task 5: no sink configured ⇒ observeCortexShadow is a silent no-op (parity)", async () => {
+  const s = new MemoryService(exitedWm, DEFAULT_MEMORY_CONFIG, undefined, 150, exitedPaneCortex(), 500);
+  assert.doesNotThrow(() => s.observeCortexShadow("p1", 9, "brief-inject", "inj-y"));
+  await flushMicrotasks();
 });

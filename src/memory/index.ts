@@ -4,7 +4,7 @@ import { BreadcrumbRing } from "./breadcrumbs";
 import { assembleBrief } from "./assembler";
 import { DEFAULT_MEMORY_CONFIG, type MemoryConfig, type SynthesizedBrief, type Breadcrumb, type CortexCtx, type MemoryTiers } from "./types";
 import type { PythonSynthClient } from "./pythonClient";
-import type { PythonCortexClient } from "./cortexClient";
+import type { PythonCortexClient, CortexResult } from "./cortexClient";
 import { isCortexPrimary, resolveWithCortex, cortexPrimaryTimeoutMs } from "./cortexShadow";
 
 /** Default quiet-window for cortex hysteresis (ms). Same hash within this window → suppress. */
@@ -23,6 +23,23 @@ export function briefIsForActivePane(briefActivePaneId: string | null, currentAc
   return briefActivePaneId === currentActivePaneId;
 }
 
+/** B-3 measurement spine: the row shape `observeCortexShadow` hands to the durable store (the
+ *  cortex decision-trace + its correlation key). Column-for-column with `store.recordCortexDecision`. */
+export interface CortexDecisionSinkRow {
+  ts: number;
+  injectId: string | null;
+  sessionId: string | null;
+  activePaneId: string | null;
+  trigger: string;
+  ruleFired: string;
+  applied: boolean;
+  traceJson: string;
+}
+
+/** The fire-and-forget durable sink for cortex decisions (typically `store.recordCortexDecision`,
+ *  bound at the construction site). Must be fail-soft on its own — but the caller guards it anyway. */
+export type CortexDecisionSink = (row: CortexDecisionSinkRow) => void;
+
 export class MemoryService {
   // B-6 hysteresis: suppress duplicate cortex fires within the quiet window (default 500 ms).
   private _lastSnapshotHash: string | null = null;
@@ -35,6 +52,9 @@ export class MemoryService {
     private timeoutMs: number = 150,
     private cortexClient?: PythonCortexClient,
     private quietWindowMs: number = DEFAULT_CORTEX_QUIET_WINDOW_MS,
+    // B-3 measurement spine (optional/last so every existing call site + test still compiles):
+    // the durable cortex-decision sink. Absent ⇒ the SHADOW tap observes but persists nothing.
+    private decisionSink?: CortexDecisionSink,
   ) {}
 
   /** Cheap 16-hex-char SHA-256 fingerprint of a tiers snapshot. Used for hysteresis gating only. */
@@ -59,7 +79,7 @@ export class MemoryService {
    *  Absent/unavailable client ⇒ a synchronous no-op. The cortex carries no risk; TS is the floor.
    *  B-6 hysteresis: back-to-back calls with the identical snapshot within quietWindowMs are suppressed
    *  (fire-and-forget efficiency guard; zero effect on synthesizeAsync or the rendered brief). */
-  observeCortexShadow(activePaneId: string | null, now: number, trigger: string = "brief-inject"): void {
+  observeCortexShadow(activePaneId: string | null, now: number, trigger: string = "brief-inject", injectId: string | null = null): void {
     const client = this.cortexClient;
     if (!client || !client.available()) return;
     try {
@@ -67,13 +87,35 @@ export class MemoryService {
       if (!this._shouldFireCortex(tiers, now)) return;
       const ctx: CortexCtx = { activePaneId, sessionId: null, trigger };
       // Fire-and-forget: do NOT await. The facade never rejects, but guard the rejection arm anyway so
-      // an unexpected throw can never surface as an unhandled rejection in the live loop.
+      // an unexpected throw can never surface as an unhandled rejection in the live loop. B-3: on a clean
+      // hit, persist the decision-trace (SHADOW counterfactual, applied:false) via the durable sink.
       void client.decide(tiers, ctx, now).then(
-        (res) => { if (res.ok) console.error(`[cortex-shadow] ${JSON.stringify(res.trace)}`); },
+        (res) => { if (res.ok) this._recordDecision(res, ctx, now, injectId); },
         () => { /* miss — silent; parity preserved */ },
       );
     } catch {
       // getTiers (or a synchronous throw from decide) must never affect injection — swallow.
+    }
+  }
+
+  /** B-3 measurement spine: persist a (would-be) cortex decision to the durable sink, keyed by
+   *  `injectId`. SHADOW ⇒ `applied:false` (counterfactual). Fail-soft: a sink throw is swallowed so
+   *  it can never surface as an unhandled rejection in the fire-and-forget `.then` microtask. */
+  private _recordDecision(res: Extract<CortexResult, { ok: true }>, ctx: CortexCtx, now: number, injectId: string | null): void {
+    if (!this.decisionSink) return;
+    try {
+      this.decisionSink({
+        ts: now,
+        injectId,
+        sessionId: ctx.sessionId ?? null,
+        activePaneId: ctx.activePaneId,
+        trigger: ctx.trigger,
+        ruleFired: res.trace.ruleFired,
+        applied: false,
+        traceJson: JSON.stringify(res.trace),
+      });
+    } catch (e) {
+      console.error("[cortex-shadow] decisionSink failed:", e);
     }
   }
 
@@ -149,8 +191,9 @@ export function createMemoryService(
   pythonClient?: PythonSynthClient,
   timeoutMs: number = 150,
   cortexClient?: PythonCortexClient,
+  decisionSink?: CortexDecisionSink,
 ): CreatedMemory {
   const breadcrumbs = new BreadcrumbRing(cfg);
   const wm = new WorldModel({ ...deps, breadcrumbs });
-  return { service: new MemoryService(wm, cfg, pythonClient, timeoutMs, cortexClient), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
+  return { service: new MemoryService(wm, cfg, pythonClient, timeoutMs, cortexClient, DEFAULT_CORTEX_QUIET_WINDOW_MS, decisionSink), breadcrumbs, addBreadcrumb: (b) => breadcrumbs.add(b) };
 }
