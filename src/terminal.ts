@@ -1272,6 +1272,12 @@ export class OrchestratorManager {
   // server.ts wires it to publish a turn-gated "closed" pane signal — the completion ack that confirms
   // the exit by voice only when it won't talk over the operator (same phase-2 gate as the create ack).
   public onClosed?: (terminalId: string) => void;
+  // wsm-e2e-pinned-kdtu: panes with an archive IN FLIGHT (stopAndArchivePane entered, not yet done).
+  // Marked SYNCHRONOUSLY at entry — before any await — because an archive that joins an in-flight
+  // term.stop() registers its promise reaction AFTER a concurrently-awaiting restart continuation, so
+  // when stop() resolves the RESTART resumes first and would see terminals[id] still populated. This
+  // mark is the archive intent that continuation can consult regardless of reaction order.
+  public readonly archivingPanes = new Set<string>();
   // B1 (async spawn): in-flight deferred starts (one per scheduleStart). flushPendingSpawns() awaits
   // them — the mandatory test/teardown seam so a real ConPTY spawn never outlives the test.
   private pendingStarts = new Set<Promise<void>>();
@@ -1661,19 +1667,27 @@ export class OrchestratorManager {
    *  Note: like "Clear Exited", this also sweeps any already-Exited sibling panes in the
    *  project into the archive. */
   async stopAndArchivePane(projectId: string, paneId: string): Promise<boolean> {
-    const term = this.terminals[paneId];
-    if (term) {
-      await term.stop();        // SIGTERM->SIGKILL; awaits full ConPTY teardown + scrollback flush
-      term.status = "Exited";   // deterministic: a stopped pane is Exited (don't rely on the onExit race)
-      this.syncLedger();        // persist alive=false to the ledger/store via updatePane
-      delete this.terminals[paneId];
+    // kdtu: declare the archive intent BEFORE any await (see archivingPanes). If this archive joins an
+    // in-flight stop() (one-tap 86 during a gated restart's stop->start gap), the restart continuation
+    // resumes FIRST when stop() resolves — this synchronous mark is what stops it respawning a ghost.
+    this.archivingPanes.add(paneId);
+    try {
+      const term = this.terminals[paneId];
+      if (term) {
+        await term.stop();        // SIGTERM->SIGKILL; awaits full ConPTY teardown + scrollback flush
+        term.status = "Exited";   // deterministic: a stopped pane is Exited (don't rely on the onExit race)
+        this.syncLedger();        // persist alive=false to the ledger/store via updatePane
+        delete this.terminals[paneId];
+      }
+      const realProj = projectId || this.ledger.activeProjectId || "default_project";
+      const archived = this.ledger.archiveExitedPanes(realProj) > 0;
+      // Completion edge: publish the turn-gated "closed" ack source (server wires onClosed -> bus).
+      // Best-effort + never-throw — a failed ack must not fail the close.
+      try { this.onClosed?.(paneId); } catch (e) { console.warn(`[terminal] onClosed subscriber threw (ignored):`, e); }
+      return archived;
+    } finally {
+      this.archivingPanes.delete(paneId);
     }
-    const realProj = projectId || this.ledger.activeProjectId || "default_project";
-    const archived = this.ledger.archiveExitedPanes(realProj) > 0;
-    // Completion edge: publish the turn-gated "closed" ack source (server wires onClosed -> bus).
-    // Best-effort + never-throw — a failed ack must not fail the close.
-    try { this.onClosed?.(paneId); } catch (e) { console.warn(`[terminal] onClosed subscriber threw (ignored):`, e); }
-    return archived;
   }
 
   // Synchronize actual terminal state to ledger

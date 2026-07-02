@@ -94,6 +94,9 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manag
     : (opts.activeProject ? { id: opts.activeProjectId ?? opts.activeProject.id, ...opts.activeProject } : opts.activeProject);
   const manager: any = {
     terminals,
+    // kdtu: mirrors OrchestratorManager.archivingPanes — stopAndArchivePane marks a pane here
+    // SYNCHRONOUSLY at entry; the respawn continuation consults it before term.start().
+    archivingPanes: new Set<string>(),
     settings: { presets: undefined, advanced: { defaultShellCommand: "" } },
     // Phase 4: clear_exited now forces a live PTY->ledger sync before reading alive flags
     // (ActionContext manager contract — same fixture completion pattern as isFrozen).
@@ -265,6 +268,100 @@ describe("c55 respawn_pane", () => {
     const { res, sent } = makeFakeRes();
     resultToHttp(result, res);
     assert.strictEqual(sent.status, 200);
+  });
+
+  // wsm-e2e-pinned-kdtu — 86-during-restart race. The gated restart acks eagerly and runs
+  // `await term.stop(); term.start()` in a detached IIFE. During the awaited stop() gap the pane reads
+  // Exited, so the UI legitimately offers one-tap 86. The archive can land on EITHER side of the
+  // restart's continuation, so there are two orderings to pin (both must end with NO ghost respawn):
+  //
+  //   (A) THE PRODUCTION one-tap-86 ordering (adversarial-review repro): stopAndArchivePane JOINS the
+  //       same in-flight stop() — its promise reaction is registered AFTER the restart's, so when
+  //       stop() resolves the RESTART continuation resumes FIRST, while terminals[id] is STILL
+  //       populated. An ownership re-check alone passes and ghosts. The closure must consult the
+  //       archive-intent mark (manager.archivingPanes, set SYNCHRONOUSLY at archive entry).
+  //   (B) The slot is already gone when the restart resumes (delete_pane's synchronous hard delete,
+  //       or an archive completed on an earlier tick) — the ownership re-check catches this one.
+  it("one-tap 86 JOINS the in-flight stop(): restart resumes FIRST yet must NOT ghost-respawn (ordering A)", async () => {
+    // A stop() that parks on a gate we resolve manually — freezes both awaiters mid-flight.
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((r) => { releaseStop = r; });
+    const term = makeFakeTerm();
+    term.stop = async () => { term.stopped++; await stopGate; };
+    const { ctx, manager } = makeCtx({ terminals: { p1: term } });
+
+    // Auto-run: eager ack returns immediately; the IIFE is now suspended at `await term.stop()`
+    // with its continuation registered FIRST on the shared gate.
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.strictEqual(term.stopped, 1, "restart began: stop() was invoked");
+    assert.strictEqual(term.started, 0, "start() has not run — still parked in the stop->start gap");
+
+    // Operator one-tap-86s in the gap. PRODUCTION-ORDER mirror of stopAndArchivePane
+    // (src/terminal.ts — its own synchronous-mark semantic is pinned in test_pane_exit_archive.ts):
+    // mark archivingPanes SYNCHRONOUSLY at entry, JOIN the same in-flight stop(), and only delete
+    // the slot in the continuation — i.e. AFTER the restart's continuation has already resumed.
+    const archive = (async () => {
+      manager.archivingPanes.add("p1");
+      try {
+        await term.stop();
+        delete manager.terminals["p1"];
+      } finally {
+        manager.archivingPanes.delete("p1");
+      }
+    })();
+    assert.ok(manager.archivingPanes.has("p1"), "archive intent is visible synchronously at entry");
+
+    // stop() resolves for BOTH awaiters; promise-reaction order runs the restart continuation first
+    // (terminals.p1 still populated at that instant — the exact window the review proved ghosts).
+    releaseStop();
+    await archive;
+    await new Promise((r) => setImmediate(r)); // flush the restart IIFE continuation
+
+    assert.strictEqual(term.started, 0, "archived pane MUST NOT be respawned by the in-flight restart");
+    assert.strictEqual(manager.terminals["p1"], undefined, "archived pane stays off the board (no re-registration)");
+    assert.strictEqual(manager.archivingPanes.has("p1"), false, "archive mark is cleaned up after completion");
+  });
+
+  it("slot already deleted when the restart resumes (hard-delete path) -> NO ghost respawn (ordering B)", async () => {
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((r) => { releaseStop = r; });
+    const term = makeFakeTerm();
+    term.stop = async () => { term.stopped++; await stopGate; };
+    const { ctx, manager } = makeCtx({ terminals: { p1: term } });
+
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.strictEqual(term.started, 0, "start() has not run — still parked in the stop->start gap");
+
+    // delete_pane's hard delete removes the slot synchronously, BEFORE the restart resumes.
+    delete manager.terminals["p1"];
+
+    releaseStop();
+    await new Promise((r) => setImmediate(r)); // flush the IIFE continuation
+
+    assert.strictEqual(term.started, 0, "deleted pane MUST NOT be respawned by the in-flight restart");
+    assert.strictEqual(manager.terminals["p1"], undefined, "deleted pane stays off the board (no re-registration)");
+  });
+
+  // Guardrail: the ownership re-check must NOT regress the happy path — a pane still registered
+  // (same instance) after stop() is restarted normally, even when stop() resolves on a later tick.
+  it("no archive during the gap -> pane is restarted normally (re-check does not block the happy path)", async () => {
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((r) => { releaseStop = r; });
+    const term = makeFakeTerm();
+    term.stop = async () => { term.stopped++; await stopGate; };
+    const { ctx, manager } = makeCtx({ terminals: { p1: term } });
+
+    const result = await runAction(REGISTRY, "respawn_pane", { pane_id: "p1" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.strictEqual(term.started, 0, "not started until stop() resolves");
+
+    releaseStop();
+    await new Promise((r) => setImmediate(r));
+
+    assert.strictEqual(term.started, 1, "still-registered pane restarts normally after stop() resolves");
+    assert.strictEqual(manager.terminals["p1"], term, "same instance still on the board");
   });
 });
 
