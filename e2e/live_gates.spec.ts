@@ -156,6 +156,13 @@ test("the override governs the live gate: Auto re-fires immediately, Ask defers 
 
   // ── cleanup: 86 the (live) pane — two-tap confirm — so the shared board is left clean ──
   await expect(page.getByTestId("burner")).toBeVisible();
+  // The gated re-fire's effect is an ORDERED async stop()→start() that acks "Fired it" eagerly
+  // (src/actions/defs/panes_rest.ts respawnPane) — the pane is legitimately Exited in the gap.
+  // Wait for the respawn to land (the 86 title flips back to the live two-tap variant) before
+  // tapping, or the first tap one-tap-freezes an "exited" pane and "Sure, Chef?" never renders.
+  // This is also the REAL "survived its gated re-fire" pin: the card existing alone can't tell
+  // a live cmd.exe pane from a corpse (bead wsm-e2e-pinned-q2mb's Windows failure mode).
+  await expect(page.getByTestId("burner-86")).not.toHaveAttribute("title", /already exited/, { timeout: 30_000 });
   await page.getByTestId("burner-86").click();
   await expect(page.getByTestId("burner-86")).toContainText("Sure, Chef?");
   await page.getByTestId("burner-86").click();

@@ -269,12 +269,16 @@ export function globalModeToast(mode: string): string {
 }
 
 /** createPane: resolve the spawn command for a tool preset — a configured preset's command wins,
- *  else the built-in default for that preset name, else bash. */
+ *  else the built-in default for a known agent preset. For Custom (or an unknown preset that the
+ *  server normalizes to Custom) there is NO safe client-side default: returning `undefined` makes
+ *  createPane OMIT the `command` field so the server derives the platform shell
+ *  (advanced.defaultShellCommand, else cmd.exe on Windows / bash on POSIX). Hardcoding 'bash' here
+ *  previously exited live Windows panes with "bash is not recognized" (wsm-e2e-pinned-q2mb). */
 export function resolvePaneCommand(
   toolPreset: string, presets: { name: string; command?: string }[] | undefined,
-): string {
+): string | undefined {
   return presets?.find((p) => p.name === toolPreset)?.command
-    || ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity", Custom: "bash" }[toolPreset] ?? "bash");
+    || ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" }[toolPreset] ?? undefined);
 }
 
 /** createPane: the pane id slug (lowercased, non-alnum→dash, trimmed, capped 24) + a 4-char suffix
