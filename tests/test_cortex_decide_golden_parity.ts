@@ -182,4 +182,80 @@ describe("cortex.decide golden-master parity (TS schema + shape lock)", () => {
       "shadow-budget-absent vector must NOT have shadowBudget in trace",
     );
   });
+
+  it("shadowBudgetCurated presence matches frozen values (present only on drop) for ok:true vectors", () => {
+    // The curated render (o23) is emitted ONLY when the cortex dropped a tier; presence must match frozen.
+    const mismatches: string[] = [];
+    for (const v of vectors) {
+      const resp = v.response as { ok: boolean; trace?: { shadowBudgetCurated?: unknown } };
+      if (!resp.ok) continue;
+      const frozenHas = resp.trace!.shadowBudgetCurated !== undefined;
+      const result = CortexDecideResponseSchema.safeParse(v.response);
+      if (!result.success || !result.data.ok) continue;
+      const parsedHas = result.data.trace.shadowBudgetCurated !== undefined;
+      if (parsedHas !== frozenHas) {
+        mismatches.push(
+          `  [${v.name}]: frozen shadowBudgetCurated present=${frozenHas} parsed=${parsedHas}`,
+        );
+      }
+    }
+    assert.equal(
+      mismatches.length,
+      0,
+      `shadowBudgetCurated presence mismatch in ${mismatches.length} vector(s):\n${mismatches.join("\n")}`,
+    );
+  });
+
+  it("shadowBudgetCurated shape (perTierChars + textLen) matches frozen values where present", () => {
+    const mismatches: string[] = [];
+    for (const v of vectors) {
+      const resp = v.response as {
+        ok: boolean;
+        trace?: { shadowBudgetCurated?: { perTierChars: Record<string, number>; textLen: number } };
+      };
+      if (!resp.ok || !resp.trace?.shadowBudgetCurated) continue;
+      const frozen = resp.trace.shadowBudgetCurated;
+      const result = CortexDecideResponseSchema.safeParse(v.response);
+      if (!result.success || !result.data.ok || !result.data.trace.shadowBudgetCurated) continue;
+      const parsed = result.data.trace.shadowBudgetCurated;
+      if (
+        JSON.stringify(parsed.perTierChars) !== JSON.stringify(frozen.perTierChars) ||
+        parsed.textLen !== frozen.textLen
+      ) {
+        mismatches.push(
+          `  [${v.name}]: frozen=${JSON.stringify(frozen)} parsed=${JSON.stringify(parsed)}`,
+        );
+      }
+    }
+    assert.equal(
+      mismatches.length,
+      0,
+      `shadowBudgetCurated shape mismatch in ${mismatches.length} vector(s):\n${mismatches.join("\n")}`,
+    );
+  });
+
+  it("exited-pane vector: curated render drops the pane tier and saves chars vs full", () => {
+    const v = vectors.find((x) => x.name === "exited-pane-drops-pane-tier");
+    assert.ok(v, "expected a vector named 'exited-pane-drops-pane-tier' in the fixture");
+    const resp = v!.response as {
+      ok: boolean;
+      trace?: {
+        shadowBudget?: { perTierChars: Record<string, number>; textLen: number };
+        shadowBudgetCurated?: { perTierChars: Record<string, number>; textLen: number };
+      };
+    };
+    assert.ok(resp.ok, "exited-pane vector must be ok:true");
+    const full = resp.trace?.shadowBudget;
+    const curated = resp.trace?.shadowBudgetCurated;
+    assert.ok(full && curated, "exited-pane vector must have BOTH shadowBudget and shadowBudgetCurated");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(curated!.perTierChars, "pane"),
+      false,
+      "curated render must exclude the dropped 'pane' tier",
+    );
+    assert.ok(
+      curated!.textLen < full!.textLen,
+      `curated textLen (${curated!.textLen}) must be < full textLen (${full!.textLen})`,
+    );
+  });
 });

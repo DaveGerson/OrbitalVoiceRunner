@@ -171,6 +171,12 @@ export const CortexTraceSchema = z.object({
     perTierChars: z.record(z.string(), z.number()),
     textLen: z.number(),
   }).optional(),
+  // 0.2.1: post-drop renderer budget (curated tiers only). Present only when drop is non-empty.
+  // Enables savings = shadowBudget.textLen - shadowBudgetCurated.textLen computation. Pure observation.
+  shadowBudgetCurated: z.object({
+    perTierChars: z.record(z.string(), z.number()),
+    textLen: z.number(),
+  }).optional(),
   ts: z.number(),
 });
 

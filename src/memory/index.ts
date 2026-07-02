@@ -82,6 +82,8 @@ export class MemoryService {
   observeCortexShadow(activePaneId: string | null, now: number, trigger: string = "brief-inject", injectId: string | null = null): void {
     const client = this.cortexClient;
     if (!client || !client.available()) return;
+    // csw: primary path decides+records via cortexCuratedBrief; suppress the shadow hit to avoid the double daemon call.
+    if (isCortexPrimary()) return;
     try {
       const tiers = this.wm.getTiers(activePaneId, now);
       if (!this._shouldFireCortex(tiers, now)) return;
@@ -99,9 +101,10 @@ export class MemoryService {
   }
 
   /** B-3 measurement spine: persist a (would-be) cortex decision to the durable sink, keyed by
-   *  `injectId`. SHADOW ⇒ `applied:false` (counterfactual). Fail-soft: a sink throw is swallowed so
-   *  it can never surface as an unhandled rejection in the fire-and-forget `.then` microtask. */
-  private _recordDecision(res: Extract<CortexResult, { ok: true }>, ctx: CortexCtx, now: number, injectId: string | null): void {
+   *  `injectId`. SHADOW ⇒ `applied:false` (counterfactual); PRIMARY hit ⇒ `applied:true`.
+   *  Fail-soft: a sink throw is swallowed so it can never surface as an unhandled rejection in
+   *  the fire-and-forget `.then` microtask. */
+  private _recordDecision(res: Extract<CortexResult, { ok: true }>, ctx: CortexCtx, now: number, injectId: string | null, applied: boolean = false): void {
     if (!this.decisionSink) return;
     try {
       this.decisionSink({
@@ -111,7 +114,7 @@ export class MemoryService {
         activePaneId: ctx.activePaneId,
         trigger: ctx.trigger,
         ruleFired: res.trace.ruleFired,
-        applied: false,
+        applied,
         traceJson: JSON.stringify(res.trace),
       });
     } catch (e) {
@@ -127,25 +130,33 @@ export class MemoryService {
   /** B-1 FLIP (default OFF): when the cortex is PRIMARY and available, ask it which tiers survive,
    *  render ONLY those, and stamp `source: "cortex-primary"`. Returns null on ANY miss (flag off,
    *  unavailable, timeout, ok:false, throw) so the caller falls through to the full-tier floor UNCHANGED
-   *  — the parity guarantee while the flag is off (the branch is never even entered). */
-  private async cortexCuratedBrief(tiers: MemoryTiers, activePaneId: string | null, now: number): Promise<SynthesizedBrief | null> {
+   *  — the parity guarantee while the flag is off (the branch is never even entered).
+   *  csw: on a clean hit, records the decision as applied:true via the onHit callback (decide runs
+   *  ONCE here; observeCortexShadow is suppressed when primary to avoid the double daemon call). */
+  private async cortexCuratedBrief(tiers: MemoryTiers, activePaneId: string | null, now: number, injectId: string | null = null): Promise<SynthesizedBrief | null> {
     const cortex = this.cortexClient;
     if (!isCortexPrimary() || !cortex || !cortex.available()) return null;
     const ctx: CortexCtx = { activePaneId, sessionId: null, trigger: "brief-inject" };
-    const filtered = await resolveWithCortex(tiers, ctx, now, cortex, cortexPrimaryTimeoutMs());
+    const onHit = (res: Extract<CortexResult, { ok: true }>) => this._recordDecision(res, ctx, now, injectId, true);
+    const filtered = await resolveWithCortex(tiers, ctx, now, cortex, cortexPrimaryTimeoutMs(), onHit);
     if (!filtered) return null;
     return { ...assembleBrief(filtered, this.cfg, now), source: "cortex-primary" };
   }
 
-  /** P0b: race the Python daemon (≤timeoutMs) against the in-process floor; TS owns `source` (I1/I4). */
-  async synthesizeAsync(activePaneId: string | null, now: number): Promise<SynthesizedBrief> {
+  /** P0b: race the Python daemon (≤timeoutMs) against the in-process floor; TS owns `source` (I1/I4).
+   *  csw: when primary and the cortex misses, tiers are already the full floor so the synth race is
+   *  pure latency — skip it and return the in-process floor immediately (+0ms vs the previous +150ms). */
+  async synthesizeAsync(activePaneId: string | null, now: number, injectId: string | null = null): Promise<SynthesizedBrief> {
     try {
       const tiers = this.wm.getTiers(activePaneId, now);
       const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
       // B-1: cortex-primary curation (default OFF). On a clean hit this REPLACES the synth race below
       // (the cortex already curated the tiers); on any miss it returns null and we fall through.
-      const curated = await this.cortexCuratedBrief(tiers, activePaneId, now);
+      const curated = await this.cortexCuratedBrief(tiers, activePaneId, now, injectId);
       if (curated) return curated;
+      // csw: primary + cortex-miss ⇒ tiers are already the full floor; the synth race only re-derives
+      // the byte-equal floor at +150ms. Skip it.
+      if (isCortexPrimary()) return fallback();
       const client = this.pythonClient;
       if (!client || !client.available()) return fallback();
       // In-flight rule: the awaited race DEPENDS on this ceiling to settle if the daemon request

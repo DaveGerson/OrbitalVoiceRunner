@@ -598,7 +598,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         memory.service.observeCortexShadow(activeId, Date.now(), "brief-inject", injectId);
         // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
         // synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        const brief = await memory.service.synthesizeAsync(activeId, Date.now());
+        const brief = await memory.service.synthesizeAsync(activeId, Date.now(), injectId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane

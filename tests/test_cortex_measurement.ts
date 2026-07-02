@@ -158,7 +158,7 @@ function exitedPaneCortex(): PythonCortexClient {
       ok: true,
       decision: { keep: ["project", "frame"], drop: ["pane"], rerank: [] },
       trace: {
-        cortexVersion: "0.2.0", strategy: "rule", ruleFired: "exited-pane",
+        cortexVersion: "0.2.1", strategy: "rule", ruleFired: "exited-pane",
         inputs: { activePaneId: "p1", sessionId: null, trigger: "brief-inject", tierKeys: ["pane", "frame"], tierChars: { pane: 10, frame: 1 } },
         output: { orderedKeep: ["project", "frame"], dropped: ["pane"] }, ts: 0,
       } as any,

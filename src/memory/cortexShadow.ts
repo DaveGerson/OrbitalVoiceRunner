@@ -16,7 +16,7 @@
 // MemoryService as a constructor field, so synthesizeAsync passes it in. This module owns only the
 // flag, the race helper, the keep-list filter, and the B-4 fallback-rate counter.
 import type { CortexCtx, MemoryTiers } from "./types";
-import type { PythonCortexClient } from "./cortexClient";
+import type { PythonCortexClient, CortexResult } from "./cortexClient";
 
 // ── the FLIP flag (off by default = SHADOW; the brief path is byte-identical to today) ───────────────
 const DEFAULT_CORTEX_PRIMARY_TIMEOUT_MS = 300; // plan B-1 default: 300ms (vs approval's 600ms)
@@ -105,12 +105,14 @@ export async function resolveWithCortex(
   now: number,
   client: PythonCortexClient,
   timeoutMs: number,
+  onHit?: (res: Extract<CortexResult, { ok: true }>) => void,
 ): Promise<MemoryTiers | null> {
   try {
     const res = await withTimeout(client.decide(tiers, ctx, now), timeoutMs);
     if (res && res.ok) {
       firstUp = true;
       totalCount++; // a clean curation — counted, not a fallback
+      if (onHit) onHit(res);
       return filterTiersToKeep(tiers, res.decision.keep);
     }
     // miss (null / timeout / ok:false): count it ONLY once the cortex has come up at least once.
