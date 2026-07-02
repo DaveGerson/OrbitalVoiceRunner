@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**91** actions across **26** gated capabilities, plus the always-allowed group.
+**93** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -29,6 +29,7 @@ These bypass the capability gate entirely — they work even while the system is
 | `edit_note` | rest | no | Operator-UI |
 | `get_attention_queue` | rest | no | Read the raw attention/alert queue (panes that transitioned to error/exit) |
 | `get_ledger` | rest | no | Read the full workspaces ledger (project/pane tree the UI loads on page open) |
+| `get_status_summary` | voice | no | Speak a prioritized situation report (SITREP) |
 | `get_stop_all_status` | rest | no | Read the live STOP-ALL freeze state {frozen, running} so a fresh page load can restore the FROZEN banner |
 | `list_archived_panes` | rest | no | List archived (exited+cleared) panes for the UI restore tray (pane_id/name/project/preset/last_command/archived_at) |
 | `list_orchestration_recipes` | rest | no | Read the orchestration recipe templates (suggested multi-pane suites the UI offers) |
@@ -190,6 +191,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `focus_pane` | voice | no | Resolve a spoken reference to a pane ('the build pane', 'the stuck one', 'pane two', 'that one') and make it the active pane |
 | `switch_active_pane` | voice | no | Change which pane is open on the operator's screen |
 
 ## Read notes & handoffs

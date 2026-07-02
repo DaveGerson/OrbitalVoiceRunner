@@ -38,6 +38,7 @@ import { WATCH_RULES_ACTIONS } from "./defs/watch_rules";
 import { TEMPLATES_ACTIONS } from "./defs/templates";
 import { LAYOUTS_ACTIONS } from "./defs/layouts";
 import { DISPATCH_ACTIONS } from "./defs/dispatch_group";
+import { VOICE_UX_ACTIONS } from "./defs/voice_ux";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -298,8 +299,9 @@ export const amendNote: ActionDef<typeof AmendNoteParams> = {
  * and the phase-B contract proof (propose_command = dispatchProposal style, amend_note = gateOrDefer
  * durable Ask-defer style). The remaining 35 tools live in src/actions/defs/* (one file per capability
  * domain), faithfully ported from their legacy server.ts branches. Phase C swaps server.ts to dispatch
- * through runAction(REGISTRY, ...). Total = 43 voice tools (parity with the legacy dispatch chain
- * + the Wave D observability pair get_action_log / get_health).
+ * through runAction(REGISTRY, ...). Total = 45 voice tools (parity with the legacy dispatch chain
+ * + the Wave D observability pair get_action_log / get_health + the voice-UX wave 3 pair
+ * get_status_summary / focus_pane).
  */
 export const REGISTRY: readonly ActionDef[] = [
   // ── phase-A + contract-proof inline defs (6) ──
@@ -332,6 +334,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...TEMPLATES_ACTIONS,
   ...LAYOUTS_ACTIONS,
   ...DISPATCH_ACTIONS,
+  // ── voice-UX wave 3: get_status_summary (SITREP) + focus_pane (conversational focus) (2) ──
+  ...VOICE_UX_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

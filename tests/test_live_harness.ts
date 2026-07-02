@@ -123,8 +123,13 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // then 44 -> 45 by wsm-e2e-pinned-5h0 (close_pane — the exit+archive voice tool),
     // then 45 -> 56 by journey-expansion templates/layouts/dispatch (list/create/update/delete/
     // apply_prompt_template, save_project_layout/list_layouts/apply_layout/delete_layout,
-    // dispatch_to_panes + get_dispatch_status — docs/design/templates-layouts-dispatch.md §3).
-    assert.strictEqual(decls.length, 56, "exactly 56 voice tools declared");
+    // dispatch_to_panes + get_dispatch_status — docs/design/templates-layouts-dispatch.md §3),
+    // then 56 -> 58 by voice-UX wave 3 (get_status_summary SITREP + focus_pane conversational
+    // focus — docs/superpowers/specs/2026-07-02-voice-ux-trio-design.md). Edit owned by the wave-3
+    // SCAFFOLD batch (this file has no dedicated feature owner in the wave's file-ownership map;
+    // it belongs alongside src/actions/defs/voice_ux.ts / registry.ts / coverage.ts, the other
+    // registry-surface edits scaffold made when the two new tool defs were registered).
+    assert.strictEqual(decls.length, 58, "exactly 58 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

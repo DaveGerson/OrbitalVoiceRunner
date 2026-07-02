@@ -1,7 +1,7 @@
 import { PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import path from "path";
-import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
+import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES, DEFAULT_VOICE_UX } from "./types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES, pruneAttentionQueue } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
@@ -1419,7 +1419,9 @@ export class OrchestratorManager {
       },
       secrets: {
         geminiApiKey: process.env.GEMINI_API_KEY ? "CONFIGURED_IN_ENV" : ""
-      }
+      },
+      // Voice UX trio (wave 3): SITREP shape / focus bind policy / spoken-confirm timeout defaults.
+      voiceUx: { ...DEFAULT_VOICE_UX }
     };
   }
 
@@ -1447,7 +1449,10 @@ export class OrchestratorManager {
               ...(parsed.advanced?.capabilityGates ?? {}),
             },
           },
-          secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets }
+          secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets },
+          // Voice UX trio (wave 3): shallow-merge so a persisted file without voiceUx (or with only
+          // some keys set) still gets the DEFAULT_VOICE_UX floor for the rest (same idiom as voiceAi).
+          voiceUx: { ...this.getDefaultSettings().voiceUx, ...parsed.voiceUx },
         };
       } else {
         this.settings = this.getDefaultSettings();

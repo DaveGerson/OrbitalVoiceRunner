@@ -69,6 +69,9 @@ import {
   type ContextInjectionTrigger,
   type ContextInjectionDisposition,
 } from "../memory/contextTelemetry";
+import type { PythonPolicyClient } from "./policyClient";
+import { createSpokenConfirm } from "./spokenConfirm";
+import { DEFAULT_VOICE_UX } from "../types";
 
 // B-3 measurement spine: the per-injection correlation key. A module-scope monotonic counter mints
 // `inj-<ts>-<seq>` once per injectMemoryBrief; the same id is stamped on the cortex decision-trace
@@ -276,6 +279,10 @@ export interface VoiceDeps {
    *  bead 53q: pass an `owner` token (this connection's state object) on BOTH register and clear so a
    *  stale/foreign connection's close cannot clear the SURVIVING connection's nudge (identity guard). */
   registerReconnectNudge?: (fn: (() => void) | null, owner?: unknown) => void;
+  /** Voice-UX wave 3: the optional "policies" Python daemon facade (focus resolution + SITREP
+   *  ranking). Wired onto ActionContext.policies for the voice lane ONLY — undefined when the
+   *  master switch (advanced.memoryPythonEnabled) is off or the daemon init failed (permanent fallback). */
+  policies?: PythonPolicyClient;
 }
 
 /**
@@ -361,6 +368,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     API_AUTH_TOKEN,
     getCookie,
     registerReconnectNudge,
+    policies,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -583,6 +591,24 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // B-3: no brief injected yet on this connection — the turn-usage join has no key until the first.
       lastInjectId: null,
     };
+
+    // Voice-UX wave 3: the spoken destructive-confirm protocol (src/voice/spokenConfirm.ts, f09-owned).
+    // Constructed ONCE per WS connection (NOT per Gemini reconnect inside connectLiveSession) so its
+    // state machine (idle / awaiting_phrase / reprompted) persists across reconnects on THIS session,
+    // and so the close handler below (outside connectLiveSession's scope) can dispose it. Intercepted
+    // BEFORE the normal approval-intent routing (see the hook inside handleOperatorUtterance) so a bare
+    // "yes" can never approve a staged destructive action.
+    const spokenConfirm = createSpokenConfirm({
+      narrate: (t) => pushApprovalNarrationDep(state.session, t),
+      redact: redactSecrets,
+      nowMs: Date.now,
+      setTimer: (fn, ms) => { const t = setTimeout(fn, ms); (t as any).unref?.(); return t; },
+      clearTimer: (t) => clearTimeout(t as any),
+      confirmTimeoutMs: () => (manager.settings.voiceUx ?? DEFAULT_VOICE_UX).confirmTimeoutMs,
+      pendingActions,
+      heldEntries: () => pendingApprovals.forSession(state.session),
+      broadcast,
+    });
 
     const turnId = (): string => {
       if (state.currentInteractionId == null) state.currentInteractionId = interactionLog.mint();
@@ -1033,6 +1059,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // builds its flat REST array from posturePayloadForPane; get_stop_all_status reads runningPaneIds.
           runningPaneIds,
           posturePayloadForPane,
+          // Voice-UX wave 3: the optional "policies" daemon facade — undefined when the master
+          // switch is off or init failed (permanent TS-fallback posture, per D2).
+          policies,
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
@@ -1217,6 +1246,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // the parser. Empty/whitespace drops. Step 6: capture dictation into the ACTIVE pane's WIP
             // draft (raw material the operator refines before sending). No-op if no pane is open.
             appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
+
+            // Voice-UX wave 3: the spoken destructive-confirm protocol gets FIRST look at every routed
+            // utterance — a synchronous TS choke point ahead of the approval-intent routing below, so a
+            // bare "yes" can never approve a staged destructive action (delete_pane/delete_project/
+            // clear_history). intercept() returns true only while consuming an utterance that is part of
+            // an open (or newly-armed) confirm window; everything else falls through unchanged.
+            if (spokenConfirm.intercept(cleanUtter)) return;
 
             // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
             // announced targeting (NOT FIFO, NOT substring matching).
@@ -1816,6 +1852,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
     clientWs.on("close", () => {
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
+      // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
+      // destructive pendingActions record survives and stays resolvable via UI/typed SURE.
+      spokenConfirm.dispose();
       // bead 9fz: the operator left — unregister this connection's reconnect-nudge so a later settings
       // PUT can't poke a dead connection's scheduler. (A fresh connection re-registers its own.)
       // bead 53q: pass THIS connection's `state` as the owner token. The module guards the clear so a
