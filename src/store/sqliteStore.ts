@@ -926,7 +926,7 @@ export class JanusStore {
   // project/pane id, so `${project_id}\0${pane_id}` is an unambiguous key (a space would collide for
   // ids containing spaces). Centralized here and threaded through the partition/assembly helpers so the
   // workspaces refactor preserves the original delimiter EXACTLY.
-  private static readonly WS_NOTE_KEY_SEP = " ";
+  private static readonly WS_NOTE_KEY_SEP = "\u0000";
 
   /** Partition note rows (DESC by created_at) into project-scoped and pane-scoped buckets. Extracted
    *  from the `workspaces` getter verbatim: partitioning preserves the DESC order within each group so
@@ -935,7 +935,7 @@ export class JanusStore {
    *  prototype-leak surface. */
   private partitionNotes(noteRows: NoteRow[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
     const projectNotes = new Map<string, string[]>();
-    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
+    const paneNotes = new Map<string, string[]>(); // key: `${project_id}\u0000${pane_id}`
     for (const n of noteRows) {
       const [bucket, key] = n.pane_id
         ? ([paneNotes, `${n.project_id}${JanusStore.WS_NOTE_KEY_SEP}${n.pane_id}`] as const)
