@@ -67,6 +67,16 @@ const SPOTLIGHT_CAPABILITIES: ReadonlySet<CapabilityGate> = new Set<CapabilityGa
 /**
  * Resolve ONE capability's effective gate value (override -> spotlight -> global -> Auto).
  * Private mirror of resolveCapabilityGateWithContext (src/pendingApprovals.ts) — see file header.
+ *
+ * rm4 note (read-gating boundary): this resolver computes the gate VALUE for every capability,
+ * including read_pane/read_notes — but resolving a value is not the same as ENFORCING it. Per
+ * action defs (src/actions/defs/reads.ts, src/actions/registry.ts) decide FOR THEMSELVES whether
+ * to call this and block on Off. read_pane/read_notes Off is meant to forbid pane/note CONTENT
+ * recall (get_pane_summary, get_pane_delta, get_pane_command_history, note/handoff content
+ * reads); it is deliberately NOT wired into operational/orientation surfaces like list_panes
+ * (existence/status), get_attention_digest, or list_pending_approvals (alert/queue metadata) —
+ * muting those would hide the very signals the operator needs. See
+ * docs/design/capability-gate-worksheet.md ("What read_pane / read_notes actually gate").
  */
 function resolveOne(
   paneGate: GateValue | undefined,
