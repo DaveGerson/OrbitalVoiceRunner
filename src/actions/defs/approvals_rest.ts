@@ -10,12 +10,20 @@
  * 500) the default kind->status map (resultToHttp) cannot express. Each def therefore carries a
  * `rest.toHttp` (c55 Batch E primitive): the handler returns `{ kind:"ok", output:<discriminated> }`
  * where `output` is a `{outcome,...}` tag (POSTs) or the projected array (GETs), and `toHttp`
- * re-projects that into the EXACT legacy `{status, body}`. Field-for-field parity with server.ts:
+ * re-projects that into the EXACT legacy `{status, body}`. Field-for-field parity with server.ts
+ * for every WELL-FORMED request:
  *   GET  /api/commands/pending      -> 200, pendingApprovals.all().map(serializePending) top-level
  *   GET  /api/actions/pending       -> 200, {id,capability,summary,ageSeconds}[] top-level
  *   POST /api/actions/:id/confirm   -> 404 / 200(already) / 200(output, +broadcast) / 500
  *   POST /api/actions/:id/cancel    -> 404 / 200(already, +broadcast)
  *   POST /api/commands/approve      -> 404 / 422 / 200(already) / 200
+ * PLUS (wsm-e2e-pinned-wqk, a deliberate delta from legacy on MALFORMED input only): a top-level
+ * ActionResult kind:'error' (zod validation reject, or an uncaught handler throw) maps to
+ * 400 {error} on ALL FIVE routes, instead of folding into not_found 404 (POSTs) or a silent 200 []
+ * (GETs). Fails closed — no resolution side effect ever fires. Known coarseness, accepted: runAction
+ * flattens validation rejects and handler throws into the same {kind:'error', message} (no
+ * discriminator), so a thrown handler bug also surfaces as 400 rather than 500; both were previously
+ * mis-shaped (404/200[]), and distinguishing them needs an ActionResult-wide cause field (own bead).
  *
  * TYPING IDIOM (mirrors the c55.11 toHttp reads in reads.ts): ActionResult.output is typed `unknown`,
  * so a handler stuffs a structured value through it with no cast; toHttp guards `result.kind === "ok"`
@@ -42,10 +50,12 @@ export const listPendingCommands: ActionDef<typeof NoParams> = {
   rest: {
     method: "get",
     path: "/api/commands/pending",
-    toHttp: (result): { status: number; body: unknown } => ({
-      status: 200,
-      body: result.kind === "ok" ? result.output : [],
-    }),
+    // wsm-e2e-pinned-wqk: a handler/validation throw (kind:'error') must surface as a 4xx, not fold
+    // into the ok-shaped [] default (which would silently report "no pending commands").
+    toHttp: (result): { status: number; body: unknown } => {
+      if (result.kind === "error") return { status: 400, body: { error: result.message } };
+      return { status: 200, body: result.kind === "ok" ? result.output : [] };
+    },
   },
   handler: (_args, ctx): ActionResult => ({
     kind: "ok",
@@ -64,10 +74,11 @@ export const listPendingActions: ActionDef<typeof NoParams> = {
   rest: {
     method: "get",
     path: "/api/actions/pending",
-    toHttp: (result): { status: number; body: unknown } => ({
-      status: 200,
-      body: result.kind === "ok" ? result.output : [],
-    }),
+    // wsm-e2e-pinned-wqk: same fold hazard as list_pending_commands above — surface kind:'error' as 400.
+    toHttp: (result): { status: number; body: unknown } => {
+      if (result.kind === "error") return { status: 400, body: { error: result.message } };
+      return { status: 200, body: result.kind === "ok" ? result.output : [] };
+    },
   },
   handler: (_args, ctx): ActionResult => ({
     kind: "ok",
@@ -100,6 +111,10 @@ export const confirmPendingAction: ActionDef<typeof IdParams> = {
     method: "post",
     path: "/api/actions/:id/confirm",
     toHttp: (result): { status: number; body: unknown } => {
+      // wsm-e2e-pinned-wqk: a handler/validation throw (kind:'error', e.g. malformed body) must NOT
+      // fold into the not_found 404 default below — that would mask an invalid request as "not found"
+      // and, worse, is indistinguishable from a real absent-id 404. Surface it as its own 400.
+      if (result.kind === "error") return { status: 400, body: { error: result.message } };
       const o = (result.kind === "ok" ? result.output : { outcome: "not_found" }) as ConfirmOutcome;
       if (o.outcome === "not_found") return { status: 404, body: { error: "Pending action not found" } };
       if (o.outcome === "already") return { status: 200, body: { success: true, already: true } };
@@ -138,6 +153,8 @@ export const cancelPendingAction: ActionDef<typeof IdParams> = {
     method: "post",
     path: "/api/actions/:id/cancel",
     toHttp: (result): { status: number; body: unknown } => {
+      // wsm-e2e-pinned-wqk: see confirm's identical note — don't fold kind:'error' into not_found 404.
+      if (result.kind === "error") return { status: 400, body: { error: result.message } };
       const o = (result.kind === "ok" ? result.output : { outcome: "not_found" }) as CancelOutcome;
       if (o.outcome === "not_found") return { status: 404, body: { error: "Pending action not found" } };
       return { status: 200, body: { success: true, already: o.already } };
@@ -171,6 +188,13 @@ export const approvePendingCommand: ActionDef<typeof ApproveParams> = {
     method: "post",
     path: "/api/commands/approve",
     toHttp: (result): { status: number; body: unknown } => {
+      // wsm-e2e-pinned-wqk: a malformed body (missing/non-boolean `approved`) fails zod validation
+      // BEFORE the handler runs, producing a top-level kind:'error' ActionResult — NOT a def-shaped
+      // ApproveOutcome. The old code cast the ok-fallback `{outcome:'not_found'}` onto this case,
+      // which folded any handler/validation throw into the same 404 a real missing-messageId gets.
+      // Special-case it to a 400 instead: distinct from 404, and (unlike loosening ApproveParams to
+      // coerce a missing `approved` to false) never silently applies a reject side effect on bad input.
+      if (result.kind === "error") return { status: 400, body: { error: result.message } };
       const o = (result.kind === "ok" ? result.output : { outcome: "not_found" }) as ApproveOutcome;
       if (o.outcome === "not_found") return { status: 404, body: { error: "Pending command not found" } };
       if (o.outcome === "dead_pane") return { status: 422, body: { success: false, error: "target pane missing" } };
