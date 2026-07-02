@@ -187,6 +187,20 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
         // contract only needs the confirm string back, which the inline route returned eagerly too.
         void (async () => {
           await term.stop();
+          // 86-during-restart race (wsm-e2e-pinned-kdtu): while stop() is awaited the pane reads Exited,
+          // so the UI legitimately offers one-tap 86. If the operator archives in that gap, resuming here
+          // and calling term.start() would respawn a GHOST PTY for a pane no longer on the board. TWO
+          // guards, because the archive can land on either side of this continuation:
+          //   1. OWNERSHIP — terminals[id] must still be THIS instance. Catches paths that delete the
+          //      slot before this continuation resumes (delete_pane's synchronous hard delete, or an
+          //      archive whose stop() completed on an earlier tick), and instance replacement.
+          //   2. ARCHIVE INTENT — stopAndArchivePane may instead JOIN our in-flight stop(): its promise
+          //      reaction is registered AFTER ours, so when stop() resolves WE resume first and the slot
+          //      is still populated (ownership alone passes — the ghost the adversarial review proved).
+          //      The archive marks manager.archivingPanes SYNCHRONOUSLY at entry, so that intent is
+          //      visible here regardless of reaction order. (`?.` tolerates slim test fakes.)
+          // The checks and term.start() share one synchronous tick — no await re-opens the window.
+          if (ctx.manager.terminals[id] !== term || ctx.manager.archivingPanes?.has(id)) return;
           term.start();
           ctx.broadcastLedgerUpdate();
           ctx.broadcastTerminalsUpdated();

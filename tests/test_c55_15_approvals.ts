@@ -349,6 +349,79 @@ describe("c55.15 — approve_pending_command status matrix", () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// (d) wsm-e2e-pinned-wqk — malformed-body parity. approved is required boolean (ApproveParams);
+// a malformed body fails zod validation BEFORE the handler runs, so runAction returns a top-level
+// {kind:'error', message}. The def-local toHttp must special-case that as 400 — NOT fold it into the
+// def's own not_found/[] default (which used to yield a spurious 404 for approve/confirm/cancel, or a
+// silent 200 [] for the two GET reads). applyResolution must never be called on this path (no
+// silent-reject side effect on bad input), and the well-formed matrix above stays byte-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("c55.15 — wsm-e2e-pinned-wqk: kind:'error' -> 400, not folded into 404/[]", () => {
+  it("approve_pending_command: approved missing -> 400 {error}; applyResolution NOT called (no silent reject)", async () => {
+    const { ctx, rec } = makeApprovalsCtx({ approvalsHas: () => true });
+    const args = { messageId: "m1" }; // 'approved' missing -> fails ApproveParams (z.boolean())
+    const result = await runAction(REGISTRY, "approve_pending_command", args, ctx);
+    assert.strictEqual(result.kind, "error", "malformed body -> top-level ActionResult.kind 'error'");
+    assert.strictEqual(rec.resolutionCalls.length, 0, "malformed body -> applyResolution never called");
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("approve_pending_command"), result, args, res);
+    assert.strictEqual(sent.status, 400, "malformed body -> 400, NOT 404");
+    assert.ok((sent.json as { error: string }).error, "400 body carries {error}");
+  });
+
+  it("approve_pending_command: approved non-boolean -> 400 {error}; applyResolution NOT called", async () => {
+    const { ctx, rec } = makeApprovalsCtx({ approvalsHas: () => true });
+    const args = { messageId: "m1", approved: "yes" }; // wrong type -> fails z.boolean()
+    const result = await runAction(REGISTRY, "approve_pending_command", args, ctx);
+    assert.strictEqual(result.kind, "error");
+    assert.strictEqual(rec.resolutionCalls.length, 0);
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("approve_pending_command"), result, args, res);
+    assert.strictEqual(sent.status, 400);
+    assert.ok((sent.json as { error: string }).error);
+  });
+
+  it("approve_pending_command: well-formed body is unaffected (regression guard for this bead's fix)", async () => {
+    const { ctx, rec } = makeApprovalsCtx({ approvalsHas: () => true, applyResolution: () => ({ reason: "approved", doWrite: true }) });
+    const result = await runAction(REGISTRY, "approve_pending_command", { messageId: "m1", approved: true }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.deepStrictEqual(rec.resolutionCalls, [{ messageId: "m1", mode: "approve" }]);
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("approve_pending_command"), result, { messageId: "m1", approved: true }, res);
+    assert.strictEqual(sent.status, 200);
+    assert.deepStrictEqual(sent.json, { success: true });
+  });
+
+  it("confirm_pending_action: a top-level kind:'error' result maps to 400, not 404", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("confirm_pending_action"), { kind: "error", message: "boom" }, { id: "a1" }, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("cancel_pending_action: a top-level kind:'error' result maps to 400, not 404", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("cancel_pending_action"), { kind: "error", message: "boom" }, { id: "a1" }, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("list_pending_commands: a top-level kind:'error' result maps to 400, not a silent 200 []", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_commands"), { kind: "error", message: "boom" }, {}, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("list_pending_actions: a top-level kind:'error' result maps to 400, not a silent 200 []", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_actions"), { kind: "error", message: "boom" }, {}, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+});
+
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // Task 3 — cutover guard. (Clone of the c55.14 guard in tests/test_c55_14_lifecycle.ts.) Slices the
 // mountRestRoutes only:new Set([...]) block from server.ts-as-text and asserts the 5 approvals/pending

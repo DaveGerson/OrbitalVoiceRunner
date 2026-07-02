@@ -93,6 +93,38 @@ describe("OrchestratorManager.stopAndArchivePane (graceful exit + archive)", () 
     assert.strictEqual(archived, false, "no pane archived when none exists");
     cleanupLedger(ledgerPath);
   });
+
+  // wsm-e2e-pinned-kdtu: the archive-intent mark MUST be set SYNCHRONOUSLY at entry — before the
+  // awaited stop(). A one-tap 86 that joins a gated restart's in-flight stop() has its promise
+  // reaction registered AFTER the restart's, so the restart continuation resumes FIRST; the
+  // synchronous mark is the ONLY signal it can consult at that instant (terminals[id] is still
+  // populated). tests/test_panes_rest_c55.ts pins the full interleaving against a mirror of this
+  // method; THIS test pins the real method's load-bearing ordering so the mirror cannot drift.
+  it("marks archivingPanes SYNCHRONOUSLY at entry (before the awaited stop) and clears it when done", async () => {
+    const { manager, ledgerPath } = makeIsolatedManager("mark");
+    const paneId = "p-mark";
+    const term = new UniversalTerminal(paneId, ".", "echo hi", "Custom", "Human-in-the-Loop", "", "default_project");
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((r) => { releaseStop = r; });
+    (term as any).stop = async () => { await stopGate; };
+    term.status = "Idle";
+    manager.terminals[paneId] = term;
+    (manager as any).syncLedger();
+
+    const archive = manager.stopAndArchivePane("default_project", paneId); // not awaited yet
+    assert.strictEqual(
+      manager.archivingPanes.has(paneId), true,
+      "archive intent is visible synchronously, before stop() resolves"
+    );
+
+    releaseStop();
+    await archive;
+    assert.strictEqual(manager.archivingPanes.has(paneId), false, "mark is cleared after the archive completes");
+    assert.ok(!manager.terminals[paneId], "the live terminal object is dropped");
+
+    cleanupScrollback(paneId);
+    cleanupLedger(ledgerPath);
+  });
 });
 
 describe("UniversalTerminal scrollback writer (async, ordered)", () => {

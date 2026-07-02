@@ -42,7 +42,8 @@ import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { CAPABILITY_DEFS } from "./src/actions/capabilities";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
-import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
+import { mountRestRoutes, resultToHttp, normalizeRestPath, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
+import { INLINE_EXCEPTIONS } from "./src/actions/inlineExceptions";
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
@@ -1778,7 +1779,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // on paths no registry def claims (set_capability_gate is voice-only; set_pane_gates / create_project
   // / execute_plan are converged with their inline twins deleted). See the design at
   // docs/superpowers/specs/2026-06-05-c55-16-opts-only-drop-guard-design.md.
-  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext);
+  // `knownInlinePaths` is the runtime collision guard's belt-and-suspenders safety net (NOT the
+  // authority — tests/test_no_inline_twins.ts is the actual CI gate): derived straight from
+  // INLINE_EXCEPTIONS (the same catalog that guard reads), it makes mountRestRoutes console.warn
+  // loudly at boot if a future registry def's rest path ever collides with a hand-written route,
+  // instead of Express silently keeping only the first-registered handler.
+  const knownInlinePaths = new Set(
+    INLINE_EXCEPTIONS.filter((e) => e.category !== "infra").map(
+      (e) => `${e.method} ${normalizeRestPath(e.path)}`
+    )
+  );
+  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext, { knownInlinePaths });
 
   // Vite middleware for development (dynamically imported so tests / production
   // bundles that disable it don't need vite resolvable at module load).

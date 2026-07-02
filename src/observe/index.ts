@@ -218,6 +218,21 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     }
   }
 
+  // Best-effort summarization: when no API key is configured and Google's client library falls
+  // back to Application Default Credentials (ADC), the ADC lookup fails with a long, alarming
+  // stack trace ("Could not load the default credentials..."). That's an EXPECTED outcome in
+  // dev/CI without a key configured, not a bug — log it at debug level so it doesn't read as a
+  // crash. Any other error kind still surfaces via console.error so real regressions on this
+  // path aren't swallowed. Extracted to keep summarizeCommandOutcome's complexity under CC 10.
+  function logSummarizeCommandOutcomeError(err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/could not load the default credentials/i.test(message)) {
+      console.debug("[summarizeCommandOutcome] No credentials configured; skipping summary.");
+    } else {
+      console.error("[summarizeCommandOutcome] Error:", err);
+    }
+  }
+
   async function summarizeCommandOutcome(command: string, rawOutput: string): Promise<string> {
     try {
       const apiKey = (manager.settings.secrets?.geminiApiKey && manager.settings.secrets.geminiApiKey !== "CONFIGURED_IN_ENV")
@@ -251,7 +266,7 @@ ${redact(rawOutput.slice(-3000))}`;
       });
       return response.text?.trim() || "No outcomes summary available.";
     } catch (err) {
-      console.error("[summarizeCommandOutcome] Error:", err);
+      logSummarizeCommandOutcomeError(err);
       // Honest neutral fallback — do NOT claim success; the outcome is unknown here.
       return "Command outcome summary unavailable.";
     }
