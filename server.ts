@@ -52,6 +52,7 @@ import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow,
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
+import { isLoopbackAddress, isOriginAllowed, parseAllowedOrigins, timingSafeEqualString } from "./src/security/perimeter";
 
 dotenv.config();
 
@@ -82,7 +83,14 @@ let lastInteractionId: string | null = null;
 
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot.
 // Exported so in-process integration tests can authenticate without guessing the token.
-export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.createHash("sha256").update(`janus-auth:${process.cwd()}`).digest("hex");
+//
+// bead wsm-e2e-pinned-xge: the old fallback was `sha256("janus-auth:" + process.cwd())` — a
+// DETERMINISTIC value derivable by anyone who knows (or guesses) the server's working directory, so
+// it was reproducible off-host and offered no real secrecy. The fallback is now a fresh
+// cryptographically random 64-hex-char token minted once per process boot (never persisted, never
+// logged) — the exported CONST SHAPE is unchanged (still a plain string equal to what the auth
+// middleware/WS guard check), which is the load-bearing contract ~40 test files depend on.
+export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
 
 // ── 2S.2: PUT /api/settings body validation ──────────────────────────────────────────────────────
 // The settings body stays a PERMISSIVE passthrough overall (settings carry many shapes — do NOT
@@ -614,7 +622,10 @@ export function __installProcessErrorNetForTest(): void {
 export interface StartServerOptions {
   /** Port to bind. Use 0 for an ephemeral port (handy in tests). Defaults to PORT (3000). */
   port?: number;
-  /** Host to bind. Defaults to 0.0.0.0 in production, 127.0.0.1 otherwise. */
+  /** Host to bind. Defaults to 127.0.0.1 (loopback-only) in ALL modes, including production — override
+   *  via this option or the JANUS_BIND_HOST env for non-loopback exposure. bead wsm-e2e-pinned-xge:
+   *  binding non-loopback without an explicit API_AUTH_TOKEN env is a fail-closed startup error (see
+   *  startServer). */
   bindHost?: string;
   /** Mount the Vite dev middleware. Defaults to true outside production. Disable in tests. */
   enableVite?: boolean;
@@ -655,12 +666,44 @@ export interface RunningServer {
 // middleware that drops the httpOnly SameSite auth_token on non-/api, non-/live renders, then (2)
 // the `/api` authMiddleware. Behavior, branch logic, and registration order are byte-identical to
 // the inline block this replaced; it must be invoked at the SAME point (right after express.json()).
+// bead wsm-e2e-pinned-xge: the pure decision the cookie-auto-seed middleware makes, extracted so it
+// is directly unit-testable without a live socket/Express request (mock the three inputs instead of
+// faking a TCP peer address). See registerAuthMiddleware for the call site + full rationale.
+export function shouldSeedAuthCookie(opts: {
+  currentToken: string | null;
+  apiToken: string;
+  remoteAddress: string | undefined | null;
+  authTokenQuery: unknown;
+}): boolean {
+  if (opts.currentToken === opts.apiToken) return false; // already correctly seeded — nothing to do.
+  // wsm-e2e review (minor): constant-time compare — the ?auth_token= proof is checked against the
+  // live secret, so a naive === would leak a byte-at-a-time timing oracle to a network attacker.
+  const provedTokenByQuery = timingSafeEqualString(opts.authTokenQuery, opts.apiToken);
+  return isLoopbackAddress(opts.remoteAddress) || provedTokenByQuery;
+}
+
 function registerAuthMiddleware(app: express.Express): void {
-  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders
+  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders.
+  //
+  // bead wsm-e2e-pinned-xge: this used to seed UNCONDITIONALLY for any non-/api, non-/live request —
+  // i.e. loading the UI from ANY peer (loopback or not) silently handed that peer the shared secret.
+  // Now gated on TWO independent authorities:
+  //   (1) the request PEER is loopback (isLoopbackAddress on the raw socket address) — the original
+  //       "seed the local dev browser" intent, unchanged for every existing loopback test/dev flow;
+  //   (2) the remote-operator bootstrap path — the request URL carries `?auth_token=<exact match>`.
+  //       Knowing the token IS the authority (out-of-band, e.g. an operator-shared link), so a
+  //       non-loopback peer that already proves it has the real token may still be cookie-seeded.
+  // Anything else (non-loopback peer, no/wrong auth_token query param) gets NO cookie — it still sees
+  // the SPA shell (mountFrontend is intentionally public) but every /api and /live call fails auth.
   app.use((req, res, next) => {
     if (!req.path.startsWith("/api") && !req.path.startsWith("/live")) {
       const currentToken = getCookie(req.headers.cookie, "auth_token");
-      if (currentToken !== API_AUTH_TOKEN) {
+      if (shouldSeedAuthCookie({
+        currentToken,
+        apiToken: API_AUTH_TOKEN,
+        remoteAddress: req.socket?.remoteAddress,
+        authTokenQuery: req.query.auth_token,
+      })) {
         res.cookie("auth_token", API_AUTH_TOKEN, {
           httpOnly: true,
           sameSite: "strict",
@@ -956,9 +999,28 @@ async function mountFrontend(app: express.Express, enableVite: boolean): Promise
   }
 }
 
-// VERBATIM extraction from startServer (CC paydown). The dev/prod default-host pick, unchanged.
-function resolveBindHost(optionHost: string | undefined): string {
-  return optionHost ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+// bead wsm-e2e-pinned-xge: the bind default is loopback-only in EVERY mode — the old
+// prod-defaults-to-0.0.0.0 special case silently exposed the process (and its host-process-spawn
+// authority) to every network peer whenever NODE_ENV=production, with no matching auth hardening.
+// Non-loopback binding now requires an explicit ask: the `bindHost` option, or JANUS_BIND_HOST.
+export function resolveBindHost(optionHost: string | undefined): string {
+  return optionHost ?? process.env.JANUS_BIND_HOST ?? "127.0.0.1";
+}
+
+// bead wsm-e2e-pinned-xge (design direction #2): FAIL CLOSED. A non-loopback effective bind host
+// (0.0.0.0, a LAN IP, a hostname, ...) with no explicitly-set API_AUTH_TOKEN env means the process
+// would come up guarded only by the per-boot RANDOM token fallback — safe against a remote guesser,
+// but the operator never chose to expose it, so refuse to start rather than silently go live.
+// Checks `process.env.API_AUTH_TOKEN` directly (not the exported API_AUTH_TOKEN const, which is
+// ALWAYS truthy thanks to its own random fallback) so this is genuinely "did the operator opt in".
+export function assertBindHostAuthorized(bindHost: string): void {
+  if (isLoopbackAddress(bindHost)) return;
+  if (process.env.API_AUTH_TOKEN) return;
+  throw new Error(
+    `[SECURITY] Refusing to bind to non-loopback host "${bindHost}" without an explicit API_AUTH_TOKEN ` +
+    `env var. Set API_AUTH_TOKEN to opt in to network exposure, or drop the bindHost option / ` +
+    `JANUS_BIND_HOST env to stay loopback-only (127.0.0.1).`
+  );
 }
 
 // VERBATIM extraction from startServer (CC paydown). Reads the actually-bound port off the live
@@ -1063,6 +1125,15 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
   const shouldListen = options.listen ?? true;
+
+  // bead wsm-e2e-pinned-xge: resolve + authorize the bind host FIRST, before any app/server
+  // construction — a non-loopback host without an explicit API_AUTH_TOKEN throws here, before this
+  // process opens a single socket or spawns any subsystem. Checked regardless of `shouldListen` (a
+  // guard-only test with listen:false must still see the throw — it validates the decision, not the
+  // actual bind).
+  const bindHost = resolveBindHost(options.bindHost);
+  const requestedPort = options.port ?? PORT;
+  assertBindHostAuthorized(bindHost);
 
   // Snapshot the live-session connector for THIS server instance. `liveConnector` is a module-level
   // seam (setLiveConnector); reading it late, at WS-connect time, let a sibling in-process server's
@@ -1848,9 +1919,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-
-  const bindHost = resolveBindHost(options.bindHost);
-  const requestedPort = options.port ?? PORT;
 
   if (shouldListen) {
     await listenServer(server, wss, requestedPort, bindHost);

@@ -107,6 +107,12 @@ export const listPanes: ActionDef<typeof NoParams> = {
   description:
     "List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing. The authoritative source of current pane status — always call it before reporting whether something is busy or done. Cheap orientation call.",
   params: NoParams,
+  // rm4: `capability: "read_pane"` here is DISCOVERABILITY METADATA ONLY — this handler
+  // deliberately does NOT check effectiveCapabilityGateFor. read_pane Off gates pane CONTENT
+  // recall (get_pane_summary/get_pane_delta/get_pane_command_history), not pane EXISTENCE/STATUS
+  // orientation metadata (alive/busy/state) that list_panes returns. See
+  // docs/design/capability-gate-worksheet.md ("What read_pane / read_notes actually gate —
+  // CONTENT recall only").
   capability: "read_pane",
   readOnly: true, // result is redacted on the way out (§5.6) — readOnly binds only read capabilities (§8.1 #5)
   surfaces: new Set(["voice", "rest"]), // voice tool (TREE narration) + GET /api/terminals (FLAT array)

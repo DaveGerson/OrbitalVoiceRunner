@@ -69,6 +69,17 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   // recorded history) but the default map omitted it, so it resolved through the permissive
   // fallback to Auto. Pin it here so map and matrix agree.
   clear_history: "Ask",
+  // rm4: the remaining 5 promoted capabilities (read_pane, read_notes, focus_pane, compose_draft,
+  // archive_pane) were ABSENT from this map and relied on resolveOne's `?? "Auto"` fallback,
+  // which HAPPENED to match their CAPABILITY_DEFS declared default (all "Auto") — correct by
+  // coincidence, not by declaration. Seed them explicitly so get_pane_gates/list_capabilities
+  // report the DECLARED default rather than the resolver fallback. Values are IDENTICAL to the
+  // prior fallback outcome (all "Auto") — a strict no-op for effective gating (test-pinned).
+  read_pane: "Auto",
+  read_notes: "Auto",
+  focus_pane: "Auto",
+  compose_draft: "Auto",
+  archive_pane: "Auto",
   // c55.10: rest-only writes tightened from ungated → Ask (gate-tightening only).
   send_keys: "Ask",
   remove_watch_rule: "Ask",

@@ -156,3 +156,32 @@ against a real on-disk JanusStore.
 - All 5 resolution-precedence rows.
 - The 4 edge cases above.
 - Back-compat: omitting `gate` reproduces the pre-matrix decision for all three modes.
+
+## What `read_pane` / `read_notes` actually gate — CONTENT recall only (rm4)
+
+`read_pane` and `read_notes` are **veto**-class capabilities (Allow/Off, no `Ask` — see
+`CAPABILITY_ENFORCEMENT` in `src/gateSurface.ts`) whose `Off` value forbids Janus from
+**recalling pane/note CONTENT** on demand:
+
+- **Gated by `read_pane` (Off ⇒ forbidden):** `get_pane_command_history`, `get_pane_summary`,
+  `get_pane_delta` — these hand the model actual terminal output/history.
+- **Gated by `read_notes` (Off ⇒ forbidden):** the notes-content reads in `src/actions/defs/notes.ts`
+  (e.g. `get_pane_notes`/handoff-content reads) — these hand the model actual note/handoff text.
+
+**Intentionally left UNGATED**, even though a couple of them carry a `read_pane`/`read_notes`
+`capability` label for UI/discoverability metadata: **operational alert and orientation
+surfaces**, not content recall —
+
+- `list_panes` — pane *existence/status* metadata (alive/busy/state), not pane content.
+- `get_attention_digest` — the operator's alert feed (error/exit transitions + pending-approval
+  summary). Muting this on `read_pane`/`read_notes` Off would hide the very alerts the operator
+  relies on to notice something needs attention.
+- `list_pending_approvals` — the approval queue itself. Same reasoning: gating this would hide
+  the queue the operator needs to see in order to approve/reject.
+
+The rule of thumb: **if the payload is pane/note CONTENT, it's gated; if the payload is
+operational/orientation METADATA (existence, status, queue state), it stays ungated.** This
+matches the general `reads.ts` model — action defs never auto-gate off their `capability` field;
+each handler makes its own explicit `effectiveCapabilityGateFor(...) === "Off"` check (or
+deliberately omits one). See the code comments at each handler in `src/actions/defs/reads.ts` and
+`src/actions/registry.ts` (`list_panes`) for the per-action call.

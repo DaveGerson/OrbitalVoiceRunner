@@ -208,6 +208,11 @@ export const listPendingApprovals: ActionDef<typeof NoParams> = {
   description:
     "List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count). Use it when the operator asks 'what's queued for approval?' and to disambiguate which one they mean before approving/rejecting.",
   params: NoParams,
+  // rm4: `capability: "read_notes"` here is DISCOVERABILITY METADATA ONLY — this handler
+  // deliberately does NOT check effectiveCapabilityGateFor. read_notes Off gates note/handoff
+  // CONTENT recall, not the approval QUEUE itself; muting this on Off would hide the very
+  // approvals awaiting the operator's decision. See docs/design/capability-gate-worksheet.md
+  // ("What read_pane / read_notes actually gate — CONTENT recall only").
   capability: "read_notes",
   readOnly: true,
   surfaces: new Set(["voice"]),
@@ -234,6 +239,12 @@ export const getAttentionDigest: ActionDef<typeof NoParams> = {
   description:
     "Speak a structured summary of items needing the operator's attention: panes that transitioned to error/exit states AND any commands currently awaiting spoken approval (both are merged into one digest).",
   params: NoParams,
+  // rm4: `capability: "read_notes"` here is DISCOVERABILITY METADATA ONLY — this handler
+  // deliberately does NOT check effectiveCapabilityGateFor. read_notes Off gates note/handoff
+  // CONTENT recall, not the operator's ALERT feed; this digest merges error/exit transitions
+  // with the pending-approval summary, so muting it would hide the alerts the operator relies on
+  // to notice something needs attention. See docs/design/capability-gate-worksheet.md
+  // ("What read_pane / read_notes actually gate — CONTENT recall only").
   capability: "read_notes",
   readOnly: true,
   surfaces: new Set(["voice"]),

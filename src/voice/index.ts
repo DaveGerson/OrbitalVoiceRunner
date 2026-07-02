@@ -26,7 +26,8 @@
  */
 
 import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
-import type { WebSocketServer } from "ws";
+import type { WebSocketServer, WebSocket } from "ws";
+import type { IncomingMessage } from "http";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
@@ -35,6 +36,7 @@ import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
+import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
 import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import {
@@ -440,14 +442,35 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
   if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
   wss.on("close", () => clearInterval(heartbeatTimer));
 
-  wss.on("connection", async (clientWs, req) => {
+  // bead wsm-e2e-pinned-xge (design direction #5): the WS Origin fence, read once per server boot
+  // (env doesn't change mid-process). Empty allowlist unless JANUS_ALLOWED_ORIGINS is set.
+  const allowedOrigins = parseAllowedOrigins(process.env.JANUS_ALLOWED_ORIGINS);
+
+  // The two independent connection fences — Origin THEN cookie/token — combined into ONE guard so
+  // the connection handler below stays a single `if (...) return;` branch (keeps its cyclomatic
+  // complexity <=10; each fence's own branching lives here, not in the handler). Origin runs first:
+  // a present Origin must match the request's Host or be in JANUS_ALLOWED_ORIGINS; an ABSENT Origin
+  // (every non-browser client — scripts, the existing test suite) is unchanged/allowed, so this is
+  // invisible to every existing test. The cookie/token check is byte-identical to the pre-existing
+  // logic, just relocated.
+  function rejectUnauthorizedConnection(clientWs: WebSocket, req: IncomingMessage): boolean {
+    if (!isOriginAllowed(req.headers.origin, req.headers.host, allowedOrigins)) {
+      console.warn("[SECURITY] Blocked WebSocket connection with disallowed Origin:", req.headers.origin);
+      clientWs.close(4003, "Origin not allowed");
+      return true;
+    }
     const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
     if (tokenFromCookie !== API_AUTH_TOKEN) {
       console.warn("[SECURITY] Blocked unauthorized WebSocket connection attempt.");
       clientWs.send(JSON.stringify({ type: "error", message: "Unauthorized WebSocket access. Please reload the interface." }));
       clientWs.close(4001, "Unauthorized");
-      return;
+      return true;
     }
+    return false;
+  }
+
+  wss.on("connection", async (clientWs, req) => {
+    if (rejectUnauthorizedConnection(clientWs, req)) return;
 
     // 3V.2: enroll this connection into the keepalive — alive on accept, re-alive on every pong.
     // Marked BEFORE the observe-only early-return below so BOTH lanes (observe + voice) are swept.
