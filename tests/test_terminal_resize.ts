@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "assert";
 import { OrchestratorManager, UniversalTerminal, appendRawCapped } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 
 // --- Pure raw-display-backfill buffer ---------------------------------------
 // xterm owns the live buffer, but a freshly-opened pane needs a one-shot raw
@@ -52,7 +53,9 @@ test("UniversalTerminal.resize rejects non-positive / non-finite dims", () => {
 });
 
 test("manager.resize delegates to the pane and no-ops on unknown ids", () => {
-  const manager = new OrchestratorManager();
+  const store = new JanusStore(":memory:");
+  store.init();
+  const manager = new OrchestratorManager({ ledger: store });
   const term = new UniversalTerminal("rzmgr", ".", "cmd");
   manager.terminals["rzmgr"] = term;   // insert without start() — no spawn
   manager.resize("rzmgr", 132, 43);

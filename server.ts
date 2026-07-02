@@ -514,17 +514,18 @@ export class HistoryManager {
 // racing the debounced flush with direct file I/O (review block on PR #68).
 registerHistoryBridge(HistoryManager.getInstance());
 
-// WS-M/Handoffs: the persistent JanusStore (SQLite). better-sqlite3 loads cleanly under tsx
-// (confirmed by the store unit tests + smoke), so a static import is fine here — unlike node-pty
-// which the transport layer loads via createRequire. init() applies migrations (idempotent);
-// bootMaintenance() prunes stale rows/scrollback. Created BEFORE the manager so it can serve as
-// the manager's ledger backend when the cutover flag is on.
+// WS-M/Handoffs: the persistent JanusStore (SQLite) — dbt3: the ONLY ledger backend (the
+// JANUS_LEDGER_BACKEND=legacy escape hatch + the in-memory/JSON `Ledger` implementation it
+// selected are retired). better-sqlite3 loads cleanly under tsx (confirmed by the store unit
+// tests + smoke), so a static import is fine here — unlike node-pty which the transport layer
+// loads via createRequire. init() applies migrations (idempotent); bootMaintenance() prunes
+// stale rows/scrollback. Created BEFORE the manager so it can serve as the manager's ledger.
 // 3V.5: store-init failure used to SILENTLY fall back to the legacy JSON ledger — but a previous
 // boot's migration already renamed .janus_ledger.json to .bak (and LEDGER_MIGRATED_KEY blocks any
 // re-import), so a corrupt .janus.db booted the app EMPTY on legacy and stranded every new write.
 // initStoreWithQuarantine instead renames the bad DB (plus -wal/-shm twins) to .janus.db.corrupt-<ts>
-// (loudly, recoverably) and retries ONCE with a fresh DB; only if THAT also fails do we fall back to
-// legacy — and we say so.
+// (loudly, recoverably) and retries ONCE with a fresh DB. With no fallback backend left to catch a
+// SECOND failure, that outcome is now a fatal boot error (see below) rather than a silent downgrade.
 let store: JanusStore | null = null;
 {
   const storeInit = initStoreWithQuarantine(process.env.JANUS_DB || ".janus.db", (s) => {
@@ -557,21 +558,19 @@ let store: JanusStore | null = null;
       console.error("[STORE] Ledger migration skipped (import failed; legacy JSON left intact):", e);
     }
   } else {
-    console.error("[STORE] JanusStore unavailable even after the quarantine retry — falling back to the legacy JSON ledger; HANDOFF PERSISTENCE IS DISABLED for this run.");
+    // dbt3: SQLite is the ONLY ledger backend — there is no legacy Ledger left to fall back to.
+    // Booting anyway would mean OrchestratorManager has no LedgerLike to construct on, so refuse
+    // to start rather than run in an undefined, silently-broken state.
+    console.error("[STORE] JanusStore unavailable even after the quarantine retry — SQLite is the only ledger backend, so the server cannot boot. Check disk space/permissions for JANUS_DB (or the CWD default .janus.db); the preceding [STORE] log lines carry the underlying error.");
+    throw new Error("[STORE] JanusStore failed to initialize and there is no fallback ledger backend (dbt3 retired JANUS_LEDGER_BACKEND=legacy). Refusing to boot.");
   }
 }
 
-// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the
-// manager's ledger — making drafts/context/approvals/etc. durable across restart.
-// DEFAULT: SQLite (when the store booted). Escape hatch: JANUS_LEDGER_BACKEND=legacy
-// forces the in-memory/JSON Ledger. If the store failed to boot, we fall back to
-// legacy automatically so the app still runs.
-const forceLegacy = process.env.JANUS_LEDGER_BACKEND === "legacy";
-const useSqliteLedger = store !== null && !forceLegacy;
-export const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
-console.log(useSqliteLedger
-  ? "[STORE] OrchestratorManager ledger backend: SQLite (durable). Set JANUS_LEDGER_BACKEND=legacy to opt out."
-  : `[STORE] OrchestratorManager ledger backend: legacy JSON Ledger${forceLegacy ? " (JANUS_LEDGER_BACKEND=legacy)" : " (store unavailable)"}.`);
+// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the manager's
+// ledger — making drafts/context/approvals/etc. durable across restart. dbt3: SQLite is the
+// ONLY backend now (the fatal throw above guarantees `store` is non-null here).
+export const manager = new OrchestratorManager({ ledger: store });
+console.log("[STORE] OrchestratorManager ledger backend: SQLite (durable, the only backend).");
 
 // `store` is a process-wide singleton: created once here at import and SHARED by every
 // startServer() call. Releasing it is therefore a PROCESS-level concern, not a per-server one —
@@ -657,8 +656,9 @@ export interface RunningServer {
   /** Cortex context-injection telemetry (spec 2026-07-02) test seam: read the module-scope JanusStore
    *  handle so a suite can assert on `context_injections` / `cortex_decision` / `gemini_turn_usage`
    *  rows written by a REAL server boot without racing a second SQLite handle onto the same file
-   *  (WAL contention) or reverse-engineering the `.janus.db` path convention. Null under
-   *  JANUS_LEDGER_BACKEND=legacy, matching `store` itself. NOT for prod use. */
+   *  (WAL contention) or reverse-engineering the `.janus.db` path convention. dbt3: SQLite is the
+   *  only ledger backend, so this is non-null on any server that finished booting — the `| null` in
+   *  the return type is defensive typing, matching `store`'s own declared type. NOT for prod use. */
   _testStore?: () => JanusStore | null;
 }
 
@@ -1238,9 +1238,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // No new runtime deps, no Python (P0b swaps in behind MemoryService.synthesize). The advanced
   // knobs are optional/additive — absent ⇒ DEFAULT_MEMORY_CONFIG. (manager/store satisfy the
   // WorldModel deps structurally; every text field is redacted at the WorldModel boundary.)
-  // store is null under JANUS_LEDGER_BACKEND=legacy (or store-init failure). The WorldModel only
-  // reads getProject/getProjectBriefing; a null-safe shim degrades the Project tier to absent
-  // (the brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8).
+  // dbt3: the module-scope `store` is guaranteed non-null here (a failed init is now a fatal boot
+  // error). The WorldModel's store dependency stays structurally nullable regardless — it only reads
+  // getProject/getProjectBriefing, and a null-safe shim degrades the Project tier to absent (the
+  // brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8) — this keeps
+  // WorldModel unit-testable against a bare `{ getProject, getProjectBriefing }` fake with no store.
   // VERBATIM extraction (CC paydown): the entire Memory Synthesis P0a/P0b subsystem construction
   // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
   // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).

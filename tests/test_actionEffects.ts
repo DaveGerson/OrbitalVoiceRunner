@@ -20,6 +20,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { buildActionRun } from "../src/actionEffects";
+import { JanusStore } from "../src/store/sqliteStore";
 
 function fakeDeps() {
   const calls: any = {
@@ -49,6 +50,23 @@ function fakeDeps() {
       renameProject(projectId: string, name: string) { calls.projectsRenamed.push([projectId, name]); },
       renamePane(projectId: string, paneId: string, name: string) { calls.panesRenamed.push([projectId, paneId, name]); },
       archivePaneOwned(projectId: string, paneId: string) { calls.archivedPanes.push([projectId, paneId]); return true; },
+      // wsm-e2e-pinned major-finding fix: the REAL durable delete_pane/delete_project effect (mirrors
+      // JanusStore.deletePane/deleteProject — a hard row delete, truthy-on-success). Mutates the SAME
+      // `projects` object the delete_pane/delete_project tests below assign onto `ledger.workspaces`,
+      // so `workspaces`/`getProject` observe the deletion exactly like a fresh SQL read would.
+      deletePane(projectId: string, paneId: string) {
+        const ws = projects[projectId];
+        if (!ws || !ws.panes[paneId]) return false;
+        delete ws.panes[paneId];
+        calls.saved++;
+        return true;
+      },
+      deleteProject(id: string) {
+        if (!projects[id]) return false;
+        delete projects[id];
+        calls.saved++;
+        return true;
+      },
       // save() tracks the legacy no-arg path; save(true) (force-persist) records the flag so the
       // watch-rule / plan replay cases can be pinned byte-for-byte against the def's `save(true)`.
       save(force?: boolean) { calls.saved++; calls.savedForce.push(force === true); },
@@ -205,15 +223,14 @@ describe("kzt — buildActionRun rebuilds deferred effects from intent", () => {
   // delete_orchestrator_plan carries `planId` — the payload the rebuilt effect needs (the original
   // bag held only { origin, versionStamp } and could not be replayed).
   // ---------------------------------------------------------------------------
-  it("remove_watch_rule intent -> splices the rule + save(true) + watch_rules_updated + EXACT string", () => {
+  it("remove_watch_rule intent -> splices the rule + save(true) + EXACT string (wsm-e2e-pinned-33c.4: no watch_rules_updated broadcast — no client consumes it)", () => {
     const { calls, deps } = fakeDeps();
     calls.watchRules.push({ id: "rule_a" }, { id: "rule_b" }, { id: "rule_c" });
     const out = buildActionRun({ capability: "remove_watch_rule", params: { origin: "rest", ruleId: "rule_b" } }, deps as any)();
     assert.deepStrictEqual(calls.watchRules.map((r: any) => r.id), ["rule_a", "rule_c"], "the matching rule is spliced");
     assert.deepStrictEqual(calls.savedForce, [true], "force-persist (save(true)) fired exactly once");
     const frame = calls.broadcasts.find((b: any) => b.type === "watch_rules_updated");
-    assert.ok(frame, "watch_rules_updated broadcast fired");
-    assert.strictEqual(frame.watchRules, calls.watchRules, "broadcast carries the live array (post-splice)");
+    assert.ok(!frame, "watch_rules_updated broadcast is PRUNED (wsm-e2e-pinned-33c.4 — no client consumes it)");
     // EXACT — matches removeEffect (watch_rules.ts:194).
     assert.strictEqual(out, "Watch rule rule_b removed.");
   });
@@ -337,6 +354,182 @@ describe("kzt — buildActionRun rebuilds deferred effects from intent", () => {
       process.chdir(prev);
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // wsm-e2e-pinned-j2e: durable replay for the gated deletes + the respawn ("restart_pane") gate.
+  // Before this, a deferred (Ask) delete_pane / delete_project / restart_pane confirmed AFTER a
+  // process restart degraded to the safe "unknown capability" no-op narration — fail-safe, but the
+  // operator was told an effect happened that never ran. These pin the REAL effect now runs.
+  // ---------------------------------------------------------------------------
+
+  it("restart_pane intent (live terminal) -> ordered stop()-then-start() + broadcasts + EXACT string", async () => {
+    const { calls, manager, deps } = fakeDeps();
+    let started = false;
+    const term = {
+      stop: () => Promise.resolve(),
+      start: () => { started = true; },
+    };
+    manager.terminals["x"] = term;
+    const out = buildActionRun({ capability: "restart_pane", params: { paneId: "x" } }, deps as any)();
+    // Synchronous return, mirroring the live handler's fire-and-return contract.
+    assert.strictEqual(out, "Terminal x restarted.");
+    assert.strictEqual(started, false, "start() has not run yet — stop() has not resolved");
+    // Flush the microtask queue so the awaited stop() continuation runs.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.strictEqual(started, true, "start() runs once stop() resolves");
+    assert.strictEqual(calls.ledgerBroadcasts, 1);
+    assert.ok(calls.broadcasts.some((b: any) => b.type === "terminals_updated"));
+  });
+
+  it("restart_pane intent (live terminal) -> archivingPanes guard suppresses start() (kdtu mirror)", async () => {
+    const { calls, manager, deps } = fakeDeps();
+    let started = false;
+    const term = { stop: () => Promise.resolve(), start: () => { started = true; } };
+    manager.terminals["x"] = term;
+    manager.archivingPanes = new Set(["x"]);
+    const out = buildActionRun({ capability: "restart_pane", params: { paneId: "x" } }, deps as any)();
+    assert.strictEqual(out, "Terminal x restarted.");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.strictEqual(started, false, "an in-flight archive intent must suppress the ghost respawn");
+    assert.strictEqual(calls.ledgerBroadcasts, 0);
+  });
+
+  it("restart_pane intent (ledger-only pane) -> respawnFromLedger spawns via addTerminal + EXACT string", () => {
+    const { calls, projects, manager, deps } = fakeDeps();
+    projects["p1"] = { id: "p1", directory: "/proj/p1", panes: { x: { tool_preset: "Custom", permissions_mode: "Human-in-the-Loop", session_id: "sess-1" } } };
+    manager.ledger.workspaces = projects;
+    const out = buildActionRun({ capability: "restart_pane", params: { paneId: "x" } }, deps as any)();
+    assert.strictEqual(calls.added.length, 1, "addTerminal called once via the shared respawnFromLedger closure");
+    const [paneId, cwd, , , permMode, sessionId, projectId] = calls.added[0];
+    assert.strictEqual(paneId, "x");
+    assert.strictEqual(cwd, "/proj/p1");
+    assert.strictEqual(permMode, "Human-in-the-Loop");
+    assert.strictEqual(sessionId, "sess-1");
+    assert.strictEqual(projectId, "p1");
+    assert.strictEqual(calls.ledgerBroadcasts, 1);
+    assert.ok(calls.broadcasts.some((b: any) => b.type === "terminals_updated"));
+    assert.strictEqual(out, "Terminal x restored and started.");
+  });
+
+  it("restart_pane intent -> neither a live terminal nor a ledger pane -> idempotent not-found narration", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "restart_pane", params: { paneId: "ghost" } }, deps as any)();
+    assert.strictEqual(out, "Terminal ghost not found.");
+    assert.strictEqual(calls.ledgerBroadcasts, 0);
+  });
+
+  it("delete_pane intent -> stop() + drop live slot + splice ledger row + save + broadcasts + EXACT string", () => {
+    const { calls, projects, manager, deps } = fakeDeps();
+    let stopped = false;
+    manager.terminals["x"] = { stop: () => { stopped = true; } };
+    projects["p1"] = { id: "p1", directory: "/proj/p1", panes: { x: { permissions_mode: "Full Auto" } } };
+    manager.ledger.workspaces = projects;
+    const out = buildActionRun({ capability: "delete_pane", params: { paneId: "x" } }, deps as any)();
+    assert.strictEqual(stopped, true, "the live terminal is stopped");
+    assert.strictEqual(manager.terminals["x"], undefined, "the live slot is dropped");
+    assert.strictEqual(projects["p1"].panes.x, undefined, "the ledger row is spliced");
+    assert.ok(calls.saved >= 1, "ledger.save() ran");
+    assert.strictEqual(calls.ledgerBroadcasts, 1);
+    assert.ok(calls.broadcasts.some((b: any) => b.type === "terminals_updated"));
+    assert.strictEqual(out, "Pane x deleted.");
+  });
+
+  it("delete_pane intent -> already gone (both slot + ledger row absent) -> idempotent not-found narration", () => {
+    const { calls, deps } = fakeDeps();
+    const out = buildActionRun({ capability: "delete_pane", params: { paneId: "ghost" } }, deps as any)();
+    assert.strictEqual(out, "Pane ghost not found.");
+    assert.strictEqual(calls.ledgerBroadcasts, 0);
+  });
+
+  it("delete_project intent -> deletes the workspace + re-points activeContext to a fresh default + EXACT string", () => {
+    const { calls, projects, manager, deps } = fakeDeps();
+    projects["p1"] = { id: "p1", directory: "/proj/p1", panes: {} };
+    manager.ledger.workspaces = projects;
+    manager.ledger.activeProjectId = "p1";
+    manager.ledger.switchContext = (id: string) => { calls.switched = id; };
+    manager.settings.projects = { activeContext: "p1", localWorkspacePath: "" };
+    const out = buildActionRun({ capability: "delete_project", params: { projectId: "p1" } }, deps as any)();
+    assert.strictEqual(projects["p1"], undefined, "the workspace row is deleted");
+    assert.ok(calls.projectsAdded.some((a: any) => a[0] === "default_project"), "a fallback default project is created");
+    assert.strictEqual(calls.switched, "default_project", "context re-pointed to the fresh default");
+    assert.strictEqual(manager.settings.projects.activeContext, "default_project");
+    assert.strictEqual(calls.ledgerBroadcasts, 1);
+    assert.strictEqual(out, "Project p1 deleted.");
+  });
+
+  it("delete_project intent -> already gone -> idempotent not-found narration, no broadcast", () => {
+    const { calls, manager, deps } = fakeDeps();
+    manager.ledger.workspaces = {};
+    const out = buildActionRun({ capability: "delete_project", params: { projectId: "ghost" } }, deps as any)();
+    assert.strictEqual(out, "Project ghost not found.");
+    assert.strictEqual(calls.ledgerBroadcasts, 0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // wsm-e2e-pinned major-finding fix (Wave 5a review): the delete_pane/delete_project replay
+  // builders above are proven ONLY against the plain-object `fakeDeps()` ledger, which mirrors a
+  // snapshot-mutation idiom (`delete ws.panes[id]` / `delete workspaces[id]`) — that idiom is a
+  // SILENT NO-OP against JanusStore, the only production backend: `workspaces`/`getProject` rebuild
+  // fresh snapshots from SQL on every call and `save()` is a documented no-op, so the deleted row
+  // resurrects on the next read. These cases run buildActionRun against a REAL JanusStore(':memory:')
+  // so the persistence half of the effect (not just the in-memory mirror logic) is actually exercised.
+  // ---------------------------------------------------------------------------
+  describe("wsm-e2e-pinned major-finding fix — delete_pane/delete_project persist against a REAL JanusStore", () => {
+    function realDeps() {
+      const store = new JanusStore(":memory:");
+      store.init();
+      const calls = { broadcasts: [] as any[], ledgerBroadcasts: 0 };
+      const manager: any = {
+        ledger: store,
+        terminals: {} as Record<string, any>,
+        settings: { projects: { activeContext: "", localWorkspacePath: "" } },
+        saveSettings() { /* no-op */ },
+      };
+      return {
+        store, manager, calls,
+        deps: {
+          manager,
+          broadcast: (m: any) => calls.broadcasts.push(m),
+          broadcastLedgerUpdate: () => { calls.ledgerBroadcasts++; },
+          sanitizeSettingsForClient: (s: any) => s,
+        },
+      };
+    }
+
+    it("delete_pane intent -> the pane row is REALLY gone from JanusStore (survives a fresh read, not just the snapshot)", () => {
+      const { store, manager, deps } = realDeps();
+      store.addProject("p1", "/proj/p1");
+      store.updatePane("p1", { pane_id: "x", name: "x", alive: true } as any);
+      manager.terminals["x"] = { stop: () => { /* no-op */ } };
+      assert.ok(store.getProject("p1")!.panes["x"], "precondition: pane exists before replay");
+
+      const out = buildActionRun({ capability: "delete_pane", params: { paneId: "x" } }, deps as any)();
+      assert.strictEqual(out, "Pane x deleted.");
+
+      // The bug this pins: a snapshot-only delete (`delete ws.panes[id]`) mutates a throwaway object
+      // returned by getProject() and never touches SQL — a FRESH read (a new getProject() call, exactly
+      // like a subsequent request/boot would do) would still see the row. Assert against a fresh read.
+      assert.strictEqual(store.getProject("p1")!.panes["x"], undefined, "pane row is gone on a FRESH read from SQL");
+      assert.strictEqual(store.getPanes("p1")["x"], undefined, "pane row is gone from the panes table directly");
+    });
+
+    it("delete_project intent -> the project row is REALLY gone from JanusStore (survives a fresh read, not just the snapshot)", () => {
+      const { store, deps } = realDeps();
+      store.addProject("p1", "/proj/p1");
+      store.addProject("p2", "/proj/p2");
+      store.activeProjectId = "p2"; // not the deleted project -> no reassignment branch
+      assert.ok(store.getProject("p1"), "precondition: project exists before replay");
+
+      const out = buildActionRun({ capability: "delete_project", params: { projectId: "p1" } }, deps as any)();
+      assert.strictEqual(out, "Project p1 deleted.");
+
+      // The bug this pins: `delete workspaces[id]` mutates a throwaway snapshot object from the
+      // `workspaces` getter and never touches SQL — a FRESH read would still see the row.
+      assert.strictEqual(store.getProject("p1"), null, "project row is gone on a FRESH read from SQL");
+      assert.ok(!("p1" in store.workspaces), "project is gone from a fresh workspaces snapshot too");
+      assert.ok(store.getProject("p2"), "sibling project untouched");
+    });
   });
 
   // ---------------------------------------------------------------------------

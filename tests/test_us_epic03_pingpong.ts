@@ -9,8 +9,8 @@
 //           ledger.activeProjectId) and broadcasts a `draft_updated` WS frame scoped to that project/pane.
 //           Negative: composing with NO active pane is a no-op (no orphan draft, no frame).
 //   US-3.2  Drafts SURVIVE a restart on the SQLite backend (a fresh JanusStore over the same .db file
-//           restores both panes' drafts with the right pane association + updatedAt). Legacy backend is
-//           CHARACTERIZED (the default JSON Ledger persists synchronously, so a reload restores them).
+//           restores both panes' drafts with the right pane association + updatedAt). SQLite is the
+//           ONLY ledger backend (dbt3 retired the legacy JSON Ledger escape hatch).
 //   US-3.3  WRITES only reach the ACTIVE pane. The raw-input REST surface 409s every off-active-pane key
 //           (incl. always-allowed nav + Ctrl+C); with no active pane the same 409 fires; a non-allowlisted
 //           byte sequence is 400-rejected BEFORE the PTY; the voice write path (propose_command) enforces
@@ -38,7 +38,6 @@ import os from "os";
 import path from "path";
 import { WebSocket } from "ws";
 
-import { Ledger } from "../src/ledger";
 import { JanusStore } from "../src/store/sqliteStore";
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
 import type { PtyTransport } from "../src/ptyTransport";
@@ -53,7 +52,7 @@ const ARROW_UP = "\x1b\x5b\x41"; // ESC[A — always-allowed nav
 const CTRL_C = "\x03";           // §13.1 always-allowed emergency brake
 const RM_RF = "rm -rf ~\r";      // the headline non-allowlisted exploit (NOT a vetted key)
 
-// A full ledger PaneMeta (legacy Ledger path).
+// A full ledger PaneMeta (the generic LedgerLike shape, used against a pure JanusStore below).
 function paneMeta(id: string, name = id): PaneMeta {
   return {
     pane_id: id, name, runtime_type: "shell", last_known_state: "Idle", is_busy: false,
@@ -95,28 +94,30 @@ describe("US-3.1 drafts are pane-isolated in the ledger", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "us31-iso-"));
     const prevCwd = process.cwd();
     process.chdir(dir);
+    const store = new JanusStore(":memory:");
+    store.init();
     try {
-      const ledger = new Ledger(path.join(dir, "ledger.json"));
-      ledger.addProject("P", dir);
-      ledger.updatePane("P", paneMeta("A"));
-      ledger.updatePane("P", paneMeta("B"));
+      store.addProject("P", dir);
+      store.updatePane("P", paneMeta("A"));
+      store.updatePane("P", paneMeta("B"));
 
       // Pane A is the active write target -> compose ALPHA against A.
-      assert.equal(ledger.setDraft("P", "A", "ALPHA build the parser", "operator"), true);
+      assert.equal(store.setDraft("P", "A", "ALPHA build the parser", "operator"), true);
       // Active flips to B (the _testSetActivePane move, modeled here as the target the composer writes).
-      assert.equal(ledger.setDraft("P", "B", "BRAVO run the migration", "operator"), true);
+      assert.equal(store.setDraft("P", "B", "BRAVO run the migration", "operator"), true);
 
-      assert.equal(ledger.getDraft("P", "A")!.text, "ALPHA build the parser", "A holds ALPHA only");
-      assert.equal(ledger.getDraft("P", "B")!.text, "BRAVO run the migration", "B holds BRAVO only");
-      assert.ok(!ledger.getDraft("P", "A")!.text.includes("BRAVO"), "no BRAVO leaked into A");
-      assert.ok(!ledger.getDraft("P", "B")!.text.includes("ALPHA"), "no ALPHA leaked into B");
+      assert.equal(store.getDraft("P", "A")!.text, "ALPHA build the parser", "A holds ALPHA only");
+      assert.equal(store.getDraft("P", "B")!.text, "BRAVO run the migration", "B holds BRAVO only");
+      assert.ok(!store.getDraft("P", "A")!.text.includes("BRAVO"), "no BRAVO leaked into A");
+      assert.ok(!store.getDraft("P", "B")!.text.includes("ALPHA"), "no ALPHA leaked into B");
 
       // The WIP register lists both, each scoped to its pane.
-      const drafts = ledger.listDrafts("P").sort((a, b) => a.paneId.localeCompare(b.paneId));
+      const drafts = store.listDrafts("P").sort((a, b) => a.paneId.localeCompare(b.paneId));
       assert.deepStrictEqual(drafts.map((d) => d.paneId), ["A", "B"]);
       assert.equal(drafts.find((d) => d.paneId === "A")!.draft.text, "ALPHA build the parser");
       assert.equal(drafts.find((d) => d.paneId === "B")!.draft.text, "BRAVO run the migration");
     } finally {
+      store.close();
       process.chdir(prevCwd);
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -161,57 +162,31 @@ describe("US-3.2 drafts survive a server restart", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
-
-  it("US-3.2: legacy backend — CHARACTERIZATION: the JSON Ledger persists drafts, so a reload restores them", () => {
-    // CHARACTERIZATION: under JANUS_LEDGER_BACKEND=legacy the manager uses the JSON `Ledger`, whose
-    // setDraft calls save(true) (synchronous atomic write). So a fresh manager that reloads the same
-    // .janus_ledger.json file RESTORES both drafts — drafts are DURABLE on legacy too (NOT lost). We
-    // assert that ACTUAL behavior here rather than the (incorrect) assumption that legacy is volatile.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "us32-legacy-"));
-    const ledgerPath = path.join(dir, ".janus_ledger.json");
-    const prevCwd = process.cwd();
-    process.chdir(dir);
-    try {
-      const l1 = new Ledger(ledgerPath);
-      l1.addProject("P", dir);
-      l1.updatePane("P", paneMeta("A"));
-      l1.updatePane("P", paneMeta("B"));
-      l1.setDraft("P", "A", "ALPHA legacy", "operator");
-      l1.setDraft("P", "B", "BRAVO legacy", "operator");
-      l1.flushSaveSync(); // belt-and-braces: force the durable write before reload
-
-      // Reload from the same file (a fresh Ledger == the legacy restart path).
-      const l2 = new Ledger(ledgerPath);
-      assert.equal(l2.getDraft("P", "A")?.text, "ALPHA legacy", "legacy DOES restore A's draft on reload");
-      assert.equal(l2.getDraft("P", "B")?.text, "BRAVO legacy", "legacy DOES restore B's draft on reload");
-    } finally {
-      process.chdir(prevCwd);
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
-// US-3.4 — a rename persists across restart (legacy ledger reload restores the human name).
+// US-3.4 — a rename persists across restart (a fresh JanusStore over the same db file
+// restores the human name).
 describe("US-3.4 a human name persists across restart (ledger)", () => {
   it("US-3.4: renamePane to 'API' survives a reload of the same ledger file", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "us34-persist-"));
-    const ledgerPath = path.join(dir, ".janus_ledger.json");
+    const dbPath = path.join(dir, "janus.db");
     const prevCwd = process.cwd();
     process.chdir(dir);
     try {
-      const l1 = new Ledger(ledgerPath);
-      l1.addProject("P", dir);
-      l1.updatePane("P", paneMeta("pane_x", "pane_x"));
-      l1.renamePane("P", "pane_x", "API");
-      assert.equal(l1.getProject("P")!.panes["pane_x"].name, "API", "rename updated the ledger name");
-      l1.flushSaveSync();
+      const store1 = new JanusStore(dbPath); store1.init();
+      store1.addProject("P", dir);
+      store1.updatePane("P", paneMeta("pane_x", "pane_x"));
+      store1.renamePane("P", "pane_x", "API");
+      assert.equal(store1.getProject("P")!.panes["pane_x"].name, "API", "rename updated the ledger name");
+      store1.close();
 
-      const l2 = new Ledger(ledgerPath);
+      const store2 = new JanusStore(dbPath); store2.init();
       assert.equal(
-        l2.getProject("P")!.panes["pane_x"].name,
+        store2.getProject("P")!.panes["pane_x"].name,
         "API",
         "the human name persists across a restart (still addressable as 'API')",
       );
+      store2.close();
     } finally {
       process.chdir(prevCwd);
       fs.rmSync(dir, { recursive: true, force: true });

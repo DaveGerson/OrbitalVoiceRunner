@@ -72,7 +72,10 @@ export const deleteProject: ActionDef<typeof DeleteProjectParams> = {
     const id = args.project_id;
     if (!ctx.manager.ledger.workspaces[id]) return { kind: "ok", output: `Project ${id} not found.` }; // resolve before gate
     const deleteEffect = (): string => {
-      delete ctx.manager.ledger.workspaces[id];
+      // wsm-e2e-pinned major-finding fix: a snapshot mutation (`delete workspaces[id]`) is a silent
+      // no-op against JanusStore (the only production backend) — `deleteProject` issues the real
+      // durable row DELETE (panes cascade via the schema's ON DELETE CASCADE).
+      ctx.manager.ledger.deleteProject(id);
       const remainingIds = Object.keys(ctx.manager.ledger.workspaces);
       if (ctx.manager.ledger.activeProjectId === id) {
         const nextId = remainingIds[0] || "default_project";
@@ -115,8 +118,13 @@ export const deletePane: ActionDef<typeof DeletePaneParams> = {
     const deleteEffect = (): string => {
       const term = ctx.manager.terminals[pane_id];
       if (term) { term.stop(); delete ctx.manager.terminals[pane_id]; }
-      const ws = ctx.manager.ledger.getProject(project_id);
-      if (ws && ws.panes[pane_id]) { delete ws.panes[pane_id]; ctx.manager.ledger["save"](); }
+      // wsm-e2e-pinned major-finding fix: a snapshot mutation (`delete ws.panes[id]`) is a silent
+      // no-op against JanusStore — `deletePane` issues the real durable row DELETE. The pre-gate
+      // existence check above already guarantees a row (or a live term) is present, so this always
+      // fires; `save()` stays for LedgerLike parity (a no-op on JanusStore, a real flush for a
+      // hand-rolled test double).
+      ctx.manager.ledger.deletePane(project_id, pane_id);
+      ctx.manager.ledger["save"]();
       ctx.broadcastLedgerUpdate();
       ctx.broadcastTerminalsUpdated();
       return `Pane ${pane_id} deleted.`;

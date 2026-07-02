@@ -382,8 +382,10 @@ describe("PLM4 (d): a re-delivered non-readOnly dispatch is NOT double-applied; 
     seedStore.recordAction({ name: "add_project_note", capability: "update_metadata", result_kind: "ok", ms: 1, idempotency_key: key });
     assert.strictEqual(rowsForKey(key), 1, "exactly the pre-seeded succeeded row exists");
 
-    // RE-DELIVER the same call.id. The replay guard must short-circuit BEFORE runAction, so NO new
-    // action_log row is written and the model is told it was already handled.
+    // RE-DELIVER the same call.id. The replay guard must short-circuit BEFORE runAction, so the
+    // side-effecting HANDLER never re-runs — but wsm-e2e-pinned-smz (3) now records a lightweight
+    // 'replay_suppressed' audit row for the suppressed attempt itself, distinct from the handler's
+    // own "ok" row.
     session.emitToolCall("add_project_note", { project_id: "default_project", note: "should not double-apply" }, key);
 
     const resp = await waitFor(() => {
@@ -391,8 +393,11 @@ describe("PLM4 (d): a re-delivered non-readOnly dispatch is NOT double-applied; 
       return fr ? fr.response?.output : undefined;
     });
     assert.match(String(resp), /already handled/i, "the model is told the call was already handled");
-    // No NEW row: the handler (and its audit) never ran.
-    assert.strictEqual(rowsForKey(key), 1, "no new action_log row — the side-effecting handler did NOT re-run");
+    // ONE new row (the 'replay_suppressed' audit), not a second "ok" — the handler itself did NOT re-run.
+    await waitFor(() => rowsForKey(key) >= 2);
+    assert.strictEqual(rowsForKey(key), 2, "exactly one new row (replay_suppressed) — the side-effecting handler did NOT re-run");
+    const rows = seedStore.getActionLog({ limit: 1000 }).filter((r) => r.idempotency_key === key);
+    assert.deepStrictEqual(rows.map((r) => r.result_kind).sort(), ["ok", "replay_suppressed"], "the pre-seeded 'ok' row is untouched; the new row is the suppression marker");
   });
 
   it("ALLOWS a re-delivered READ (readOnly) to run — replaying a read is harmless", async () => {

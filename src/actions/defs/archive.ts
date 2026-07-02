@@ -115,8 +115,13 @@ export const restoreArchivedPane: ActionDef<typeof PaneIdParams> = {
       args.pane_id,
       `Restart pane ${args.pane_id}`,
       spawnEffect,
-      // Mirrors respawn_pane's staging bag. buildActionRun has no restart_pane case, so only the
-      // in-process confirm replays (accepted limitation, panes_rest.ts:21-25).
+      // Mirrors respawn_pane's staging bag. Updated by wsm-e2e-pinned-j2e: buildActionRun NOW HAS a
+      // "restart_pane" EFFECT_BUILDERS case (panes_rest.ts header note), so a confirm-AFTER-restart
+      // also replays — via buildRespawnPane's ledger-only branch, since restore_archived_pane already
+      // restored the ledger row BEFORE gating the respawn. Side effect: the cross-restart replay's
+      // confirm string is "Terminal <id> restored and started." (respawnFromLedger's fallback
+      // default), not this closure's "Pane <id> restored and its terminal respawned." — an
+      // (undocumented, beneficial) narrowing of narration fidelity, not a functional gap.
       { ...(ctx.versionStamp ?? {}), origin: "rest", paneId: args.pane_id },
     );
     if (g.disposition === "forbidden") {

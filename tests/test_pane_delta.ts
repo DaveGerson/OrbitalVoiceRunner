@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { UniversalTerminal, OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 
 // Helper: push clean lines straight into the model-lane buffer the way onData does,
 // without spinning up a real PTY. We exercise the public delta surface only.
@@ -56,7 +57,9 @@ describe("UniversalTerminal.consumeDelta", () => {
 
 describe("manager.getPaneDelta", () => {
   it("returns a redacted, fenced delta and a no-output sentinel", () => {
-    const m: any = new OrchestratorManager();
+    const store = new JanusStore(":memory:");
+    store.init();
+    const m: any = new OrchestratorManager({ ledger: store });
     const t: any = new UniversalTerminal("p3", process.cwd(), "shell");
     m.terminals["p3"] = t;
     t.outputBuffer.push("hello", "AKIA1234567890ABCD99"); // 2nd line is an AWS-key shape

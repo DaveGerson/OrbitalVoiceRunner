@@ -258,10 +258,26 @@ export class JanusStore {
   /** Seam for deterministic IDs in tests. */
   protected rand(): number { return Math.random(); }
 
+  /**
+   * wsm-e2e-pinned-4s2 (3): plain INSERT OR REPLACE would let a re-add of an existing messageId
+   * (e.g. a stray retry, or a hydration re-insert racing a live claim) silently reset claimed=1
+   * back to 0, re-opening an exactly-once row for a second write. ON CONFLICT DO UPDATE still
+   * lets legitimate rewrites through (reattachSession() carries the row to a new session_id/
+   * expires_at on reconnect), but the `claimed` column is STICKY: once 1, it can never be written
+   * back to 0 by this path — only claimApproval()'s atomic UPDATE flips it, and deletePendingApproval
+   * is the only way a claimed row goes away. `excluded.claimed` still applies when the existing row
+   * is unclaimed, so a legitimate claimed:true insert (there is none today, but the seam stays
+   * correct) is not silently downgraded either.
+   */
   insertPendingApproval(a: StoredPendingApproval): void {
     this.db.prepare(
-      `INSERT OR REPLACE INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
-       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)`
+      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
+       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)
+       ON CONFLICT(id) DO UPDATE SET
+         session_id=excluded.session_id, workspace_id=excluded.workspace_id, pane_id=excluded.pane_id,
+         command=excluded.command, kind=excluded.kind, rationale=excluded.rationale,
+         timestamp=excluded.timestamp, expires_at=excluded.expires_at,
+         claimed=CASE WHEN pending_approvals.claimed=1 THEN 1 ELSE excluded.claimed END`
     ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null });
   }
   /** Atomic claim: flips 0->1 only if currently 0. True == this caller won. */
@@ -275,8 +291,12 @@ export class JanusStore {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));
   }
+  // wsm-e2e-pinned-4s2 (2): expires_at alone has no tiebreak — two rows staged in the same
+  // millisecond (a real possibility for co-arriving approvals) would sort in undefined/storage
+  // order, so hydration/reconnect ordering could vary run-to-run. `timestamp ASC, id ASC` gives a
+  // fully deterministic total order (id is the PK, so it is always a unique final tiebreak).
   getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
-    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as PendingApprovalRow[])
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC, timestamp ASC, id ASC").all(now) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));
   }
 
@@ -1016,6 +1036,28 @@ export class JanusStore {
       .run(name, Date.now(), paneId, projectId);
   }
 
+  /** wsm-e2e-pinned major-finding fix: hard-delete a LIVE pane row (the delete_pane action's real
+   *  durable effect — NOT the recoverable archivePane/archivePaneOwned pair above). Truthy-on-success
+   *  (Ledger parity): false when the row was already gone, so callers can narrate idempotently without
+   *  a spurious broadcast. `workspaces`/`getProject` are snapshot getters that re-read SQL on every
+   *  call and `save()` is a documented no-op — a caller that only mutated the projected snapshot object
+   *  (`delete ws.panes[id]`) never touched the database, so the row silently resurrected on next read.
+   *  This issues the actual `DELETE FROM panes` row mutation. */
+  deletePane(projectId: string, paneId: string): boolean {
+    const res = this.db.prepare("DELETE FROM panes WHERE pane_id=? AND workspace_id=?").run(paneId, projectId);
+    return res.changes > 0;
+  }
+
+  /** wsm-e2e-pinned major-finding fix: hard-delete a project row (the delete_project action's real
+   *  durable effect). Truthy-on-success. `panes.workspace_id REFERENCES projects(id) ON DELETE CASCADE`
+   *  with `foreign_keys=ON` (schema.ts), so this also removes the project's own panes in the same
+   *  statement — the SQL analog of the legacy in-memory Ledger dropping the whole nested workspace
+   *  object. See deletePane's doc comment for why a snapshot-only mutation is a silent no-op here. */
+  deleteProject(id: string): boolean {
+    const res = this.db.prepare("DELETE FROM projects WHERE id=?").run(id);
+    return res.changes > 0;
+  }
+
   /**
    * Project briefing in the exact legacy Ledger.getProjectBriefing shape, or null.
    * { project_id, summary, directory, panes: PaneMeta[], notes: string[], key_codebase_terms: string[] }
@@ -1188,6 +1230,13 @@ export class JanusStore {
   updateHandoffState(id: string, state: HandoffState, patch: Partial<StoredHandoff> = {}): StoredHandoff | null {
     const existing = this.getHandoff(id);
     if (!existing) return null;
+    // wsm-e2e-pinned-3vl (2): defense-in-depth terminal-state no-op. Exactly-once already rests on
+    // the UPSTREAM claim gate (resolveDecision's atomic claim() — only the claim winner ever reaches
+    // a flip call), so under correct operation this branch should never fire. It exists so a second
+    // write attempt against an already-terminal row (a bug elsewhere, a replay, a future caller that
+    // forgets the claim gate) can never re-stamp terminal_at/approved_via or emit a second handoff
+    // audit event — it silently returns the row UNCHANGED rather than corrupting the audit trail.
+    if (JanusStore.HANDOFF_TERMINAL_STATES.has(existing.state)) return existing;
     const now = Date.now();
     const { sets, params } = this.buildHandoffStateUpdate(id, state, patch, now);
     this.recordActivity(

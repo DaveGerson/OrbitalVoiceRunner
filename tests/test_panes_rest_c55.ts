@@ -393,12 +393,16 @@ describe("c55 send_keys", () => {
     });
   });
 
-  it("missing command -> zod rejects -> 500/error (replaces inline 400)", async () => {
+  it("missing command -> zod rejects -> error/cause:'validation' -> 400 (wsm-e2e-pinned-f9ne; replaces inline 400)", async () => {
     const term = makeFakeTerm();
     const { ctx } = makeCtx({ terminals: { p1: term } });
     const result = await runAction(REGISTRY, "send_keys", { pane_id: "p1" }, ctx);
     assert.strictEqual(result.kind, "error", "missing required command is a zod rejection");
+    assert.strictEqual((result as { cause?: string }).cause, "validation", "a zod reject is a client-fault, not a server-fault");
     assert.strictEqual(term.inputs.length, 0, "nothing written on a rejected request");
+    const { res, sent } = makeFakeRes();
+    resultToHttp(result, res);
+    assert.strictEqual(sent.status, 400, "a validation-caused error maps to 400, not 500");
   });
 });
 

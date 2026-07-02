@@ -123,11 +123,10 @@ describe("p85 — boot rehydrate loop QUARANTINEs a drifted/legacy intent and re
     seed.close();
 
     // ── Boot the REAL server against the seeded file. ───────────────────────────────────────────
-    // JANUS_DB -> our seeded db (the module-level `store` opens this at import).
-    // JANUS_LEDGER_BACKEND unset -> SQLite ledger is the DEFAULT (the loop's `if (store)` audit fires).
+    // JANUS_DB -> our seeded db (the module-level `store` opens this at import). SQLite is the
+    // ONLY ledger backend (dbt3), so the loop's `if (store)` audit always fires on a healthy boot.
     // JANUS_NO_AUTOSTART=1 -> the module tail must NOT auto-start a second server on import.
     setEnv("JANUS_DB", dbPath);
-    setEnv("JANUS_LEDGER_BACKEND", undefined);
     setEnv("JANUS_NO_AUTOSTART", "1");
     setEnv("NODE_ENV", "test");
 

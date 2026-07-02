@@ -26,7 +26,7 @@ import {
   type ResolveMode,
   type ResolveReason,
 } from "../src/pendingApprovals";
-import { applyHandoffFlipOnResolve } from "../src/handoffFlow";
+import { applyHandoffFlipOnResolve, isFlipReason } from "../src/handoffFlow";
 
 const TTL = 5 * 60 * 1000;
 const WS = "ws-alf";
@@ -97,7 +97,9 @@ function resolveAndFlip(
 ): { reason: ResolveReason; flipped: boolean } {
   const action = resolveDecision(approvals, id, mode, paneExists);
   let flipped = false;
-  if (action.reason === "approved" || action.reason === "rejected" || action.reason === "expired" || action.reason === "dead_pane") {
+  // wsm-e2e-pinned-3vl (1): same predicate the server's flip-gate call site uses (src/gating/index.ts)
+  // — one exported allowlist, not a locally re-typed chain that could drift out of sync with it.
+  if (isFlipReason(action.reason)) {
     flipped = applyHandoffFlipOnResolve(store, id, action.reason, opts).flipped;
   }
   return { reason: action.reason, flipped };

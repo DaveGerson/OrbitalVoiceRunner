@@ -148,9 +148,12 @@ npm run complexity:report                      # churn × complexity hotspot ran
 Voice-driven orchestrator for live Claude/Codex CLI panes. `server.ts` is the WS/REST hub;
 `src/terminal.ts` (`OrchestratorManager` + `UniversalTerminal`) owns pane lifecycle over a
 real PTY (`src/ptyTransport.ts`, node-pty/ConPTY). State persists through a **SQLite ledger**
-(`src/store/`, `JanusStore`) — the default backend as of WS-M; opt out with
-`JANUS_LEDGER_BACKEND=legacy`. Safety is the **capability-gate matrix** (per-capability
-Auto/Ask/Off, global + per-pane), the choke-point every pane-mutating action routes through.
+(`src/store/`, `JanusStore`) — the ONLY backend since dbt3 (2026-07-02) retired the legacy
+in-memory/JSON ledger and its `JANUS_LEDGER_BACKEND=legacy` escape hatch; a store-init failure
+is now a fatal boot error (there is no fallback). The one-way JSON→SQLite boot migration for
+operators upgrading from pre-WS-M on-disk data is unaffected and still runs. Safety is the
+**capability-gate matrix** (per-capability Auto/Ask/Off, global + per-pane), the choke-point
+every pane-mutating action routes through.
 
 ### Python ⇄ TS boundary (the seam — read before adding "logic")
 

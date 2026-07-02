@@ -45,7 +45,7 @@ import { PendingActionStore } from "../pendingActions";
 import { applyPaneMode, type PaneModeResult } from "../applyPaneMode";
 import { buildActionRun, checkActionVersion } from "../actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
-import { applyHandoffFlipOnResolve, type HandoffResolveReason } from "../handoffFlow";
+import { applyHandoffFlipOnResolve, isFlipReason, type HandoffResolveReason } from "../handoffFlow";
 import {
   deriveEffectiveGates,
   derivePostureWord,
@@ -123,11 +123,11 @@ export interface Gating {
   /** 4D.1: stamp the moment the live voice session detached — opens the "while you were away"
    *  window that reannounceSurvivors digests (and consumes) on the next reconnect. */
   noteSessionDetached: (now?: number) => void;
-  /** The LIVE mode-switch choke point (multi-cli spec §6, bead 1y8). set_pane_permissions + restart_pane delegate here. */
+  /** The LIVE mode-switch choke point (multi-cli spec §6, bead 1y8). set_pane_permissions + promote_pane_mode delegate here. */
   applyPaneMode: (
     paneId: string,
     targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
-    source: "voice" | "ui" | "restart_pane"
+    source: "voice" | "ui" | "promote_pane_mode"
   ) => Promise<PaneModeResult>;
   reannounceSurvivors: (session: any) => void;
   pendingApprovals: PendingApprovalStore;
@@ -175,9 +175,9 @@ export function createGating(deps: GatingDeps): Gating {
   // session side-map + ordered index + claim flag live in PendingApprovalStore so WS-F can
   // add durability/atomicity without a rewrite (see src/pendingApprovals.ts §8).
   // WS-M (bead wsm-e2e-pinned-nzt): inject the durable JanusStore so pending approvals SURVIVE a
-  // process restart, while the N-1 atomic-claim gate is backed by the durable SQL claim. When the
-  // store is null (JANUS_LEDGER_BACKEND=legacy or store init failed) the class is pure in-memory,
-  // byte-for-byte as before — no behavioral change on the legacy path.
+  // process restart, while the N-1 atomic-claim gate is backed by the durable SQL claim. dbt3:
+  // SQLite is the only ledger backend, so `store` is non-null on any real server boot; when null
+  // (a hand-built test harness) the class is pure in-memory, byte-for-byte as before.
   const pendingApprovals = new PendingApprovalStore(store);
   // G1: deferred execution for gated NON-PTY mutators (create_pane / set_*_permissions /
   // update_metadata). On the Ask tier these stage a side-effect here and run exactly once on operator
@@ -186,7 +186,8 @@ export function createGating(deps: GatingDeps): Gating {
   // kzt (wsm-e2e-pinned-kzt): inject the durable JanusStore so a deferred action SURVIVES a process
   // restart. The run() closure is non-serializable, so add() persists the action's INTENT
   // (capability + params); the boot loop below rebuilds run() via buildActionRun. store===null
-  // (JANUS_LEDGER_BACKEND=legacy / store init failed) => pure in-memory, byte-for-byte as before.
+  // (a hand-built test harness — dbt3 removed the only production cause) => pure in-memory,
+  // byte-for-byte as before.
   const pendingActions = new PendingActionStore(store);
   let pendingActionSeq = 0;
 
@@ -667,7 +668,9 @@ export function createGating(deps: GatingDeps): Gating {
     if (ledgerChanged) {
       manager.ledger["save"]?.(true);
       broadcast({ type: "plans_updated", plans: manager.ledger.plans });
-      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+      // wsm-e2e-pinned-33c.4: watch_rules_updated is PRUNED — no client consumes that frame (the
+      // classic UI's Alerts/Orchestrate tabs were removed d858e5e; Kitchen has no watch-rule surface).
+      // The disable-on-freeze persist above is unchanged.
     }
   }
 
@@ -837,12 +840,10 @@ export function createGating(deps: GatingDeps): Gating {
   } as const;
 
   // Step 9: the resolve reasons whose handoff row must be flipped to its terminal state in the SAME
-  // choke-point. Replaces the inline `reason === "approved" || ... || "dead_pane"` chain byte-for-byte
-  // (lost_race / not_found are deliberately absent — they never flip a handoff). `reason` is a typed
-  // ResolveReason union (never external/prototype input), so Set membership is the exact equivalent.
-  const handoffFlipReasons: ReadonlySet<ResolveReason> = new Set<ResolveReason>([
-    "approved", "rejected", "expired", "dead_pane",
-  ]);
+  // choke-point (lost_race / not_found deliberately never flip a handoff). wsm-e2e-pinned-3vl (1):
+  // this used to be a locally-declared Set duplicating the exact allowlist `resolveAndFlip` re-typed
+  // in the test file — the two could silently drift. Both now call the SAME exported predicate
+  // (`isFlipReason`, src/handoffFlow) so the guard cannot drift server-vs-test.
 
   // WS-E single choke-point (simplicity H1 / maintainability H1/H2/L9): the ONE place every
   // resolve path (REST approve, voice approve/reject, TTL sweep) renders the outcome of the pure
@@ -945,7 +946,7 @@ export function createGating(deps: GatingDeps): Gating {
       case "lost_race": break;
     }
     // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
-    if (handoffFlipReasons.has(reason)) {
+    if (isFlipReason(reason)) {
       flipHandoffOnResolve(messageId, reason, opts);
     }
     // Issue E: emit a messageId-keyed resolve event so EVERY client dismisses the ApprovalDialog in
@@ -1143,12 +1144,12 @@ export function createGating(deps: GatingDeps): Gating {
 
   // ── applyPaneMode: the LIVE mode-switch choke point (multi-cli adapter spec §6, bead 1y8) ──────
   // Binds the standalone applyPaneMode core to this server's real terminal + gate + pending stores +
-  // broadcast + ledger persist. set_pane_permissions and the restart_pane voice tool delegate here
+  // broadcast + ledger persist. set_pane_permissions and the promote_pane_mode voice tool delegate here
   // (via ctx.applyPaneMode) so a Full-Auto promotion reaches the RUNNING process and drains pending.
   async function applyPaneModeBound(
     paneId: string,
     targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
-    source: "voice" | "ui" | "restart_pane",
+    source: "voice" | "ui" | "promote_pane_mode",
   ): Promise<PaneModeResult> {
     const term = manager.terminals[paneId];
     if (!term) {

@@ -394,7 +394,9 @@ describe("eventBus — BUG-010 dispatch mapping", () => {
       [{ type: "attention_updated", queue: [{ type: "error", dismissed: false }] }, "setAttentionQueue", "alert"],
       [{ type: "attention_updated", queue: [] }, "setAttentionQueue", null],
       [{ type: "plans_updated", plans: [] }, "setPlans", null],
-      [{ type: "watch_rules_updated", watchRules: [] }, "setWatchRules", null],
+      // wsm-e2e-pinned-33c.4: watch_rules_updated is no longer emitted (no client consumed the
+      // setWatchRules arm), so it's no longer in eventBus's mapping table either — see
+      // test_eventbus_complexity_refactor.ts for the "unmapped -> null" pin.
       [{ type: "pane_transition", transition: "error" }, "fetchTerminals", "alert"],
       // idle yields NO earcon from the event bus: the AnnouncementBus owns the completion
       // tone on the genuine onIdle edge, so mapping it here too would double-play it.

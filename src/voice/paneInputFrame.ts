@@ -86,6 +86,11 @@ export function applyPaneInputFrame(
   const paneId = typeof msg.paneId === "string" ? msg.paneId : coreState.activePaneId;
   if (!paneId) return;
   if (typeof msg.data !== "string" || msg.data.length === 0) return;
+  // wsm-e2e-pinned-izj (2026-07-02, no behavior change): a `coreState.frozen` check would
+  // otherwise live HERE, before the write below. It is deliberately absent — STOP-ALL freeze does
+  // NOT gate operator direct typing, same rationale as the always-allowed Ctrl+C brake: the
+  // operator stays above the gate so they can type a recovery command right after hitting stop.
+  // See docs/design/2026-06-24-pane-direct-typing.md ("2026-07-02 — decision reaffirmed").
   // Single-active-pane targeting (matches the raw-input control-key route): the operator's keystrokes
   // may only ever reach the pane they currently have open. An explicit paneId that isn't the active
   // pane — a stale/hand-crafted frame, or a set_active_pane/pane_input race — is dropped, not written.

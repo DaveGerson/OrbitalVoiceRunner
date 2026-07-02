@@ -2,6 +2,7 @@ import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert";
 import fs from "fs";
 import { UniversalTerminal, OrchestratorManager, stripAnsiSequences } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 
 // IDs of scrollback files created by this test suite
 const SUITE_SCROLLBACK_IDS = ["test-1", "test-input", "term-1", "pane_1"];
@@ -86,7 +87,9 @@ describe("Orchestrator Terminal Logic Test Suite", () => {
     let manager: OrchestratorManager;
 
     beforeEach(() => {
-      manager = new OrchestratorManager();
+      const store = new JanusStore(":memory:");
+      store.init();
+      manager = new OrchestratorManager({ ledger: store });
     });
 
     it("should manage multiple panes correctly", async () => {

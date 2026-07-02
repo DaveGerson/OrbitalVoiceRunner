@@ -48,11 +48,11 @@ describe("effectForEvent — every switch arm pinned", () => {
     });
   });
 
-  it("watch_rules_updated -> setWatchRules, null", () => {
-    assert.deepStrictEqual(effectForEvent({ type: "watch_rules_updated" }), {
-      setter: "setWatchRules",
-      earcon: null,
-    });
+  // wsm-e2e-pinned-33c.4: watch_rules_updated is no longer server-emitted (and never had a real
+  // client consumer post d858e5e), so it's dropped from eventBus's mapping table — an unmapped
+  // type now falls through to null, same as any other unrecognized event.
+  it("watch_rules_updated -> null (no longer mapped; the frame is pruned server-side)", () => {
+    assert.strictEqual(effectForEvent({ type: "watch_rules_updated" }), null);
   });
 
   it("pane_transition -> fetchTerminals, earcon from transition (alert)", () => {

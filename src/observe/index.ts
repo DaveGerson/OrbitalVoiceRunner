@@ -417,7 +417,9 @@ ${redact(rawOutput.slice(-3000))}`;
     }
     if (changed) {
       manager.ledger["save"](true);
-      broadcast({ type: "watch_rules_updated", watchRules: manager.ledger.watchRules });
+      // wsm-e2e-pinned-33c.4: watch_rules_updated is PRUNED — no client consumes that frame (the
+      // classic UI's Alerts/Orchestrate tabs were removed d858e5e; Kitchen has no watch-rule surface).
+      // The oneShot-disable persist above is unchanged.
     }
   }
 
