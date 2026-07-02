@@ -155,6 +155,14 @@ export interface ObserveHandlers {
   // goes quiet inside the pre-idle window — WITHOUT enqueuing a completion announcement (cooking
   // is not 'done'). The PaneSignalBus owns the per-(pane,kind) debounce.
   onQuiescing: (terminalId: string) => void;
+  // res2 (bead res2 / wsm-e2e-pinned-y09): the PUSH exit edge. Fired from
+  // UniversalTerminal.onExit the instant a pane's PTY exits — does NOT depend on a subsequent
+  // output chunk (unlike the onOutput-driven classifier below, which a silent SIGKILL never
+  // reaches). Reuses the identical classifyTransition/emitHighSeverityTransition path, so it is
+  // the SAME attention item / attention_updated broadcast / paneSignalBus 'exited' publish, deduped
+  // through the same lastStates edge tracking (a chunk that already classified this exit, or a
+  // later one, can never double-fire it).
+  onExit: (terminalId: string) => void;
 }
 
 // VOICE_TRACE is recomputed here from the same env signal server.ts uses, so the high-volume PTY
@@ -335,6 +343,13 @@ ${redact(rawOutput.slice(-3000))}`;
   // debounce, so a chatty Running edge can't spam the model; no second debounce here.
   const onRunning = (terminalId: string): void => {
     const term = manager.terminals[terminalId];
+    // y09 follow-up: a fresh spawn is a NEW pane lifetime — clear any stamped "exited" (or other)
+    // edge from a prior life so a genuine silent death after this restart can classify a fresh
+    // "exited" transition instead of being suppressed by the stale dedup (detectAndTriggerTransitions
+    // no-ops when transition === lastStates[terminalId]). Without this, once a pane has exited once
+    // — including via an intentional stop, which still stamps lastStates via the chunk classifier —
+    // every subsequent restart's silent death goes unsignalled for the rest of the server's life.
+    delete lastStates[terminalId];
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "running", detail });
     broadcast({ type: "pane_status", terminalId, status: "Running" });
@@ -702,7 +717,22 @@ ${redact(rawOutput.slice(-3000))}`;
     bufferAndScheduleFlush(terminalId, chunk);
   };
 
-  return { onOutput, onIdle, onRunning, onQuiescing };
+  // res2/y09: the PUSH exit edge (manager.onExit, forwarded from UniversalTerminal.onExit). Calls
+  // the SAME detectAndTriggerTransitions the onOutput chunk path uses — classifyTransition
+  // short-circuits to "exited" the moment term.status is "Exited" (already true by the time this
+  // fires), so a pane that dies with no trailing output chunk still gets the attention item +
+  // attention_updated broadcast + paneSignalBus 'exited' publish. No new decision logic; this is
+  // strictly a second, chunk-independent entry point into the existing classifier. Own try/catch
+  // (QW5 philosophy): an observation fault here must never propagate out of the exit teardown.
+  const onExit = (terminalId: string): void => {
+    try {
+      detectAndTriggerTransitions(terminalId, "");
+    } catch (e) {
+      console.error(`[ONEXIT] transition step failed for ${terminalId}:`, e);
+    }
+  };
+
+  return { onOutput, onIdle, onRunning, onQuiescing, onExit };
 }
 
 // Re-export the secret redactor's identity for callers that want the same default `redact` the

@@ -77,8 +77,13 @@ export interface DispatchDeps {
   pendingId: string;
   /** the Live functionCall id consumed exactly once. */
   callId: string;
-  /** the live terminal handle for targetId (undefined for an inert/ledger-only pane). */
-  term: { writeInput: (s: string) => void } | undefined;
+  /**
+   * The live terminal handle for targetId (undefined for an inert/ledger-only pane never
+   * spawned/archived). `status` is optional structural surface (the real UniversalTerminal always
+   * has it) — res2: applyAutoExecute reads it to refuse a write against a pane that is registered
+   * but has died in place (status === "Exited"), instead of silently no-oping into a dead PTY.
+   */
+  term: { writeInput: (s: string) => void; status?: string } | undefined;
   /**
    * Fan-out staging (dispatch_to_panes). When true: (a) an `auto_execute` decision is DOWNGRADED to
    * `pending_approval` before the effect switch — nothing can land without operator confirmation —
@@ -189,7 +194,7 @@ function applyEffect(
   }
 }
 
-/** auto_execute arm — immediate Full-Auto write (guards the inert/ledger-only pane). */
+/** auto_execute arm — immediate Full-Auto write (guards the inert/ledger-only + dead-in-place pane). */
 function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcome {
   const { broadcast, addCommand, targetId, instruction, term } = deps;
   // Inert boot (feat/local-testing) means a pane can exist in the ledger without a live process
@@ -197,6 +202,15 @@ function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcom
   // write: if there is no live terminal, refuse instead of crashing on `term!.writeInput`. (The
   // pending-approval path re-checks liveness at resolve time.)
   if (!term) {
+    return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+  }
+  // res2: a REGISTERED-but-dead pane (the process crashed/exited in place, term still present in
+  // manager.terminals) previously fell through to `term.writeInput` — a swallowed no-op against a
+  // dead PTY (src/ptyTransport.ts writes silently discard on a dead process) that STILL returned
+  // `{kind:'executed', ...}`: a false-positive success narrated to the operator/model. Fail the
+  // same way the never-spawned/archived case above does (kind:'error', same message shape) instead
+  // of a silent no-op success.
+  if (term.status === "Exited") {
     return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
   }
   addCommand(targetId, instruction);

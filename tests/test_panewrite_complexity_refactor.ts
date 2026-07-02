@@ -53,6 +53,7 @@ function makeDeps(
     activePaneId: string | null;
     forceStage?: boolean;
     hasTerm?: boolean; // default true; false simulates an inert / ledger-only pane
+    exited?: boolean; // res2: true simulates a REGISTERED pane whose process died in place
   }
 ): DispatchDeps {
   const hasTerm = opts.hasTerm !== false;
@@ -90,7 +91,10 @@ function makeDeps(
     pendingId: "call-1__dispatch_x__p_target",
     callId: "call-1",
     term: hasTerm
-      ? { writeInput: (s: string) => rec.writes.push({ paneId: opts.targetId, cmd: s }) }
+      ? {
+          writeInput: (s: string) => rec.writes.push({ paneId: opts.targetId, cmd: s }),
+          status: opts.exited ? "Exited" : "Running",
+        }
       : undefined,
     forceStage: opts.forceStage,
   };
@@ -263,6 +267,30 @@ describe("applyDispatchDecision — switch cases", () => {
     assert.strictEqual(rec.commands.length, 0, "no command recorded on a dead pane");
     assert.strictEqual(rec.writes.length, 0);
     assert.strictEqual(rec.broadcasts.length, 0);
+  });
+
+  // res2 (bead res2 / PTY death handling): a REGISTERED pane whose process crashed/exited IN PLACE
+  // (term still present in manager.terminals, term.status === "Exited") previously fell through to
+  // term.writeInput — a swallowed no-op against a dead PTY that STILL returned
+  // {kind:'executed', ...}, a false-positive success narrated to the operator/model. Must now fail
+  // clean with the SAME error shape as the never-spawned/archived (`!term`) case above, and must
+  // NOT record the command / write / broadcast a false success.
+  it("auto_execute on a REGISTERED-but-EXITED pane (dead in place): clean error, NOTHING fired", () => {
+    const rec = freshRec();
+    const deps = makeDeps(rec, {
+      targetId: "p1",
+      instruction: "ls",
+      activePaneId: "p1",
+      exited: true,
+    });
+    const out = applyDispatchDecision({ type: "auto_execute" }, deps, voiceConn(rec));
+    assert.deepStrictEqual(out, {
+      kind: "error",
+      text: "Pane p1 is not running. Start it first (restart the pane), then try again.",
+    });
+    assert.strictEqual(rec.commands.length, 0, "no command recorded on a dead-in-place pane");
+    assert.strictEqual(rec.writes.length, 0, "no write reaches the dead PTY");
+    assert.strictEqual(rec.broadcasts.length, 0, "no false command_auto_executed broadcast");
   });
 
   it("pending_approval: stores a serializable record + session, announces, notifies, returns pending", () => {
