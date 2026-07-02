@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -306,6 +306,42 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       );
       CREATE INDEX idx_gemini_turn_usage_ts        ON gemini_turn_usage(ts);
       CREATE INDEX idx_gemini_turn_usage_inject_id ON gemini_turn_usage(inject_id);
+    `);
+  },
+  // v10 (cortex context-injection telemetry, P0 first PR — 2026-07-02): one append-only row per
+  // ATTEMPTED context injection (injected or skipped/failed), joining the v9 measurement spine
+  // (cortex_decision, gemini_turn_usage) via the SAME `inject_id` — a three-way join on inject_id.
+  // Unlike v9's tables, `inject_id` here is NOT an afterthought: it's recorded on every event that
+  // reaches the mint (delta 18.1) and indexed accordingly. Purely additive (new table + indexes
+  // only) — safe on an already-migrated DB. See docs/superpowers/specs/2026-07-02-cortex-context-
+  // telemetry.md §7 and §18.1 for the design rationale.
+  (db) => {
+    db.exec(`
+      CREATE TABLE context_injections (
+        id TEXT PRIMARY KEY NOT NULL,
+        ts INTEGER NOT NULL,
+        session_id TEXT,
+        interaction_id TEXT,
+        inject_id TEXT,
+        trigger TEXT NOT NULL,
+        active_project_id TEXT,
+        active_pane_id TEXT,
+        brief_active_pane_id TEXT,
+        source TEXT NOT NULL,
+        disposition TEXT NOT NULL,
+        skipped_reason TEXT,
+        source_snapshot_hash TEXT,
+        brief_hash TEXT,
+        brief_chars INTEGER NOT NULL DEFAULT 0,
+        estimated_tokens INTEGER NOT NULL DEFAULT 0,
+        elapsed_ms INTEGER,
+        error TEXT
+      );
+      CREATE INDEX idx_context_injections_ts               ON context_injections(ts);
+      CREATE INDEX idx_context_injections_session_ts        ON context_injections(session_id, ts);
+      CREATE INDEX idx_context_injections_inject_id         ON context_injections(inject_id);
+      CREATE INDEX idx_context_injections_active_pane_ts    ON context_injections(active_pane_id, ts);
+      CREATE INDEX idx_context_injections_brief_hash        ON context_injections(brief_hash);
     `);
   },
 ];
