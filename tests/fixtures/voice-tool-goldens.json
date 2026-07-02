@@ -32,6 +32,13 @@
   "dismiss_attention": {
     "output": "Dismissed all 0 pending attention items."
   },
+  "focus_pane.exact": {
+    "output": "Focused pane 'gold-focus-exact'."
+  },
+  "focus_pane.none": {
+    "output": "I didn't catch which pane you meant. Panes I see: 'gold-list', 'gold-auto', 'gold-ask', 'gold-off', or 'gold-focus-exact'.",
+    "status": "clarify"
+  },
   "get_attention_digest": {
     "output": "There are no pending alerts or actions requiring your attention right now."
   },
@@ -95,6 +102,9 @@
       ],
       "project_id": "gold_getnotes_proj"
     }
+  },
+  "get_status_summary": {
+    "output": "Nothing needs your attention: no pending approvals, no alerts, and no panes are busy."
   },
   "list_capabilities": {
     "output": [

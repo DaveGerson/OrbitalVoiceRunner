@@ -27,6 +27,7 @@ import type { JanusStore } from "../store/sqliteStore";
 import type { PaneModeResult } from "../applyPaneMode";
 import type { ShadowStats } from "../approvalShadow";
 import type { ContextInjectionTrigger } from "../memory/contextTelemetry";
+import type { PythonPolicyClient } from "../voice/policyClient";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -403,6 +404,12 @@ export interface ActionContext {
     effective_gates: Record<CapabilityGate, GateValue>;
     posture: unknown;
   };
+
+  // ── Voice-UX wave 3 (optional — voice lane only) ────────────────────────────────────────────
+  /** The optional "policies" Python daemon facade (focus resolution + SITREP ranking). Wired on the
+   *  voice ActionContext ONLY (server.ts VoiceDeps.policies); absent on REST/hand-built test contexts
+   *  — handlers must null-chain (`ctx.policies?.resolveFocus(...) ?? <TS fallback>`, per D2). */
+  policies?: PythonPolicyClient;
 
   // deliver_handoff note: NO injected closure for the outcome→row mapping. `deliverOutcomeToHandoff`
   // is a PURE, EXPORTED function in src/handoffFlow (server.ts imports it as a value at server.ts:37,

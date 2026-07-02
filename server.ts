@@ -48,6 +48,7 @@ import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/i
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient, type CortexDecisionSink } from "./src/memory";
+import { createPythonPolicyClient, type PythonPolicyClient } from "./src/voice/policyClient";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
@@ -140,19 +141,76 @@ function validateCapabilityGatesField(adv: Record<string, unknown>): string | nu
   return null;
 }
 
+// Voice UX trio (wave 3): strict-when-present validation for the operator-tunable settings.voiceUx
+// block. sitrepShape/focusBindPolicy must be a known enum value; confirmTimeoutMs must be a finite
+// number in [1000, 120000]. Unknown keys inside voiceUx are STRIPPED in place (forward compat, mirrors
+// validateCapabilityGatesField), never a 400 — a newer client's extra knob must not brick the PUT.
+const SettingsSitrepShapeSchema = z.enum(["brief", "walk", "full"]);
+const SettingsFocusBindPolicySchema = z.enum(["confirm", "echo", "tiered"]);
+const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs"]);
+
+/** Strip unknown voiceUx keys IN PLACE (forward compat, mirrors validateCapabilityGatesField's
+ *  unknown-key strip). Pure side effect, no validation — kept separate to hold each function's own
+ *  cyclomatic complexity down. */
+function stripUnknownVoiceUxKeys(voiceUx: Record<string, unknown>): void {
+  for (const key of Object.keys(voiceUx)) {
+    if (!VOICE_UX_KNOWN_KEYS.has(key)) {
+      delete voiceUx[key]; // unknown voiceUx key: strip, don't 400 (forward compat).
+    }
+  }
+}
+
+/** Validate voiceUx.sitrepShape / voiceUx.focusBindPolicy (when present). Returns an error message
+ *  string for an invalid KNOWN-key value, else null. */
+function validateVoiceUxEnumFields(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.sitrepShape !== undefined && !SettingsSitrepShapeSchema.safeParse(voiceUx.sitrepShape).success) {
+    return `Invalid settings field 'voiceUx.sitrepShape': must be one of ${SettingsSitrepShapeSchema.options.join(", ")}.`;
+  }
+  if (voiceUx.focusBindPolicy !== undefined && !SettingsFocusBindPolicySchema.safeParse(voiceUx.focusBindPolicy).success) {
+    return `Invalid settings field 'voiceUx.focusBindPolicy': must be one of ${SettingsFocusBindPolicySchema.options.join(", ")}.`;
+  }
+  return null;
+}
+
+/** Validate voiceUx.confirmTimeoutMs (when present): must be a finite number in [1000, 120000]. */
+function validateVoiceUxConfirmTimeout(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.confirmTimeoutMs === undefined) return null;
+  const v = voiceUx.confirmTimeoutMs;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 1000 || v > 120_000) {
+    return "Invalid settings field 'voiceUx.confirmTimeoutMs': must be a finite number between 1000 and 120000.";
+  }
+  return null;
+}
+
+/** Validate (and forward-compat-strip) settings.voiceUx (when present). Returns an error message
+ *  string for an invalid value on a KNOWN field, else null. Pure over everything except the
+ *  unknown-key strip (mirrors validateCapabilityGatesField). */
+function validateVoiceUxField(body: Record<string, unknown>): string | null {
+  const voiceUx = body.voiceUx;
+  if (voiceUx === undefined) return null;
+  if (!isPlainObject(voiceUx)) {
+    return "Invalid settings field 'voiceUx': expected an object.";
+  }
+  stripUnknownVoiceUxKeys(voiceUx);
+  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx);
+}
+
 export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
   if (!isPlainObject(body)) {
     return { ok: false, error: "Settings body must be a JSON object." };
   }
   const advanced = body.advanced;
-  if (advanced === undefined) return { ok: true };
-  if (!isPlainObject(advanced)) {
-    return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+  if (advanced !== undefined) {
+    if (!isPlainObject(advanced)) {
+      return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+    }
+    const modeError = validateGlobalModeField(advanced);
+    if (modeError) return { ok: false, error: modeError };
+    const gatesError = validateCapabilityGatesField(advanced);
+    if (gatesError) return { ok: false, error: gatesError };
   }
-  const modeError = validateGlobalModeField(advanced);
-  if (modeError) return { ok: false, error: modeError };
-  const gatesError = validateCapabilityGatesField(advanced);
-  if (gatesError) return { ok: false, error: gatesError };
+  const voiceUxError = validateVoiceUxField(body);
+  if (voiceUxError) return { ok: false, error: voiceUxError };
   return { ok: true };
 }
 
@@ -789,6 +847,23 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
   }
 }
 
+// Voice-UX wave 3: best-effort, non-fatal construction of the SECOND optional warm Python daemon —
+// "policies" (focus resolution + SITREP ranking). Sibling of createPythonSynthClientOrUndefined: same
+// master switch, same disabled/init-throw ⇒ undefined posture (permanent TS-fallback). A SEPARATE
+// process from the synth/approval/cortex daemon (moduleName:"policies" resolves a different
+// python/<dir>/__main__.py), so a policies-side wedge can never trip the synth breaker. dispose() is
+// joined into the existing close() teardown next to pythonSynthClient?.dispose().
+function createPythonPolicyClientOrUndefined(memoryPythonEnabled: boolean): PythonPolicyClient | undefined {
+  if (!memoryPythonEnabled) return undefined;
+  try {
+    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), moduleName: "policies" });
+    return createPythonPolicyClient(core);
+  } catch (e) {
+    console.error("[policies] python daemon client init failed (continuing on fallback):", e);
+    return undefined;
+  }
+}
+
 // VERBATIM extraction from startServer (CC paydown). Registers the raw control-byte path
 // (POST /api/terminals/:id/raw-input) — the multi-cli adapter spec §7/§10 surface. Every branch,
 // status code, message, the active-pane guard, the isKnownRawKey allowlist, and the
@@ -1261,6 +1336,10 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       daemonTracker.onTransition(state);
     } catch { /* best-effort observability accounting */ }
   });
+  // Voice-UX wave 3: the SECOND optional warm Python daemon (focus resolution + SITREP ranking),
+  // gated by the SAME master switch as the synth/approval/cortex daemon. VoiceDeps.policies threads it
+  // to the voice lane only (server.ts REST ctx does NOT get it — both new tools are voice-only).
+  const pythonPolicyClient = createPythonPolicyClientOrUndefined(manager.settings.advanced?.memoryPythonEnabled !== false);
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
@@ -1703,6 +1782,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // bead 9fz: the live voice connection registers its reconnect-nudge here; the settings PUT invokes
     // it (via requestVoiceReconnect) when the operator sets a real Gemini key — voice resumes, no reload.
     registerReconnectNudge: setVoiceReconnectNudge,
+    // Voice-UX wave 3: the optional "policies" daemon facade (voice lane only).
+    policies: pythonPolicyClient,
   });
 
   // ── REST surface, DERIVED from the registry (cv/PLM2). One ActionContext per request, session:null
@@ -1911,6 +1992,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // clear the installed shadow recorder so it can't reference the dead core.
     pythonSynthClient?.dispose();
     installApprovalShadow(null);
+    // Voice-UX wave 3: the policies daemon is a SEPARATE process (its own core) — dispose it too.
+    pythonPolicyClient?.dispose();
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).

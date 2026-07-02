@@ -268,6 +268,25 @@ export interface CliPreset {
   capabilityGates?: CapabilityGateMap;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Voice UX trio (wave 3, spec 2026-07-02-voice-ux-trio-design.md). Operator-tunable knobs
+// for the conversational SITREP shape, the focus-by-reference bind policy, and the spoken
+// destructive-confirm window. Optional on SystemSettings so a persisted file without it keeps
+// loading (shallow-merged with DEFAULT_VOICE_UX in terminal.ts loadSettings); every reader
+// defaults via `manager.settings.voiceUx ?? DEFAULT_VOICE_UX`.
+// ─────────────────────────────────────────────────────────────────────────────
+export interface VoiceUxSettings {
+  sitrepShape: "brief" | "walk" | "full";
+  focusBindPolicy: "confirm" | "echo" | "tiered";
+  confirmTimeoutMs: number;
+}
+
+export const DEFAULT_VOICE_UX: VoiceUxSettings = {
+  sitrepShape: "brief",
+  focusBindPolicy: "confirm",
+  confirmTimeoutMs: 10_000,
+};
+
 export interface SystemSettings {
   server: {
     port: number;
@@ -347,6 +366,9 @@ export interface SystemSettings {
   secrets: {
     geminiApiKey: string;
   };
+  // Voice UX trio (wave 3): SITREP shape / focus bind policy / spoken-confirm timeout. Optional —
+  // absent on settings persisted before this wave; loadSettings shallow-merges DEFAULT_VOICE_UX.
+  voiceUx?: VoiceUxSettings;
 }
 
 export interface AttentionItem {

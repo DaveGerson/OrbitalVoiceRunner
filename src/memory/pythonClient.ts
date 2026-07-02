@@ -64,6 +64,9 @@ interface InterpreterCandidate { cmd: string; baseArgs: string[]; }
 export interface PythonModuleClientOpts {
   moduleDir: string;
   repoRoot: string;
+  /** Which python/<moduleName>/__main__.py to spawn. Defaults to "synthesizer" (byte-identical to
+   *  the pre-generalization default path) — new daemons (e.g. "policies") pass this explicitly. */
+  moduleName?: string;
   timeoutMs?: number;            // (unused by the client itself; the race lives in synthesizeAsync)
   requestExpiryMs?: number;      // internal pending-entry hard expiry (default 2000) — prevents id leaks
   pingTimeoutMs?: number;        // per-spawn handshake deadline; a miss advances to the next candidate (default 1500)
@@ -95,21 +98,23 @@ export function discoverPythonInterpreter(env: NodeJS.ProcessEnv, platform: stri
   return [{ cmd: "python3", baseArgs: [] }, { cmd: "python", baseArgs: [] }];
 }
 
-/** First-exists of [override, moduleDir/python, repoRoot/python] that contains synthesizer/__main__.py. */
+/** First-exists of [override, moduleDir/python, repoRoot/python] that contains
+ *  <moduleName>/__main__.py (moduleName defaults to "synthesizer" — byte-identical default path). */
 export function resolveSynthDir(
-  opts: { override?: string; moduleDir: string; repoRoot: string },
+  opts: { override?: string; moduleDir: string; repoRoot: string; moduleName?: string },
   existsSync: (p: string) => boolean,
 ): string | null {
   // Normalize to forward slashes so existsSync predicates (and tests) can use '/' consistently
   // on both POSIX and Windows without callers needing to know the platform separator.
   const norm = (p: string) => p.replace(/\\/g, "/");
+  const moduleName = opts.moduleName ?? "synthesizer";
   const candidates = [
     opts.override,
     norm(nodePath.join(opts.moduleDir, "python")),
     norm(nodePath.join(opts.repoRoot, "python")),
   ].filter(Boolean) as string[];
   for (const dir of candidates) {
-    if (existsSync(norm(nodePath.join(dir, "synthesizer", "__main__.py")))) return dir;
+    if (existsSync(norm(nodePath.join(dir, moduleName, "__main__.py")))) return dir;
     if (opts.override && dir === opts.override && existsSync(dir)) return dir; // override may already be a leaf
   }
   return null;
@@ -168,12 +173,13 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
     backoffBaseMs, backoffMaxMs, breakerThreshold, breakerWindowMs, cooldownMs,
   } = resolveOpts(opts);
   const onStateChange = opts.onStateChange; // Inc 2 task 2.2: observability transition callback (optional)
+  const moduleName = opts.moduleName ?? "synthesizer";
   let consecutiveFails = 0;
   let firstFailAt = 0;
   let breakerUntil = 0;          // epoch ms; 0 = breaker closed
 
   const synthDir = resolveSynthDir(
-    { override: opts.synthDirOverride ?? env.JANUS_PYTHON_SYNTH_DIR, moduleDir: opts.moduleDir, repoRoot: opts.repoRoot },
+    { override: opts.synthDirOverride ?? env.JANUS_PYTHON_SYNTH_DIR, moduleDir: opts.moduleDir, repoRoot: opts.repoRoot, moduleName },
     existsSync,
   );
   const cands = discoverPythonInterpreter(env, platform);
@@ -299,7 +305,7 @@ export function createPythonModuleClient(opts: PythonModuleClientOpts): PythonMo
 
   /** Spawn the candidate's child; on a thrown spawn, tear down and return null. */
   function trySpawnChild(c: InterpreterCandidate): any {
-    const script = nodePath.join(synthDir!, "synthesizer", "__main__.py");
+    const script = nodePath.join(synthDir!, moduleName, "__main__.py");
     const args = [...c.baseArgs, "-X", "utf8", "-u", script];
     try {
       return spawnImpl(c.cmd, args, {

@@ -384,6 +384,16 @@ describe("REG1 voice-tool dispatch goldens (no-behavior-change oracle)", () => {
     assertGolden("get_attention_digest");
   });
 
+  // ── voice-UX wave 3: get_status_summary (SITREP), empty-world case ────────────
+  // MUST run before any propose_command/deliver_handoff test stages a pending approval or
+  // attention item (same ordering constraint as list_pending_approvals/get_attention_digest above),
+  // so the SITREP composer genuinely sees an empty world.
+  it("get_status_summary (empty world)", async () => {
+    clearPanes();
+    await captureTool("get_status_summary", "get_status_summary");
+    assertGolden("get_status_summary");
+  });
+
   // ── Capability-matrix reads (UNGATED) ─────────────────────────────────────────
   it("list_capabilities", async () => {
     await captureTool("list_capabilities", "list_capabilities");
@@ -671,6 +681,27 @@ describe("REG1 voice-tool dispatch goldens (no-behavior-change oracle)", () => {
     assertGolden("propose_command.Off");
     clearActivePane();
     dropLedgerPane("gold-off");
+  });
+
+  // ── voice-UX wave 3: focus_pane (exact match + no-match) ──────────────────────
+  it("focus_pane (exact match)", async () => {
+    clearPanes();
+    addPane("gold-focus-exact");
+    registerLedgerPane("gold-focus-exact");
+    await captureTool("focus_pane.exact", "focus_pane", { reference: "gold-focus-exact" });
+    assertGolden("focus_pane.exact");
+    clearActivePane();
+    dropLedgerPane("gold-focus-exact");
+  });
+
+  it("focus_pane (no match — reference overlaps no pane name)", async () => {
+    // NOTE: clearPanes() only clears live `manager.terminals`; the ledger accumulates registered
+    // panes across this whole suite (dropLedgerPane is a best-effort no-op on the SQLite backend —
+    // see its comment above), so candidates here are whatever ledger panes prior tests left behind.
+    // That is still deterministic (fixed test order), just not a literally-zero candidate set.
+    clearPanes();
+    await captureTool("focus_pane.none", "focus_pane", { reference: "nonexistent pane xyz" });
+    assertGolden("focus_pane.none");
   });
 
   // ── deliver_handoff: the pending / HiTL path ──────────────────────────────────

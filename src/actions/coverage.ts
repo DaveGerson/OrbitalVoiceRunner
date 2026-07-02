@@ -205,6 +205,14 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // panes/:id/stop route + the UI Exit button — both call manager.stopAndArchivePane — so a separate
   // close_pane REST registry twin would be a redundant affordance (same reasoning as promote_pane_mode). ─
   close_pane: new Set<Surface>(["voice"]),
+
+  // ── voice-UX wave 3: voice-only by design ─────────────────────────────────────────────────────
+  // get_status_summary is a SESSION-scoped read (same 7ep rationale as get_attention_digest/
+  // list_pending_approvals — a REST twin would be vacuous on the session:null REST path).
+  get_status_summary: new Set<Surface>(["voice"]),
+  // focus_pane is conversational (spoken-reference) focus; the UI/REST path for the same intent is
+  // the existing set_active_pane WS frame, not a registry twin. No REST/WS twin is planned.
+  focus_pane: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
