@@ -383,10 +383,27 @@ describe("resultToHttp — ActionResult -> HTTP mapping", () => {
     assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "m1" });
   });
 
-  it("error -> 500 { error }", () => {
+  it("error (no cause / handler / timeout) -> 500 { error }", () => {
     const { res, sent } = makeFakeRes();
     resultToHttp({ kind: "error", message: "boom" }, res);
     assert.strictEqual(sent.status, 500);
     assert.deepStrictEqual(sent.json, { error: "boom" });
+
+    const { res: res2, sent: sent2 } = makeFakeRes();
+    resultToHttp({ kind: "error", message: "boom", cause: "handler" }, res2);
+    assert.strictEqual(sent2.status, 500);
+
+    const { res: res3, sent: sent3 } = makeFakeRes();
+    resultToHttp({ kind: "error", message: "boom", cause: "timeout" }, res3);
+    assert.strictEqual(sent3.status, 500);
+  });
+
+  // wsm-e2e-pinned-f9ne: a validation-caused error (bad action name / zod arg reject) is a client
+  // fault -> 400, distinct from the handler/timeout server-fault 500 above.
+  it("error (cause:'validation') -> 400 { error }", () => {
+    const { res, sent } = makeFakeRes();
+    resultToHttp({ kind: "error", message: "unknown action foo", cause: "validation" }, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "unknown action foo" });
   });
 });

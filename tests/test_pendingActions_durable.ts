@@ -194,7 +194,9 @@ test("durable e2e: remove_watch_rule rebuilds + splices the bound rule across a 
   assert.strictEqual(r.reason, "confirmed");
   assert.deepStrictEqual(watchRules.map((rr) => rr.id), ["rule_a", "rule_c"], "the bound rule is spliced across the reopen");
   assert.strictEqual(savedForce, true, "force-persist fired");
-  assert.ok(broadcasts.some((b) => b.type === "watch_rules_updated"), "repaint broadcast fired");
+  // wsm-e2e-pinned-33c.4: watch_rules_updated is PRUNED (no client consumes it) — the persist above
+  // is the durable effect this test pins; no repaint broadcast fires anymore.
+  assert.ok(!broadcasts.some((b) => b.type === "watch_rules_updated"), "watch_rules_updated broadcast is PRUNED");
   assert.strictEqual(r.output, "Watch rule rule_b removed.");
   store2.close();
 });

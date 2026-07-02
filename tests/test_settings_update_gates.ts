@@ -15,8 +15,16 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 import { DEFAULT_CAPABILITY_GATES } from "../src/types";
 import { resolveCapabilityGateWithContext } from "../src/pendingApprovals";
+
+// SQLite is the only ledger backend (dbt3) — an in-memory store is the lightweight fixture here.
+function newManager(): OrchestratorManager {
+  const store = new JanusStore(":memory:");
+  store.init();
+  return new OrchestratorManager({ ledger: store });
+}
 
 let tmpDir: string;
 let prevSettingsPath: string | undefined;
@@ -45,7 +53,7 @@ describe("2S.1 — partial settings PUT cannot open the safety gates", () => {
   });
 
   it("updateSettings with a PARTIAL capabilityGates map keeps every unmentioned default (no fail-open)", () => {
-    const m = new OrchestratorManager();
+    const m = newManager();
     // Sanity: the fresh default matrix has the sharp edges gated Ask.
     assert.strictEqual(m.settings.advanced.capabilityGates?.delete_project, "Ask");
 
@@ -70,7 +78,7 @@ describe("2S.1 — partial settings PUT cannot open the safety gates", () => {
   });
 
   it("an advanced update that carries NO capabilityGates leaves the existing matrix untouched", () => {
-    const m = new OrchestratorManager();
+    const m = newManager();
     m.updateSettings({ advanced: { capabilityGates: { write_to_pane: "Off" } } as any });
     m.updateSettings({ advanced: { maxBufferLines: 1234 } as any });
     const gates = m.settings.advanced.capabilityGates!;

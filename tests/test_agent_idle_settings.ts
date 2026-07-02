@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 
 /**
  * Conservative Phase 2 settings plumbing: the low-risk agent idle-timing safeguard
@@ -10,9 +11,17 @@ import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
  * propagation pattern (terminal.ts updateSettings).
  */
 
+// SQLite is the only ledger backend (dbt3) — an in-memory store is the lightweight fixture
+// these settings-plumbing tests need; none of them touch the ledger's persisted content.
+function newManager(): OrchestratorManager {
+  const store = new JanusStore(":memory:");
+  store.init();
+  return new OrchestratorManager({ ledger: store });
+}
+
 describe("agentIdleTimeoutMs settings plumbing (Conservative Phase 2)", () => {
   it("updateSettings({advanced:{agentIdleTimeoutMs}}) propagates to live terminals", () => {
-    const manager = new OrchestratorManager();
+    const manager = newManager();
     // Insert a terminal WITHOUT spawning a PTY (start() is what spawns; we never call it).
     const agent = new UniversalTerminal("agent1", ".", "claude", "Claude Code", "Human-in-the-Loop", "", "default_project");
     const shell = new UniversalTerminal("shell1", ".", "bash", "Custom", "Human-in-the-Loop", "", "default_project");
@@ -28,7 +37,7 @@ describe("agentIdleTimeoutMs settings plumbing (Conservative Phase 2)", () => {
   });
 
   it("updateSettings idleTimeoutMs and agentIdleTimeoutMs are independent (no cross-talk)", () => {
-    const manager = new OrchestratorManager();
+    const manager = newManager();
     const agent = new UniversalTerminal("agent2", ".", "claude", "Claude Code", "Human-in-the-Loop", "", "default_project");
     manager.terminals["agent2"] = agent;
 
@@ -43,7 +52,7 @@ describe("agentIdleTimeoutMs settings plumbing (Conservative Phase 2)", () => {
   });
 
   it("addTerminal applies settings.advanced.agentIdleTimeoutMs to a freshly created interactive_cli pane", async () => {
-    const manager = new OrchestratorManager();
+    const manager = newManager();
     manager.updateSettings({ advanced: { agentIdleTimeoutMs: 4800 } as any });
 
     // addTerminal spawns a PTY; tear it down after the assertion.

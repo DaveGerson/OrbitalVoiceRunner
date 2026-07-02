@@ -190,7 +190,9 @@ export function applyResultToHttp(
  *   pending  -> 202 { status:"pending_approval", messageId }
  *   clarify  -> 409 { clarify }
  *   blocked  -> 403 { error }
- *   error    -> 500 { error }
+ *   error    -> 400 { error }  when result.cause === "validation" (bad action name / bad args)
+ *            -> 500 { error }  otherwise (handler throw / deadline timeout / no cause — legacy
+ *                               handler-constructed errors default here, unchanged from prior behavior)
  */
 export function resultToHttp(result: ActionResult, res: RestResponse): void {
   switch (result.kind) {
@@ -207,7 +209,7 @@ export function resultToHttp(result: ActionResult, res: RestResponse): void {
       res.status(403).json({ error: result.reason });
       return;
     case "error":
-      res.status(500).json({ error: result.message });
+      res.status(result.cause === "validation" ? 400 : 500).json({ error: result.message });
       return;
   }
 }

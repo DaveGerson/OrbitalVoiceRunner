@@ -312,7 +312,9 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
     const prevCwd = process.cwd();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us12-"));
     process.chdir(dir);
-    const mgr = new OrchestratorManager();
+    const monitoringStore = new JanusStore(":memory:");
+    monitoringStore.init();
+    const mgr = new OrchestratorManager({ ledger: monitoringStore });
     let idleCount = 0;
     let sawRunning = false;
     let sawQuiescing = false;
@@ -385,7 +387,9 @@ describe("US-1.3 Status from summary not scrollback (P0)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us13-"));
     process.chdir(dir);
     try {
-      const mgr = new OrchestratorManager();
+      const summaryStore = new JanusStore(":memory:");
+      summaryStore.init();
+      const mgr = new OrchestratorManager({ ledger: summaryStore });
       const t: any = new UniversalTerminal("us13-A", ".", "npm run build", "Custom", "Read-Only");
       mgr.terminals["us13-A"] = t;
 

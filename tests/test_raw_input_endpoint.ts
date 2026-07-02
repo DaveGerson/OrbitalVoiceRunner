@@ -35,6 +35,10 @@ function spawnedPane(id: string): { term: UniversalTerminal; writes: string[] } 
   };
   const term = new UniversalTerminal(id, ".", "cmd");
   (term as any).transport = transport;
+  // wsm-e2e-pinned-ztd: writeRaw now buffers pre-spawn-ready bytes; this harness injects the
+  // transport directly (bypassing start()/markSpawnReady), so mark the pane already spawn-ready to
+  // model a real "live PTY" pane, matching what "un-spawned" (409, tested separately) is NOT.
+  (term as any).spawnReady = true;
   return { term, writes };
 }
 

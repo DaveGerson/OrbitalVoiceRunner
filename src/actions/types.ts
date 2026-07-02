@@ -68,7 +68,7 @@ export type ActionResult =
   | { kind: "pending"; messageId: string; summary: string; extra?: Record<string, unknown> } // HiTL / deferred
   | { kind: "clarify"; text: string }                                // re-route / disambiguate (e.g. non-allowlisted shell)
   | { kind: "blocked"; reason: string }                              // gate Off / forbidden
-  | { kind: "error"; message: string };                              // handler failure (still answered once)
+  | { kind: "error"; message: string; cause?: "validation" | "handler" | "timeout" }; // handler failure (still answered once); `cause` (wsm-e2e-pinned-f9ne) discriminates a client-fault (bad action name / bad args) from a server-fault (uncaught handler throw / deadline) so REST projections can pick 400 vs 500 — absent (legacy handler-constructed errors) defaults to a server-fault 500, unchanged from prior behavior.
 
 /**
  * One row of the per-action audit trail emitted by runAction (the audit() seam). The store stamps
@@ -327,13 +327,13 @@ export interface ActionContext {
    * the LIVE process (Claude live-signal / Codex+agy restart-resume), draining pending on a Full-Auto
    * promotion (§11). The server binds it to the real terminal + gateOrDefer + pending stores +
    * broadcast + ledger persist. OPTIONAL so test/REST contexts that don't wire it fall back to the
-   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the new `restart_pane`
-   * tool delegate here when present. `source` is the caller surface (audit only).
+   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the
+   * `promote_pane_mode` tool delegate here when present. `source` is the caller surface (audit only).
    */
   applyPaneMode?: (
     paneId: string,
     targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
-    source: "voice" | "ui" | "restart_pane",
+    source: "voice" | "ui" | "promote_pane_mode",
   ) => Promise<PaneModeResult>;
 
   // ── Gate inspection (server.ts:1711 — the resolver behind gateCapability/gateOrDefer) ─────────
@@ -364,8 +364,10 @@ export interface ActionContext {
   applyResolution: ApplyResolution;
 
   // ── Durable ledger (server.ts module `store`) ────────────────────────────────────────────────
-  /** The SQLite ledger backing handoffs + the audit trail. `null` under JANUS_LEDGER_BACKEND=legacy
-   *  (or store-init failure); the 8 handoff/gate tools degrade gracefully when null. */
+  /** The SQLite ledger backing handoffs + the audit trail. dbt3: SQLite is the only ledger backend,
+   *  so a real server boot always has one — this stays `| null` defensively (a store-init failure is
+   *  now a fatal boot error, but a hand-built test ActionContext may still pass store:null); the 8
+   *  handoff/gate tools degrade gracefully when null. */
   store: JanusStore | null;
 
   // ── Settings masking (server.ts:84) ─────────────────────────────────────────────────────────

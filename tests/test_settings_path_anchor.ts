@@ -22,6 +22,14 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
+
+// SQLite is the only ledger backend (dbt3) — an in-memory store is the lightweight fixture here.
+function newManager(): OrchestratorManager {
+  const store = new JanusStore(":memory:");
+  store.init();
+  return new OrchestratorManager({ ledger: store });
+}
 
 test("JANUS_SETTINGS_PATH override: resolved settings path is ABSOLUTE and independent of process.cwd()", () => {
   const anchorDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-anchor-"));
@@ -34,7 +42,7 @@ test("JANUS_SETTINGS_PATH override: resolved settings path is ABSOLUTE and indep
   process.env.JANUS_SETTINGS_PATH = anchorFile;
   process.chdir(cwdDir);
   try {
-    const m = new OrchestratorManager();
+    const m = newManager();
     const resolved = m.getSettingsFilePath();
     // ABSOLUTE — never a bare cwd-relative ".janus_settings.json".
     assert.ok(path.isAbsolute(resolved), `resolved settings path must be absolute, got: ${resolved}`);
@@ -64,7 +72,7 @@ test("backward-compat: with JANUS_SETTINGS_PATH UNSET, settings still land at th
   delete process.env.JANUS_SETTINGS_PATH;
   process.chdir(cwdDir);
   try {
-    const m = new OrchestratorManager();
+    const m = newManager();
     const resolved = m.getSettingsFilePath();
     // The existing on-disk contract: a server from the repo root finds/writes the
     // cwd-relative file (this is what the secrets-at-rest suite relies on).

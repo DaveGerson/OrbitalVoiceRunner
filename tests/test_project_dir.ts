@@ -53,6 +53,14 @@ describe("G5 — resolveProjectDir / isBadProjectDir", () => {
 });
 
 import { OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
+
+// SQLite is the only ledger backend (dbt3) — an in-memory store is the lightweight fixture here.
+function newManager(): OrchestratorManager {
+  const store = new JanusStore(":memory:");
+  store.init();
+  return new OrchestratorManager({ ledger: store });
+}
 
 describe("G5 — create_project never persists a bad dir (handler contract)", () => {
   const BOGUS = path.join(os.tmpdir(), "janus_g5_handler_absent_" + Date.now());
@@ -67,14 +75,14 @@ describe("G5 — create_project never persists a bad dir (handler contract)", ()
   }
 
   it("rejects a bad dir on the voice/REST contract — nothing is stored", () => {
-    const mgr = new OrchestratorManager();
+    const mgr = newManager();
     const ok = simulateCreateProject(mgr, "proj_bad", BOGUS);
     assert.strictEqual(ok, false);
     assert.strictEqual(mgr.ledger.getProject("proj_bad"), null);
   });
 
   it("stores the RESOLVED (not raw) dir for a blank/'.' create", () => {
-    const mgr = new OrchestratorManager();
+    const mgr = newManager();
     simulateCreateProject(mgr, "proj_dot", ".");
     const ws = mgr.ledger.getProject("proj_dot");
     assert.ok(ws);

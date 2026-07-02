@@ -15,8 +15,11 @@
 // list_watch_rules toHttp array. No server boot, no PTY.
 //
 // TARGET CONTRACTS (the spec §Batch G asserts):
-//   - list_watch_rules body === the legacy raw WatchRule[] array (setWatchRules() consumes it on load).
-//   - add_watch_rule / remove_watch_rule REPAINT via a {type:'watch_rules_updated'} broadcast.
+//   - list_watch_rules body === the legacy raw WatchRule[] array (GET /api/watch-rules on load).
+//   - add_watch_rule / remove_watch_rule persist (push/splice + force-save); wsm-e2e-pinned-33c.4:
+//     the {type:'watch_rules_updated'} repaint broadcast they used to also fire is PRUNED — no client
+//     has consumed that frame since the classic UI's Alerts/Orchestrate tabs were removed (d858e5e),
+//     and Kitchen has no watch-rule surface at all.
 //   - delete_orchestrator_plan removes from the board via {type:'plans_updated'}.
 //   - writes return {output} (200) — the client only needs res.ok.
 //   - unknown-id remove/delete -> 200 ok-narration (the inline 404 -> 200 Decision-2 collapse).
@@ -184,9 +187,9 @@ describe("c55 list_watch_rules", () => {
   });
 });
 
-// ── add_watch_rule — push + save + watch_rules_updated; {output} 200 ─────────────────────────────────
+// ── add_watch_rule — push + save; {output} 200 (wsm-e2e-pinned-33c.4: no watch_rules_updated broadcast) ──
 describe("c55 add_watch_rule", () => {
-  it("creates a rule (push + persist), repaints via watch_rules_updated; ok -> 200 {output}", async () => {
+  it("creates a rule (push + persist), no watch_rules_updated broadcast (no client consumes it); ok -> 200 {output}", async () => {
     const { ctx, rec, watchRules } = makeCtx({ watchRules: [] });
     const result = await runAction(REGISTRY, "add_watch_rule", sampleRuleBody(), ctx);
     assert.strictEqual(result.kind, "ok");
@@ -205,10 +208,10 @@ describe("c55 add_watch_rule", () => {
     // Persisted via the force-save (inline ledger["save"](true)).
     assert.deepStrictEqual(rec.saves, [true], "persisted with a force-save");
 
-    // Repaint contract: a watch_rules_updated broadcast carrying the CURRENT list.
+    // wsm-e2e-pinned-33c.4: the watch_rules_updated broadcast is PRUNED (no client consumes it) —
+    // the force-save above is the durable effect this suite now pins.
     const frame = rec.broadcasts.find((b) => b.type === "watch_rules_updated");
-    assert.ok(frame, "must broadcast watch_rules_updated so the UI repaints");
-    assert.deepStrictEqual(frame!.watchRules, watchRules, "broadcast carries the current watchRules list");
+    assert.ok(!frame, "watch_rules_updated broadcast is PRUNED");
 
     // Wire contract: writes are {output} 200 (the client only needs res.ok).
     const { res, sent } = makeFakeRes();
@@ -236,18 +239,19 @@ describe("c55 add_watch_rule", () => {
   });
 });
 
-// ── remove_watch_rule — splice by :id + save + watch_rules_updated; unknown id -> 200 ok (404->200) ───
+// ── remove_watch_rule — splice by :id + save; unknown id -> 200 ok (404->200) (wsm-e2e-pinned-33c.4: no watch_rules_updated broadcast) ──
 describe("c55 remove_watch_rule", () => {
-  it("removes the matching rule (splice + persist), repaints via watch_rules_updated; ok -> 200", async () => {
+  it("removes the matching rule (splice + persist), no watch_rules_updated broadcast (no client consumes it); ok -> 200", async () => {
     const { ctx, rec, watchRules } = makeCtx({ watchRules: [sampleWatchRule("keep_1"), sampleWatchRule("drop_2"), sampleWatchRule("keep_3")] });
     const result = await runAction(REGISTRY, "remove_watch_rule", { id: "drop_2" }, ctx);
     assert.strictEqual(result.kind, "ok");
 
     assert.deepStrictEqual(watchRules.map((r) => r.id), ["keep_1", "keep_3"], "only the matching rule removed");
     assert.deepStrictEqual(rec.saves, [true], "persisted with a force-save");
+    // wsm-e2e-pinned-33c.4: the watch_rules_updated broadcast is PRUNED (no client consumes it) —
+    // the force-save above is the durable effect this suite now pins.
     const frame = rec.broadcasts.find((b) => b.type === "watch_rules_updated");
-    assert.ok(frame, "must broadcast watch_rules_updated");
-    assert.deepStrictEqual(frame!.watchRules, watchRules, "broadcast carries the post-removal list");
+    assert.ok(!frame, "watch_rules_updated broadcast is PRUNED");
 
     const { res, sent } = makeFakeRes();
     resultToHttp(result, res);

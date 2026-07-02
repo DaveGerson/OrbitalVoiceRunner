@@ -97,7 +97,11 @@ test("3P.1: OLD transport's late exit does not mark the NEW spawn Exited / clear
     current = stub2;
     term.start();
     term.writeInput("echo new-gen");
-    assert.deepStrictEqual((term as any).pendingInput, ["echo new-gen"], "pre-ready input queued on the new spawn");
+    assert.deepStrictEqual(
+      (term as any).pendingInput,
+      [{ kind: "submit", command: "echo new-gen" }],
+      "pre-ready input queued on the new spawn",
+    );
     assert.ok((term as any).readyFallbackTimer, "new spawn's readiness fallback is armed");
     assert.ok((term as any).probeTimer, "new spawn's probe interval is armed");
 
@@ -108,7 +112,7 @@ test("3P.1: OLD transport's late exit does not mark the NEW spawn Exited / clear
     assert.ok((term as any).probeTimer, "stale exit must NOT clear the new spawn's probe timer");
     assert.ok((term as any).readyFallbackTimer, "stale exit must NOT clear the new spawn's readiness fallback");
     assert.deepStrictEqual(
-      (term as any).pendingInput, ["echo new-gen"],
+      (term as any).pendingInput, [{ kind: "submit", command: "echo new-gen" }],
       "stale exit must NOT strand/clear the new spawn's queued input",
     );
 
@@ -186,7 +190,11 @@ test("3P.4: input queued for a pane that died pre-ready is dropped, not replayed
   try {
     term.start();
     term.writeInput("echo doomed"); // queued pre-ready
-    assert.deepStrictEqual((term as any).pendingInput, ["echo doomed"], "input queued while not ready");
+    assert.deepStrictEqual(
+      (term as any).pendingInput,
+      [{ kind: "submit", command: "echo doomed" }],
+      "input queued while not ready",
+    );
 
     // The child dies BEFORE ever becoming ready (becomeReady never fires).
     current.emitExit();
@@ -224,7 +232,7 @@ test("3P.4 carve-out: pre-start input still survives the first start() and flush
     term.writeInput("echo BEFORE"); // pre-start: no transport yet
     term.start();
     assert.deepStrictEqual(
-      (term as any).pendingInput, ["echo BEFORE"],
+      (term as any).pendingInput, [{ kind: "submit", command: "echo BEFORE" }],
       "pre-start input survives start()'s reset (first-spawn carve-out)",
     );
     stub.becomeReady();

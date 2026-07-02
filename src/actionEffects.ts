@@ -37,6 +37,8 @@ import path from "path";
 import { actionSchemaHash } from "./actions/registry";
 import { findPaneOwningProject } from "./paneOwnership";
 import { getHistoryBridge } from "./historyBridge";
+import { respawnFromLedger } from "./actions/respawnFromLedger";
+import type { ActionContext } from "./actions/types";
 
 /**
  * Which staging site produced a create_pane intent. The three sites run the SAME side effects
@@ -75,7 +77,7 @@ export interface SetPanePermissionsParams { paneId: string; projectId: string; p
  * presence routes the rebuild to the applyPaneMode arm. No projectId is staged — the choke point
  * persists against the ACTIVE project (gating's persistMode), which the rebuild mirrors.
  */
-export interface ApplyPaneModeParams { paneId: string; permissionsMode: string; source: "voice" | "ui" | "restart_pane"; }
+export interface ApplyPaneModeParams { paneId: string; permissionsMode: string; source: "voice" | "ui" | "promote_pane_mode"; }
 /**
  * Params captured by the #27 update_metadata closures (amend_note / delete_note, server.ts:2511/2525).
  * `op` is the discriminator — both sites share capability "update_metadata" but call different ledger
@@ -124,6 +126,26 @@ export interface ClearHistoryParams { op: "clear"; paneId: string; }
  * the "already gone" narration, no broadcast.
  */
 export interface ArchivePaneParams { paneId: string; projectId: string; }
+/**
+ * wsm-e2e-pinned-j2e: params captured by the respawn_pane deferral (src/actions/defs/panes_rest.ts).
+ * The staged CAPABILITY is "restart_pane" (unchanged matrix row — see that file's header note on the
+ * respawn_pane/restart_pane name split), so that is the EFFECT_BUILDERS key below, even though the
+ * action itself is named respawn_pane. Only paneId is staged (mirrors ArchivePaneParams's minimal
+ * shape) — the rebuild re-resolves the owning project via findPaneOwningProject, the same canonical
+ * resolver the live handler uses, rather than trusting a persisted snapshot that could be stale.
+ */
+export interface RestartPaneReplayParams { paneId: string; }
+/**
+ * wsm-e2e-pinned-j2e: params captured by the delete_pane deferral (src/actions/defs/lifecycle_rest.ts).
+ * NOTE: the staging site does NOT widen the persisted bag with project_id (only paneId), so the
+ * rebuild resolves the owning project via findPaneOwningProject rather than trusting a stale caller id.
+ */
+export interface DeletePaneReplayParams { paneId: string; }
+/**
+ * wsm-e2e-pinned-j2e: params captured by the delete_project deferral (src/actions/defs/lifecycle_rest.ts).
+ */
+export interface DeleteProjectReplayParams { projectId: string; }
+
 /**
  * Params captured by the c55.10 remove_watch_rule closure (src/actions/defs/watch_rules.ts).
  * `ruleId` is the WIDENED payload (the staging bag formerly carried only { origin, versionStamp }, so a
@@ -406,15 +428,15 @@ function buildRemoveWatchRule(intent: ActionIntent, deps: ActionEffectDeps): () 
   // c55.16 tech_debt_buildactionrun: durable replay of the c55.10 gated rest-only cap. Mirrors
   // removeEffect (src/actions/defs/watch_rules.ts:187-195) BYTE-IDENTICALLY — re-find by id (the
   // idempotent guard: a rule deleted between stage and confirm is a no-op), splice, force-persist
-  // via ledger.save(true), broadcast watch_rules_updated with the CURRENT live array, return the
-  // EXACT confirm string. CRITICAL LOCKSTEP RULE (header §): keep in step with the def closure.
+  // via ledger.save(true), return the EXACT confirm string. CRITICAL LOCKSTEP RULE (header §): keep
+  // in step with the def closure. wsm-e2e-pinned-33c.4: the watch_rules_updated BROADCAST is pruned
+  // (no client consumes that frame post d858e5e) — the persist + confirm-string effect is unchanged.
   const p = intent.params as unknown as RemoveWatchRuleParams;
   return () => {
     const i = deps.manager.ledger.watchRules.findIndex((r: { id: string }) => r.id === p.ruleId);
     if (i !== -1) {
       deps.manager.ledger.watchRules.splice(i, 1);
       deps.manager.ledger["save"](true);
-      deps.broadcast({ type: "watch_rules_updated", watchRules: deps.manager.ledger.watchRules });
     }
     return `Watch rule ${p.ruleId} removed.`;  // EXACT — matches watch_rules.ts:194
   };
@@ -502,6 +524,107 @@ function buildArchivePane(intent: ActionIntent, deps: ActionEffectDeps): () => s
   };
 }
 
+// ── wsm-e2e-pinned-j2e: durable replay for the gated deletes + the respawn ("restart_pane") gate ──
+// buildActionRun previously had NO case for delete_pane / delete_project / restart_pane, so a
+// deferred (Ask) confirm of any of the three AFTER a process restart degraded to the safe "unknown
+// capability" no-op narration instead of running the real effect (fail-safe but wrong — the operator
+// is told the pane/project was deleted or restarted, but it wasn't). These three mirror their
+// staging-site closures (lifecycle_rest.ts / panes_rest.ts) BYTE-IDENTICALLY.
+
+function buildRespawnPane(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // Mirrors respawnPane's restartEffect (panes_rest.ts) for the two branches reachable on replay:
+  //  - a LIVE terminal already present in this (fresh) manager: the SAME ordered stop()-then-start()
+  //    with the SAME two kdtu 86-during-restart guards (ownership + archivingPanes), so a replay can
+  //    never respawn a ghost PTY for a pane an interleaved archive already took off the board.
+  //  - a ledger-only pane: respawnFromLedger, the SAME shared spawn closure respawn_pane/restore both
+  //    use — reused here (not re-derived) so the launch-command/cwd/addTerminal logic can never drift.
+  // Neither present (deleted between stage and confirm) -> idempotent "not found" narration, no-op.
+  const p = intent.params as unknown as RestartPaneReplayParams;
+  return () => {
+    const id = p.paneId;
+    const term = deps.manager.terminals[id];
+    const owner = findPaneOwningProject(deps.manager, id);
+    if (!term && !owner) return `Terminal ${id} not found.`;
+    if (term) {
+      void (async () => {
+        await term.stop();
+        // Same synchronous-tick guard as the live handler (kdtu): no await between the checks and
+        // term.start() re-opens the 86-during-restart window.
+        if (deps.manager.terminals[id] !== term || deps.manager.archivingPanes?.has(id)) return;
+        term.start();
+        deps.broadcastLedgerUpdate();
+        deps.broadcast({ type: "terminals_updated" });
+      })().catch((e: unknown) => console.error(`[restart_pane replay] deferred restart failed for ${id}:`, e));
+      return `Terminal ${id} restarted.`;
+    }
+    // respawnFromLedger only touches ctx.manager / ctx.broadcastLedgerUpdate / ctx.broadcastTerminalsUpdated
+    // — the minimal ActionContext slice this replay deps bag can satisfy.
+    const replayCtx = {
+      manager: deps.manager,
+      broadcastLedgerUpdate: deps.broadcastLedgerUpdate,
+      broadcastTerminalsUpdated: () => deps.broadcast({ type: "terminals_updated" }),
+    } as unknown as ActionContext;
+    return respawnFromLedger(replayCtx, id, owner!.pane, owner!.projectId, `Terminal ${id} restored and started.`);
+  };
+}
+
+function buildDeletePane(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // Mirrors lifecycle_rest.ts deleteEffect BYTE-IDENTICALLY: stop() + drop the live terminal slot,
+  // splice the ledger row, persist, broadcast, EXACT confirm string. The owning project is resolved
+  // via findPaneOwningProject (see DeletePaneReplayParams — project_id is never staged). Idempotent:
+  // a pane already gone by replay time (both the live slot and the ledger row absent) is a no-op
+  // "not found" narration, mirroring the def's own pre-gate existence check.
+  const p = intent.params as unknown as DeletePaneReplayParams;
+  return () => {
+    const id = p.paneId;
+    const owner = findPaneOwningProject(deps.manager, id);
+    if (!deps.manager.terminals[id] && !owner) return `Pane ${id} not found.`;
+    const term = deps.manager.terminals[id];
+    if (term) { term.stop(); delete deps.manager.terminals[id]; }
+    // wsm-e2e-pinned major-finding fix: a snapshot mutation (`delete ws.panes[id]`) is a silent
+    // no-op against JanusStore — `deletePane` issues the real durable row DELETE, mirroring
+    // lifecycle_rest.ts's live handler byte-identically (lockstep rule), `save()` included.
+    if (owner) {
+      deps.manager.ledger.deletePane(owner.projectId, id);
+      deps.manager.ledger["save"]();
+    }
+    deps.broadcastLedgerUpdate();
+    deps.broadcast({ type: "terminals_updated" });
+    return `Pane ${id} deleted.`;  // EXACT — matches lifecycle_rest.ts delete_pane
+  };
+}
+
+function buildDeleteProject(intent: ActionIntent, deps: ActionEffectDeps): () => string {
+  // Mirrors lifecycle_rest.ts deleteEffect BYTE-IDENTICALLY: delete the workspace row, re-point the
+  // active project (create a fallback default_project if none remain) when the deleted one WAS
+  // active, persist, broadcast, EXACT confirm string. Idempotent guard added for the cross-restart
+  // gap (the def's own existence check only covers stage time): a project already gone by replay
+  // time is a no-op "not found" narration, no broadcast.
+  const p = intent.params as unknown as DeleteProjectReplayParams;
+  return () => {
+    const id = p.projectId;
+    if (!deps.manager.ledger.workspaces[id]) return `Project ${id} not found.`;
+    // wsm-e2e-pinned major-finding fix: a snapshot mutation (`delete workspaces[id]`) is a silent
+    // no-op against JanusStore — `deleteProject` issues the real durable row DELETE (panes cascade),
+    // mirroring lifecycle_rest.ts's live handler byte-identically (lockstep rule).
+    deps.manager.ledger.deleteProject(id);
+    const remainingIds = Object.keys(deps.manager.ledger.workspaces);
+    if (deps.manager.ledger.activeProjectId === id) {
+      const nextId = remainingIds[0] || "default_project";
+      if (!deps.manager.ledger.workspaces[nextId]) {
+        deps.manager.ledger.addProject(nextId, process.cwd(), "Default workspace");
+      }
+      deps.manager.ledger.switchContext(nextId);
+      deps.manager.settings.projects.activeContext = nextId;
+      deps.manager.settings.projects.localWorkspacePath = deps.manager.ledger.workspaces[nextId]?.directory || process.cwd();
+      deps.manager.saveSettings();
+    }
+    deps.manager.ledger["save"]();
+    deps.broadcastLedgerUpdate();
+    return `Project ${id} deleted.`;  // EXACT — matches lifecycle_rest.ts delete_project
+  };
+}
+
 // The capability ⇄ builder dispatch table. A Map (not a string-keyed plain object) so a rehydrated
 // capability string can never collide with an Object.prototype member name (the prototype-leak class
 // that bit terminal.ts normalizePreset / the gating resolver). An unknown capability returns the
@@ -521,6 +644,11 @@ const EFFECT_BUILDERS = new Map<string, EffectBuilder>([
   ["create_project", buildCreateProject],
   ["clear_history", buildClearHistory],
   ["archive_pane", buildArchivePane],
+  // wsm-e2e-pinned-j2e: the capability key is "restart_pane" (the matrix row), NOT the action name
+  // "respawn_pane" — see RestartPaneReplayParams / panes_rest.ts's header note on the name split.
+  ["restart_pane", buildRespawnPane],
+  ["delete_pane", buildDeletePane],
+  ["delete_project", buildDeleteProject],
 ]);
 
 /**

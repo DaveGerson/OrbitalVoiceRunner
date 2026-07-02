@@ -352,12 +352,18 @@ describe("c55.15 — approve_pending_command status matrix", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // (d) wsm-e2e-pinned-wqk — malformed-body parity. approved is required boolean (ApproveParams);
 // a malformed body fails zod validation BEFORE the handler runs, so runAction returns a top-level
-// {kind:'error', message}. The def-local toHttp must special-case that as 400 — NOT fold it into the
-// def's own not_found/[] default (which used to yield a spurious 404 for approve/confirm/cancel, or a
-// silent 200 [] for the two GET reads). applyResolution must never be called on this path (no
-// silent-reject side effect on bad input), and the well-formed matrix above stays byte-identical.
+// {kind:'error', message, cause:'validation'}. The def-local toHttp must special-case that (via
+// errorToHttp) — NOT fold it into the def's own not_found/[] default (which used to yield a spurious
+// 404 for approve/confirm/cancel, or a silent 200 [] for the two GET reads). applyResolution must
+// never be called on this path (no silent-reject side effect on bad input), and the well-formed
+// matrix above stays byte-identical.
+//
+// wsm-e2e-pinned-f9ne — cause discriminator: runAction now stamps kind:'error' with
+// cause:'validation'|'handler'|'timeout' at its four construction sites, so a client-fault (bad args /
+// unknown action) maps to 400 while a server-fault (uncaught handler throw / deadline timeout, or a
+// legacy handler-constructed error with no cause) maps to 500 — no longer folded into the same 400.
 // ─────────────────────────────────────────────────────────────────────────────
-describe("c55.15 — wsm-e2e-pinned-wqk: kind:'error' -> 400, not folded into 404/[]", () => {
+describe("c55.15 — wsm-e2e-pinned-wqk / wsm-e2e-pinned-f9ne: kind:'error' -> 400 (validation) or 500 (handler/timeout), not folded into 404/[]", () => {
   it("approve_pending_command: approved missing -> 400 {error}; applyResolution NOT called (no silent reject)", async () => {
     const { ctx, rec } = makeApprovalsCtx({ approvalsHas: () => true });
     const args = { messageId: "m1" }; // 'approved' missing -> fails ApproveParams (z.boolean())
@@ -393,31 +399,66 @@ describe("c55.15 — wsm-e2e-pinned-wqk: kind:'error' -> 400, not folded into 40
     assert.deepStrictEqual(sent.json, { success: true });
   });
 
-  it("confirm_pending_action: a top-level kind:'error' result maps to 400, not 404", async () => {
+  it("confirm_pending_action: a top-level kind:'error' with cause:'validation' maps to 400, not 404", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("confirm_pending_action"), { kind: "error", message: "boom", cause: "validation" }, { id: "a1" }, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("confirm_pending_action: a top-level kind:'error' with cause:'handler' maps to 500, not 404", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("confirm_pending_action"), { kind: "error", message: "boom", cause: "handler" }, { id: "a1" }, res);
+    assert.strictEqual(sent.status, 500);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("confirm_pending_action: a top-level kind:'error' with NO cause (legacy shape) defaults to 500, not 400", async () => {
     const { res, sent } = makeFakeRes();
     applyResultToHttp(findDef("confirm_pending_action"), { kind: "error", message: "boom" }, { id: "a1" }, res);
-    assert.strictEqual(sent.status, 400);
+    assert.strictEqual(sent.status, 500);
     assert.deepStrictEqual(sent.json, { error: "boom" });
   });
 
-  it("cancel_pending_action: a top-level kind:'error' result maps to 400, not 404", async () => {
+  it("cancel_pending_action: a top-level kind:'error' with cause:'validation' maps to 400, not 404", async () => {
     const { res, sent } = makeFakeRes();
-    applyResultToHttp(findDef("cancel_pending_action"), { kind: "error", message: "boom" }, { id: "a1" }, res);
+    applyResultToHttp(findDef("cancel_pending_action"), { kind: "error", message: "boom", cause: "validation" }, { id: "a1" }, res);
     assert.strictEqual(sent.status, 400);
     assert.deepStrictEqual(sent.json, { error: "boom" });
   });
 
-  it("list_pending_commands: a top-level kind:'error' result maps to 400, not a silent 200 []", async () => {
+  it("cancel_pending_action: a top-level kind:'error' with cause:'timeout' maps to 500, not 404", async () => {
     const { res, sent } = makeFakeRes();
-    applyResultToHttp(findDef("list_pending_commands"), { kind: "error", message: "boom" }, {}, res);
+    applyResultToHttp(findDef("cancel_pending_action"), { kind: "error", message: "boom", cause: "timeout" }, { id: "a1" }, res);
+    assert.strictEqual(sent.status, 500);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("list_pending_commands: a top-level kind:'error' with cause:'validation' maps to 400, not a silent 200 []", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_commands"), { kind: "error", message: "boom", cause: "validation" }, {}, res);
     assert.strictEqual(sent.status, 400);
     assert.deepStrictEqual(sent.json, { error: "boom" });
   });
 
-  it("list_pending_actions: a top-level kind:'error' result maps to 400, not a silent 200 []", async () => {
+  it("list_pending_commands: a top-level kind:'error' with cause:'handler' maps to 500, not a silent 200 []", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_commands"), { kind: "error", message: "boom", cause: "handler" }, {}, res);
+    assert.strictEqual(sent.status, 500);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("list_pending_actions: a top-level kind:'error' with cause:'validation' maps to 400, not a silent 200 []", async () => {
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_actions"), { kind: "error", message: "boom", cause: "validation" }, {}, res);
+    assert.strictEqual(sent.status, 400);
+    assert.deepStrictEqual(sent.json, { error: "boom" });
+  });
+
+  it("list_pending_actions: a top-level kind:'error' with NO cause (legacy shape) defaults to 500, not a silent 200 []", async () => {
     const { res, sent } = makeFakeRes();
     applyResultToHttp(findDef("list_pending_actions"), { kind: "error", message: "boom" }, {}, res);
-    assert.strictEqual(sent.status, 400);
+    assert.strictEqual(sent.status, 500);
     assert.deepStrictEqual(sent.json, { error: "boom" });
   });
 });

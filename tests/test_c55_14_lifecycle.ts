@@ -101,6 +101,21 @@ function makeCtx(opts: CtxOpts = {}): { ctx: ActionContext; rec: Recorded; manag
       addProject: (...a: unknown[]): void => { rec.addProjectCalls.push(a); },
       switchContext: (id: string): void => { rec.switchContextCalls.push(id); manager.ledger.activeProjectId = id; },
       save: (immediate?: boolean): void => { rec.saves.push(!!immediate); },
+      // wsm-e2e-pinned major-finding fix: the REAL durable delete_pane/delete_project effect (mirrors
+      // JanusStore.deletePane/deleteProject — a hard row delete, truthy-on-success). Mutates the SAME
+      // `workspaces` object this fake's `getProject`/assertions read, so the deletion is observable
+      // exactly like a real SQL DELETE would be (unlike the retired snapshot-mutation idiom).
+      deletePane: (projectId: string, paneId: string): boolean => {
+        const ws = workspaces[projectId];
+        if (!ws || !ws.panes[paneId]) return false;
+        delete ws.panes[paneId];
+        return true;
+      },
+      deleteProject: (id: string): boolean => {
+        if (!workspaces[id]) return false;
+        delete workspaces[id];
+        return true;
+      },
     },
   };
   const ctx = {

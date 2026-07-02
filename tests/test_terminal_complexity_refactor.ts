@@ -38,7 +38,6 @@ import {
   UniversalTerminal,
   OrchestratorManager,
 } from "../src/terminal";
-import { Ledger } from "../src/ledger";
 import { JanusStore } from "../src/store/sqliteStore";
 import type { PtyTransport, createPtyTransport } from "../src/ptyTransport";
 
@@ -304,30 +303,33 @@ describe("Phase 7b — OrchestratorManager constructor + addTerminal + updateSet
   }
 
   it("constructor boots restored panes INERT (alive=false, is_busy=false, Exited)", () => {
-    // Uses the legacy JSON Ledger (live-reference backend the boot reconcile loop targets).
-    // Isolate cwd so the Ledger's JSON file lands in a throwaway dir.
+    // Isolate cwd so the manager's settings-file read/write (unrelated to the ledger backend)
+    // lands in a throwaway dir.
     const prev = process.cwd();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "p7b-inert-boot-"));
     process.chdir(tmp);
+    let store: JanusStore | null = null;
     try {
-      const ledger = new Ledger();
+      store = new JanusStore(":memory:");
+      store.init();
       const proj = "default_project";
-      ledger.addProject(proj, tmp, "ws");
-      ledger.switchContext(proj);
+      store.addProject(proj, tmp, "ws");
+      store.switchContext(proj);
       // Stage a pane that LOOKS alive/busy before boot.
-      ledger.updatePane(proj, {
+      store.updatePane(proj, {
         pane_id: "p-alive", name: "p-alive", runtime_type: "interactive_cli",
         tool_preset: "Claude Code", permissions_mode: "Human-in-the-Loop", session_id: "",
         last_known_state: "Running active command", is_busy: true, alive: true, context_size: 0,
         last_command: "", elapsed_ms: 0,
       } as any, true);
-      assert.strictEqual(ledger.getProject(proj)!.panes["p-alive"].alive, true, "precondition: staged alive");
-      const manager = new OrchestratorManager({ ledger });
+      assert.strictEqual(store.getProject(proj)!.panes["p-alive"].alive, true, "precondition: staged alive");
+      const manager = new OrchestratorManager({ ledger: store });
       const pane = manager.ledger.getProject(proj)!.panes["p-alive"];
       assert.strictEqual(pane.alive, false, "restored pane reconciled to not-alive on boot (no auto-spawn)");
       assert.strictEqual(pane.is_busy, false);
       assert.strictEqual(pane.last_known_state, "Exited");
     } finally {
+      try { store?.close(); } catch { /* best-effort */ }
       process.chdir(prev);
       try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
     }

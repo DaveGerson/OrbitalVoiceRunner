@@ -105,10 +105,11 @@ describe("US-2.1 — switch_context loads the target project's briefing", () => 
   before(async () => {
     process.env.NODE_ENV = "test";
     process.env.JANUS_NO_AUTOSTART = "1";
-    // Legacy backend so manager.ledger is the in-memory Ledger we can seed directly. (Under the
-    // SQLite default the WorldModel Project tier reads the store; here it degrades to null — the
-    // brief-content flip is proven by the dedicated WorldModel tests in US-2.4 below.)
-    process.env.JANUS_LEDGER_BACKEND = "legacy";
+    // dbt3 — SQLite (JanusStore) is the only ledger backend. manager.ledger IS the real store
+    // here (a real server boot), and JanusStore implements the same LedgerLike seeding methods
+    // (addProject/addNote/switchContext) the legacy Ledger did, so this suite's direct-seed
+    // pattern is unchanged. The brief-content flip is proven by the dedicated WorldModel tests
+    // in the next describe block below.
 
     prevCwd = process.cwd();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-ep02-switch-"));
@@ -156,7 +157,6 @@ describe("US-2.1 — switch_context loads the target project's briefing", () => 
     }
     await teardownServerSuite(running);
     process.chdir(prevCwd);
-    delete process.env.JANUS_LEDGER_BACKEND;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   });
 

@@ -191,7 +191,7 @@ export async function runAction(
   try {
     const def = registry.find((d) => d.name === name);
     if (!def) {
-      return { kind: "error", message: `unknown action ${name}` };
+      return { kind: "error", message: `unknown action ${name}`, cause: "validation" };
     }
 
     // 1 validation point: coerce legacy arg shapes, then parse against the zod schema.
@@ -213,7 +213,7 @@ export async function runAction(
     return finalResult;
   } catch (e) {
     // ONE try/catch. A throwing handler becomes a typed error, answered once by the surface.
-    return { kind: "error", message: e instanceof Error ? e.message : String(e) };
+    return { kind: "error", message: e instanceof Error ? e.message : String(e), cause: "handler" };
   }
 }
 
@@ -232,7 +232,7 @@ function parseActionArgs(
     return { args: def.params.parse(coerced) };
   } catch (parseErr) {
     const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-    return { error: { kind: "error", message: `invalid arguments for ${name}: ${msg}` } };
+    return { error: { kind: "error", message: `invalid arguments for ${name}: ${msg}`, cause: "validation" } };
   }
 }
 
@@ -302,7 +302,7 @@ function raceDeadline(
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      resolve({ kind: "error", message: `action ${name} exceeded its ${ms}ms deadline` });
+      resolve({ kind: "error", message: `action ${name} exceeded its ${ms}ms deadline`, cause: "timeout" });
     }, ms);
     // In-flight rule: the awaited dispatch DEPENDS on this timer to settle when the handler hangs,
     // so it must hold the event loop while the race is live. It is ALWAYS cleared when the handler

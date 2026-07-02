@@ -101,9 +101,9 @@ function def(over: Partial<ActionDef> & { name: string; handler: ActionDef["hand
 }
 
 describe("gemini refactor — runAction dispatch contract", () => {
-  it("unknown action -> typed error", async () => {
+  it("unknown action -> typed error (wsm-e2e-pinned-f9ne: cause:'validation' — a client fault)", async () => {
     const r = await runAction([], "nope", {}, makeCtx());
-    assert.deepStrictEqual(r, { kind: "error", message: "unknown action nope" });
+    assert.deepStrictEqual(r, { kind: "error", message: "unknown action nope", cause: "validation" });
   });
 
   it("coerceArgs runs before parse", async () => {
@@ -188,9 +188,9 @@ describe("gemini refactor — runAction dispatch contract", () => {
     assert.match((r as any).message, /exceeded its 5ms deadline/);
   });
 
-  it("throwing handler -> typed error answered once", async () => {
+  it("throwing handler -> typed error answered once (wsm-e2e-pinned-f9ne: cause:'handler' — a server fault)", async () => {
     const d = def({ name: "boom", handler: () => { throw new Error("kaboom"); } });
     const r = await runAction([d], "boom", {}, makeCtx());
-    assert.deepStrictEqual(r, { kind: "error", message: "kaboom" });
+    assert.deepStrictEqual(r, { kind: "error", message: "kaboom", cause: "handler" });
   });
 });

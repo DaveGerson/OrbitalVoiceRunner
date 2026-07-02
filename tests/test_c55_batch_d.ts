@@ -548,7 +548,8 @@ describe("c55 Batch D — server.ts cutover guard (no double-registration)", () 
   // (test_c55_batch_f.ts) now asserts that inline route is DELETED. NOTE: POST /api/watch-rules was
   // likewise a Batch-D out-of-scope neighbor, but c55 Batch G CONVERGED the whole watch-rules family
   // (add_watch_rule) — so it is no longer asserted here; the Batch G contract suite
-  // (test_watch_rules_c55.ts) pins the converged def + the watch_rules_updated frame. NOTE: the bulk
+  // (test_watch_rules_c55.ts) pins the converged def (the watch_rules_updated frame it used to also
+  // pin was pruned wsm-e2e-pinned-33c.4 — no client consumed it). NOTE: the bulk
   // PUT /api/projects/:projectId/panes/:paneId/capability-gates route was a Batch-D out-of-scope
   // neighbor (the set_pane_gates carve-out was HELD), but c55.16 CONVERGED it (the new rest-only
   // set_pane_gates def + rest.toHttp), so it is no longer asserted-preserved here — c55.16's own

@@ -2,19 +2,28 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import fs from "fs";
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
-import { Ledger } from "../src/ledger";
+import { JanusStore } from "../src/store/sqliteStore";
+
+// dbt3 — SQLite (JanusStore) is the only ledger backend. A real on-disk db (not
+// :memory:) so Journey 7's "survives a restart" step can reopen a FRESH store over the
+// SAME file, the same way it used to reload a fresh legacy `Ledger`.
+function deleteLedgerDb(dbPath: string): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try { fs.unlinkSync(`${dbPath}${suffix}`); } catch { /* already gone */ }
+  }
+}
 
 describe("Voice-Driven Applet User Journeys Validation Suite", () => {
-  const TEST_LEDGER_PATH = ".janus_ledger_journeys_test.json";
+  const TEST_LEDGER_DB = ".janus_ledger_journeys_test.db";
   let manager: OrchestratorManager;
+  let store: JanusStore;
 
   beforeEach(() => {
-    if (fs.existsSync(TEST_LEDGER_PATH)) {
-      fs.unlinkSync(TEST_LEDGER_PATH);
-    }
+    deleteLedgerDb(TEST_LEDGER_DB);
     // Initialize standard manager targeting custom test ledger storage
-    manager = new OrchestratorManager();
-    manager.ledger = new Ledger(TEST_LEDGER_PATH);
+    store = new JanusStore(TEST_LEDGER_DB);
+    store.init();
+    manager = new OrchestratorManager({ ledger: store });
     // Hermetic precondition: the constructor seeds globalPermissionsMode from the
     // developer's live .janus_settings.json, which makes Journey 2's Inherit->pane
     // fallback depend on machine state. Pin it so the suite is self-contained.
@@ -30,9 +39,8 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     // (src\win\async.c:76). stop() now internally drains that worker, so awaiting all
     // stops in parallel is sufficient (one shared drain window, no extra settle).
     await Promise.all(Object.values(manager.terminals).map((term) => term.stop()));
-    if (fs.existsSync(TEST_LEDGER_PATH)) {
-      fs.unlinkSync(TEST_LEDGER_PATH);
-    }
+    try { store.close(); } catch { /* best-effort */ }
+    deleteLedgerDb(TEST_LEDGER_DB);
   });
 
   // ==========================================
@@ -183,7 +191,13 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
 
     const brief = manager.ledger.getProjectBriefing("active_workspace");
     assert.strictEqual(brief?.notes.length, 2, "Project notes should persist all added note strings");
-    assert.strictEqual(brief?.notes[0], "Decision points: Transition server to CommonJS bundle output.");
+    // Membership, not position: two notes added back-to-back can land in the same millisecond, and
+    // JanusStore orders by created_at (ms resolution) — a same-tick tie is not guaranteed to
+    // preserve add order (unlike the legacy Ledger's plain array push).
+    assert.ok(
+      brief?.notes.includes("Decision points: Transition server to CommonJS bundle output."),
+      "the first dictated note must be present",
+    );
 
     const paneMeta = brief?.panes.find(p => p.pane_id === "pane_dev");
     assert.ok(paneMeta, "Pane metadata must reflect in the active workspace briefing context");
@@ -208,10 +222,15 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     term.setPermissionsMode("Full Auto");
     assert.strictEqual(term.permissionsMode, "Full Auto");
 
-    // Mimic the set_pane_permissions tool logic updating ledger states
+    // Mimic the set_pane_permissions tool logic updating ledger states. updatePane() (not a direct
+    // mutation of the getProject() result) is the backend-agnostic write path: JanusStore's
+    // getProject() rebuilds a fresh Workspace from SQL on every call (it is not a live reference
+    // into mutable state the way the legacy Ledger's plain object graph was), so a direct mutation
+    // of the returned object silently does not persist against the SQLite backend.
     const ws = manager.ledger.getProject("active_workspace");
-    if (ws && ws.panes["pane_adjustable"]) {
-      ws.panes["pane_adjustable"].permissions_mode = "Full Auto";
+    const pane = ws?.panes["pane_adjustable"];
+    if (pane) {
+      manager.ledger.updatePane("active_workspace", { ...pane, permissions_mode: "Full Auto" }, true);
     }
 
     const paneLedgerAfter = manager.ledger.getProject("active_workspace")?.panes["pane_adjustable"];
@@ -268,7 +287,7 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
 
     // A mis-addressed dictation must be signalled to the model, not silently dropped (J8-G10 class).
     // Falsy-on-failure, not strictEqual(false): the LedgerLike contract is truthy-on-success
-    // (legacy Ledger returns false, JanusStore returns null), and this test should hold for both.
+    // (JanusStore returns null on failure), and this test should hold across that contract.
     assert.ok(!manager.ledger.addPaneNote("spec_project", "pane_ghost", "lost"),
       "Note to a nonexistent pane must report failure");
     assert.ok(!manager.ledger.addNote("ghost_project", "lost"),
@@ -279,19 +298,36 @@ describe("Voice-Driven Applet User Journeys Validation Suite", () => {
     assert.strictEqual(rows.length, 3, "All three dictated notes must be retrievable without a context switch");
     assert.ok(rows.some(r => r.pane_id === "pane_spec"), "Pane-scoped note must carry its pane attribution");
 
-    const hits = manager.ledger.search("PKCE");
+    // { source: "note" } matches the real notes-recall voice tool's call pattern: search() also
+    // indexes the NOTE_ADDED activity event each addNote() emits, so an unscoped search would
+    // double-count (the note row + its own audit-trail event both mention "PKCE").
+    const hits = manager.ledger.search("PKCE", { source: "note" });
     assert.strictEqual(hits.length, 1, "Keyword recall must find exactly the matching spec fragment");
     assert.ok(hits[0].snippet.includes("PKCE"));
 
-    // 3. Continuity: a fresh Ledger over the same storage path (server restart) keeps everything
-    const reloaded = new Ledger(TEST_LEDGER_PATH);
-    const brief = reloaded.getProjectBriefing("spec_project");
-    assert.strictEqual(brief?.notes.length, 2, "Project spec notes must survive a restart");
-    assert.strictEqual(brief?.notes[0], "Spec: the auth service must support PKCE, not implicit flow.");
+    // 3. Continuity: a fresh JanusStore over the same db file (server restart) keeps everything.
+    // The live `store` must be closed first — SQLite's single-writer model means a second
+    // connection reopening the same file while the first is still open races the WAL.
+    store.close();
+    const reloaded = new JanusStore(TEST_LEDGER_DB);
+    reloaded.init();
+    try {
+      const brief = reloaded.getProjectBriefing("spec_project");
+      assert.strictEqual(brief?.notes.length, 2, "Project spec notes must survive a restart");
+      // Membership, not position — see the same-millisecond-tie note on Journey 4 above.
+      assert.ok(
+        brief?.notes.includes("Spec: the auth service must support PKCE, not implicit flow."),
+        "the PKCE spec note must survive a restart",
+      );
 
-    const paneMeta = brief?.panes.find(p => p.pane_id === "pane_spec");
-    assert.strictEqual(paneMeta?.notes.length, 1, "Pane spec note must survive a restart");
-    assert.strictEqual(paneMeta?.notes[0], "Spec: token endpoint must reject grant_type=password.");
+      const paneMeta = brief?.panes.find(p => p.pane_id === "pane_spec");
+      assert.strictEqual(paneMeta?.notes.length, 1, "Pane spec note must survive a restart");
+      assert.strictEqual(paneMeta?.notes[0], "Spec: token endpoint must reject grant_type=password.");
+    } finally {
+      // afterEach still calls store.close() on the ORIGINAL (now-closed) store — harmless double
+      // close is guarded there with try/catch, so close the reload handle here explicitly.
+      reloaded.close();
+    }
   });
 
   // ==========================================

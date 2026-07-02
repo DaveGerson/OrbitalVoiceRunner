@@ -625,7 +625,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       brief: SynthesizedBrief | null;
       error: string | null;
     }): void => {
-      if (!store) return; // JANUS_LEDGER_BACKEND=legacy — no durable conduit; skip, don't fall back to JSONL.
+      if (!store) return; // no durable conduit (store is null only in a hand-built test harness); skip, don't fall back to JSONL.
       try {
         const { trigger, activeId, injectId, startedAt, disposition, skippedReason, brief, error } = input;
         const briefChars = brief ? brief.text.length : 0;
@@ -864,68 +864,89 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // guard so a stale callback can't clobber a newer session, broadcast voice_channel_lost, THEN
     // (PLM4) schedule a bounded reconnect. Idempotent-ish: onerror + onclose can both fire for one
     // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
-    const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
-      if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
-      // 3V.1 (b): STALE-ATTEMPT GUARD — extend the identity principle (the activeLiveSession-nulling
-      // guard below) to the WHOLE teardown. If a NEWER connectLiveSession has bumped the generation,
-      // THIS attempt's session is stale (it was, or is about to be, closed by the post-connect
-      // generation guard) and its late onerror/onclose must be a complete no-op: its detachSession
-      // would detach the LIVE session's approvals (state.session already points at the newer
-      // session), its voice_channel_lost would be a lie, and its scheduleReconnect would hoist a
-      // THIRD session over the healthy one without closing it. The CURRENT generation's own
-      // callbacks own the real teardown. Mark this attempt dead so a paired onerror+onclose for the
-      // same stale drop stays idempotent.
-      if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
-      sessionDead = true;
-      if (state.session) {
-        const detached = pendingApprovals.detachSession(state.session);
-        // 4D.1: open the "while you were away" window — the next reconnect digests the durable
-        // activity rows recorded between this moment and the reconnect.
-        noteSessionDetached();
-        if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
-        // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
-        // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
-        // job — it only nulls the hoisted handle if it still points at THIS session, so a LATE stale
-        // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
-        // session. `session` is the mutated connection-scope let, so the comparison is by reference
-        // against whatever is currently hoisted (copied from WS-close).
-        if (coreState.activeLiveSession === state.session) {
-          coreState.activeLiveSession = null;
-          // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
-          // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
-          // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
-          clearStableResetTimer();
+    // wsm-e2e-pinned-smz (1): doHandleSessionLost is the ORIGINAL body, unchanged, extracted so the
+    // try/catch wrapper below (handleSessionLost) doesn't push this function's already-near-the-cap
+    // branch count over the complexity gate. This fires directly off the Gemini SDK's onerror/onclose
+    // callbacks (no caller to catch a throw), and its callees (detachSession, broadcast,
+    // persistResumptionToken, scheduleReconnect, …) are best-effort but were previously unwrapped — a
+    // throw from any of them would propagate out of an SDK callback (an unhandled exception context)
+    // and skip every step after it, including the reconnect schedule that is the whole point of this
+    // handler. A swallowed error here is strictly better than a wedged voice channel that never even
+    // tries to come back.
+    const doHandleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
+        if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
+        // 3V.1 (b): STALE-ATTEMPT GUARD — extend the identity principle (the activeLiveSession-nulling
+        // guard below) to the WHOLE teardown. If a NEWER connectLiveSession has bumped the generation,
+        // THIS attempt's session is stale (it was, or is about to be, closed by the post-connect
+        // generation guard) and its late onerror/onclose must be a complete no-op: its detachSession
+        // would detach the LIVE session's approvals (state.session already points at the newer
+        // session), its voice_channel_lost would be a lie, and its scheduleReconnect would hoist a
+        // THIRD session over the healthy one without closing it. The CURRENT generation's own
+        // callbacks own the real teardown. Mark this attempt dead so a paired onerror+onclose for the
+        // same stale drop stays idempotent.
+        if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
+        sessionDead = true;
+        if (state.session) {
+          const detached = pendingApprovals.detachSession(state.session);
+          // 4D.1: open the "while you were away" window — the next reconnect digests the durable
+          // activity rows recorded between this moment and the reconnect.
+          noteSessionDetached();
+          if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
+          // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
+          // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
+          // job — it only nulls the hoisted handle if it still points at THIS session, so a LATE stale
+          // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
+          // session. `session` is the mutated connection-scope let, so the comparison is by reference
+          // against whatever is currently hoisted (copied from WS-close).
+          if (coreState.activeLiveSession === state.session) {
+            coreState.activeLiveSession = null;
+            // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
+            // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
+            // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
+            clearStableResetTimer();
+          }
         }
+        // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
+        // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
+        // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
+        // reconnect AND re-seeded from the durable KV on restart. Clear it HERE, before scheduleReconnect,
+        // so the next bounded attempt connects FRESH — bounding any handle-induced wedge to one attempt.
+        if (shouldClearHandleOnClose(closeCode, attemptUsedHandle)) {
+          console.warn("[SESSION RESUMPTION] handle-fed session closed with code=1008 — clearing the poisoned handle so the next attempt connects fresh.");
+          lastSessionResumptionToken = null;
+          persistResumptionToken(null);
+        }
+        // Issue A: a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
+        // with the SAME unresolved key can only 1007 again, so it must NOT spend a bounded reconnect
+        // attempt — that silently drains the budget (the boot-time 1007 cascade burned 3/6 attempts
+        // before recovering only on a reload). Broadcast a distinct key-problem loss and STOP; recovery
+        // comes from the next client connect once a valid key is set in Settings. isBlankApiKey
+        // distinguishes "no key configured" from "key configured but rejected" for a precise reason.
+        // (`sessionKey` is the later-declared const in this same scope, safely captured by this closure
+        // because handleSessionLost only ever fires AFTER the connect — same pattern as attemptUsedHandle.)
+        if (isInvalidKeyClose(closeCode)) {
+          const blank = isBlankApiKey(sessionKey);
+          console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
+          state.voiceLostSinceLastRestore = true; // 2S.5: a later successful connect announces recovery.
+          broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
+          return;
+        }
+        state.voiceLostSinceLastRestore = true; // 2S.5: arm the restored announcement for the reconnect.
+        broadcast({ type: "voice_channel_lost", reason });
+        // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
+        scheduleReconnect();
+    };
+
+    // wsm-e2e-pinned-smz (1): the actual onerror/onclose-facing entry point — a thin try/catch shell
+    // around doHandleSessionLost so a throw from ANY of its best-effort callees is swallowed rather
+    // than escaping into the SDK's callback context (an unhandled exception there has no caller to
+    // catch it and would abort mid-teardown, potentially skipping the reconnect schedule entirely).
+    const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
+      try {
+        doHandleSessionLost(reason, closeCode);
+      } catch (e) {
+        console.error("[VOICE] handleSessionLost threw — swallowed so the SDK callback never propagates an unhandled exception:", e instanceof Error ? e.message : String(e));
       }
-      // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
-      // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
-      // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
-      // reconnect AND re-seeded from the durable KV on restart. Clear it HERE, before scheduleReconnect,
-      // so the next bounded attempt connects FRESH — bounding any handle-induced wedge to one attempt.
-      if (shouldClearHandleOnClose(closeCode, attemptUsedHandle)) {
-        console.warn("[SESSION RESUMPTION] handle-fed session closed with code=1008 — clearing the poisoned handle so the next attempt connects fresh.");
-        lastSessionResumptionToken = null;
-        persistResumptionToken(null);
-      }
-      // Issue A: a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
-      // with the SAME unresolved key can only 1007 again, so it must NOT spend a bounded reconnect
-      // attempt — that silently drains the budget (the boot-time 1007 cascade burned 3/6 attempts
-      // before recovering only on a reload). Broadcast a distinct key-problem loss and STOP; recovery
-      // comes from the next client connect once a valid key is set in Settings. isBlankApiKey
-      // distinguishes "no key configured" from "key configured but rejected" for a precise reason.
-      // (`sessionKey` is the later-declared const in this same scope, safely captured by this closure
-      // because handleSessionLost only ever fires AFTER the connect — same pattern as attemptUsedHandle.)
-      if (isInvalidKeyClose(closeCode)) {
-        const blank = isBlankApiKey(sessionKey);
-        console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
-        state.voiceLostSinceLastRestore = true; // 2S.5: a later successful connect announces recovery.
-        broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
-        return;
-      }
-      state.voiceLostSinceLastRestore = true; // 2S.5: arm the restored announcement for the reconnect.
-      broadcast({ type: "voice_channel_lost", reason });
-      // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
-      scheduleReconnect();
     };
 
       // Resolve the Gemini key: a real configured secret wins; the "CONFIGURED_IN_ENV" sentinel and a
@@ -1335,6 +1356,27 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           };
 
+          // wsm-e2e-pinned-smz (3): a lightweight, best-effort action_log row for a SUPPRESSED replay —
+          // distinct from the "ok" row the original delivery already wrote for this SAME
+          // idempotency_key, so `getActionLog` (and any operator-facing audit view) can tell "this ran"
+          // apart from "this was replayed and skipped". Never throws; a store fault here must not
+          // affect the tool response already being sent in the caller.
+          const recordReplaySuppressed = (call: any, name: string, ixnId: string): void => {
+            if (!store) return;
+            const replayDef = REGISTRY.find((d: any) => d.name === name);
+            try {
+              store.recordAction({
+                name,
+                capability: replayDef?.capability ?? "unknown",
+                result_kind: "replay_suppressed",
+                ms: 0,
+                idempotency_key: call.id ?? null,
+                surface: "voice",
+                interaction_id: ixnId ?? null,
+              });
+            } catch { /* audit is best-effort; never break the dispatch */ }
+          };
+
           // B1 (phase-1 ack): an AUTO-created pane boots asynchronously, so confirm "opening" immediately —
           // BUT only when it will not speak over the operator (turn-aware gate). Called on the NON-replay
           // path so a reconnect-replayed create_pane never double-narrates. The startsWith("Pane ") check
@@ -1360,6 +1402,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               // REG1 phase-C: unified registry dispatch. runAction is itself try/caught + never throws; the
               // outer catch here is belt-and-suspenders. A re-delivered side-effecting call short-circuits.
               if (isReplayShortCircuit(call, name)) {
+                recordReplaySuppressed(call, name, ixnId);
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
                 });
@@ -1613,10 +1656,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // gives up with a final voice_channel_lost), and must NOT escape this async callback.
         scheduleReconnect();
       } else {
-        clientWs.send(JSON.stringify({
-          type: "error",
-          message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
-        }));
+        // wsm-e2e-pinned-smz (2): guarded for symmetry with doInitialConnect's own catch (below),
+        // which wraps its identical clientWs.send in a try/catch ("client gone") — this initial-path
+        // send was the ONE asymmetric unguarded call. clientWs can already be gone by the time this
+        // fires (the connect is async; the operator's WS can close mid-connect), and an unguarded
+        // .send() on a closed socket throws, which would escape this catch handler entirely.
+        try {
+          clientWs.send(JSON.stringify({
+            type: "error",
+            message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
+          }));
+        } catch { /* client gone */ }
       }
     }
     }

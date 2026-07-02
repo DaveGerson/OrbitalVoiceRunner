@@ -108,7 +108,7 @@ const SetPanePermissionsParams = z.object({
   permissions_mode: z.string(),
 });
 
-/** The three valid Janus modes (shared by set_pane_permissions + restart_pane). */
+/** The three valid Janus modes (shared by set_pane_permissions + promote_pane_mode). */
 const VALID_MODES = ["Full Auto", "Human-in-the-Loop", "Read-Only"] as const;
 type JanusMode = (typeof VALID_MODES)[number];
 
@@ -171,7 +171,7 @@ async function applyPaneModeDelegate(
   ctx: Parameters<ActionDef<typeof SetPanePermissionsParams>["handler"]>[1],
   pane_id: string,
   permissions_mode: JanusMode,
-  source: "voice" | "ui" | "restart_pane",
+  source: "voice" | "ui" | "promote_pane_mode",
 ): Promise<ActionResult | null> {
   if (!ctx.applyPaneMode) return null;
   const r = await ctx.applyPaneMode(pane_id, permissions_mode, source);
@@ -238,22 +238,24 @@ export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// restart_pane — the gated voice tool that makes Full-Auto reach the LIVE process (bead 1y8).
-// Mirrors set_pane_permissions (same gate, same intent params); routed through ctx.applyPaneMode so a
-// promotion either live-signals (Claude) or restart-resumes (Codex/agy) and drains pending (§11).
+// promote_pane_mode — the gated voice tool that makes Full-Auto reach the LIVE process (bead 1y8;
+// renamed from restart_pane, wsm-e2e-pinned-egc — it applies a live PERMISSION MODE, it does not
+// restart anything). Mirrors set_pane_permissions (same gate, same intent params); routed through
+// ctx.applyPaneMode so a promotion either live-signals (Claude) or restart-resumes (Codex/agy) and
+// drains pending (§11).
 // ─────────────────────────────────────────────────────────────────────────────
 
-const RestartPaneParams = z.object({
+const PromotePaneModeParams = z.object({
   project_id: z.string(),
   pane_id: z.string(),
   permissions_mode: z.string(),
 });
 
-export const restartPane: ActionDef<typeof RestartPaneParams> = {
-  name: "restart_pane",
+export const promotePaneMode: ActionDef<typeof PromotePaneModeParams> = {
+  name: "promote_pane_mode",
   description:
-    "Apply a permission mode to a LIVE terminal pane, reaching the running CLI: promote to Full Auto (or revert) so the change takes effect now, not just on the next launch. Use to make an agent run unattended.",
-  params: RestartPaneParams,
+    "Apply a permission mode to a LIVE terminal pane, reaching the running CLI right now: promote to Full Auto (or revert) so the change takes effect immediately, not just on the next launch. Use to make an agent run unattended.",
+  params: PromotePaneModeParams,
   capability: "set_pane_permissions", // rides the same lock-change gate (no new matrix row for v1).
   readOnly: false,
   surfaces: new Set(["voice"]),
@@ -274,11 +276,11 @@ export const restartPane: ActionDef<typeof RestartPaneParams> = {
         output: `Pane ${pane_id} not found in project ${project_id}; no permission change applied.`,
       };
     }
-    // restart_pane is the LIVE tool: it only makes sense on a running pane. When the pane has no live
-    // term (inert / ledger-only), there is no process to reach — fall back to the legacy persist so
-    // the next launch carries the mode.
+    // promote_pane_mode is the LIVE tool: it only makes sense on a running pane. When the pane has no
+    // live term (inert / ledger-only), there is no process to reach — fall back to the legacy persist
+    // so the next launch carries the mode.
     if (term) {
-      const delegated = await applyPaneModeDelegate(ctx, pane_id, permissions_mode as JanusMode, "restart_pane");
+      const delegated = await applyPaneModeDelegate(ctx, pane_id, permissions_mode as JanusMode, "promote_pane_mode");
       if (delegated) return delegated;
     }
     return legacyApplyPanePerms(ctx, project_id, pane_id, permissions_mode);
@@ -443,7 +445,7 @@ export const setPaneGates: ActionDef<typeof SetPaneGatesParams> = {
     "Set the per-pane capability-gate OVERRIDE map from the matrix editor (bulk, whole-map, loosening allowed — the deliberate operator-direct UI sibling of the voice set_capability_gate tool). Operator UI, rest-only.",
   params: SetPaneGatesParams,
   // Reuses the EXISTING set_capability_gate capability row (for matrix projection + audit attribution).
-  // deriveCapabilities de-dupes on def.capability (restart_pane/set_pane_permissions already share a
+  // deriveCapabilities de-dupes on def.capability (promote_pane_mode/set_pane_permissions already share a
   // cap), so this adds ZERO matrix rows — the §8.1b subset invariant holds with no matrix-file edits.
   // Declaring the capability is NOT a promise runAction enforces it (handler-owned gate model,
   // types.ts:200-213): this handler is UNGATED by design (see below).
@@ -503,7 +505,8 @@ export const setPaneGates: ActionDef<typeof SetPaneGatesParams> = {
     // capability_gates column (schema v4); a bare ledger.save() would be a SQLite no-op and silently
     // drop the override. Fires on BOTH the set and clear paths.
     ctx.manager.ledger.updatePane(project_id, pane, true);
-    // (E) audit — guarded by if(ctx.store) + try/catch (store is null under JANUS_LEDGER_BACKEND=legacy).
+    // (E) audit — guarded by if(ctx.store) + try/catch (ctx.store is a defensive `| null`; a real
+    // server boot always has one — dbt3 — but a hand-built test ActionContext may pass store:null).
     recordPaneGatesActivity(ctx, project_id, pane_id, clean);
     // (F)+(G) re-broadcast on BOTH set and clear so the chips repaint from the new server-resolved
     // posture (the clear path repaints back to the global default — R7).
@@ -537,9 +540,9 @@ function normalizePaneGates(capability_gates: unknown): CapabilityGateMap | null
 }
 
 /**
- * Best-effort audit row for set_pane_gates (guarded by if(ctx.store) + try/catch — store is null under
- * JANUS_LEDGER_BACKEND=legacy). `clean` is the normalized map (null on the clear path). Same summary /
- * payload as the inlined block (behavior-preserving).
+ * Best-effort audit row for set_pane_gates (guarded by if(ctx.store) + try/catch — ctx.store is a
+ * defensive `| null`, see the call-site note above). `clean` is the normalized map (null on the
+ * clear path). Same summary / payload as the inlined block (behavior-preserving).
  */
 function recordPaneGatesActivity(
   ctx: Parameters<ActionDef<typeof SetPaneGatesParams>["handler"]>[1],
@@ -563,7 +566,7 @@ function recordPaneGatesActivity(
 export const LOCKS_ACTIONS: ActionDef[] = [
   setGlobalPermissions,
   setPanePermissions,
-  restartPane,
+  promotePaneMode,
   setCapabilityGate,
   setPaneGates,
 ];

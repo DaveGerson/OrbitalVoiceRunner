@@ -201,6 +201,65 @@ test("durable: purgeSession deletes durable rows for that handle", () => {
 });
 
 // ---------------------------------------------------------------------------
+// wsm-e2e-pinned-4s2 (5): forSession(null) — the REST no-live-session sentinel — must never
+// alias the orphan bucket the way forSession(undefined) deliberately does.
+// ---------------------------------------------------------------------------
+test("durable: forSession(null) returns [] and never aliases the orphan bucket", () => {
+  const path = tmpDbPath();
+  const store1 = new JanusStore(path); store1.init();
+  const s1 = new PendingApprovalStore(store1);
+  s1.add(mkRecord("a1", "pane_a", "x"), { id: "h" }, { workspaceId: "p1", ttlMs: TTL });
+  store1.close();
+
+  // Fresh reopen: "a1" hydrates as an orphan (session === undefined).
+  const store2 = new JanusStore(path); store2.init();
+  const s2 = new PendingApprovalStore(store2);
+  assert.deepStrictEqual(s2.forSession(undefined).map((r) => r.messageId), ["a1"], "undefined still aliases orphans() (unchanged, intentional)");
+  assert.deepStrictEqual(s2.forSession(null), [], "null must never see the orphan bucket");
+  store2.close();
+});
+
+// ---------------------------------------------------------------------------
+// wsm-e2e-pinned-4s2 (5): delete() prunes sidToHandle for a hydrated orphan once no other
+// record still references its sid — otherwise every resolved survivor leaks one map entry.
+// ---------------------------------------------------------------------------
+test("durable: delete() prunes the hydrated sid->handle entry once its last record is gone", () => {
+  const path = tmpDbPath();
+  const store1 = new JanusStore(path); store1.init();
+  const s1 = new PendingApprovalStore(store1);
+  s1.add(mkRecord("a1", "pane_a", "x"), { id: "h" }, { workspaceId: "p1", ttlMs: TTL });
+  store1.close();
+
+  const store2 = new JanusStore(path); store2.init();
+  const s2 = new PendingApprovalStore(store2) as any;
+  // Hydration populated sidToHandle with the orphan's durable sid.
+  assert.strictEqual(s2.sidToHandle.size, 1, "hydrate registers the orphan's sid");
+  const action = resolveDecision(s2, "a1", "expire", alive);
+  assert.strictEqual(action.reason, "expired");
+  assert.strictEqual(s2.sidToHandle.size, 0, "delete() must prune the now-unreferenced sid entry");
+  store2.close();
+});
+
+// ---------------------------------------------------------------------------
+// wsm-e2e-pinned-4s2 (5): delete() must NOT prune a sid that a SIBLING record still references.
+// ---------------------------------------------------------------------------
+test("durable: delete() keeps the sid entry while a sibling record still shares it", () => {
+  const path = tmpDbPath();
+  const handle = { id: "shared-h" };
+  const store = new JanusStore(path); store.init();
+  const s = new PendingApprovalStore(store);
+  s.add(mkRecord("a1", "pane_a", "x"), handle, { workspaceId: "p1", ttlMs: TTL });
+  s.add(mkRecord("a2", "pane_a", "y"), handle, { workspaceId: "p1", ttlMs: TTL }); // SAME handle -> same sid
+  const internal = s as any;
+  assert.strictEqual(internal.sidToHandle.size, 1, "one shared sid for the two same-handle records");
+  s.delete("a1");
+  assert.strictEqual(internal.sidToHandle.size, 1, "the sid is still referenced by a2 — must not be pruned");
+  s.delete("a2");
+  assert.strictEqual(internal.sidToHandle.size, 0, "now unreferenced — pruned");
+  store.close();
+});
+
+// ---------------------------------------------------------------------------
 // LEGACY byte-for-byte: new PendingApprovalStore(null) behaves exactly as today.
 // ---------------------------------------------------------------------------
 test("legacy: store=null behaves exactly as the in-memory store (regression guard)", () => {

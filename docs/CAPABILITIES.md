@@ -288,7 +288,7 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
-| `restart_pane` | voice | no | Apply a permission mode to a LIVE terminal pane, reaching the running CLI |
+| `promote_pane_mode` | voice | no | Apply a permission mode to a LIVE terminal pane, reaching the running CLI right now |
 | `set_pane_permissions` | voice / rest | no | Set the safety permission policy mode for a specific terminal pane |
 
 ## Mute or unmute voice

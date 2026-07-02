@@ -99,6 +99,26 @@ describe("handoff flip applied to a real JanusStore", () => {
     } finally { cleanup(store, dbPath); }
   });
 
+  // wsm-e2e-pinned-3vl (2): defense-in-depth — once a row is TERMINAL, a further
+  // updateHandoffState call must be a silent no-op (unchanged row, no 2nd audit event), even
+  // though under correct operation the upstream claim gate already makes this unreachable.
+  it("updateHandoffState on an already-terminal row is a no-op (defense-in-depth)", () => {
+    const { store, dbPath } = freshStore();
+    try {
+      const id = stage(store);
+      store.updateHandoffState(id, "rejected");
+      const before = store.getHandoff(id)!;
+      assert.strictEqual(before.state, "rejected");
+
+      // A second flip attempt against the now-terminal row (e.g. approved, delivered_at set)
+      // must NOT mutate the row at all.
+      const after = store.updateHandoffState(id, "delivered", { approved_via: "voice", delivered_at: 999 });
+      assert.strictEqual(after!.state, "rejected", "state must stay rejected, not flip to delivered");
+      assert.ok(!after!.delivered_at, "delivered_at must not be stamped on a terminal-state no-op");
+      assert.deepStrictEqual(after, before, "the row must be byte-for-byte unchanged");
+    } finally { cleanup(store, dbPath); }
+  });
+
   it("Full-Auto deliver effect drives the row to delivered (the smoke's non-PTY half)", () => {
     const { store, dbPath } = freshStore();
     try {
