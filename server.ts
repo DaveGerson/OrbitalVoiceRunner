@@ -643,6 +643,12 @@ export interface RunningServer {
   /** bead 9fz test seam: register/clear a spy reconnect-nudge so a settings-PUT suite can assert the
    *  non-empty-key trigger without a live Gemini socket. NOT for prod use. */
   _testSetReconnectNudge?: (fn: (() => void) | null) => void;
+  /** Cortex context-injection telemetry (spec 2026-07-02) test seam: read the module-scope JanusStore
+   *  handle so a suite can assert on `context_injections` / `cortex_decision` / `gemini_turn_usage`
+   *  rows written by a REAL server boot without racing a second SQLite handle onto the same file
+   *  (WAL contention) or reverse-engineering the `.janus.db` path convention. Null under
+   *  JANUS_LEDGER_BACKEND=legacy, matching `store` itself. NOT for prod use. */
+  _testStore?: () => JanusStore | null;
 }
 
 // VERBATIM extraction from startServer (CC paydown). Registers, IN ORDER: (1) the cookie-seed
@@ -1859,6 +1865,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testClients: () => coreState.clients,
     _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
     _testSetReconnectNudge: (fn: (() => void) | null) => { setVoiceReconnectNudge(fn); },
+    _testStore: () => store,
   };
 }
 

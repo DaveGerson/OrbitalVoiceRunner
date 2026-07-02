@@ -926,7 +926,7 @@ export class JanusStore {
   // project/pane id, so `${project_id}\0${pane_id}` is an unambiguous key (a space would collide for
   // ids containing spaces). Centralized here and threaded through the partition/assembly helpers so the
   // workspaces refactor preserves the original delimiter EXACTLY.
-  private static readonly WS_NOTE_KEY_SEP = " ";
+  private static readonly WS_NOTE_KEY_SEP = "\u0000";
 
   /** Partition note rows (DESC by created_at) into project-scoped and pane-scoped buckets. Extracted
    *  from the `workspaces` getter verbatim: partitioning preserves the DESC order within each group so
@@ -935,7 +935,7 @@ export class JanusStore {
    *  prototype-leak surface. */
   private partitionNotes(noteRows: NoteRow[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
     const projectNotes = new Map<string, string[]>();
-    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
+    const paneNotes = new Map<string, string[]>(); // key: `${project_id}\u0000${pane_id}`
     for (const n of noteRows) {
       const [bucket, key] = n.pane_id
         ? ([paneNotes, `${n.project_id}${JanusStore.WS_NOTE_KEY_SEP}${n.pane_id}`] as const)
@@ -1306,5 +1306,76 @@ export class JanusStore {
     return this.db.prepare(
       `SELECT * FROM gemini_turn_usage WHERE ts >= ? ORDER BY id DESC LIMIT ?`
     ).all(sinceTs, limit) as import("./types").GeminiTurnUsageRow[];
+  }
+
+  // ── Cortex context-injection telemetry (schema v10) ─────────────────────────────────────────────
+  // Fail-soft writer: telemetry must NEVER throw into the live voice loop (mirrors
+  // recordGeminiTurnUsage's try/catch-and-console.error shape, delta 18.4). Read helper follows the
+  // getGeminiTurnUsages pattern (since filter, most-recent-first, default limit 100), plus optional
+  // sessionId/limit filters per the delta-18-required round-trip contract.
+
+  /** Append one context-injection attempt row. Fail-soft: swallows + console.error on any DB error. */
+  recordContextInjection(row: import("../memory/contextTelemetry").ContextInjectionEvent): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO context_injections(
+           id,ts,session_id,interaction_id,inject_id,trigger,active_project_id,active_pane_id,
+           brief_active_pane_id,source,disposition,skipped_reason,source_snapshot_hash,brief_hash,
+           brief_chars,estimated_tokens,elapsed_ms,error
+         ) VALUES(
+           @id,@ts,@session_id,@interaction_id,@inject_id,@trigger,@active_project_id,@active_pane_id,
+           @brief_active_pane_id,@source,@disposition,@skipped_reason,@source_snapshot_hash,@brief_hash,
+           @brief_chars,@estimated_tokens,@elapsed_ms,@error
+         )`
+      ).run({
+        id: row.id,
+        ts: row.ts,
+        session_id: row.session_id,
+        interaction_id: row.interaction_id,
+        inject_id: row.inject_id,
+        trigger: row.trigger,
+        active_project_id: row.active_project_id,
+        active_pane_id: row.active_pane_id,
+        brief_active_pane_id: row.brief_active_pane_id,
+        source: row.source,
+        disposition: row.disposition,
+        skipped_reason: row.skipped_reason,
+        source_snapshot_hash: row.source_snapshot_hash,
+        brief_hash: row.brief_hash,
+        brief_chars: row.brief_chars,
+        estimated_tokens: row.estimated_tokens,
+        elapsed_ms: row.elapsed_ms,
+        error: row.error,
+      });
+    } catch (e) {
+      console.error("[store] recordContextInjection failed:", e);
+    }
+  }
+
+  /** Read context-injection rows (most-recent-first), optionally filtered by `since` (ts >=),
+   *  `sessionId` (exact match), and capped by `limit` (default 100). Never throws — an unexpected
+   *  DB error yields an empty array (telemetry reads must not break a caller either).
+   *
+   *  Ordering: `ts DESC, rowid DESC`. Event ids are minted `ctxevt-<Date.now()>-<seq>`
+   *  (src/memory/contextTelemetry.ts) and are NOT zero-padded, so they are not safely
+   *  lexicographically sortable once `seq` reaches two digits (e.g. "...-10" < "...-9").
+   *  SQLite's implicit `rowid` reflects insertion order instead, giving a deterministic
+   *  tiebreak for same-millisecond bursts without depending on the id's string shape. */
+  getContextInjections(filter?: { since?: number; sessionId?: string; limit?: number }): import("./types").ContextInjectionRow[] {
+    const since = filter?.since ?? 0;
+    const limit = filter?.limit ?? 100;
+    try {
+      if (filter?.sessionId !== undefined) {
+        return this.db.prepare(
+          `SELECT * FROM context_injections WHERE ts >= ? AND session_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?`
+        ).all(since, filter.sessionId, limit) as import("./types").ContextInjectionRow[];
+      }
+      return this.db.prepare(
+        `SELECT * FROM context_injections WHERE ts >= ? ORDER BY ts DESC, rowid DESC LIMIT ?`
+      ).all(since, limit) as import("./types").ContextInjectionRow[];
+    } catch (e) {
+      console.error("[store] getContextInjections failed:", e);
+      return [];
+    }
   }
 }

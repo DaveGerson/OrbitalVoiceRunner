@@ -26,6 +26,7 @@ import type { PendingActionStore } from "../pendingActions";
 import type { JanusStore } from "../store/sqliteStore";
 import type { PaneModeResult } from "../applyPaneMode";
 import type { ShadowStats } from "../approvalShadow";
+import type { ContextInjectionTrigger } from "../memory/contextTelemetry";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -276,8 +277,12 @@ export interface ActionContext {
   /** Request a FRESH situational brief synthesis + inject it into the live session for the
    *  now-active pane (anti-rot, spec freshness trigger). switch_context calls it after its live
    *  ledger sync (the "catch me up" path). Wired by the server's voice context builder; absent on
-   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws. */
-  injectMemoryBrief?: () => void;
+   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws.
+   *  `trigger` (cortex telemetry, spec 2026-07-02 §18.2) labels the resulting context_injections
+   *  row; callers that omit it get the hook's own default (currently "catch_me_up" — the only
+   *  live call site today is switch_context, which always passes an explicit trigger). Optional
+   *  so existing/legacy callers keep compiling. */
+  injectMemoryBrief?: (trigger?: ContextInjectionTrigger) => void;
   /** P0b observability: which synthesis path is currently live ("python" when the warm daemon is
    *  available + the breaker is closed, else "fallback"). Wired by the server on the REST surface;
    *  absent on voice/test paths, where get_health reports the safe default "fallback". */
