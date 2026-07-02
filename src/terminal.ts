@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
-import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
+import { DEFAULT_ANNOUNCEMENT_TEMPLATES, pruneAttentionQueue } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
 import { PtyTransport, createPtyTransport } from "./ptyTransport";
 import {
@@ -448,6 +448,18 @@ export class UniversalTerminal {
   // markSpawnReady) — the phase-2 "ready" source. A degraded-Exited spawn never reaches
   // markSpawnReady, so it correctly never emits a false "ready".
   public onReady?: (terminalId: string) => void;
+  // res2 (bead res2 / wsm-e2e-pinned-y09): the PUSH exit edge. Fired synchronously from the
+  // transport.onExit teardown below, the instant `this.status` flips to "Exited" — i.e. it does
+  // NOT wait for a subsequent PTY output chunk. Today the "exited" attention/earcon/paneSignal is
+  // produced INDIRECTLY by src/observe's onOutput-driven classifier (classifyTransition
+  // short-circuits on term.status==="Exited"), so a pane that dies with no trailing output chunk
+  // (e.g. an external SIGKILL) never re-enters that classifier and the operator never learns the
+  // pane died. This hook gives the observe pipeline a second, PUSH-based entry point into the
+  // identical classifier so a silent death still surfaces. Gated on ownExit (see the
+  // transport.onExit teardown below): fires ONLY for a genuine, unexpected self-exit — an
+  // INTENTIONAL stop (respawn_pane, close_pane/archive, shutdown) nulls this.transport before
+  // killing, so it does not fire this hook. No new decision logic beyond that gate is introduced.
+  public onExit?: (terminalId: string) => void;
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
@@ -1022,6 +1034,19 @@ export class UniversalTerminal {
         );
         this.pendingInput = [];
       }
+      // res2/y09: push the exit edge to observers NOW (status is already "Exited" above) instead
+      // of waiting for a PTY chunk that may never come. Guarded like every other pane callback so
+      // a subscriber throw can never poison this teardown. Gated on ownExit: an INTENTIONAL stop
+      // (respawn_pane, close_pane/archive, shutdown) nulls this.transport in _doStop BEFORE
+      // killing, so ownExit is false there — only a genuine unexpected death (this.transport still
+      // equals the exiting transport) fans out the attention item / announcement / voice signal.
+      if (ownExit && this.onExit) {
+        try {
+          this.onExit(this.terminalId);
+        } catch (e) {
+          console.warn(`[terminal] ${this.terminalId}: onExit subscriber threw (ignored):`, e);
+        }
+      }
     });
 
     // Run the ~500ms process-state probe (Tier A, design §3).
@@ -1292,6 +1317,12 @@ export class OrchestratorManager {
   // B1 (async spawn): forwarded from UniversalTerminal.onReady — fires once when the child attaches
   // its PTY (markSpawnReady). The phase-2 "ready" publish source.
   public onReady?: (terminalId: string) => void;
+  // res2/y09: the manager-level fan of UniversalTerminal.onExit — fires the instant a pane's OWN
+  // live transport exits unexpectedly (ownExit-gated in UniversalTerminal — an intentional
+  // stop/respawn/archive/shutdown does NOT fire this), with NO dependency on a subsequent output
+  // chunk. server.ts assigns this to the observe pipeline's onExit handler, which re-uses the
+  // existing classifyTransition("exited")/emitHighSeverityTransition path.
+  public onExit?: (terminalId: string) => void;
   // wsm-e2e-pinned-5h0 (A-voice): fires once after stopAndArchivePane terminates + archives a pane.
   // server.ts wires it to publish a turn-gated "closed" pane signal — the completion ack that confirms
   // the exit by voice only when it won't talk over the operator (same phase-2 gate as the create ack).
@@ -1543,13 +1574,57 @@ export class OrchestratorManager {
   private reconcilePanesInert(activeCtx: string): void {
     const project = this.ledger.getProject(activeCtx);
     if (!project || !project.panes) return;
+    // res3: capture which panes were actually alive/running BEFORE we flip them, so the operator
+    // can be told "N panes were live before restart" — this must be read before the mutation below
+    // overwrites `pane.alive`, and it deliberately EXCLUDES panes that were already inert (a pane
+    // that had already exited on its own before the restart is not part of the recovery story).
+    const wasLive: string[] = [];
     for (const pane of Object.values(project.panes)) {
+      if (pane.alive) wasLive.push(pane.pane_id);
       pane.alive = false;
       pane.is_busy = false;
       pane.last_known_state = "Exited";
       this.ledger.updatePane(activeCtx, pane, false);
     }
     this.ledger.save(true);
+    this.announceBootRecovery(activeCtx, wasLive);
+  }
+
+  /**
+   * res3 (bead res3 — server-restart recovery UX): tell the operator what was running before this
+   * boot through the SAME idioms every other alert already uses — no new UI surface. This is a
+   * PULL-only surface by design (a conservative call on an explicitly punted product decision):
+   * it lands one informational item in `attentionQueue`, which is already consumed by (a) the voice
+   * `get_attention_digest` narration path (src/actions/defs/reads.ts) and (b) the existing
+   * `GET /api/attention` REST read the frontend already fetches on mount (src/orbital/useOrbitalData.ts
+   * `refetchAttention`). We deliberately do NOT broadcast `attention_updated` here — there are no WS
+   * clients connected yet at construction time (this runs from the OrchestratorManager constructor,
+   * before server.ts wires `broadcast`/`announcementBus`), so a push would be a no-op anyway; the next
+   * client to connect picks this up via its normal GET /api/attention fetch. Restoring a pane stays an
+   * EXPLICIT operator action through the existing respawn_pane / restore_archived_pane actions —
+   * nothing here spawns anything.
+   */
+  private announceBootRecovery(projectId: string, wasLive: string[]): void {
+    if (wasLive.length === 0) return;
+    const n = wasLive.length;
+    const list = wasLive.join(", ");
+    console.log(`[boot] ${n} pane${n === 1 ? "" : "s"} were live before this restart, now inert: ${list}`);
+    this.attentionQueue.push({
+      id: "att_" + Math.random().toString(36).substring(2, 11),
+      // "idle" = informational (no failure, no held request) — matches the existing dispatch-join
+      // completion idiom in src/observe/index.ts (settleDispatchJoin). Not actionable via
+      // Approve/Deny/Re-fire; the operator dismisses it or restarts the listed panes explicitly.
+      type: "idle",
+      terminalId: wasLive[0],
+      projectId,
+      message:
+        `${n} pane${n === 1 ? "" : "s"} ${n === 1 ? "was" : "were"} running before this restart and ` +
+        `${n === 1 ? "is" : "are"} now inert: ${list}. Restart one explicitly (POST ` +
+        `/api/terminals/:pane_id/restart, or "restart pane <id>") — nothing auto-spawns.`,
+      timestamp: new Date().toISOString(),
+      dismissed: false,
+    });
+    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, same as every other attentionQueue push
   }
 
   addTerminal(
@@ -1625,6 +1700,9 @@ export class OrchestratorManager {
     };
     term.onReady = (tid) => {
       if (this.onReady) this.onReady(tid);
+    };
+    term.onExit = (tid) => {
+      if (this.onExit) this.onExit(tid);
     };
   }
 

@@ -1267,7 +1267,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
   // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
   // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
-  const { onOutput, onIdle, onRunning, onQuiescing } = attachObserve(manager, {
+  const { onOutput, onIdle, onRunning, onQuiescing, onExit } = attachObserve(manager, {
     broadcast,
     announcementBus,
     paneSignalBus,
@@ -1291,6 +1291,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // 'quiescing' model signal), mirroring the onRunning/onIdle wiring above. The frames are
   // emitted from inside attachObserve via the injected broadcast/paneSignalBus.
   manager.onQuiescing = onQuiescing;
+  // res2/y09: fan the PUSH exit edge (pane death without a dependency on a subsequent PTY output
+  // chunk) — see src/terminal.ts UniversalTerminal.onExit and src/observe/index.ts's onExit handler.
+  manager.onExit = onExit;
 
   function broadcastLedgerUpdate() {
     broadcast({
