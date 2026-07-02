@@ -9,7 +9,7 @@ deterministic prosthetic. Spec: docs/superpowers/specs/2026-06-27-python-cortex-
 """
 import json
 
-CORTEX_VERSION = "0.2.0"
+CORTEX_VERSION = "0.2.1"
 
 # Canonical tier order (matches the synthesizer's tier set). Identity preserves this order.
 _TIER_KEYS = ("project", "pane", "breadcrumbs", "board", "frame")
@@ -85,6 +85,13 @@ def decide(tiers, ctx, now):
         # full text — keep logs small). Additive; TS still log-only. None if the shadow render raised
         # (an observation MUST NOT break the identity decision/trace).
         trace["shadowBudget"] = shadow
+    if drop:
+        # 0.2.1: also render over the post-drop tiers so callers can compute actual savings.
+        # Pure observation — a render failure yields None and is silently dropped (telemetry only).
+        curated_tiers = {k: tiers.get(k) for k in keep}
+        shadow_curated = _shadow_budget(curated_tiers, ctx)
+        if shadow_curated is not None:
+            trace["shadowBudgetCurated"] = shadow_curated
     return {"decision": decision, "trace": trace}
 
 

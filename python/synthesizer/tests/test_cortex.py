@@ -156,8 +156,47 @@ class CortexTest(unittest.TestCase):
         self.assertIn("pane", out["decision"]["keep"])      # idle ≈ just-finished ≈ relevant
         self.assertEqual(out["trace"]["ruleFired"], "baseline-identity")
 
-    def test_cortex_version_is_0_2_0(self):
-        self.assertEqual(cortex.CORTEX_VERSION, "0.2.0")
+    def test_cortex_version_is_0_2_1(self):
+        self.assertEqual(cortex.CORTEX_VERSION, "0.2.1")
+
+    # ── shadowBudgetCurated (0.2.1) ──────────────────────────────────────────────
+
+    def test_exited_pane_has_both_shadow_budgets(self):
+        """exited-pane drop: trace must have both shadowBudget (full) and shadowBudgetCurated (post-drop)."""
+        tiers = {
+            "project": {"projectId": "p1", "name": "P", "summary": "s", "keyTerms": [], "recentDecisions": []},
+            "pane": {"paneId": "p1", "name": "main", "runtimeType": "claude",
+                     "status": "Exited", "lastCommand": "ls", "recent": ["done"]},
+            "breadcrumbs": [],
+            "board": [],
+            "frame": {"role": "Janus", "gatePosture": "Auto", "prefs": []},
+        }
+        out = cortex.decide(tiers, CTX, 42)
+        self.assertEqual(out["decision"]["drop"], ["pane"])
+        tr = out["trace"]
+        # Both budgets must be present when drop is non-empty.
+        self.assertIn("shadowBudget", tr, "shadowBudget (full-tier render) must still be present")
+        self.assertIn("shadowBudgetCurated", tr, "shadowBudgetCurated must be present when drop is non-empty")
+        # Curated textLen must be LESS than full textLen (pane tier was dropped).
+        self.assertLess(
+            tr["shadowBudgetCurated"]["textLen"],
+            tr["shadowBudget"]["textLen"],
+            "curated render must be shorter than full render because pane was dropped",
+        )
+        # Lean shape: no raw text, only perTierChars + textLen.
+        self.assertIn("perTierChars", tr["shadowBudgetCurated"])
+        self.assertIsInstance(tr["shadowBudgetCurated"]["textLen"], int)
+        self.assertNotIn("text", tr["shadowBudgetCurated"])
+
+    def test_non_drop_input_has_no_shadow_budget_curated(self):
+        """When drop is empty (identity), shadowBudgetCurated must NOT appear in the trace."""
+        out = cortex.decide(TIERS, CTX, 123)
+        self.assertEqual(out["decision"]["drop"], [])
+        self.assertNotIn("shadowBudgetCurated", out["trace"])
+
+    def test_cortex_version_in_trace_is_0_2_1(self):
+        tr = cortex.decide(TIERS, CTX, 0)["trace"]
+        self.assertEqual(tr["cortexVersion"], "0.2.1")
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@
         "rerank": []
       },
       "trace": {
-        "cortexVersion": "0.2.0",
+        "cortexVersion": "0.2.1",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -85,7 +85,7 @@
       "ok": true,
       "decision": {"keep": ["frame"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.2.0",
+        "cortexVersion": "0.2.1",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -132,7 +132,7 @@
       "ok": true,
       "decision": {"keep": ["project", "frame"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.2.0",
+        "cortexVersion": "0.2.1",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -167,7 +167,7 @@
       "ok": true,
       "decision": {"keep": ["breadcrumbs"], "drop": [], "rerank": []},
       "trace": {
-        "cortexVersion": "0.2.0",
+        "cortexVersion": "0.2.1",
         "strategy": "baseline-identity",
         "ruleFired": "baseline-identity",
         "inputs": {
@@ -244,7 +244,7 @@
         "rerank": []
       },
       "trace": {
-        "cortexVersion": "0.2.0",
+        "cortexVersion": "0.2.1",
         "strategy": "exited-pane",
         "ruleFired": "exited-pane",
         "inputs": {
@@ -262,6 +262,10 @@
         "shadowBudget": {
           "perTierChars": {"project": 160, "pane": 57, "breadcrumbs": 24, "board": 19, "frame": 25},
           "textLen": 289
+        },
+        "shadowBudgetCurated": {
+          "perTierChars": {"project": 160, "breadcrumbs": 24, "board": 19, "frame": 25},
+          "textLen": 231
         }
       }
     }
