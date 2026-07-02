@@ -29,6 +29,9 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: Dependency audit
+        run: npm audit --audit-level=moderate
+
   # The component lane (Vitest + jsdom + RTL): src/**/*.test.tsx React component tests. No
   # browser/Playwright install needed — jsdom runs headless in Node. Disjoint from the node:test
   # glob (tests/*.ts), so the two runners never collide.
