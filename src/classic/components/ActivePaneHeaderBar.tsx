@@ -45,21 +45,31 @@ export function ActivePaneHeaderBar({
   setActiveTerminalId: (id: string | null) => void;
   handleStopPane: (projId: string, paneId: string) => void;
 }) {
+  // One home for the badge text: it renders truncated (min-w-0, bead 357), so the SAME full
+  // string goes on the title tooltip.
+  const badgeLabel = `${activeProjectMeta?.name?.toUpperCase() || "NODE"}: ${activePaneMeta?.name || activeTerminal.id}`;
   return (
-    <div className="flex items-center justify-between px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
-      <div className="flex gap-2 items-center overflow-hidden min-w-0">
-        <span className="text-xs font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded shrink-0">
-          {activeProjectMeta?.name?.toUpperCase() || "NODE"}: {activePaneMeta?.name || activeTerminal.id}
+    <div className="flex items-center justify-between gap-3 px-4 py-3 bg-white/[0.02] border-b border-white/5 shadow-sm">
+      <div className="flex gap-2 items-center min-w-0 flex-1">
+        <span
+          className="text-xs font-mono px-2 py-0.5 bg-cyan-400/20 text-cyan-400 rounded truncate min-w-0"
+          title={badgeLabel}
+        >
+          {badgeLabel}
         </span>
-        <span className="text-xs font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
-          $ {activeTerminal.command}
-        </span>
-        {/* bead 8sq: the active pane's effective-posture chip (server truth via the terminals
-            payload). Click for the full breakdown in plain language. The shrink-0 wrapper +
-            the min-w-0/shrink-0 group guards keep the chip from being visually collapsed or
-            overlapped by the right-hand controls when the header is narrowed (sidebar +
-            transcript panel open). The e2e opens the popover via dispatchEvent('click'), so
-            the spec no longer hinges on this layout winning a pixel-level hit-test. */}
+        {/* bead 8sq / bead 357: the active pane's effective-posture chip (server truth via the
+            terminals payload). Click for the full breakdown in plain language. The chip is the
+            ONLY shrink-0 element in this group — under squeeze the command and the name badge
+            truncate (both min-w-0) and the chip keeps its full box. That is the structural fix
+            for the 1280px-with-transcript-panel occlusion the popover-content specs previously
+            routed around via dispatchEvent('click'). Deliberately NO `overflow-hidden` here:
+            clipping the group pushes the chip's click point outside its own box, and the
+            gate_chip.spec.ts real-pointer test fails (reproduced both ways). The companion
+            hazard — header content stealing pointer events from the right-hand Grid/Exit
+            controls (pane_exit_controls + terminal_header_affordances, the adversarial-review
+            blocker) — is prevented by keeping every width in this header flexible or capped
+            (badge/command truncate; cwd capped in the right group), never by clipping. All
+            three spec files pin this at the default 1280px viewport. */}
         {activeTerminal.posture && (
           // data-testid: an inert hook so e2e can target THIS (center-header) chip
           // specifically — `getByTestId("gate-chip-trigger").first()` resolves to a sidebar
@@ -72,9 +82,16 @@ export function ActivePaneHeaderBar({
             />
           </span>
         )}
+        <span className="text-xs font-mono px-2 py-0.5 opacity-40 truncate min-w-0" title={activeTerminal.command}>
+          $ {activeTerminal.command}
+        </span>
       </div>
       <div className="flex items-center gap-4 shrink-0">
-        <span className="text-xs font-mono opacity-40 truncate" title={activeTerminal.cwd}>
+        {/* bead 357: the cwd is CAPPED, not just `truncate` — inside a shrink-0 flex group a
+            bare truncate has no width constraint, so a long path inflates the whole right
+            group and crushes the left flex-1 group (the header's only unbounded rigid width).
+            Full path stays available on the title tooltip. */}
+        <span className="text-xs font-mono opacity-40 truncate max-w-[12rem]" title={activeTerminal.cwd}>
           {activeTerminal.cwd}
         </span>
         <button
