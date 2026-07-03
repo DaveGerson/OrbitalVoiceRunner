@@ -1,9 +1,14 @@
 // tests/test_cortex_flip.ts — B-1: THE CORTEX FLIP. synthesizeAsync goes cortex-PRIMARY (the cortex
-// curates which tiers survive) behind setCortexPrimary (default OFF). The full-tier synth/assembler
-// path is the fail-closed floor. These are the load-bearing locks the flip-PR merge gate signs off on:
+// curates which tiers survive, in what order, and under what per-tier budget) behind setCortexPrimary
+// (default OFF). The full-tier synth/assembler path is the fail-closed floor. These are the
+// load-bearing locks the flip-PR merge gate signs off on:
 //   • OFF (default): synthesizeAsync is BYTE-IDENTICAL to today — the parity guarantee (test a).
 //   • ON happy path: the brief is filtered to the cortex's `keep` list; source === "cortex-primary".
 //   • FAIL-CLOSED: on cortex miss / timeout / ok:false / unavailable, the FULL-tier floor is used.
+//   • Wave 4 (D5, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): resolveWithCortex now
+//     returns {tiers, plan} — RAW (unfiltered) tiers plus a render plan (order=decision.keep,
+//     caps=decision.budget) — and assembleBrief itself does the filtering-by-omission + per-tier
+//     budget. Tests (i)/(j) below cover the budget/order render path this wave added.
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryService, DEFAULT_MEMORY_CONFIG } from "../src/memory";
@@ -133,25 +138,72 @@ test("(h) isCortexPrimary reflects the flag (and resetting works)", () => {
   assert.equal(isCortexPrimary(), false);
 });
 
-// ── resolveWithCortex helper: direct unit coverage of the race + filter ─────────────────────────────
-test("resolveWithCortex: ok ⇒ filtered MemoryTiers (kept tiers retain value, dropped nulled)", async () => {
-  const filtered = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "brief-inject" }, 0, cortexKeeping(["project"]), 100);
-  assert.ok(filtered);
-  assert.equal(filtered!.project, TIERS.project);
-  assert.equal(filtered!.pane, null);
-  assert.deepEqual(filtered!.board, []);
-  assert.deepEqual(filtered!.breadcrumbs, []);
-  assert.equal(filtered!.frame, TIERS.frame); // structural — always kept
+// ── resolveWithCortex helper: direct unit coverage of the race + plan-building ───────────────────────
+test("resolveWithCortex: ok ⇒ {tiers, plan} — tiers are RAW/unfiltered; plan.order = decision.keep", async () => {
+  const resolved = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "catch-up" }, 0, cortexKeeping(["project"]), 100);
+  assert.ok(resolved);
+  // Wave 4 D5: filtering-by-omission is now the RENDERER's job — resolveWithCortex hands back the
+  // same tiers object unmodified (no nulling), plus a plan the renderer honors.
+  assert.equal(resolved!.tiers, TIERS);
+  assert.deepEqual(resolved!.plan.order, ["project"]);
+  assert.deepEqual(resolved!.plan.caps, {}, "no budget in the decision ⇒ caps default to {}");
+});
+
+test("resolveWithCortex: ok with a budget ⇒ plan.caps mirrors decision.budget verbatim", async () => {
+  const cortexWithBudget: PythonCortexClient = {
+    available: () => true,
+    decide: async (): Promise<CortexResult> => ({
+      ok: true,
+      decision: { keep: ["project", "frame"], drop: ["pane", "board", "breadcrumbs"], rerank: [], budget: { project: 40, frame: 10 } },
+      trace: { cortexVersion: "0.1.0", strategy: "profile:catch-up", ruleFired: "profile:catch-up",
+        inputs: { activePaneId: "p1", sessionId: null, trigger: "catch-up", tierKeys: ["project", "frame"], tierChars: {} },
+        output: { orderedKeep: ["project", "frame"], dropped: ["pane", "board", "breadcrumbs"] }, ts: 0 },
+    }),
+  };
+  const resolved = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "catch-up" }, 0, cortexWithBudget, 100);
+  assert.ok(resolved);
+  assert.deepEqual(resolved!.plan.caps, { project: 40, frame: 10 });
 });
 
 test("resolveWithCortex: timeout ⇒ null (caller uses full-tier floor)", async () => {
-  const filtered = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "x" }, 0, cortexHangs, 20);
-  assert.equal(filtered, null);
+  const resolved = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "x" }, 0, cortexHangs, 20);
+  assert.equal(resolved, null);
 });
 
 test("resolveWithCortex: ok:false ⇒ null", async () => {
-  const filtered = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "x" }, 0, cortexFails, 100);
-  assert.equal(filtered, null);
+  const resolved = await resolveWithCortex(TIERS, { activePaneId: "p1", sessionId: null, trigger: "x" }, 0, cortexFails, 100);
+  assert.equal(resolved, null);
+});
+
+// ── Wave 4 D5: budget/order render cases (the cortex's plan actually shapes the renderer) ────────────
+
+test("(i) ON + budget ⇒ assembleBrief honors the per-tier char cap (tighter than the default weight-derived cap)", async () => {
+  setCortexPrimary(true);
+  const cortexWithBudget: PythonCortexClient = {
+    available: () => true,
+    decide: async (): Promise<CortexResult> => ({
+      ok: true,
+      decision: { keep: ["project", "frame"], drop: [], rerank: [], budget: { project: 12, frame: 500 } },
+      trace: { cortexVersion: "0.1.0", strategy: "profile:catch-up", ruleFired: "profile:catch-up",
+        inputs: { activePaneId: "p1", sessionId: null, trigger: "catch-up", tierKeys: ["project", "frame"], tierChars: {} },
+        output: { orderedKeep: ["project", "frame"], dropped: [] }, ts: 0 },
+    }),
+  };
+  const brief = await svc(cortexWithBudget).synthesizeAsync("p1", 0);
+  // project's DEFAULT weight-derived cap is floor(4800*0.40)=1920 chars — a 12-char budget forces a
+  // truncation this fixture's text would never hit under the default weight.
+  assert.ok(brief.perTierChars.project! <= 12, `project must respect the cortex budget cap (got ${brief.perTierChars.project})`);
+  assert.ok(brief.text.includes("…"), "a tight cap must trigger the assembler's truncation ellipsis");
+});
+
+test("(j) ON + order ⇒ rendered block sequence follows plan.order, not the canonical order", async () => {
+  setCortexPrimary(true);
+  // Canonical order is project, pane, breadcrumbs, board, frame — request [pane, project] (reversed).
+  const brief = await svc(cortexKeeping(["pane", "project"])).synthesizeAsync("p1", 0);
+  const paneIdx = brief.text.indexOf("ACTIVE PANE");
+  const projectIdx = brief.text.indexOf("PROJECT Janus");
+  assert.ok(paneIdx >= 0 && projectIdx >= 0, "both blocks must be present");
+  assert.ok(paneIdx < projectIdx, "pane must render BEFORE project — plan.order, not the canonical order");
 });
 
 // ── B-4 sub-task: cortexFallbackRate counter (warm-up-immune) ────────────────────────────────────────

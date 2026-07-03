@@ -62,6 +62,8 @@ import { findPaneOwningProject } from "../paneOwnership";
 import type { CreatedMemory } from "../memory";
 import { briefIsForActivePane } from "../memory";
 import type { SynthesizedBrief } from "../memory/types";
+import { toCortexTrigger } from "../memory/types";
+import { isCortexPrimary } from "../memory/cortexShadow";
 import {
   mintContextInjectionEventId,
   hashText,
@@ -650,10 +652,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       skippedReason: string | null;
       brief: SynthesizedBrief | null;
       error: string | null;
+      // Wave 4 (D2, cortex cutover design): the input tier-snapshot hash the InjectGate evaluated.
+      // Populated on gate skips (unchanged-brief/debounce) where it's the whole point of the row;
+      // absent elsewhere (spec §6.2 still permits deferring it on the pre-existing skip paths).
+      sourceSnapshotHash?: string | null;
     }): void => {
       if (!store) return; // no durable conduit (store is null only in a hand-built test harness); skip, don't fall back to JSONL.
       try {
-        const { trigger, activeId, injectId, startedAt, disposition, skippedReason, brief, error } = input;
+        const { trigger, activeId, injectId, startedAt, disposition, skippedReason, brief, error, sourceSnapshotHash } = input;
         const briefChars = brief ? brief.text.length : 0;
         store.recordContextInjection({
           id: mintContextInjectionEventId(),
@@ -668,9 +674,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           source: brief ? brief.source : "none",
           disposition,
           skipped_reason: skippedReason,
-          // Deferred (spec §6.2 explicitly permits this for the first PR): no canonical stable
-          // stringifier exists yet, and this choke point has no ready-made snapshot object to hash.
-          source_snapshot_hash: null,
+          source_snapshot_hash: sourceSnapshotHash ?? null,
           brief_hash: brief ? hashText(brief.text) : null,
           brief_chars: briefChars,
           estimated_tokens: estimateTokens(briefChars),
@@ -682,17 +686,50 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       }
     };
 
+    // Wave 4 (D5): a primary-mode brief that fell all the way to the floor (cortex miss — timeout,
+    // ok:false, unavailable, throw) is STILL an injected-at-the-floor brief for reporting purposes —
+    // `brief.source` only reads "cortex-primary" on a clean curated hit, so any other source while
+    // primary is live means the choke point rendered today's default composition instead.
+    const dispositionForBrief = (brief: SynthesizedBrief): ContextInjectionDisposition =>
+      (isCortexPrimary() && brief.source !== "cortex-primary") ? "cortex-miss" : "injected";
+
+    // Wave 4 (D2): record + exit for an InjectGate skip — pulled out of injectMemoryBrief to keep
+    // its cyclomatic count down (the complexity gate is a hard error).
+    const recordGateSkip = (
+      trigger: ContextInjectionTrigger,
+      activeId: string | null,
+      injectId: string | null,
+      startedAt: number,
+      skip: "unchanged-brief" | "debounce",
+      snapshotHash: string,
+    ): void => {
+      recordInjectionEvent({
+        trigger, activeId, injectId, startedAt,
+        disposition: skip, skippedReason: skip, brief: null, error: null,
+        sourceSnapshotHash: snapshotHash,
+      });
+    };
+
     // Memory Synthesis P0a (anti-rot injection): synthesize a FRESH situational brief for the
     // now-active pane and inject it into the live session via the SAME sendClientContent channel the
     // ears use. Wrapped in try/catch and fully NON-BLOCKING — a synthesis/inject failure must NEVER
     // throw into the live loop (the brief is best-effort context, not a turn the model owes a reply).
-    // `now` is the Node runtime epoch-ms clock. Called on (a) session start and (b) pane switch.
-    // `trigger` (spec 2026-07-02 §18.2) labels the telemetry row emitted for EVERY exit below —
-    // it never affects the injection guards/order/payload, only what gets recorded about them.
+    // `now` is the Node runtime epoch-ms clock. Called on session start, pane switch, catch-up, and
+    // (Wave 4 D1) command-outcome (the pane-signal "idle" edge). `trigger` (spec 2026-07-02 §18.2)
+    // labels the telemetry row emitted for EVERY exit below. `affectedPaneId` (Wave 4 D1) is the pane
+    // a command-outcome trigger is ABOUT (independent of the currently-active pane) — threaded into
+    // the cortex ctx so a command-outcome profile can lead with it.
+    //
+    // Wave 4 (D2) choke-point order: (1) no-session guard, (2) mint injectId, (3) map the trigger to
+    // the wire vocabulary + hash the input tier snapshot, (4) the InjectGate — a skip here costs ZERO
+    // Python round-trips, (5) the shadow observation, (6) synthesize (races the cortex when primary),
+    // (7) the pre-existing stale/empty guards, (8) send — redacted — through the SAME channel, (9)
+    // noteInjected ONLY after the send succeeds, and record disposition (injected vs cortex-miss).
     const injectMemoryBrief = async (
       sess: any,
       activeId: string | null,
-      trigger: ContextInjectionTrigger
+      trigger: ContextInjectionTrigger,
+      affectedPaneId: string | null = null,
     ): Promise<void> => {
       const startedAt = Date.now();
       let injectId: string | null = null;
@@ -712,13 +749,22 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // (below) — so the turn-usage capture joins the nearest preceding ACTUALLY-injected brief,
         // never one dropped by the pane-switch / empty-text guards.
         injectId = mintInjectId();
+        const now = Date.now();
+        const wire = toCortexTrigger(trigger);
+        const snapshotHash = memory.service.snapshotHashFor(activeId, now);
+        const gateDecision = memory.service.gate.evaluate(snapshotHash, wire, now);
+        if (gateDecision.skip) {
+          recordGateSkip(trigger, activeId, injectId, startedAt, gateDecision.skip, snapshotHash);
+          return;
+        }
         // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
-        // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
-        // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
-        memory.service.observeCortexShadow(activeId, Date.now(), "brief-inject", injectId);
-        // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
-        // synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        brief = await memory.service.synthesizeAsync(activeId, Date.now(), injectId);
+        // this trigger when NOT primary; a no-op when primary (that path decides via synthesizeAsync
+        // below instead, avoiding a double daemon call). Synchronous void; never blocks or alters the
+        // brief below. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
+        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId);
+        // P0b/Wave 4 D5: race the cortex (when primary) / the Python synthesizer against the
+        // in-process floor. synthesizeAsync owns the race + `source` authority and NEVER rejects.
+        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
@@ -732,27 +778,33 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           });
           return;
         }
-        if (brief.text.trim()) {
-          sess.sendClientContent({
-            turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
-            turnComplete: true,
-          });
-          // Join key: only NOW (the brief actually entered Gemini) does this injection become the
-          // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
-          state.lastInjectId = injectId;
-          recordInjectionEvent({
-            trigger, activeId, injectId, startedAt,
-            disposition: "injected", skippedReason: null, brief, error: null,
-          });
-        } else {
+        if (!brief.text.trim()) {
           recordInjectionEvent({
             trigger, activeId, injectId, startedAt,
             disposition: "skipped_empty_brief", skippedReason: "synthesized brief text was empty",
             brief, error: null,
           });
+          return;
         }
+        // Redaction invariant: every string injected toward Gemini goes through the redaction pass
+        // regardless of who composed it — identity on already-clean tier text, load-bearing when the
+        // cortex-curated path renders text this choke point did not itself sanitize upstream.
+        sess.sendClientContent({
+          turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}` }] }],
+          turnComplete: true,
+        });
+        // Join key: only NOW (the brief actually entered Gemini) does this injection become the
+        // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
+        state.lastInjectId = injectId;
+        // Wave 4 (D2): the gate only advances state AFTER a confirmed send — a dropped/stale/empty
+        // brief above returned before this point and never counts as "injected".
+        memory.service.gate.noteInjected(snapshotHash, now);
+        recordInjectionEvent({
+          trigger, activeId, injectId, startedAt,
+          disposition: dispositionForBrief(brief), skippedReason: null, brief, error: null,
+        });
       } catch (e) {
-        // The whole body is guarded so the returned promise NEVER rejects — the four fire-and-forget
+        // The whole body is guarded so the returned promise NEVER rejects — the fire-and-forget
         // call sites ignore it, and an unhandled rejection must never escape into the live loop.
         console.error("[memory] brief injection failed:", e);
         recordInjectionEvent({
@@ -1664,6 +1716,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           }
           pushSignal(sig);
+          // Wave 4 (D1, cortex cutover design): the observe layer's EXISTING onIdle 'idle' pane
+          // signal (src/observe/index.ts) IS the command-completion edge — no new observe-layer
+          // wiring needed. Fire a fourth injectMemoryBrief trigger here, threading the pane the
+          // signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever pane is
+          // currently focused, so a command-outcome cortex profile can lead with it. Fire-and-forget
+          // (injectMemoryBrief owns its own try/catch and never rejects) + gated by the SAME
+          // InjectGate every other trigger goes through — a burst of idle edges across panes still
+          // collapses to at most one cortex round-trip per debounce floor.
+          if (sig.kind === "idle") {
+            void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
+          }
         });
       };
       hoistAndSubscribe();

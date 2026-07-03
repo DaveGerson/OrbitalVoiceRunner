@@ -141,12 +141,65 @@ export interface CortexCtx {
   activePaneId: string | null;
   sessionId?: string | null;
   trigger: string;
+  // Wave 4 (D0/D4, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the last
+  // HISTORY_K decide outcomes (oldest-first), so Python's hysteresis rule can suppress a
+  // just-dropped tier from re-surfacing without the daemon retaining any state itself.
+  history?: CortexHistoryEntry[];
+  // Wave 4 (D4): TS-computed per-tier content hashes for THIS call's snapshot. Python never
+  // hashes — it only compares these against tierHashes recorded on prior history entries to
+  // detect a "strong trigger" (content actually changed since the tier was dropped).
+  tierHashes?: Record<string, string>;
+  // Wave 4 (D1): the paneId the triggering signal was about (e.g. the pane that just went
+  // idle), independent of activePaneId, so a command-outcome profile can lead with it.
+  affectedPaneId?: string | null;
 }
+
+// Wave 4 (D0, cortex cutover design): the wire-level trigger vocabulary Python's profile
+// table is keyed on EXACTLY — see D3. Distinct from the free-form `ContextInjectionTrigger`
+// telemetry union (src/memory/contextTelemetry.ts), which describes call-site provenance;
+// this is the narrower, curated set the cortex actually branches on.
+export type CortexWireTrigger = "session-start" | "pane-switch" | "command-outcome" | "catch-up";
+
+/** Map an arbitrary TS-side trigger string onto the wire vocabulary. Unknown values fall to
+ *  "catch-up" (never "session-start") so an unrecognized trigger can never bypass the inject
+ *  gate's session-start-only bypass (D2). */
+export function toCortexTrigger(t: string): CortexWireTrigger {
+  switch (t) {
+    case "session_start":
+    case "reconnect":
+      return "session-start";
+    case "pane_switch":
+    case "project_switch":
+      return "pane-switch";
+    case "command_outcome":
+      return "command-outcome";
+    default:
+      return "catch-up";
+  }
+}
+
+/** One prior decide outcome, as retained by the D4 ring buffer (src/memory/decisionRing.ts).
+ *  `tierHashes` covers only the tiers listed in `droppedTiers` (the hysteresis rule only ever
+ *  needs the hash of what was dropped, to detect a later content change). */
+export interface CortexHistoryEntry {
+  droppedTiers: string[];
+  tierHashes: Record<string, string>;
+  trigger: string;
+  ts: number;
+}
+
+/** Ring-buffer depth for CortexCtx.history (D4). Named constant, reviewable default — not a
+ *  magic number. Mirrors python/synthesizer's own HISTORY_K, which MUST stay equal (D4). */
+export const HISTORY_K = 8;
 
 export const CortexDecisionSchema = z.object({
   keep: z.array(z.string()),
   drop: z.array(z.string()),
   rerank: z.array(z.string()),
+  // Wave 4 (D3): per-tier char caps the cortex allocated for this decision. Optional so an
+  // older daemon (pre-cutover, no budget field) still validates; absent ⇒ renderer falls back
+  // to its own default weights (src/memory/index.ts assembleBrief).
+  budget: z.record(z.string(), z.number()).optional(),
 });
 
 export const CortexTraceSchema = z.object({

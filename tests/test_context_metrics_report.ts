@@ -135,8 +135,88 @@ test("buildContextMetricsReport produces the exact expected JSON for a hand-seed
     durableDuplicatePaneCount: null,
     wrongPaneRefusals: null,
     approvalExactlyOnceSuccessRate: null,
+    // Wave 4 (D6): no cortex-primary/cortex-miss rows in this fixture -> both rates are 0 (not
+    // null — the injected SET is non-empty, just none of it is cortex-sourced/floored).
+    cortexPrimaryRate: 0,
+    cortexFallbackRate: 0,
     notes: [DEDUPE_NOTE, SESSION_ID_NOTE, NOT_DERIVABLE_NOTE],
   });
+
+  s.close();
+});
+
+// ── Wave 4 (D6): cortexPrimaryRate / cortexFallbackRate arithmetic ──────────────────────────────
+test("buildContextMetricsReport: cortexPrimaryRate/cortexFallbackRate over a mixed injected set", () => {
+  const s = seed();
+  const rows: ContextInjectionEvent[] = [
+    // injected, source cortex-primary
+    {
+      id: "cx-1", ts: BASE_TS + 1, session_id: null, interaction_id: null, inject_id: "inj-cx-1",
+      trigger: "pane_switch", active_project_id: "proj-a", active_pane_id: "pane-p1",
+      brief_active_pane_id: "pane-p1", source: "cortex-primary", disposition: "injected",
+      skipped_reason: null, source_snapshot_hash: null, brief_hash: "hash-cx1",
+      brief_chars: 300, estimated_tokens: 75, elapsed_ms: 2, error: null,
+    },
+    // injected, source fallback (cortex not primary for this call)
+    {
+      id: "cx-2", ts: BASE_TS + 2, session_id: null, interaction_id: null, inject_id: "inj-cx-2",
+      trigger: "pane_switch", active_project_id: "proj-a", active_pane_id: "pane-p2",
+      brief_active_pane_id: "pane-p2", source: "fallback", disposition: "injected",
+      skipped_reason: null, source_snapshot_hash: null, brief_hash: "hash-cx2",
+      brief_chars: 200, estimated_tokens: 50, elapsed_ms: 2, error: null,
+    },
+    // cortex-miss: an INJECTED-AT-THE-FLOOR brief (primary mode, cortex missed) — part of the
+    // injected SET (D6), NOT skippedByDisposition, and its tokens/focus count toward the totals.
+    {
+      id: "cx-3", ts: BASE_TS + 3, session_id: null, interaction_id: null, inject_id: "inj-cx-3",
+      trigger: "pane_switch", active_project_id: "proj-a", active_pane_id: "pane-p3",
+      brief_active_pane_id: "pane-p3", source: "fallback", disposition: "cortex-miss",
+      skipped_reason: null, source_snapshot_hash: null, brief_hash: "hash-cx3",
+      brief_chars: 100, estimated_tokens: 25, elapsed_ms: 2, error: null,
+    },
+    // a genuine gate skip (D2) — must NOT be in the injected set, must land in skippedByDisposition.
+    {
+      id: "cx-4", ts: BASE_TS + 4, session_id: null, interaction_id: null, inject_id: null,
+      trigger: "command_outcome", active_project_id: "proj-a", active_pane_id: "pane-p1",
+      brief_active_pane_id: null, source: "none", disposition: "unchanged-brief",
+      skipped_reason: "snapshot hash unchanged since the last injected brief", source_snapshot_hash: "snap-1",
+      brief_hash: null, brief_chars: 0, estimated_tokens: 0, elapsed_ms: 1, error: null,
+    },
+  ];
+  for (const r of rows) s.recordContextInjection(r);
+
+  const report = buildContextMetricsReport(s, { sinceMs: 0 });
+
+  // injected set = cx-1, cx-2, cx-3 (3 rows); cx-4 (unchanged-brief) is excluded.
+  assert.strictEqual(report.contextInjectionCount, 3);
+  assert.strictEqual(report.rowCount, 4);
+  assert.deepStrictEqual(report.skippedByDisposition, { "unchanged-brief": 1 });
+  assert.strictEqual(report.skippedCount, 1);
+  // cortexPrimaryRate: 1 of 3 injected-set rows is source "cortex-primary".
+  assert.strictEqual(report.cortexPrimaryRate, 1 / 3);
+  // cortexFallbackRate: 1 of 3 injected-set rows is disposition "cortex-miss".
+  assert.strictEqual(report.cortexFallbackRate, 1 / 3);
+  // tokens/cost/focus now range over the injected SET (3 rows): 75+50+25 = 150.
+  assert.strictEqual(report.estimatedInputTokens, 150);
+  assert.strictEqual(report.focusCorrectnessRate, 1, "all three injected-set rows have matching active/brief pane ids");
+
+  s.close();
+});
+
+test("buildContextMetricsReport: cortexPrimaryRate/cortexFallbackRate are null on an empty injected set", () => {
+  const s = seed();
+  s.recordContextInjection({
+    id: "cx-skip", ts: BASE_TS + 1, session_id: null, interaction_id: null, inject_id: null,
+    trigger: "pane_switch", active_project_id: null, active_pane_id: null,
+    brief_active_pane_id: null, source: "none", disposition: "skipped_no_session",
+    skipped_reason: "no active gemini session", source_snapshot_hash: null, brief_hash: null,
+    brief_chars: 0, estimated_tokens: 0, elapsed_ms: null, error: null,
+  });
+
+  const report = buildContextMetricsReport(s, { sinceMs: 0 });
+  assert.strictEqual(report.contextInjectionCount, 0);
+  assert.strictEqual(report.cortexPrimaryRate, null);
+  assert.strictEqual(report.cortexFallbackRate, null);
 
   s.close();
 });
@@ -175,6 +255,8 @@ test("buildContextMetricsReport on an empty DB returns a well-formed zeroed/null
   assert.strictEqual(report.durableDuplicatePaneCount, null);
   assert.strictEqual(report.wrongPaneRefusals, null);
   assert.strictEqual(report.approvalExactlyOnceSuccessRate, null);
+  assert.strictEqual(report.cortexPrimaryRate, null, "primacy of zero injections is undefined, not 0");
+  assert.strictEqual(report.cortexFallbackRate, null, "fallback rate of zero injections is undefined, not 0");
 });
 
 test("buildContextMetricsReport is deterministic — the same seeded DB yields byte-identical JSON across repeated calls", () => {

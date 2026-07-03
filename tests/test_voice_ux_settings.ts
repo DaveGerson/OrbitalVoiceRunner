@@ -36,6 +36,9 @@ test("DEFAULT_VOICE_UX matches the spec defaults", () => {
     sitrepShape: "brief",
     focusBindPolicy: "confirm",
     confirmTimeoutMs: 10_000,
+    // Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the inject gate's
+    // debounce floor.
+    contextInjectDebounceMs: 3000,
   });
 });
 
@@ -70,6 +73,7 @@ test("loadSettings: a persisted PARTIAL voiceUx shallow-merges over DEFAULT_VOIC
       sitrepShape: "full",
       focusBindPolicy: DEFAULT_VOICE_UX.focusBindPolicy,
       confirmTimeoutMs: DEFAULT_VOICE_UX.confirmTimeoutMs,
+      contextInjectDebounceMs: DEFAULT_VOICE_UX.contextInjectDebounceMs,
     });
   });
 });
@@ -79,10 +83,10 @@ test("loadSettings: a fully-overridden voiceUx round-trips exactly", () => {
     const m = newManager();
     const settingsPath = m.getSettingsFilePath();
     const onDisk = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-    onDisk.voiceUx = { sitrepShape: "walk", focusBindPolicy: "echo", confirmTimeoutMs: 5000 };
+    onDisk.voiceUx = { sitrepShape: "walk", focusBindPolicy: "echo", confirmTimeoutMs: 5000, contextInjectDebounceMs: 1500 };
     fs.writeFileSync(settingsPath, JSON.stringify(onDisk, null, 2), "utf-8");
     m.loadSettings();
-    assert.deepEqual(m.settings.voiceUx, { sitrepShape: "walk", focusBindPolicy: "echo", confirmTimeoutMs: 5000 });
+    assert.deepEqual(m.settings.voiceUx, { sitrepShape: "walk", focusBindPolicy: "echo", confirmTimeoutMs: 5000, contextInjectDebounceMs: 1500 });
   });
 });
 
@@ -135,6 +139,24 @@ test("validateSettingsPutBody: valid voiceUx values (boundary-inclusive) are acc
   for (const ms of [1000, 120_000, 10_000]) {
     assert.deepEqual(validateSettingsPutBody({ voiceUx: { confirmTimeoutMs: ms } }), { ok: true }, String(ms));
   }
+  for (const ms of [0, 60_000, 3000]) {
+    assert.deepEqual(validateSettingsPutBody({ voiceUx: { contextInjectDebounceMs: ms } }), { ok: true }, String(ms));
+  }
+});
+
+// ── Wave 4 (D6): voiceUx.contextInjectDebounceMs — the inject gate's debounce floor ─────────────
+test("validateSettingsPutBody: contextInjectDebounceMs out of [0,60000] is rejected", async () => {
+  const { validateSettingsPutBody } = await import("../server");
+  for (const bad of [-1, 60_001, NaN, Infinity, -Infinity, "3000"]) {
+    const r = validateSettingsPutBody({ voiceUx: { contextInjectDebounceMs: bad } });
+    assert.equal(r.ok, false, `expected rejection for contextInjectDebounceMs=${bad}`);
+    assert.equal(r.error, "Invalid settings field 'voiceUx.contextInjectDebounceMs': must be a finite number between 0 and 60000.");
+  }
+});
+
+test("validateSettingsPutBody: contextInjectDebounceMs=0 is accepted (debounce effectively disabled)", async () => {
+  const { validateSettingsPutBody } = await import("../server");
+  assert.deepEqual(validateSettingsPutBody({ voiceUx: { contextInjectDebounceMs: 0 } }), { ok: true });
 });
 
 test("validateSettingsPutBody: UNKNOWN voiceUx keys are STRIPPED in place (forward compat), never 400", () => {

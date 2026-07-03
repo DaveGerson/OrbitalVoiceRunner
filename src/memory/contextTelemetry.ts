@@ -21,7 +21,11 @@ export type ContextInjectionTrigger =
   | "approval_event"
   | "handoff"
   | "manual_refresh"
-  | "test";
+  | "test"
+  // Wave 4 (D1, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the observe
+  // layer's existing idle-signal now fires injectMemoryBrief directly (a fourth call-site
+  // trigger alongside session_start/pane_switch/catch_me_up).
+  | "command_outcome";
 
 /** Outcome of one injection attempt. `skipped_empty_brief` is a delta-18.3 addition: the doc's
  *  original taxonomy conflated "no active pane" with "brief rendered empty for the active pane",
@@ -34,7 +38,16 @@ export type ContextInjectionDisposition =
   | "skipped_stale_brief"
   | "skipped_empty_brief"
   | "skipped_dedupe_candidate"
-  | "failed";
+  | "failed"
+  // Wave 4 (D2, cortex cutover design): the InjectGate's own skip reasons — recorded BEFORE
+  // any Python round-trip. Distinct from the pre-existing skipped_* values above, which fire
+  // deeper in injectMemoryBrief (no session / no active pane / stale or empty brief).
+  | "unchanged-brief"
+  | "debounce"
+  // Wave 4 (D5): an injected-at-the-floor brief when primary mode's cortex.decide missed
+  // (timeout/error/off-schema/daemon dead). Still counts as an INJECTED row for reporting
+  // purposes (D6) — the operator got a brief, just not the cortex-curated one.
+  | "cortex-miss";
 
 /** One attempted context injection (spec §6.1). Column-for-column with schema v10's
  *  `context_injections` table — see src/store/schema.ts and src/store/sqliteStore.ts. Never carries

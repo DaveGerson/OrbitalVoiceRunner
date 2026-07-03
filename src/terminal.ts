@@ -1482,6 +1482,7 @@ export class OrchestratorManager {
   public updateSettings(newSettings: Partial<SystemSettings>) {
     if (newSettings.server) this.settings.server = { ...this.settings.server, ...newSettings.server };
     if (newSettings.voiceAi) this.settings.voiceAi = { ...this.settings.voiceAi, ...newSettings.voiceAi };
+    if (newSettings.voiceUx) this.settings.voiceUx = { ...this.settings.voiceUx, ...newSettings.voiceUx };
     if (newSettings.projects) this.settings.projects = { ...this.settings.projects, ...newSettings.projects };
     if (newSettings.presets) this.settings.presets = parsePresetsSafe(newSettings.presets);
     if (newSettings.announcements) {

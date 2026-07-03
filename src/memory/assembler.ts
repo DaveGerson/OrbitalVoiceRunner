@@ -1,6 +1,25 @@
 // src/memory/assembler.ts — deterministic, no-LLM blend of tiers into one budgeted brief.
 // This is the anti-rot guarantee: it always produces a FRESH brief with Python absent (spec M8).
+//
+// Wave 4 (D5, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): assembleBrief gained an
+// optional render PLAN — {order, caps} — so the renderer can honor the cortex's curated tier order
+// and per-tier char budget while staying a pure renderer (the cortex is the single curation
+// authority; this module never decides relevance, only renders). An ABSENT plan renders the
+// CANONICAL order with weight-derived caps — i.e. TODAY'S bytes verbatim, byte-for-byte identical
+// to the pre-cutover behavior. This is the fail-closed FLOOR every miss path falls back to.
 import type { MemoryTiers, MemoryConfig, SynthesizedBrief } from "./types";
+
+/** The cortex's curated render instructions: an ordered tier list (`decision.keep`, reordered) and
+ *  optional per-tier char caps (`decision.budget`). A tier key ABSENT from `order` is simply never
+ *  rendered — that IS "drop"; there is no separate filter/null step. `frame` is structural and is
+ *  ALWAYS rendered even if omitted from `order` (appended last). An unknown key in `order` (not one
+ *  of the five canonical tier names) is silently ignored. */
+export interface RenderPlan {
+  order: string[];
+  caps: Record<string, number>;
+}
+
+const CANONICAL_ORDER = ["project", "pane", "breadcrumbs", "board", "frame"];
 
 function cap(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -8,62 +27,76 @@ function cap(s: string, max: number): string {
 }
 
 /** PROJECT (mid-ground) block, or null when absent. Identical text to the inline original. */
-function projectBlock(tiers: MemoryTiers, B: number, w: MemoryConfig["weights"]): string | null {
+function projectBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.project) return null;
   const p = tiers.project;
   return cap(
     `PROJECT ${p.name}: ${p.summary}` +
     (p.keyTerms.length ? ` | terms: ${p.keyTerms.join(", ")}` : "") +
     (p.recentDecisions.length ? ` | decisions: ${p.recentDecisions.slice(0, 3).join("; ")}` : ""),
-    Math.floor(B * w.project));
+    capChars);
 }
 
 /** ACTIVE PANE (sharp foreground) block, or null when absent. */
-function paneBlock(tiers: MemoryTiers, B: number, w: MemoryConfig["weights"]): string | null {
+function paneBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.pane) return null;
   const pn = tiers.pane;
   return cap(
     `ACTIVE PANE ${pn.name} (${pn.status}, ${pn.runtimeType})` +
     (pn.lastCommand ? ` last: ${pn.lastCommand}` : "") +
     (pn.recent.length ? ` | recent: ${pn.recent.slice(0, 4).join("; ")}` : ""),
-    Math.floor(B * w.pane));
+    capChars);
 }
 
 /** BREADCRUMBS (decaying working memory) block, or null when empty. */
-function breadcrumbsBlock(tiers: MemoryTiers, B: number, w: MemoryConfig["weights"]): string | null {
+function breadcrumbsBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.breadcrumbs.length) return null;
-  return cap(`RECENTLY: ${tiers.breadcrumbs.map(b => b.text).join(" · ")}`, Math.floor(B * w.breadcrumbs));
+  return cap(`RECENTLY: ${tiers.breadcrumbs.map(b => b.text).join(" · ")}`, capChars);
 }
 
 /** BOARD (perception) block, or null when empty. */
-function boardBlock(tiers: MemoryTiers, B: number, w: MemoryConfig["weights"]): string | null {
+function boardBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.board.length) return null;
-  return cap(`BOARD: ${tiers.board.map(b => `${b.name}=${b.status}`).join(", ")}`, Math.floor(B * w.board));
+  return cap(`BOARD: ${tiers.board.map(b => `${b.name}=${b.status}`).join(", ")}`, capChars);
 }
 
 /** JANUS FRAME (self-model) block — always present. */
-function frameBlock(tiers: MemoryTiers, B: number, w: MemoryConfig["weights"]): string {
+function frameBlock(tiers: MemoryTiers, capChars: number): string {
   const f = tiers.frame;
   return cap(`FRAME ${f.role} | gates: ${f.gatePosture}` + (f.prefs.length ? ` | prefs: ${f.prefs.join("; ")}` : ""),
-    Math.floor(B * w.frame));
+    capChars);
 }
 
-export function assembleBrief(tiers: MemoryTiers, cfg: MemoryConfig, _now: number): SynthesizedBrief {
-  const B = cfg.totalBudgetChars, w = cfg.weights;
+const RENDERERS: Record<string, (tiers: MemoryTiers, capChars: number) => string | null> = {
+  project: projectBlock,
+  pane: paneBlock,
+  breadcrumbs: breadcrumbsBlock,
+  board: boardBlock,
+  frame: frameBlock,
+};
+
+export function assembleBrief(tiers: MemoryTiers, cfg: MemoryConfig, _now: number, plan?: RenderPlan): SynthesizedBrief {
+  const B = cfg.totalBudgetChars;
+  const weights = cfg.weights as unknown as Record<string, number>;
+  const order = plan?.order ?? CANONICAL_ORDER;
+  const caps = plan?.caps ?? {};
   const perTierChars: Record<string, number> = {};
   const blocks: string[] = [];
+  const seen = new Set<string>();
 
-  const collect = (key: string, body: string | null): void => {
+  const collect = (key: string): void => {
+    const render = RENDERERS[key];
+    if (!render || seen.has(key)) return; // unknown/duplicate key — ignored
+    seen.add(key);
+    const capChars = caps[key] ?? Math.floor(B * (weights[key] ?? 0));
+    const body = render(tiers, capChars);
     if (body === null) return;
     perTierChars[key] = body.length;
     blocks.push(body);
   };
 
-  collect("project", projectBlock(tiers, B, w));
-  collect("pane", paneBlock(tiers, B, w));
-  collect("breadcrumbs", breadcrumbsBlock(tiers, B, w));
-  collect("board", boardBlock(tiers, B, w));
-  collect("frame", frameBlock(tiers, B, w));
+  for (const key of order) collect(key);
+  if (!seen.has("frame")) collect("frame"); // structural — always rendered, even if plan omitted it
 
   return {
     text: blocks.join("\n"),

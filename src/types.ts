@@ -279,12 +279,18 @@ export interface VoiceUxSettings {
   sitrepShape: "brief" | "walk" | "full";
   focusBindPolicy: "confirm" | "echo" | "tiered";
   confirmTimeoutMs: number;
+  // Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the inject
+  // gate's debounce floor — minimum ms since the last INJECTED brief before a changed-hash
+  // event is allowed to inject again (session-start always bypasses). Reuses this block's
+  // existing strip/validate idiom (VOICE_UX_KNOWN_KEYS + a dedicated validator in server.ts).
+  contextInjectDebounceMs: number;
 }
 
 export const DEFAULT_VOICE_UX: VoiceUxSettings = {
   sitrepShape: "brief",
   focusBindPolicy: "confirm",
   confirmTimeoutMs: 10_000,
+  contextInjectDebounceMs: 3000,
 };
 
 export interface SystemSettings {

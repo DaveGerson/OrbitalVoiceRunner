@@ -39,12 +39,24 @@ import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 import { buildContextMetricsReport } from "../src/memory/contextMetricsReport";
 import type { ContextInjectionEvent } from "../src/memory/contextTelemetry";
+import { DEFAULT_VOICE_UX } from "../src/types";
+import { setCortexPrimary } from "../src/memory/cortexShadow";
 
 // ── Shared, closure-free helpers (parameterized on the running server) ─────────────────────────
 
 /** A real-execution probe on the pane's native shell — same idiom as tests/test_voice_journeys.ts. */
 function execProbe(verb: string): string {
   return process.platform === "win32" ? `echo ${verb}_%VJ42%` : `echo ${verb}_\${VJ42}`;
+}
+
+/** Wave 4 (D2, cortex cutover design): the InjectGate's debounce floor (default 3000ms) now sits in
+ *  front of every non-session-start injection. These journeys drive many rapid, back-to-back
+ *  triggers with no real-clock pacing — their own concern is the spec §10 acceptance bullets (no
+ *  dup panes, focus correctness, cost estimates, repeated-hash visibility, etc.), not the gate's own
+ *  timing behavior (covered by tests/test_inject_gate.ts and tests/test_cortex_cutover_journeys.ts),
+ *  so zero the floor to isolate that concern. */
+function disableInjectDebounce(running: RunningServer): void {
+  running.manager.settings.voiceUx = { ...(running.manager.settings.voiceUx ?? DEFAULT_VOICE_UX), contextInjectDebounceMs: 0 };
 }
 
 /** Register a pane WITHOUT spawning a real PTY (tests/test_context_injection_telemetry.ts idiom) —
@@ -154,6 +166,15 @@ describe("context smoke journey — 15-minute bugfix session (spec §10.1)", () 
     mock = installMockLive();
     bootTs = Date.now();
     running = await startServer({ port: 0, enableVite: false });
+    // Wave 4 (D5) fixer note, 2026-07-03: cortex-primary is now the boot-time DEFAULT
+    // (server.ts's resolveCortexPrimaryFlagFromEnv). This suite's own concern is the telemetry/
+    // journey plumbing (dup panes, focus correctness, cost estimates, inject_id joins, ...), not
+    // cortex curation, and it boots with no warm daemon — under the default every injected brief
+    // would floor to `disposition: 'cortex-miss'` (still part of the injected SET, but not the
+    // literal "injected" string these assertions check for). Pin it explicitly OFF so this journey
+    // stays a pure floor-path test regardless of the ambient default.
+    setCortexPrimary(false);
+    disableInjectDebounce(running);
     if (!running.manager.settings.advanced.capabilityGates) (running.manager.settings.advanced as any).capabilityGates = {};
     (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
     process.env.VJ42 = "42";
@@ -304,6 +325,15 @@ describe("context smoke journey — 30-minute debugging session (spec §10.2)", 
     mock = installMockLive();
     bootTs = Date.now();
     running = await startServer({ port: 0, enableVite: false });
+    // Wave 4 (D5) fixer note, 2026-07-03: cortex-primary is now the boot-time DEFAULT
+    // (server.ts's resolveCortexPrimaryFlagFromEnv). This suite's own concern is the telemetry/
+    // journey plumbing (dup panes, focus correctness, cost estimates, inject_id joins, ...), not
+    // cortex curation, and it boots with no warm daemon — under the default every injected brief
+    // would floor to `disposition: 'cortex-miss'` (still part of the injected SET, but not the
+    // literal "injected" string these assertions check for). Pin it explicitly OFF so this journey
+    // stays a pure floor-path test regardless of the ambient default.
+    setCortexPrimary(false);
+    disableInjectDebounce(running);
 
     client = await connectOperator(running, apiToken);
     await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
@@ -437,6 +467,15 @@ describe("context smoke journey — 1-2 hour orchestration session (spec §10.3,
     mock = installMockLive();
     bootTs = Date.now();
     running = await startServer({ port: 0, enableVite: false });
+    // Wave 4 (D5) fixer note, 2026-07-03: cortex-primary is now the boot-time DEFAULT
+    // (server.ts's resolveCortexPrimaryFlagFromEnv). This suite's own concern is the telemetry/
+    // journey plumbing (dup panes, focus correctness, cost estimates, inject_id joins, ...), not
+    // cortex curation, and it boots with no warm daemon — under the default every injected brief
+    // would floor to `disposition: 'cortex-miss'` (still part of the injected SET, but not the
+    // literal "injected" string these assertions check for). Pin it explicitly OFF so this journey
+    // stays a pure floor-path test regardless of the ambient default.
+    setCortexPrimary(false);
+    disableInjectDebounce(running);
     if (!running.manager.settings.advanced.capabilityGates) (running.manager.settings.advanced as any).capabilityGates = {};
     (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
     process.env.VJ42 = "42";
