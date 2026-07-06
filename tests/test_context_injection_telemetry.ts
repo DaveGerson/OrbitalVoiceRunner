@@ -40,7 +40,9 @@ import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 import type { JanusStore } from "../src/store/sqliteStore";
+import { DEFAULT_VOICE_UX } from "../src/types";
 import type { ContextInjectionEvent } from "../src/memory/contextTelemetry";
+import { setCortexPrimary } from "../src/memory/cortexShadow";
 
 const PROJECT = "cti_proj";
 
@@ -112,6 +114,20 @@ describe("cortex context-injection telemetry (real server, real choke point — 
     running = await startServer({ port: 0, enableVite: false });
     assert.ok(running._testStore, "the server exposes the JanusStore test seam");
     assert.ok(running._testStore!(), "the SQLite store booted (default backend — delta 18.4 requires it non-null)");
+    // Wave 4 (D5) fixer note, 2026-07-03: cortex-primary is now the boot-time DEFAULT (server.ts's
+    // resolveCortexPrimaryFlagFromEnv), but this suite is about the injectMemoryBrief choke point's
+    // OWN telemetry/disposition-reachability contract (session_start/pane_switch/reconnect rows,
+    // inject_id joins, ...), not cortex curation — and it boots with no warm daemon. Pin cortex
+    // primary explicitly OFF so every `disposition, "injected"` assertion below stays a floor-path
+    // assertion regardless of the ambient default (cortex-primary curation itself is exercised
+    // separately, with a controllable fake client, by tests/test_cortex_cutover_journeys.ts).
+    setCortexPrimary(false);
+    // Wave 4 (D2, cortex cutover design): the InjectGate's debounce floor (default 3000ms) now sits
+    // in front of every non-session-start injection. This suite drives many DISTINCT-pane triggers
+    // back-to-back with no real-clock pacing — its own concern is per-trigger disposition/telemetry
+    // labeling (the gate's own timing behavior is covered by tests/test_inject_gate.ts and
+    // tests/test_cortex_cutover_journeys.ts), so zero the floor to isolate that concern.
+    running.manager.settings.voiceUx = { ...(running.manager.settings.voiceUx ?? DEFAULT_VOICE_UX), contextInjectDebounceMs: 0 };
 
     client = new WebSocket(`ws://127.0.0.1:${running.port}/live`, {
       headers: { Cookie: `auth_token=${apiToken}` },

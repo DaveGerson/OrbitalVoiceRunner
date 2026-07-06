@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
 import { registerHistoryBridge } from "./src/historyBridge";
 import { PaneSignalBus } from "./src/paneSignalBus";
+import type { PaneSignalKind } from "./src/paneSignals";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
@@ -36,6 +37,7 @@ import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import type { CapabilityGate } from "./src/types";
+import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { z } from "zod";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
@@ -147,7 +149,7 @@ function validateCapabilityGatesField(adv: Record<string, unknown>): string | nu
 // validateCapabilityGatesField), never a 400 — a newer client's extra knob must not brick the PUT.
 const SettingsSitrepShapeSchema = z.enum(["brief", "walk", "full"]);
 const SettingsFocusBindPolicySchema = z.enum(["confirm", "echo", "tiered"]);
-const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs"]);
+const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs"]);
 
 /** Strip unknown voiceUx keys IN PLACE (forward compat, mirrors validateCapabilityGatesField's
  *  unknown-key strip). Pure side effect, no validation — kept separate to hold each function's own
@@ -182,6 +184,21 @@ function validateVoiceUxConfirmTimeout(voiceUx: Record<string, unknown>): string
   return null;
 }
 
+/** Validate voiceUx.contextInjectDebounceMs (when present): must be a finite number in [0, 60000].
+ *  Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md) — the inject gate's
+ *  debounce floor (src/memory/injectGate.ts, memory-owned): minimum ms since the last INJECTED
+ *  brief before a changed-hash event may inject again. Reuses this block's existing strip/validate
+ *  idiom verbatim, per spec D6. 0 is a valid floor (debounce effectively disabled); 60000 (60s) is a
+ *  generous sanity ceiling — same shape as validateVoiceUxConfirmTimeout above. */
+function validateVoiceUxDebounceMs(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.contextInjectDebounceMs === undefined) return null;
+  const v = voiceUx.contextInjectDebounceMs;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 60_000) {
+    return "Invalid settings field 'voiceUx.contextInjectDebounceMs': must be a finite number between 0 and 60000.";
+  }
+  return null;
+}
+
 /** Validate (and forward-compat-strip) settings.voiceUx (when present). Returns an error message
  *  string for an invalid value on a KNOWN field, else null. Pure over everything except the
  *  unknown-key strip (mirrors validateCapabilityGatesField). */
@@ -192,7 +209,7 @@ function validateVoiceUxField(body: Record<string, unknown>): string | null {
     return "Invalid settings field 'voiceUx': expected an object.";
   }
   stripUnknownVoiceUxKeys(voiceUx);
-  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx);
+  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx) ?? validateVoiceUxDebounceMs(voiceUx);
 }
 
 export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
@@ -688,6 +705,16 @@ export interface StartServerOptions {
   enableVite?: boolean;
   /** Actually call server.listen(). Defaults to true. */
   listen?: boolean;
+  /** TEST-ONLY seam (Wave 4 cortex-cutover journeys, docs/superpowers/specs/2026-07-02-cortex-
+   *  cutover-design.md): override the PythonCortexClient MemoryService is constructed with, so a
+   *  journey suite can drive the cortex-primary curation path deterministically against an
+   *  in-process fake instead of racing a real spawned python daemon's startup timing (no live API
+   *  keys / real subprocess races in tests — mirrors the fake-PythonCortexClient idiom already
+   *  established in tests/test_cortex_flip.ts). Combine with `setCortexPrimary(true)` (imported
+   *  from src/memory/cortexShadow) AFTER startServer resolves, since the disabled/init-failure
+   *  paths inside createPythonSynthClientOrUndefined force the flag OFF during boot. Undefined in
+   *  production. NOT for prod use. */
+  testCortexClientOverride?: PythonCortexClient;
 }
 
 export interface RunningServer {
@@ -718,6 +745,11 @@ export interface RunningServer {
    *  only ledger backend, so this is non-null on any server that finished booting — the `| null` in
    *  the return type is defensive typing, matching `store`'s own declared type. NOT for prod use. */
   _testStore?: () => JanusStore | null;
+  /** Wave 4 cortex-cutover journeys test seam: publish a pane signal directly onto the server's
+   *  paneSignalBus, bypassing the need for a real PTY/command run to reach the D1 command-outcome
+   *  call site. Returns true if delivered (false if the bus's own cross-signal debounce/cooldown
+   *  dropped it — same semantics as a real onIdle-originated publish). NOT for prod use. */
+  _testPublishPaneSignal?: (sig: { paneId: string; kind: PaneSignalKind; detail?: string }) => boolean;
 }
 
 // VERBATIM extraction from startServer (CC paydown). Registers, IN ORDER: (1) the cookie-seed
@@ -794,16 +826,36 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
 }
 
-// Inc 4 task B-1 — the CORTEX FLIP boot wiring. Default OFF (full-tier floor). JANUS_CORTEX_PRIMARY=1
-// makes the cortex the PRIMARY context-curation authority (synthesizeAsync renders ONLY the tiers it
-// keeps); JANUS_CORTEX_PRIMARY_TIMEOUT_MS (optional) tightens/loosens the budget past which a slow
-// cortex falls to the full-tier floor (default 300ms). Reversible at runtime; floor = the synth/
-// assembler. Extracted from createPythonSynthClientOrUndefined to keep that host under the CC<=10 gate.
+// Inc 4 task B-1 — the CORTEX FLIP boot wiring. JANUS_CORTEX_PRIMARY=0 makes the cortex floor-only
+// (full-tier synth/assembler, the escape hatch); unset or "1" makes it the PRIMARY context-curation
+// authority (synthesizeAsync renders ONLY the tiers it keeps). JANUS_CORTEX_PRIMARY_TIMEOUT_MS
+// (optional) tightens/loosens the budget past which a slow cortex falls to the full-tier floor
+// (default 300ms). Reversible at runtime. Extracted from createPythonSynthClientOrUndefined to keep
+// that host under the CC<=10 gate; the env-string parse is further pulled into
+// resolveCortexPrimaryFlagFromEnv (pure, exported for unit testing — no live daemon needed to verify it).
+//
+// Wave 4 (896, 2026-07-02) D5: unset or "1" = primary is now the DEFAULT (fixer review, 2026-07-03,
+// completing the flip a prior integration pass had reverted). Getting here required un-blocking the
+// three fixture files that boot a real server with no warm daemon and used to lean on the (then-OFF)
+// ambient default to keep every injected row's disposition "injected": they now pin cortex primary
+// EXPLICITLY OFF right after boot (tests/test_context_smoke_journeys.ts,
+// tests/test_context_injection_telemetry.ts, tests/test_cortex_cutover_journeys.ts's Journey 4) since
+// none of them are actually testing cortex-primary curation — only the gate/telemetry plumbing around
+// it, which is unaffected by which curation authority is live.
 function applyCortexFlipFromEnv(): void {
-  const cortexFlipOn = /^(1|true|on|yes)$/i.test((process.env.JANUS_CORTEX_PRIMARY ?? "").trim());
+  const cortexFlipOn = resolveCortexPrimaryFlagFromEnv(process.env.JANUS_CORTEX_PRIMARY);
   const cortexFlipTimeoutMs = Number(process.env.JANUS_CORTEX_PRIMARY_TIMEOUT_MS) || undefined;
   setCortexPrimary(cortexFlipOn, cortexFlipTimeoutMs);
   if (cortexFlipOn) console.error(`[synth] cortex curation: PYTHON-PRIMARY (flip ON, floor=full-tier synth, budget=${cortexFlipTimeoutMs ?? 300}ms)`);
+}
+
+// Pure env-string -> boolean resolution for the CORTEX FLIP's default (spec D5): unset/empty or any
+// of the recognized "on" tokens -> primary; a recognized "off" token is the explicit escape hatch;
+// an UNRECOGNIZED non-empty value fails toward the new default (primary) rather than silently
+// downgrading to the floor on a config typo. Exported for unit testing (tests/
+// test_startserver_complexity_refactor.ts) — the parse itself needs no live daemon to verify.
+export function resolveCortexPrimaryFlagFromEnv(raw: string | undefined): boolean {
+  return !/^(0|false|off|no)$/i.test((raw ?? "").trim());
 }
 
 // Best-effort, non-fatal construction of the optional warm Python daemon: disabled ⇒ undefined; an
@@ -834,9 +886,9 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
     setApprovalPythonPrimary(flipOn, flipTimeoutMs);
     if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
-    applyCortexFlipFromEnv(); // Inc 4 task B-1 — the CORTEX FLIP (default OFF; extracted to hold CC<=10).
-    // Inc 4 slice 1 (SHADOW): the cortex facade rides the SAME multiplexed core (observe-only — its
-    // decision is logged, never applied). One daemon, many typed facades (synth + approval + cortex).
+    applyCortexFlipFromEnv(); // Wave 4 (896) — the CORTEX FLIP (default PRIMARY, =0 escape hatch; extracted to hold CC<=10).
+    // The cortex facade rides the SAME multiplexed core. One daemon, many typed facades
+    // (synth + approval + cortex).
     return { synth: synthFacadeOverCore(core), cortex: createPythonCortexClient(core) };
   } catch (e) {
     console.error("[memory] python daemon client init failed (continuing on fallback):", e);
@@ -1154,7 +1206,22 @@ function bindCortexDecisionSink(store: JanusStore | null): CortexDecisionSink | 
 // client so startServer's close() can dispose the daemon. `manager`, `redactSecrets`,
 // `createMemoryService`, `clampMemorySynthTimeoutMs`, and `createPythonSynthClientOrUndefined` are
 // all module-scope; only the connection-bound `store` is injected.
-function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state: "python" | "fallback", reason: string) => void): {
+/** Wave 4 test-seam resolution: prefer the test-only cortex client override when supplied, else the
+ *  real/undefined client the daemon bootstrap resolved. Extracted purely to keep
+ *  createMemorySubsystem's cyclomatic complexity under the CC<=10 gate (this file's existing
+ *  one-helper-per-branch idiom, e.g. clampMemorySynthTimeoutMs above). */
+function resolveCortexClient(override: PythonCortexClient | undefined, real: PythonCortexClient | undefined): PythonCortexClient | undefined {
+  return override ?? real;
+}
+
+function createMemorySubsystem(
+  store: JanusStore | null,
+  onDaemonState?: (state: "python" | "fallback", reason: string) => void,
+  // TEST-ONLY (see StartServerOptions.testCortexClientOverride): when supplied, replaces the
+  // real/undefined cortex client the daemon bootstrap resolved, so journey suites can drive the
+  // cortex-primary path against a controllable fake with no real-process timing involved.
+  cortexClientOverride?: PythonCortexClient,
+): {
   memory: ReturnType<typeof createMemoryService>;
   pythonSynthClient: PythonSynthClient | undefined;
 } {
@@ -1181,6 +1248,9 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
   // writer is the decisionSink (null store ⇒ undefined ⇒ the tap observes but persists nothing —
   // parity preserved). recordCortexDecision swallows + console.errors on any DB fault (fail-soft).
   const cortexDecisionSink = bindCortexDecisionSink(store);
+  // Wave 4 (D6, cortex cutover design): the inject gate's live debounce-floor getter. Read fresh on
+  // every gate.evaluate() call (never cached), so a settings PUT to voiceUx.contextInjectDebounceMs
+  // takes effect immediately, same idiom as the confirmTimeoutMs getter above.
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -1191,8 +1261,9 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
     },
     pythonSynthClient,
     memorySynthTimeoutMs,
-    cortexClient,
+    resolveCortexClient(cortexClientOverride, cortexClient),
     cortexDecisionSink,
+    () => (manager.settings.voiceUx ?? DEFAULT_VOICE_UX).contextInjectDebounceMs ?? 3000,
   );
   return { memory, pythonSynthClient };
 }
@@ -1335,7 +1406,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       console.error(`[synth] daemon_state ${state} (${reason})`);
       daemonTracker.onTransition(state);
     } catch { /* best-effort observability accounting */ }
-  });
+  }, options.testCortexClientOverride);
   // Voice-UX wave 3: the SECOND optional warm Python daemon (focus resolution + SITREP ranking),
   // gated by the SAME master switch as the synth/approval/cortex daemon. VoiceDeps.policies threads it
   // to the voice lane only (server.ts REST ctx does NOT get it — both new tools are voice-only).
@@ -2022,6 +2093,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
     _testSetReconnectNudge: (fn: (() => void) | null) => { setVoiceReconnectNudge(fn); },
     _testStore: () => store,
+    _testPublishPaneSignal: (sig) => paneSignalBus.publish(sig),
   };
 }
 

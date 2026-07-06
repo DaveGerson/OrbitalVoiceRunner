@@ -67,6 +67,16 @@ export interface ContextMetricsReport {
   durableDuplicatePaneCount: number | null;
   wrongPaneRefusals: number | null;
   approvalExactlyOnceSuccessRate: number | null;
+  /** Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the fraction of the
+   *  INJECTED SET (disposition "injected" OR "cortex-miss" — see injectedSetNote below) whose
+   *  `source` is "cortex-primary". Null when the injected set is empty ("primacy of zero
+   *  injections" is undefined, same convention as focusCorrectnessRate). */
+  cortexPrimaryRate: number | null;
+  /** Wave 4 (D6): the fraction of the injected set whose disposition is "cortex-miss" — an
+   *  injected-at-the-floor brief because primary mode's cortex.decide missed (timeout/error/
+   *  off-schema/daemon dead). Null when the injected set is empty. Post-land health check target
+   *  (spec D5): <1% on a warm daemon. */
+  cortexFallbackRate: number | null;
   notes: string[];
 }
 
@@ -78,11 +88,21 @@ function countByTrigger(rows: ContextInjectionEvent[]): Record<string, number> {
   return out;
 }
 
-/** Count non-"injected" rows per disposition. */
+/** Wave 4 (D6): a row counts as "the operator got a brief" when its disposition is "injected" OR
+ *  "cortex-miss" (an injected-at-the-floor brief — see ContextInjectionDisposition's Wave 4 doc
+ *  comment in ./contextTelemetry). Every downstream metric that used to range over "injected" rows
+ *  only (tokens, cost, focus correctness, count) now ranges over this wider injected SET. */
+function isInjectedSetMember(r: ContextInjectionEvent): boolean {
+  return r.disposition === "injected" || r.disposition === ("cortex-miss" satisfies ContextInjectionDisposition);
+}
+
+/** Count non-injected-set rows per disposition (everything the operator did NOT get a brief for —
+ *  including the D2 inject-gate's own "unchanged-brief"/"debounce" skips, recorded before any
+ *  Python round-trip). */
 function countSkippedByDisposition(rows: ContextInjectionEvent[]): Record<string, number> {
   const out: Record<string, number> = {};
   for (const r of rows) {
-    if (r.disposition === "injected") continue;
+    if (isInjectedSetMember(r)) continue;
     out[r.disposition] = (out[r.disposition] ?? 0) + 1;
   }
   return out;
@@ -102,19 +122,37 @@ function computeBriefHashRepeatRate(rows: ContextInjectionEvent[]): number {
   return (total - counts.size) / total;
 }
 
-/** Among INJECTED rows only (the only rows where a brief was actually sent), the fraction whose
- *  active_pane_id matches the pane the synthesized brief was actually for. Null when there are no
- *  injected rows in the window — "correctness of zero injections" is undefined, not 1 or 0. */
-function computeFocusCorrectnessRate(injected: ContextInjectionEvent[]): number | null {
-  if (injected.length === 0) return null;
-  const correct = injected.filter((r) => r.active_pane_id === r.brief_active_pane_id).length;
-  return correct / injected.length;
+/** Among the INJECTED SET only (rows where a brief actually reached Gemini — "injected" or the
+ *  Wave 4 "cortex-miss" floor-injected variant), the fraction whose active_pane_id matches the
+ *  pane the synthesized brief was actually for. Null when the set is empty — "correctness of zero
+ *  injections" is undefined, not 1 or 0. */
+function computeFocusCorrectnessRate(injectedSet: ContextInjectionEvent[]): number | null {
+  if (injectedSet.length === 0) return null;
+  const correct = injectedSet.filter((r) => r.active_pane_id === r.brief_active_pane_id).length;
+  return correct / injectedSet.length;
 }
 
-/** Sum of estimated_tokens across INJECTED rows only — skipped/failed attempts never reached
+/** Sum of estimated_tokens across the INJECTED SET only — skipped/failed attempts never reached
  *  Gemini, so they carry no input-token cost regardless of how big the assembled brief was. */
-function sumEstimatedInputTokens(injected: ContextInjectionEvent[]): number {
-  return injected.reduce((sum, r) => sum + (r.estimated_tokens || 0), 0);
+function sumEstimatedInputTokens(injectedSet: ContextInjectionEvent[]): number {
+  return injectedSet.reduce((sum, r) => sum + (r.estimated_tokens || 0), 0);
+}
+
+/** Wave 4 (D6): fraction of the injected set curated by the cortex (source === "cortex-primary").
+ *  Null when the injected set is empty. */
+function computeCortexPrimaryRate(injectedSet: ContextInjectionEvent[]): number | null {
+  if (injectedSet.length === 0) return null;
+  const primary = injectedSet.filter((r) => r.source === "cortex-primary").length;
+  return primary / injectedSet.length;
+}
+
+/** Wave 4 (D6): fraction of the injected set that fell to the floor (disposition "cortex-miss").
+ *  Null when the injected set is empty. Post-land health check target (spec D5): <1% on a warm
+ *  daemon. */
+function computeCortexFallbackRate(injectedSet: ContextInjectionEvent[]): number | null {
+  if (injectedSet.length === 0) return null;
+  const missed = injectedSet.filter((r) => r.disposition === ("cortex-miss" satisfies ContextInjectionDisposition)).length;
+  return missed / injectedSet.length;
 }
 
 function countDistinctSessions(rows: ContextInjectionEvent[]): number {
@@ -151,9 +189,12 @@ export function buildContextMetricsReport(
   const costConfig: ContextCostConfig = { ...DEFAULT_CONTEXT_COST_CONFIG, ...options.costConfig };
 
   const rows = store.getContextInjections({ since: sinceMs, limit });
-  const injected = rows.filter((r) => r.disposition === ("injected" satisfies ContextInjectionDisposition));
+  // Wave 4 (D6): the injected SET — "injected" plus the floor-injected "cortex-miss" variant. Every
+  // metric below that used to range over "injected" rows only now ranges over this wider set (see
+  // isInjectedSetMember's doc comment).
+  const injectedSet = rows.filter(isInjectedSetMember);
 
-  const estimatedInputTokens = sumEstimatedInputTokens(injected);
+  const estimatedInputTokens = sumEstimatedInputTokens(injectedSet);
   const skippedByDisposition = countSkippedByDisposition(rows);
   const skippedCount = Object.values(skippedByDisposition).reduce((a, b) => a + b, 0);
 
@@ -161,17 +202,19 @@ export function buildContextMetricsReport(
     sinceMs,
     rowCount: rows.length,
     sessions: countDistinctSessions(rows),
-    contextInjectionCount: injected.length,
+    contextInjectionCount: injectedSet.length,
     injectionsByTrigger: countByTrigger(rows),
     skippedCount,
     skippedByDisposition,
     briefHashRepeatRate: computeBriefHashRepeatRate(rows),
     estimatedInputTokens,
     estimatedTextInputCostUsd: (estimatedInputTokens / 1_000_000) * costConfig.textInputUsdPer1M,
-    focusCorrectnessRate: computeFocusCorrectnessRate(injected),
+    focusCorrectnessRate: computeFocusCorrectnessRate(injectedSet),
     durableDuplicatePaneCount: null,
     wrongPaneRefusals: null,
     approvalExactlyOnceSuccessRate: null,
+    cortexPrimaryRate: computeCortexPrimaryRate(injectedSet),
+    cortexFallbackRate: computeCortexFallbackRate(injectedSet),
     notes: [DEDUPE_NOTE, SESSION_ID_NOTE, NOT_DERIVABLE_NOTE],
   };
 }

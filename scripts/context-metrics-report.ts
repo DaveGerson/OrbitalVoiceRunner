@@ -31,6 +31,11 @@
  *   --audio-output-usd-per-minute <n> Override ContextCostConfig.audioOutputUsdPerMinute. Must be finite.
  *
  * Exit codes: 0 = report written. 1 = bad args or the db could not be opened.
+ *
+ * Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the report JSON gained
+ * `cortexPrimaryRate` / `cortexFallbackRate` (see src/memory/contextMetricsReport.ts). No new CLI
+ * flag — both are pure derivations over `context_injections` rows already read by this script, so
+ * they appear automatically in the printed/written JSON.
  */
 import fs from "fs";
 import path from "path";

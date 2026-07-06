@@ -172,8 +172,8 @@ describe("cortex.decide golden-master parity (TS schema + shape lock)", () => {
   });
 
   it("shadow-budget-absent vector has no shadowBudget in trace", () => {
-    const v = vectors.find((x) => x.name === "shadow-budget-absent");
-    assert.ok(v, "expected a vector named 'shadow-budget-absent' in the fixture");
+    const v = vectors.find((x) => x.name === "shadow-budget-absent-command-outcome");
+    assert.ok(v, "expected a vector named 'shadow-budget-absent-command-outcome' in the fixture");
     const resp = v!.response as { ok: boolean; trace?: { shadowBudget?: unknown } };
     assert.ok(resp.ok, "shadow-budget-absent vector must be ok:true");
     assert.equal(
