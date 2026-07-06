@@ -494,11 +494,34 @@ describe("cortex cutover journey — command-outcome -> gate -> inject round-tri
     await waitFor(() => term.getRecentOutput(100).includes("cmdout_42"), 10000);
     await waitFor(() => term.status === "Idle", 10000);
 
-    const before = rowsSince(running, bootTs).length;
-    const outcomeRow = await waitFor(() => {
-      const rows = rowsSince(running, bootTs);
-      return rows.length > before ? rows.find((r) => r.trigger === "command_outcome") : undefined;
-    }, 3000);
+    // Whether THAT organic idle was DELIVERED is machine-speed dependent BY DESIGN: the bus's L1
+    // cross-kind cooldown (crossKindCooldownMs=5000, src/paneSignalBus.ts) suppresses any signal
+    // landing within 5s of the pane's last DELIVERED signal, and a fast probe (spawn running ->
+    // probe running -> quiescing -> idle, idleTimeoutMs=2000) fits the whole cluster inside one
+    // window on a fast runner (this failed deterministically on ubuntu CI while passing on slower
+    // ConPTY). The injection leg inheriting the SPOKEN-turn anti-spam is a recorded product
+    // question (bead wsm-e2e-pinned-1d6w: inject-leg vs L1 cooldown); the chain under test here is
+    // idle-edge -> voice subscription -> gate -> telemetry. So: accept the organic row when the
+    // runner was slow enough, otherwise REPLAY the same edge payload through the real bus (same
+    // publish path, full bus semantics). A single fixed sleep is NOT enough to age the window: a
+    // live shell can re-stamp it mid-wait (a late prompt redraw delivers a genuine running/idle
+    // flap — observed locally on Windows), so retry until the bus accepts the replay. Dropped
+    // publishes never stamp any bus state (src/paneSignalBus.ts), so polling is side-effect-free.
+    const organicOutcomeRow = () => rowsSince(running, bootTs).find(
+      (r) => r.trigger === "command_outcome" && r.active_pane_id === "outcome-a" && r.disposition === "injected");
+    if (!organicOutcomeRow()) {
+      const deadline = Date.now() + 20_000;
+      let redelivered = false;
+      while (!redelivered && !organicOutcomeRow() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1300));
+        redelivered = running._testPublishPaneSignal!({
+          paneId: "outcome-a", kind: "idle", detail: "completion replay (organic edge cooldown-suppressed)",
+        });
+      }
+      assert.ok(redelivered || organicOutcomeRow(),
+        "the replayed completion edge must outlive the pane's cooldown window and deliver");
+    }
+    const outcomeRow = await waitFor(organicOutcomeRow, 10000);
     assert.ok(outcomeRow, "a command_outcome-triggered injection was recorded");
     assert.strictEqual(outcomeRow!.disposition, "injected", "a genuinely changed snapshot passes the gate");
     assert.strictEqual(outcomeRow!.active_pane_id, "outcome-a", "the currently-active pane (the one that just ran) is what got injected");
