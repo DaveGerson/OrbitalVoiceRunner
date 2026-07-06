@@ -43,4 +43,21 @@ describe("capability catalog (docs/CAPABILITIES.md)", () => {
   it("render is deterministic (no timestamps / random)", () => {
     assert.strictEqual(renderCatalog(), renderCatalog());
   });
+
+  it("distinguishes internally gated actions from true always-allowed actions", () => {
+    const md = renderCatalog();
+
+    assert.match(md, /## Internally gated actions/);
+    assert.match(md, /## Internally gated actions[\s\S]*\| `deliver_handoff` \|/);
+    const alwaysAllowedSection = md.match(
+      /## Always allowed \(emergency brake\)[\s\S]*?(?=\n## Internally gated actions)/
+    )?.[0];
+    assert.ok(alwaysAllowedSection, "expected an always-allowed section before internally gated actions");
+    assert.doesNotMatch(alwaysAllowedSection, /\| `deliver_handoff` \|/);
+    assert.doesNotMatch(md, /## Capabilities without actions[\s\S]*\| `deliver_handoff` \|/);
+    assert.match(
+      md,
+      /ALWAYS_ALLOWED` sentinel only to avoid double-gating[\s\S]*handlers still route through the named capability gate/
+    );
+  });
 });
