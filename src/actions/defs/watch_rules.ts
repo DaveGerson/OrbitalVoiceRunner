@@ -4,8 +4,11 @@
  * Four NEW rest-only ActionDefs that converge inline watch-rule / plan-delete routes which have NO
  * voice twin today. surfaces = {'rest'} ONLY (so they never force a Gemini voice-tool description),
  * and each replicates its inline server.ts route logic FAITHFULLY. The UI clients read only res.ok
- * (writes) or setWatchRules()/the plan board (reads) and repaint off the watch_rules_updated /
- * plans_updated WS frames the handlers fan out.
+ * (writes) and repaint off the plans_updated WS frame the plan-delete handler fans out.
+ * wsm-e2e-pinned-33c.4: the watch_rules_updated WS frame these handlers used to also broadcast is
+ * PRUNED — no client has consumed it since the classic UI's Alerts/Orchestrate tabs were removed
+ * (d858e5e), and the Orbital Kitchen UI has no watch-rule surface at all. The persist effect (the
+ * REST backend) is unchanged; only the now-unconsumed broadcast frame is gone.
  *
  * Routes converged (the inline app.* twins are deleted in the SAME change — never both, or Express
  * keeps the first-registered handler and silently masks the cutover):
@@ -104,8 +107,9 @@ const AddWatchRuleParams = z.object({
 /**
  * add_watch_rule — FAITHFUL PORT of inline app.post("/api/watch-rules") (server.ts ~923): build a new
  * rule (generated id, enabled:true, oneShot defaulting to true when omitted), push it onto the ledger,
- * force-persist, and broadcast watch_rules_updated with the CURRENT list — now ROUTED THROUGH
- * ctx.gateOrDefer("add_watch_rule", ...). c55.10 UN-RESERVES the EXISTING `add_watch_rule` matrix row
+ * force-persist — now ROUTED THROUGH ctx.gateOrDefer("add_watch_rule", ...). wsm-e2e-pinned-33c.4: the
+ * watch_rules_updated BROADCAST is pruned (no client consumes that frame post d858e5e); the persist
+ * effect is unchanged. c55.10 UN-RESERVES the EXISTING `add_watch_rule` matrix row
  * (default Ask): creating an autonomous rule is a safety-config/automation change. The side effects are
  * wrapped in ONE synchronous effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
  * The gate is keyed on the trigger terminal id (the rule's natural scope). The inline presence-check 400
@@ -135,7 +139,6 @@ export const addWatchRule: ActionDef<typeof AddWatchRuleParams> = {
       };
       ctx.manager.ledger.watchRules.push(newRule);
       ctx.manager.ledger["save"](true);
-      ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
       return `Watch rule ${newRule.id} created.`;
     };
     const g = ctx.gateOrDefer(
@@ -165,8 +168,9 @@ const RemoveWatchRuleParams = z.object({
 
 /**
  * remove_watch_rule — FAITHFUL PORT of inline app.delete("/api/watch-rules/:id") (server.ts ~944): find
- * the rule by id, splice it, force-persist, broadcast watch_rules_updated — now ROUTED THROUGH
- * ctx.gateOrDefer("remove_watch_rule", ...). c55.10 adds a NEW matrix row (default Ask): the mirror
+ * the rule by id, splice it, force-persist — now ROUTED THROUGH ctx.gateOrDefer("remove_watch_rule",
+ * ...). wsm-e2e-pinned-33c.4: the watch_rules_updated BROADCAST is pruned (no client consumes that
+ * frame post d858e5e); the persist effect is unchanged. c55.10 adds a NEW matrix row (default Ask): the mirror
  * safety-config change to add_watch_rule. Unknown id -> ok narration resolved BEFORE the gate (inline 404
  * -> 200, Decision 2): NO mutation, NO persist, NO broadcast, gate NOT consulted (a stale client deleting
  * an already-gone rule must not error, spuriously repaint, OR stage/forbid a no-op). The side effects are
@@ -193,7 +197,6 @@ export const removeWatchRule: ActionDef<typeof RemoveWatchRuleParams> = {
       if (i !== -1) {
         ctx.manager.ledger.watchRules.splice(i, 1);
         ctx.manager.ledger["save"](true);
-        ctx.broadcast({ type: "watch_rules_updated", watchRules: ctx.manager.ledger.watchRules });
       }
       return `Watch rule ${args.id} removed.`;
     };

@@ -20,3 +20,26 @@ export interface PaneInputClientFrame {
 export function buildPaneInputFrame(paneId: string, data: string): PaneInputClientFrame {
   return { type: "pane_input", paneId, data };
 }
+
+/**
+ * The `TerminalView onInput=` send guard, pulled out of the App.tsx / TerminalWindow.tsx call
+ * sites (bead wsm-e2e-pinned-vs7) so it's a plain, testable predicate instead of an inline closure
+ * duplicated at both sites. Mirrors the original two conditions exactly:
+ *  - under plain `?mock=1` (isMock, not e2e-wire-armed) keystrokes never leave the browser — no
+ *    live pane exists to receive them;
+ *  - otherwise a frame only ever goes out while the observe socket is actually OPEN.
+ * `readyState` accepts a raw WebSocket (or a `{readyState}`-shaped stand-in for tests) so this
+ * module never needs to import the `WebSocket` global itself.
+ */
+export function shouldSendPaneInput(
+  isMock: boolean,
+  wireArmed: boolean,
+  ws: { readyState: number } | null | undefined,
+): boolean {
+  if (isMock && !wireArmed) return false;
+  return ws != null && ws.readyState === WS_OPEN;
+}
+
+// WebSocket.OPEN is spec-pinned to 1 (CONNECTING=0, OPEN=1, CLOSING=2, CLOSED=3) — hardcoded so
+// this module has no dependency on a global WebSocket existing (e.g. under a jsdom test runner).
+const WS_OPEN = 1;

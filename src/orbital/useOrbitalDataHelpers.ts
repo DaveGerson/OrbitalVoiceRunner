@@ -269,7 +269,13 @@ export function globalModeToast(mode: string): string {
 }
 
 /** createPane: resolve the spawn command for a tool preset — a configured preset's command wins,
- *  else the built-in default for known preset names; undefined lets the server derive the shell. */
+ *  else the built-in default for a known agent preset. For Custom (or an unknown preset that the
+ *  server normalizes to Custom) there is NO safe client-side default: returning `undefined` makes
+ *  createPane OMIT the `command` field so the server derives the platform shell
+ *  (advanced.defaultShellCommand, else cmd.exe on Windows / bash on POSIX). Hardcoding 'bash' here
+ *  previously exited live Windows panes with "bash is not recognized" (wsm-e2e-pinned-q2mb).
+ *  A whitespace-only configured command counts as unset (trim-check), but a real command is returned
+ *  VERBATIM (untrimmed) so an intentional leading/trailing space survives (26e9796). */
 export function resolvePaneCommand(
   toolPreset: string, presets: { name: string; command?: string }[] | undefined,
 ): string | undefined {

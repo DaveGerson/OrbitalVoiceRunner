@@ -25,11 +25,15 @@ import type { StoredPendingApproval } from "./store/types";
  * backend (legacy / store-init-failed) means pure in-memory behavior, byte-for-byte as before.
  * Typed structurally (not as the whole JanusStore) so the dependency surface stays minimal.
  */
+// wsm-e2e-pinned-4s2 (5): `getPendingApprovals(sessionId)` is NOT part of this contract —
+// PendingApprovalStore never calls it (hydration/expiry both go through getExpiredApprovals, which
+// with now=MAX_SAFE_INTEGER doubles as "all unclaimed rows"). JanusStore still implements + exports
+// the concrete method (tests exercise it directly against a JanusStore instance), so this is purely
+// trimming the INTERFACE surface to what this module actually depends on.
 export interface ApprovalDurableStore {
   insertPendingApproval(a: StoredPendingApproval): void;
   claimApproval(id: string): boolean;
   deletePendingApproval(id: string): void;
-  getPendingApprovals(sessionId: string): StoredPendingApproval[];
   getExpiredApprovals(now?: number): StoredPendingApproval[];
 }
 
@@ -381,6 +385,13 @@ export function resolveDecision(
   if (mode === "reject" || mode === "expire") {
     // If someone already claimed (a winning approve mid-flight), don't stomp it.
     if (record.claimed) return { reason: "lost_race", record, doWrite: false };
+    // store.claim()'s boolean return is intentionally unchecked here: we just proved this record
+    // is unclaimed, so the ONLY way this claim() can now lose is a genuinely concurrent approve
+    // that claimed it in between (a cross-process race on the durable store — impossible in-process,
+    // since JS never interleaves between these two synchronous statements). Either outcome is safe
+    // to fall through on: if we won, this is the normal reject/expire path; if we lost, the winning
+    // approve already captured its own copy of `record` and will write + delete independently — our
+    // delete() here is then a harmless no-op (or races it harmlessly) rather than a correctness bug.
     store.claim(messageId);
     store.delete(messageId);
     return { reason: mode === "reject" ? "rejected" : "expired", record, doWrite: false };
@@ -533,8 +544,9 @@ export class PendingApprovalStore {
   // dual-writes (store + in-memory mirror) so the live call sites never change shape and the
   // N-1 claim gate is enforced by the durable atomic SQL when a store is present.
   //
-  // When `store === null` (JANUS_LEDGER_BACKEND=legacy or store init failed) every method
-  // takes the EXACT original in-memory path — legacy behavior is byte-for-byte preserved.
+  // When `store === null` (a hand-built test harness — dbt3 removed the only production cause,
+  // a store-init failure, which is now a fatal boot error) every method takes the EXACT original
+  // in-memory path — byte-for-byte preserved.
   private readonly store: ApprovalDurableStore | null;
   /**
    * The live WS `session` handle is NOT serializable and churns per turn; durable rows need a
@@ -641,15 +653,34 @@ export class PendingApprovalStore {
 
   delete(messageId: string): void {
     if (this.store) this.store.deletePendingApproval(messageId);
+    const sid = this.sidForId[messageId];
     delete this.records[messageId];
     delete this.sessions[messageId];
     delete this.sidForId[messageId];
     delete this.workspaceForId[messageId];
     this.order = this.order.filter((id) => id !== messageId);
+    // wsm-e2e-pinned-4s2 (5): a hydrated/detached orphan's sid was registered in sidToHandle
+    // (hydrateFromStore / sidFor) but has no live handle to be reclaimed via purgeSession's
+    // handleToSid walk. Once the LAST record referencing this sid is gone, drop it here too —
+    // otherwise every fully-resolved hydrated survivor leaks one sidToHandle entry forever.
+    if (sid && !Object.values(this.sidForId).includes(sid)) {
+      this.sidToHandle.delete(sid);
+    }
   }
 
-  /** Entries for a session, in ANNOUNCED order (oldest first). */
+  /**
+   * Entries for a session, in ANNOUNCED order (oldest first).
+   *
+   * wsm-e2e-pinned-4s2 (5): `undefined` is a DELIBERATE alias for orphans() (see reattachSession's
+   * doc — `sessions[id] === undefined` is exactly what a hydrated/detached survivor looks like), so
+   * forSession(undefined) intentionally returns the orphan set and must NOT be short-circuited here.
+   * `null` is a DIFFERENT, non-orphan sentinel — server.ts's REST ActionContext stamps `session:
+   * null` for the no-live-session surface — and `sessions[id]` is never literally `null`, so the
+   * filter below already returns [] for it. The explicit guard just makes that "REST calls never
+   * see the orphan bucket" invariant load-bearing/obvious rather than an accident of `===` typing.
+   */
   forSession(session: any): PendingApproval[] {
+    if (session === null) return [];
     return this.order
       .filter((id) => this.sessions[id] === session)
       .map((id) => this.records[id]);
@@ -835,6 +866,15 @@ export class PendingApprovalStore {
    * tick. Rows are hydrated and the in-memory mirror is reconciled so the returned records are the
    * same objects the resolver will claim+delete. Without a store it is the original in-memory
    * filter (`now - timestamp > ttlMs && !claimed`).
+   *
+   * wsm-e2e-pinned-4s2 (4): note the durable branch below never reads `ttlMs` — it trusts the
+   * `expires_at` column, which was ANCHORED once at add()/reattachSession() time (`expires_at =
+   * timestamp + ttlMs` at that moment). The legacy (no-store) branch above has no persisted
+   * expires_at, so it re-derives the same comparison live from the CURRENT ttlMs argument every
+   * call. The two are equivalent as long as callers pass the same ttlMs they anchored with — a
+   * caller that started passing a DIFFERENT ttlMs mid-flight would only affect the legacy branch
+   * (durable rows are locked to their add-time TTL). This is intentional, not a bug: it's what
+   * makes a durable row's expiry survive a reopen without re-reading server config.
    */
   expired(ttlMs: number, now: number = Date.now()): PendingApproval[] {
     if (!this.store) {

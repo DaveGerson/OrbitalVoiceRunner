@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// BEAD wsm-e2e-pinned-rwnq: per-lane run-wide caps live in one data module so the safety margin
+// under the orchestrator's external wall is independently unit-testable (tests/test_e2e_budgets.ts).
+import { MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS } from "./scripts/e2eBudgets.mjs";
 
 /**
  * E2E config — TWO lanes:
@@ -33,6 +36,11 @@ if (LIVE) fs.mkdirSync(LIVE_STATE_DIR, { recursive: true });
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
+  // BEAD wsm-e2e-pinned-rwnq: bound each lane's total wall-clock so Playwright aborts ITSELF (and
+  // runs its normal webServer teardown) well before the orchestrator's external SIGKILL — which
+  // would otherwise orphan the vite/tsx child on ports 5173/3117. Do not raise without re-checking
+  // the margin guard in tests/test_e2e_budgets.ts.
+  globalTimeout: LIVE ? LIVE_GLOBAL_TIMEOUT_MS : MOCK_GLOBAL_TIMEOUT_MS,
   // The live specs share ONE real server + state set (freeze flag, active project, the board),
   // so the lane is single-worker: files run one at a time, in filename order.
   workers: LIVE ? 1 : undefined,

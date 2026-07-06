@@ -159,7 +159,7 @@ describe("applyPaneMode — the live mode-switch choke point (spec §6, bead 1y8
       permissionsMode: "Human-in-the-Loop",
       sessionId: "rollout-abc-123",
     });
-    const res = await applyPaneMode("pane_codex", "Full Auto", "restart_pane", pane, baseDeps());
+    const res = await applyPaneMode("pane_codex", "Full Auto", "promote_pane_mode", pane, baseDeps());
 
     assert.strictEqual(res.ok, true, "restart-resume resolves ok");
     assert.strictEqual(res.kind, "restart-resume");

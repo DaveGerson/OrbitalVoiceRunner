@@ -26,6 +26,8 @@ import type { PendingActionStore } from "../pendingActions";
 import type { JanusStore } from "../store/sqliteStore";
 import type { PaneModeResult } from "../applyPaneMode";
 import type { ShadowStats } from "../approvalShadow";
+import type { ContextInjectionTrigger } from "../memory/contextTelemetry";
+import type { PythonPolicyClient } from "../voice/policyClient";
 
 /** Which surfaces expose this action. Goal is convergence; the flag makes drift explicit. */
 export type Surface = "voice" | "rest" | "ws";
@@ -67,7 +69,7 @@ export type ActionResult =
   | { kind: "pending"; messageId: string; summary: string; extra?: Record<string, unknown> } // HiTL / deferred
   | { kind: "clarify"; text: string }                                // re-route / disambiguate (e.g. non-allowlisted shell)
   | { kind: "blocked"; reason: string }                              // gate Off / forbidden
-  | { kind: "error"; message: string };                              // handler failure (still answered once)
+  | { kind: "error"; message: string; cause?: "validation" | "handler" | "timeout" }; // handler failure (still answered once); `cause` (wsm-e2e-pinned-f9ne) discriminates a client-fault (bad action name / bad args) from a server-fault (uncaught handler throw / deadline) so REST projections can pick 400 vs 500 — absent (legacy handler-constructed errors) defaults to a server-fault 500, unchanged from prior behavior.
 
 /**
  * One row of the per-action audit trail emitted by runAction (the audit() seam). The store stamps
@@ -276,8 +278,12 @@ export interface ActionContext {
   /** Request a FRESH situational brief synthesis + inject it into the live session for the
    *  now-active pane (anti-rot, spec freshness trigger). switch_context calls it after its live
    *  ledger sync (the "catch me up" path). Wired by the server's voice context builder; absent on
-   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws. */
-  injectMemoryBrief?: () => void;
+   *  REST/test paths, where the call site is a safe no-op. NON-BLOCKING + never throws.
+   *  `trigger` (cortex telemetry, spec 2026-07-02 §18.2) labels the resulting context_injections
+   *  row; callers that omit it get the hook's own default (currently "catch_me_up" — the only
+   *  live call site today is switch_context, which always passes an explicit trigger). Optional
+   *  so existing/legacy callers keep compiling. */
+  injectMemoryBrief?: (trigger?: ContextInjectionTrigger) => void;
   /** P0b observability: which synthesis path is currently live ("python" when the warm daemon is
    *  available + the breaker is closed, else "fallback"). Wired by the server on the REST surface;
    *  absent on voice/test paths, where get_health reports the safe default "fallback". */
@@ -322,13 +328,13 @@ export interface ActionContext {
    * the LIVE process (Claude live-signal / Codex+agy restart-resume), draining pending on a Full-Auto
    * promotion (§11). The server binds it to the real terminal + gateOrDefer + pending stores +
    * broadcast + ledger persist. OPTIONAL so test/REST contexts that don't wire it fall back to the
-   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the new `restart_pane`
-   * tool delegate here when present. `source` is the caller surface (audit only).
+   * legacy setPermissionsMode (next-spawn-only) path. `set_pane_permissions` and the
+   * `promote_pane_mode` tool delegate here when present. `source` is the caller surface (audit only).
    */
   applyPaneMode?: (
     paneId: string,
     targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
-    source: "voice" | "ui" | "restart_pane",
+    source: "voice" | "ui" | "promote_pane_mode",
   ) => Promise<PaneModeResult>;
 
   // ── Gate inspection (server.ts:1711 — the resolver behind gateCapability/gateOrDefer) ─────────
@@ -359,8 +365,10 @@ export interface ActionContext {
   applyResolution: ApplyResolution;
 
   // ── Durable ledger (server.ts module `store`) ────────────────────────────────────────────────
-  /** The SQLite ledger backing handoffs + the audit trail. `null` under JANUS_LEDGER_BACKEND=legacy
-   *  (or store-init failure); the 8 handoff/gate tools degrade gracefully when null. */
+  /** The SQLite ledger backing handoffs + the audit trail. dbt3: SQLite is the only ledger backend,
+   *  so a real server boot always has one — this stays `| null` defensively (a store-init failure is
+   *  now a fatal boot error, but a hand-built test ActionContext may still pass store:null); the 8
+   *  handoff/gate tools degrade gracefully when null. */
   store: JanusStore | null;
 
   // ── Settings masking (server.ts:84) ─────────────────────────────────────────────────────────
@@ -396,6 +404,12 @@ export interface ActionContext {
     effective_gates: Record<CapabilityGate, GateValue>;
     posture: unknown;
   };
+
+  // ── Voice-UX wave 3 (optional — voice lane only) ────────────────────────────────────────────
+  /** The optional "policies" Python daemon facade (focus resolution + SITREP ranking). Wired on the
+   *  voice ActionContext ONLY (server.ts VoiceDeps.policies); absent on REST/hand-built test contexts
+   *  — handlers must null-chain (`ctx.policies?.resolveFocus(...) ?? <TS fallback>`, per D2). */
+  policies?: PythonPolicyClient;
 
   // deliver_handoff note: NO injected closure for the outcome→row mapping. `deliverOutcomeToHandoff`
   // is a PURE, EXPORTED function in src/handoffFlow (server.ts imports it as a value at server.ts:37,

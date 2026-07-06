@@ -235,7 +235,7 @@ describe("observe refactor — handleWatchRulesTrigger", () => {
     assert.ok(frames.some((f) => f.type === "watch_rule_suggested" && f.ruleId === "r1"));
   });
 
-  it("a oneShot rule disables itself and force-persists the watchRules change", () => {
+  it("a oneShot rule disables itself and force-persists the watchRules change (wsm-e2e-pinned-33c.4: no watch_rules_updated frame — no client consumes it)", () => {
     const frames: any[] = [];
     const rule = { id: "r1", enabled: true, triggerTerminalId: "p1", triggerTransition: "error", actionCommand: "x", actionTerminalId: "p2", oneShot: true };
     const { manager, saved } = makeManager({ status: "Running", watchRules: [rule] });
@@ -243,7 +243,7 @@ describe("observe refactor — handleWatchRulesTrigger", () => {
     onOutput("p1", "Error: boom\n");
     assert.strictEqual(rule.enabled, false, "oneShot rule disabled after firing");
     assert.deepStrictEqual(saved, [true], "force-persist fired for the rule change");
-    assert.ok(frames.some((f) => f.type === "watch_rules_updated"));
+    assert.ok(!frames.some((f) => f.type === "watch_rules_updated"), "watch_rules_updated broadcast is PRUNED");
   });
 
   it("a rule whose transition does NOT match is left alone (no suggestion)", () => {

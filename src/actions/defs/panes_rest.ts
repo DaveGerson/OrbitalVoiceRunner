@@ -18,11 +18,10 @@
  *   - respawn_pane is GATED via ctx.gateOrDefer("restart_pane", ...) — the capability (still named
  *     restart_pane) already exists in the matrix (default Ask). The inline route SKIPPED the gate;
  *     converging it ENFORCES the gate (a deliberate safety improvement — recorded as a behaviorDelta).
- *     Off->blocked->403, Ask->pending->202, Auto->run-now->200. NOTE: buildActionRun (src/actionEffects.ts)
- *     has no restart_pane case, so an IN-PROCESS Ask->confirm replays the real `run` closure correctly
- *     (pendingActions keeps it), while a confirm-AFTER-process-restart would degrade to the "unknown
- *     capability" no-op string — an accepted limitation for this batch (durable restart-intent replay for
- *     respawn_pane is out of scope here).
+ *     Off->blocked->403, Ask->pending->202, Auto->run-now->200. NOTE (updated by wsm-e2e-pinned-j2e):
+ *     buildActionRun (src/actionEffects.ts) NOW HAS a "restart_pane" EFFECT_BUILDERS case, so BOTH an
+ *     IN-PROCESS Ask->confirm AND a confirm-AFTER-process-restart replay the real respawn effect — the
+ *     prior accepted limitation (durable restart-intent replay was out of scope) is closed.
  *   - send_keys was UNGATED inline → registered ALWAYS_ALLOWED at cutover; c55.10 TIGHTENS it to its OWN
  *     matrix row `send_keys` (default Ask) + ctx.gateOrDefer — it is term.writeInput straight to the live
  *     PTY, the most consequential CLI keystroke act (the rest-only twin of the gated voice write).
@@ -53,6 +52,7 @@ import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { getHistoryBridge } from "../../historyBridge";
 import { findPaneOwningProject } from "../../paneOwnership";
 import { respawnFromLedger } from "../respawnFromLedger";
+import { withPaneLifecycleLock } from "../../lifecycleLock";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HistoryManager re-derivation (faithful port of server.ts:129-217 load/save/add).
@@ -185,12 +185,32 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
         // Ordered async restart, fire-and-return: stop() (SIGTERM->SIGKILL) MUST resolve before start()
         // spawns the replacement. The ordering is preserved inside this IIFE; the gate's sync `run`
         // contract only needs the confirm string back, which the inline route returned eagerly too.
-        void (async () => {
+        // kcc0: serialize per-pane via withPaneLifecycleLock so a SECOND overlapping respawn on this
+        // pane queues behind this one instead of both racing term.stop()/term.start() (3P.3 already
+        // stops two LIVE PTYs from coexisting, but a queued-not-racing pair is deterministic instead of
+        // "whichever start() runs last wins"). On an uncontended pane (every scenario the existing
+        // kdtu tests pin) the lock invokes this closure IMMEDIATELY in the same tick — term.stop() still
+        // fires synchronously here, unchanged from before this lock existed.
+        void withPaneLifecycleLock(id, async () => {
           await term.stop();
+          // 86-during-restart race (wsm-e2e-pinned-kdtu): while stop() is awaited the pane reads Exited,
+          // so the UI legitimately offers one-tap 86. If the operator archives in that gap, resuming here
+          // and calling term.start() would respawn a GHOST PTY for a pane no longer on the board. TWO
+          // guards, because the archive can land on either side of this continuation:
+          //   1. OWNERSHIP — terminals[id] must still be THIS instance. Catches paths that delete the
+          //      slot before this continuation resumes (delete_pane's synchronous hard delete, or an
+          //      archive whose stop() completed on an earlier tick), and instance replacement.
+          //   2. ARCHIVE INTENT — stopAndArchivePane may instead JOIN our in-flight stop(): its promise
+          //      reaction is registered AFTER ours, so when stop() resolves WE resume first and the slot
+          //      is still populated (ownership alone passes — the ghost the adversarial review proved).
+          //      The archive marks manager.archivingPanes SYNCHRONOUSLY at entry, so that intent is
+          //      visible here regardless of reaction order. (`?.` tolerates slim test fakes.)
+          // The checks and term.start() share one synchronous tick — no await re-opens the window.
+          if (ctx.manager.terminals[id] !== term || ctx.manager.archivingPanes?.has(id)) return;
           term.start();
           ctx.broadcastLedgerUpdate();
           ctx.broadcastTerminalsUpdated();
-        })().catch((e) => console.error(`[restart_pane] deferred restart failed for ${id}:`, e));
+        }).catch((e) => console.error(`[restart_pane] deferred restart failed for ${id}:`, e));
         return `Terminal ${id} restarted.`;
       }
       // Spawn into the pane's OWNING project (its directory + project id as the 7th arg), NOT the active

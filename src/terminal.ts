@@ -1,9 +1,9 @@
-import { Ledger, PaneMeta, type LedgerLike } from "./ledger";
+import { PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import path from "path";
-import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES } from "./types";
+import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES, DEFAULT_VOICE_UX } from "./types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
-import { DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./announcementBus";
+import { DEFAULT_ANNOUNCEMENT_TEMPLATES, pruneAttentionQueue } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
 import { PtyTransport, createPtyTransport } from "./ptyTransport";
 import {
@@ -12,6 +12,7 @@ import {
   RuntimeType,
 } from "./statusMachine";
 import { AgentAdapter, createAdapter } from "./agents";
+import { withPaneLifecycleLock } from "./lifecycleLock";
 
 // Status-machine input to applyStatusEvent and its extracted side-effect helpers.
 type StatusEvent =
@@ -365,6 +366,10 @@ const DEFAULT_PTY_SUBMIT_DELAY_MS = (() => {
   return Number.isFinite(n) && n >= 0 ? n : 20;
 })();
 
+// wsm-e2e-pinned-ztd: tagged entry for UniversalTerminal's pre-spawn-ready queue — 'submit' bytes
+// need the deliverSubmit body/CR split, 'raw' bytes must flush verbatim (no CR appended).
+type PendingInputEntry = { kind: "submit"; command: string } | { kind: "raw"; bytes: string };
+
 export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
@@ -376,7 +381,11 @@ export class UniversalTerminal {
   // agent CLI prints "Warning: no stdin data received in 3s". We buffer input until
   // the child proves itself ready (first onData) or a short fallback timer fires.
   private spawnReady = false;
-  private pendingInput: string[] = [];
+  // wsm-e2e-pinned-ztd: a single tagged queue for BOTH pre-ready input paths so ordering between
+  // writeInput (submit) and writeRaw (raw passthrough) is preserved relative to each other. 'submit'
+  // entries flush through deliverSubmit (body + CR split); 'raw' entries flush VERBATIM via writeRaw
+  // (no appended CR — deliverSubmit's CR would mangle raw control bytes).
+  private pendingInput: PendingInputEntry[] = [];
   private readyFallbackTimer: NodeJS.Timeout | null = null;
   private static readonly READY_FALLBACK_MS = 750;
   // Issue B: gap (ms) between writing a submitted command's BODY and its terminating CR (see
@@ -439,6 +448,18 @@ export class UniversalTerminal {
   // markSpawnReady) — the phase-2 "ready" source. A degraded-Exited spawn never reaches
   // markSpawnReady, so it correctly never emits a false "ready".
   public onReady?: (terminalId: string) => void;
+  // res2 (bead res2 / wsm-e2e-pinned-y09): the PUSH exit edge. Fired synchronously from the
+  // transport.onExit teardown below, the instant `this.status` flips to "Exited" — i.e. it does
+  // NOT wait for a subsequent PTY output chunk. Today the "exited" attention/earcon/paneSignal is
+  // produced INDIRECTLY by src/observe's onOutput-driven classifier (classifyTransition
+  // short-circuits on term.status==="Exited"), so a pane that dies with no trailing output chunk
+  // (e.g. an external SIGKILL) never re-enters that classifier and the operator never learns the
+  // pane died. This hook gives the observe pipeline a second, PUSH-based entry point into the
+  // identical classifier so a silent death still surfaces. Gated on ownExit (see the
+  // transport.onExit teardown below): fires ONLY for a genuine, unexpected self-exit — an
+  // INTENTIONAL stop (respawn_pane, close_pane/archive, shutdown) nulls this.transport before
+  // killing, so it does not fire this hook. No new decision logic beyond that gate is introduced.
+  public onExit?: (terminalId: string) => void;
   public projectId: string;
   private idleTimer: NodeJS.Timeout | null = null;
   private cachedCpu = 0.0;
@@ -1013,6 +1034,19 @@ export class UniversalTerminal {
         );
         this.pendingInput = [];
       }
+      // res2/y09: push the exit edge to observers NOW (status is already "Exited" above) instead
+      // of waiting for a PTY chunk that may never come. Guarded like every other pane callback so
+      // a subscriber throw can never poison this teardown. Gated on ownExit: an INTENTIONAL stop
+      // (respawn_pane, close_pane/archive, shutdown) nulls this.transport in _doStop BEFORE
+      // killing, so ownExit is false there — only a genuine unexpected death (this.transport still
+      // equals the exiting transport) fans out the attention item / announcement / voice signal.
+      if (ownExit && this.onExit) {
+        try {
+          this.onExit(this.terminalId);
+        } catch (e) {
+          console.warn(`[terminal] ${this.terminalId}: onExit subscriber threw (ignored):`, e);
+        }
+      }
     });
 
     // Run the ~500ms process-state probe (Tier A, design §3).
@@ -1061,8 +1095,11 @@ export class UniversalTerminal {
     }
     const queued = this.pendingInput;
     this.pendingInput = [];
-    for (const command of queued) {
-      this.deliverSubmit(command);
+    for (const entry of queued) {
+      // spawnReady is already true at this point (set above), so the writeRaw call below takes the
+      // straight transport.write passthrough branch rather than re-queuing.
+      if (entry.kind === "submit") this.deliverSubmit(entry.command);
+      else this.writeRaw(entry.bytes);
     }
     // B1 (async spawn): the child has attached its PTY — emit the phase-2 "ready" edge. Guarded by
     // the early `if (this.spawnReady) return` above, so this fires AT MOST ONCE per (re)spawn. Wrapped
@@ -1082,7 +1119,7 @@ export class UniversalTerminal {
     // B1 (async spawn): the PTY now boots on a deferred tick, so writeInput can land BEFORE start()
     // assigns a transport (an "open a pane then run X" follow-up). Buffer it onto the SAME
     // pendingInput queue markSpawnReady drains in order, instead of dropping it on the floor.
-    if (!this.transport) { this.pendingInput.push(command); return; }
+    if (!this.transport) { this.pendingInput.push({ kind: "submit", command }); return; }
     // G3: a freshly spawned ConPTY child has not attached its stdin reader yet, so
     // a synchronous write here is dropped on the floor. Queue the RAW command until
     // spawn-ready (first onData / fallback timer), then flush in submission order
@@ -1090,7 +1127,7 @@ export class UniversalTerminal {
     if (this.spawnReady) {
       this.deliverSubmit(command);
     } else {
-      this.pendingInput.push(command);
+      this.pendingInput.push({ kind: "submit", command });
     }
   }
 
@@ -1134,10 +1171,22 @@ export class UniversalTerminal {
    * writeInput/deliverSubmit (SUBMIT semantics: a separate CR, paste-burst split, optimistic
    * Running, history), writeRaw writes the bytes VERBATIM in a single transport.write with NO
    * appended \r and no split. It is the ONE primitive behind the raw-input endpoint and the GUI
-   * control-key bar (a Shift+Tab button writes ESC[Z verbatim). No-op on an inert/un-spawned pane
-   * (transport === null) — the REST caller surfaces a 409.
+   * control-key bar (a Shift+Tab button writes ESC[Z verbatim).
+   *
+   * wsm-e2e-pinned-ztd: pre-spawn-ready bytes (transport not yet attached to the child's stdin
+   * reader — the same ConPTY window writeInput buffers into `pendingInput`) are now buffered onto
+   * that SAME queue, tagged `{kind:"raw"}` so markSpawnReady flushes them verbatim (no CR) in
+   * submission order relative to any queued writeInput entries. Once spawn-ready, this stays the
+   * hot-path straight passthrough — no per-keystroke queueing overhead. The raw-input REST route
+   * still 409s up front on an inert/un-spawned pane before ever calling writeRaw (its own explicit
+   * status check, not a writeRaw no-op) — this buffering only matters for callers (like pane_input)
+   * that write into a pane that has started but has not yet reached spawn-ready.
    */
   writeRaw(bytes: string): void {
+    if (!this.spawnReady) {
+      this.pendingInput.push({ kind: "raw", bytes });
+      return;
+    }
     if (!this.transport) return;
     this.transport.write(bytes);
   }
@@ -1268,10 +1317,22 @@ export class OrchestratorManager {
   // B1 (async spawn): forwarded from UniversalTerminal.onReady — fires once when the child attaches
   // its PTY (markSpawnReady). The phase-2 "ready" publish source.
   public onReady?: (terminalId: string) => void;
+  // res2/y09: the manager-level fan of UniversalTerminal.onExit — fires the instant a pane's OWN
+  // live transport exits unexpectedly (ownExit-gated in UniversalTerminal — an intentional
+  // stop/respawn/archive/shutdown does NOT fire this), with NO dependency on a subsequent output
+  // chunk. server.ts assigns this to the observe pipeline's onExit handler, which re-uses the
+  // existing classifyTransition("exited")/emitHighSeverityTransition path.
+  public onExit?: (terminalId: string) => void;
   // wsm-e2e-pinned-5h0 (A-voice): fires once after stopAndArchivePane terminates + archives a pane.
   // server.ts wires it to publish a turn-gated "closed" pane signal — the completion ack that confirms
   // the exit by voice only when it won't talk over the operator (same phase-2 gate as the create ack).
   public onClosed?: (terminalId: string) => void;
+  // wsm-e2e-pinned-kdtu: panes with an archive IN FLIGHT (stopAndArchivePane entered, not yet done).
+  // Marked SYNCHRONOUSLY at entry — before any await — because an archive that joins an in-flight
+  // term.stop() registers its promise reaction AFTER a concurrently-awaiting restart continuation, so
+  // when stop() resolves the RESTART resumes first and would see terminals[id] still populated. This
+  // mark is the archive intent that continuation can consult regardless of reaction order.
+  public readonly archivingPanes = new Set<string>();
   // B1 (async spawn): in-flight deferred starts (one per scheduleStart). flushPendingSpawns() awaits
   // them — the mandatory test/teardown seam so a real ConPTY spawn never outlives the test.
   private pendingStarts = new Set<Promise<void>>();
@@ -1358,7 +1419,9 @@ export class OrchestratorManager {
       },
       secrets: {
         geminiApiKey: process.env.GEMINI_API_KEY ? "CONFIGURED_IN_ENV" : ""
-      }
+      },
+      // Voice UX trio (wave 3): SITREP shape / focus bind policy / spoken-confirm timeout defaults.
+      voiceUx: { ...DEFAULT_VOICE_UX }
     };
   }
 
@@ -1386,7 +1449,10 @@ export class OrchestratorManager {
               ...(parsed.advanced?.capabilityGates ?? {}),
             },
           },
-          secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets }
+          secrets: { ...this.getDefaultSettings().secrets, ...parsed.secrets },
+          // Voice UX trio (wave 3): shallow-merge so a persisted file without voiceUx (or with only
+          // some keys set) still gets the DEFAULT_VOICE_UX floor for the rest (same idiom as voiceAi).
+          voiceUx: { ...this.getDefaultSettings().voiceUx, ...parsed.voiceUx },
         };
       } else {
         this.settings = this.getDefaultSettings();
@@ -1416,6 +1482,7 @@ export class OrchestratorManager {
   public updateSettings(newSettings: Partial<SystemSettings>) {
     if (newSettings.server) this.settings.server = { ...this.settings.server, ...newSettings.server };
     if (newSettings.voiceAi) this.settings.voiceAi = { ...this.settings.voiceAi, ...newSettings.voiceAi };
+    if (newSettings.voiceUx) this.settings.voiceUx = { ...this.settings.voiceUx, ...newSettings.voiceUx };
     if (newSettings.projects) this.settings.projects = { ...this.settings.projects, ...newSettings.projects };
     if (newSettings.presets) this.settings.presets = parsePresetsSafe(newSettings.presets);
     if (newSettings.announcements) {
@@ -1469,17 +1536,18 @@ export class OrchestratorManager {
     for (const term of Object.values(this.terminals)) fn(term);
   }
 
-  constructor(opts?: { ledger?: LedgerLike }) {
+  constructor(opts: { ledger: LedgerLike }) {
     // BEAD kqy — log the RESOLVED ABSOLUTE settings path once at boot so a cwd
     // mismatch is obvious in the logs (the file that silently held NO Gemini key
     // was indistinguishable from the right one before this line). SECRET INVARIANT:
     // we log only the PATH — never the key (secrets stay in-memory, strip-on-save).
     console.log(`[settings] resolved settings file: ${path.resolve(this.settingsFilePath)}`);
     this.loadSettings();
-    // WS-M cutover seam: a LedgerLike backend may be injected (e.g. JanusStore for
-    // durable SQLite state). Default stays the legacy JSON Ledger so existing
-    // behavior is unchanged unless the caller opts in.
-    this.ledger = opts?.ledger ?? new Ledger();
+    // WS-M cutover seam (dbt3: SQLite is now the ONLY ledger backend — the caller must inject
+    // one, typically the module-scope JanusStore server.ts boots). Kept as a LedgerLike
+    // injection (not a hardcoded JanusStore import) so unit tests can pass a lightweight
+    // in-memory JanusStore(":memory:") without spinning up a real file-backed DB.
+    this.ledger = opts.ledger;
 
     // Set activeProjectId from ledger or settings
     const projects = this.settings.projects;
@@ -1500,16 +1568,69 @@ export class OrchestratorManager {
    * every boot/reconnect, compounding into a runaway ("a million terminals"). Panes are now
    * reconciled to a not-running state on load; the operator starts one explicitly via
    * POST /api/terminals/:id/restart (which creates + starts it on demand).
+   *
+   * dbt3 drive-by fix: this used to mutate the Workspace object getProject() returned and call
+   * ledger.save(true) — which persisted against the legacy Ledger's live in-memory object graph,
+   * but is a SILENT NO-OP against JanusStore (getProject() rebuilds a fresh snapshot from SQL on
+   * every call; JanusStore.save() is a documented no-op — "auto-persisted per mutation"). Every
+   * pane now goes through updatePane(), the backend-agnostic durable write path (matching the
+   * idiom set_pane_gates already uses), so the inert reconciliation actually survives on SQLite —
+   * the only backend since dbt3 retired the legacy fallback this bug had been hiding behind.
    */
   private reconcilePanesInert(activeCtx: string): void {
     const project = this.ledger.getProject(activeCtx);
     if (!project || !project.panes) return;
+    // res3: capture which panes were actually alive/running BEFORE we flip them, so the operator
+    // can be told "N panes were live before restart" — this must be read before the mutation below
+    // overwrites `pane.alive`, and it deliberately EXCLUDES panes that were already inert (a pane
+    // that had already exited on its own before the restart is not part of the recovery story).
+    const wasLive: string[] = [];
     for (const pane of Object.values(project.panes)) {
+      if (pane.alive) wasLive.push(pane.pane_id);
       pane.alive = false;
       pane.is_busy = false;
       pane.last_known_state = "Exited";
+      this.ledger.updatePane(activeCtx, pane, false);
     }
     this.ledger.save(true);
+    this.announceBootRecovery(activeCtx, wasLive);
+  }
+
+  /**
+   * res3 (bead res3 — server-restart recovery UX): tell the operator what was running before this
+   * boot through the SAME idioms every other alert already uses — no new UI surface. This is a
+   * PULL-only surface by design (a conservative call on an explicitly punted product decision):
+   * it lands one informational item in `attentionQueue`, which is already consumed by (a) the voice
+   * `get_attention_digest` narration path (src/actions/defs/reads.ts) and (b) the existing
+   * `GET /api/attention` REST read the frontend already fetches on mount (src/orbital/useOrbitalData.ts
+   * `refetchAttention`). We deliberately do NOT broadcast `attention_updated` here — there are no WS
+   * clients connected yet at construction time (this runs from the OrchestratorManager constructor,
+   * before server.ts wires `broadcast`/`announcementBus`), so a push would be a no-op anyway; the next
+   * client to connect picks this up via its normal GET /api/attention fetch. Restoring a pane stays an
+   * EXPLICIT operator action through the existing respawn_pane / restore_archived_pane actions —
+   * nothing here spawns anything.
+   */
+  private announceBootRecovery(projectId: string, wasLive: string[]): void {
+    if (wasLive.length === 0) return;
+    const n = wasLive.length;
+    const list = wasLive.join(", ");
+    console.log(`[boot] ${n} pane${n === 1 ? "" : "s"} were live before this restart, now inert: ${list}`);
+    this.attentionQueue.push({
+      id: "att_" + Math.random().toString(36).substring(2, 11),
+      // "idle" = informational (no failure, no held request) — matches the existing dispatch-join
+      // completion idiom in src/observe/index.ts (settleDispatchJoin). Not actionable via
+      // Approve/Deny/Re-fire; the operator dismisses it or restarts the listed panes explicitly.
+      type: "idle",
+      terminalId: wasLive[0],
+      projectId,
+      message:
+        `${n} pane${n === 1 ? "" : "s"} ${n === 1 ? "was" : "were"} running before this restart and ` +
+        `${n === 1 ? "is" : "are"} now inert: ${list}. Restart one explicitly (POST ` +
+        `/api/terminals/:pane_id/restart, or "restart pane <id>") — nothing auto-spawns.`,
+      timestamp: new Date().toISOString(),
+      dismissed: false,
+    });
+    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, same as every other attentionQueue push
   }
 
   addTerminal(
@@ -1586,6 +1707,9 @@ export class OrchestratorManager {
     term.onReady = (tid) => {
       if (this.onReady) this.onReady(tid);
     };
+    term.onExit = (tid) => {
+      if (this.onExit) this.onExit(tid);
+    };
   }
 
   /**
@@ -1661,19 +1785,35 @@ export class OrchestratorManager {
    *  Note: like "Clear Exited", this also sweeps any already-Exited sibling panes in the
    *  project into the archive. */
   async stopAndArchivePane(projectId: string, paneId: string): Promise<boolean> {
-    const term = this.terminals[paneId];
-    if (term) {
-      await term.stop();        // SIGTERM->SIGKILL; awaits full ConPTY teardown + scrollback flush
-      term.status = "Exited";   // deterministic: a stopped pane is Exited (don't rely on the onExit race)
-      this.syncLedger();        // persist alive=false to the ledger/store via updatePane
-      delete this.terminals[paneId];
+    // kdtu: declare the archive intent BEFORE any await (see archivingPanes). If this archive joins an
+    // in-flight stop() (one-tap 86 during a gated restart's stop->start gap), the restart continuation
+    // resumes FIRST when stop() resolves — this synchronous mark is what stops it respawning a ghost.
+    // kcc0: the mark stays HERE, unwrapped and synchronous (before the lock, before any await) — the
+    // lock only wraps the WORK below, so kdtu's synchronous-tick property is untouched. On an
+    // uncontended pane (the common case, and every existing pinned scenario) the lock invokes this
+    // body immediately in the same tick, so timing is unchanged; on a contended pane (e.g. this
+    // archive lands while a respawn on the SAME pane is already mid-flight) the work queues behind it
+    // instead of interleaving.
+    this.archivingPanes.add(paneId);
+    try {
+      return await withPaneLifecycleLock(paneId, async () => {
+        const term = this.terminals[paneId];
+        if (term) {
+          await term.stop();        // SIGTERM->SIGKILL; awaits full ConPTY teardown + scrollback flush
+          term.status = "Exited";   // deterministic: a stopped pane is Exited (don't rely on the onExit race)
+          this.syncLedger();        // persist alive=false to the ledger/store via updatePane
+          delete this.terminals[paneId];
+        }
+        const realProj = projectId || this.ledger.activeProjectId || "default_project";
+        const archived = this.ledger.archiveExitedPanes(realProj) > 0;
+        // Completion edge: publish the turn-gated "closed" ack source (server wires onClosed -> bus).
+        // Best-effort + never-throw — a failed ack must not fail the close.
+        try { this.onClosed?.(paneId); } catch (e) { console.warn(`[terminal] onClosed subscriber threw (ignored):`, e); }
+        return archived;
+      });
+    } finally {
+      this.archivingPanes.delete(paneId);
     }
-    const realProj = projectId || this.ledger.activeProjectId || "default_project";
-    const archived = this.ledger.archiveExitedPanes(realProj) > 0;
-    // Completion edge: publish the turn-gated "closed" ack source (server wires onClosed -> bus).
-    // Best-effort + never-throw — a failed ack must not fail the close.
-    try { this.onClosed?.(paneId); } catch (e) { console.warn(`[terminal] onClosed subscriber threw (ignored):`, e); }
-    return archived;
   }
 
   // Synchronize actual terminal state to ledger

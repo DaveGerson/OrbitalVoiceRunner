@@ -28,7 +28,9 @@ test("saveSettings keeps the Gemini key in memory but NEVER writes it to .janus_
   const prevCwd = process.cwd();
   process.chdir(dir);
   try {
-    const m = new OrchestratorManager();
+    const store = new JanusStore(":memory:");
+    store.init();
+    const m = new OrchestratorManager({ ledger: store });
     m.updateSettings({ secrets: { geminiApiKey: FAKE_KEY } });
     // In-memory: the running session HAS the key, so voice works after the operator enters it.
     assert.strictEqual(m.settings.secrets.geminiApiKey, FAKE_KEY, "key stays in memory for the session");
@@ -48,7 +50,9 @@ test("sa4: voiceAi.systemPrompt survives updateSettings AND persists to disk (it
   const prevCwd = process.cwd();
   process.chdir(dir);
   try {
-    const m = new OrchestratorManager();
+    const store = new JanusStore(":memory:");
+    store.init();
+    const m = new OrchestratorManager({ ledger: store });
     const customPrompt = "custom voice prompt {{activeProjectId}}";
     // Set both a secret AND the system prompt in the same update.
     m.updateSettings({

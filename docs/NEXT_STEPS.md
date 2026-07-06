@@ -17,9 +17,12 @@ capability-gate matrix as the safety substrate. Stack: **P0a harden → P0b keys
 
 ## DONE recently (on trunk)
 - ✅ **WS-M SQLite ledger is LIVE & default** (PR #6 parity `98c2cfe`, PR #7 activation `ffee0e4`).
-  Gated, idempotent, reversible boot migration (`migrateOnBootIfNeeded`, marker `ledgerMigratedAt`
-  in `kv`); originals → `.bak`. Opt out with `JANUS_LEDGER_BACKEND=legacy`. → closes P0a *PendingApproval
-  persistence (store layer)*.
+  Gated, idempotent boot migration (`migrateOnBootIfNeeded`, marker `ledgerMigratedAt` in `kv`);
+  originals → `.bak`. → closes P0a *PendingApproval persistence (store layer)*.
+- ✅ **dbt3 — legacy ledger backend retired** (2026-07-02). SQLite (`JanusStore`) is now the ONLY
+  ledger backend; the `JANUS_LEDGER_BACKEND=legacy` escape hatch + the in-memory/JSON `Ledger`
+  implementation it selected are gone. A store-init failure is now a fatal boot error. The
+  JSON→SQLite boot migration for pre-WS-M on-disk data is unaffected and still runs.
 - ✅ **Smoke content-assertion** (PR #8 `1ce30d2`) — `scripts/smoke-claude-pane.ts` now asserts the
   response contains `PONG`, not just `bytesAfter>0`. → closes a P0a hardening item.
 
@@ -60,7 +63,7 @@ capability-gate matrix as the safety substrate. Stack: **P0a harden → P0b keys
 |---|---|---|---|---|
 | R1 | Med | **Concurrent-session churn** — another agent commits across worktrees (`feat/handoff-hardening`, `feat/p0b-plan`) and an auto-committer can absorb a worktree's uncommitted tree. Caused HEAD churn + a surprise checkpoint commit this session. | repo-wide | **Live** — work in an isolated worktree; coordinate before touching `server.ts` approval/handoff. |
 | R2 | Low | **Smoke test not in CI** — `npm run smoke:claude` needs an authenticated Claude binary + ~30s round-trip; the new PONG assertion is logic-verified but the live run is manual. | `scripts/smoke-claude-pane.ts` | **Accepted** — manual gate. |
-| R3 | Low | **Migration is one-way in practice** — rollback path (restore `.bak` + `JANUS_LEDGER_BACKEND=legacy`) is documented but untested as a drill. | `src/store/migrate.ts` | **Open** — consider a rollback smoke. |
+| R3 | Low | **Migration is one-way** — dbt3 (2026-07-02) retired the `JANUS_LEDGER_BACKEND=legacy` rollback path along with the legacy backend itself; restoring the `.bak` JSON file no longer has a backend that reads it. | `src/store/migrate.ts` | **Closed by design** — no rollback path exists post-dbt3; restore from a `.janus.db` backup instead. |
 | R4 | Low | **`bytesAfter>0`-style weak assertions may exist elsewhere** — audit other smoke/integration checks for "some output" vs "expected content". | `scripts/`, smoke tests | **Open** — sweep. |
 | R5 | Info | **Roadmap line anchors stale** — `docs/roadmap/*` reference `main @16c62da` (2026-05-28); re-anchor before acting (`RECONCILIATION.md` §5). | `docs/roadmap/` | **Known** — re-anchor per item. |
 

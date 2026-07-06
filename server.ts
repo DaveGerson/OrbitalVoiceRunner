@@ -10,6 +10,7 @@ import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
 import { registerHistoryBridge } from "./src/historyBridge";
 import { PaneSignalBus } from "./src/paneSignalBus";
+import type { PaneSignalKind } from "./src/paneSignals";
 import { AnnouncementBus, pruneAttentionQueue, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "./src/announcementBus";
 import {
   PendingApprovalStore,
@@ -36,21 +37,25 @@ import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import type { CapabilityGate } from "./src/types";
+import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
 import { z } from "zod";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { CAPABILITY_DEFS } from "./src/actions/capabilities";
 import { runAction, resultToToolResponse, toGeminiDeclarations } from "./src/actions/gemini";
 import type { ActionContext } from "./src/actions/types";
-import { mountRestRoutes, resultToHttp, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
+import { mountRestRoutes, resultToHttp, normalizeRestPath, type RestApp, type RestRequest, type RestResponse } from "./src/actions/rest";
+import { INLINE_EXCEPTIONS } from "./src/actions/inlineExceptions";
 import { InteractionLogger, createFileInteractionSink, NOOP_SINK } from "./src/interactionLog";
 import { createCoreState } from "./src/core/coreState";
 import { attachObserve } from "./src/observe";
 import { createMemoryService, createPythonModuleClient, synthFacadeOverCore, createPythonApprovalClient, createPythonCortexClient, createDaemonStateTracker, defaultModuleDir, type PythonSynthClient, type PythonCortexClient, type CortexDecisionSink } from "./src/memory";
+import { createPythonPolicyClient, type PythonPolicyClient } from "./src/voice/policyClient";
 import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow, setApprovalPythonPrimary } from "./src/approvalShadow";
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
+import { isLoopbackAddress, isOriginAllowed, parseAllowedOrigins, timingSafeEqualString } from "./src/security/perimeter";
 
 dotenv.config();
 
@@ -81,7 +86,14 @@ let lastInteractionId: string | null = null;
 
 // Automatic session secret token loaded from env or generated cryptographically fresh on boot.
 // Exported so in-process integration tests can authenticate without guessing the token.
-export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.createHash("sha256").update(`janus-auth:${process.cwd()}`).digest("hex");
+//
+// bead wsm-e2e-pinned-xge: the old fallback was `sha256("janus-auth:" + process.cwd())` — a
+// DETERMINISTIC value derivable by anyone who knows (or guesses) the server's working directory, so
+// it was reproducible off-host and offered no real secrecy. The fallback is now a fresh
+// cryptographically random 64-hex-char token minted once per process boot (never persisted, never
+// logged) — the exported CONST SHAPE is unchanged (still a plain string equal to what the auth
+// middleware/WS guard check), which is the load-bearing contract ~40 test files depend on.
+export const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
 
 // ── 2S.2: PUT /api/settings body validation ──────────────────────────────────────────────────────
 // The settings body stays a PERMISSIVE passthrough overall (settings carry many shapes — do NOT
@@ -131,19 +143,91 @@ function validateCapabilityGatesField(adv: Record<string, unknown>): string | nu
   return null;
 }
 
+// Voice UX trio (wave 3): strict-when-present validation for the operator-tunable settings.voiceUx
+// block. sitrepShape/focusBindPolicy must be a known enum value; confirmTimeoutMs must be a finite
+// number in [1000, 120000]. Unknown keys inside voiceUx are STRIPPED in place (forward compat, mirrors
+// validateCapabilityGatesField), never a 400 — a newer client's extra knob must not brick the PUT.
+const SettingsSitrepShapeSchema = z.enum(["brief", "walk", "full"]);
+const SettingsFocusBindPolicySchema = z.enum(["confirm", "echo", "tiered"]);
+const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs"]);
+
+/** Strip unknown voiceUx keys IN PLACE (forward compat, mirrors validateCapabilityGatesField's
+ *  unknown-key strip). Pure side effect, no validation — kept separate to hold each function's own
+ *  cyclomatic complexity down. */
+function stripUnknownVoiceUxKeys(voiceUx: Record<string, unknown>): void {
+  for (const key of Object.keys(voiceUx)) {
+    if (!VOICE_UX_KNOWN_KEYS.has(key)) {
+      delete voiceUx[key]; // unknown voiceUx key: strip, don't 400 (forward compat).
+    }
+  }
+}
+
+/** Validate voiceUx.sitrepShape / voiceUx.focusBindPolicy (when present). Returns an error message
+ *  string for an invalid KNOWN-key value, else null. */
+function validateVoiceUxEnumFields(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.sitrepShape !== undefined && !SettingsSitrepShapeSchema.safeParse(voiceUx.sitrepShape).success) {
+    return `Invalid settings field 'voiceUx.sitrepShape': must be one of ${SettingsSitrepShapeSchema.options.join(", ")}.`;
+  }
+  if (voiceUx.focusBindPolicy !== undefined && !SettingsFocusBindPolicySchema.safeParse(voiceUx.focusBindPolicy).success) {
+    return `Invalid settings field 'voiceUx.focusBindPolicy': must be one of ${SettingsFocusBindPolicySchema.options.join(", ")}.`;
+  }
+  return null;
+}
+
+/** Validate voiceUx.confirmTimeoutMs (when present): must be a finite number in [1000, 120000]. */
+function validateVoiceUxConfirmTimeout(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.confirmTimeoutMs === undefined) return null;
+  const v = voiceUx.confirmTimeoutMs;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 1000 || v > 120_000) {
+    return "Invalid settings field 'voiceUx.confirmTimeoutMs': must be a finite number between 1000 and 120000.";
+  }
+  return null;
+}
+
+/** Validate voiceUx.contextInjectDebounceMs (when present): must be a finite number in [0, 60000].
+ *  Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md) — the inject gate's
+ *  debounce floor (src/memory/injectGate.ts, memory-owned): minimum ms since the last INJECTED
+ *  brief before a changed-hash event may inject again. Reuses this block's existing strip/validate
+ *  idiom verbatim, per spec D6. 0 is a valid floor (debounce effectively disabled); 60000 (60s) is a
+ *  generous sanity ceiling — same shape as validateVoiceUxConfirmTimeout above. */
+function validateVoiceUxDebounceMs(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.contextInjectDebounceMs === undefined) return null;
+  const v = voiceUx.contextInjectDebounceMs;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 60_000) {
+    return "Invalid settings field 'voiceUx.contextInjectDebounceMs': must be a finite number between 0 and 60000.";
+  }
+  return null;
+}
+
+/** Validate (and forward-compat-strip) settings.voiceUx (when present). Returns an error message
+ *  string for an invalid value on a KNOWN field, else null. Pure over everything except the
+ *  unknown-key strip (mirrors validateCapabilityGatesField). */
+function validateVoiceUxField(body: Record<string, unknown>): string | null {
+  const voiceUx = body.voiceUx;
+  if (voiceUx === undefined) return null;
+  if (!isPlainObject(voiceUx)) {
+    return "Invalid settings field 'voiceUx': expected an object.";
+  }
+  stripUnknownVoiceUxKeys(voiceUx);
+  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx) ?? validateVoiceUxDebounceMs(voiceUx);
+}
+
 export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
   if (!isPlainObject(body)) {
     return { ok: false, error: "Settings body must be a JSON object." };
   }
   const advanced = body.advanced;
-  if (advanced === undefined) return { ok: true };
-  if (!isPlainObject(advanced)) {
-    return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+  if (advanced !== undefined) {
+    if (!isPlainObject(advanced)) {
+      return { ok: false, error: "Invalid settings field 'advanced': expected an object." };
+    }
+    const modeError = validateGlobalModeField(advanced);
+    if (modeError) return { ok: false, error: modeError };
+    const gatesError = validateCapabilityGatesField(advanced);
+    if (gatesError) return { ok: false, error: gatesError };
   }
-  const modeError = validateGlobalModeField(advanced);
-  if (modeError) return { ok: false, error: modeError };
-  const gatesError = validateCapabilityGatesField(advanced);
-  if (gatesError) return { ok: false, error: gatesError };
+  const voiceUxError = validateVoiceUxField(body);
+  if (voiceUxError) return { ok: false, error: voiceUxError };
   return { ok: true };
 }
 
@@ -505,17 +589,18 @@ export class HistoryManager {
 // racing the debounced flush with direct file I/O (review block on PR #68).
 registerHistoryBridge(HistoryManager.getInstance());
 
-// WS-M/Handoffs: the persistent JanusStore (SQLite). better-sqlite3 loads cleanly under tsx
-// (confirmed by the store unit tests + smoke), so a static import is fine here — unlike node-pty
-// which the transport layer loads via createRequire. init() applies migrations (idempotent);
-// bootMaintenance() prunes stale rows/scrollback. Created BEFORE the manager so it can serve as
-// the manager's ledger backend when the cutover flag is on.
+// WS-M/Handoffs: the persistent JanusStore (SQLite) — dbt3: the ONLY ledger backend (the
+// JANUS_LEDGER_BACKEND=legacy escape hatch + the in-memory/JSON `Ledger` implementation it
+// selected are retired). better-sqlite3 loads cleanly under tsx (confirmed by the store unit
+// tests + smoke), so a static import is fine here — unlike node-pty which the transport layer
+// loads via createRequire. init() applies migrations (idempotent); bootMaintenance() prunes
+// stale rows/scrollback. Created BEFORE the manager so it can serve as the manager's ledger.
 // 3V.5: store-init failure used to SILENTLY fall back to the legacy JSON ledger — but a previous
 // boot's migration already renamed .janus_ledger.json to .bak (and LEDGER_MIGRATED_KEY blocks any
 // re-import), so a corrupt .janus.db booted the app EMPTY on legacy and stranded every new write.
 // initStoreWithQuarantine instead renames the bad DB (plus -wal/-shm twins) to .janus.db.corrupt-<ts>
-// (loudly, recoverably) and retries ONCE with a fresh DB; only if THAT also fails do we fall back to
-// legacy — and we say so.
+// (loudly, recoverably) and retries ONCE with a fresh DB. With no fallback backend left to catch a
+// SECOND failure, that outcome is now a fatal boot error (see below) rather than a silent downgrade.
 let store: JanusStore | null = null;
 {
   const storeInit = initStoreWithQuarantine(process.env.JANUS_DB || ".janus.db", (s) => {
@@ -548,21 +633,19 @@ let store: JanusStore | null = null;
       console.error("[STORE] Ledger migration skipped (import failed; legacy JSON left intact):", e);
     }
   } else {
-    console.error("[STORE] JanusStore unavailable even after the quarantine retry — falling back to the legacy JSON ledger; HANDOFF PERSISTENCE IS DISABLED for this run.");
+    // dbt3: SQLite is the ONLY ledger backend — there is no legacy Ledger left to fall back to.
+    // Booting anyway would mean OrchestratorManager has no LedgerLike to construct on, so refuse
+    // to start rather than run in an undefined, silently-broken state.
+    console.error("[STORE] JanusStore unavailable even after the quarantine retry — SQLite is the only ledger backend, so the server cannot boot. Check disk space/permissions for JANUS_DB (or the CWD default .janus.db); the preceding [STORE] log lines carry the underlying error.");
+    throw new Error("[STORE] JanusStore failed to initialize and there is no fallback ledger backend (dbt3 retired JANUS_LEDGER_BACKEND=legacy). Refusing to boot.");
   }
 }
 
-// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the
-// manager's ledger — making drafts/context/approvals/etc. durable across restart.
-// DEFAULT: SQLite (when the store booted). Escape hatch: JANUS_LEDGER_BACKEND=legacy
-// forces the in-memory/JSON Ledger. If the store failed to boot, we fall back to
-// legacy automatically so the app still runs.
-const forceLegacy = process.env.JANUS_LEDGER_BACKEND === "legacy";
-const useSqliteLedger = store !== null && !forceLegacy;
-export const manager = new OrchestratorManager(useSqliteLedger ? { ledger: store! } : undefined);
-console.log(useSqliteLedger
-  ? "[STORE] OrchestratorManager ledger backend: SQLite (durable). Set JANUS_LEDGER_BACKEND=legacy to opt out."
-  : `[STORE] OrchestratorManager ledger backend: legacy JSON Ledger${forceLegacy ? " (JANUS_LEDGER_BACKEND=legacy)" : " (store unavailable)"}.`);
+// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the manager's
+// ledger — making drafts/context/approvals/etc. durable across restart. dbt3: SQLite is the
+// ONLY backend now (the fatal throw above guarantees `store` is non-null here).
+export const manager = new OrchestratorManager({ ledger: store });
+console.log("[STORE] OrchestratorManager ledger backend: SQLite (durable, the only backend).");
 
 // `store` is a process-wide singleton: created once here at import and SHARED by every
 // startServer() call. Releasing it is therefore a PROCESS-level concern, not a per-server one —
@@ -613,12 +696,25 @@ export function __installProcessErrorNetForTest(): void {
 export interface StartServerOptions {
   /** Port to bind. Use 0 for an ephemeral port (handy in tests). Defaults to PORT (3000). */
   port?: number;
-  /** Host to bind. Defaults to 0.0.0.0 in production, 127.0.0.1 otherwise. */
+  /** Host to bind. Defaults to 127.0.0.1 (loopback-only) in ALL modes, including production — override
+   *  via this option or the JANUS_BIND_HOST env for non-loopback exposure. bead wsm-e2e-pinned-xge:
+   *  binding non-loopback without an explicit API_AUTH_TOKEN env is a fail-closed startup error (see
+   *  startServer). */
   bindHost?: string;
   /** Mount the Vite dev middleware. Defaults to true outside production. Disable in tests. */
   enableVite?: boolean;
   /** Actually call server.listen(). Defaults to true. */
   listen?: boolean;
+  /** TEST-ONLY seam (Wave 4 cortex-cutover journeys, docs/superpowers/specs/2026-07-02-cortex-
+   *  cutover-design.md): override the PythonCortexClient MemoryService is constructed with, so a
+   *  journey suite can drive the cortex-primary curation path deterministically against an
+   *  in-process fake instead of racing a real spawned python daemon's startup timing (no live API
+   *  keys / real subprocess races in tests — mirrors the fake-PythonCortexClient idiom already
+   *  established in tests/test_cortex_flip.ts). Combine with `setCortexPrimary(true)` (imported
+   *  from src/memory/cortexShadow) AFTER startServer resolves, since the disabled/init-failure
+   *  paths inside createPythonSynthClientOrUndefined force the flag OFF during boot. Undefined in
+   *  production. NOT for prod use. */
+  testCortexClientOverride?: PythonCortexClient;
 }
 
 export interface RunningServer {
@@ -642,18 +738,62 @@ export interface RunningServer {
   /** bead 9fz test seam: register/clear a spy reconnect-nudge so a settings-PUT suite can assert the
    *  non-empty-key trigger without a live Gemini socket. NOT for prod use. */
   _testSetReconnectNudge?: (fn: (() => void) | null) => void;
+  /** Cortex context-injection telemetry (spec 2026-07-02) test seam: read the module-scope JanusStore
+   *  handle so a suite can assert on `context_injections` / `cortex_decision` / `gemini_turn_usage`
+   *  rows written by a REAL server boot without racing a second SQLite handle onto the same file
+   *  (WAL contention) or reverse-engineering the `.janus.db` path convention. dbt3: SQLite is the
+   *  only ledger backend, so this is non-null on any server that finished booting — the `| null` in
+   *  the return type is defensive typing, matching `store`'s own declared type. NOT for prod use. */
+  _testStore?: () => JanusStore | null;
+  /** Wave 4 cortex-cutover journeys test seam: publish a pane signal directly onto the server's
+   *  paneSignalBus, bypassing the need for a real PTY/command run to reach the D1 command-outcome
+   *  call site. Returns true if delivered (false if the bus's own cross-signal debounce/cooldown
+   *  dropped it — same semantics as a real onIdle-originated publish). NOT for prod use. */
+  _testPublishPaneSignal?: (sig: { paneId: string; kind: PaneSignalKind; detail?: string }) => boolean;
 }
 
 // VERBATIM extraction from startServer (CC paydown). Registers, IN ORDER: (1) the cookie-seed
 // middleware that drops the httpOnly SameSite auth_token on non-/api, non-/live renders, then (2)
 // the `/api` authMiddleware. Behavior, branch logic, and registration order are byte-identical to
 // the inline block this replaced; it must be invoked at the SAME point (right after express.json()).
+// bead wsm-e2e-pinned-xge: the pure decision the cookie-auto-seed middleware makes, extracted so it
+// is directly unit-testable without a live socket/Express request (mock the three inputs instead of
+// faking a TCP peer address). See registerAuthMiddleware for the call site + full rationale.
+export function shouldSeedAuthCookie(opts: {
+  currentToken: string | null;
+  apiToken: string;
+  remoteAddress: string | undefined | null;
+  authTokenQuery: unknown;
+}): boolean {
+  if (opts.currentToken === opts.apiToken) return false; // already correctly seeded — nothing to do.
+  // wsm-e2e review (minor): constant-time compare — the ?auth_token= proof is checked against the
+  // live secret, so a naive === would leak a byte-at-a-time timing oracle to a network attacker.
+  const provedTokenByQuery = timingSafeEqualString(opts.authTokenQuery, opts.apiToken);
+  return isLoopbackAddress(opts.remoteAddress) || provedTokenByQuery;
+}
+
 function registerAuthMiddleware(app: express.Express): void {
-  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders
+  // Automatically seed the httpOnly SameSite API cookie on core layout/page renders.
+  //
+  // bead wsm-e2e-pinned-xge: this used to seed UNCONDITIONALLY for any non-/api, non-/live request —
+  // i.e. loading the UI from ANY peer (loopback or not) silently handed that peer the shared secret.
+  // Now gated on TWO independent authorities:
+  //   (1) the request PEER is loopback (isLoopbackAddress on the raw socket address) — the original
+  //       "seed the local dev browser" intent, unchanged for every existing loopback test/dev flow;
+  //   (2) the remote-operator bootstrap path — the request URL carries `?auth_token=<exact match>`.
+  //       Knowing the token IS the authority (out-of-band, e.g. an operator-shared link), so a
+  //       non-loopback peer that already proves it has the real token may still be cookie-seeded.
+  // Anything else (non-loopback peer, no/wrong auth_token query param) gets NO cookie — it still sees
+  // the SPA shell (mountFrontend is intentionally public) but every /api and /live call fails auth.
   app.use((req, res, next) => {
     if (!req.path.startsWith("/api") && !req.path.startsWith("/live")) {
       const currentToken = getCookie(req.headers.cookie, "auth_token");
-      if (currentToken !== API_AUTH_TOKEN) {
+      if (shouldSeedAuthCookie({
+        currentToken,
+        apiToken: API_AUTH_TOKEN,
+        remoteAddress: req.socket?.remoteAddress,
+        authTokenQuery: req.query.auth_token,
+      })) {
         res.cookie("auth_token", API_AUTH_TOKEN, {
           httpOnly: true,
           sameSite: "strict",
@@ -686,16 +826,36 @@ export function clampMemorySynthTimeoutMs(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 150;
 }
 
-// Inc 4 task B-1 — the CORTEX FLIP boot wiring. Default OFF (full-tier floor). JANUS_CORTEX_PRIMARY=1
-// makes the cortex the PRIMARY context-curation authority (synthesizeAsync renders ONLY the tiers it
-// keeps); JANUS_CORTEX_PRIMARY_TIMEOUT_MS (optional) tightens/loosens the budget past which a slow
-// cortex falls to the full-tier floor (default 300ms). Reversible at runtime; floor = the synth/
-// assembler. Extracted from createPythonSynthClientOrUndefined to keep that host under the CC<=10 gate.
+// Inc 4 task B-1 — the CORTEX FLIP boot wiring. JANUS_CORTEX_PRIMARY=0 makes the cortex floor-only
+// (full-tier synth/assembler, the escape hatch); unset or "1" makes it the PRIMARY context-curation
+// authority (synthesizeAsync renders ONLY the tiers it keeps). JANUS_CORTEX_PRIMARY_TIMEOUT_MS
+// (optional) tightens/loosens the budget past which a slow cortex falls to the full-tier floor
+// (default 300ms). Reversible at runtime. Extracted from createPythonSynthClientOrUndefined to keep
+// that host under the CC<=10 gate; the env-string parse is further pulled into
+// resolveCortexPrimaryFlagFromEnv (pure, exported for unit testing — no live daemon needed to verify it).
+//
+// Wave 4 (896, 2026-07-02) D5: unset or "1" = primary is now the DEFAULT (fixer review, 2026-07-03,
+// completing the flip a prior integration pass had reverted). Getting here required un-blocking the
+// three fixture files that boot a real server with no warm daemon and used to lean on the (then-OFF)
+// ambient default to keep every injected row's disposition "injected": they now pin cortex primary
+// EXPLICITLY OFF right after boot (tests/test_context_smoke_journeys.ts,
+// tests/test_context_injection_telemetry.ts, tests/test_cortex_cutover_journeys.ts's Journey 4) since
+// none of them are actually testing cortex-primary curation — only the gate/telemetry plumbing around
+// it, which is unaffected by which curation authority is live.
 function applyCortexFlipFromEnv(): void {
-  const cortexFlipOn = /^(1|true|on|yes)$/i.test((process.env.JANUS_CORTEX_PRIMARY ?? "").trim());
+  const cortexFlipOn = resolveCortexPrimaryFlagFromEnv(process.env.JANUS_CORTEX_PRIMARY);
   const cortexFlipTimeoutMs = Number(process.env.JANUS_CORTEX_PRIMARY_TIMEOUT_MS) || undefined;
   setCortexPrimary(cortexFlipOn, cortexFlipTimeoutMs);
   if (cortexFlipOn) console.error(`[synth] cortex curation: PYTHON-PRIMARY (flip ON, floor=full-tier synth, budget=${cortexFlipTimeoutMs ?? 300}ms)`);
+}
+
+// Pure env-string -> boolean resolution for the CORTEX FLIP's default (spec D5): unset/empty or any
+// of the recognized "on" tokens -> primary; a recognized "off" token is the explicit escape hatch;
+// an UNRECOGNIZED non-empty value fails toward the new default (primary) rather than silently
+// downgrading to the floor on a config typo. Exported for unit testing (tests/
+// test_startserver_complexity_refactor.ts) — the parse itself needs no live daemon to verify.
+export function resolveCortexPrimaryFlagFromEnv(raw: string | undefined): boolean {
+  return !/^(0|false|off|no)$/i.test((raw ?? "").trim());
 }
 
 // Best-effort, non-fatal construction of the optional warm Python daemon: disabled ⇒ undefined; an
@@ -726,9 +886,9 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     const flipTimeoutMs = Number(process.env.JANUS_APPROVAL_PRIMARY_TIMEOUT_MS) || undefined;
     setApprovalPythonPrimary(flipOn, flipTimeoutMs);
     if (flipOn) console.error(`[synth] approval parsing: PYTHON-PRIMARY (flip ON, floor=TS twin, budget=${flipTimeoutMs ?? 600}ms)`);
-    applyCortexFlipFromEnv(); // Inc 4 task B-1 — the CORTEX FLIP (default OFF; extracted to hold CC<=10).
-    // Inc 4 slice 1 (SHADOW): the cortex facade rides the SAME multiplexed core (observe-only — its
-    // decision is logged, never applied). One daemon, many typed facades (synth + approval + cortex).
+    applyCortexFlipFromEnv(); // Wave 4 (896) — the CORTEX FLIP (default PRIMARY, =0 escape hatch; extracted to hold CC<=10).
+    // The cortex facade rides the SAME multiplexed core. One daemon, many typed facades
+    // (synth + approval + cortex).
     return { synth: synthFacadeOverCore(core), cortex: createPythonCortexClient(core) };
   } catch (e) {
     console.error("[memory] python daemon client init failed (continuing on fallback):", e);
@@ -736,6 +896,23 @@ function createPythonSynthClientOrUndefined(memoryPythonEnabled: boolean, onDaem
     setApprovalPythonPrimary(false);
     setCortexPrimary(false);
     return { synth: undefined, cortex: undefined };
+  }
+}
+
+// Voice-UX wave 3: best-effort, non-fatal construction of the SECOND optional warm Python daemon —
+// "policies" (focus resolution + SITREP ranking). Sibling of createPythonSynthClientOrUndefined: same
+// master switch, same disabled/init-throw ⇒ undefined posture (permanent TS-fallback). A SEPARATE
+// process from the synth/approval/cortex daemon (moduleName:"policies" resolves a different
+// python/<dir>/__main__.py), so a policies-side wedge can never trip the synth breaker. dispose() is
+// joined into the existing close() teardown next to pythonSynthClient?.dispose().
+function createPythonPolicyClientOrUndefined(memoryPythonEnabled: boolean): PythonPolicyClient | undefined {
+  if (!memoryPythonEnabled) return undefined;
+  try {
+    const core = createPythonModuleClient({ moduleDir: defaultModuleDir(), repoRoot: process.cwd(), moduleName: "policies" });
+    return createPythonPolicyClient(core);
+  } catch (e) {
+    console.error("[policies] python daemon client init failed (continuing on fallback):", e);
+    return undefined;
   }
 }
 
@@ -949,9 +1126,28 @@ async function mountFrontend(app: express.Express, enableVite: boolean): Promise
   }
 }
 
-// VERBATIM extraction from startServer (CC paydown). The dev/prod default-host pick, unchanged.
-function resolveBindHost(optionHost: string | undefined): string {
-  return optionHost ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+// bead wsm-e2e-pinned-xge: the bind default is loopback-only in EVERY mode — the old
+// prod-defaults-to-0.0.0.0 special case silently exposed the process (and its host-process-spawn
+// authority) to every network peer whenever NODE_ENV=production, with no matching auth hardening.
+// Non-loopback binding now requires an explicit ask: the `bindHost` option, or JANUS_BIND_HOST.
+export function resolveBindHost(optionHost: string | undefined): string {
+  return optionHost ?? process.env.JANUS_BIND_HOST ?? "127.0.0.1";
+}
+
+// bead wsm-e2e-pinned-xge (design direction #2): FAIL CLOSED. A non-loopback effective bind host
+// (0.0.0.0, a LAN IP, a hostname, ...) with no explicitly-set API_AUTH_TOKEN env means the process
+// would come up guarded only by the per-boot RANDOM token fallback — safe against a remote guesser,
+// but the operator never chose to expose it, so refuse to start rather than silently go live.
+// Checks `process.env.API_AUTH_TOKEN` directly (not the exported API_AUTH_TOKEN const, which is
+// ALWAYS truthy thanks to its own random fallback) so this is genuinely "did the operator opt in".
+export function assertBindHostAuthorized(bindHost: string): void {
+  if (isLoopbackAddress(bindHost)) return;
+  if (process.env.API_AUTH_TOKEN) return;
+  throw new Error(
+    `[SECURITY] Refusing to bind to non-loopback host "${bindHost}" without an explicit API_AUTH_TOKEN ` +
+    `env var. Set API_AUTH_TOKEN to opt in to network exposure, or drop the bindHost option / ` +
+    `JANUS_BIND_HOST env to stay loopback-only (127.0.0.1).`
+  );
 }
 
 // VERBATIM extraction from startServer (CC paydown). Reads the actually-bound port off the live
@@ -1010,7 +1206,22 @@ function bindCortexDecisionSink(store: JanusStore | null): CortexDecisionSink | 
 // client so startServer's close() can dispose the daemon. `manager`, `redactSecrets`,
 // `createMemoryService`, `clampMemorySynthTimeoutMs`, and `createPythonSynthClientOrUndefined` are
 // all module-scope; only the connection-bound `store` is injected.
-function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state: "python" | "fallback", reason: string) => void): {
+/** Wave 4 test-seam resolution: prefer the test-only cortex client override when supplied, else the
+ *  real/undefined client the daemon bootstrap resolved. Extracted purely to keep
+ *  createMemorySubsystem's cyclomatic complexity under the CC<=10 gate (this file's existing
+ *  one-helper-per-branch idiom, e.g. clampMemorySynthTimeoutMs above). */
+function resolveCortexClient(override: PythonCortexClient | undefined, real: PythonCortexClient | undefined): PythonCortexClient | undefined {
+  return override ?? real;
+}
+
+function createMemorySubsystem(
+  store: JanusStore | null,
+  onDaemonState?: (state: "python" | "fallback", reason: string) => void,
+  // TEST-ONLY (see StartServerOptions.testCortexClientOverride): when supplied, replaces the
+  // real/undefined cortex client the daemon bootstrap resolved, so journey suites can drive the
+  // cortex-primary path against a controllable fake with no real-process timing involved.
+  cortexClientOverride?: PythonCortexClient,
+): {
   memory: ReturnType<typeof createMemoryService>;
   pythonSynthClient: PythonSynthClient | undefined;
 } {
@@ -1037,6 +1248,9 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
   // writer is the decisionSink (null store ⇒ undefined ⇒ the tap observes but persists nothing —
   // parity preserved). recordCortexDecision swallows + console.errors on any DB fault (fail-soft).
   const cortexDecisionSink = bindCortexDecisionSink(store);
+  // Wave 4 (D6, cortex cutover design): the inject gate's live debounce-floor getter. Read fresh on
+  // every gate.evaluate() call (never cached), so a settings PUT to voiceUx.contextInjectDebounceMs
+  // takes effect immediately, same idiom as the confirmTimeoutMs getter above.
   const memory = createMemoryService(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
@@ -1047,8 +1261,9 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
     },
     pythonSynthClient,
     memorySynthTimeoutMs,
-    cortexClient,
+    resolveCortexClient(cortexClientOverride, cortexClient),
     cortexDecisionSink,
+    () => (manager.settings.voiceUx ?? DEFAULT_VOICE_UX).contextInjectDebounceMs ?? 3000,
   );
   return { memory, pythonSynthClient };
 }
@@ -1056,6 +1271,15 @@ function createMemorySubsystem(store: JanusStore | null, onDaemonState?: (state:
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
   const shouldListen = options.listen ?? true;
+
+  // bead wsm-e2e-pinned-xge: resolve + authorize the bind host FIRST, before any app/server
+  // construction — a non-loopback host without an explicit API_AUTH_TOKEN throws here, before this
+  // process opens a single socket or spawns any subsystem. Checked regardless of `shouldListen` (a
+  // guard-only test with listen:false must still see the throw — it validates the decision, not the
+  // actual bind).
+  const bindHost = resolveBindHost(options.bindHost);
+  const requestedPort = options.port ?? PORT;
+  assertBindHostAuthorized(bindHost);
 
   // Snapshot the live-session connector for THIS server instance. `liveConnector` is a module-level
   // seam (setLiveConnector); reading it late, at WS-connect time, let a sibling in-process server's
@@ -1160,9 +1384,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // No new runtime deps, no Python (P0b swaps in behind MemoryService.synthesize). The advanced
   // knobs are optional/additive — absent ⇒ DEFAULT_MEMORY_CONFIG. (manager/store satisfy the
   // WorldModel deps structurally; every text field is redacted at the WorldModel boundary.)
-  // store is null under JANUS_LEDGER_BACKEND=legacy (or store-init failure). The WorldModel only
-  // reads getProject/getProjectBriefing; a null-safe shim degrades the Project tier to absent
-  // (the brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8).
+  // dbt3: the module-scope `store` is guaranteed non-null here (a failed init is now a fatal boot
+  // error). The WorldModel's store dependency stays structurally nullable regardless — it only reads
+  // getProject/getProjectBriefing, and a null-safe shim degrades the Project tier to absent (the
+  // brief still synthesizes from pane/board/frame/breadcrumbs — anti-rot survives, M8) — this keeps
+  // WorldModel unit-testable against a bare `{ getProject, getProjectBriefing }` fake with no store.
   // VERBATIM extraction (CC paydown): the entire Memory Synthesis P0a/P0b subsystem construction
   // (null-safe store shim, WorldModel-narrow manager adapter, python-enabled flag, timeout clamp,
   // optional warm python client, createMemoryService with the same weights + advanced-knob defaults).
@@ -1180,14 +1406,18 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       console.error(`[synth] daemon_state ${state} (${reason})`);
       daemonTracker.onTransition(state);
     } catch { /* best-effort observability accounting */ }
-  });
+  }, options.testCortexClientOverride);
+  // Voice-UX wave 3: the SECOND optional warm Python daemon (focus resolution + SITREP ranking),
+  // gated by the SAME master switch as the synth/approval/cortex daemon. VoiceDeps.policies threads it
+  // to the voice lane only (server.ts REST ctx does NOT get it — both new tools are voice-only).
+  const pythonPolicyClient = createPythonPolicyClientOrUndefined(manager.settings.advanced?.memoryPythonEnabled !== false);
 
   // dec-2 (DBT5): attach the PTY observation/trigger pipeline (src/observe/index.ts). This is invoked
   // HERE — after broadcast / announcementBus / pruneAttention / paneSignalBus are constructed — and the
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
   // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
   // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
-  const { onOutput, onIdle, onRunning, onQuiescing } = attachObserve(manager, {
+  const { onOutput, onIdle, onRunning, onQuiescing, onExit } = attachObserve(manager, {
     broadcast,
     announcementBus,
     paneSignalBus,
@@ -1211,6 +1441,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // 'quiescing' model signal), mirroring the onRunning/onIdle wiring above. The frames are
   // emitted from inside attachObserve via the injected broadcast/paneSignalBus.
   manager.onQuiescing = onQuiescing;
+  // res2/y09: fan the PUSH exit edge (pane death without a dependency on a subsequent PTY output
+  // chunk) — see src/terminal.ts UniversalTerminal.onExit and src/observe/index.ts's onExit handler.
+  manager.onExit = onExit;
 
   function broadcastLedgerUpdate() {
     broadcast({
@@ -1620,6 +1853,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // bead 9fz: the live voice connection registers its reconnect-nudge here; the settings PUT invokes
     // it (via requestVoiceReconnect) when the operator sets a real Gemini key — voice resumes, no reload.
     registerReconnectNudge: setVoiceReconnectNudge,
+    // Voice-UX wave 3: the optional "policies" daemon facade (voice lane only).
+    policies: pythonPolicyClient,
   });
 
   // ── REST surface, DERIVED from the registry (cv/PLM2). One ActionContext per request, session:null
@@ -1778,7 +2013,17 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // on paths no registry def claims (set_capability_gate is voice-only; set_pane_gates / create_project
   // / execute_plan are converged with their inline twins deleted). See the design at
   // docs/superpowers/specs/2026-06-05-c55-16-opts-only-drop-guard-design.md.
-  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext);
+  // `knownInlinePaths` is the runtime collision guard's belt-and-suspenders safety net (NOT the
+  // authority — tests/test_no_inline_twins.ts is the actual CI gate): derived straight from
+  // INLINE_EXCEPTIONS (the same catalog that guard reads), it makes mountRestRoutes console.warn
+  // loudly at boot if a future registry def's rest path ever collides with a hand-written route,
+  // instead of Express silently keeping only the first-registered handler.
+  const knownInlinePaths = new Set(
+    INLINE_EXCEPTIONS.filter((e) => e.category !== "infra").map(
+      (e) => `${e.method} ${normalizeRestPath(e.path)}`
+    )
+  );
+  mountRestRoutes(app as unknown as RestApp, REGISTRY, buildRestActionContext, { knownInlinePaths });
 
   // Vite middleware for development (dynamically imported so tests / production
   // bundles that disable it don't need vite resolvable at module load).
@@ -1818,6 +2063,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // clear the installed shadow recorder so it can't reference the dead core.
     pythonSynthClient?.dispose();
     installApprovalShadow(null);
+    // Voice-UX wave 3: the policies daemon is a SEPARATE process (its own core) — dispose it too.
+    pythonPolicyClient?.dispose();
     // NOTE: we deliberately do NOT close the JanusStore here. It is a process-wide singleton shared
     // by every startServer() call (see the `process.once("exit", ...)` handler near its creation);
     // closing it per-server would break sibling in-process servers (the test_live_harness flake).
@@ -1832,9 +2079,6 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  const bindHost = resolveBindHost(options.bindHost);
-  const requestedPort = options.port ?? PORT;
-
   if (shouldListen) {
     await listenServer(server, wss, requestedPort, bindHost);
   }
@@ -1848,6 +2092,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     _testClients: () => coreState.clients,
     _testSetActivePane: (id: string | null) => { coreState.activePaneId = id; },
     _testSetReconnectNudge: (fn: (() => void) | null) => { setVoiceReconnectNudge(fn); },
+    _testStore: () => store,
+    _testPublishPaneSignal: (sig) => paneSignalBus.publish(sig),
   };
 }
 

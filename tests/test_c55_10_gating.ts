@@ -256,14 +256,14 @@ describe("c55.10 — add_watch_rule gating (status-via-kinds)", () => {
     assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "act_aw" });
   });
 
-  it("Auto -> ok -> 200; rule pushed + save(true) + watch_rules_updated", async () => {
+  it("Auto -> ok -> 200; rule pushed + save(true) (wsm-e2e-pinned-33c.4: no watch_rules_updated broadcast — no client consumes it)", async () => {
     const { ctx, rec, manager } = makeCtx({ watchRules: [] });
     const result = await runAction(REGISTRY, "add_watch_rule", body, ctx);
     assert.strictEqual(result.kind, "ok");
     assert.strictEqual(manager.ledger.watchRules.length, 1, "Auto add pushes the rule");
     assert.strictEqual(manager.ledger.watchRules[0].triggerTerminalId, "trig");
     assert.deepStrictEqual(rec.saves, [true], "ledger.save(true)");
-    assert.ok(rec.broadcasts.some((b) => b.type === "watch_rules_updated"), "watch_rules_updated broadcast");
+    assert.ok(!rec.broadcasts.some((b) => b.type === "watch_rules_updated"), "watch_rules_updated broadcast is PRUNED");
     const { res, sent } = makeFakeRes();
     applyResultToHttp(findDef("add_watch_rule"), result, {}, res);
     assert.strictEqual(sent.status, 200);
@@ -297,13 +297,13 @@ describe("c55.10 — remove_watch_rule gating (status-via-kinds)", () => {
     assert.deepStrictEqual(sent.json, { status: "pending_approval", messageId: "act_rw" });
   });
 
-  it("Auto -> ok -> 200; rule spliced + save(true) + watch_rules_updated", async () => {
+  it("Auto -> ok -> 200; rule spliced + save(true) (wsm-e2e-pinned-33c.4: no watch_rules_updated broadcast — no client consumes it)", async () => {
     const { ctx, rec, manager } = makeCtx(seed());
     const result = await runAction(REGISTRY, "remove_watch_rule", { id: "rule_x" }, ctx);
     assert.strictEqual(result.kind, "ok");
     assert.deepStrictEqual(manager.ledger.watchRules.map((r: { id: string }) => r.id), ["rule_y"], "rule_x spliced");
     assert.deepStrictEqual(rec.saves, [true], "ledger.save(true)");
-    assert.ok(rec.broadcasts.some((b) => b.type === "watch_rules_updated"), "watch_rules_updated broadcast");
+    assert.ok(!rec.broadcasts.some((b) => b.type === "watch_rules_updated"), "watch_rules_updated broadcast is PRUNED");
     const { res, sent } = makeFakeRes();
     applyResultToHttp(findDef("remove_watch_rule"), result, {}, res);
     assert.strictEqual(sent.status, 200);

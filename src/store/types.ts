@@ -145,3 +145,6 @@ export interface GeminiTurnUsageRow {
   id: number; ts: number; session_id: string | null; inject_id: string | null;
   prompt_tokens: number | null; response_tokens: number | null; total_tokens: number | null;
 }
+/** Raw `context_injections` row (schema v10, cortex context-injection telemetry). Column-for-column
+ *  with `ContextInjectionEvent` (src/memory/contextTelemetry.ts) — this IS that shape as stored. */
+export type ContextInjectionRow = import("../memory/contextTelemetry").ContextInjectionEvent;

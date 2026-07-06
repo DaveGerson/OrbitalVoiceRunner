@@ -100,6 +100,21 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
+## Repository Default: Agent Commit + Push Policy
+
+> This section overrides the Conservative default inside the Beads block. The Beads block is
+> issue-tracker scaffolding; git authority is set here.
+
+The default profile for agents on this repo is **team-maintainer-scoped** (not Conservative):
+
+- **In an isolated worktree**, once the full quality gate passes (adversarial review → e2e →
+  loop-until-clean → lint → unit tests → build → smoke where applicable), agents **commit and push
+  to a feature branch** without waiting for explicit approval.
+- **Open a PR** from that branch — the PR is the human review gate.
+- **Direct push to `main` is always prohibited.** Main is reached only via PR merge.
+- **Outside an isolated worktree** (the shared main checkout), fall back to Conservative: report
+  changed files + proposed commands, and wait for approval.
+- An explicit "do not commit / do not push" instruction in the current session still wins.
 
 ## Worktree Isolation (REQUIRED for commit-authorized agents)
 
@@ -148,9 +163,12 @@ npm run complexity:report                      # churn × complexity hotspot ran
 Voice-driven orchestrator for live Claude/Codex CLI panes. `server.ts` is the WS/REST hub;
 `src/terminal.ts` (`OrchestratorManager` + `UniversalTerminal`) owns pane lifecycle over a
 real PTY (`src/ptyTransport.ts`, node-pty/ConPTY). State persists through a **SQLite ledger**
-(`src/store/`, `JanusStore`) — the default backend as of WS-M; opt out with
-`JANUS_LEDGER_BACKEND=legacy`. Safety is the **capability-gate matrix** (per-capability
-Auto/Ask/Off, global + per-pane), the choke-point every pane-mutating action routes through.
+(`src/store/`, `JanusStore`) — the ONLY backend since dbt3 (2026-07-02) retired the legacy
+in-memory/JSON ledger and its `JANUS_LEDGER_BACKEND=legacy` escape hatch; a store-init failure
+is now a fatal boot error (there is no fallback). The one-way JSON→SQLite boot migration for
+operators upgrading from pre-WS-M on-disk data is unaffected and still runs. Safety is the
+**capability-gate matrix** (per-capability Auto/Ask/Off, global + per-pane), the choke-point
+every pane-mutating action routes through.
 
 ### Python ⇄ TS boundary (the seam — read before adding "logic")
 

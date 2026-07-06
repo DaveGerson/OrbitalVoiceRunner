@@ -164,7 +164,7 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     // the switched project instead of drifting on the prior snapshot. Additive + non-blocking — the
     // server wires injectMemoryBrief on the voice ctx; absent on REST/test paths (safe no-op). The
     // injector owns its own try/catch, so this never throws into the action path.
-    ctx.injectMemoryBrief?.();
+    ctx.injectMemoryBrief?.("project_switch");
     const briefing = ctx.manager.ledger.getProjectBriefing(projectId) || { error: "Project not found" };
     return { kind: "ok", output: briefing };
   },

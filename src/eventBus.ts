@@ -16,7 +16,6 @@ export type EarconType = EarconTypeOrNull;
 export type SetterKey =
   | "setAttentionQueue"
   | "setPlans"
-  | "setWatchRules"
   | "fetchTerminals"
   | "fetchPlans"
   | "noop";
@@ -37,7 +36,6 @@ export interface EventEffect {
  */
 const STATIC_EFFECTS: Record<string, EventEffect> = {
   plans_updated: { setter: "setPlans", earcon: null },
-  watch_rules_updated: { setter: "setWatchRules", earcon: null },
   plan_step_completed: { setter: "fetchPlans", earcon: "execute" },
   plan_completed: { setter: "fetchPlans", earcon: "success" },
   plan_paused: { setter: "fetchPlans", earcon: "alert" },

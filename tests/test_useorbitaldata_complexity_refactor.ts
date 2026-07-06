@@ -174,17 +174,21 @@ describe("resolvePaneCommand", () => {
     assert.strictEqual(resolvePaneCommand("Claude Code", []), "claude");
     assert.strictEqual(resolvePaneCommand("Codex", undefined), "codex");
     assert.strictEqual(resolvePaneCommand("Antigravity", []), "antigravity");
+  });
+  it("returns undefined for Custom so the client omits command and the server derives the platform shell", () => {
+    // wsm-e2e-pinned-q2mb: hardcoding 'bash' here exited live Windows panes ('bash' not recognized).
+    // Omitting the field lets the server pick cmd.exe / advanced.defaultShellCommand.
     assert.strictEqual(resolvePaneCommand("Custom", []), undefined);
   });
-  it("leaves an unknown preset unresolved for the server to derive", () => {
-    assert.strictEqual(resolvePaneCommand("Mystery", []), undefined);
-  });
-  it("preserves a configured Custom command verbatim", () => {
+  it("preserves a configured Custom command verbatim (including intentional whitespace)", () => {
     assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "pwsh.exe" }]), "pwsh.exe");
     assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "  pwsh.exe -NoLogo  " }]), "  pwsh.exe -NoLogo  ");
   });
   it("treats a configured whitespace-only command as unresolved", () => {
     assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "   " }]), undefined);
+  });
+  it("returns undefined for an unknown preset (server normalizes to Custom and derives the shell)", () => {
+    assert.strictEqual(resolvePaneCommand("Mystery", []), undefined);
   });
   it("a preset present but without a command falls through to the default map", () => {
     assert.strictEqual(resolvePaneCommand("Codex", [{ name: "Codex" }]), "codex");

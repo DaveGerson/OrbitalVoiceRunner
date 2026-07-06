@@ -72,10 +72,27 @@ an **isolated worktree**, the user delegates integration:
 
 - Proceed **wave-by-wave without per-wave approval** — self-review each wave, then merge its branch
   into local `main` and roll into the next wave.
-- **Hold `git push`** until the user explicitly approves.
+- **Push to the feature branch and open a PR** — never push directly to `main`. The PR is the
+  human review gate. ("Hold push" originally meant don't push to `main`, not don't push at all.)
 - **Surface** product decisions, design ambiguities, and deviations as notes — do not block on them.
 - Applies only when (a) a written plan is in place, (b) work is isolated (`dev <task>`), and (c) the
   session has team-maintainer authority. Absent these, fall back to the Conservative profile.
+
+## Repository Default: Agent Commit + Push Policy
+
+> This section overrides the Conservative default inside the Beads block below. The Beads block is
+> issue-tracker scaffolding; git authority is set here.
+
+The default profile for agents on this repo is **team-maintainer-scoped** (not Conservative):
+
+- **In an isolated worktree**, once the full quality gate passes (adversarial review → e2e →
+  loop-until-clean → lint → unit tests → build → smoke where applicable), agents **commit and push
+  to a feature branch** without waiting for explicit approval.
+- **Open a PR** from that branch — the PR is the human review gate.
+- **Direct push to `main` is always prohibited.** Main is reached only via PR merge.
+- **Outside an isolated worktree** (the shared main checkout), fall back to Conservative: report
+  changed files + proposed commands, and wait for approval.
+- An explicit "do not commit / do not push" instruction in the current session still wins.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

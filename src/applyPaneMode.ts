@@ -3,7 +3,7 @@
  * wsm-e2e-pinned-1y8). EVERY mode-change caller routes through here so a Full-Auto promotion actually
  * reaches the LIVE process (bug B1: setPermissionsMode only mutated the next spawn):
  *   - the voice `set_pane_permissions` tool,
- *   - the voice `restart_pane` tool,
+ *   - the voice `promote_pane_mode` tool,
  *   - the UI mode <select>.
  *
  * The flow (spec §6):
@@ -160,12 +160,13 @@ async function runLiveSignal(
 
 /**
  * Switch a pane to `targetMode` through the gate + the per-CLI adapter, reaching the LIVE process.
- * `source` is the caller surface (voice | ui | restart_pane), threaded into the gate intent for audit.
+ * `source` is the caller surface (voice | ui | promote_pane_mode), threaded into the gate intent for
+ * audit.
  */
 export async function applyPaneMode(
   paneId: string,
   targetMode: Mode,
-  source: "voice" | "ui" | "restart_pane",
+  source: "voice" | "ui" | "promote_pane_mode",
   term: PaneLike,
   deps: PaneModeDeps,
 ): Promise<PaneModeResult> {

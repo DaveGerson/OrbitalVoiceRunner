@@ -1,19 +1,13 @@
 // tests/test_manager_ledger_backend.ts
-// The WS-M cutover seam: OrchestratorManager.ledger is a LedgerLike, and a
-// JanusStore can be injected to back it instead of the legacy JSON Ledger.
-// Default construction (no injection) must keep using the legacy Ledger so
-// existing behavior/tests are unchanged. Migration of real JSON is NOT covered
-// here — this only proves the dependency-injection seam compiles and works.
+// The WS-M cutover seam: OrchestratorManager.ledger is a LedgerLike. dbt3 retired the
+// legacy JSON Ledger backend — SQLite (JanusStore) is now the ONLY backend, and the
+// `ledger` constructor option is mandatory (no default). Migration of real legacy JSON
+// into SQLite is NOT covered here — this only proves the dependency-injection seam
+// compiles and works end-to-end against a JanusStore.
 import { test } from "node:test";
 import assert from "node:assert";
 import { OrchestratorManager } from "../src/terminal";
 import { JanusStore } from "../src/store/sqliteStore";
-import { Ledger } from "../src/ledger";
-
-test("default OrchestratorManager keeps using the legacy JSON Ledger", () => {
-  const m = new OrchestratorManager();
-  assert.ok(m.ledger instanceof Ledger, "default backend should be the legacy Ledger");
-});
 
 test("OrchestratorManager can be constructed on an injected JanusStore (LedgerLike)", () => {
   const store = new JanusStore(":memory:"); store.init();

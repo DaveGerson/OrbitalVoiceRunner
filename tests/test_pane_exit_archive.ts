@@ -5,7 +5,7 @@
 // the reactive "Clear Exited". It kills the PTY, marks the pane Exited, and moves it
 // into the RECOVERABLE archive — the ledger record survives (restorable), the live
 // terminal object is dropped. Backend-agnostic: uses only interface methods
-// (archiveExitedPanes + updatePane via syncLedger), so it holds for legacy + SQLite.
+// (archiveExitedPanes + updatePane via syncLedger), so it holds against any LedgerLike.
 //
 // B2: appendScrollback no longer blocks the event loop with a per-chunk
 // fs.appendFileSync (that synchronous disk write, fired once per PTY output burst on
@@ -13,13 +13,13 @@
 // queues writes on an ordered async promise-chain; flushScrollback() awaits the chain
 // so callers (stop/restart) can guarantee durability.
 //
-// Each manager test gets an ISOLATED on-disk ledger (unique path) so the shared
-// .janus_ledger.json written by sibling suites can't pollute the archive counts.
+// Each manager test gets an ISOLATED in-memory JanusStore ledger (dbt3: SQLite is the
+// only ledger backend) so sibling suites can't pollute the archive counts.
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
-import { Ledger } from "../src/ledger";
+import { JanusStore } from "../src/store/sqliteStore";
 import type { PtyTransport } from "../src/ptyTransport";
 import fs from "fs";
 
@@ -40,21 +40,16 @@ function cleanupScrollback(id: string): void {
   try { fs.unlinkSync(`.janus_scrollback_${id}.log`); } catch { /* already gone */ }
 }
 
-function makeIsolatedManager(tag: string): { manager: OrchestratorManager; ledgerPath: string } {
-  const ledgerPath = `.janus_ledger_test_${tag}.json`;
-  cleanupLedger(ledgerPath);
-  const manager = new OrchestratorManager({ ledger: new Ledger(ledgerPath) });
-  return { manager, ledgerPath };
-}
-
-function cleanupLedger(ledgerPath: string): void {
-  try { fs.unlinkSync(ledgerPath); } catch { /* already gone */ }
-  try { fs.unlinkSync(`${ledgerPath}.tmp`); } catch { /* already gone */ }
+function makeIsolatedManager(_tag: string): { manager: OrchestratorManager; store: JanusStore } {
+  const store = new JanusStore(":memory:");
+  store.init();
+  const manager = new OrchestratorManager({ ledger: store });
+  return { manager, store };
 }
 
 describe("OrchestratorManager.stopAndArchivePane (graceful exit + archive)", () => {
   it("kills the pane, moves it to the recoverable archive, and drops the live object WITHOUT hard-deleting the record", async () => {
-    const { manager, ledgerPath } = makeIsolatedManager("exit");
+    const { manager, store } = makeIsolatedManager("exit");
     const projectId = "default_project";
     const paneId = "p-exit";
 
@@ -84,14 +79,46 @@ describe("OrchestratorManager.stopAndArchivePane (graceful exit + archive)", () 
     assert.strictEqual(arch[0].pane.pane_id, paneId, "the correct pane was archived");
 
     cleanupScrollback(paneId);
-    cleanupLedger(ledgerPath);
+    store.close();
   });
 
   it("is a safe no-op-ish call when the pane has no live terminal (already exited)", async () => {
-    const { manager, ledgerPath } = makeIsolatedManager("ghost");
+    const { manager, store } = makeIsolatedManager("ghost");
     const archived = await manager.stopAndArchivePane("default_project", "ghost-pane");
     assert.strictEqual(archived, false, "no pane archived when none exists");
-    cleanupLedger(ledgerPath);
+    store.close();
+  });
+
+  // wsm-e2e-pinned-kdtu: the archive-intent mark MUST be set SYNCHRONOUSLY at entry — before the
+  // awaited stop(). A one-tap 86 that joins a gated restart's in-flight stop() has its promise
+  // reaction registered AFTER the restart's, so the restart continuation resumes FIRST; the
+  // synchronous mark is the ONLY signal it can consult at that instant (terminals[id] is still
+  // populated). tests/test_panes_rest_c55.ts pins the full interleaving against a mirror of this
+  // method; THIS test pins the real method's load-bearing ordering so the mirror cannot drift.
+  it("marks archivingPanes SYNCHRONOUSLY at entry (before the awaited stop) and clears it when done", async () => {
+    const { manager, store } = makeIsolatedManager("mark");
+    const paneId = "p-mark";
+    const term = new UniversalTerminal(paneId, ".", "echo hi", "Custom", "Human-in-the-Loop", "", "default_project");
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((r) => { releaseStop = r; });
+    (term as any).stop = async () => { await stopGate; };
+    term.status = "Idle";
+    manager.terminals[paneId] = term;
+    (manager as any).syncLedger();
+
+    const archive = manager.stopAndArchivePane("default_project", paneId); // not awaited yet
+    assert.strictEqual(
+      manager.archivingPanes.has(paneId), true,
+      "archive intent is visible synchronously, before stop() resolves"
+    );
+
+    releaseStop();
+    await archive;
+    assert.strictEqual(manager.archivingPanes.has(paneId), false, "mark is cleared after the archive completes");
+    assert.ok(!manager.terminals[paneId], "the live terminal object is dropped");
+
+    cleanupScrollback(paneId);
+    store.close();
   });
 });
 

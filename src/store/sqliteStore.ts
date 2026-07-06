@@ -258,10 +258,26 @@ export class JanusStore {
   /** Seam for deterministic IDs in tests. */
   protected rand(): number { return Math.random(); }
 
+  /**
+   * wsm-e2e-pinned-4s2 (3): plain INSERT OR REPLACE would let a re-add of an existing messageId
+   * (e.g. a stray retry, or a hydration re-insert racing a live claim) silently reset claimed=1
+   * back to 0, re-opening an exactly-once row for a second write. ON CONFLICT DO UPDATE still
+   * lets legitimate rewrites through (reattachSession() carries the row to a new session_id/
+   * expires_at on reconnect), but the `claimed` column is STICKY: once 1, it can never be written
+   * back to 0 by this path — only claimApproval()'s atomic UPDATE flips it, and deletePendingApproval
+   * is the only way a claimed row goes away. `excluded.claimed` still applies when the existing row
+   * is unclaimed, so a legitimate claimed:true insert (there is none today, but the seam stays
+   * correct) is not silently downgraded either.
+   */
   insertPendingApproval(a: StoredPendingApproval): void {
     this.db.prepare(
-      `INSERT OR REPLACE INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
-       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)`
+      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
+       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)
+       ON CONFLICT(id) DO UPDATE SET
+         session_id=excluded.session_id, workspace_id=excluded.workspace_id, pane_id=excluded.pane_id,
+         command=excluded.command, kind=excluded.kind, rationale=excluded.rationale,
+         timestamp=excluded.timestamp, expires_at=excluded.expires_at,
+         claimed=CASE WHEN pending_approvals.claimed=1 THEN 1 ELSE excluded.claimed END`
     ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null });
   }
   /** Atomic claim: flips 0->1 only if currently 0. True == this caller won. */
@@ -275,8 +291,12 @@ export class JanusStore {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));
   }
+  // wsm-e2e-pinned-4s2 (2): expires_at alone has no tiebreak — two rows staged in the same
+  // millisecond (a real possibility for co-arriving approvals) would sort in undefined/storage
+  // order, so hydration/reconnect ordering could vary run-to-run. `timestamp ASC, id ASC` gives a
+  // fully deterministic total order (id is the PK, so it is always a unique final tiebreak).
   getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
-    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC").all(now) as PendingApprovalRow[])
+    return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC, timestamp ASC, id ASC").all(now) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));
   }
 
@@ -926,7 +946,7 @@ export class JanusStore {
   // project/pane id, so `${project_id}\0${pane_id}` is an unambiguous key (a space would collide for
   // ids containing spaces). Centralized here and threaded through the partition/assembly helpers so the
   // workspaces refactor preserves the original delimiter EXACTLY.
-  private static readonly WS_NOTE_KEY_SEP = " ";
+  private static readonly WS_NOTE_KEY_SEP = "\u0000";
 
   /** Partition note rows (DESC by created_at) into project-scoped and pane-scoped buckets. Extracted
    *  from the `workspaces` getter verbatim: partitioning preserves the DESC order within each group so
@@ -935,7 +955,7 @@ export class JanusStore {
    *  prototype-leak surface. */
   private partitionNotes(noteRows: NoteRow[]): { projectNotes: Map<string, string[]>; paneNotes: Map<string, string[]> } {
     const projectNotes = new Map<string, string[]>();
-    const paneNotes = new Map<string, string[]>(); // key: `${project_id} ${pane_id}`
+    const paneNotes = new Map<string, string[]>(); // key: `${project_id}\u0000${pane_id}`
     for (const n of noteRows) {
       const [bucket, key] = n.pane_id
         ? ([paneNotes, `${n.project_id}${JanusStore.WS_NOTE_KEY_SEP}${n.pane_id}`] as const)
@@ -1014,6 +1034,28 @@ export class JanusStore {
   renamePane(projectId: string, paneId: string, name: string): void {
     this.db.prepare("UPDATE panes SET name=?, updated_at=? WHERE pane_id=? AND workspace_id=?")
       .run(name, Date.now(), paneId, projectId);
+  }
+
+  /** wsm-e2e-pinned major-finding fix: hard-delete a LIVE pane row (the delete_pane action's real
+   *  durable effect — NOT the recoverable archivePane/archivePaneOwned pair above). Truthy-on-success
+   *  (Ledger parity): false when the row was already gone, so callers can narrate idempotently without
+   *  a spurious broadcast. `workspaces`/`getProject` are snapshot getters that re-read SQL on every
+   *  call and `save()` is a documented no-op — a caller that only mutated the projected snapshot object
+   *  (`delete ws.panes[id]`) never touched the database, so the row silently resurrected on next read.
+   *  This issues the actual `DELETE FROM panes` row mutation. */
+  deletePane(projectId: string, paneId: string): boolean {
+    const res = this.db.prepare("DELETE FROM panes WHERE pane_id=? AND workspace_id=?").run(paneId, projectId);
+    return res.changes > 0;
+  }
+
+  /** wsm-e2e-pinned major-finding fix: hard-delete a project row (the delete_project action's real
+   *  durable effect). Truthy-on-success. `panes.workspace_id REFERENCES projects(id) ON DELETE CASCADE`
+   *  with `foreign_keys=ON` (schema.ts), so this also removes the project's own panes in the same
+   *  statement — the SQL analog of the legacy in-memory Ledger dropping the whole nested workspace
+   *  object. See deletePane's doc comment for why a snapshot-only mutation is a silent no-op here. */
+  deleteProject(id: string): boolean {
+    const res = this.db.prepare("DELETE FROM projects WHERE id=?").run(id);
+    return res.changes > 0;
   }
 
   /**
@@ -1188,6 +1230,13 @@ export class JanusStore {
   updateHandoffState(id: string, state: HandoffState, patch: Partial<StoredHandoff> = {}): StoredHandoff | null {
     const existing = this.getHandoff(id);
     if (!existing) return null;
+    // wsm-e2e-pinned-3vl (2): defense-in-depth terminal-state no-op. Exactly-once already rests on
+    // the UPSTREAM claim gate (resolveDecision's atomic claim() — only the claim winner ever reaches
+    // a flip call), so under correct operation this branch should never fire. It exists so a second
+    // write attempt against an already-terminal row (a bug elsewhere, a replay, a future caller that
+    // forgets the claim gate) can never re-stamp terminal_at/approved_via or emit a second handoff
+    // audit event — it silently returns the row UNCHANGED rather than corrupting the audit trail.
+    if (JanusStore.HANDOFF_TERMINAL_STATES.has(existing.state)) return existing;
     const now = Date.now();
     const { sets, params } = this.buildHandoffStateUpdate(id, state, patch, now);
     this.recordActivity(
@@ -1306,5 +1355,76 @@ export class JanusStore {
     return this.db.prepare(
       `SELECT * FROM gemini_turn_usage WHERE ts >= ? ORDER BY id DESC LIMIT ?`
     ).all(sinceTs, limit) as import("./types").GeminiTurnUsageRow[];
+  }
+
+  // ── Cortex context-injection telemetry (schema v10) ─────────────────────────────────────────────
+  // Fail-soft writer: telemetry must NEVER throw into the live voice loop (mirrors
+  // recordGeminiTurnUsage's try/catch-and-console.error shape, delta 18.4). Read helper follows the
+  // getGeminiTurnUsages pattern (since filter, most-recent-first, default limit 100), plus optional
+  // sessionId/limit filters per the delta-18-required round-trip contract.
+
+  /** Append one context-injection attempt row. Fail-soft: swallows + console.error on any DB error. */
+  recordContextInjection(row: import("../memory/contextTelemetry").ContextInjectionEvent): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO context_injections(
+           id,ts,session_id,interaction_id,inject_id,trigger,active_project_id,active_pane_id,
+           brief_active_pane_id,source,disposition,skipped_reason,source_snapshot_hash,brief_hash,
+           brief_chars,estimated_tokens,elapsed_ms,error
+         ) VALUES(
+           @id,@ts,@session_id,@interaction_id,@inject_id,@trigger,@active_project_id,@active_pane_id,
+           @brief_active_pane_id,@source,@disposition,@skipped_reason,@source_snapshot_hash,@brief_hash,
+           @brief_chars,@estimated_tokens,@elapsed_ms,@error
+         )`
+      ).run({
+        id: row.id,
+        ts: row.ts,
+        session_id: row.session_id,
+        interaction_id: row.interaction_id,
+        inject_id: row.inject_id,
+        trigger: row.trigger,
+        active_project_id: row.active_project_id,
+        active_pane_id: row.active_pane_id,
+        brief_active_pane_id: row.brief_active_pane_id,
+        source: row.source,
+        disposition: row.disposition,
+        skipped_reason: row.skipped_reason,
+        source_snapshot_hash: row.source_snapshot_hash,
+        brief_hash: row.brief_hash,
+        brief_chars: row.brief_chars,
+        estimated_tokens: row.estimated_tokens,
+        elapsed_ms: row.elapsed_ms,
+        error: row.error,
+      });
+    } catch (e) {
+      console.error("[store] recordContextInjection failed:", e);
+    }
+  }
+
+  /** Read context-injection rows (most-recent-first), optionally filtered by `since` (ts >=),
+   *  `sessionId` (exact match), and capped by `limit` (default 100). Never throws — an unexpected
+   *  DB error yields an empty array (telemetry reads must not break a caller either).
+   *
+   *  Ordering: `ts DESC, rowid DESC`. Event ids are minted `ctxevt-<Date.now()>-<seq>`
+   *  (src/memory/contextTelemetry.ts) and are NOT zero-padded, so they are not safely
+   *  lexicographically sortable once `seq` reaches two digits (e.g. "...-10" < "...-9").
+   *  SQLite's implicit `rowid` reflects insertion order instead, giving a deterministic
+   *  tiebreak for same-millisecond bursts without depending on the id's string shape. */
+  getContextInjections(filter?: { since?: number; sessionId?: string; limit?: number }): import("./types").ContextInjectionRow[] {
+    const since = filter?.since ?? 0;
+    const limit = filter?.limit ?? 100;
+    try {
+      if (filter?.sessionId !== undefined) {
+        return this.db.prepare(
+          `SELECT * FROM context_injections WHERE ts >= ? AND session_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?`
+        ).all(since, filter.sessionId, limit) as import("./types").ContextInjectionRow[];
+      }
+      return this.db.prepare(
+        `SELECT * FROM context_injections WHERE ts >= ? ORDER BY ts DESC, rowid DESC LIMIT ?`
+      ).all(since, limit) as import("./types").ContextInjectionRow[];
+    } catch (e) {
+      console.error("[store] getContextInjections failed:", e);
+      return [];
+    }
   }
 }

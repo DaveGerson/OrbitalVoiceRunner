@@ -13,7 +13,7 @@ import { Check, Sparkles, BookOpen, Play, Activity, Flame, Send } from "lucide-r
 import { apiFetch } from "./utils/api";
 import { publishChunk } from "./terminalStream";
 import { useE2EHarness, isE2EWireArmed } from "./e2e/harness";
-import { buildPaneInputFrame } from "./orbital/paneInputClient";
+import { buildPaneInputFrame, shouldSendPaneInput } from "./orbital/paneInputClient";
 import { resolveActivePaneMeta } from "./activePaneMeta";
 import {
   countExitedPanes,
@@ -1142,9 +1142,9 @@ function AppRaw() {
                     backfill={activeTerminal.backfill}
                     onResize={(cols, rows) => handleTerminalResize(activeTerminal.id, cols, rows)}
                     onInput={(data) => {
-                      if (isMockModeRef.current && !isE2EWireArmed()) return;
                       const ws = wsRef.current;
-                      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(buildPaneInputFrame(activeTerminal.id, data)));
+                      if (!shouldSendPaneInput(isMockModeRef.current, isE2EWireArmed(), ws)) return;
+                      ws!.send(JSON.stringify(buildPaneInputFrame(activeTerminal.id, data)));
                     }}
                   />
                 </div>

@@ -76,6 +76,18 @@ not buffered; a follow-up bead tracks it.
   `pane_input` has no REST fallback) — boots a real server + bash PTY, focuses the xterm, types a
   uniquely-seeded `echo`, and asserts the marker round-trips back into the terminal.
 
+## 2026-07-02 — decision reaffirmed (bead wsm-e2e-pinned-izj)
+
+**Operator decision, no behavior change:** STOP-ALL freeze does **not** gate `pane_input` /
+`writeRaw` operator direct typing. Same rationale as the always-allowed Ctrl+C brake: the operator
+stays *above* the capability gate, so they can still type recovery commands (e.g. Ctrl+C, `exit`, a
+corrective command) into a pane immediately after hitting STOP-ALL, without waiting to
+`release_stop_all` first. This was already noted in passing under "Deliberately NOT done" above
+(2026-06-24); this entry makes it an explicit, dated, standalone decision record — no code changed.
+A matching comment lives at the `applyPaneInputFrame` handler in `src/voice/paneInputFrame.ts`,
+where a `coreState.frozen` check would otherwise live. If freeze should ever gate typing, that is a
+deliberate future bead, not an accidental regression.
+
 ## Files
 
 `src/components/TerminalView.tsx` (onInput edge), `src/orbital/TerminalWindow.tsx` + `src/App.tsx`

@@ -25,11 +25,13 @@ import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 
 let clampMemorySynthTimeoutMs: (raw: unknown) => number;
+let resolveCortexPrimaryFlagFromEnv: (raw: string | undefined) => boolean;
 
 before(async () => {
   process.env.JANUS_NO_AUTOSTART = "1";
   const mod = await import("../server");
   clampMemorySynthTimeoutMs = mod.clampMemorySynthTimeoutMs;
+  resolveCortexPrimaryFlagFromEnv = mod.resolveCortexPrimaryFlagFromEnv;
 });
 
 describe("clampMemorySynthTimeoutMs (startServer memory-deadline clamp)", () => {
@@ -62,5 +64,39 @@ describe("clampMemorySynthTimeoutMs (startServer memory-deadline clamp)", () => 
     assert.equal(clampMemorySynthTimeoutMs(null), 150);
     assert.equal(clampMemorySynthTimeoutMs("300"), 150);
     assert.equal(clampMemorySynthTimeoutMs({}), 150);
+  });
+});
+
+// Wave 4 (896, 2026-07-02) revert-fix (fixer review, 2026-07-03): spec D5 says the flip's default
+// becomes PRIMARY (unset or "1") once the battery is green under that mode; `JANUS_CORTEX_PRIMARY=0`
+// is the escape hatch (the JANUS_LEDGER_BACKEND=legacy analog). A prior integration pass shipped the
+// OPPOSITE default (OFF-unless-explicitly-"1") because flipping regressed fixtures that boot with no
+// warm daemon — those fixtures are now pinned to explicit `setCortexPrimary(false)` instead (see
+// tests/test_context_smoke_journeys.ts, tests/test_context_injection_telemetry.ts,
+// tests/test_cortex_cutover_journeys.ts), unblocking this default flip. These pins lock the exact
+// env-string lattice the boot-time flip parses.
+describe("resolveCortexPrimaryFlagFromEnv (the CORTEX FLIP's default-resolution, D5)", () => {
+  it("unset or empty -> primary (the new default)", () => {
+    assert.equal(resolveCortexPrimaryFlagFromEnv(undefined), true);
+    assert.equal(resolveCortexPrimaryFlagFromEnv(""), true);
+    assert.equal(resolveCortexPrimaryFlagFromEnv("   "), true);
+  });
+
+  it('"1"/"true"/"on"/"yes" (any case) -> primary', () => {
+    for (const v of ["1", "true", "TRUE", "on", "On", "yes", "YES"]) {
+      assert.equal(resolveCortexPrimaryFlagFromEnv(v), true, `expected primary for ${v}`);
+    }
+  });
+
+  it('"0"/"false"/"off"/"no" (any case) -> the floor-only escape hatch', () => {
+    for (const v of ["0", "false", "FALSE", "off", "Off", "no", "NO"]) {
+      assert.equal(resolveCortexPrimaryFlagFromEnv(v), false, `expected floor-only for ${v}`);
+    }
+  });
+
+  it("an unrecognized non-empty value fails toward primary, not silently toward the floor", () => {
+    // Only the recognized off-tokens opt out; anything else (including typos/garbage) keeps the
+    // D5 default rather than silently downgrading to the floor on a config typo.
+    assert.equal(resolveCortexPrimaryFlagFromEnv("banana"), true);
   });
 });

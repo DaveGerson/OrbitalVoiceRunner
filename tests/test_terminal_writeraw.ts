@@ -34,6 +34,10 @@ test("writeRaw writes the EXACT bytes (ESC[Z => 0x1b 0x5b 0x5a) as ONE write, wi
   const term = new UniversalTerminal("test-raw-shifttab", ".", "cmd");
   const { transport, writes } = makeFakeTransport();
   (term as any).transport = transport;
+  // wsm-e2e-pinned-ztd: writeRaw now buffers pre-spawn-ready bytes (see
+  // tests/test_terminal_writeraw_buffering.ts); this test injects transport directly (bypassing
+  // start()/markSpawnReady), so mark the pane already spawn-ready to exercise the passthrough path.
+  (term as any).spawnReady = true;
 
   term.writeRaw(SHIFT_TAB);
 
@@ -53,6 +57,7 @@ test("writeRaw passes through a single control byte (Ctrl+C = 0x03) unchanged", 
   const term = new UniversalTerminal("test-raw-ctrlc", ".", "cmd");
   const { transport, writes } = makeFakeTransport();
   (term as any).transport = transport;
+  (term as any).spawnReady = true; // see note above — simulate an already-spawn-ready pane
 
   term.writeRaw("\x03");
 

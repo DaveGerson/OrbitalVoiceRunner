@@ -69,6 +69,17 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
   // recorded history) but the default map omitted it, so it resolved through the permissive
   // fallback to Auto. Pin it here so map and matrix agree.
   clear_history: "Ask",
+  // rm4: the remaining 5 promoted capabilities (read_pane, read_notes, focus_pane, compose_draft,
+  // archive_pane) were ABSENT from this map and relied on resolveOne's `?? "Auto"` fallback,
+  // which HAPPENED to match their CAPABILITY_DEFS declared default (all "Auto") — correct by
+  // coincidence, not by declaration. Seed them explicitly so get_pane_gates/list_capabilities
+  // report the DECLARED default rather than the resolver fallback. Values are IDENTICAL to the
+  // prior fallback outcome (all "Auto") — a strict no-op for effective gating (test-pinned).
+  read_pane: "Auto",
+  read_notes: "Auto",
+  focus_pane: "Auto",
+  compose_draft: "Auto",
+  archive_pane: "Auto",
   // c55.10: rest-only writes tightened from ungated → Ask (gate-tightening only).
   send_keys: "Ask",
   remove_watch_rule: "Ask",
@@ -257,6 +268,31 @@ export interface CliPreset {
   capabilityGates?: CapabilityGateMap;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Voice UX trio (wave 3, spec 2026-07-02-voice-ux-trio-design.md). Operator-tunable knobs
+// for the conversational SITREP shape, the focus-by-reference bind policy, and the spoken
+// destructive-confirm window. Optional on SystemSettings so a persisted file without it keeps
+// loading (shallow-merged with DEFAULT_VOICE_UX in terminal.ts loadSettings); every reader
+// defaults via `manager.settings.voiceUx ?? DEFAULT_VOICE_UX`.
+// ─────────────────────────────────────────────────────────────────────────────
+export interface VoiceUxSettings {
+  sitrepShape: "brief" | "walk" | "full";
+  focusBindPolicy: "confirm" | "echo" | "tiered";
+  confirmTimeoutMs: number;
+  // Wave 4 (D6, docs/superpowers/specs/2026-07-02-cortex-cutover-design.md): the inject
+  // gate's debounce floor — minimum ms since the last INJECTED brief before a changed-hash
+  // event is allowed to inject again (session-start always bypasses). Reuses this block's
+  // existing strip/validate idiom (VOICE_UX_KNOWN_KEYS + a dedicated validator in server.ts).
+  contextInjectDebounceMs: number;
+}
+
+export const DEFAULT_VOICE_UX: VoiceUxSettings = {
+  sitrepShape: "brief",
+  focusBindPolicy: "confirm",
+  confirmTimeoutMs: 10_000,
+  contextInjectDebounceMs: 3000,
+};
+
 export interface SystemSettings {
   server: {
     port: number;
@@ -336,6 +372,9 @@ export interface SystemSettings {
   secrets: {
     geminiApiKey: string;
   };
+  // Voice UX trio (wave 3): SITREP shape / focus bind policy / spoken-confirm timeout. Optional —
+  // absent on settings persisted before this wave; loadSettings shallow-merges DEFAULT_VOICE_UX.
+  voiceUx?: VoiceUxSettings;
 }
 
 export interface AttentionItem {

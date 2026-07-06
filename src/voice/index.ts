@@ -26,7 +26,8 @@
  */
 
 import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
-import type { WebSocketServer } from "ws";
+import type { WebSocketServer, WebSocket } from "ws";
+import type { IncomingMessage } from "http";
 import { redactSecrets, type OrchestratorManager } from "../terminal";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
@@ -35,6 +36,7 @@ import { shouldSpeak } from "./speakGate";
 import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
+import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
 import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import {
@@ -59,6 +61,19 @@ import type { Gating } from "../gating";
 import { findPaneOwningProject } from "../paneOwnership";
 import type { CreatedMemory } from "../memory";
 import { briefIsForActivePane } from "../memory";
+import type { SynthesizedBrief } from "../memory/types";
+import { toCortexTrigger } from "../memory/types";
+import { isCortexPrimary } from "../memory/cortexShadow";
+import {
+  mintContextInjectionEventId,
+  hashText,
+  estimateTokens,
+  type ContextInjectionTrigger,
+  type ContextInjectionDisposition,
+} from "../memory/contextTelemetry";
+import type { PythonPolicyClient } from "./policyClient";
+import { createSpokenConfirm } from "./spokenConfirm";
+import { DEFAULT_VOICE_UX } from "../types";
 
 // B-3 measurement spine: the per-injection correlation key. A module-scope monotonic counter mints
 // `inj-<ts>-<seq>` once per injectMemoryBrief; the same id is stamped on the cortex decision-trace
@@ -266,6 +281,10 @@ export interface VoiceDeps {
    *  bead 53q: pass an `owner` token (this connection's state object) on BOTH register and clear so a
    *  stale/foreign connection's close cannot clear the SURVIVING connection's nudge (identity guard). */
   registerReconnectNudge?: (fn: (() => void) | null, owner?: unknown) => void;
+  /** Voice-UX wave 3: the optional "policies" Python daemon facade (focus resolution + SITREP
+   *  ranking). Wired onto ActionContext.policies for the voice lane ONLY — undefined when the
+   *  master switch (advanced.memoryPythonEnabled) is off or the daemon init failed (permanent fallback). */
+  policies?: PythonPolicyClient;
 }
 
 /**
@@ -351,6 +370,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     API_AUTH_TOKEN,
     getCookie,
     registerReconnectNudge,
+    policies,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -432,14 +452,35 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
   if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
   wss.on("close", () => clearInterval(heartbeatTimer));
 
-  wss.on("connection", async (clientWs, req) => {
+  // bead wsm-e2e-pinned-xge (design direction #5): the WS Origin fence, read once per server boot
+  // (env doesn't change mid-process). Empty allowlist unless JANUS_ALLOWED_ORIGINS is set.
+  const allowedOrigins = parseAllowedOrigins(process.env.JANUS_ALLOWED_ORIGINS);
+
+  // The two independent connection fences — Origin THEN cookie/token — combined into ONE guard so
+  // the connection handler below stays a single `if (...) return;` branch (keeps its cyclomatic
+  // complexity <=10; each fence's own branching lives here, not in the handler). Origin runs first:
+  // a present Origin must match the request's Host or be in JANUS_ALLOWED_ORIGINS; an ABSENT Origin
+  // (every non-browser client — scripts, the existing test suite) is unchanged/allowed, so this is
+  // invisible to every existing test. The cookie/token check is byte-identical to the pre-existing
+  // logic, just relocated.
+  function rejectUnauthorizedConnection(clientWs: WebSocket, req: IncomingMessage): boolean {
+    if (!isOriginAllowed(req.headers.origin, req.headers.host, allowedOrigins)) {
+      console.warn("[SECURITY] Blocked WebSocket connection with disallowed Origin:", req.headers.origin);
+      clientWs.close(4003, "Origin not allowed");
+      return true;
+    }
     const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
     if (tokenFromCookie !== API_AUTH_TOKEN) {
       console.warn("[SECURITY] Blocked unauthorized WebSocket connection attempt.");
       clientWs.send(JSON.stringify({ type: "error", message: "Unauthorized WebSocket access. Please reload the interface." }));
       clientWs.close(4001, "Unauthorized");
-      return;
+      return true;
     }
+    return false;
+  }
+
+  wss.on("connection", async (clientWs, req) => {
+    if (rejectUnauthorizedConnection(clientWs, req)) return;
 
     // 3V.2: enroll this connection into the keepalive — alive on accept, re-alive on every pong.
     // Marked BEFORE the observe-only early-return below so BOTH lanes (observe + voice) are swept.
@@ -553,6 +594,24 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       lastInjectId: null,
     };
 
+    // Voice-UX wave 3: the spoken destructive-confirm protocol (src/voice/spokenConfirm.ts, f09-owned).
+    // Constructed ONCE per WS connection (NOT per Gemini reconnect inside connectLiveSession) so its
+    // state machine (idle / awaiting_phrase / reprompted) persists across reconnects on THIS session,
+    // and so the close handler below (outside connectLiveSession's scope) can dispose it. Intercepted
+    // BEFORE the normal approval-intent routing (see the hook inside handleOperatorUtterance) so a bare
+    // "yes" can never approve a staged destructive action.
+    const spokenConfirm = createSpokenConfirm({
+      narrate: (t) => pushApprovalNarrationDep(state.session, t),
+      redact: redactSecrets,
+      nowMs: Date.now,
+      setTimer: (fn, ms) => { const t = setTimeout(fn, ms); (t as any).unref?.(); return t; },
+      clearTimer: (t) => clearTimeout(t as any),
+      confirmTimeoutMs: () => (manager.settings.voiceUx ?? DEFAULT_VOICE_UX).confirmTimeoutMs,
+      pendingActions,
+      heldEntries: () => pendingApprovals.forSession(state.session),
+      broadcast,
+    });
+
     const turnId = (): string => {
       if (state.currentInteractionId == null) state.currentInteractionId = interactionLog.mint();
       setLastInteractionId(state.currentInteractionId);
@@ -578,45 +637,181 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const setModelTurn = () => { state.lastSpeaker = "model"; state.lastInterrupted = false; };
     const voiceName = manager.settings.voiceAi?.voice || "Zephyr";
 
+    // Cortex context-injection telemetry (spec 2026-07-02, deltas 18.1/18.3/18.4): assemble ONE
+    // context_injections row for a single injectMemoryBrief exit and persist it via the fail-soft
+    // v10 writer (same JanusStore | null conduit already threaded to captureTurnUsage). Telemetry
+    // OBSERVES the choke point — it is called ONLY after the disposition is already decided, so it
+    // can never delay or reorder sendClientContent, and its own body is try/catch-guarded (the
+    // writer is already fail-soft, but hashing/Date.now() here run on the caller's stack too).
+    const recordInjectionEvent = (input: {
+      trigger: ContextInjectionTrigger;
+      activeId: string | null;
+      injectId: string | null;
+      startedAt: number;
+      disposition: ContextInjectionDisposition;
+      skippedReason: string | null;
+      brief: SynthesizedBrief | null;
+      error: string | null;
+      // Wave 4 (D2, cortex cutover design): the input tier-snapshot hash the InjectGate evaluated.
+      // Populated on gate skips (unchanged-brief/debounce) where it's the whole point of the row;
+      // absent elsewhere (spec §6.2 still permits deferring it on the pre-existing skip paths).
+      sourceSnapshotHash?: string | null;
+    }): void => {
+      if (!store) return; // no durable conduit (store is null only in a hand-built test harness); skip, don't fall back to JSONL.
+      try {
+        const { trigger, activeId, injectId, startedAt, disposition, skippedReason, brief, error, sourceSnapshotHash } = input;
+        const briefChars = brief ? brief.text.length : 0;
+        store.recordContextInjection({
+          id: mintContextInjectionEventId(),
+          ts: Date.now(),
+          session_id: null, // no per-connection session id concept exists yet — matches captureTurnUsage's own null.
+          interaction_id: state.currentInteractionId,
+          inject_id: injectId,
+          trigger,
+          active_project_id: manager.ledger.activeProjectId ?? null,
+          active_pane_id: activeId,
+          brief_active_pane_id: brief ? brief.activePaneId : null,
+          source: brief ? brief.source : "none",
+          disposition,
+          skipped_reason: skippedReason,
+          source_snapshot_hash: sourceSnapshotHash ?? null,
+          brief_hash: brief ? hashText(brief.text) : null,
+          brief_chars: briefChars,
+          estimated_tokens: estimateTokens(briefChars),
+          elapsed_ms: Date.now() - startedAt,
+          error,
+        });
+      } catch (e) {
+        console.error("[cortex-telemetry] recordInjectionEvent failed:", e);
+      }
+    };
+
+    // Wave 4 (D5): a primary-mode brief that fell all the way to the floor (cortex miss — timeout,
+    // ok:false, unavailable, throw) is STILL an injected-at-the-floor brief for reporting purposes —
+    // `brief.source` only reads "cortex-primary" on a clean curated hit, so any other source while
+    // primary is live means the choke point rendered today's default composition instead.
+    const dispositionForBrief = (brief: SynthesizedBrief): ContextInjectionDisposition =>
+      (isCortexPrimary() && brief.source !== "cortex-primary") ? "cortex-miss" : "injected";
+
+    // Wave 4 (D2): record + exit for an InjectGate skip — pulled out of injectMemoryBrief to keep
+    // its cyclomatic count down (the complexity gate is a hard error).
+    const recordGateSkip = (
+      trigger: ContextInjectionTrigger,
+      activeId: string | null,
+      injectId: string | null,
+      startedAt: number,
+      skip: "unchanged-brief" | "debounce",
+      snapshotHash: string,
+    ): void => {
+      recordInjectionEvent({
+        trigger, activeId, injectId, startedAt,
+        disposition: skip, skippedReason: skip, brief: null, error: null,
+        sourceSnapshotHash: snapshotHash,
+      });
+    };
+
     // Memory Synthesis P0a (anti-rot injection): synthesize a FRESH situational brief for the
     // now-active pane and inject it into the live session via the SAME sendClientContent channel the
     // ears use. Wrapped in try/catch and fully NON-BLOCKING — a synthesis/inject failure must NEVER
     // throw into the live loop (the brief is best-effort context, not a turn the model owes a reply).
-    // `now` is the Node runtime epoch-ms clock. Called on (a) session start and (b) pane switch.
-    const injectMemoryBrief = async (sess: any, activeId: string | null): Promise<void> => {
+    // `now` is the Node runtime epoch-ms clock. Called on session start, pane switch, catch-up, and
+    // (Wave 4 D1) command-outcome (the pane-signal "idle" edge). `trigger` (spec 2026-07-02 §18.2)
+    // labels the telemetry row emitted for EVERY exit below. `affectedPaneId` (Wave 4 D1) is the pane
+    // a command-outcome trigger is ABOUT (independent of the currently-active pane) — threaded into
+    // the cortex ctx so a command-outcome profile can lead with it.
+    //
+    // Wave 4 (D2) choke-point order: (1) no-session guard, (2) mint injectId, (3) map the trigger to
+    // the wire vocabulary + hash the input tier snapshot, (4) the InjectGate — a skip here costs ZERO
+    // Python round-trips, (5) the shadow observation, (6) synthesize (races the cortex when primary),
+    // (7) the pre-existing stale/empty guards, (8) send — redacted — through the SAME channel, (9)
+    // noteInjected ONLY after the send succeeds, and record disposition (injected vs cortex-miss).
+    const injectMemoryBrief = async (
+      sess: any,
+      activeId: string | null,
+      trigger: ContextInjectionTrigger,
+      affectedPaneId: string | null = null,
+    ): Promise<void> => {
+      const startedAt = Date.now();
+      let injectId: string | null = null;
+      let brief: SynthesizedBrief | null = null;
       try {
-        if (!sess) return;
+        if (!sess) {
+          recordInjectionEvent({
+            trigger, activeId, injectId: null, startedAt,
+            disposition: "skipped_no_session", skippedReason: "no active gemini session",
+            brief: null, error: null,
+          });
+          return;
+        }
         // B-3 measurement spine: mint the per-injection correlation key ONCE. It keys the SHADOW
         // decision row (observed for this trigger regardless of whether the brief is ultimately
         // injected) and is stashed on session state ONLY AFTER the brief actually reaches Gemini
         // (below) — so the turn-usage capture joins the nearest preceding ACTUALLY-injected brief,
         // never one dropped by the pane-switch / empty-text guards.
-        const injectId = mintInjectId();
+        injectId = mintInjectId();
+        const now = Date.now();
+        const wire = toCortexTrigger(trigger);
+        const snapshotHash = memory.service.snapshotHashFor(activeId, now);
+        const gateDecision = memory.service.gate.evaluate(snapshotHash, wire, now);
+        if (gateDecision.skip) {
+          recordGateSkip(trigger, activeId, injectId, startedAt, gateDecision.skip, snapshotHash);
+          return;
+        }
         // Inc 4 slice 1 (SHADOW): fire-and-forget cortex OBSERVATION — logs what it WOULD curate for
-        // this trigger, applies nothing. Synchronous void; never blocks or alters the brief below
-        // (parity invariants I-P1..I-P3). Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
-        memory.service.observeCortexShadow(activeId, Date.now(), "brief-inject", injectId);
-        // P0b: race the Python synthesizer (≤memorySynthTimeoutMs) against the in-process floor.
-        // synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        const brief = await memory.service.synthesizeAsync(activeId, Date.now(), injectId);
+        // this trigger when NOT primary; a no-op when primary (that path decides via synthesizeAsync
+        // below instead, avoiding a double daemon call). Synchronous void; never blocks or alters the
+        // brief below. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
+        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId);
+        // P0b/Wave 4 D5: race the cortex (when primary) / the Python synthesizer against the
+        // in-process floor. synthesizeAsync owns the race + `source` authority and NEVER rejects.
+        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
         // with no tier yet (brief.activePaneId null) is still correctly injected.
-        if (!briefIsForActivePane(activeId, coreState.activePaneId)) return;
-        if (brief.text.trim()) {
-          sess.sendClientContent({
-            turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${brief.text}` }] }],
-            turnComplete: true,
+        if (!briefIsForActivePane(activeId, coreState.activePaneId)) {
+          recordInjectionEvent({
+            trigger, activeId, injectId, startedAt,
+            disposition: "skipped_stale_brief",
+            skippedReason: "operator switched the active pane before synthesis completed",
+            brief, error: null,
           });
-          // Join key: only NOW (the brief actually entered Gemini) does this injection become the
-          // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
-          state.lastInjectId = injectId;
+          return;
         }
+        if (!brief.text.trim()) {
+          recordInjectionEvent({
+            trigger, activeId, injectId, startedAt,
+            disposition: "skipped_empty_brief", skippedReason: "synthesized brief text was empty",
+            brief, error: null,
+          });
+          return;
+        }
+        // Redaction invariant: every string injected toward Gemini goes through the redaction pass
+        // regardless of who composed it — identity on already-clean tier text, load-bearing when the
+        // cortex-curated path renders text this choke point did not itself sanitize upstream.
+        sess.sendClientContent({
+          turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}` }] }],
+          turnComplete: true,
+        });
+        // Join key: only NOW (the brief actually entered Gemini) does this injection become the
+        // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
+        state.lastInjectId = injectId;
+        // Wave 4 (D2): the gate only advances state AFTER a confirmed send — a dropped/stale/empty
+        // brief above returned before this point and never counts as "injected".
+        memory.service.gate.noteInjected(snapshotHash, now);
+        recordInjectionEvent({
+          trigger, activeId, injectId, startedAt,
+          disposition: dispositionForBrief(brief), skippedReason: null, brief, error: null,
+        });
       } catch (e) {
-        // The whole body is guarded so the returned promise NEVER rejects — the three fire-and-forget
+        // The whole body is guarded so the returned promise NEVER rejects — the fire-and-forget
         // call sites ignore it, and an unhandled rejection must never escape into the live loop.
         console.error("[memory] brief injection failed:", e);
+        recordInjectionEvent({
+          trigger, activeId, injectId, startedAt,
+          disposition: "failed", skippedReason: null, brief,
+          error: redactSecrets(e instanceof Error ? e.message : String(e)),
+        });
       }
     };
 
@@ -747,68 +942,89 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // guard so a stale callback can't clobber a newer session, broadcast voice_channel_lost, THEN
     // (PLM4) schedule a bounded reconnect. Idempotent-ish: onerror + onclose can both fire for one
     // drop — `sessionDead` makes the second call a no-op so we schedule exactly one reconnect.
-    const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
-      if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
-      // 3V.1 (b): STALE-ATTEMPT GUARD — extend the identity principle (the activeLiveSession-nulling
-      // guard below) to the WHOLE teardown. If a NEWER connectLiveSession has bumped the generation,
-      // THIS attempt's session is stale (it was, or is about to be, closed by the post-connect
-      // generation guard) and its late onerror/onclose must be a complete no-op: its detachSession
-      // would detach the LIVE session's approvals (state.session already points at the newer
-      // session), its voice_channel_lost would be a lie, and its scheduleReconnect would hoist a
-      // THIRD session over the healthy one without closing it. The CURRENT generation's own
-      // callbacks own the real teardown. Mark this attempt dead so a paired onerror+onclose for the
-      // same stale drop stays idempotent.
-      if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
-      sessionDead = true;
-      if (state.session) {
-        const detached = pendingApprovals.detachSession(state.session);
-        // 4D.1: open the "while you were away" window — the next reconnect digests the durable
-        // activity rows recorded between this moment and the reconnect.
-        noteSessionDetached();
-        if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
-        // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
-        // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
-        // job — it only nulls the hoisted handle if it still points at THIS session, so a LATE stale
-        // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
-        // session. `session` is the mutated connection-scope let, so the comparison is by reference
-        // against whatever is currently hoisted (copied from WS-close).
-        if (coreState.activeLiveSession === state.session) {
-          coreState.activeLiveSession = null;
-          // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
-          // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
-          // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
-          clearStableResetTimer();
+    // wsm-e2e-pinned-smz (1): doHandleSessionLost is the ORIGINAL body, unchanged, extracted so the
+    // try/catch wrapper below (handleSessionLost) doesn't push this function's already-near-the-cap
+    // branch count over the complexity gate. This fires directly off the Gemini SDK's onerror/onclose
+    // callbacks (no caller to catch a throw), and its callees (detachSession, broadcast,
+    // persistResumptionToken, scheduleReconnect, …) are best-effort but were previously unwrapped — a
+    // throw from any of them would propagate out of an SDK callback (an unhandled exception context)
+    // and skip every step after it, including the reconnect schedule that is the whole point of this
+    // handler. A swallowed error here is strictly better than a wedged voice channel that never even
+    // tries to come back.
+    const doHandleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
+        if (sessionDead) return; // already torn down this attempt — don't double-schedule a reconnect.
+        // 3V.1 (b): STALE-ATTEMPT GUARD — extend the identity principle (the activeLiveSession-nulling
+        // guard below) to the WHOLE teardown. If a NEWER connectLiveSession has bumped the generation,
+        // THIS attempt's session is stale (it was, or is about to be, closed by the post-connect
+        // generation guard) and its late onerror/onclose must be a complete no-op: its detachSession
+        // would detach the LIVE session's approvals (state.session already points at the newer
+        // session), its voice_channel_lost would be a lie, and its scheduleReconnect would hoist a
+        // THIRD session over the healthy one without closing it. The CURRENT generation's own
+        // callbacks own the real teardown. Mark this attempt dead so a paired onerror+onclose for the
+        // same stale drop stays idempotent.
+        if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
+        sessionDead = true;
+        if (state.session) {
+          const detached = pendingApprovals.detachSession(state.session);
+          // 4D.1: open the "while you were away" window — the next reconnect digests the durable
+          // activity rows recorded between this moment and the reconnect.
+          noteSessionDetached();
+          if (detached.length) console.log(`[VOICE] kept ${detached.length} approval survivor(s) after voice channel ${reason}.`);
+          // Identity guard (NOT the double-fire guard): the per-attempt `sessionDead` flag above is what
+          // makes a double onerror+onclose for ONE drop fire exactly once. THIS guard does a DIFFERENT
+          // job — it only nulls the hoisted handle if it still points at THIS session, so a LATE stale
+          // callback (whose `session` was overwritten by a newer reconnect) can't null the newer live
+          // session. `session` is the mutated connection-scope let, so the comparison is by reference
+          // against whatever is currently hoisted (copied from WS-close).
+          if (coreState.activeLiveSession === state.session) {
+            coreState.activeLiveSession = null;
+            // PLM4 (Finding: flap): the currently-live session dropped — cancel its pending stable-reset
+            // timer so a flapping session never refreshes its bounded-retry budget. Gated by the same
+            // identity guard so a LATE stale callback can't cancel a NEWER session's freshly-armed timer.
+            clearStableResetTimer();
+          }
         }
+        // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
+        // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
+        // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
+        // reconnect AND re-seeded from the durable KV on restart. Clear it HERE, before scheduleReconnect,
+        // so the next bounded attempt connects FRESH — bounding any handle-induced wedge to one attempt.
+        if (shouldClearHandleOnClose(closeCode, attemptUsedHandle)) {
+          console.warn("[SESSION RESUMPTION] handle-fed session closed with code=1008 — clearing the poisoned handle so the next attempt connects fresh.");
+          lastSessionResumptionToken = null;
+          persistResumptionToken(null);
+        }
+        // Issue A: a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
+        // with the SAME unresolved key can only 1007 again, so it must NOT spend a bounded reconnect
+        // attempt — that silently drains the budget (the boot-time 1007 cascade burned 3/6 attempts
+        // before recovering only on a reload). Broadcast a distinct key-problem loss and STOP; recovery
+        // comes from the next client connect once a valid key is set in Settings. isBlankApiKey
+        // distinguishes "no key configured" from "key configured but rejected" for a precise reason.
+        // (`sessionKey` is the later-declared const in this same scope, safely captured by this closure
+        // because handleSessionLost only ever fires AFTER the connect — same pattern as attemptUsedHandle.)
+        if (isInvalidKeyClose(closeCode)) {
+          const blank = isBlankApiKey(sessionKey);
+          console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
+          state.voiceLostSinceLastRestore = true; // 2S.5: a later successful connect announces recovery.
+          broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
+          return;
+        }
+        state.voiceLostSinceLastRestore = true; // 2S.5: arm the restored announcement for the reconnect.
+        broadcast({ type: "voice_channel_lost", reason });
+        // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
+        scheduleReconnect();
+    };
+
+    // wsm-e2e-pinned-smz (1): the actual onerror/onclose-facing entry point — a thin try/catch shell
+    // around doHandleSessionLost so a throw from ANY of its best-effort callees is swallowed rather
+    // than escaping into the SDK's callback context (an unhandled exception there has no caller to
+    // catch it and would abort mid-teardown, potentially skipping the reconnect schedule entirely).
+    const handleSessionLost = (reason: "error" | "closed", closeCode?: number) => {
+      try {
+        doHandleSessionLost(reason, closeCode);
+      } catch (e) {
+        console.error("[VOICE] handleSessionLost threw — swallowed so the SDK callback never propagates an unhandled exception:", e instanceof Error ? e.message : String(e));
       }
-      // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
-      // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
-      // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
-      // reconnect AND re-seeded from the durable KV on restart. Clear it HERE, before scheduleReconnect,
-      // so the next bounded attempt connects FRESH — bounding any handle-induced wedge to one attempt.
-      if (shouldClearHandleOnClose(closeCode, attemptUsedHandle)) {
-        console.warn("[SESSION RESUMPTION] handle-fed session closed with code=1008 — clearing the poisoned handle so the next attempt connects fresh.");
-        lastSessionResumptionToken = null;
-        persistResumptionToken(null);
-      }
-      // Issue A: a 1007 "API key not valid" close is a CONFIG error, not a transient drop. Retrying
-      // with the SAME unresolved key can only 1007 again, so it must NOT spend a bounded reconnect
-      // attempt — that silently drains the budget (the boot-time 1007 cascade burned 3/6 attempts
-      // before recovering only on a reload). Broadcast a distinct key-problem loss and STOP; recovery
-      // comes from the next client connect once a valid key is set in Settings. isBlankApiKey
-      // distinguishes "no key configured" from "key configured but rejected" for a precise reason.
-      // (`sessionKey` is the later-declared const in this same scope, safely captured by this closure
-      // because handleSessionLost only ever fires AFTER the connect — same pattern as attemptUsedHandle.)
-      if (isInvalidKeyClose(closeCode)) {
-        const blank = isBlankApiKey(sessionKey);
-        console.warn(`[VOICE] Gemini Live closed with code=1007 (API key not valid) — ${blank ? "no Gemini API key is configured" : "the configured Gemini key was rejected"}. NOT consuming the reconnect budget; set a valid key in Settings and the voice channel will reconnect on the next connect.`);
-        state.voiceLostSinceLastRestore = true; // 2S.5: a later successful connect announces recovery.
-        broadcast({ type: "voice_channel_lost", reason: blank ? "no_api_key" : "invalid_api_key" });
-        return;
-      }
-      state.voiceLostSinceLastRestore = true; // 2S.5: arm the restored announcement for the reconnect.
-      broadcast({ type: "voice_channel_lost", reason });
-      // PLM4 (2): try to bring the voice channel back, bounded. No-op if the operator already left.
-      scheduleReconnect();
     };
 
       // Resolve the Gemini key: a real configured secret wins; the "CONFIGURED_IN_ENV" sentinel and a
@@ -867,11 +1083,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the active pane just
             // changed — re-focus the live brief on the new pane (the previous pane's detail demotes
             // to a breadcrumb). Non-blocking + self-guarded.
-            injectMemoryBrief(state.session, id);
+            injectMemoryBrief(state.session, id, "pane_switch");
           },
           // Memory Synthesis P0a: the "catch me up" path — switch_context calls this AFTER its live
-          // ledger sync to inject a fresh brief for the now-active pane (orient.ts).
-          injectMemoryBrief: () => injectMemoryBrief(state.session, coreState.activePaneId),
+          // ledger sync to inject a fresh brief for the now-active pane (orient.ts). Cortex telemetry
+          // (spec 2026-07-02 §18.2): switch_context passes "project_switch" explicitly; the
+          // "catch_me_up" fallback below only fires for a hypothetical future caller of this same
+          // hook that omits a trigger.
+          injectMemoryBrief: (trigger) => injectMemoryBrief(state.session, coreState.activePaneId, trigger ?? "catch_me_up"),
           activeDraftTarget,
           broadcastDraft,
           broadcastTerminalsUpdated,
@@ -892,6 +1111,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // builds its flat REST array from posturePayloadForPane; get_stop_all_status reads runningPaneIds.
           runningPaneIds,
           posturePayloadForPane,
+          // Voice-UX wave 3: the optional "policies" daemon facade — undefined when the master
+          // switch is off or init failed (permanent TS-fallback posture, per D2).
+          policies,
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
@@ -1077,6 +1299,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // draft (raw material the operator refines before sending). No-op if no pane is open.
             appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
 
+            // Voice-UX wave 3: the spoken destructive-confirm protocol gets FIRST look at every routed
+            // utterance — a synchronous TS choke point ahead of the approval-intent routing below, so a
+            // bare "yes" can never approve a staged destructive action (delete_pane/delete_project/
+            // clear_history). intercept() returns true only while consuming an utterance that is part of
+            // an open (or newly-armed) confirm window; everything else falls through unchanged.
+            if (spokenConfirm.intercept(cleanUtter)) return;
+
             // WS-E.2 (BUG-007/008): hands-free voice approvals via the PURE intent parser + most-recently-
             // announced targeting (NOT FIFO, NOT substring matching).
             // Seam Inc 1 (task 1.6) / Inc 2 (task 2.1, the FLIP): the single production entry to approval
@@ -1215,6 +1444,27 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           };
 
+          // wsm-e2e-pinned-smz (3): a lightweight, best-effort action_log row for a SUPPRESSED replay —
+          // distinct from the "ok" row the original delivery already wrote for this SAME
+          // idempotency_key, so `getActionLog` (and any operator-facing audit view) can tell "this ran"
+          // apart from "this was replayed and skipped". Never throws; a store fault here must not
+          // affect the tool response already being sent in the caller.
+          const recordReplaySuppressed = (call: any, name: string, ixnId: string): void => {
+            if (!store) return;
+            const replayDef = REGISTRY.find((d: any) => d.name === name);
+            try {
+              store.recordAction({
+                name,
+                capability: replayDef?.capability ?? "unknown",
+                result_kind: "replay_suppressed",
+                ms: 0,
+                idempotency_key: call.id ?? null,
+                surface: "voice",
+                interaction_id: ixnId ?? null,
+              });
+            } catch { /* audit is best-effort; never break the dispatch */ }
+          };
+
           // B1 (phase-1 ack): an AUTO-created pane boots asynchronously, so confirm "opening" immediately —
           // BUT only when it will not speak over the operator (turn-aware gate). Called on the NON-replay
           // path so a reconnect-replayed create_pane never double-narrates. The startsWith("Pane ") check
@@ -1240,6 +1490,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               // REG1 phase-C: unified registry dispatch. runAction is itself try/caught + never throws; the
               // outer catch here is belt-and-suspenders. A re-delivered side-effecting call short-circuits.
               if (isReplayShortCircuit(call, name)) {
+                recordReplaySuppressed(call, name, ixnId);
                 session.sendToolResponse({
                   functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
                 });
@@ -1395,8 +1646,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
         // Memory Synthesis P0a (freshness trigger #2): never hand a fresh/resumed live client a stale
         // brief — synthesize + inject the current situational context once, right after the hoist.
-        // Non-blocking + self-guarded (injectMemoryBrief owns its try/catch).
-        injectMemoryBrief(justConnected, coreState.activePaneId);
+        // Non-blocking + self-guarded (injectMemoryBrief owns its try/catch). Cortex telemetry (spec
+        // 2026-07-02 §18.2): `isReconnect` is this closure's own connectLiveSession param, in scope —
+        // "session_start" on a first connect, "reconnect" when arriving via the PLM4 reconnect scheduler.
+        injectMemoryBrief(justConnected, coreState.activePaneId, isReconnect ? "reconnect" : "session_start");
 
         // Push-observation: bridge global pane signals into THIS live session. The bus owns
         // debounce; we forward each signal as a user-role nudge (same convention as approval
@@ -1463,6 +1716,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           }
           pushSignal(sig);
+          // Wave 4 (D1, cortex cutover design): the observe layer's EXISTING onIdle 'idle' pane
+          // signal (src/observe/index.ts) IS the command-completion edge — no new observe-layer
+          // wiring needed. Fire a fourth injectMemoryBrief trigger here, threading the pane the
+          // signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever pane is
+          // currently focused, so a command-outcome cortex profile can lead with it. Fire-and-forget
+          // (injectMemoryBrief owns its own try/catch and never rejects) + gated by the SAME
+          // InjectGate every other trigger goes through — a burst of idle edges across panes still
+          // collapses to at most one cortex round-trip per debounce floor.
+          if (sig.kind === "idle") {
+            void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
+          }
         });
       };
       hoistAndSubscribe();
@@ -1491,10 +1755,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // gives up with a final voice_channel_lost), and must NOT escape this async callback.
         scheduleReconnect();
       } else {
-        clientWs.send(JSON.stringify({
-          type: "error",
-          message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
-        }));
+        // wsm-e2e-pinned-smz (2): guarded for symmetry with doInitialConnect's own catch (below),
+        // which wraps its identical clientWs.send in a try/catch ("client gone") — this initial-path
+        // send was the ONE asymmetric unguarded call. clientWs can already be gone by the time this
+        // fires (the connect is async; the operator's WS can close mid-connect), and an unguarded
+        // .send() on a closed socket throws, which would escape this catch handler entirely.
+        try {
+          clientWs.send(JSON.stringify({
+            type: "error",
+            message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
+          }));
+        } catch { /* client gone */ }
       }
     }
     }
@@ -1592,7 +1863,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
       // Memory Synthesis P0a (freshness trigger #1, the acute rot case): the operator switched the open
       // pane — re-focus the live brief on it (the prior pane demotes to a breadcrumb). Non-blocking.
-      injectMemoryBrief(state.session, coreState.activePaneId);
+      injectMemoryBrief(state.session, coreState.activePaneId, "pane_switch");
     };
 
     // TWO-STAGE EMERGENCY BRAKE from the UI (bead 8sq). Always allowed — never gated. Stage 1
@@ -1644,6 +1915,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
     clientWs.on("close", () => {
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
+      // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
+      // destructive pendingActions record survives and stays resolvable via UI/typed SURE.
+      spokenConfirm.dispose();
       // bead 9fz: the operator left — unregister this connection's reconnect-nudge so a later settings
       // PUT can't poke a dead connection's scheduler. (A fresh connection re-registers its own.)
       // bead 53q: pass THIS connection's `state` as the owner token. The module guards the clear so a

@@ -144,4 +144,39 @@ describe("2S.2 PUT /api/settings validation (headless)", () => {
     assert.strictEqual(running.manager.settings.advanced.maxBufferLines, 777, "permissive advanced field landed");
     assert.strictEqual((running.manager.settings.voiceAi as any)?.voice, "Puck", "voiceAi passthrough landed");
   });
+
+  // ── Wave 4 (D6): voiceUx.contextInjectDebounceMs through the REAL PUT round trip ────────────────
+  it("rejects an out-of-range voiceUx.contextInjectDebounceMs with 400 naming the field, live value unchanged", async () => {
+    const before = running.manager.settings.voiceUx?.contextInjectDebounceMs;
+    const res = await putSettings({ voiceUx: { contextInjectDebounceMs: -5 } });
+    assert.strictEqual(res.status, 400, "an out-of-range debounce floor answers 400");
+    const body = await res.json();
+    assert.match(String(body.error), /contextInjectDebounceMs/, "the 400 names the offending field");
+    assert.strictEqual(running.manager.settings.voiceUx?.contextInjectDebounceMs, before, "the live value is unchanged");
+  });
+
+  // PRE-EXISTING BUG found via this new D6 coverage (not introduced by this change, and not fixable
+  // here — OrchestratorManager.updateSettings, src/terminal.ts, is outside this file's ownership):
+  // updateSettings() merges server/voiceAi/projects/presets/announcements/advanced/secrets but has
+  // NO branch for `voiceUx` at all, so a validated (200) voiceUx PUT is silently a no-op on the live
+  // settings — this affects EVERY voiceUx field (sitrepShape/focusBindPolicy/confirmTimeoutMs too,
+  // not just contextInjectDebounceMs). These two tests assert the CORRECT contract and are expected
+  // to fail until src/terminal.ts's updateSettings grows a
+  // `if (newSettings.voiceUx) this.settings.voiceUx = { ...this.settings.voiceUx, ...newSettings.voiceUx };`
+  // branch mirroring the existing voiceAi one.
+  it("accepts a valid voiceUx.contextInjectDebounceMs and persists it", async () => {
+    const res = await putSettings({ voiceUx: { contextInjectDebounceMs: 1500 } });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(running.manager.settings.voiceUx?.contextInjectDebounceMs, 1500, "the new debounce floor landed");
+    // Restore the default for the rest of the suite.
+    await putSettings({ voiceUx: { contextInjectDebounceMs: 3000 } });
+  });
+
+  it("STRIPS an unknown voiceUx key alongside a valid contextInjectDebounceMs (forward compat, never 400)", async () => {
+    const res = await putSettings({ voiceUx: { contextInjectDebounceMs: 2000, someFutureVoiceUxKnob: true } });
+    assert.strictEqual(res.status, 200, "unknown voiceUx keys are stripped, not rejected");
+    assert.strictEqual(running.manager.settings.voiceUx?.contextInjectDebounceMs, 2000, "the known key landed");
+    assert.ok(!("someFutureVoiceUxKnob" in (running.manager.settings.voiceUx as any)), "the unknown key was stripped, not persisted");
+    await putSettings({ voiceUx: { contextInjectDebounceMs: 3000 } });
+  });
 });

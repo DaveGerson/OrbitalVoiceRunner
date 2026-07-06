@@ -1,5 +1,6 @@
 import assert from "assert";
 import { OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 import fs from "fs";
 
 function deleteScrollback(id: string): void {
@@ -9,7 +10,9 @@ function deleteScrollback(id: string): void {
 
 async function runTests() {
   console.log("Running OrchestratorManager tests...");
-  const manager = new OrchestratorManager();
+  const store = new JanusStore(":memory:");
+  store.init();
+  const manager = new OrchestratorManager({ ledger: store });
   
   // 1. Test addition
   console.log("Testing terminal addition...");

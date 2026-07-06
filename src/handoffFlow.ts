@@ -21,6 +21,19 @@ export type DeliverDispatchKind = "executed" | "pending" | "blocked" | "error" |
 /** Pending-approval resolution reasons that flip a handoff row (mirrors ResolveReason). */
 export type HandoffResolveReason = "approved" | "rejected" | "expired" | "dead_pane";
 
+/**
+ * wsm-e2e-pinned-3vl (1): the single source of truth for "does this resolve reason flip a linked
+ * handoff row". Previously the allowlist (`approved`/`rejected`/`expired`/`dead_pane`, excluding
+ * `lost_race`/`not_found`) was DUPLICATED as a literal `Set`/`||` chain at every call site — the
+ * server gate-check and the test's `resolveAndFlip` helper could silently drift out of sync (e.g. a
+ * future new ResolveReason added to one allowlist but not the other). Both now import and call this
+ * one predicate. A plain `string` param (not `ResolveReason`) keeps this importable without pulling
+ * in `pendingApprovals`'s type from a module that must stay decoupled from it.
+ */
+export function isFlipReason(reason: string): reason is HandoffResolveReason {
+  return reason === "approved" || reason === "rejected" || reason === "expired" || reason === "dead_pane";
+}
+
 export type DeliverHandoffEffect =
   /** Full Auto: the write already landed via auto_execute; flip the row to delivered now. */
   | { kind: "deliver_now"; state: "delivered"; approvedVia: "full_auto" }
@@ -117,6 +130,15 @@ function writeHandoffFlip(
   } else if (nextState === "rejected") {
     store.updateHandoffState(handoffId, "rejected", { approved_via: vocal ? "voice" : "rest" });
   } else if (nextState === "expired") {
+    // wsm-e2e-pinned-3vl (3): both HandoffResolveReason "expired" (TTL sweep) AND "dead_pane"
+    // (approve against a since-vanished pane) map to nextState "expired" here and share this SAME
+    // 'ttl_expire' provenance label — dead_pane does NOT get its own distinct approved_via value.
+    // This is a DELIBERATE umbrella, not an oversight: 'ttl_expire' already reads as "resolved
+    // without an operator decision" (the handoffs.approved_via column has no third value for it),
+    // and splitting it would touch every consumer/golden that pattern-matches approved_via (UI
+    // provenance labels, any exported fixture). The STATE the row lands in ("expired") already
+    // distinguishes "operator decided" (delivered/rejected) from "resolved without one"
+    // (expired/dead_pane) — that is the distinction that actually matters downstream today.
     store.updateHandoffState(handoffId, "expired", { approved_via: "ttl_expire" });
   }
 }

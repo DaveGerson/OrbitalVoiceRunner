@@ -18,6 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert";
 import fs from "fs";
 import { UniversalTerminal, OrchestratorManager } from "../src/terminal";
+import { JanusStore } from "../src/store/sqliteStore";
 import type { PtyTransport } from "../src/ptyTransport";
 
 function deleteScrollback(id: string): void {
@@ -83,10 +84,14 @@ test("pre-spawn follow-up command is buffered, not dropped", async () => {
     const term = makeTerm("b1-6a", stub);
     try {
       term.writeInput("echo BEFORE"); // pre-start: transport === null
-      assert.deepStrictEqual((term as any).pendingInput, ["echo BEFORE"], "pre-start input buffered, not dropped");
+      assert.deepStrictEqual(
+        (term as any).pendingInput,
+        [{ kind: "submit", command: "echo BEFORE" }],
+        "pre-start input buffered, not dropped",
+      );
       term.start(); // first spawn: must PRESERVE the pre-spawn queue across the reset
       assert.deepStrictEqual(
-        (term as any).pendingInput, ["echo BEFORE"],
+        (term as any).pendingInput, [{ kind: "submit", command: "echo BEFORE" }],
         "pre-spawn input survives start()'s spawnReady/pendingInput reset (first-spawn carve-out)",
       );
       stub.becomeReady();
@@ -104,7 +109,11 @@ test("pre-spawn follow-up command is buffered, not dropped", async () => {
     try {
       term.start();
       term.writeInput("echo X");
-      assert.deepStrictEqual((term as any).pendingInput, ["echo X"], "post-start pre-ready input queued");
+      assert.deepStrictEqual(
+        (term as any).pendingInput,
+        [{ kind: "submit", command: "echo X" }],
+        "post-start pre-ready input queued",
+      );
       stub.becomeReady();
       await tick();
       assert.deepStrictEqual(stub.writes, ["echo X", "\r"], "queued input flushed in order after boot");
@@ -119,7 +128,9 @@ test("pre-spawn follow-up command is buffered, not dropped", async () => {
 // The slot must exist the instant addTerminal returns; the actual start() runs on a later tick.
 // A microtask/setImmediate liveness probe scheduled right after addTerminal must run BEFORE onReady.
 test("addTerminal registers synchronously and defers the spawn (loop not frozen)", async () => {
-  const manager = new OrchestratorManager();
+  const store = new JanusStore(":memory:");
+  store.init();
+  const manager = new OrchestratorManager({ ledger: store });
   let readyFired = false;
   let livenessRanBeforeReady = false;
   (manager as any).onReady = () => { readyFired = true; };

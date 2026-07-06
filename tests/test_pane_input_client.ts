@@ -9,7 +9,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { buildPaneInputFrame } from "../src/orbital/paneInputClient";
+import { buildPaneInputFrame, shouldSendPaneInput } from "../src/orbital/paneInputClient";
 
 describe("buildPaneInputFrame — the pane_input wire contract", () => {
   it("produces exactly { type:'pane_input', paneId, data } with those field names", () => {
@@ -36,5 +36,28 @@ describe("buildPaneInputFrame — the pane_input wire contract", () => {
     const arrowUp = "\x1b[A";
     const frame = buildPaneInputFrame("p1", arrowUp);
     assert.strictEqual(frame.data, arrowUp, "raw bytes are not transformed");
+  });
+});
+
+describe("shouldSendPaneInput — the TerminalView onInput= send guard", () => {
+  it("suppresses under plain mock mode (e2e wire NOT armed), even with an OPEN socket", () => {
+    assert.strictEqual(shouldSendPaneInput(true, false, { readyState: 1 }), false);
+  });
+
+  it("allows mock mode when the e2e wire IS armed and the socket is OPEN", () => {
+    assert.strictEqual(shouldSendPaneInput(true, true, { readyState: 1 }), true);
+  });
+
+  it("suppresses when the socket is not OPEN, even live and wire-armed", () => {
+    assert.strictEqual(shouldSendPaneInput(false, true, { readyState: 3 }), false);
+  });
+
+  it("suppresses when there is no socket at all", () => {
+    assert.strictEqual(shouldSendPaneInput(false, true, null), false);
+    assert.strictEqual(shouldSendPaneInput(false, true, undefined), false);
+  });
+
+  it("allows the live/non-mock path with an OPEN socket (positive control)", () => {
+    assert.strictEqual(shouldSendPaneInput(false, false, { readyState: 1 }), true);
   });
 });
