@@ -48,3 +48,24 @@ export class InjectGate {
     this.lastInjectedAt = now;
   }
 }
+
+/** z5c slice 1 groundwork (spec 2026-07-07 D5): per-session gate state. One InjectGate per
+ *  session key, created on demand; `null` (today's single implicit session) maps to a stable
+ *  default key so current behavior is byte-identical. The debounceMs getter is shared by every
+ *  gate so a runtime settings PUT reaches all sessions at once. Naming follows the existing
+ *  `pendingApprovals.forSession(...)` idiom. */
+export class InjectGateRegistry {
+  private gates = new Map<string, InjectGate>();
+
+  constructor(private debounceMs: () => number) {}
+
+  forSession(sessionId: string | null): InjectGate {
+    const key = sessionId ?? "__single_session__";
+    let gate = this.gates.get(key);
+    if (!gate) {
+      gate = new InjectGate(this.debounceMs);
+      this.gates.set(key, gate);
+    }
+    return gate;
+  }
+}
