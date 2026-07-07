@@ -3,7 +3,9 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import dispatch  # noqa: E402
+from _synth_dispatch_loader import load_dispatch  # noqa: E402
+
+dispatch = load_dispatch()
 
 CFG = {"totalBudgetChars": 4800,
        "weights": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05},

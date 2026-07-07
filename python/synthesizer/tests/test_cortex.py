@@ -5,7 +5,9 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import cortex  # noqa: E402
-import dispatch  # noqa: E402
+from _synth_dispatch_loader import load_dispatch  # noqa: E402
+
+dispatch = load_dispatch()
 
 # Resolve the fixture path relative to this file (works from any cwd).
 # Layout: python/synthesizer/tests/test_cortex.py  →  ../../.. = repo root
