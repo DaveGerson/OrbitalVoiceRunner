@@ -80,4 +80,109 @@ test.describe("Orbital Kitchen — Back of House", () => {
     await page.getByTestId("boh-room-dock").click();
     await expect(page.getByTestId("boh-disabled")).toBeVisible();
   });
+
+  // ── f09.2: timed autonomy windows (the Rulebook's per-pane grant/end) ──────────────────────────
+  // The kitchen ?mock=1 harness (armE2EWire) seeds stations `mock_pane_1`/`mock_pane_2` ("React
+  // Frontend" / "Python Backend" — see e2e/fixtures.ts MOCK_TERMINAL_ID). Scoping the Rulebook to one
+  // exposes the "Timed full-auto window" control. Granting POSTs /api/terminals/:id/autonomy-window (a
+  // deliberate UI loosen → immediate on REST); the server would broadcast terminals_updated so the
+  // countdown badge repaints from the refetched autonomy_until. The countdown → GUARDED revert on
+  // expiry rides the same terminals refetch (server truth). NOTE (integrator): seeding a LIVE window
+  // into the mock terminals payload (so the countdown badge + End control render) needs the kitchen
+  // harness to carry `autonomy_until` on the seeded pane (e.g. a setAutonomyMock hook), mirroring
+  // setPostureMock — that is why the countdown→revert case below stays skipped.
+  const MOCK_PANE = "mock_pane_1";
+
+  test("scoping the Rulebook to a station reveals the timed-autonomy control", async ({ page }) => {
+    await gotoBoH(page);
+    await page.getByTestId(`rulebook-scope-${MOCK_PANE}`).click();
+    await expect(page.getByTestId("autonomy-window-controls")).toBeVisible();
+    // No live window seeded → the GRANT affordance, not the End/countdown.
+    await expect(page.getByTestId("autonomy-grant")).toBeVisible();
+  });
+
+  test("granting a window POSTs the autonomy-window endpoint and acks", async ({ page }) => {
+    await page.route(/\/api\/terminals\/[^/]+\/autonomy-window$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ output: "Autonomy window granted." }) }));
+    await gotoBoH(page);
+    await page.getByTestId(`rulebook-scope-${MOCK_PANE}`).click();
+    const grantReq = page.waitForRequest(
+      (r) => /\/api\/terminals\/[^/]+\/autonomy-window$/.test(r.url()) && r.method() === "POST",
+      { timeout: 10_000 });
+    await page.getByTestId("autonomy-grant").click();
+    const req = await grantReq;
+    expect(req.url()).toContain(`/api/terminals/${MOCK_PANE}/autonomy-window`);
+    expect(req.postDataJSON()?.minutes).toBe(20); // default 20-minute window
+    await expect(page.getByTestId("toast")).toContainText("Full-auto window opened");
+  });
+
+  // ── f09.3: posture profiles (the Rulebook's one-tap named gate bundles, global scope) ──────────
+  test("the Rulebook shows one-tap posture pills in global scope", async ({ page }) => {
+    await gotoBoH(page);
+    await expect(page.getByTestId("posture-pills")).toBeVisible();
+    // the three seed profiles
+    await expect(page.getByTestId("posture-pill-headsdown")).toBeVisible();
+    await expect(page.getByTestId("posture-pill-demo")).toBeVisible();
+    await expect(page.getByTestId("posture-pill-locked")).toBeVisible();
+    // the "save current as profile" affordance
+    await expect(page.getByTestId("posture-save")).toBeVisible();
+  });
+
+  test("tapping the Locked posture flips every gate to Off and highlights the pill", async ({ page }) => {
+    // The apply POSTs /api/posture (the deliberate UI loosen); mock it so the success toast stands.
+    await page.route(/\/api\/posture$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ output: "Applied the 'Locked' posture." }) }));
+    await gotoBoH(page);
+    // Before: a productive write is not Off.
+    await expect(page.getByTestId("rule-write_to_pane").getByTestId("gate-Off")).toHaveAttribute("aria-pressed", "false");
+    const postReq = page.waitForRequest((r) => /\/api\/posture$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
+    await page.getByTestId("posture-pill-locked").click();
+    // The whole matrix reads Off (Locked = "not in my kitchen") and the pill is active.
+    await expect(page.getByTestId("rule-write_to_pane").getByTestId("gate-Off")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("rule-delete_project").getByTestId("gate-Off")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("posture-pill-locked")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("toast")).toContainText("Posture set");
+    // The apply routes through the dedicated posture endpoint with the profile name.
+    const req = await postReq;
+    expect(req.postDataJSON()?.name).toBe("Locked");
+  });
+
+  test("posture pills are global-scope only (hidden when a station is scoped)", async ({ page }) => {
+    await gotoBoH(page);
+    await expect(page.getByTestId("posture-pills")).toBeVisible();
+    await page.getByTestId(`rulebook-scope-${MOCK_PANE}`).click();
+    await expect(page.getByTestId("posture-pills")).toHaveCount(0);
+  });
+
+  test("save current as profile adds a new operator pill", async ({ page }) => {
+    // Saving a profile writes the postureProfiles array via PUT /api/settings.
+    await page.route(/\/api\/settings$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true }) }));
+    await gotoBoH(page);
+    await page.getByTestId("posture-save-name").fill("Night shift");
+    const putReq = page.waitForRequest((r) => /\/api\/settings$/.test(r.url()) && r.method() === "PUT", { timeout: 10_000 });
+    await page.getByTestId("posture-save").click();
+    // The write carries the new profile in advanced.postureProfiles.
+    const body = (await putReq).postDataJSON();
+    expect(body?.advanced?.postureProfiles?.some((p: { name: string }) => p.name === "Night shift")).toBe(true);
+    // The new profile pill (folded name key) renders, with a delete affordance (operator-saved).
+    await expect(page.getByTestId("posture-pill-nightshift")).toBeVisible();
+    await expect(page.getByTestId("posture-delete-nightshift")).toBeVisible();
+    // Seeds never carry a delete affordance.
+    await expect(page.getByTestId("posture-delete-locked")).toHaveCount(0);
+  });
+
+  // The countdown badge + auto-revert to GUARDED. Requires the harness to reflect a live window on the
+  // seeded pane (autonomy_until on the terminals payload). Skipped until that harness hook lands so the
+  // suite stays green; unskip alongside the setAutonomyMock harness seed (integrator).
+  test.skip("a granted window shows a countdown badge that reverts to GUARDED on expiry", async ({ page }) => {
+    await gotoBoH(page);
+    await page.getByTestId(`rulebook-scope-${MOCK_PANE}`).click();
+    await page.getByTestId("autonomy-grant").click();
+    // Countdown badge appears while the window is live.
+    await expect(page.getByTestId("autonomy-countdown")).toBeVisible();
+    // Force expiry through the harness (window removed → terminals_updated → refetch drops autonomy_until).
+    // The badge disappears and the pane posture reverts.
+    await expect(page.getByTestId("autonomy-countdown")).toHaveCount(0);
+  });
 });

@@ -476,6 +476,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     shellAllowlist,
     APPROVAL_TTL_MS,
     posturePayloadForPane,
+    grantAutonomyWindow,
+    endAutonomyWindow,
     broadcastTerminalsUpdated,
     stopAll,
     releaseStopAll,
@@ -1197,6 +1199,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // builds its flat REST array from posturePayloadForPane; get_stop_all_status reads runningPaneIds.
           runningPaneIds,
           posturePayloadForPane,
+          // f09.2: the timed-autonomy-window seam (grant defers via gateOrDefer; end is immediate).
+          grantAutonomyWindow,
+          endAutonomyWindow,
           // Voice-UX wave 3: the optional "policies" daemon facade — undefined when the master
           // switch is off or init failed (permanent TS-fallback posture, per D2).
           policies,

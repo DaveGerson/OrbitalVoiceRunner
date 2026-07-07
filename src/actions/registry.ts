@@ -165,6 +165,11 @@ export const listPanes: ActionDef<typeof NoParams> = {
           context_size: term.contextSize,
           effective_gates: posture.effective_gates,
           posture: posture.posture,
+          // f09.2: carry the live autonomy-window expiry (epoch ms) so the WS terminals_updated →
+          // refetchTerminals path feeds the pane-chip countdown badge. Only present while a window is
+          // live (posturePayloadForPane omits it otherwise), so the flat array stays byte-identical
+          // when no window is open.
+          ...(posture.autonomy_until !== undefined ? { autonomy_until: posture.autonomy_until } : {}),
         };
       });
       return { kind: "ok", output: flat };

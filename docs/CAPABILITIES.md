@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**101** actions across **26** gated capabilities, plus the always-allowed group.
+**104** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -279,6 +279,9 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `apply_posture` | voice / rest | no | Apply a named safety posture — say 'go heads down' to let agents run on their own work, 'demo mode' to make everything ask first, or 'lock it down' to block ev… |
+| `end_autonomy_window` | voice / rest | no | End an active autonomy window on a pane right now, reverting it to the normal ask-first posture |
+| `grant_autonomy_window` | voice / rest | no | Grant a bounded full-auto window (default 20 minutes, hard-capped at 120) on ONE pane's productive work, so an agent runs unattended and the window auto-revert… |
 | `set_capability_gate` | voice | no | Set a capability gate to Auto, Ask, or Off — globally or for one pane (meta capability) |
 | `set_pane_gates` | rest | no | Set the per-pane capability-gate OVERRIDE map from the matrix editor (bulk, whole-map, loosening allowed — the deliberate operator-direct UI sibling of the voi… |
 

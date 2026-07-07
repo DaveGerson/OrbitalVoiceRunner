@@ -11,9 +11,10 @@
 //   • Loading Dock / Boss's Office — integrations / budget: disabled placeholders.
 import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { INK, SERVICE_MODES, type ServiceModeId } from "./../theme";
-import { Button, Chip, Icon } from "./../primitives";
+import { AutonomyBadge, Button, Chip, Icon } from "./../primitives";
 import { CAPABILITY_CATEGORIES, CAPABILITY_LABELS } from "../../gateSurface";
-import { DEFAULT_CAPABILITY_GATES, type SystemSettings, type CapabilityGateMap, type CapabilityGate, type GateValue } from "../../types";
+import { DEFAULT_CAPABILITY_GATES, SEED_POSTURE_PROFILES, type SystemSettings, type CapabilityGateMap, type CapabilityGate, type GateValue, type PostureProfile } from "../../types";
+import { resolvePostureProfiles, matchActiveProfile, normalizePostureName, normalizeGateMap } from "../../settingsGatesRoundTrip";
 import { getAudioOutputDevices, getStoredOutputDeviceId, storeOutputDeviceId } from "../../utils/audio";
 
 type RoomId = "rulebook" | "chef" | "walkin" | "boiler" | "recipe" | "dock" | "boss";
@@ -136,9 +137,11 @@ export interface RulebookPane {
   name: string;
   project: string;
   overrides?: Partial<CapabilityGateMap>;
+  /** f09.2: epoch-ms expiry of a LIVE timed-autonomy window on this pane (server truth), or undefined. */
+  autonomy_until?: number;
 }
 
-export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSettings, panes = [], setPaneGates }: {
+export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSettings, panes = [], setPaneGates, grantAutonomyWindow, endAutonomyWindow, applyPosture }: {
   dark: boolean;
   settings: SystemSettings | null;
   globalMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
@@ -148,6 +151,12 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
   panes?: RulebookPane[];
   /** 2K.2: PUT the pane's whole override map (…/capability-gates). */
   setPaneGates?: (projectId: string, paneId: string, gates: Record<string, string>) => void;
+  /** f09.2: open a bounded full-auto window on the scoped pane. */
+  grantAutonomyWindow?: (paneId: string, minutes?: number) => void;
+  /** f09.2: end an active autonomy window on the scoped pane. */
+  endAutonomyWindow?: (paneId: string) => void;
+  /** f09.3: apply a named posture profile (the deliberate UI loosen — applies directly). */
+  applyPosture?: (name: string) => void;
 }) {
   const [room, setRoom] = useState<RoomId>("rulebook");
   const [outputDevices, setOutputDevices] = useState<MediaDeviceInfo[]>([]);
@@ -157,6 +166,8 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
   // (its override map, PUT to the per-pane capability-gates route). Falls back to kitchen scope
   // if the scoped pane disappears (closed/archived).
   const [scope, setScope] = useState<string>("kitchen");
+  // f09.3: the "save current matrix as profile" name input (global scope only).
+  const [newProfileName, setNewProfileName] = useState<string>("");
   const scopedPane = resolveGateScope(scope, panes);
   const fg = dark ? "#ffe9c7" : INK;
 
@@ -176,6 +187,39 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
   };
   const patchVoice = (patch: Partial<SystemSettings["voiceAi"]>) => { if (settings) saveSettings({ ...settings, voiceAi: { ...settings.voiceAi, ...patch } }); };
   const patchAdvanced = (patch: Partial<SystemSettings["advanced"]>) => { if (settings) saveSettings({ ...settings, advanced: { ...settings.advanced, ...patch } }); };
+
+  // ── f09.3: posture profiles (global scope only) ──────────────────────────────
+  const savedProfiles = settings?.advanced?.postureProfiles;
+  const allProfiles: PostureProfile[] = resolvePostureProfiles(savedProfiles);
+  // The pill to highlight: the profile whose matrix exactly matches the current global map.
+  const activeProfileName = matchActiveProfile(globalGates, savedProfiles);
+  const seedNames = new Set(SEED_POSTURE_PROFILES.map((p) => normalizePostureName(p.name)));
+  const isSeedProfile = (p: PostureProfile) => seedNames.has(normalizePostureName(p.name));
+  // Snapshot the CURRENT global matrix as a new operator-saved profile (the matrix editor IS the
+  // profile editor — no dedicated editor UI). Overwrites a same-named saved profile.
+  const saveCurrentAsProfile = () => {
+    const name = newProfileName.trim();
+    if (!name || !settings) return;
+    const key = normalizePostureName(name);
+    const kept = (savedProfiles ?? []).filter((p) => normalizePostureName(p.name) !== key);
+    const snapshot = normalizeGateMap(globalGates) ?? {};
+    saveSettings({ ...settings, advanced: { ...settings.advanced, postureProfiles: [...kept, { name, capabilityGates: snapshot }] } });
+    setNewProfileName("");
+  };
+  const deleteProfile = (p: PostureProfile) => {
+    if (!settings) return;
+    const key = normalizePostureName(p.name);
+    saveSettings({ ...settings, advanced: { ...settings.advanced, postureProfiles: (savedProfiles ?? []).filter((sp) => normalizePostureName(sp.name) !== key) } });
+  };
+  // Apply a profile — the deliberate UI loosen (applies directly, no gate). Prefers the wired
+  // applyPosture callback (optimistic settings update + POST /api/posture); falls back to a direct
+  // settings write when rendered without it (isolated component tests).
+  const applyProfilePill = (p: PostureProfile) => {
+    if (applyPosture) { applyPosture(p.name); return; }
+    if (!settings) return;
+    const gates = normalizeGateMap(p.capabilityGates);
+    saveSettings({ ...settings, advanced: { ...settings.advanced, capabilityGates: gates, ...(p.globalPermissionsMode ? { globalPermissionsMode: p.globalPermissionsMode } : {}) } });
+  };
 
   // ── Inline render helpers (closures over component scope — NOT React components) ──
 
@@ -200,6 +244,80 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
           );
         })}
       </aside>
+    );
+  }
+
+  // f09.2: the timed-autonomy-window control for the scoped station — grant a bounded full-auto
+  // window (auto-reverts) or end a live one. Renders ONLY in pane scope (a window is per-pane).
+  function renderAutonomyCard(pane: RulebookPane): ReactNode {
+    const live = typeof pane.autonomy_until === "number" && pane.autonomy_until > Date.now();
+    return (
+      <Card dark={dark}>
+        <Lbl dark={dark}>Timed full-auto window</Lbl>
+        <div data-testid="autonomy-window-controls" style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {live ? (
+            <>
+              <span style={{ fontFamily: "DM Sans", fontSize: 13, fontWeight: 700, color: fg }}>
+                Running unattended —
+              </span>
+              <AutonomyBadge until={pane.autonomy_until} />
+              <div style={{ flex: 1 }} />
+              <Button testId="autonomy-end" variant="primary" icon="check" onClick={() => endAutonomyWindow?.(pane.id)}>
+                End window
+              </Button>
+            </>
+          ) : (
+            <>
+              <span style={{ flex: 1, minWidth: 0, fontFamily: "DM Sans", fontSize: 12.5, fontWeight: 600, color: "#8a6a4f" }}>
+                Let this station cook on its own for 20 minutes. It reverts to asking automatically — and never survives a restart.
+              </span>
+              <Button testId="autonomy-grant" variant="mint" icon="spark" onClick={() => grantAutonomyWindow?.(pane.id, 20)}>
+                Let 'em cook · 20 min
+              </Button>
+            </>
+          )}
+        </div>
+      </Card>
+    );
+  }
+
+  // f09.3: one-tap posture pills + "save current as profile" — GLOBAL scope only (a posture is the
+  // whole-kitchen matrix). The active-matching profile is highlighted. Applying is the deliberate UI
+  // loosen (applies directly); seeds can't be deleted, operator-saved ones carry an × .
+  function renderPostureCard(): ReactNode {
+    return (
+      <Card dark={dark}>
+        <Lbl dark={dark}>Postures — one tap swaps every rule</Lbl>
+        <div data-testid="posture-pills" style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          {allProfiles.map((p) => {
+            const on = !!activeProfileName && normalizePostureName(activeProfileName) === normalizePostureName(p.name);
+            const slug = normalizePostureName(p.name);
+            return (
+              <Fragment key={slug}>
+                <span data-testid={`posture-pill-wrap-${slug}`} style={{ display: "inline-flex", alignItems: "center", gap: 4, border: "2px solid " + INK, borderRadius: 999, background: on ? "#4db892" : (dark ? "#1a0f08" : "#fff4de"), boxShadow: on ? "2px 2px 0 0 " + INK : "none", overflow: "hidden" }}>
+                  <button data-testid={`posture-pill-${slug}`} aria-pressed={on} onClick={() => applyProfilePill(p)}
+                    style={{ padding: "6px 12px", border: "none", background: "transparent", color: on ? INK : fg, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12.5 }}>
+                    {p.name}
+                  </button>
+                  {!isSeedProfile(p) && (
+                    <button data-testid={`posture-delete-${slug}`} title={`Delete ${p.name}`} aria-label={`Delete ${p.name}`} onClick={() => deleteProfile(p)}
+                      style={{ padding: "6px 8px", border: "none", borderLeft: "2px solid " + INK, background: "transparent", color: "#e23a3a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 900, fontSize: 12.5 }}>
+                      ×
+                    </button>
+                  )}
+                </span>
+              </Fragment>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+          <input data-testid="posture-save-name" value={newProfileName} onChange={(e) => setNewProfileName(e.target.value)} placeholder="name this posture…"
+            style={{ ...fieldStyle(dark), flex: 1, minWidth: 160 }} />
+          <Button testId="posture-save" variant="mint" icon="check" disabled={!newProfileName.trim()} onClick={saveCurrentAsProfile}>
+            Save current as profile
+          </Button>
+        </div>
+      </Card>
     );
   }
 
@@ -232,6 +350,8 @@ export function BackOfHouse({ dark, settings, globalMode, setGlobalMode, saveSet
               : <>Kitchen-wide defaults — every station follows these unless you tune it individually above.</>}
           </div>
         </Card>
+        {scopedPane && renderAutonomyCard(scopedPane)}
+        {!scopedPane && renderPostureCard()}
         {Object.entries(CAPABILITY_CATEGORIES).map(([cat, caps]) => (
           <Fragment key={cat}>
             <Card dark={dark}>

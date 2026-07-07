@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
-import { SystemSettings, CliPreset, CapabilityGateMap, PaneMeta } from "../types";
-import { preservePresetGates, withAdvancedGates, normalizeGateMap } from "../settingsGatesRoundTrip";
+import { SystemSettings, CliPreset, CapabilityGateMap, PaneMeta, PostureProfile } from "../types";
+import { preservePresetGates, withAdvancedGates, normalizeGateMap, preservePostureProfiles, normalizePostureProfiles } from "../settingsGatesRoundTrip";
 import { CapabilityMatrixTab } from "./CapabilityMatrixTab";
 import {
   type AnnouncementTemplates,
@@ -158,6 +158,10 @@ export function SettingsDialog({
   // bead 8sq: the global default capability-gate matrix. Held in form state so save/load
   // round-trips it (it was being DROPPED by getCompiledSettings's flat `advanced` rebuild).
   const [capabilityGates, setCapabilityGates] = useState<CapabilityGateMap | undefined>(undefined);
+  // f09.3: operator-saved posture profiles. Held in form state for the SAME reason as capabilityGates
+  // above — getCompiledSettings rebuilds `advanced` from a literal, so without carrying this through
+  // (preservePostureProfiles) every save would silently erase the operator's saved profiles.
+  const [postureProfiles, setPostureProfiles] = useState<PostureProfile[] | undefined>(undefined);
 
   // Local states - Secret Key Cabinet
   const [geminiApiKey, setGeminiApiKey] = useState<string>("");
@@ -228,6 +232,7 @@ export function SettingsDialog({
     setHistoryMaxCommands(ad.historyMaxCommands);
     setHistoryMaxOutputLength(ad.historyMaxOutputLength);
     setCapabilityGates(normalizeGateMap(s.advanced?.capabilityGates));
+    setPostureProfiles(normalizePostureProfiles(s.advanced?.postureProfiles));
     setMemoryPythonEnabled(ad.memoryPythonEnabled);
     setMemorySynthTimeoutMs(ad.memorySynthTimeoutMs);
 
@@ -275,8 +280,9 @@ export function SettingsDialog({
       presets,
       announcements,
       // bead 8sq: re-attach the global capability-gate matrix from form state via withAdvancedGates,
-      // so a save no longer ERASES advanced.capabilityGates (the drop-on-save data-loss bug).
-      advanced: withAdvancedGates({
+      // so a save no longer ERASES advanced.capabilityGates (the drop-on-save data-loss bug). f09.3:
+      // preservePostureProfiles does the SAME for advanced.postureProfiles (same silent-erase class).
+      advanced: preservePostureProfiles(withAdvancedGates({
         webSocketUrl: "",
         latencyMode: "Balanced",
         throughputBps: 16000,
@@ -293,7 +299,7 @@ export function SettingsDialog({
         historyMaxOutputLength,
         memoryPythonEnabled,
         memorySynthTimeoutMs
-      }, capabilityGates) as SystemSettings["advanced"],
+      }, capabilityGates), postureProfiles) as SystemSettings["advanced"],
       secrets: {
         geminiApiKey
       }
@@ -310,7 +316,7 @@ export function SettingsDialog({
     activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
-    announcements, capabilityGates, memoryPythonEnabled, memorySynthTimeoutMs
+    announcements, capabilityGates, postureProfiles, memoryPythonEnabled, memorySynthTimeoutMs
   ]);
 
   // Handle Saving
@@ -376,6 +382,9 @@ export function SettingsDialog({
     });
     // bead 8sq: round-trip the global capability-gate matrix through the JSON tab too.
     if (jsonHasAdvancedGates(parsed)) setCapabilityGates(normalizeGateMap(parsed.advanced.capabilityGates));
+    // f09.3: round-trip operator-saved posture profiles through the JSON tab (undefined ⇒ untouched).
+    const jsonProfiles = normalizePostureProfiles(parsed?.advanced?.postureProfiles);
+    if (jsonProfiles) setPostureProfiles(jsonProfiles);
   };
 
   // Handle direct JSON String modifications

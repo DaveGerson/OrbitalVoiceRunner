@@ -362,8 +362,13 @@ export default function OrbitalApp() {
         saveSettings={data.saveSettings}
         /* 2K.2: the Rulebook's pane scope — live panes + their CURRENT override maps (ledger truth). */
         panes={stations.map((s) => ({ id: s.id, name: s.name, project: s.project,
-          overrides: data.ledger[s.project]?.panes?.[s.id]?.capabilityGates }))}
-        setPaneGates={data.setPaneGates} />
+          overrides: data.ledger[s.project]?.panes?.[s.id]?.capabilityGates,
+          /* f09.2: server-truth live-window expiry so the Rulebook can show a countdown + End control. */
+          autonomy_until: s.autonomy_until }))}
+        setPaneGates={data.setPaneGates}
+        grantAutonomyWindow={data.grantAutonomyWindow}
+        endAutonomyWindow={data.endAutonomyWindow}
+        applyPosture={data.applyPosture} />
     );
   };
 
