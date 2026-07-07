@@ -22,9 +22,39 @@
  */
 
 import { z } from "zod";
-import type { ActionDef, ActionResult } from "../types";
+import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { ALWAYS_ALLOWED } from "../types";
 import { redactSecrets } from "../../terminal";
+import { recentTurns, type TurnAuthor } from "../../voice/recentTurns";
+import type { NoteType } from "../../store/types";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Note-TYPE classification seam (hwu.3). Pure, deterministic, non-hot (fires once per operator save,
+// never per frame) -> Python via the "policies" stdio daemon (ctx.policies.classifyNote), FAIL-OPEN to
+// "note". The seam call is async, bounded by the policy race timeout, and NEVER rejects/blocks: a daemon
+// down/timeout/schema-miss yields "note", so classification can never block or delay note capture.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Classify note text into a NoteType, falling OPEN to "note" on ANY daemon miss (down/timeout/schema/
+ *  throw). This is the ONE place the classification seam is crossed for a note write. hwu.4 reuses this
+ *  exported helper for promote_draft so draft→note capture classifies identically to transcript capture. */
+export async function classifyNoteType(ctx: ActionContext, text: string): Promise<NoteType> {
+  try {
+    const t = await ctx.policies?.classifyNote?.(text);
+    return t ?? "note";
+  } catch {
+    // The client contract is never-reject, but belt-and-suspenders: a stray throw must never block capture.
+    return "note";
+  }
+}
+
+/** Map the optional spoken `author` arg (model/janus | operator/user) to a transcript-turn author
+ *  filter; undefined => "the last turn of either author". */
+function turnAuthorFilter(author: string | undefined): TurnAuthor | undefined {
+  if (author === "model" || author === "janus") return "janus";
+  if (author === "operator" || author === "user") return "user";
+  return undefined;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // add_project_note (server.ts:2665) — UNGATED write.
@@ -72,6 +102,73 @@ export const addProjectNote: ActionDef<typeof AddProjectNoteParams> = {
     }
     if (g.disposition === "deferred") {
       return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to add the note.` };
+    }
+    return { kind: "ok", output: addEffect() };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// save_transcript_note (hwu.3) — capture the last completed transcript turn as a typed note.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** save_transcript_note params — optional `author` narrows capture to the model (Janus) or operator
+ *  side; omitted => the most recent turn of either author. */
+const SaveTranscriptNoteParams = z.object({
+  author: z.enum(["model", "operator", "janus", "user"]).optional(),
+});
+
+/**
+ * save_transcript_note — "save that as a note". Captures the most recent COMPLETED transcript turn from
+ * the server-side recent-turns ring (src/voice/recentTurns.ts), REDACTS it (the live transcript is raw —
+ * an operator may have spoken a secret), CLASSIFIES its NoteType via the fail-open Python seam, and
+ * persists it through the addNote path with the classified type + the turn's author.
+ *
+ * GATING PARITY with add_project_note (notes.ts add_project_note): routes through
+ * ctx.gateOrDefer("update_metadata", null, …) with the SAME op:"add"/scope:"project" durable intent, so
+ * a deferred save survives a restart in lockstep with src/actionEffects.ts (applyUpdateAddProject).
+ * Note-TYPE is classified BEFORE the gate so the narration + intent name the type; the classification
+ * seam is bounded + fail-open, so it never blocks capture.
+ *
+ * Empty ring => a graceful spoken "nothing to save yet" (never a crash, never an empty note).
+ */
+export const saveTranscriptNote: ActionDef<typeof SaveTranscriptNoteParams> = {
+  name: "save_transcript_note",
+  description:
+    "Save the last thing said in the conversation as a durable, typed note (decision/todo/warning/note, auto-classified). Use for 'save that as a note', 'note that', 'remember that'. Omit author to capture the most recent turn; pass author='operator' or 'model' to pick a side. Attaches to the active project.",
+  params: SaveTranscriptNoteParams,
+  capability: "update_metadata",
+  readOnly: false,
+  surfaces: new Set(["voice"]),
+  handler: async (args, ctx): Promise<ActionResult> => {
+    const turn = recentTurns.latest(turnAuthorFilter(args.author));
+    if (!turn) {
+      return { kind: "ok", output: "There's nothing to save yet — I don't have a recent transcript turn to note." };
+    }
+    // Redact BEFORE persistence (the raw transcript may carry a spoken secret). Classify the REDACTED
+    // text (fail-open "note") so the classifier never sees a secret either.
+    const text = redactSecrets(turn.text);
+    const noteType = await classifyNoteType(ctx, text);
+    const projectId = ctx.manager.ledger.activeProjectId || "default_project";
+    const noteAuthor: TurnAuthor = turn.author;
+    const addEffect = (): string => {
+      const ok = ctx.manager.ledger.addNote(projectId, text, { type: noteType, author: noteAuthor });
+      if (ok) ctx.broadcastLedgerUpdate();
+      return ok
+        ? `Saved that as a ${noteType} note.`
+        : `Could not save the note: project ${projectId} not found.`;
+    };
+    const g = ctx.gateOrDefer("update_metadata", null, `Save transcript as a ${noteType} note`, addEffect, {
+      ...(ctx.versionStamp ?? {}),
+      op: "add",
+      scope: "project",
+      projectId,
+      note: text,
+    });
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'update_metadata' capability is gated Off; saving notes is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to save the note.` };
     }
     return { kind: "ok", output: addEffect() };
   },
@@ -187,22 +284,34 @@ export const getProjectNotes: ActionDef<typeof GetProjectNotesParams> = {
 // search_notes (server.ts:2700) — read-only FTS, note-only + redaction.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** search_notes params (server.ts Gemini decl: query required STRING, limit? number). */
+/** search_notes params (server.ts Gemini decl: query required STRING, limit? number). hwu.5 adds an
+ *  OPTIONAL `type` narrowing param — a closed zod enum over NoteType, so an invalid value is REJECTED
+ *  at the params boundary (never reaches the handler, let alone a query) and an absent value is the
+ *  legacy behavior byte-for-byte (untyped search across all note types). */
 const SearchNotesParams = z.object({
   query: z.string(),
   limit: z.number().optional(),
+  type: z.enum(["decision", "todo", "warning", "note", "handoff"]).optional(),
 });
 
 /**
  * search_notes — FAITHFUL PORT of server.ts:2700-2713 (bead bjm MUST-FIX #2). store.search with
  * source:"note" (so the events sub-query returns [] and can't starve note hits), re-filtered to
  * source==="note" (belt-and-suspenders), sliced to limit, each snippet redacted. Result shape is
- * {id, snippet} ONLY. Pure read.
+ * {id, snippet} ONLY (plus `type` once hwu.5's optional filter is supplied — see below). Pure read.
+ *
+ * hwu.5 TYPE FILTER: `args.type` is ALREADY validated by the zod enum above before this line ever
+ * runs — it can never be an arbitrary string, so it never reaches SQL as raw text. Because
+ * sqliteStore.search()'s FTS union is the belt-and-suspenders-guarded surface (bjm MUST-FIX #2), we
+ * do NOT thread the filter into that FTS query (a second WHERE clause there would need its own
+ * note+event-union care). Instead we POST-FILTER the already note-only, already-redacted result rows
+ * against getNotes()'s existing, already-parameterized `type=?` predicate (sqliteStore.ts getNotes) —
+ * bounded to the already-limit-sliced hit set, so this never touches an unbounded row set.
  */
 export const searchNotes: ActionDef<typeof SearchNotesParams> = {
   name: "search_notes",
   description:
-    "Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries'). Returns matching note snippets (secret-redacted) with their ids. Notes only — it does not search the raw activity log.",
+    "Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries'). Returns matching note snippets (secret-redacted) with their ids. Notes only — it does not search the raw activity log. Pass type='decision' for 'what did we decide?', type='todo' for outstanding action items, type='warning' for flagged risks, or type='handoff' for handoff notes; omit type to search across all note types.",
   params: SearchNotesParams,
   capability: "read_notes",
   readOnly: true,
@@ -216,11 +325,18 @@ export const searchNotes: ActionDef<typeof SearchNotesParams> = {
     }
     const query = String(args.query ?? "");
     const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
-    const results = ctx.manager.ledger.search(query, { limit, source: "note" })
+    let results = ctx.manager.ledger.search(query, { limit, source: "note" })
       .filter((r) => r.source === "note")
-      .slice(0, limit)
-      .map((r) => ({ id: r.id, snippet: redactSecrets(r.snippet) }));
-    return { kind: "ok", output: { query, count: results.length, results } };
+      .slice(0, limit);
+    // hwu.5: args.type is enum-validated above (never raw text); when present, narrow the ALREADY
+    // note-only rows to that type by cross-referencing the persisted note row (belt-and-suspenders
+    // filter #2 above stays intact — this runs strictly after it).
+    if (args.type) {
+      const typed = new Set(ctx.manager.ledger.getNotes({ type: args.type }).map((n) => n.id));
+      results = results.filter((r) => typed.has(r.id));
+    }
+    const mapped = results.map((r) => ({ id: r.id, snippet: redactSecrets(r.snippet) }));
+    return { kind: "ok", output: { query, count: mapped.length, results: mapped } };
   },
 };
 
@@ -302,8 +418,13 @@ export const createProjectNote: ActionDef<typeof CreateProjectNoteParams> = {
   readOnly: false,
   surfaces: new Set(["rest"]),
   rest: { method: "post", path: "/api/projects/:project_id/notes" },
-  handler: (args, ctx): ActionResult => {
-    ctx.manager.ledger.addNote(args.project_id, redactSecrets(args.note));
+  // hwu.3: the operator-direct save route (the KitchenRadio bubble-save target) now classifies the note
+  // server-side so a saved bubble lands in The Pass with the right kind chip. Classification is bounded +
+  // fail-open ("note" on any daemon miss), so the operator save is never blocked or delayed.
+  handler: async (args, ctx): Promise<ActionResult> => {
+    const text = redactSecrets(args.note);
+    const noteType = await classifyNoteType(ctx, text);
+    ctx.manager.ledger.addNote(args.project_id, text, { type: noteType });
     // Faithful to the inline route: broadcasts unconditionally (the voice add_project_note guards on success). Harmless spurious broadcast if the project is missing.
     ctx.broadcastLedgerUpdate();
     return { kind: "ok", output: `Note added to project ${args.project_id}.` };
@@ -400,9 +521,16 @@ export const addPaneContext: ActionDef<typeof AddPaneContextParams> = {
   },
 };
 
-/** The NOTES group of the canonical registry (amend_note lives in registry.ts; not re-exported here). */
+/**
+ * The NOTES group of the canonical registry (amend_note lives in registry.ts; not re-exported here).
+ *
+ * hwu.3 (Wave 6 integration): `saveTranscriptNote` is now registered here — its golden/coverage/harness
+ * updates landed with the Wave 6 integration pass. The def is also unit-tested directly
+ * (tests/test_save_transcript_note.ts).
+ */
 export const NOTES_ACTIONS: ActionDef[] = [
   addProjectNote,
+  saveTranscriptNote,
   addPaneNote,
   getProjectNotes,
   searchNotes,

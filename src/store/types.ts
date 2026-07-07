@@ -22,7 +22,15 @@ export interface StoredArchivedPane extends StoredPane { archived_at: number; ar
 export interface StoredNote {
   id: string; project_id: string; pane_id: string | null; text: string;
   type: NoteType; author: "janus" | "user"; created_at: number; updated_at: number;
+  // hwu.4 (schema v11): draft→bead promotion marker. NULL/absent for ordinary notes; set to
+  // 'proposed' when a note is put forward as a bead, 'created' once the operator-approved promoter
+  // filed the bead, or 'denied' when the operator discarded the proposal (so re-proposal is
+  // explicit, never automatic). Never written by the live Gemini path.
+  bead_status?: BeadStatus | null;
 }
+
+/** hwu.4: lifecycle of a note that has been put forward for promotion to a bead. */
+export type BeadStatus = "proposed" | "created" | "denied";
 export interface StoredPendingApproval {
   id: string; session_id: string; workspace_id: string; pane_id: string;
   command: string; kind: ApprovalKind; rationale: string | null;

@@ -8,7 +8,7 @@ import { INK, TICKET_KINDS, type TicketKind } from "../theme";
 import { Button, Chip, Icon, VoiceCue } from "../primitives";
 import { useDialog } from "../useFocusTrap";
 import type { Station, StationProject } from "../station";
-import type { StoredNote } from "../../store/types";
+import type { StoredNote, NoteType } from "../../store/types";
 import type { PaneLayout, Plan, AttentionItem } from "../../types";
 import type { TemplateView } from "../useOrbitalData";
 import { pendingApprovalBadgeCount } from "../useOrbitalDataHelpers";
@@ -22,6 +22,26 @@ function kindFor(t: StoredNote["type"]): TicketKind {
   if (t === "handoff" || t === "decision") return "log";
   return "note";
 }
+// ── hwu.6: the project export download (GET /api/projects/:id/export) ────────────────────────────
+// A best-effort browser download of the SAME deterministic, redacted Markdown the voice export_project
+// tool writes to disk — this button never writes anything server-side, it just fetches the composed
+// text and hands the browser a Blob to save. A failed fetch degrades to a silent no-op (there is
+// nothing else useful to show inline for a download button).
+async function downloadProjectExport(projectId: string): Promise<void> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}/export`);
+  if (!res.ok) return;
+  const text = await res.text();
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "ORBITAL_EXPORT.md";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function ago(ms: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
   if (s < 60) return "just now";
@@ -45,6 +65,71 @@ export function resolveTemplateInitial(initial?: { name: string; description: st
     body: initial?.body ?? "",
   };
 }
+
+// ── hwu.5: The Pass ticket filter chips (type/author/date) — pure helpers ─────────────────────
+// Client-side only: notes already carry their persisted type/author/created_at, so filtering is a
+// pure narrowing of the same list the server already sent. Kept as pure exported functions (same
+// idiom as pluralSuffix/attentionActKind above) so ThePass's own render function stays under the
+// complexity gate.
+
+export type NoteTypeFilter = "all" | NoteType;
+export type NoteAuthorFilter = "all" | "janus" | "you";
+export type NoteDateFilter = "all" | "today" | "week";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = DAY_MS * 7;
+
+/** The type chip: "all" always matches; otherwise an exact NoteType match. */
+export function matchesTypeFilter(n: Pick<StoredNote, "type">, filter: NoteTypeFilter): boolean {
+  return filter === "all" || n.type === filter;
+}
+
+/** The author chip: "you" maps to the persisted "user" author (the operator's own notes/turns);
+ *  "janus" matches the model's own notes; "all" always matches. */
+export function matchesAuthorFilter(n: Pick<StoredNote, "author">, filter: NoteAuthorFilter): boolean {
+  if (filter === "all") return true;
+  return n.author === (filter === "you" ? "user" : "janus");
+}
+
+/** The recency-bucket chip: "today" = last 24h, "week" = last 7d (inclusive of "today"), "all" =
+ *  no recency narrowing. `now` is injectable so tests are deterministic. */
+export function matchesDateFilter(n: Pick<StoredNote, "created_at">, filter: NoteDateFilter, now: number = Date.now()): boolean {
+  if (filter === "all") return true;
+  const age = now - n.created_at;
+  return age <= (filter === "today" ? DAY_MS : WEEK_MS);
+}
+
+/** Compose all three chip filters into one pure narrowing pass — the single point the ticket-list
+ *  render narrows `notes` through. Generic over any note-shaped row so tests can pass minimal fixtures. */
+export function filterNotes<T extends Pick<StoredNote, "type" | "author" | "created_at">>(
+  notes: T[],
+  filters: { type: NoteTypeFilter; author: NoteAuthorFilter; date: NoteDateFilter },
+  now: number = Date.now(),
+): T[] {
+  return notes.filter((n) =>
+    matchesTypeFilter(n, filters.type) && matchesAuthorFilter(n, filters.author) && matchesDateFilter(n, filters.date, now));
+}
+
+/** Chip metadata for the type-filter row (emoji + label), independent of the ticket-card kindFor
+ *  collapse (decision/handoff share a ticket "kind" visually but are DISTINCT filter chips). */
+export const NOTE_TYPE_CHIPS: Array<{ id: NoteTypeFilter; label: string; emoji: string }> = [
+  { id: "all", label: "all", emoji: "📋" },
+  { id: "decision", label: "decision", emoji: "🧭" },
+  { id: "todo", label: "todo", emoji: "✅" },
+  { id: "warning", label: "warning", emoji: "⚠️" },
+  { id: "note", label: "note", emoji: "📝" },
+  { id: "handoff", label: "handoff", emoji: "🤝" },
+];
+export const NOTE_AUTHOR_CHIPS: Array<{ id: NoteAuthorFilter; label: string }> = [
+  { id: "all", label: "all" },
+  { id: "janus", label: "janus" },
+  { id: "you", label: "you" },
+];
+export const NOTE_DATE_CHIPS: Array<{ id: NoteDateFilter; label: string }> = [
+  { id: "all", label: "all" },
+  { id: "today", label: "today" },
+  { id: "week", label: "week" },
+];
 
 // ── D2: the Attention ("what needs me") tab ───────────────────────────────────
 // The act a queue row offers, by AttentionItem.type AND whether it carries a resolvable messageId:
@@ -541,6 +626,26 @@ function SpecTicket({ p, dark, onExecute, onDelete }: {
   );
 }
 
+/** One row of exclusive filter chips (type/author/date share this shape). Generic over the filter's
+ *  literal-union id type so all three chip rows reuse one small component. */
+function FilterChipRow<F extends string>({ dark, prefix, options, value, onChange }: {
+  dark: boolean; prefix: string; options: Array<{ id: F; label: string; emoji?: string }>; value: F; onChange: (v: F) => void;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+      {options.map((o) => (
+        <button key={o.id} data-testid={`pass-filter-${prefix}-${o.id}`} data-active={value === o.id || undefined}
+          onClick={() => onChange(o.id)}
+          style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 9px", borderRadius: 999, border: "1.5px solid " + INK, cursor: "pointer",
+            background: value === o.id ? (dark ? "#1a0f08" : "#fff9ec") : "transparent", color: dark ? "#ffe9c7" : INK,
+            fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, opacity: value === o.id ? 1 : 0.6 }}>
+          {o.emoji ? `${o.emoji} ${o.label}` : o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function JotNote({ dark, projectName, disabled, onAdd }: { dark: boolean; projectName: string; disabled: boolean; onAdd: (text: string) => void }) {
   const [text, setText] = useState("");
   const fire = () => { if (text.trim()) { onAdd(text); setText(""); } };
@@ -689,6 +794,11 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
   const [jar, setJar] = useState(false);
   // D2: which view the pass shows. "tickets" = the classic strip; "attention" = the what-needs-me inbox.
   const [tab, setTab] = useState<"tickets" | "attention">("tickets");
+  // hwu.5: the three ticket filter chips (type/author/date) — pure client-side narrowing of `notes`.
+  const [typeFilter, setTypeFilter] = useState<NoteTypeFilter>("all");
+  const [authorFilter, setAuthorFilter] = useState<NoteAuthorFilter>("all");
+  const [dateFilter, setDateFilter] = useState<NoteDateFilter>("all");
+  const filteredNotes = filterNotes(notes, { type: typeFilter, author: authorFilter, date: dateFilter });
   const canJot = !!jotProjectId && jotProjectId !== "all";
   const fg = dark ? "#ffe9c7" : INK;
   const empty = notes.length === 0 && plans.length === 0 && templates.length === 0 && layouts.length === 0;
@@ -725,6 +835,16 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
     );
   }
 
+  // Extracted out of renderPassBar to keep its complexity under the gate — a single-purpose button
+  // whose disabled-ness mirrors the jot input's canJot gate (no kitchen picked -> nothing to export).
+  function renderExportButton(): ReactNode {
+    return (
+      <button data-testid="pass-export" disabled={!canJot} onClick={() => canJot && jotProjectId && downloadProjectExport(jotProjectId)}
+        title={canJot ? "Download a Markdown export of this kitchen (notes/panes/history/plans)" : "pick a kitchen to export"}
+        style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 10px", borderRadius: 9, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: fg, cursor: canJot ? "pointer" : "not-allowed", opacity: canJot ? 1 : 0.5, fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, flexShrink: 0 }}>⬇ export</button>
+    );
+  }
+
   function renderPassBar(): ReactNode {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 16px" }}>
@@ -741,7 +861,24 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
         {voiceCues && <VoiceCue phrase="what's on the pass?" dark={dark} />}
         <div style={{ flex: 1 }} />
         <JotNote dark={dark} projectName={jotProjectName} disabled={!canJot} onAdd={(t) => jotProjectId && onAdd(jotProjectId, t)} />
+        {renderExportButton()}
         <button data-testid="pass-jar" onClick={() => setJar(true)} title="Explore the bead jar" style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 10px", borderRadius: 9, border: "2px solid " + INK, background: dark ? "#1a0f08" : "#fff9ec", color: fg, cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, flexShrink: 0 }}>🫙 jar</button>
+      </div>
+    );
+  }
+
+  // hwu.5: the type/author/date filter chip bar — only earns its space when there's at least one
+  // note to narrow. Purely client-side (filteredNotes above); nothing here ever refetches.
+  function renderNoteFilters(): ReactNode {
+    if (notes.length === 0) return null;
+    return (
+      <div data-testid="pass-filters" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, padding: "0 16px 8px" }}>
+        <FilterChipRow dark={dark} prefix="type" options={NOTE_TYPE_CHIPS} value={typeFilter} onChange={setTypeFilter} />
+        <FilterChipRow dark={dark} prefix="author" options={NOTE_AUTHOR_CHIPS} value={authorFilter} onChange={setAuthorFilter} />
+        <FilterChipRow dark={dark} prefix="date" options={NOTE_DATE_CHIPS} value={dateFilter} onChange={setDateFilter} />
+        <span data-testid="pass-filter-count" style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>
+          {filteredNotes.length} of {notes.length} ticket{pluralSuffix(notes.length)}
+        </span>
       </div>
     );
   }
@@ -751,13 +888,14 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
     if (empty && !expanded) return null;
     return (
       /* the tickets (collapsed = a single scrolling row; expanded = wrap). 4U.1: spec tickets
-         (voice-built plans) lead the row — they're the fireable work; notes follow, then the
-         cookbook (templates) and mise en place (layouts). The two ghost creator cards live in the
-         expanded pass only, so the collapsed strip stays glanceable. */
+         (voice-built plans) lead the row — they're the fireable work; notes follow (narrowed by the
+         type/author/date filter chips above), then the cookbook (templates) and mise en place
+         (layouts). The two ghost creator cards live in the expanded pass only, so the collapsed
+         strip stays glanceable. */
       <div style={{ display: "flex", gap: 10, padding: "2px 16px 14px", overflowX: expanded ? "visible" : "auto", flexWrap: expanded ? "wrap" : "nowrap" }}>
         {empty && <div data-testid="pass-empty" style={{ alignSelf: "center", flexShrink: 0, fontFamily: "Caveat, cursive", fontSize: 16, color: "#8a6a4f" }}>nothin' on the pass — clean board, Chef 😌</div>}
         {plans.map((p) => <Fragment key={p.id}><SpecTicket p={p} dark={dark} onExecute={onExecutePlan} onDelete={onDeletePlan} /></Fragment>)}
-        {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
+        {filteredNotes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
         {templates.map((t) => <Fragment key={t.id}><TemplateTicket t={t} dark={dark} stations={stations} activePaneId={activePaneId} onUpdate={onUpdateTemplate} onDelete={onDeleteTemplate} onApply={onApplyTemplate} /></Fragment>)}
         {layouts.map((l) => <Fragment key={l.id}><LayoutTicket l={l} dark={dark} onApply={onApplyLayout} onDelete={onDeleteLayout} /></Fragment>)}
         {/* Voice macros (8fz.6): self-fetching REST/UI-authored management panel. */}
@@ -779,7 +917,12 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
           onRestart={onRestartAttention} onJump={onJumpToPane} onDismiss={onDismissAttention} />
       );
     }
-    return renderPassTickets();
+    return (
+      <>
+        {renderNoteFilters()}
+        {renderPassTickets()}
+      </>
+    );
   };
 
   return (

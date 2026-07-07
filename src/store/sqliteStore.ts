@@ -229,6 +229,20 @@ export class JanusStore {
   deleteNote(id: string): void {
     this.db.prepare("DELETE FROM notes WHERE id=?").run(id);
   }
+  /** Single note by id (hwu.4 — the promoter reads back the note it just marked). Null when gone. */
+  getNote(id: string): import("./types").StoredNote | null {
+    const r = this.db.prepare("SELECT * FROM notes WHERE id=?").get(id) as NoteRow | undefined;
+    return r ? { ...r } : null;
+  }
+  /**
+   * hwu.4: set (or clear) a note's draft→bead promotion marker. `bead_status` does NOT feed the FTS
+   * index (the notes_au trigger re-indexes `text` only, so this UPDATE writes text=text unchanged —
+   * a no-op re-index that keeps the row's snippet intact). This is the ONLY writer of the column; the
+   * live Gemini path never reaches it — the promoter (on operator approval) and the proposal marker do.
+   */
+  setNoteBeadStatus(id: string, status: import("./types").BeadStatus | null): void {
+    this.db.prepare("UPDATE notes SET bead_status=?, updated_at=? WHERE id=?").run(status, Date.now(), id);
+  }
   getNotes(filter: { projectId?: string; paneId?: string; type?: string } = {}): import("./types").StoredNote[] {
     const where: string[] = []; const args: any[] = [];
     if (filter.projectId) { where.push("project_id=?"); args.push(filter.projectId); }

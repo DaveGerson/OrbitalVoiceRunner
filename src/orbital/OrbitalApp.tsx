@@ -15,6 +15,7 @@ import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
+import { ActionPanel } from "./ActionPanel";
 import { CaptionBar } from "./CaptionBar";
 import { TerminalWindow } from "./TerminalWindow";
 import { BackOfHouse } from "./views/BackOfHouse";
@@ -316,8 +317,18 @@ export default function OrbitalApp() {
               connected={data.voiceConnected} micBlocked={data.micBlocked}
               audioPlaying={data.audioPlaying} approvalWaiting={data.approvalWaiting}
               transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
-              onGoLive={data.goLive} onStopLive={data.stopLive} onToggleMute={data.toggleMute} onCall={handleCall} />
+              onGoLive={data.goLive} onStopLive={data.stopLive} onToggleMute={data.toggleMute} onCall={handleCall}
+              /* hwu.3: a transcript bubble's save icon jots it into The Pass (the concrete pass project),
+                 through the operator-direct ungated + server-classified note route. */
+              onSaveBubble={(text) => data.saveRadioNote(passProjectId, text)} />
           </div>
+          {/* hwu.7: the read-only action panel — a sibling REGION (not a replacement) that re-keys to
+              the agent's most recent completed voice tool call (the panel keys its own root by callId,
+              so it re-mounts per call). Renders nothing until the first tool completes, so the at-rest
+              sidebar (KitchenRadio above, CaptionBar below) is byte-identical to today; when present it
+              takes a capped share of height with its own scroll, so it can never cover the mic controls
+              or the caption bar. */}
+          <ActionPanel frame={data.lastAction} dark={t.dark} />
           {/* bead 8fz.3: caption pop-up — rises from the bottom of this sidebar as its own flex
               row (never an overlay), so it structurally can't cover KitchenRadio's mic controls. */}
           <CaptionBar transcript={data.transcript} live={data.isLive} captionsOn={t.captions} dark={t.dark} />

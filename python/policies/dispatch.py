@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from focus import resolve_focus  # noqa: E402
 from sitrep import rank_sitrep  # noqa: E402
 from macros import match_macro  # noqa: E402
+from notetype import classify_note  # noqa: E402
 
 # The NDJSON wire protocol version. MUST stay equal to WIRE_VERSION in src/memory/types.ts — a
 # mismatch makes the ping handshake fail and the daemon is treated as unavailable (fallback).
@@ -59,6 +60,13 @@ def handle(msg):
         except Exception as e:  # same per-request blast radius as focus.resolve
             return {"id": mid, "v": WIRE_VERSION, "ok": False,
                     "error": {"code": "MACRO_FAILED", "message": str(e)}}
+    if op == "note.classify":
+        try:
+            note_type = classify_note(msg["text"])
+            return {"id": mid, "v": WIRE_VERSION, "ok": True, "type": note_type}
+        except Exception as e:  # same per-request blast radius as focus.resolve
+            return {"id": mid, "v": WIRE_VERSION, "ok": False,
+                    "error": {"code": "NOTETYPE_FAILED", "message": str(e)}}
     return {"id": mid, "v": WIRE_VERSION, "ok": False,
             "error": {"code": "BAD_OP", "message": "unknown op: %r" % op}}
 

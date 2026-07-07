@@ -169,7 +169,43 @@ function fmtTime(d: Date): string {
   try { return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
 }
 
-function Bubble({ m, dark }: { m: TranscriptEntry; dark: boolean }) {
+// The grounded-sources footer on a Chef turn. Extracted so Bubble stays under the complexity gate.
+function BubbleGrounding({ g }: { g: NonNullable<TranscriptEntry["grounding"]> }) {
+  if (!g.sources || g.sources.length === 0) return null;
+  return (
+    <div data-testid="radio-grounding" style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".06em" }}>grounded via</span>
+      {g.sources.slice(0, 3).map((s, i) => (
+        <a key={i} href={s.uri} target="_blank" rel="noreferrer" title={s.title || s.uri} style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#2f7a5e", textDecoration: "underline", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title || s.uri}</a>
+      ))}
+    </div>
+  );
+}
+
+// hwu.3: the timestamp + per-bubble save affordance. The save icon jots this line into The Pass through
+// the operator-direct ungated note route (server-classified into the right kind). Shown only for a
+// saveable line (real text) when a save handler is wired. Extracted so Bubble stays under the CC gate.
+function BubbleFooter({ m, dark, me, onSave }: { m: TranscriptEntry; dark: boolean; me: boolean; onSave?: (text: string) => void }) {
+  const canSave = !!onSave && !!m.text && m.text.trim().length > 0;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, flexDirection: me ? "row-reverse" : "row" }}>
+      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", padding: "0 4px" }}>{fmtTime(m.timestamp)}</span>
+      {canSave && (
+        <button
+          data-testid="radio-bubble-save"
+          onClick={() => onSave!(m.text)}
+          title="Save to The Pass"
+          aria-label="Save to The Pass"
+          style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 6px", border: "1.5px solid " + INK, borderRadius: 7, background: dark ? "#2f1d12" : "#fff9ec", color: "#a8151a", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".04em", textTransform: "uppercase" }}
+        >
+          <Icon name="ticket" size={12} color="#a8151a" /> save
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Bubble({ m, dark, onSave }: { m: TranscriptEntry; dark: boolean; onSave?: (text: string) => void }) {
   const me = m.sender === "User";
   const g = m.grounding;
   return (
@@ -177,16 +213,9 @@ function Bubble({ m, dark }: { m: TranscriptEntry; dark: boolean }) {
       <div style={{ maxWidth: "88%", padding: "7px 11px", borderRadius: 12, border: "2px solid " + INK, background: getBubbleBg(me, dark), color: getBubbleColor(me, dark), boxShadow: "2px 2px 0 0 " + INK, fontFamily: "DM Sans", fontSize: 13, fontWeight: me ? 700 : 600, lineHeight: 1.35, borderBottomRightRadius: me ? 3 : 12, borderBottomLeftRadius: me ? 12 : 3 }}>
         {!me && <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, letterSpacing: ".08em", textTransform: "uppercase", color: "#a8151a", display: "block", marginBottom: 2 }}>Chef de Cuisine</span>}
         {m.text}
-        {g && g.sources && g.sources.length > 0 && (
-          <div data-testid="radio-grounding" style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
-            <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", textTransform: "uppercase", letterSpacing: ".06em" }}>grounded via</span>
-            {g.sources.slice(0, 3).map((s, i) => (
-              <a key={i} href={s.uri} target="_blank" rel="noreferrer" title={s.title || s.uri} style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#2f7a5e", textDecoration: "underline", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title || s.uri}</a>
-            ))}
-          </div>
-        )}
+        {g && <BubbleGrounding g={g} />}
       </div>
-      <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f", padding: "0 4px" }}>{fmtTime(m.timestamp)}</span>
+      <BubbleFooter m={m} dark={dark} me={me} onSave={onSave} />
     </div>
   );
 }
@@ -208,7 +237,7 @@ function buildCalls(stations: { name: string }[]): { group: string; color: strin
 
 export function KitchenRadio({
   dark, live, muted, reconnecting, connected, micBlocked, audioPlaying, approvalWaiting,
-  transcript, voiceCues, stations, onGoLive, onStopLive, onToggleMute, onCall,
+  transcript, voiceCues, stations, onGoLive, onStopLive, onToggleMute, onCall, onSaveBubble,
 }: {
   dark: boolean; live: boolean; muted: boolean; reconnecting: boolean;
   /** 1B.5: the voice /live socket is actually OPEN — "● LIVE" gates on this, not on the click. */
@@ -222,6 +251,8 @@ export function KitchenRadio({
   approvalWaiting: boolean;
   transcript: TranscriptEntry[];
   voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onStopLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
+  /** hwu.3: save a transcript bubble as a durable note in The Pass (operator-direct ungated route). */
+  onSaveBubble?: (text: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [calls, setCalls] = useState(false);
@@ -245,7 +276,7 @@ export function KitchenRadio({
             {live ? "listening for you, Chef…" : "tune in the radio to talk to the Chef de Cuisine"}
           </div>
         )}
-        {transcript.map((m, i) => <Fragment key={i}><Bubble m={m} dark={dark} /></Fragment>)}
+        {transcript.map((m, i) => <Fragment key={i}><Bubble m={m} dark={dark} onSave={onSaveBubble} /></Fragment>)}
         {listening && transcript.length > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "Caveat, cursive", fontSize: 17, color: "#8a6a4f", transform: "rotate(-1deg)", paddingLeft: 4 }}>
             <span className="orb-listening-dot" /> listening for you, Chef…

@@ -35,6 +35,7 @@
 import fs from "fs";
 import path from "path";
 import { actionSchemaHash } from "./actions/registry";
+import { buildExportSnapshot, composeExportMarkdown, writeExportArtifactAtomic, EXPORT_BASENAME } from "./actions/defs/export";
 import { findPaneOwningProject } from "./paneOwnership";
 import { getHistoryBridge } from "./historyBridge";
 import { respawnFromLedger } from "./actions/respawnFromLedger";
@@ -85,7 +86,7 @@ export interface ApplyPaneModeParams { paneId: string; permissionsMode: string; 
  * #3): a confirm-after-restart must apply exactly this text, not whatever the model says next.
  */
 export interface UpdateMetadataParams {
-  op: "amend" | "delete" | "add" | "rename";
+  op: "amend" | "delete" | "add" | "rename" | "export";
   /** amend/delete: the target note id. */
   noteId?: string;
   /** amend: the ENQUEUE-BOUND amend text (applied verbatim across a restart). */
@@ -397,15 +398,42 @@ function applyUpdateDelete(p: UpdateMetadataParams, deps: ActionEffectDeps): str
   return `Note ${p.noteId} deleted.`;       // EXACT — matches notes.ts delete_note
 }
 
+function applyUpdateExport(p: UpdateMetadataParams, deps: ActionEffectDeps): string {
+  // Wave 6 fix: export_project stages capability "update_metadata" with op:"export" (export.ts). WITHOUT
+  // this arm the op fell through to applyUpdateDelete → ledger.deleteNote(undefined) → a bind TypeError
+  // that consumed the operator's confirm as a 500. This re-runs the DETERMINISTIC export exactly like the
+  // live effect (export.ts exportEffect): resolve the project, build the snapshot, compose (pure), write
+  // atomically, and return the BYTE-IDENTICAL confirm string. Events come from the JanusStore's getEvents
+  // (manager.ledger IS the store — server.ts:647); a ledger without getEvents degrades to no events (the
+  // snapshot builder's `ctx.store?.getEvents` guard), never a crash.
+  const projectId = p.projectId ?? "";
+  const project = deps.manager.ledger.getProject(projectId);
+  if (!project) return `Could not export: project ${projectId} not found.`;  // EXACT — export.ts miss string
+  const ledger = deps.manager.ledger as { getEvents?: unknown };
+  const store = typeof ledger.getEvents === "function" ? deps.manager.ledger : undefined;
+  const replayCtx = { manager: deps.manager, store } as unknown as ActionContext;
+  const snapshot = buildExportSnapshot(replayCtx, project, projectId);
+  const markdown = composeExportMarkdown(snapshot, Date.now);
+  try {
+    writeExportArtifactAtomic(project.directory, markdown);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return `Export failed: could not write ${EXPORT_BASENAME} (${message}).`;  // EXACT — export.ts fail string
+  }
+  return `Export written — ${snapshot.notes.length} notes, ${snapshot.panes.length} stations.`;  // EXACT
+}
+
 function buildUpdateMetadata(intent: ActionIntent, deps: ActionEffectDeps): () => string {
   // RE-SCOPE CORE (kzt-rescope.md §3.4): the #27 amend_note / delete_note deferral. `op` discriminates;
-  // `text` is the enqueue-bound amend text (applied verbatim across a restart). An unrecognized op
-  // takes the delete arm — the documented legacy-shaped default (preserved from the original chain).
+  // `text` is the enqueue-bound amend text (applied verbatim across a restart). op:"export" re-runs the
+  // deterministic project export (Wave 6 fix — see applyUpdateExport). An unrecognized op takes the
+  // delete arm — the documented legacy-shaped default (preserved from the original chain).
   const p = intent.params as unknown as UpdateMetadataParams;
   return () => {
     if (p.op === "amend") return applyUpdateAmend(p, deps);
     if (p.op === "add") return applyUpdateAdd(p, deps);
     if (p.op === "rename") return applyUpdateRename(p, deps);
+    if (p.op === "export") return applyUpdateExport(p, deps);
     return applyUpdateDelete(p, deps);
   };
 }

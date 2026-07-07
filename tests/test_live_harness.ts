@@ -128,8 +128,11 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // focus — docs/superpowers/specs/2026-07-02-voice-ux-trio-design.md). Edit owned by the wave-3
     // SCAFFOLD batch (this file has no dedicated feature owner in the wave's file-ownership map;
     // it belongs alongside src/actions/defs/voice_ux.ts / registry.ts / coverage.ts, the other
-    // registry-surface edits scaffold made when the two new tool defs were registered).
-    assert.strictEqual(decls.length, 58, "exactly 58 voice tools declared");
+    // registry-surface edits scaffold made when the two new tool defs were registered),
+    // then 58 -> 62 by Wave 6 knowledge-capture (catch_me_up hwu.2 + save_transcript_note hwu.3 +
+    // promote_draft hwu.4 + export_project hwu.6; get_project_export is rest-only so it does NOT add a
+    // voice declaration).
+    assert.strictEqual(decls.length, 62, "exactly 62 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

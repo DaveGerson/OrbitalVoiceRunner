@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**96** actions across **26** gated capabilities, plus the always-allowed group.
+**101** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -202,10 +202,12 @@ These bypass the capability gate entirely — they work even while the system is
 
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
+| `catch_me_up` | voice | yes | Catch the operator up on what happened over a recent time window WITHOUT reconnecting |
 | `get_action_log` | voice / rest | yes | Read the unified action log |
 | `get_attention_digest` | voice | yes | Speak a structured summary of items needing the operator's attention |
 | `get_health` | voice / rest | yes | Report a one-glance health snapshot |
 | `get_pane_gates` | voice / rest | yes | Read the resolved capability-gate matrix for a pane (or global if pane_id omitted) |
+| `get_project_export` | rest | no | Return the same deterministic, secret-redacted Markdown export as export_project, as a markdown download (text/markdown; Content-Disposition |
 | `get_project_notes` | voice | yes | Recall the durable notes saved for a project (decisions, todos, warnings) |
 | `list_capabilities` | voice / rest | yes | List every gateable capability name |
 | `list_handoffs` | voice / rest | yes | List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output) |
@@ -331,9 +333,12 @@ These bypass the capability gate entirely — they work even while the system is
 | `delete_macro` | rest | no | Delete a saved voice macro by its id |
 | `delete_note` | voice | no | Delete a note permanently by its id (get the id from get_project_notes or search_notes) |
 | `delete_prompt_template` | voice / rest | no | Delete a saved prompt template by its id |
+| `export_project` | voice | no | Write a deterministic, secret-redacted Markdown snapshot of this project (notes/panes/recent history/plans) to ORBITAL_EXPORT.md in the project's own folder, s… |
+| `promote_draft` | voice | no | Promote the active pane's current draft into project knowledge |
 | `rename_pane` | voice / rest | no | Rename a pane |
 | `rename_project` | voice / rest | no | Rename a project |
 | `save_project_layout` | voice / rest | no | Snapshot the current project's running panes (launch command, directory, preset, permission mode) as a named layout you can re-apply later with apply_layout |
+| `save_transcript_note` | voice | no | Save the last thing said in the conversation as a durable, typed note (decision/todo/warning/note, auto-classified) |
 | `update_prompt_template` | voice / rest | no | Edit a saved prompt template's name, description, or body by its id |
 
 ## Type a command into a pane

@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
 const MIGRATIONS: ((db: Database.Database) => void)[] = [
@@ -343,6 +343,22 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       CREATE INDEX idx_context_injections_active_pane_ts    ON context_injections(active_pane_id, ts);
       CREATE INDEX idx_context_injections_brief_hash        ON context_injections(brief_hash);
     `);
+  },
+  // v11 (hwu.4 — draft→knowledge promotion): a nullable `bead_status` marker on notes so a note
+  // that was promoted toward a bead can be surfaced durably (proposed → created | denied). NULL for
+  // every ordinary note (the overwhelming majority) — additive + nullable, so the explicit-column
+  // addNote INSERT and the notes_fts triggers (which index `text` only) are unaffected. The live
+  // Gemini path NEVER writes a bead; this column only records the OPERATOR-approved promotion state
+  // set by the constrained promoter (src/beadPromoter.ts) and the note's proposal marker.
+  //
+  // Guarded on the notes table's existence so the migration stays robust in isolation (a bare db
+  // fast-forwarded to a prior user_version without the v1 `notes` DDL). On any REAL db the notes table
+  // was created in v1, so the column is always added on a fresh boot or a v10→v11 upgrade.
+  (db) => {
+    const hasNotes = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='notes'"
+    ).get();
+    if (hasNotes) db.exec(`ALTER TABLE notes ADD COLUMN bead_status TEXT;`);
   },
 ];
 

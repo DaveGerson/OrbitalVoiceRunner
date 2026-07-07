@@ -76,6 +76,16 @@ export interface PendingAction {
   lastCallAt?: number;
   /** The deferred side effect. Returns a model/operator-facing result string. NOT serializable. */
   run: () => string;
+  /**
+   * OPTIONAL discard side effect — fired exactly once when the action is DISCARDED without running
+   * (cancel / expire / pane-drain, all of which route through cancel()), never on confirm(). Lets a
+   * staged proposal record a durable "denied" marker on its source (e.g. a bead proposal marking its
+   * note denied so re-proposal is explicit, not automatic — hwu.4). Like `run`, it is a non-serializable
+   * closure and does NOT survive a process restart (a rehydrated survivor loses its onDiscard hook);
+   * the in-session deny paths are the ones this covers. Wrapped in a try/catch by the store so a throw
+   * can never break the discard's exactly-once claim/remove contract.
+   */
+  onDiscard?: () => void;
 }
 
 export type ActionResolveReason = "not_found" | "lost_race" | "confirmed" | "cancelled" | "expired";
@@ -157,6 +167,13 @@ export class PendingActionStore {
     this.order = this.order.filter((x) => x !== id);
   }
 
+  /** Fire a record's optional onDiscard hook exactly once, swallowing any throw so a discard's
+   *  claim/remove contract can never be broken by a misbehaving hook (hwu.4 deny marker). */
+  private fireDiscard(record: PendingAction): void {
+    if (!record.onDiscard) return;
+    try { record.onDiscard(); } catch (e) { console.error(`[pendingActions] onDiscard hook failed for ${record.id}:`, e); }
+  }
+
   /**
    * Atomic claim: returns true only for the first caller (exactly-once seam). With a durable store
    * the winner is selected by the atomic SQL `claimAction` (UPDATE ... WHERE claimed=0 => exactly one
@@ -201,6 +218,9 @@ export class PendingActionStore {
     if (!record) return { reason: "not_found" };
     if (!this.claim(id)) return { reason: "lost_race", record };
     this.remove(id);
+    // Discard side effect (hwu.4): fire AFTER claim+remove so it runs exactly once, only for the caller
+    // that won the claim (a concurrent confirm that lost the race returned above, never double-firing).
+    this.fireDiscard(record);
     return { reason: "cancelled", record };
   }
 
@@ -239,6 +259,8 @@ export class PendingActionStore {
     if (!record) return { reason: "not_found" };
     if (!this.claim(id)) return { reason: "lost_race", record };
     this.remove(id);
+    // A TTL expiry is a discard, not a run — fire the same deny marker as cancel (hwu.4).
+    this.fireDiscard(record);
     return { reason: "expired", record };
   }
 }

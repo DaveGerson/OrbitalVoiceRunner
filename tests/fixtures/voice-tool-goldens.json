@@ -197,6 +197,9 @@
   "rename_project": {
     "output": "Project renamed to Renamed Project"
   },
+  "save_transcript_note.empty": {
+    "output": "There's nothing to save yet — I don't have a recent transcript turn to note."
+  },
   "search_notes": {
     "output": {
       "count": 1,

@@ -212,6 +212,44 @@ describe("kzt — buildActionRun rebuilds deferred effects from intent", () => {
     assert.strictEqual(out, "Note n2 updated.");
   });
 
+  // Wave 6 fix: a deferred export_project stages capability "update_metadata" with op:"export". WITHOUT
+  // an export arm the op fell through to the DELETE arm -> ledger.deleteNote(undefined) -> a bind
+  // TypeError that consumed the operator's confirm as a 500. These pin the real re-run + the no-delete.
+  it("update_metadata[op=export] -> re-runs the deterministic export, writes ORBITAL_EXPORT.md, EXACT string; NEVER deletes a note", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "orbital-export-replay-"));
+    try {
+      const deleted: string[] = [];
+      const project = {
+        id: "p1", name: "Kitchen", directory: tmpDir, summary: "s", keyTerms: [],
+        panes: { pa: { pane_id: "pa", name: "Pane A", alive: true, last_known_state: "Idle", tool_preset: "Claude Code", permissions_mode: "Human-in-the-Loop" } },
+      };
+      const manager: any = {
+        ledger: {
+          getProject: (id: string) => (id === "p1" ? project : null),
+          getNotes: () => [{ id: "n1", type: "note", pane_id: null, text: "hi", created_at: 0 }],
+          deleteNote: (id: string) => deleted.push(id),
+          plans: [],
+        },
+      };
+      const deps = { manager, broadcast: () => {}, broadcastLedgerUpdate: () => {}, sanitizeSettingsForClient: (s: any) => s };
+      const out = buildActionRun({ capability: "update_metadata", params: { op: "export", projectId: "p1" } }, deps as any)();
+      assert.strictEqual(out, "Export written — 1 notes, 1 stations.");
+      assert.ok(fs.existsSync(path.join(tmpDir, "ORBITAL_EXPORT.md")), "the export artifact is written on replay");
+      assert.deepStrictEqual(deleted, [], "op:export must NEVER fall through to deleteNote (the bind-TypeError bug)");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("update_metadata[op=export] with a missing project -> graceful not-found narration, no write, no delete", () => {
+    const deleted: string[] = [];
+    const manager: any = { ledger: { getProject: () => null, deleteNote: (id: string) => deleted.push(id), getNotes: () => [], plans: [] } };
+    const deps = { manager, broadcast: () => {}, broadcastLedgerUpdate: () => {}, sanitizeSettingsForClient: (s: any) => s };
+    const out = buildActionRun({ capability: "update_metadata", params: { op: "export", projectId: "ghost" } }, deps as any)();
+    assert.strictEqual(out, "Could not export: project ghost not found.");
+    assert.deepStrictEqual(deleted, [], "a missing project must not delete anything either");
+  });
+
   // ---------------------------------------------------------------------------
   // c55.16 tech_debt_buildactionrun: the c55.10 gated rest-only caps. Each STAGES a pending action
   // on Ask (gateOrDefer), so a confirm-AFTER-restart must rebuild the SAME side effect from the

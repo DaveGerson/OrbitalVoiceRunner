@@ -76,4 +76,72 @@ test.describe("Orbital Kitchen — The Pass", () => {
     await expect(page.getByTestId("beads-explorer")).toBeVisible();
     await expect(page.getByTestId("beads-explorer")).toContainText("no HTTP door");
   });
+
+  // hwu.5: the type/author/date filter chip row. NOTE: the ?mock=1 harness's jot flow always seeds
+  // optimistic notes as type="note"/author="user" (src/orbital/useOrbitalData.ts addNote) — there is
+  // no harness hook to seed a decision/todo/warning/handoff-typed fixture client-side, so this spec
+  // proves the filter MECHANISM (chips present, exclusive selection narrows the visible tickets, the
+  // count label updates, "all" restores) using the note type/author the harness can actually produce.
+  test.describe("ticket filter chips (type/author/date)", () => {
+    async function seedNotes(page: Page, texts: string[]) {
+      await page.route(/\/api\/projects\/.+\/notes$/, (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
+      await gotoKitchen(page);
+      for (const t of texts) {
+        await page.getByTestId("pass-jot-input").fill(t);
+        await page.getByTestId("pass-jot-add").click();
+      }
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(texts.length);
+    }
+
+    test("the filter row appears once there is at least one ticket", async ({ page }) => {
+      await gotoKitchen(page);
+      await expect(page.getByTestId("pass-filters")).toHaveCount(0);
+      await seedNotes(page, ["first jot"]);
+      await expect(page.getByTestId("pass-filters")).toBeVisible();
+      await expect(page.getByTestId("pass-filter-type-all")).toBeVisible();
+      await expect(page.getByTestId("pass-filter-author-all")).toBeVisible();
+      await expect(page.getByTestId("pass-filter-date-all")).toBeVisible();
+    });
+
+    test("clicking a non-matching type chip hides every ticket and the count label updates", async ({ page }) => {
+      await seedNotes(page, ["alpha jot", "beta jot"]);
+      await expect(page.getByTestId("pass-filter-count")).toContainText("2 of 2");
+
+      // Every jotted note is type="note" — the "decision" chip must narrow the visible strip to zero.
+      await page.getByTestId("pass-filter-type-decision").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(0);
+      await expect(page.getByTestId("pass-filter-count")).toContainText("0 of 2");
+
+      // "note" (the real type) restores both.
+      await page.getByTestId("pass-filter-type-note").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(2);
+      await expect(page.getByTestId("pass-filter-count")).toContainText("2 of 2");
+
+      // "all" also restores (and is the default).
+      await page.getByTestId("pass-filter-type-decision").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(0);
+      await page.getByTestId("pass-filter-type-all").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(2);
+    });
+
+    test("the author chip narrows to the jotted 'you' (operator) notes", async ({ page }) => {
+      await seedNotes(page, ["operator jot"]);
+      // Every jotted note is author="user" ("you") — the "janus" chip must narrow to zero.
+      await page.getByTestId("pass-filter-author-janus").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(0);
+      await page.getByTestId("pass-filter-author-you").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(1);
+    });
+
+    test("the date chip's 'today' bucket keeps a freshly-jotted note visible", async ({ page }) => {
+      await seedNotes(page, ["fresh jot"]);
+      await page.getByTestId("pass-filter-date-today").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(1);
+      await page.getByTestId("pass-filter-date-week").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(1);
+      await page.getByTestId("pass-filter-date-all").click();
+      await expect(page.getByTestId("pass-ticket")).toHaveCount(1);
+    });
+  });
 });
