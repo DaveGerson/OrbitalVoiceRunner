@@ -31,6 +31,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const DOC_PATH = path.resolve(HERE, "..", "docs", "CAPABILITIES.md");
 
 const SURFACE_ORDER: readonly Surface[] = ["voice", "rest", "ws"];
+const INTERNALLY_GATED_ACTION_NAMES = new Set(["deliver_handoff"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helpers
@@ -160,12 +161,19 @@ export function renderCatalog(): string {
     .sort();
 
   const totalActions = REGISTRY.length;
-  const alwaysAllowed = (byCapability.get(ALWAYS_ALLOWED) ?? []).slice().sort(byName);
+  const alwaysAllowedAll = (byCapability.get(ALWAYS_ALLOWED) ?? []).slice().sort(byName);
+  const internallyGated = alwaysAllowedAll
+    .filter((a) => INTERNALLY_GATED_ACTION_NAMES.has(a.name))
+    .sort(byName);
+  const alwaysAllowed = alwaysAllowedAll
+    .filter((a) => !INTERNALLY_GATED_ACTION_NAMES.has(a.name))
+    .sort(byName);
   const wiredCapCount = wiredCapabilityIds.length;
 
   // Matrix capabilities that have NO action wired yet (defined in CAPABILITY_DEFS but unused by the
   // registry). Listed in an appendix so the "what can this system do" map is complete.
   const wiredSet = new Set(wiredCapabilityIds);
+  if (internallyGated.some((a) => a.name === "deliver_handoff")) wiredSet.add("deliver_handoff");
   const unwiredDefs = CAPABILITY_DEFS.filter((d) => !wiredSet.has(d.id)).slice().sort((a, b) =>
     a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   );
@@ -205,6 +213,18 @@ export function renderCatalog(): string {
   out.push("");
   out.push(actionsTable(alwaysAllowed));
   out.push("");
+
+  if (internallyGated.length) {
+    out.push("## Internally gated actions");
+    out.push("");
+    out.push(
+      "These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating in `runAction`. " +
+        "Their handlers still route through the named capability gate before doing privileged work."
+    );
+    out.push("");
+    out.push(actionsTable(internallyGated));
+    out.push("");
+  }
 
   // ── One section per wired capability, sorted by id ──
   for (const capId of wiredCapabilityIds) {

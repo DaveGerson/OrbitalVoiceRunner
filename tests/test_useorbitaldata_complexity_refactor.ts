@@ -180,8 +180,12 @@ describe("resolvePaneCommand", () => {
     // Omitting the field lets the server pick cmd.exe / advanced.defaultShellCommand.
     assert.strictEqual(resolvePaneCommand("Custom", []), undefined);
   });
-  it("honors an operator-configured Custom preset command when one is present", () => {
-    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "pwsh" }]), "pwsh");
+  it("preserves a configured Custom command verbatim (including intentional whitespace)", () => {
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "pwsh.exe" }]), "pwsh.exe");
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "  pwsh.exe -NoLogo  " }]), "  pwsh.exe -NoLogo  ");
+  });
+  it("treats a configured whitespace-only command as unresolved", () => {
+    assert.strictEqual(resolvePaneCommand("Custom", [{ name: "Custom", command: "   " }]), undefined);
   });
   it("returns undefined for an unknown preset (server normalizes to Custom and derives the shell)", () => {
     assert.strictEqual(resolvePaneCommand("Mystery", []), undefined);

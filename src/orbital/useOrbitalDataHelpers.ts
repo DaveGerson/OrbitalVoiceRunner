@@ -273,12 +273,15 @@ export function globalModeToast(mode: string): string {
  *  server normalizes to Custom) there is NO safe client-side default: returning `undefined` makes
  *  createPane OMIT the `command` field so the server derives the platform shell
  *  (advanced.defaultShellCommand, else cmd.exe on Windows / bash on POSIX). Hardcoding 'bash' here
- *  previously exited live Windows panes with "bash is not recognized" (wsm-e2e-pinned-q2mb). */
+ *  previously exited live Windows panes with "bash is not recognized" (wsm-e2e-pinned-q2mb).
+ *  A whitespace-only configured command counts as unset (trim-check), but a real command is returned
+ *  VERBATIM (untrimmed) so an intentional leading/trailing space survives (26e9796). */
 export function resolvePaneCommand(
   toolPreset: string, presets: { name: string; command?: string }[] | undefined,
 ): string | undefined {
-  return presets?.find((p) => p.name === toolPreset)?.command
-    || ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" }[toolPreset] ?? undefined);
+  const configured = presets?.find((p) => p.name === toolPreset)?.command;
+  if (configured?.trim()) return configured;
+  return ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" } as Record<string, string>)[toolPreset];
 }
 
 /** createPane: the pane id slug (lowercased, non-alnum→dash, trimmed, capped 24) + a 4-char suffix

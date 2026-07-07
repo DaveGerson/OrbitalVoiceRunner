@@ -8,59 +8,21 @@
 //   - resolveLogLabel        (from ServiceLogLine)
 //   - resolvePid             (from ThePantry, CC 17 → ≤10)
 //
-// The suite must shim three things that are Vite-only (not resolvable by tsx):
-//   - icons.svg?raw  (imported by src/orbital/primitives.tsx)
-//   - react / react/jsx-runtime (not installed as test deps)
-//
-// We use Node 22 module.register() with an inline data-URL hook to intercept
-// these imports BEFORE loading Pantry.tsx. The hook runs in a separate Worker
-// thread (Node ESM loader protocol); the data URL encodes the hook source so no
-// extra file is needed.
+// Pantry.tsx pulls in Vite-only imports (icons.svg?raw via primitives.tsx, plus
+// react) that the tsx/Node runner can't resolve. The shared stub loader
+// (helpers/viteStubLoader.ts) intercepts them before the module graph loads.
 //
 // Runner: npx tsx --test --test-force-exit tests/test_pantry_complexity_refactor.ts
 
-import { register } from "node:module";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-// ── Inline ESM loader hook to stub Vite-only / React imports ──────────────
-const hookSource = /* js */`
-export async function resolve(specifier, context, nextResolve) {
-  if (specifier.endsWith('?raw') || specifier.endsWith('.svg')) {
-    return { url: 'data:text/javascript,export default ""', shortCircuit: true };
-  }
-  if (specifier === 'react') {
-    return { url: 'data:text/javascript,export default {};export function useState(){}export function useRef(){}export function useEffect(){}export const Fragment=Symbol("Fragment")', shortCircuit: true };
-  }
-  if (specifier === 'react/jsx-runtime') {
-    return { url: 'data:text/javascript,export function jsx(){}export function jsxs(){}export const Fragment=Symbol("Fragment");export default {}', shortCircuit: true };
-  }
-  return nextResolve(specifier, context);
-}
-export async function load(url, context, nextLoad) {
-  if (url.startsWith('data:text/javascript,')) {
-    // node can leak a ?raw query onto this synthetic data: URL (-> export default ""?raw, invalid
-    // JS) — decode only up to the first '?'; the stub sources never contain one.
-    const head = 'data:text/javascript,';
-    const q = url.indexOf('?', head.length);
-    const payload = q === -1 ? url.slice(head.length) : url.slice(head.length, q);
-    return { format: 'module', source: decodeURIComponent(payload), shortCircuit: true };
-  }
-  // tsx strips the ?raw query on TRANSITIVE imports (component -> primitives ->
-  // icons.svg?raw), so a bare .svg reaches load and Node dies on the unknown
-  // extension. The resolve guard above only catches the literal '?raw' specifier;
-  // stub the queryless .svg here too so transitive graphs load without Vite.
-  if (url.endsWith('.svg') || url.includes('.svg?')) {
-    return { format: 'module', source: 'export default ""', shortCircuit: true };
-  }
-  return nextLoad(url, context);
-}
-`;
+import { registerViteStubs } from "./helpers/viteStubLoader.js";
 
-register(
-  `data:text/javascript,${encodeURIComponent(hookSource)}`,
-  { parentURL: import.meta.url },
-);
+// Register the shared Vite/React stub loader BEFORE importing the .tsx graph so
+// the hook is active when the transitive module graph (-> primitives ->
+// icons.svg?raw) loads.
+registerViteStubs();
 
 // ── Import pure helpers (after hook registration) ──────────────────────────
 // Dynamic import so the loader hook is active before the module graph loads.

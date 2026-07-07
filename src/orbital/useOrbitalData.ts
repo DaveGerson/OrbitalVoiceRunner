@@ -1343,11 +1343,20 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     const slug = paneSlug(opts.name);
     const terminalId = `${slug}-${Math.random().toString(36).slice(2, 6)}`;
     const cmdFor = (tp: string) => resolvePaneCommand(tp, settings?.presets);
+    const command = cmdFor(opts.toolPreset);
+    const body = {
+      terminalId,
+      cwd,
+      toolPreset: opts.toolPreset,
+      permissionsMode: opts.permissionsMode,
+      projectId: opts.projectId,
+      ...(command ? { command } : {}),
+    };
     if (isMockModeRef.current) { showToast(`Fired up ${terminalId} 🔥`); return; }
     try {
       const res = await apiFetch("/api/terminals", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ terminalId, cwd, command: cmdFor(opts.toolPreset), toolPreset: opts.toolPreset, permissionsMode: opts.permissionsMode, projectId: opts.projectId }),
+        body: JSON.stringify(body),
       });
       if (res.status === 403) { showToast("Not in my kitchen — that's gated off", "warn"); return; }
       if (res.status === 202) { showToast("Queued — needs your ok at the pass 🛎", "warn"); return; }
