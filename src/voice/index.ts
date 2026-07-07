@@ -74,6 +74,7 @@ import {
 import type { PythonPolicyClient } from "./policyClient";
 import { createSpokenConfirm } from "./spokenConfirm";
 import { DEFAULT_VOICE_UX } from "../types";
+import { matchMacroUtterance, fireMacro } from "../macros";
 
 // B-3 measurement spine: the per-injection correlation key. A module-scope monotonic counter mints
 // `inj-<ts>-<seq>` once per injectMemoryBrief; the same id is stamped on the cortex decision-trace
@@ -1265,6 +1266,43 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             });
           };
 
+          // Voice macros (8fz.6): match a routed utterance against the stored phrases and, on a hit,
+          // FIRE the macro — expand it through the dispatch_group forceStage kernel into N staged
+          // approvals joined by ONE dispatch group (never auto-run). Reached ONLY after spokenConfirm
+          // and approval-intent routing have declined (parsed.intent === "none"), so a macro phrase can
+          // never shadow "approve"/"yes". Matching is Python-primary (macro.match) with a synchronous
+          // TS exact floor; both matchMacroUtterance and fireMacro are fail-closed and NEVER throw into
+          // the voice loop (this whole body is try/caught + fire-and-forget). Async because the match
+          // (a bounded policies-callable) and pane resolution are async — mirrors the FLIP approval path.
+          const maybeFireMacro = async (cleanUtter: string, session: any): Promise<void> => {
+            try {
+              const macros = manager.ledger.macros;
+              if (!macros || macros.length === 0) return;
+              const macro = await matchMacroUtterance(cleanUtter, macros, policies);
+              if (!macro) return;
+              const ctx = buildActionContext(`macro_${Date.now().toString(36)}`);
+              const result = await fireMacro(ctx, macro);
+              interactionLog.log({
+                interactionId: turnId(),
+                kind: "system",
+                data: {
+                  tag: "macro_fired",
+                  macro: redactSecrets(macro.name),
+                  staged: result.staged.length,
+                  refused: result.refused.length,
+                },
+              });
+              // The spoken read-back rides the SAME narration sink as approvals. narrateDispatch
+              // emits only the macro label + pane ids + tallies (never instruction text), but every
+              // string toward Gemini passes the redaction pass — same as the interactionLog line
+              // above and the spokenConfirm precedent (defense-in-depth, no unredacted seam).
+              pushApprovalNarrationDep(session, redactSecrets(result.output));
+            } catch (e) {
+              // A macro fire must NEVER break the voice loop (fail-closed to silence).
+              console.error("Voice macro fire failed:", e);
+            }
+          };
+
           // Process an operator ASR transcript: latch the speak-gate, emit the User transcript frame,
           // capture dictation, and route any approval intent. Byte-identical to the former `if (userUtterance)`.
           const handleOperatorUtterance = (userUtterance: string, session: any): void => {
@@ -1326,13 +1364,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // re-exercise the identical synchronous gate (triage: flip-vote-order, accept-as-designed).
             if (isApprovalPythonPrimary()) {
               void resolveApprovalIntent(cleanUtter)
-                .then((parsed) => { if (parsed.intent !== "none") routeApprovalIntent(parsed, cleanUtter, session); })
-                .catch(() => { /* resolveApprovalIntent is fail-closed; never let a stray throw escape the loop */ });
+                .then((parsed) => {
+                  // Macro matching runs ONLY when approval routing declines (intent === "none") — so a
+                  // colliding phrase can never shadow an approval vote, on the FLIP path too.
+                  if (parsed.intent !== "none") { routeApprovalIntent(parsed, cleanUtter, session); return undefined; }
+                  return maybeFireMacro(cleanUtter, session);
+                })
+                .catch(() => { /* resolveApprovalIntent + maybeFireMacro are fail-closed; never let a stray throw escape the loop */ });
               return;
             }
             const parsed = parseApprovalIntentShadowed(cleanUtter);
-            if (parsed.intent === "none") return;
-            routeApprovalIntent(parsed, cleanUtter, session);
+            // Approval intent wins; only a genuinely non-approval utterance ("none") reaches macro matching.
+            if (parsed.intent !== "none") { routeApprovalIntent(parsed, cleanUtter, session); return; }
+            void maybeFireMacro(cleanUtter, session);
           };
 
           // Process a model spoken-text transcript: emit the Janus transcript frame + capture the thought.

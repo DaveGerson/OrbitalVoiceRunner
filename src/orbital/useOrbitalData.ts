@@ -5,14 +5,18 @@
 // WebSocket (and voice audio) lands in a later wave (P5); until then the poll +
 // post-mutation refetch keep the board fresh, exactly like the classic app
 // before a voice session is started.
-import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { apiFetch } from "../utils/api";
 import { publishChunk } from "../terminalStream";
-import { pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume, applyOutputDevice } from "../utils/audio";
-import { isEarconType, playEarcon } from "../utils/earcon";
+import {
+  pcmToBase64, playAudioChunk, resetAudioPlayback, setPlaybackVolume, applyOutputDevice,
+  subscribeAudioPlayback, isAudioPlaybackActive,
+} from "../utils/audio";
+import { isEarconType, playEarcon, createYourTurnChimeDetector } from "../utils/earcon";
 import { notifyDesktop, requestNotifyPermission } from "../utils/notify";
 import { useE2EHarness, isE2EWireArmed, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
+import { deriveConversationalState, hasToolActivity } from "./useConversationalState";
 import type {
   Terminal,
   Workspace,
@@ -31,11 +35,19 @@ import {
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
   dismissAttentionOutcome, attentionResolveTarget, handoffsFromFrame, normalizeHandoffRows, handoffPromptFromReadResponse,
-  isApprovalHere, buildAttentionApprovalItem, approvalToPromote,
+  isApprovalHere, buildAttentionApprovalItem, approvalToPromote, pendingApprovalBadgeCount,
 } from "./useOrbitalDataHelpers";
 
 export type GlobalMode = "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
 export type { TranscriptEntry };
+
+// bead 8fz.4: the voice_channel_restored → toast+earcon mapping, pulled out to a pure constant-
+// returning function (same "showToast(t.msg, t.kind, t.earcon)" idiom useOrbitalDataHelpers.ts's
+// layoutApplyToast/templateApplyToast already use) so the callsite contract is pinned by a plain
+// unit test without needing to drive the WS onmessage closure end-to-end.
+export function voiceChannelRestoredToast(): { msg: string; kind: "fire"; earcon: Parameters<typeof playEarcon>[0] } {
+  return { msg: "Back on the air.", kind: "fire", earcon: "reconnect" };
+}
 
 // 2K.1: one archived (stopped/cleared, recoverable) pane — the exact row shape GET /api/archive
 // returns ({archived:[…]}, src/actions/defs/archive.ts listArchivedPanes).
@@ -172,6 +184,13 @@ export interface OrbitalData {
   /** 1B.5: getUserMedia was denied/failed — the radio must say so, not claim it's listening. */
   micBlocked: boolean;
   micMuted: boolean;
+  /** bead 8fz.2: Janus audio is ACTUALLY playing right now (subscribeAudioPlayback in
+   *  src/utils/audio.ts) — the conversational pill's "speaking" signal, never inferred from the
+   *  freshest transcript sender. */
+  audioPlaying: boolean;
+  /** bead 8fz.2: the attention queue carries at least one resolvable approval (attentionResolveTarget
+   *  != null for an undismissed item) — the conversational pill's "waiting" signal. */
+  approvalWaiting: boolean;
   streamConnected: boolean;
   /** 3C.2: bumps each time the observe socket RE-opens after a drop — mounted terminals resync on it. */
   streamGeneration: number;
@@ -329,6 +348,10 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [voiceConnected, setVoiceConnected] = useState<boolean>(false);
   const [micBlocked, setMicBlocked] = useState<boolean>(false);
   const [micMuted, setMicMuted] = useState<boolean>(false);
+  // bead 8fz.2: the conversational pill's "speaking" signal — subscribed to the REAL audio-playback
+  // seam (src/utils/audio.ts), not inferred from transcript text. Seeded from the current snapshot
+  // so a remount mid-playback doesn't briefly read stale-false.
+  const [audioPlaying, setAudioPlaying] = useState<boolean>(() => isAudioPlaybackActive());
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn"; action?: ToastAction } | null>(null);
   // 2K.1: the freezer (archived, recoverable panes). 2K.3: per-pane server-pushed draft mirror.
   const [archived, setArchived] = useState<ArchivedPane[]>([]);
@@ -386,6 +409,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   desktopNotesRef.current = opts?.desktopNotes ?? true;
   const desktopNote = useCallback((title: string, body: string) => { if (desktopNotesRef.current) notifyDesktop(title, body); }, []);
   const earcon = useCallback((type: Parameters<typeof playEarcon>[0]) => { if (voiceCuesRef.current) playEarcon(type); }, []);
+  // bead 8fz.4: the "your-turn" chime — a stable, framework-free detector instance (src/utils/earcon
+  // .ts) held across renders. Lazily constructed once (the `if` guard, not a dep-array effect, since
+  // it must exist before the voice-socket effect below can call markInterrupted on a barge-in).
+  const yourTurnDetectorRef = useRef<ReturnType<typeof createYourTurnChimeDetector> | null>(null);
+  if (yourTurnDetectorRef.current === null) {
+    yourTurnDetectorRef.current = createYourTurnChimeDetector(() => earcon("chime"));
+  }
   // Declared ABOVE the live-socket effect (which now references it for honest WS-driven feedback —
   // 1B.5 mic denial, 1B.7 auto-executed/blocked/proactive toasts). `earconOverride` lets a caller
   // pick a more specific tone than the fire→success / warn→alert default, or `null` for no tone
@@ -399,7 +429,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     toastTimerRef.current = setTimeout(() => setToast(null), action ? 6000 : 2400);
     // Narrate every ack into the Kitchen Radio — the brief's "source of truth" — so an eyes-off chef
     // keeps a durable, scrollable record even when off-air. Renders as a Chef de Cuisine bubble.
-    setTranscript((prev) => [...prev, { sender: "Janus" as const, text: msg, timestamp: new Date() }].slice(-50));
+    // `fromToast` so the CaptionBar's aria-live region does NOT re-announce this line — the toast's
+    // own role="status" region already speaks it (avoids the double-announce loop, bead 8fz.3).
+    setTranscript((prev) => [...prev, { sender: "Janus" as const, text: msg, timestamp: new Date(), fromToast: true }].slice(-50));
     if (earconOverride !== null) earcon(earconOverride ?? (kind === "fire" ? "success" : "alert")); // audible + visible ack (gated by Voice cues)
   }, [earcon]);
   // Voice session audio plumbing (ported from App.tsx connectLive). All per-session; torn down on stop.
@@ -858,6 +890,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     if (typeof vol === "number") setPlaybackVolume(vol);
   }, [settings?.voiceAi?.volume]);
 
+  // bead 8fz.2: mirror the REAL audio-playback seam into React state for the conversational pill's
+  // "speaking" signal. Fires only on genuine start/drain transitions (see subscribeAudioPlayback),
+  // never once per streamed chunk.
+  useEffect(() => subscribeAudioPlayback(setAudioPlaying), []);
+
   // 4U.3: persist the radio transcript across reloads (sessionStorage; the slice(-50) writers
   // already cap the in-memory list, the slice here re-asserts the cap on the wire format).
   useEffect(() => {
@@ -1099,6 +1136,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
               if (typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
               return true;
             case "interrupted":
+              // bead 8fz.4: a barge-in — the operator already took the turn back, so the settle
+              // into "listening" this produces must stay silent (no your-turn chime for it).
+              yourTurnDetectorRef.current?.markInterrupted();
               resetAudioPlayback();
               return true;
             case "transcript_text":
@@ -1135,7 +1175,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
               // loud as the loss was: success earcon + toast + a durable transcript line (showToast
               // carries all three) and the reconnecting tell stands down.
               setVoiceReconnecting(false);
-              showToast("Back on the air.", "fire", "success");
+              // bead 8fz.4: a DEDICATED reconnect tone (3-note rising figure, src/utils/earcon.ts)
+              // instead of borrowing the generic success chime — the return of a lost channel is a
+              // distinct event from a plain "order up" success, and eyes-off operators learn the
+              // difference by ear.
+              { const t = voiceChannelRestoredToast(); showToast(t.msg, t.kind, t.earcon); }
               break;
             case "error":
               setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
@@ -1923,10 +1967,32 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // bead 8fz.2: the conversational pill's "waiting" signal — true iff the attention queue carries at
+  // least one undismissed item with a resolvable approval target (attentionResolveTarget != null).
+  const approvalWaiting = useMemo(() => pendingApprovalBadgeCount(attentionQueue) > 0, [attentionQueue]);
+
+  // bead 8fz.4: the your-turn chime — re-derive the SAME 8fz.2 conversational-state ladder here (not
+  // just raw audioPlaying) so a speaking→waiting/muted/reconnecting settle correctly stays silent —
+  // only a genuine settle into "listening" is really "your turn". `executing` has no backing
+  // production signal in this hook (see 8fz.2 notes); wired to false like the chip's own call sites.
+  const toolActive = useMemo(() => hasToolActivity(transcript), [transcript]);
+  const conversationalKind = useMemo(
+    () => deriveConversationalState({
+      live: voiceLive, connected: voiceConnected, micBlocked, muted: micMuted, reconnecting: voiceReconnecting,
+      speaking: audioPlaying, waiting: approvalWaiting, executing: false, toolActive,
+    }).kind,
+    [voiceLive, voiceConnected, micBlocked, micMuted, voiceReconnecting, audioPlaying, approvalWaiting, toolActive],
+  );
+  useEffect(() => {
+    yourTurnDetectorRef.current?.onKindChange(conversationalKind);
+  }, [conversationalKind]);
+  useEffect(() => () => yourTurnDetectorRef.current?.cancel(), []);
+
   return {
     terminals, ledger, settings, globalPermissionsMode, plans,
     pendingCommands, pendingActions, attentionQueue, frozen, frozenRunning, daemonState, transcript,
-    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted, streamConnected, toast, notes,
+    activeTerminalId, isMock, isLive: voiceLive, voiceReconnecting, voiceConnected, micBlocked, micMuted,
+    audioPlaying, approvalWaiting, streamConnected, toast, notes,
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
     healthSnapshot, refetchHealth,

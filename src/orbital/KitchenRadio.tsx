@@ -10,7 +10,7 @@ import { INK } from "./theme";
 import { Chip, Icon, VoiceCue } from "./primitives";
 import { useDialog } from "./useFocusTrap";
 import type { TranscriptEntry } from "./useOrbitalData";
-import { chipColorForKind, deriveConversationalState } from "./useConversationalState";
+import { chipColorForKind, deriveConversationalState, hasToolActivity } from "./useConversationalState";
 
 // ── Pure helpers (CC burndown) ────────────────────────────────────────────
 
@@ -21,7 +21,10 @@ import { chipColorForKind, deriveConversationalState } from "./useConversational
  * colors. The radio chip has no tool-activity input, so toolActive/reconnecting are false here.
  */
 export function getChipBg(live: boolean, micBlocked: boolean, connected: boolean, muted: boolean): string {
-  const { kind } = deriveConversationalState({ live, micBlocked, connected, muted, reconnecting: false, toolActive: false });
+  const { kind } = deriveConversationalState({
+    live, micBlocked, connected, muted,
+    reconnecting: false, speaking: false, waiting: false, executing: false, toolActive: false,
+  });
   return chipColorForKind(kind);
 }
 
@@ -203,12 +206,20 @@ function buildCalls(stations: { name: string }[]): { group: string; color: strin
   ];
 }
 
-export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBlocked, transcript, voiceCues, stations, onGoLive, onStopLive, onToggleMute, onCall }: {
+export function KitchenRadio({
+  dark, live, muted, reconnecting, connected, micBlocked, audioPlaying, approvalWaiting,
+  transcript, voiceCues, stations, onGoLive, onStopLive, onToggleMute, onCall,
+}: {
   dark: boolean; live: boolean; muted: boolean; reconnecting: boolean;
   /** 1B.5: the voice /live socket is actually OPEN — "● LIVE" gates on this, not on the click. */
   connected: boolean;
   /** 1B.5: getUserMedia denied/failed — the chip must say MIC BLOCKED, not "I'm listening". */
   micBlocked: boolean;
+  /** bead 8fz.2: Janus audio is ACTUALLY playing (data.audioPlaying) — the chip's "speaking" rung. */
+  audioPlaying: boolean;
+  /** bead 8fz.2: a resolvable approval is on the attention queue (data.approvalWaiting) — the
+   *  chip's "waiting" rung. */
+  approvalWaiting: boolean;
   transcript: TranscriptEntry[];
   voiceCues: boolean; stations: { name: string }[]; onGoLive: () => void; onStopLive: () => void; onToggleMute: () => void; onCall: (phrase: string) => void;
 }) {
@@ -217,6 +228,14 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [transcript]);
 
   const listening = live && connected && !muted && !micBlocked;
+  // bead 8fz.2: the chip reads the FULL 10-kind reducer directly (kind -> label + color) instead of
+  // the retired getChipLabel/getChipBg boolean ladders. `executing` has no backing signal yet
+  // (reserved for a follow-up wave that surfaces real dispatch/tool-write-in-flight telemetry).
+  const convo = deriveConversationalState({
+    live, connected, micBlocked, muted, reconnecting,
+    speaking: audioPlaying, waiting: approvalWaiting, executing: false,
+    toolActive: hasToolActivity(transcript),
+  });
 
   function renderTranscriptBody() {
     return (
@@ -270,10 +289,19 @@ export function KitchenRadio({ dark, live, muted, reconnecting, connected, micBl
         <button onClick={() => setCalls((c) => !c)} title="What can I say?" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 9px", borderRadius: 8, border: "2px solid #fff4de", background: calls ? "#ffc94a" : "transparent", color: calls ? INK : "#fff4de", cursor: "pointer", fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", flexShrink: 0 }}>🎙 calls</button>
         {/* 1B.5: LIVE means live — between the click and the socket opening the chip reads
             "TUNING IN…", and a blocked mic is named loudly instead of pretending to listen.
-            velocity-mech: the conversational gloss rides the chip as a title (hover/AT readout). */}
-        <span title={getChipHelper(live, micBlocked, connected, muted, reconnecting)} style={{ display: "inline-flex" }}>
-          <Chip bg={getChipBg(live, micBlocked, connected, muted)} color="#fff4de" border="#fff4de">
-            {getChipLabel(live, micBlocked, connected, muted, reconnecting)}
+            velocity-mech: the conversational gloss rides the chip as a title (hover/AT readout).
+            bead 8fz.2: role="status" + aria-live="polite" so a screen reader announces the turn
+            state too — the label text only ever changes on a real kind TRANSITION (deriveConversat-
+            ionalState returns the same stable string for an unchanged kind across re-renders, e.g.
+            each streamed audio chunk), so this never spams one announcement per chunk. */}
+        <span
+          role="status"
+          aria-live="polite"
+          title={getChipHelper(live, micBlocked, connected, muted, reconnecting)}
+          style={{ display: "inline-flex" }}
+        >
+          <Chip bg={chipColorForKind(convo.kind)} color="#fff4de" border="#fff4de">
+            {convo.label}
           </Chip>
         </span>
       </div>

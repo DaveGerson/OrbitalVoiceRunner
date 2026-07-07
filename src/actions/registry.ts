@@ -39,6 +39,7 @@ import { TEMPLATES_ACTIONS } from "./defs/templates";
 import { LAYOUTS_ACTIONS } from "./defs/layouts";
 import { DISPATCH_ACTIONS } from "./defs/dispatch_group";
 import { VOICE_UX_ACTIONS } from "./defs/voice_ux";
+import { MACROS_ACTIONS } from "./defs/macros";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -336,6 +337,8 @@ export const REGISTRY: readonly ActionDef[] = [
   ...DISPATCH_ACTIONS,
   // ── voice-UX wave 3: get_status_summary (SITREP) + focus_pane (conversational focus) (2) ──
   ...VOICE_UX_ACTIONS,
+  // ── voice macros (8fz.6): list / define / delete — REST/UI-only CRUD (fired via utterance match) (3) ──
+  ...MACROS_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

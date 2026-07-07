@@ -1,11 +1,13 @@
 // tests/test_useconversationalstate.ts
 //
-// Velocity-design layer (operator decision D7): the conversational pill's STATE MACHINE.
-// Written FIRST (TDD RED) to pin every transition of deriveConversationalState() — the pure
-// reducer that the useConversationalState hook wraps. The pill's discrete state is derived
-// ONLY from the voice-channel booleans the data layer already computes (live / connected /
-// micBlocked / muted / reconnecting) plus tool-call activity surfaced through the transcript's
-// grounding sources (the "activeSources" signal). No React, no rendering — the machine is pure.
+// Velocity-design layer (operator decision D7, extended bead 8fz.2): the conversational pill's
+// STATE MACHINE. Written FIRST (TDD RED) to pin every transition of deriveConversationalState() —
+// the pure reducer that the useConversationalState hook wraps. The pill's discrete state is
+// derived ONLY from the voice-channel booleans the data layer already computes (live / connected /
+// micBlocked / muted / reconnecting) plus: real audio playback (speaking), a resolvable approval
+// on the attention queue (waiting), a dispatched/tool write in flight (executing), and tool-call
+// activity surfaced through the transcript's grounding sources (the "activeSources" signal,
+// toolActive/thinking). No React, no rendering — the machine is pure.
 //
 // IMPORT STRATEGY: useConversationalState.ts imports React (useMemo) for the thin hook wrapper,
 // but the pure deriveConversationalState/hasToolActivity exports pull in nothing transitive (no
@@ -31,6 +33,9 @@ function sig(over: Partial<ConversationalSignals> = {}): ConversationalSignals {
     micBlocked: false,
     muted: false,
     reconnecting: false,
+    speaking: false,
+    waiting: false,
+    executing: false,
     toolActive: false,
     ...over,
   };
@@ -67,10 +72,38 @@ describe("deriveConversationalState", () => {
     assert.equal(deriveConversationalState(sig({ connected: false, reconnecting: true })).kind, "tuning");
   });
 
+  it("live + connected + reconnecting → reconnecting (no longer silently dropped)", () => {
+    assert.equal(deriveConversationalState(sig({ reconnecting: true })).kind, "reconnecting");
+    // reconnecting outranks muted AND speaking — a reconnect while muted (or mid-playback) must
+    // never be masked as "muted"/"speaking" (the exact bug this bead fixes).
+    assert.equal(deriveConversationalState(sig({ reconnecting: true, muted: true })).kind, "reconnecting");
+    assert.equal(deriveConversationalState(sig({ reconnecting: true, speaking: true })).kind, "reconnecting");
+    assert.equal(deriveConversationalState(sig({ reconnecting: true, muted: true, speaking: true, waiting: true, executing: true, toolActive: true })).kind, "reconnecting");
+  });
+
   it("live + connected + muted → muted (mic held, session intact)", () => {
     assert.equal(deriveConversationalState(sig({ muted: true })).kind, "muted");
-    // tool activity must NOT override an explicitly muted mic
+    // tool activity, speaking, waiting, executing must NOT override an explicitly muted mic
     assert.equal(deriveConversationalState(sig({ muted: true, toolActive: true })).kind, "muted");
+    assert.equal(deriveConversationalState(sig({ muted: true, speaking: true, waiting: true, executing: true, toolActive: true })).kind, "muted");
+  });
+
+  it("fully live + speaking → speaking (Janus audio is ACTUALLY playing)", () => {
+    assert.equal(deriveConversationalState(sig({ speaking: true })).kind, "speaking");
+    // speaking outranks waiting/executing/thinking
+    assert.equal(deriveConversationalState(sig({ speaking: true, waiting: true, executing: true, toolActive: true })).kind, "speaking");
+  });
+
+  it("fully live + waiting → waiting (a resolvable approval needs the operator)", () => {
+    assert.equal(deriveConversationalState(sig({ waiting: true })).kind, "waiting");
+    // waiting outranks executing/thinking
+    assert.equal(deriveConversationalState(sig({ waiting: true, executing: true, toolActive: true })).kind, "waiting");
+  });
+
+  it("fully live + executing → executing (a dispatched/tool write is in flight)", () => {
+    assert.equal(deriveConversationalState(sig({ executing: true })).kind, "executing");
+    // executing outranks thinking
+    assert.equal(deriveConversationalState(sig({ executing: true, toolActive: true })).kind, "executing");
   });
 
   it("fully live + tool activity → thinking (a tool/grounding call is in flight)", () => {
@@ -81,17 +114,24 @@ describe("deriveConversationalState", () => {
     assert.equal(deriveConversationalState(sig()).kind, "listening");
   });
 
-  it("precedence is total & ordered: offline > blocked > tuning > muted > thinking > listening", () => {
+  it("precedence is total & ordered: offline > blocked > tuning > reconnecting > muted > speaking > waiting > executing > thinking > listening", () => {
     // each higher-precedence flag wins even when every lower signal is also asserted
-    assert.equal(deriveConversationalState(sig({ live: false, micBlocked: true, connected: false, muted: true, toolActive: true })).kind, "offline");
-    assert.equal(deriveConversationalState(sig({ micBlocked: true, connected: false, muted: true, toolActive: true })).kind, "blocked");
-    assert.equal(deriveConversationalState(sig({ connected: false, muted: true, toolActive: true })).kind, "tuning");
-    assert.equal(deriveConversationalState(sig({ muted: true, toolActive: true })).kind, "muted");
-    assert.equal(deriveConversationalState(sig({ toolActive: true })).kind, "thinking");
+    const all = { micBlocked: true, connected: false, reconnecting: true, muted: true, speaking: true, waiting: true, executing: true, toolActive: true };
+    assert.equal(deriveConversationalState(sig({ live: false, ...all })).kind, "offline");
+    assert.equal(deriveConversationalState(sig(all)).kind, "blocked");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false })).kind, "tuning");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true })).kind, "reconnecting");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true, reconnecting: false })).kind, "muted");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true, reconnecting: false, muted: false })).kind, "speaking");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true, reconnecting: false, muted: false, speaking: false })).kind, "waiting");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true, reconnecting: false, muted: false, speaking: false, waiting: false })).kind, "executing");
+    assert.equal(deriveConversationalState(sig({ ...all, micBlocked: false, connected: true, reconnecting: false, muted: false, speaking: false, waiting: false, executing: false })).kind, "thinking");
   });
 
-  it("every state carries a stable, non-empty label", () => {
-    const kinds: ConversationalState["kind"][] = ["offline", "blocked", "tuning", "muted", "thinking", "listening"];
+  it("every state carries a stable, non-empty label — Record totality over all 10 kinds", () => {
+    const kinds: ConversationalState["kind"][] = [
+      "offline", "blocked", "tuning", "reconnecting", "muted", "speaking", "waiting", "executing", "thinking", "listening",
+    ];
     const seen = new Set<string>();
     for (const k of kinds) {
       // build a signals object that resolves to exactly k via precedence
@@ -99,7 +139,11 @@ describe("deriveConversationalState", () => {
         offline: sig({ live: false }),
         blocked: sig({ micBlocked: true }),
         tuning: sig({ connected: false }),
+        reconnecting: sig({ reconnecting: true }),
         muted: sig({ muted: true }),
+        speaking: sig({ speaking: true }),
+        waiting: sig({ waiting: true }),
+        executing: sig({ executing: true }),
         thinking: sig({ toolActive: true }),
         listening: sig(),
       };

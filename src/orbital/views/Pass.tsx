@@ -12,6 +12,7 @@ import type { StoredNote } from "../../store/types";
 import type { PaneLayout, Plan, AttentionItem } from "../../types";
 import type { TemplateView } from "../useOrbitalData";
 import { pendingApprovalBadgeCount } from "../useOrbitalDataHelpers";
+import { apiFetch } from "../../utils/api";
 
 // Map the persisted NoteType onto the design's ticket kinds (the wire only ever stores "note"; the
 // kind chip is a read-time presentation of whatever type the note carries).
@@ -338,6 +339,132 @@ function LayoutTicket({ l, dark, onApply, onDelete }: {
   );
 }
 
+// ── Voice macros (8fz.6): a self-contained management panel on The Pass ────────
+// Macros are REST/UI-authored ONLY (voice can FIRE them but never DEFINE/MODIFY — operator decision
+// 2026-07-06). This section owns its own data: it fetches GET /api/macros on mount and re-reads after
+// each mutation (no parent prop plumbing — the panel is self-sufficient). Each macro is a phrase that
+// fans out to an ordered group of per-pane steps; firing stages one pending approval per step.
+
+/** The macro projection GET /api/macros returns (snake_case steps, mirroring the REST body). */
+interface SavedMacroStep { pane_name: string; instruction: string }
+interface SavedMacro { id: string; phrase: string; name: string; steps: SavedMacroStep[]; created_at: number; updated_at: number }
+
+/** One saved macro as a pass card: phrase, name, ordered per-pane step chips; two-tap 86. */
+function MacroTicket({ m, dark, onDelete }: { m: SavedMacro; dark: boolean; onDelete: (id: string) => void }) {
+  const fg = dark ? "#ffe9c7" : INK;
+  const steps = Array.isArray(m.steps) ? m.steps : [];
+  return (
+    <div data-testid="pass-macro" data-macro-id={m.id}
+      style={{ width: 230, flexShrink: 0, padding: 11, border: "2px solid " + INK, borderRadius: 11, background: dark ? "#2b1c0a" : "#fff0dc", boxShadow: "2px 2px 0 0 " + INK, display: "flex", flexDirection: "column", gap: 7 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <Chip bg="#b36ae0" color={INK}>🎙 macro</Chip>
+        <div style={{ flex: 1 }} />
+        <span style={{ fontFamily: "JetBrains Mono", fontSize: 12, color: "#8a6a4f" }}>{steps.length} step{pluralSuffix(steps.length)}</span>
+      </div>
+      <div style={cardText(fg)}>{m.name}</div>
+      <div style={{ fontFamily: "Caveat, cursive", fontSize: 14, color: "#8a6a4f", lineHeight: 1.2 }}>say “{m.phrase}”</div>
+      {steps.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {steps.map((s, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={monoChip(dark)}>#{s.pane_name}</span>
+              <span style={{ ...cardText(fg), fontSize: 12, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.instruction}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={byline}>— voice macro</span>
+        <div style={{ flex: 1 }} />
+        <Confirm86 dark={dark} title="86 this macro" testId="pass-macro-delete" onConfirm={() => onDelete(m.id)} />
+      </div>
+    </div>
+  );
+}
+
+/** The "new macro" ghost card: name + phrase + an editable ordered step list. Surfaces the server's
+ *  403 reason (a phrase that would shadow a voice approval / a reserved command is refused). */
+function NewMacroCard({ dark, onCreate }: {
+  dark: boolean; onCreate: (o: { name: string; phrase: string; steps: SavedMacroStep[] }, onErr: (msg: string) => void) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [phrase, setPhrase] = useState("");
+  const [steps, setSteps] = useState<SavedMacroStep[]>([{ pane_name: "", instruction: "" }]);
+  const [err, setErr] = useState("");
+  const setStep = (i: number, patch: Partial<SavedMacroStep>) =>
+    setSteps((prev) => prev.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  const cleanSteps = steps.map((s) => ({ pane_name: s.pane_name.trim(), instruction: s.instruction.trim() })).filter((s) => s.pane_name && s.instruction);
+  const can = !!name.trim() && !!phrase.trim() && cleanSteps.length > 0;
+  const reset = () => { setName(""); setPhrase(""); setSteps([{ pane_name: "", instruction: "" }]); setErr(""); setOpen(false); };
+  const save = () => { if (can) onCreate({ name: name.trim(), phrase: phrase.trim(), steps: cleanSteps }, setErr); };
+  if (!open) {
+    return (
+      <div data-testid="pass-macro-new" style={{ width: 230, flexShrink: 0, padding: 11, border: `2px dashed ${INK}88`, borderRadius: 11, display: "flex", flexDirection: "column", gap: 7, justifyContent: "center", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}><Chip bg="#b36ae0" color={INK}>🎙 macro</Chip></div>
+        <Button testId="pass-macro-add" variant="ghost" size="sm" icon="plus" onClick={() => setOpen(true)}>New macro</Button>
+      </div>
+    );
+  }
+  return (
+    <div data-testid="pass-macro-new" style={{ width: 230, flexShrink: 0, padding: 11, border: `2px dashed ${INK}88`, borderRadius: 11, display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}><Chip bg="#b36ae0" color={INK}>🎙 macro</Chip></div>
+      <input data-testid="pass-macro-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="macro name" autoFocus style={fieldStyle(dark)} />
+      <input data-testid="pass-macro-phrase" value={phrase} onChange={(e) => setPhrase(e.target.value)} placeholder="spoken phrase (e.g. morning rounds)" style={fieldStyle(dark)} />
+      {steps.map((s, i) => (
+        <div key={i} style={{ display: "flex", gap: 4 }}>
+          <input data-testid={`pass-macro-step-pane-${i}`} value={s.pane_name} onChange={(e) => setStep(i, { pane_name: e.target.value })} placeholder="pane" style={{ ...fieldStyle(dark), width: 80 }} />
+          <input data-testid={`pass-macro-step-instr-${i}`} value={s.instruction} onChange={(e) => setStep(i, { instruction: e.target.value })} placeholder="instruction" style={fieldStyle(dark)} />
+        </div>
+      ))}
+      <button data-testid="pass-macro-add-step" onClick={() => setSteps((p) => [...p, { pane_name: "", instruction: "" }])} style={{ ...miniBtn(dark), width: "auto", padding: "0 8px", alignSelf: "flex-start" }}>+ step</button>
+      {!!err && <div data-testid="pass-macro-error" style={{ fontFamily: "DM Sans", fontSize: 12, fontWeight: 700, color: "#e23a3a", lineHeight: 1.2 }}>{err}</div>}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
+        <button onClick={reset} title="Cancel" style={miniBtn(dark)}>✕</button>
+        <button data-testid="pass-macro-save" onClick={save} disabled={!can} title={can ? "Save" : "Needs a name, a phrase, and at least one full step"}
+          style={{ ...miniBtn(dark), background: "#b36ae0", color: "#fff4de", opacity: can ? 1 : 0.5, cursor: can ? "pointer" : "not-allowed" }}>✓</button>
+      </div>
+    </div>
+  );
+}
+
+/** The self-fetching macros section rendered inline on The Pass (cards + the expanded creator card). */
+function MacrosSection({ dark, expanded }: { dark: boolean; expanded: boolean }) {
+  const [macros, setMacros] = useState<SavedMacro[]>([]);
+  const load = (): void => {
+    apiFetch("/api/macros")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((d) => setMacros(Array.isArray(d) ? (d as SavedMacro[]) : []))
+      .catch(() => { /* a management-panel read failure is non-fatal */ });
+  };
+  useEffect(() => {
+    let alive = true;
+    apiFetch("/api/macros")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((d) => { if (alive) setMacros(Array.isArray(d) ? (d as SavedMacro[]) : []); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  const remove = (id: string): void => {
+    apiFetch(`/api/macros/${id}`, { method: "DELETE" }).then(() => load()).catch(() => {});
+  };
+  const create = (o: { name: string; phrase: string; steps: SavedMacroStep[] }, onErr: (msg: string) => void): void => {
+    apiFetch("/api/macros", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(o) })
+      .then(async (r) => {
+        if (r.ok) { load(); return; }
+        const body = await r.json().catch(() => ({}));
+        onErr((body as { error?: string }).error ?? `Could not save macro (HTTP ${r.status}).`);
+      })
+      .catch(() => onErr("Could not reach the server."));
+  };
+  return (
+    <>
+      {macros.map((m) => <Fragment key={m.id}><MacroTicket m={m} dark={dark} onDelete={remove} /></Fragment>)}
+      {expanded && <NewMacroCard dark={dark} onCreate={create} />}
+    </>
+  );
+}
+
 // "Save current setup as layout" — a ghost card with a name input; the server snapshots the active
 // kitchen's live stations (POST /api/layouts {name}).
 function SaveLayoutCard({ dark, onSave }: { dark: boolean; onSave: (name: string) => void }) {
@@ -633,6 +760,8 @@ export function ThePass({ notes, plans, templates, layouts, attention, stations,
         {notes.map((n) => <Fragment key={n.id}><TicketCard n={n} dark={dark} onEdit={onEdit} onDelete={onDelete} onFirePane={onFirePane} onJumpToPane={onJumpToPane} /></Fragment>)}
         {templates.map((t) => <Fragment key={t.id}><TemplateTicket t={t} dark={dark} stations={stations} activePaneId={activePaneId} onUpdate={onUpdateTemplate} onDelete={onDeleteTemplate} onApply={onApplyTemplate} /></Fragment>)}
         {layouts.map((l) => <Fragment key={l.id}><LayoutTicket l={l} dark={dark} onApply={onApplyLayout} onDelete={onDeleteLayout} /></Fragment>)}
+        {/* Voice macros (8fz.6): self-fetching REST/UI-authored management panel. */}
+        <MacrosSection dark={dark} expanded={expanded} />
         {expanded && <NewTemplateCard dark={dark} onCreate={onCreateTemplate} />}
         {expanded && <SaveLayoutCard dark={dark} onSave={onSaveLayout} />}
       </div>

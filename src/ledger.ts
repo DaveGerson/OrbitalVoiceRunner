@@ -1,5 +1,6 @@
 import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft, PromptTemplate, PaneLayout } from "./types";
 import type { StoredNote } from "./store/types";
+import type { Macro } from "./macros";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
 // re-exported here so existing `from "./ledger"` imports keep working (D7).
@@ -67,6 +68,8 @@ export interface LedgerLike {
   watchRules: WatchRule[];
   promptTemplates: PromptTemplate[];
   layouts: PaneLayout[];
+  // Voice macros (8fz.6) — self-persisting document array (kv-JSON, same shape as promptTemplates).
+  macros: Macro[];
   archiveExitedPanes(projectId?: string): number;
   // PHASE 1 (deferrable-toggle honesty): archive ONE pane by its owning project + id (recoverable,
   // does NOT terminate the process). Truthy-on-success: false when the pane row is already gone.

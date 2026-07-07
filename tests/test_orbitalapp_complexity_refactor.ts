@@ -24,6 +24,7 @@ import {
   resolvePassProjectId,
   resolvePassProjectName,
   matchVoiceCall,
+  labelForPill,
   type View,
   type VoiceCallAction,
 } from "../src/orbital/orbitalAppHelpers.ts";
@@ -324,5 +325,34 @@ describe("matchVoiceCall", () => {
   it("no stations: 'open any' → coaching (no match possible)", () => {
     const a = matchVoiceCall("open any", []) as Extract<VoiceCallAction, { kind: "coaching" }>;
     assert.equal(a.kind, "coaching");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. labelForPill (Wave 5 minor fix — no doubled bullet)
+// The nav ConversationalPill draws its OWN status dot span, so a shared LABELS
+// entry that already carries a leading bullet (LABELS.listening = '● LIVE',
+// byte-pinned to the KitchenRadio chip's e2e strings) would render '● ● LIVE'.
+// labelForPill strips a single leading bullet+space for the PILL only — the
+// shared LABELS map (and the chip that pins it) is untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("labelForPill — the pill draws its own dot, so the label must not carry a second bullet", () => {
+  it("strips a leading '● ' so '● LIVE' renders 'LIVE' (no bullet doubled next to the pill's own dot)", () => {
+    assert.equal(labelForPill("● LIVE"), "LIVE");
+  });
+
+  it("the pill label carries no bullet glyph at all once stripped", () => {
+    assert.equal(labelForPill("● LIVE").includes("●"), false);
+  });
+
+  it("passes every non-bulleted label through unchanged", () => {
+    for (const l of ["OFF AIR", "TUNING IN…", "MIC BLOCKED", "RECONNECTING…", "MUTED", "SPEAKING…", "WAITING ON YOU", "EXECUTING…", "THINKING…"]) {
+      assert.equal(labelForPill(l), l);
+    }
+  });
+
+  it("is idempotent — re-applying never strips further and a bare label is untouched", () => {
+    assert.equal(labelForPill(labelForPill("● LIVE")), "LIVE");
+    assert.equal(labelForPill("LIVE"), "LIVE");
   });
 });

@@ -31,7 +31,10 @@ export function isE2EWireArmed(): boolean {
     && (window as unknown as { __ORBITAL_E2E_WIRE__?: unknown }).__ORBITAL_E2E_WIRE__ === true;
 }
 
-export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } };
+// `fromToast` marks a Janus line that was minted by showToast() — it is ALREADY announced by the
+// toast's own role="status" aria-live region (OrbitalApp renderToast), so the CaptionBar must NOT
+// re-announce it through its own aria-live (the double-announce guard, bead 8fz.3 coordination).
+export type TranscriptEntry = { sender: "User" | "Janus"; text: string; timestamp: Date; fromToast?: boolean; grounding?: { queries: string[]; sources: { uri: string; title: string }[] } };
 
 /** Injection surface exposed on `window.__ORBITAL_E2E__` for Playwright to drive. */
 export interface OrbitalE2EHooks {

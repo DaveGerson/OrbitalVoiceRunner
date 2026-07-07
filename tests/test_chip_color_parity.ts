@@ -51,20 +51,27 @@ before(async () => {
 // drive getChipBg (the radio chip) for the four states the chip can actually reach.
 function signalsForKind(kind: ConversationalKind): ConversationalSignals {
   const base: ConversationalSignals = {
-    live: true, connected: true, micBlocked: false, muted: false, reconnecting: false, toolActive: false,
+    live: true, connected: true, micBlocked: false, muted: false, reconnecting: false,
+    speaking: false, waiting: false, executing: false, toolActive: false,
   };
   switch (kind) {
     case "offline": return { ...base, live: false };
     case "blocked": return { ...base, micBlocked: true };
     case "tuning": return { ...base, connected: false };
+    case "reconnecting": return { ...base, reconnecting: true };
     case "muted": return { ...base, muted: true };
+    case "speaking": return { ...base, speaking: true };
+    case "waiting": return { ...base, waiting: true };
+    case "executing": return { ...base, executing: true };
     case "thinking": return { ...base, toolActive: true };
     case "listening": return base;
   }
 }
 
 test("chipColorForKind covers every ConversationalKind with a non-empty hex", () => {
-  const kinds: ConversationalKind[] = ["offline", "tuning", "blocked", "muted", "thinking", "listening"];
+  const kinds: ConversationalKind[] = [
+    "offline", "tuning", "blocked", "reconnecting", "muted", "speaking", "waiting", "executing", "thinking", "listening",
+  ];
   for (const k of kinds) {
     const c = chipColorForKind(k);
     assert.match(c, /^#[0-9a-fA-F]{6}$/, `color for ${k} must be a 6-digit hex, got ${c}`);

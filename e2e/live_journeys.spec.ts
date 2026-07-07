@@ -129,7 +129,12 @@ test("pane lifecycle: exit → Exited card → 86 to the freezer → restore (le
   // ── "86 this station": an Exited pane skips the confirm tap → straight to the freezer ──
   await openBurner(page);
   await page.getByTestId("burner-86").click();
-  await expect(page.getByTestId("toast")).toContainText("86'd", { timeout: 15_000 });
+  // The toast is a SINGLE displaceable slot: on a fast runner the "86'd" flash loses it to the
+  // trailing async exit announcements ("Pane ... exited." / "Command outcome summary unavailable"
+  // — deterministic CI-only failure 2026-07-06, ubuntu live lane, both retries). Every toast also
+  // appends a durable line to the radio transcript (useOrbitalData's showToast), so assert the
+  // record, not the flash.
+  await expect(page.getByTestId("radio-transcript")).toContainText("86'd", { timeout: 15_000 });
   // The pane left the Line (stopAndArchivePane archived its ledger row) and the burner
   // self-closed (its station disappeared from the board).
   await expect(paneCard(page)).toHaveCount(0, { timeout: 30_000 });
@@ -141,6 +146,8 @@ test("pane lifecycle: exit → Exited card → 86 to the freezer → restore (le
   const frozenRow = page.locator(`[data-testid="freezer-pane"][data-pane-id="${paneId}"]`);
   await expect(frozenRow).toBeVisible({ timeout: 15_000 });
   await frozenRow.getByTestId("freezer-restore").click();
+  // Toast (not transcript) on purpose: the Pantry tab doesn't render the radio transcript, and
+  // unlike the 86 step there is no trailing async announcement to displace this slot.
   await expect(page.getByTestId("toast")).toContainText("back on the line", { timeout: 15_000 });
   await expect(frozenRow).toHaveCount(0, { timeout: 15_000 });
 
