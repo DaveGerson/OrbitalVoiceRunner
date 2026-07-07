@@ -20,11 +20,14 @@ export interface InjectGateDecision {
 
 export class InjectGate {
   private lastInjectedHash: string | null = null;
-  // Epoch-ms of the last confirmed injection. Defaults to 0 (not "no prior injection" sentinel
-  // logic) — production `now` is always a real Date.now() epoch, so `now - 0` is astronomically
-  // larger than any debounce floor on the very first call, which is the desired "never debounce
-  // before anything has ever been injected" behavior without a separate first-call flag.
-  private lastInjectedAt = 0;
+  // Epoch-ms of the last confirmed injection. Defaults to a true "no prior injection" sentinel
+  // (z5c s1 review graft, from the codex executor branch): with the old `0` default the
+  // never-debounce-before-first-injection guarantee held only because production `now` is
+  // epoch-scale — a per-session gate evaluated under a relative/fake clock (small `now`) would
+  // spuriously debounce its very first non-session-start call. NEGATIVE_INFINITY makes the
+  // guarantee unconditional (`now - (-Infinity)` is +Infinity at any clock scale), which matters
+  // once slices 2/3 unit-test per-session gates under fake timers.
+  private lastInjectedAt = Number.NEGATIVE_INFINITY;
 
   constructor(private debounceMs: () => number) {}
 

@@ -95,7 +95,6 @@ export class MemoryService {
     return this.gates.forSession(null);
   }
 
-
   /** Cheap 16-hex-char SHA-256 fingerprint of an arbitrary JSON-serializable value. Shared by the
    *  whole-snapshot hysteresis hash and the per-tier hashes (D4's ctx.tierHashes). */
   private _hashOf(value: unknown): string {
