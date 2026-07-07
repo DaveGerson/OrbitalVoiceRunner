@@ -411,6 +411,12 @@ export interface ActionContext {
    *  — handlers must null-chain (`ctx.policies?.resolveFocus(...) ?? <TS fallback>`, per D2). */
   policies?: PythonPolicyClient;
 
+  /** hwu.2: the "while you were away" activity-digest composer over an arbitrary (since, now] window,
+   *  or null when nothing notable happened. Threaded from Gating.composeAwayDigest onto the VOICE
+   *  ActionContext only; absent on REST/hand-built test contexts, where catch_me_up degrades to the
+   *  graceful "nothing notable" line. PURE read of durable event rows — never mutates. */
+  composeAwayDigest?: (since: number, now: number) => string | null;
+
   // deliver_handoff note: NO injected closure for the outcome→row mapping. `deliverOutcomeToHandoff`
   // is a PURE, EXPORTED function in src/handoffFlow (server.ts imports it as a value at server.ts:37,
   // and the deliver_handoff branch calls it at server.ts:3315). It captures NO server state, so it is

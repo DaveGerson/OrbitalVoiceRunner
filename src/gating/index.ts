@@ -123,6 +123,11 @@ export interface Gating {
   /** 4D.1: stamp the moment the live voice session detached — opens the "while you were away"
    *  window that reannounceSurvivors digests (and consumes) on the next reconnect. */
   noteSessionDetached: (now?: number) => void;
+  /** hwu.2: compose the "while you were away" activity digest over an ARBITRARY (since, now] window,
+   *  returning null when nothing notable happened. PURE additive export of the existing internal
+   *  composer — the reconnect call site (reannounceSurvivors) is unchanged. The catch_me_up voice verb
+   *  threads this onto its ActionContext so "what happened in the last hour?" reuses the shipped path. */
+  composeAwayDigest: (since: number, now: number) => string | null;
   /** The LIVE mode-switch choke point (multi-cli spec §6, bead 1y8). set_pane_permissions + promote_pane_mode delegate here. */
   applyPaneMode: (
     paneId: string,
@@ -1193,6 +1198,7 @@ export function createGating(deps: GatingDeps): Gating {
     applyResolution,
     applyDeferral,
     noteSessionDetached,
+    composeAwayDigest,
     reannounceSurvivors,
     pendingApprovals,
     pendingActions,

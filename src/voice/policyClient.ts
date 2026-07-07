@@ -11,6 +11,13 @@
 import { z } from "zod";
 import type { ModuleResponse, PythonModuleClient } from "../memory/pythonClient";
 import { WIRE_VERSION } from "../memory/types";
+import type { NoteType } from "../store/types";
+
+/** The four NoteType values classify_note may emit (a SUBSET of NoteType — NEVER "handoff"). The
+ *  zod enum below pins the wire to exactly this set so a drifted daemon can never inject an
+ *  out-of-taxonomy type; the client falls open to "note" on any miss. */
+export const CLASSIFIABLE_NOTE_TYPES = ["decision", "todo", "warning", "note"] as const;
+export type ClassifiableNoteType = (typeof CLASSIFIABLE_NOTE_TYPES)[number];
 
 /** Per-call race bound (D2). Overridable via `opts.timeoutMs` (tests only — production always uses
  *  the default). Kept small: a slow/absent daemon must never be perceptible as voice latency. */
@@ -101,6 +108,12 @@ export interface PythonPolicyClient {
    *  production facade (createPythonPolicyClient) always implements it, and a caller treats an absent
    *  method exactly like a daemon miss (the TS exact floor). */
   matchMacro?(utterance: string, entries: MacroPhraseEntry[]): Promise<MacroMatch | null>;
+  /** Classify a note's text into a NoteType (decision|todo|warning|note). Resolves null on ANY miss
+   *  (down/timeout/schema/ok:false) — the caller MUST fall open to "note" so classification NEVER
+   *  blocks or delays note capture. NEVER rejects, NEVER emits "handoff" or an out-of-taxonomy value
+   *  (the wire enum is pinned to the four-value subset). Same fallback contract as resolveFocus.
+   *  OPTIONAL on the interface (like matchMacro) so pre-hwu.3 test doubles stay valid. */
+  classifyNote?(text: string): Promise<ClassifiableNoteType | null>;
   /** True only when the shared daemon has pinged and the breaker is closed. */
   available(): boolean;
   /** Tear down the shared core (idempotent — call once for all facades over that core). */
@@ -174,6 +187,21 @@ const MacroMatchResponseSchema = z.discriminatedUnion("ok", [
   }),
 ]);
 
+const NoteClassifyResponseSchema = z.discriminatedUnion("ok", [
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(true),
+    type: z.enum(CLASSIFIABLE_NOTE_TYPES),
+  }),
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string() }),
+  }),
+]);
+
 /** Race one core.request against `timeoutMs`; resolves null on timeout (the timer never rejects, so
  *  a slow daemon just loses the race — no unhandled rejection, no throw). */
 async function raceRequest(
@@ -234,6 +262,14 @@ export function createPythonPolicyClient(
       if (!parsed.success || !parsed.data.ok) return null;
       // Rebuilt field-by-field (independent of any zod-inference quirk), mirroring resolveFocus.
       return { id: parsed.data.match.id };
+    },
+    async classifyNote(text) {
+      const obj = await raceRequest(core, "note.classify", { text }, timeoutMs);
+      if (!obj) return null;
+      const parsed = NoteClassifyResponseSchema.safeParse(obj);
+      if (!parsed.success || !parsed.data.ok) return null;
+      // The enum-validated `type` is one of the four allowed values; return it verbatim.
+      return parsed.data.type;
     },
     dispose() { core.dispose(); },
   };

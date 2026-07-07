@@ -79,6 +79,67 @@ describe("PendingActionStore — deferred execution (G1)", () => {
     assert.strictEqual(store.has("a7"), false);
   });
 
+  // hwu.4 deny marker: the optional onDiscard hook fires exactly once on a DISCARD (cancel / expire /
+  // pane-drain), never on confirm. This is the seam promote_draft's bead proposal uses to mark its
+  // source note 'denied' so re-proposal is explicit.
+  describe("onDiscard discard hook", () => {
+    function stageWithDiscard(store: PendingActionStore, id: string, run: { n: number }, discard: { n: number }, ts = Date.now()) {
+      store.add({
+        id, capability: "promote_bead", summary: `propose ${id}`, timestamp: ts,
+        run: () => { run.n++; return `ran ${id}`; },
+        onDiscard: () => { discard.n++; },
+      });
+    }
+
+    it("cancel fires onDiscard exactly once; run never fires", () => {
+      const store = new PendingActionStore();
+      const run = { n: 0 }; const discard = { n: 0 };
+      stageWithDiscard(store, "d1", run, discard);
+      store.cancel("d1");
+      assert.strictEqual(discard.n, 1, "onDiscard fired on cancel");
+      assert.strictEqual(run.n, 0, "the run effect never fired on a discard");
+    });
+
+    it("expire fires onDiscard", () => {
+      const store = new PendingActionStore();
+      const run = { n: 0 }; const discard = { n: 0 };
+      stageWithDiscard(store, "d2", run, discard, 1_000);
+      store.expire("d2");
+      assert.strictEqual(discard.n, 1, "onDiscard fired on expiry");
+      assert.strictEqual(run.n, 0);
+    });
+
+    it("confirm does NOT fire onDiscard (a run is not a discard)", () => {
+      const store = new PendingActionStore();
+      const run = { n: 0 }; const discard = { n: 0 };
+      stageWithDiscard(store, "d3", run, discard);
+      store.confirm("d3");
+      assert.strictEqual(discard.n, 0, "onDiscard must never fire on confirm");
+      assert.strictEqual(run.n, 1);
+    });
+
+    it("a lost-race cancel (already confirmed) does NOT fire onDiscard", () => {
+      const store = new PendingActionStore();
+      const run = { n: 0 }; const discard = { n: 0 };
+      stageWithDiscard(store, "d4", run, discard);
+      store.confirm("d4");             // wins the claim, runs
+      const r = store.cancel("d4");    // record already gone -> not_found (never fires discard)
+      assert.strictEqual(r.reason, "not_found");
+      assert.strictEqual(discard.n, 0, "a cancel that finds nothing must not fire onDiscard");
+      assert.strictEqual(run.n, 1);
+    });
+
+    it("a throwing onDiscard does not break cancel's remove contract", () => {
+      const store = new PendingActionStore();
+      store.add({
+        id: "d5", capability: "promote_bead", summary: "boom", timestamp: Date.now(),
+        run: () => "x", onDiscard: () => { throw new Error("discard boom"); },
+      });
+      assert.doesNotThrow(() => store.cancel("d5"));
+      assert.strictEqual(store.has("d5"), false, "the record is still removed despite the throwing hook");
+    });
+  });
+
   it("list reflects staged actions and clears on resolve", () => {
     const store = new PendingActionStore();
     const c = { n: 0 };

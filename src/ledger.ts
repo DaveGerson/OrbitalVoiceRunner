@@ -1,5 +1,5 @@
 import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft, PromptTemplate, PaneLayout } from "./types";
-import type { StoredNote } from "./store/types";
+import type { NoteType, StoredNote } from "./store/types";
 import type { Macro } from "./macros";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
@@ -50,7 +50,10 @@ export interface LedgerLike {
   updatePane(projectId: string, paneMeta: PaneMeta, shouldSave?: boolean): void;
   save(immediate?: boolean): void;
   // Truthy-on-success: JanusStore returns StoredNote|null (or boolean for a hand-rolled test double).
-  addNote(projectId: string, text: string): unknown;
+  // hwu.3: the optional `opts` (already honored by the JanusStore impl) lets typed-note writers persist
+  // a classified NoteType + author (the taxonomy hwu.4/hwu.5 build on). Additive + backward-compatible —
+  // existing 2-arg callers are unchanged (opts defaults to a project-scoped "note"/"user" write).
+  addNote(projectId: string, text: string, opts?: { paneId?: string; type?: NoteType; author?: "janus" | "user" }): unknown;
   addPaneNote(projectId: string, paneId: string, text: string): unknown;
   // bead bjm: notes-recall surface. JanusStore implements these over id-bearing rows + FTS5.
   getNotes(filter?: { projectId?: string; paneId?: string; type?: string }): StoredNote[];

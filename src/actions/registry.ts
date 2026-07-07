@@ -40,6 +40,10 @@ import { LAYOUTS_ACTIONS } from "./defs/layouts";
 import { DISPATCH_ACTIONS } from "./defs/dispatch_group";
 import { VOICE_UX_ACTIONS } from "./defs/voice_ux";
 import { MACROS_ACTIONS } from "./defs/macros";
+// Wave 6 (hwu.*) net-new defs.
+import { CATCHUP_ACTIONS } from "./defs/catchup";
+import { EXPORT_ACTIONS } from "./defs/export";
+import { promoteDraft } from "./defs/promote";
 
 /** Empty-params schema shared by the brake trio + list_panes (pins §8.2 #8 -> properties {}). */
 const NoParams = z.object({});
@@ -300,9 +304,11 @@ export const amendNote: ActionDef<typeof AmendNoteParams> = {
  * and the phase-B contract proof (propose_command = dispatchProposal style, amend_note = gateOrDefer
  * durable Ask-defer style). The remaining 35 tools live in src/actions/defs/* (one file per capability
  * domain), faithfully ported from their legacy server.ts branches. Phase C swaps server.ts to dispatch
- * through runAction(REGISTRY, ...). Total = 45 voice tools (parity with the legacy dispatch chain
- * + the Wave D observability pair get_action_log / get_health + the voice-UX wave 3 pair
- * get_status_summary / focus_pane).
+ * through runAction(REGISTRY, ...). The voice-tool surface has since grown well past the phase-A 45
+ * (Wave D observability, voice-UX wave 3, journey-expansion templates/layouts/dispatch, and Wave 6's
+ * knowledge-capture verbs: catch_me_up, save_transcript_note, promote_draft, export_project — plus the
+ * rest-only get_project_export). The authoritative live count is the toGeminiDeclarations(REGISTRY)
+ * voice filter, pinned in tests/test_live_harness.ts.
  */
 export const REGISTRY: readonly ActionDef[] = [
   // ── phase-A + contract-proof inline defs (6) ──
@@ -339,6 +345,12 @@ export const REGISTRY: readonly ActionDef[] = [
   ...VOICE_UX_ACTIONS,
   // ── voice macros (8fz.6): list / define / delete — REST/UI-only CRUD (fired via utterance match) (3) ──
   ...MACROS_ACTIONS,
+  // ── Wave 6 (hwu.*) knowledge-capture defs ──
+  // hwu.2 catch_me_up (voice); hwu.4 promote_draft (voice); hwu.6 export_project (voice) +
+  // get_project_export (rest). save_transcript_note (hwu.3) ships inside NOTES_ACTIONS above.
+  ...CATCHUP_ACTIONS,
+  promoteDraft,
+  ...EXPORT_ACTIONS,
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -483,4 +483,41 @@ export interface PaneLayout {
   created_at: number;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// hwu.7 — the action-activity WS frame. Broadcast ONCE per completed voice tool call so the
+// read-only ActionPanel (a sibling region beside the KitchenRadio, NOT a replacement for the
+// attention inbox) can re-key to the agent's most recent tool result while voice stays terse.
+//
+// `payload` is a PROJECTION of the ActionResult that has already passed redactDeep and a size cap
+// (never the raw args): `output` for a kind:"ok" result, `summary` for a deferred kind:"pending",
+// `reason` for a kind:"blocked" refusal, `message` for a kind:"error"/"clarify". `truncated` marks
+// a payload whose `output` was replaced because it exceeded the cap. This shape is the ONLY thing
+// that crosses the WS seam for this feature — the panel's name→view mapping is pure UI presentation.
+// ─────────────────────────────────────────────────────────────────────────────
+export interface ActionActivityPayload {
+  /** The ActionResult discriminant: "ok" | "pending" | "clarify" | "blocked" | "error". */
+  kind: string;
+  /** kind:"ok" structured output (string prose OR an object like {notes}/{results}). Redacted. */
+  output?: unknown;
+  /** kind:"pending" deferred-write summary (renders an "awaiting approval" card, never a result). */
+  summary?: string;
+  /** kind:"blocked" refusal reason. */
+  reason?: string;
+  /** kind:"error"/"clarify" message text. */
+  message?: string;
+  /** True iff `output` was elided because the serialized payload exceeded the size cap. */
+  truncated?: boolean;
+}
+
+export interface ActionActivityFrame {
+  type: "action_activity";
+  /** The dispatched tool name (drives the deterministic panel view lookup). */
+  name: string;
+  /** The Gemini functionCall id — the React re-key so the panel resets per completed call. */
+  callId: string;
+  /** Emission wall-clock (ms). */
+  ts: number;
+  payload: ActionActivityPayload;
+}
+
 

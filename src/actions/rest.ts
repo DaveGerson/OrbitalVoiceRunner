@@ -47,6 +47,17 @@ export interface RestRequest {
 export interface RestResponse {
   status(code: number): RestResponse;
   json(payload: unknown): unknown;
+  /**
+   * OPTIONAL (hwu.6): set one or more response headers. Absent on the minimal fake `RestResponse`
+   * test doubles used throughout tests/test_c55_*.ts — `applyResultToHttp`'s meta-driven branch below
+   * feature-detects it and falls back to a plain JSON envelope when it's missing, so every existing
+   * test double keeps compiling/passing unchanged. The real Express `res` (cast to this structural
+   * type in server.ts) has it.
+   */
+  set?(headers: Record<string, string>): RestResponse;
+  /** OPTIONAL (hwu.6): send a raw text body (as opposed to `json`). Same feature-detection story as
+   *  `set` above. */
+  send?(body: string): unknown;
 }
 
 export type RestHandler = (req: RestRequest, res: RestResponse) => void | Promise<void>;
@@ -162,13 +173,49 @@ export function mountRestRoutes(
 }
 
 /**
+ * hwu.6: an `ok`-kind result MAY carry `meta.httpStatus` (a custom status, e.g. a REST-only read's
+ * 404-unknown-target) and/or `meta.contentType` (a raw text body — e.g. a Markdown export download —
+ * served with real `Content-Type`/`Content-Disposition` headers instead of the flat `{output}` JSON
+ * envelope). Detected STRUCTURALLY off the existing `meta` bag (no ActionResult shape change) so it is
+ * purely additive: no other def sets these keys today, and any def using `rest.toHttp` is handled by
+ * that hook FIRST (see applyResultToHttp) — this branch is unreachable for those. `res.set`/`res.send`
+ * are feature-detected: a minimal test-double `RestResponse` without them still gets a working (JSON)
+ * fallback. Returns true when it produced a response (caller must not fall through to resultToHttp).
+ */
+/** The raw-text half of applyMetaResponseOverride: real Content-Type/Content-Disposition headers +
+ *  a raw-text body, with a JSON fallback for a minimal fake RestResponse missing set()/send(). */
+function sendMarkdownDownload(r: RestResponse, output: string, contentType: string, filename: unknown): void {
+  const headers: Record<string, string> = { "Content-Type": contentType };
+  if (typeof filename === "string") headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+  const withHeaders = typeof r.set === "function" ? r.set(headers) : r;
+  if (typeof withHeaders.send === "function") { withHeaders.send(output); return; }
+  withHeaders.json({ output }); // fallback for a minimal fake RestResponse without send()
+}
+
+function applyMetaResponseOverride(result: ActionResult, res: RestResponse): boolean {
+  if (result.kind !== "ok" || !result.meta) return false;
+  const { httpStatus, contentType, filename } = result.meta as { httpStatus?: unknown; contentType?: unknown; filename?: unknown };
+  if (typeof httpStatus !== "number" && typeof contentType !== "string") return false;
+  const status = typeof httpStatus === "number" ? httpStatus : 200;
+  const r = res.status(status);
+  if (typeof contentType === "string" && typeof result.output === "string") {
+    sendMarkdownDownload(r, result.output, contentType, filename);
+    return true;
+  }
+  r.json(result.output);
+  return true;
+}
+
+/**
  * applyResultToHttp(def, result, args, res) — the c55 Batch E response-translation dispatcher.
  *
  * If the def declares an optional `rest.toHttp` hook, route through it: it re-projects the typed
  * `result.output` into a bespoke `{ status, body }` (the escape hatch for the ~4 structured page-load
- * reads whose body the flat `{output}` cannot carry) and that response wins. Otherwise fall through to
- * the unchanged default `resultToHttp` map — so any def WITHOUT a hook is byte-identical to the legacy
- * behavior (no regression). This is the single REST projection seam; the voice path never reaches it.
+ * reads whose body the flat `{output}` cannot carry) and that response wins. Otherwise, an `ok` result
+ * carrying `meta.httpStatus`/`meta.contentType` rides applyMetaResponseOverride (hwu.6 — the export
+ * download's custom status/raw-text escape hatch). Otherwise fall through to the unchanged default
+ * `resultToHttp` map — so any def WITHOUT either hook is byte-identical to the legacy behavior (no
+ * regression). This is the single REST projection seam; the voice path never reaches it.
  */
 export function applyResultToHttp(
   def: ActionDef,
@@ -181,6 +228,7 @@ export function applyResultToHttp(
     res.status(status).json(body);
     return;
   }
+  if (applyMetaResponseOverride(result, res)) return;
   resultToHttp(result, res);
 }
 

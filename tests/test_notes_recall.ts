@@ -169,6 +169,31 @@ describe("bjm notes-recall voice tools (headless, no API key, no mic)", () => {
       assert.ok(!blob.includes("supersecret123"), "snippet secret is redacted");
       assert.ok(blob.includes("[REDACTED"), "redaction marker present in snippet");
     });
+
+    // hwu.5: the optional `type` narrowing param — enum-validated at the params boundary, applied as
+    // a post-filter over the already note-only, already-limit-sliced FTS hits.
+    it("hwu.5: type=decision returns only the decision-typed hit for a shared token", async () => {
+      // Two notes share a distinctive token but carry different types (addNote's 3rd arg sets type).
+      running.manager.ledger.addNote(PROJECT, "SPLINTERWORD we decided to ship it", { type: "decision" });
+      running.manager.ledger.addNote(PROJECT, "SPLINTERWORD remember to check logs", { type: "todo" });
+
+      const allCall = session.emitToolCall("search_notes", { query: "SPLINTERWORD" });
+      const allOut: any = await waitFor(() => mock.responseFor(allCall));
+      assert.ok(allOut.results.length >= 2, "untyped search returns both hits (legacy shape unchanged)");
+
+      const typedCall = session.emitToolCall("search_notes", { query: "SPLINTERWORD", type: "decision" });
+      const typedOut: any = await waitFor(() => mock.responseFor(typedCall));
+      assert.strictEqual(typedOut.results.length, 1, "type=decision narrows to exactly the decision hit");
+      assert.ok(/decided to ship it/.test(typedOut.results[0].snippet), "the surviving hit is the decision note");
+    });
+
+    it("hwu.5: an invalid type value is rejected at the params boundary (zod enum), not silently accepted", async () => {
+      const callId = session.emitToolCall("search_notes", { query: "SPLINTERWORD", type: "not_a_real_type" });
+      const out: any = await waitFor(() => mock.responseFor(callId));
+      // A garbage type must produce the validation-error narration, NOT a normal {query,count,results}
+      // success shape (which would mean it was silently accepted/ignored as a filter).
+      assert.ok(typeof out === "string" && /invalid arguments|internal error/i.test(out), `garbage type rejected, not silently accepted: ${JSON.stringify(out)}`);
+    });
   });
 
   // ── add_pane_note active-pane default (MUST-FIX #4) ─────────────────────────────────────────

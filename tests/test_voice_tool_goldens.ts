@@ -449,6 +449,16 @@ describe("REG1 voice-tool dispatch goldens (no-behavior-change oracle)", () => {
     assertGolden("search_notes");
   });
 
+  // hwu.3: save_transcript_note over an EMPTY recent-turns ring. The ring is only fed by real ASR
+  // transcript turns (handleOperatorUtterance/handleModelUtterance) — the headless harness drives tool
+  // calls directly, so the ring stays empty regardless of suite order, making the graceful
+  // "nothing to save yet" line perfectly deterministic. (The populated-capture, redaction, and
+  // classification paths are pinned deterministically in tests/test_save_transcript_note.ts.)
+  it("save_transcript_note (empty ring -> graceful nothing-to-save)", async () => {
+    await captureTool("save_transcript_note.empty", "save_transcript_note");
+    assertGolden("save_transcript_note.empty");
+  });
+
   it("amend_note (Auto disposition, fixed echoed id)", async () => {
     // update_metadata gate defaults Auto -> applies now. The handler ECHOES the supplied
     // note_id verbatim (no existence check), so a LITERAL id keeps the output deterministic.

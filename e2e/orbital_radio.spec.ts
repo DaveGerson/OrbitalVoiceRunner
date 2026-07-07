@@ -90,6 +90,24 @@ test.describe("Orbital Kitchen — Kitchen Radio (voice)", () => {
     await expect(page.getByTestId("kitchen-radio")).toContainText("● LIVE");
   });
 
+  // hwu.3: each transcript bubble carries a per-bubble save affordance (radio-bubble-save) that jots
+  // the line into The Pass through the operator-direct ungated note route (POST /api/projects/:id/notes,
+  // which classifies server-side). The saved line lands as an optimistic ticket in The Pass immediately.
+  test("a transcript bubble can be saved to The Pass (bubble save → note)", async ({ page }) => {
+    await page.route(/\/api\/projects\/.+\/notes$/, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: '{"output":"ok"}' }));
+    await gotoKitchen(page);
+    await injectTranscript(page, "Janus", "cap the retry backoff at five");
+    const saveBtn = page.getByTestId("radio-bubble-save").first();
+    await expect(saveBtn).toBeVisible();
+    const postReq = page.waitForRequest((r) => /\/api\/projects\/.+\/notes$/.test(r.url()) && r.method() === "POST", { timeout: 10_000 });
+    await saveBtn.click();
+    const body = (await postReq).postDataJSON();
+    expect(body?.note).toBe("cap the retry backoff at five");
+    // The saved line appears as a ticket on The Pass (optimistic), with its kind chip.
+    await expect(page.getByTestId("pass-ticket").filter({ hasText: "cap the retry backoff at five" }).first()).toBeVisible();
+  });
+
   // 1B.5: a denied mic must be LOUD — the chip names it instead of claiming "I'm listening, Chef".
   // (The real getUserMedia denial path — toast + earcon from startMic's catch — needs a real browser
   // permission denial and is verified manually; this pins the honest render-state.)

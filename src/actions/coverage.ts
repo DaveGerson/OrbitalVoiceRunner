@@ -221,6 +221,21 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // focus_pane is conversational (spoken-reference) focus; the UI/REST path for the same intent is
   // the existing set_active_pane WS frame, not a registry twin. No REST/WS twin is planned.
   focus_pane: new Set<Surface>(["voice"]),
+
+  // ── Wave 6 knowledge-capture (hwu.*): voice-only by design ───────────────────────────────────────
+  // catch_me_up (hwu.2) is the spoken away-digest verb; its UI/REST twin would be vacuous (it composes
+  // the session-independent event digest but is fired conversationally). save_transcript_note (hwu.3) is
+  // the "save that as a note" voice verb — the operator-direct UI twin is the existing rest note route
+  // (create_project_note, which now also classifies). promote_draft (hwu.4) reads the active pane's live
+  // dictation draft (per-connection state) → a REST twin would be vacuous, same rationale as the other
+  // draft/focus composers above. All three are voice-only; no REST/WS twin is planned.
+  catch_me_up: new Set<Surface>(["voice"]),
+  save_transcript_note: new Set<Surface>(["voice"]),
+  promote_draft: new Set<Surface>(["voice"]),
+  // export_project (hwu.6) is the voice write verb (fixed-path artifact); get_project_export is its
+  // rest-only READ twin (the download route) — no voice twin BY DESIGN (voice never reads the body aloud).
+  export_project: new Set<Surface>(["voice"]),
+  get_project_export: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

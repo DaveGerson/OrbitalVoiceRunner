@@ -26,6 +26,7 @@ import type {
   Plan,
   PaneLayout,
   AttentionItem,
+  ActionActivityFrame,
 } from "../types";
 import type { StoredNote, StoredHandoff } from "../store/types";
 import { extractSlots } from "../templates";
@@ -142,6 +143,22 @@ function truncateCmd(cmd: unknown): string {
   return s.length > 80 ? s.slice(0, 77) + "…" : s;
 }
 
+// hwu.7: validate an `action_activity` frame off the wire before it re-keys the ActionPanel. A
+// malformed frame (missing name/callId, non-object payload) yields null so a bad frame can never
+// blank or crash the panel — the last good action simply stays put.
+function actionActivityFromFrame(msg: Record<string, unknown>): ActionActivityFrame | null {
+  const { name, callId, ts, payload } = msg as { name?: unknown; callId?: unknown; ts?: unknown; payload?: unknown };
+  if (typeof name !== "string" || typeof callId !== "string") return null;
+  if (!payload || typeof payload !== "object" || typeof (payload as { kind?: unknown }).kind !== "string") return null;
+  return {
+    type: "action_activity",
+    name,
+    callId,
+    ts: typeof ts === "number" ? ts : Date.now(),
+    payload: payload as ActionActivityFrame["payload"],
+  };
+}
+
 // Mock settings seeded under ?mock=1 so the Back of House rooms (and any settings-driven surface)
 // render deterministically in the e2e harness, which is client-only (no real GET /api/settings).
 const MOCK_SETTINGS: SystemSettings = {
@@ -175,6 +192,9 @@ export interface OrbitalData {
   daemonState: "python" | "fallback" | null;
   transcript: TranscriptEntry[];
   notes: StoredNote[];
+  /** hwu.7: the agent's most recent completed voice tool call (action_activity frame), or null
+   *  before any call — drives the read-only ActionPanel. */
+  lastAction: ActionActivityFrame | null;
   activeTerminalId: string | null;
   isMock: boolean;
   isLive: boolean;
@@ -279,6 +299,8 @@ export interface OrbitalData {
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
   refetchNotes: (projectIds: string[]) => void;
   addNote: (projectId: string, text: string, paneId?: string | null) => void;
+  /** hwu.3: save a Kitchen Radio transcript bubble as a durable, server-classified project note. */
+  saveRadioNote: (projectId: string, text: string) => void;
   editNote: (id: string, text: string, projectId?: string) => void;
   deleteNote: (id: string, projectId?: string) => void;
   goLive: () => void;
@@ -368,6 +390,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [layouts, setLayouts] = useState<PaneLayout[]>([]);
   // j4e1: the line drawer's handoffs (GET /api/handoffs + handoffs_updated frames).
   const [handoffs, setHandoffs] = useState<StoredHandoff[]>([]);
+  // hwu.7: the agent's most recent completed voice tool call (drives the read-only ActionPanel).
+  const [lastAction, setLastAction] = useState<ActionActivityFrame | null>(null);
 
   // 3C.2: counts observe-socket REconnects (not the first open). TerminalView keys its
   // reset-and-rewrite-from-snapshot resync on this, so a gap is repaired the moment we're back.
@@ -828,6 +852,14 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // stays at its last-known value, which is the safest observable-degradation posture.
       daemon_state: () => {
         if (msg.state === "python" || msg.state === "fallback") setDaemonState(msg.state);
+      },
+      // hwu.7: the agent completed a voice tool call — re-key the read-only ActionPanel to it. This is
+      // strictly additive (a separate sidebar region) — it never touches the attention inbox or its
+      // approve/deny state. A malformed frame is dropped (actionActivityFromFrame → null), so the last
+      // good action stays shown rather than blanking.
+      action_activity: () => {
+        const f = actionActivityFromFrame(msg);
+        if (f) setLastAction(f);
       },
     };
     const type = msg?.type;
@@ -1795,6 +1827,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, [showToast, refetchNotes, refetchLedger, mockClientOnly]);
 
+  // hwu.3: save a Kitchen Radio transcript bubble as a durable note. Targets the operator-direct,
+  // UNGATED note route (POST /api/projects/:project_id/notes -> create_project_note), which now
+  // classifies the note server-side (bounded + fail-open) so a saved bubble lands in The Pass with the
+  // right kind chip. Delegates to addNote so the optimistic ticket + The Pass repaint are shared with
+  // the jot flow — the one seam the bubble-save UI + its e2e target.
+  const saveRadioNote = useCallback((projectId: string, text: string) => {
+    addNote(projectId, text);
+  }, [addNote]);
+
   const editNote = useCallback(async (id: string, text: string, projectId?: string) => {
     const t = text.trim();
     setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, text: t, updated_at: Date.now() } : n)));
@@ -1997,6 +2038,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
     healthSnapshot, refetchHealth,
     templates, layouts, handoffs,
+    lastAction,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
@@ -2004,7 +2046,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     createTemplate, updateTemplate, deleteTemplate, applyTemplate,
     saveLayout, applyLayout, deleteLayout, refetchTemplates, refetchLayouts,
     deliverHandoff, reviseHandoff, stageHandoff, rejectHandoff, fetchHandoffPrompt, refetchHandoffs,
-    refetchNotes, addNote, editNote, deleteNote,
+    refetchNotes, addNote, saveRadioNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
     stopAllFreeze, stopAllKill, stopAllRelease,

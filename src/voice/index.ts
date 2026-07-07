@@ -53,8 +53,10 @@ import { buildSystemInstruction } from "./systemPrompt";
 import { applyPaneInputFrame } from "./paneInputFrame";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
 import { actionSchemaHash } from "../actions/registry";
-import type { ActionContext, DispatchOutcome } from "../actions/types";
-import type { CapabilityGate } from "../types";
+import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
+import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
+import { redactDeep } from "../interactionLog";
+import { recentTurns } from "./recentTurns";
 import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
 import type { Gating } from "../gating";
@@ -108,6 +110,88 @@ export function captureTurnUsage(message: any, store: JanusStore | null, lastInj
   } catch (e) {
     // Measurement must never throw into the voice turn — swallow + log.
     console.error("[cortex-usage] captureTurnUsage failed:", e);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// hwu.7 — the action_activity emitter. Projects a completed tool call's ActionResult into the
+// wire payload, redacts EVERY string leaf (the same redactDeep the interaction log uses), and caps
+// the serialized size so a large read (e.g. a long note list) can never balloon the frame or add
+// serialization latency to the live-session dispatch loop. Pure + exported so the emitter is unit-
+// testable without booting a session.
+// ─────────────────────────────────────────────────────────────────────────────
+const ACTION_ACTIVITY_CAP_BYTES = 8192;
+
+/** Project the discriminated ActionResult into the flat wire payload (pre-redaction, pre-cap). */
+function projectActionResult(result: ActionResult): ActionActivityPayload {
+  switch (result.kind) {
+    case "ok":
+      return { kind: "ok", output: result.output };
+    case "pending":
+      return { kind: "pending", summary: result.summary };
+    case "clarify":
+      return { kind: "clarify", message: result.text };
+    case "blocked":
+      return { kind: "blocked", reason: result.reason };
+    default:
+      return { kind: "error", message: result.message };
+  }
+}
+
+/**
+ * Size-cap the (already redacted) payload. If the serialized form exceeds `cap`, the large `output`
+ * field is replaced with a marker and `truncated` is set; a still-oversized payload (a pathological
+ * huge scalar field) hard-minimizes to just its kind. Never throws — an unserializable payload
+ * (e.g. a cycle) collapses to a truncated stub.
+ */
+function capActionPayload(payload: ActionActivityPayload, cap: number): ActionActivityPayload {
+  let size: number;
+  try {
+    size = JSON.stringify(payload).length;
+  } catch {
+    return { kind: payload.kind, truncated: true, message: "[unserializable payload]" };
+  }
+  if (size <= cap) return payload;
+  const capped: ActionActivityPayload = { ...payload, truncated: true };
+  if ("output" in capped) capped.output = `[truncated: ${size} bytes exceeded ${cap}]`;
+  if (JSON.stringify(capped).length > cap) return { kind: payload.kind, truncated: true };
+  return capped;
+}
+
+/**
+ * Build the redacted, size-capped action_activity frame for a completed tool call. Exported for the
+ * emitter unit test. The frame carries ONLY the result projection — never the raw tool args.
+ */
+export function buildActionActivityFrame(
+  name: string,
+  callId: string,
+  result: ActionResult,
+  ts: number,
+  redact: (s: string) => string,
+  cap: number = ACTION_ACTIVITY_CAP_BYTES,
+): ActionActivityFrame {
+  const redacted = redactDeep(projectActionResult(result), redact) as ActionActivityPayload;
+  return { type: "action_activity", name, callId, ts, payload: capActionPayload(redacted, cap) };
+}
+
+/**
+ * Emit the action_activity frame — the completion seam in runToolCall calls this AFTER the tool
+ * response is already back on its way to Gemini. NON-THROWING by contract: a broadcast (or even a
+ * build) fault is swallowed + logged so it can NEVER break the tool-response path or add latency to
+ * the audio turn. Exported so the swallow behavior is unit-testable.
+ */
+export function emitActionActivity(
+  broadcast: (msg: any) => void,
+  name: string,
+  callId: string,
+  result: ActionResult,
+  redact: (s: string) => string,
+  ts: number,
+): void {
+  try {
+    broadcast(buildActionActivityFrame(name, callId, result, ts, redact));
+  } catch (e) {
+    console.error("[action-activity] emit failed:", e);
   }
 }
 
@@ -396,6 +480,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     stopAll,
     releaseStopAll,
     runningPaneIds,
+    composeAwayDigest,
   } = gating;
 
   // PLM4 (1): RESUMPTION-TOKEN PERSISTENCE. The Gemini Live resume handle was in-memory only, so a
@@ -1115,6 +1200,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // Voice-UX wave 3: the optional "policies" daemon facade — undefined when the master
           // switch is off or init failed (permanent TS-fallback posture, per D2).
           policies,
+          // hwu.2: the away-digest composer, so catch_me_up can render "what happened in the last
+          // hour?" over an arbitrary window (fires the shipped reconnect-digest path, no reconnect).
+          composeAwayDigest,
           // PLM2 (F1): per-action audit seam -> durable action_log. runAction calls this once per
           // dispatch (best-effort, never-throw). Args are redacted to a JSON string before persistence
           // (NEVER raw). The store stamps the timestamp. A store failure must not break the tool call.
@@ -1308,6 +1396,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           const handleOperatorUtterance = (userUtterance: string, session: any): void => {
             state.currentSessionUserUtterance = userUtterance;
             interactionLog.log({ interactionId: onOperatorSpeech(), kind: "voice_in", text: userUtterance, data: { source: "operator" } });
+            // hwu.3: append this COMPLETED operator turn to the bounded recent-turns ring (O(1), once
+            // per finalized ASR line — never per audio frame) so save_transcript_note can capture "the
+            // last thing said". Raw/untruncated here; redaction is applied by the consumer pre-persist.
+            recentTurns.push("user", userUtterance);
 
             // BEAD tkd (should-I-speak gate): decide ONCE per operator turn whether Janus's spoken AUDIO
             // for the model's reply should be muted. DEFAULT OFF (silenceGate:false) => shouldSpeak
@@ -1383,6 +1475,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           const handleModelUtterance = (modelUtterance: string): void => {
             state.currentSessionModelUtterance = modelUtterance;
             interactionLog.log({ interactionId: turnId(), kind: "gemini_text", text: modelUtterance });
+            // hwu.3: append this COMPLETED model turn to the recent-turns ring (once per finalized spoken
+            // line) so save_transcript_note can capture Janus's side too. Consumer redacts pre-persist.
+            recentTurns.push("janus", modelUtterance);
             setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
             clientWs.send(JSON.stringify({
               type: "transcript_text",
@@ -1548,6 +1643,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
                 resultToToolResponse(result, session, name!, call.id!);
                 maybeSpeakCreatePaneAck(name!, result, session);
+                // hwu.7: re-key the read-only ActionPanel to this completed call. Emitted AFTER the
+                // tool response is on its way to Gemini and is non-throwing — a broadcast fault can
+                // never break the response path or add latency to the audio turn. Once per completed
+                // dispatch only (never the replay/duplicate short-circuits, never per audio frame).
+                emitActionActivity(broadcast, name!, call.id!, result, redactSecrets, Date.now());
               }
             } catch (toolErr) {
               console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
