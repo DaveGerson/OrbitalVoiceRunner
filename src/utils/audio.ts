@@ -17,6 +17,52 @@ export function pcmToBase64(pcmData: Float32Array): string {
 let nextStartTime = 0;
 const activeSources: AudioBufferSourceNode[] = [];
 
+// ── bead 8fz.2: the playback-state subscribe/notify seam ────────────────────
+// The conversational pill's "speaking" signal must come from ACTUAL audio playback, never from
+// guessing off the freshest transcript sender (that would read SPEAKING forever after the last
+// Janus turn). This is a thin, AudioContext-free pub/sub over the SAME activeSources list
+// playAudioChunk/resetAudioPlayback already maintain — it fires only on a genuine 0→1 ("started
+// speaking") or 1→0 ("done speaking") transition, never once per streamed chunk, so a downstream
+// aria-live/screen-reader hook can never be spammed mid-stream.
+type PlaybackListener = (playing: boolean) => void;
+const playbackListeners = new Set<PlaybackListener>();
+
+/** True while at least one scheduled chunk is actively playing. Pure array-membership check — no
+ *  AudioContext needed (the timing-buffer variant that DOES need one is isAudioPlaying below). */
+export function isAudioPlaybackActive(): boolean {
+  return activeSources.length > 0;
+}
+
+function notifyPlaybackState(): void {
+  const playing = isAudioPlaybackActive();
+  for (const listener of playbackListeners) listener(playing);
+}
+
+/** Subscribe to start/stop transitions of Janus audio playback. Returns an unsubscribe function. */
+export function subscribeAudioPlayback(listener: PlaybackListener): () => void {
+  playbackListeners.add(listener);
+  return () => { playbackListeners.delete(listener); };
+}
+
+/** Track a newly started source: notifies subscribers only on the 0→1 transition (the FIRST active
+ *  source). Exported standalone (not folded into playAudioChunk) so the playback-lifecycle unit
+ *  test can drive it with plain mock source objects — no AudioContext, no createBuffer. */
+export function trackPlaybackStart(source: AudioBufferSourceNode): void {
+  const wasIdle = activeSources.length === 0;
+  activeSources.push(source);
+  if (wasIdle) notifyPlaybackState();
+}
+
+/** Track a finished source: notifies subscribers only on the 1→0 transition (the LAST active
+ *  source just drained). A source already removed (e.g. by a bulk resetAudioPlayback) is a no-op —
+ *  guards against a double "stopped" notify if the browser still fires a stale onended after reset. */
+export function trackPlaybackEnd(source: AudioBufferSourceNode): void {
+  const idx = activeSources.indexOf(source);
+  if (idx === -1) return;
+  activeSources.splice(idx, 1);
+  if (activeSources.length === 0) notifyPlaybackState();
+}
+
 // Client-side playback volume (0..1). Gemini Live has no server volume control,
 // so the Settings "volume" slider is honored here by scaling the output samples.
 let playbackVolume = 1.0;
@@ -60,20 +106,16 @@ export function playAudioChunk(audioCtx: AudioContext, base64: string) {
     nextStartTime = currentTime;
   }
   source.start(nextStartTime);
-  activeSources.push(source);
+  trackPlaybackStart(source);
 
-  source.onended = () => {
-    const idx = activeSources.indexOf(source);
-    if (idx !== -1) {
-      activeSources.splice(idx, 1);
-    }
-  };
+  source.onended = () => trackPlaybackEnd(source);
 
   nextStartTime += buffer.duration;
 }
 
 export function resetAudioPlayback() {
   nextStartTime = 0;
+  const hadActive = activeSources.length > 0;
   for (const source of activeSources) {
     try {
       source.stop();
@@ -82,6 +124,7 @@ export function resetAudioPlayback() {
     }
   }
   activeSources.length = 0;
+  if (hadActive) notifyPlaybackState();
 }
 
 export function isAudioPlaying(audioCtx: AudioContext | null): boolean {

@@ -15,6 +15,7 @@ import { Board, ProjectsSidebar } from "./views/Line";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
+import { CaptionBar } from "./CaptionBar";
 import { TerminalWindow } from "./TerminalWindow";
 import { BackOfHouse } from "./views/BackOfHouse";
 import { ThePass } from "./views/Pass";
@@ -28,7 +29,7 @@ import { modeToServiceId, serviceIdToMode, type ServiceModeId } from "./theme";
 import {
   resolveStartView, resolveStartProject, getLocationSearch,
   resolveServiceId, resolvePassProjectId, resolvePassProjectName,
-  matchVoiceCall, type View,
+  matchVoiceCall, labelForPill, type View,
 } from "./orbitalAppHelpers";
 
 const CHATTER = [
@@ -84,7 +85,9 @@ function ConversationalPill({ state }: { state: ConversationalState }) {
     <div data-testid="convo-pill" data-convo-state={state.kind}
       style={{ display: "flex", alignItems: "center", gap: 7, background: "#fff4de", color: INK, padding: "6px 12px", borderRadius: 999, border: "2px solid " + INK, boxShadow: "2px 2px 0 0 " + INK, flexShrink: 0 }}>
       <span style={{ width: 8, height: 8, borderRadius: "50%", background: chipColorForKind(state.kind), border: "1.5px solid " + INK, animation: pulse ? "orb-pulse 1s var(--ease-bounce) infinite" : undefined }} />
-      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", textTransform: "capitalize" }}>{state.label}</span>
+      {/* labelForPill drops any leading bullet the shared label carries (LABELS.listening = '● LIVE'),
+          so the pill's own dot span above is never doubled to '● ● LIVE'. */}
+      <span style={{ fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, whiteSpace: "nowrap", textTransform: "capitalize" }}>{labelForPill(state.label)}</span>
     </div>
   );
 }
@@ -224,6 +227,9 @@ export default function OrbitalApp() {
   const convo = useConversationalState({
     live: data.isLive, connected: data.voiceConnected, micBlocked: data.micBlocked,
     muted: data.micMuted, reconnecting: data.voiceReconnecting, transcript: data.transcript,
+    // bead 8fz.2: real audio playback + a resolvable approval on the attention queue. `executing`
+    // has no backing signal yet — reserved for a follow-up wave (dispatch/tool-write telemetry).
+    speaking: data.audioPlaying, waiting: data.approvalWaiting, executing: false,
   });
   const needsList = stations.filter((s) => s.status === "Needs Input");
   const jumpToNeeds = () => { const f = needsList[0]; if (f) { data.selectActivePane(f.id); setBurnerId(f.id); } };
@@ -304,11 +310,17 @@ export default function OrbitalApp() {
           <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
-        <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0 }}>
-          <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
-            connected={data.voiceConnected} micBlocked={data.micBlocked}
-            transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
-            onGoLive={data.goLive} onStopLive={data.stopLive} onToggleMute={data.toggleMute} onCall={handleCall} />
+        <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column" }}>
+          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+            <KitchenRadio dark={t.dark} live={data.isLive} muted={data.micMuted} reconnecting={data.voiceReconnecting}
+              connected={data.voiceConnected} micBlocked={data.micBlocked}
+              audioPlaying={data.audioPlaying} approvalWaiting={data.approvalWaiting}
+              transcript={data.transcript} voiceCues={t.voiceCues} stations={stations}
+              onGoLive={data.goLive} onStopLive={data.stopLive} onToggleMute={data.toggleMute} onCall={handleCall} />
+          </div>
+          {/* bead 8fz.3: caption pop-up — rises from the bottom of this sidebar as its own flex
+              row (never an overlay), so it structurally can't cover KitchenRadio's mic controls. */}
+          <CaptionBar transcript={data.transcript} live={data.isLive} captionsOn={t.captions} dark={t.dark} />
         </aside>
       </div>
     );
@@ -473,6 +485,7 @@ export default function OrbitalApp() {
         <TweakToggle label="Chef mascot & chatter" value={t.mascot} onChange={(v) => setTweak("mascot", v)} />
         <TweakSection label="Hands-free" />
         <TweakToggle label="Voice cues" value={t.voiceCues} onChange={(v) => setTweak("voiceCues", v)} />
+        <TweakToggle label="Captions" value={t.captions} onChange={(v) => setTweak("captions", v)} />
         <TweakToggle label="Desktop notes" value={t.desktopNotes} onChange={(v) => setTweak("desktopNotes", v)} />
         <TweakToggle label="Chef dance party 🕺" value={t.danceParty} onChange={(v) => setTweak("danceParty", v)} />
       </TweaksPanel>

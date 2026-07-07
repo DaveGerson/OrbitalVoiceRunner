@@ -51,6 +51,14 @@ export function resolvePassProjectId(
     || null;
 }
 
+/** The nav ConversationalPill draws its OWN status dot span, so a shared LABELS entry that already
+ *  carries a leading bullet (LABELS.listening = '● LIVE', byte-pinned to the KitchenRadio chip's e2e
+ *  strings) would render a DOUBLED bullet ('● ● LIVE'). Strip a single leading bullet + optional
+ *  whitespace for the pill ONLY — the shared LABELS map (and the chip that pins it) stays untouched. */
+export function labelForPill(label: string): string {
+  return label.replace(/^●\s*/, "");
+}
+
 /** Resolve a human-readable project name for the Pass, falling back to "a kitchen". */
 export function resolvePassProjectName(
   passProjectId: string | null,

@@ -206,6 +206,14 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // close_pane REST registry twin would be a redundant affordance (same reasoning as promote_pane_mode). ─
   close_pane: new Set<Surface>(["voice"]),
 
+  // ── voice macros (8fz.6): REST/UI-only CRUD by design (operator decision 2026-07-06) ────────────
+  // Authoring is REST + Pass-view UI ONLY — voice can FIRE a macro (via the utterance-match interceptor
+  // in src/voice/index.ts, NOT a Gemini tool) but can NEVER define or modify one. So none of these
+  // expose a voice surface; there is deliberately no voice-surface define/delete verb.
+  list_macros: new Set<Surface>(["rest"]),
+  define_macro: new Set<Surface>(["rest"]),
+  delete_macro: new Set<Surface>(["rest"]),
+
   // ── voice-UX wave 3: voice-only by design ─────────────────────────────────────────────────────
   // get_status_summary is a SESSION-scoped read (same 7ep rationale as get_attention_digest/
   // list_pending_approvals — a REST twin would be vacuous on the session:null REST path).

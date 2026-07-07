@@ -120,8 +120,9 @@ function recordDispatchOutcome(groupId: string, paneId: string, outcome: Dispatc
   return { staged: false, refused: `${paneId} (${outcome.kind})` };
 }
 
-/** Assemble the spoken read-back from the staged/refused tallies. Behavior-preserving extraction. */
-function narrateDispatch(label: string, groupId: string, staged: string[], refused: string[]): string {
+/** Assemble the spoken read-back from the staged/refused tallies. Behavior-preserving extraction.
+ *  Exported so voice macros (src/macros.ts) narrate their fan-out in the IDENTICAL shape. */
+export function narrateDispatch(label: string, groupId: string, staged: string[], refused: string[]): string {
   const parts: string[] = [];
   if (staged.length) {
     parts.push(
@@ -131,6 +132,57 @@ function narrateDispatch(label: string, groupId: string, staged: string[], refus
   if (refused.length) parts.push(`Not staged: ${refused.join("; ")}.`);
   if (!staged.length) parts.push("No writes were staged.");
   return parts.join(" ");
+}
+
+/** One staging target for stageDispatchGroup: a unique per-step `key` (so N synthetic pendingIds
+ *  never collide on one functionCall id), the resolved pane id, and its per-target instruction. */
+export interface StageTarget {
+  key: string;
+  paneId: string;
+  instruction: string;
+}
+
+/**
+ * The SHARED staging/join/narration kernel (extracted so dispatch_to_panes AND voice macros reuse it
+ * verbatim — never a fork). Creates ONE join group, forceStages EVERY target through the same
+ * ctx.dispatchProposal pane-write choke-point with a DISTINCT synthetic pendingId, broadcasts
+ * dispatch_updated, and returns the group id + staged/refused tallies. `forceStage:true` on every
+ * write is THE fan-out safety invariant — a Full-Auto decision is downgraded to pending_approval
+ * inside the engine, so a group can never silently land N writes. dispatch_to_panes fans ONE
+ * instruction to N panes (key = paneId, format-identical to the pre-extraction inline loop); a macro
+ * fans N per-step instructions (key = step index + pane, so repeated panes still get unique pendingIds).
+ */
+export function stageDispatchGroup(
+  ctx: ActionContext,
+  label: string,
+  groupInstruction: string,
+  targets: StageTarget[],
+  trigger: string,
+): { groupId: string; staged: string[]; refused: string[] } {
+  const group = dispatchJoinTracker.create(label, groupInstruction, targets.map((t) => t.paneId));
+  const base = ctx.callId ?? group.id;
+  const staged: string[] = [];
+  const refused: string[] = [];
+  for (const t of targets) {
+    const outcome = ctx.dispatchProposal({
+      sess: ctx.session,
+      callId: base,
+      // Synthetic per-step pending id (the execute_plan precedent) so N stagings never collide on one
+      // functionCall id — `key` is unique per target (paneId for a fan-out, step-index+pane for a macro).
+      pendingId: `${base}__${group.id}__${t.key}`,
+      targetId: t.paneId,
+      instruction: t.instruction,
+      trigger,
+      capability: "write_to_pane",
+      // The fan-out invariant: never auto-execute; every write parks as an approval. See paneWrite.ts.
+      forceStage: true,
+    });
+    const recorded = recordDispatchOutcome(group.id, t.paneId, outcome);
+    if (recorded.staged) staged.push(t.paneId);
+    else refused.push(recorded.refused!);
+  }
+  ctx.broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
+  return { groupId: group.id, staged, refused };
 }
 
 export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {
@@ -148,34 +200,13 @@ export const dispatchToPanes: ActionDef<typeof DispatchToPanesParams> = {
     if ("early" in resolved) return resolved.early;
     const { text, label } = resolved;
 
+    // ONE instruction to N deduped panes: build the targets (key = paneId, so the synthetic pendingId
+    // stays format-identical to the pre-extraction inline loop) and route through the shared kernel.
     const paneIds = [...new Set(args.pane_ids)];
-    const group = dispatchJoinTracker.create(label, text, paneIds);
-
-    const staged: string[] = [];
-    const refused: string[] = [];
-    for (const paneId of paneIds) {
-      const outcome = ctx.dispatchProposal({
-        sess: ctx.session,
-        callId: ctx.callId ?? group.id,
-        // Synthetic per-pane pending id (the execute_plan precedent) so N stagings never collide
-        // on one functionCall id.
-        pendingId: `${ctx.callId ?? group.id}__${group.id}__${paneId}`,
-        targetId: paneId,
-        instruction: text,
-        trigger: ctx.userUtterance || `Dispatch group '${label}'`,
-        capability: "write_to_pane",
-        // The fan-out invariant: never auto-execute; every write parks as an approval the operator
-        // resolves (individually or via batch voice verbs). See paneWrite.ts forceStage.
-        forceStage: true,
-      });
-      const recorded = recordDispatchOutcome(group.id, paneId, outcome);
-      if (recorded.staged) staged.push(paneId);
-      else refused.push(recorded.refused!);
-    }
-
-    ctx.broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
-
-    return { kind: "ok", output: narrateDispatch(label, group.id, staged, refused) };
+    const targets: StageTarget[] = paneIds.map((paneId) => ({ key: paneId, paneId, instruction: text }));
+    const trigger = ctx.userUtterance || `Dispatch group '${label}'`;
+    const { groupId, staged, refused } = stageDispatchGroup(ctx, label, text, targets, trigger);
+    return { kind: "ok", output: narrateDispatch(label, groupId, staged, refused) };
   },
 };
 

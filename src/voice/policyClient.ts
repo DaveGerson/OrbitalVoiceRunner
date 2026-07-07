@@ -76,12 +76,31 @@ export interface SitrepRanking {
   sections: Array<{ key: "approvals" | "busy" | "attention" | "idle"; itemIds: string[] }>;
 }
 
+/** One stored macro phrase the daemon matches a routed utterance against (id + trigger phrase). */
+export interface MacroPhraseEntry {
+  id: string;
+  phrase: string;
+}
+
+/** The macro.match result: the matched macro id, or null when the daemon RAN but found no match. */
+export interface MacroMatch {
+  id: string | null;
+}
+
 export interface PythonPolicyClient {
   /** Resolve a spoken reference against the live candidate set. Resolves null on ANY miss — see the
    *  FALLBACK CONTRACT above. NEVER rejects. */
   resolveFocus(reference: string, candidates: FocusCandidate[]): Promise<FocusResolution | null>;
   /** Rank a SITREP payload into prioritized sections. Resolves null on ANY miss. NEVER rejects. */
   rankSitrep(payload: SitrepPayload): Promise<SitrepRanking | null>;
+  /** Match a routed utterance against stored macro phrases (normalized exact + bounded fuzzy).
+   *  Resolves null on ANY miss (down/timeout/schema/ok:false) — the caller falls to the TS exact
+   *  floor. A RAN daemon resolves { id } (id null = definitive no-match). NEVER rejects, NEVER fails
+   *  open (a daemon error is a null, not a match). Same fallback contract as resolveFocus.
+   *  OPTIONAL on the interface (like ctx.policies itself) so pre-macro test doubles stay valid; the
+   *  production facade (createPythonPolicyClient) always implements it, and a caller treats an absent
+   *  method exactly like a daemon miss (the TS exact floor). */
+  matchMacro?(utterance: string, entries: MacroPhraseEntry[]): Promise<MacroMatch | null>;
   /** True only when the shared daemon has pinged and the breaker is closed. */
   available(): boolean;
   /** Tear down the shared core (idempotent — call once for all facades over that core). */
@@ -126,6 +145,26 @@ const SitrepRankResponseSchema = z.discriminatedUnion("ok", [
     v: z.literal(WIRE_VERSION),
     ok: z.literal(true),
     ranking: SitrepRankingSchema,
+  }),
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string() }),
+  }),
+]);
+
+const MacroMatchSchema = z.object({
+  id: z.string().nullable(),
+  score: z.number(),
+});
+
+const MacroMatchResponseSchema = z.discriminatedUnion("ok", [
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(true),
+    match: MacroMatchSchema,
   }),
   z.object({
     id: z.string(),
@@ -187,6 +226,14 @@ export function createPythonPolicyClient(
       return {
         sections: rk.sections.map((s) => ({ key: s.key, itemIds: [...s.itemIds] })),
       };
+    },
+    async matchMacro(utterance, entries) {
+      const obj = await raceRequest(core, "macro.match", { utterance, entries }, timeoutMs);
+      if (!obj) return null;
+      const parsed = MacroMatchResponseSchema.safeParse(obj);
+      if (!parsed.success || !parsed.data.ok) return null;
+      // Rebuilt field-by-field (independent of any zod-inference quirk), mirroring resolveFocus.
+      return { id: parsed.data.match.id };
     },
     dispose() { core.dispose(); },
   };

@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**93** actions across **26** gated capabilities, plus the always-allowed group.
+**96** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -210,6 +210,7 @@ These bypass the capability gate entirely — they work even while the system is
 | `list_capabilities` | voice / rest | yes | List every gateable capability name |
 | `list_handoffs` | voice / rest | yes | List handoffs in the active workspace, optionally filtered by state (UNGATED, redacted output) |
 | `list_layouts` | voice / rest | yes | List the saved pane layouts (name, source project, and the panes each would spawn) |
+| `list_macros` | rest | yes | List the saved voice macros (phrase, name, and the ordered per-pane steps each fires) |
 | `list_pending_approvals` | voice | yes | List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count) |
 | `list_prompt_templates` | voice / rest | yes | List the saved prompt templates (name, description, and the {{slot}} parameters each one needs) |
 | `read_handoff` | voice / rest | yes | Read a single handoff (UNGATED, redacted output) |
@@ -325,7 +326,9 @@ These bypass the capability gate entirely — they work even while the system is
 | `add_project_note` | voice | no | Add a durable note to a project |
 | `amend_note` | voice | no | Edit the text of an existing note by its id (get the id from get_project_notes or search_notes) |
 | `create_prompt_template` | voice / rest | no | Save a reusable prompt template |
+| `define_macro` | rest | no | Save a voice macro |
 | `delete_layout` | voice / rest | no | Delete a saved pane layout by its id |
+| `delete_macro` | rest | no | Delete a saved voice macro by its id |
 | `delete_note` | voice | no | Delete a note permanently by its id (get the id from get_project_notes or search_notes) |
 | `delete_prompt_template` | voice / rest | no | Delete a saved prompt template by its id |
 | `rename_pane` | voice / rest | no | Rename a pane |

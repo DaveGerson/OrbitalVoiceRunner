@@ -72,6 +72,7 @@ export class JanusStore {
   private _plans?: import("../types").Plan[];
   private _promptTemplates?: import("../types").PromptTemplate[];
   private _layouts?: import("../types").PaneLayout[];
+  private _macros?: import("../macros").Macro[];
 
   private loadJsonArray<T>(key: string): T[] {
     return this.parseJSON<T[]>(this.getKV(key), []);
@@ -102,12 +103,18 @@ export class JanusStore {
     if (!this._layouts) this._layouts = this.persistingArray("layouts", this.loadJsonArray("layouts"));
     return this._layouts;
   }
+  // Voice macros (8fz.6) — same kv-JSON self-persisting document array as promptTemplates/layouts.
+  get macros(): import("../macros").Macro[] {
+    if (!this._macros) this._macros = this.persistingArray("macros", this.loadJsonArray("macros"));
+    return this._macros;
+  }
 
   /** Flush in-place element edits that the array Proxy can't observe. */
   persistWatchRules(): void { this.setKV("watchRules", JSON.stringify(this.watchRules)); }
   persistPlans(): void { this.setKV("plans", JSON.stringify(this.plans)); }
   persistPromptTemplates(): void { this.setKV("promptTemplates", JSON.stringify(this.promptTemplates)); }
   persistLayouts(): void { this.setKV("layouts", JSON.stringify(this.layouts)); }
+  persistMacros(): void { this.setKV("macros", JSON.stringify(this.macros)); }
 
   /** Append `event` AND run `mutations(db)` in ONE transaction (parallel-write). */
   recordActivity(event: NewEvent, mutations?: (db: Database.Database) => void): void {

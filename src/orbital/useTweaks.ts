@@ -17,6 +17,9 @@ export interface Tweaks {
   danceParty: boolean;
   /** 2K.6: desktop notifications for background-tab events (separate from Voice cues, which gates audio). */
   desktopNotes: boolean;
+  /** 8fz.3: the caption pop-up (last Janus + last User transcript lines). Auto-shown while the
+   *  radio is live; this toggle just governs whether it's allowed to show at all. */
+  captions: boolean;
 }
 
 export const TWEAK_DEFAULTS: Tweaks = {
@@ -28,6 +31,7 @@ export const TWEAK_DEFAULTS: Tweaks = {
   voiceCues: true,
   danceParty: false,
   desktopNotes: true,
+  captions: true,
 };
 
 const LS_KEY = "orbital-tweaks";
@@ -55,6 +59,7 @@ export function mergedDefaults(): Tweaks {
   if (p.has("cues")) d.voiceCues = p.get("cues") === "1";
   if (p.has("dance")) d.danceParty = p.get("dance") === "1";
   if (p.has("notes")) d.desktopNotes = p.get("notes") === "1";
+  if (p.has("captions")) d.captions = p.get("captions") === "1";
   return d;
 }
 
