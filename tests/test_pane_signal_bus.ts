@@ -191,3 +191,99 @@ describe("PaneSignalBus", () => {
     assert.deepStrictEqual(seen, ["p1:running", "p2:idle"]);
   });
 });
+
+// ── z5c slice 1 (spec 2026-07-07 D1, closes bead wsm-e2e-pinned-1d6w) — delivery classes ──────
+// The inject leg (command-outcome context injection) must not inherit the SPOKEN-turn L1
+// cross-kind cooldown: a fast command completing within 5s of its own "running" edge was never
+// injected. Each class runs its OWN debounce window; only `spoken` keeps the cross-kind cooldown.
+describe("PaneSignalBus delivery classes (z5c slice 1)", () => {
+  it("inject class is NOT suppressed by the cross-kind cooldown; spoken pacing is unchanged", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const spoken: string[] = [];
+    const inject: string[] = [];
+    bus.subscribe((s) => spoken.push(s.kind), "spoken");
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true);
+    now += 2000; // inside the 5s cross-kind window — the fast-command case
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "done" }), true,
+      "delivered to the inject lane even though spoken is cooldown-suppressed");
+    assert.deepStrictEqual(spoken, ["running"], "spoken pacing unchanged: idle still suppressed");
+    assert.deepStrictEqual(inject, ["running", "idle"], "the outcome edge reaches the inject leg");
+  });
+
+  it("inject class still collapses identical repeats (per-lane debounce)", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const inject: string[] = [];
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "d" }), true);
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "d" }), false,
+      "identical repeat inside the window collapses on the inject lane too");
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "e" }), true,
+      "4D.2 pass-through for a genuinely new detail applies per lane");
+    assert.deepStrictEqual(inject, ["idle", "idle"]);
+  });
+
+  it("a spoken-only delivery does not consume the inject lane's window (per-lane 4D.2)", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const spoken: string[] = [];
+    bus.subscribe((s) => spoken.push(s.kind), "spoken");
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "x" }), true);
+    now += 10;
+    const inject: string[] = [];
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+    // Identical signal 10ms later: spoken collapses in its OWN window; the inject lane never
+    // heard the first one (zero inject observers then), so its window was NOT consumed.
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "x" }), true);
+    assert.deepStrictEqual(spoken, ["idle"]);
+    assert.deepStrictEqual(inject, ["idle"]);
+  });
+
+  it("an inject-only delivery neither paces nor debounces the spoken lane", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const inject: string[] = [];
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "running" }), true); // inject-only
+    now += 100;
+    const spoken: string[] = [];
+    bus.subscribe((s) => spoken.push(s.kind), "spoken");
+    // Spoken lane: fresh debounce window AND no cross-kind stamp from the inject-only delivery.
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle" }), true);
+    assert.deepStrictEqual(spoken, ["idle"], "inject deliveries never pace the spoken lane");
+    assert.deepStrictEqual(inject, ["running", "idle"]);
+  });
+
+  it("publish returns false only when EVERY lane suppresses", () => {
+    let now = 1000;
+    const bus = new PaneSignalBus(3000, 5000, () => now);
+    const spoken: string[] = [];
+    const inject: string[] = [];
+    bus.subscribe((s) => spoken.push(s.kind), "spoken");
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "d" }), true);
+    now += 100;
+    assert.strictEqual(bus.publish({ paneId: "p1", kind: "idle", detail: "d" }), false,
+      "identical repeat inside both lanes' windows delivers nowhere");
+    assert.deepStrictEqual(spoken, ["idle"]);
+    assert.deepStrictEqual(inject, ["idle"]);
+  });
+
+  it("unsubscribe removes the observer from its own lane only", () => {
+    const bus = new PaneSignalBus(0, 0);
+    const spoken: string[] = [];
+    const inject: string[] = [];
+    const offSpoken = bus.subscribe((s) => spoken.push(s.kind), "spoken");
+    bus.subscribe((s) => inject.push(s.kind), "inject");
+    offSpoken();
+    bus.publish({ paneId: "p1", kind: "idle" });
+    assert.deepStrictEqual(spoken, []);
+    assert.deepStrictEqual(inject, ["idle"]);
+  });
+});
