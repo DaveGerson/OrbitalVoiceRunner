@@ -29,6 +29,7 @@ import type {
   ActionActivityFrame,
 } from "../types";
 import type { StoredNote, StoredHandoff } from "../store/types";
+import { findPostureProfileByName, normalizeGateMap } from "../settingsGatesRoundTrip";
 import { extractSlots } from "../templates";
 import {
   projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
@@ -297,6 +298,12 @@ export interface OrbitalData {
   // 2K.2: per-pane capability-gate override (the Rulebook's pane scope) —
   // PUT /api/projects/:p/panes/:id/capability-gates {capabilityGates}.
   setPaneGates: (projectId: string, paneId: string, gates: Record<string, string>) => void;
+  /** f09.2: open a bounded full-auto window on a pane (POST /api/terminals/:id/autonomy-window). */
+  grantAutonomyWindow: (paneId: string, minutes?: number) => void;
+  /** f09.2: end an active autonomy window on a pane (DELETE /api/terminals/:id/autonomy-window). */
+  endAutonomyWindow: (paneId: string) => void;
+  /** f09.3: apply a named posture profile (the deliberate UI loosen — POST /api/posture). */
+  applyPosture: (name: string) => void;
   refetchNotes: (projectIds: string[]) => void;
   addNote: (projectId: string, text: string, paneId?: string | null) => void;
   /** hwu.3: save a Kitchen Radio transcript bubble as a durable, server-classified project note. */
@@ -1783,6 +1790,56 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { showToast("That didn't save, Chef — try again.", "warn"); }
   }, [refetchLedger, refetchTerminals, showToast, mockClientOnly]);
 
+  // ── f09.2: timed autonomy windows (the Rulebook's per-pane grant/end) ────
+  // POST/DELETE /api/terminals/:pane_id/autonomy-window. A grant is the deliberate operator loosen
+  // (immediate server-side, sibling of set_pane_gates); an end reverts it. The server broadcasts
+  // terminals_updated on both, so the countdown badge repaints from the refetched posture truth.
+  const grantAutonomyWindow = useCallback(async (paneId: string, minutes?: number) => {
+    if (mockClientOnly()) { showToast("Full-auto window opened for that station."); return; }
+    try {
+      const res = await apiFetch(`/api/terminals/${paneId}/autonomy-window`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(minutes !== undefined ? { minutes } : {}),
+      });
+      if (!res.ok) { showToast("Couldn't open that window, Chef — try again.", "warn"); return; }
+      showToast("Full-auto window opened for that station.");
+      if (!isMockModeRef.current) refetchTerminals();
+    } catch { showToast("Couldn't open that window, Chef — try again.", "warn"); }
+  }, [refetchTerminals, showToast, mockClientOnly]);
+
+  const endAutonomyWindow = useCallback(async (paneId: string) => {
+    if (mockClientOnly()) { showToast("Window closed — back to asking first."); return; }
+    try {
+      const res = await apiFetch(`/api/terminals/${paneId}/autonomy-window`, { method: "DELETE" });
+      if (!res.ok) { showToast("Couldn't close that window, Chef — try again.", "warn"); return; }
+      showToast("Window closed — back to asking first.");
+      if (!isMockModeRef.current) refetchTerminals();
+    } catch { showToast("Couldn't close that window, Chef — try again.", "warn"); }
+  }, [refetchTerminals, showToast, mockClientOnly]);
+
+  // ── f09.3: apply a named posture profile (the deliberate operator-UI loosen — applies directly,
+  // POST /api/posture). Optimistically swaps the global matrix so the Rulebook + chips repaint now;
+  // the server broadcasts settings_updated + terminals so real deployments reconcile to server truth.
+  const applyPosture = useCallback(async (name: string) => {
+    const profile = findPostureProfileByName(name, settings?.advanced?.postureProfiles);
+    if (!profile || !settings) return;
+    const gates = normalizeGateMap(profile.capabilityGates);
+    const nextAdvanced = { ...settings.advanced, capabilityGates: gates,
+      ...(profile.globalPermissionsMode ? { globalPermissionsMode: profile.globalPermissionsMode } : {}) };
+    setSettings({ ...settings, advanced: nextAdvanced }); // optimistic → matrix + chips flip
+    if (profile.globalPermissionsMode) setGlobalPermissionsMode(profile.globalPermissionsMode);
+    showToast(`Posture set — ${profile.name}.`);
+    if (mockClientOnly()) return;
+    try {
+      const res = await apiFetch("/api/posture", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: profile.name }),
+      });
+      if (!res.ok) { showToast("That posture didn't stick, Chef — try again.", "warn"); refetchSettings(); return; }
+      refetchSettings(); refetchTerminals();
+    } catch { showToast("That posture didn't stick, Chef — try again.", "warn"); refetchSettings(); }
+  }, [settings, showToast, refetchSettings, refetchTerminals, mockClientOnly]);
+
   // ── The Pass: per-project notes (the expediter's tickets) ───────────────
   // Notes are the real backend for The Pass (there is no beads REST surface — BeadsExplorer stays a
   // disabled placeholder). refetchNotes merges the id-bearing feed across the given projects.
@@ -2033,6 +2090,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
     createPane, createProject, updateProjectSummary, restartPane,
     stopPane, renamePane, clearExited, restoreArchived, deleteArchived, refetchArchive, setPaneGates,
+    grantAutonomyWindow, endAutonomyWindow, applyPosture,
     executePlan, deletePlan,
     createTemplate, updateTemplate, deleteTemplate, applyTemplate,
     saveLayout, applyLayout, deleteLayout, refetchTemplates, refetchLayouts,

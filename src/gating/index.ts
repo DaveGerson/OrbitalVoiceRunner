@@ -36,6 +36,7 @@ import {
   decideSweepAction,
   renderResumptionLine,
   applyFrozenShortCircuit,
+  applyAutonomyWindow,
   APPROVAL_GRACE_MS,
   type EffectiveMode,
   type ResolveMode,
@@ -53,8 +54,16 @@ import {
   type EffectiveMode as GateSurfaceMode,
 } from "../gateSurface";
 import { MAX_DEFERRALS } from "../approvalIntent";
-import type { GateValue, CapabilityGate, PaneMeta } from "../types";
+import type { GateValue, CapabilityGate, PaneMeta, AutonomyWindow } from "../types";
 import { findPaneOwningProject } from "../paneOwnership";
+import {
+  AutonomyWindowStore,
+  clampAutonomyMinutes,
+  deserializeAutonomyWindows,
+  sanitizeAutonomyCapabilities,
+  AUTONOMY_WARN_LEAD_MS,
+  AUTONOMY_WINDOWS_KV,
+} from "./autonomyWindows";
 import type { JanusStore } from "../store/sqliteStore";
 import type { AnnouncementBus } from "../announcementBus";
 import type { CoreState } from "../core/coreState";
@@ -109,8 +118,14 @@ export interface Gating {
     requestedMode?: string
   ) => { disposition: "run" } | { disposition: "forbidden" } | { disposition: "deferred"; actionId: string; summary: string };
   effectiveGatesForPane: (paneId: string) => Record<CapabilityGate, GateValue>;
-  posturePayloadForPane: (paneId: string) => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> };
-  allPanePostures: () => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> }[];
+  posturePayloadForPane: (paneId: string) => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord>; autonomy_until?: number };
+  /** f09.2: open (or replace) a bounded autonomy window on a pane — persists, audits, broadcasts. */
+  grantAutonomyWindow: (paneId: string, minutes: number, capabilities?: CapabilityGate[]) => AutonomyWindow;
+  /** f09.2: end (revert) a pane's autonomy window immediately (tighten). Returns the removed record or null. */
+  endAutonomyWindow: (paneId: string) => AutonomyWindow | null;
+  /** f09.2: the in-memory window state surface (exported for f09.3 posture-profile layering + tests). */
+  autonomyWindows: AutonomyWindowStore;
+  allPanePostures: () => { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord>; autonomy_until?: number }[];
   broadcastTerminalsUpdated: () => void;
   runningPaneIds: () => string[];
   stopAll: (kill: boolean) => Promise<string[]>;
@@ -196,10 +211,24 @@ export function createGating(deps: GatingDeps): Gating {
   const pendingActions = new PendingActionStore(store);
   let pendingActionSeq = 0;
 
+  // f09.2 (timed autonomy windows): the in-memory window state. It ALWAYS starts EMPTY — a window
+  // NEVER survives a restart into live resolution (operator decision 2026-07-06, fail-closed). The
+  // boot path below revokes any persisted rows (audit + clear KV); nothing here rehydrates as live.
+  const autonomyWindows = new AutonomyWindowStore();
+  const persistAutonomyWindows = (): void => {
+    if (!store) return;
+    try { store.setKV(AUTONOMY_WINDOWS_KV, autonomyWindows.serialize()); } catch { /* best-effort */ }
+  };
+
   // kzt: rebuild deferred-action survivors from durable intent. Extracted to hydrateDeferredActions()
   // (behavior-preserving) but invoked HERE, in the exact original order: AFTER manager + pendingActions
   // are built and BEFORE the first WS connection / sweep tick. See the helper for the full rationale.
   hydrateDeferredActions();
+  // f09.2: revoke ANY persisted autonomy windows at boot (operator decision 2026-07-06, fail-closed).
+  // Runs in the SAME boot phase as the deferred-action hydration — a persisted window is enumerated
+  // ONLY to write a revoke-audit row + clear the KV; it is NEVER loaded into the live store, so no
+  // window can survive a restart un-reverted (the bead's hard requirement, satisfied trivially).
+  revokePersistedAutonomyWindows();
   // R1/R2: read-only first-token allowlist for kind:"shell" (operator-overridable via env).
   const shellAllowlist = loadShellAllowlist();
   // WS-E.3 (BUG-019): TTL for an unresolved approval before it auto-rejects.
@@ -275,6 +304,26 @@ export function createGating(deps: GatingDeps): Gating {
         payload: { capability: row.capability, action: "rehydrated", action_id: row.id },
       });
     }
+  }
+
+  // f09.2: at boot, REVOKE every persisted autonomy window (operator decision 2026-07-06). Panes boot
+  // INERT and a respawned pane is a new trust context, so an autonomy grant made against the prior
+  // process must not silently outlive it. We enumerate the persisted rows ONLY to leave an audit trail
+  // ("REVOKED … at boot"), then clear the KV. The in-memory store is untouched (already empty), so
+  // live resolution sees ZERO windows — a window can never survive a restart un-reverted. Best-effort:
+  // a store read/clear fault is swallowed (the empty in-memory store is the fail-closed truth anyway).
+  function revokePersistedAutonomyWindows(): void {
+    if (!store) return;
+    let raw: string | null = null;
+    try { raw = store.getKV(AUTONOMY_WINDOWS_KV); } catch { return; }
+    for (const w of deserializeAutonomyWindows(raw)) {
+      recordActivitySafe({
+        type: "permission_changed", project_id: "default_project", pane_id: w.pane_id,
+        summary: `REVOKED autonomy window on pane ${w.pane_id} at boot (fail-closed — re-grant to reopen)`,
+        payload: { action: "autonomy_window_revoked_boot", window_id: w.id, capabilities: w.capabilities },
+      });
+    }
+    try { store.setKV(AUTONOMY_WINDOWS_KV, "[]"); } catch { /* best-effort */ }
   }
 
   // ── 4D.1: the "while you were away" window ──────────────────────────────────────────────────
@@ -486,9 +535,16 @@ export function createGating(deps: GatingDeps): Gating {
     }
     const isActivePane = !!paneId && coreState.activePaneId === paneId;
     const resolved = resolveCapabilityGateWithContext(paneGate, ownCapabilityGate(globalGates, capability), capability, isActivePane);
+    // f09.2 (timed autonomy windows): a LIVE window loosens Ask→Auto for its capabilities. Liveness is
+    // a LAZY `now < expires_at` check inside this sync path — an expired window is inert IMMEDIATELY,
+    // even if the 30s sweep has not yet removed it (a dead sweep timer can never keep a pane hot). The
+    // overlay NEVER loosens an explicit Off (applyAutonomyWindow's veto), and it is applied BEFORE the
+    // frozen short-circuit below so a STOP-ALL freeze ALWAYS wins over a window.
+    const windowLive = !!paneId && autonomyWindows.isCapabilityLive(paneId, capability, Date.now());
+    const windowed = applyAutonomyWindow(resolved, windowLive);
     // STOP-ALL Stage-1: the ONE place the `frozen` short-circuit is applied. While frozen every
     // capability resolves Off; the matrix above is untouched, so Release re-exposes it exactly.
-    return applyFrozenShortCircuit(coreState.frozen, resolved);
+    return applyFrozenShortCircuit(coreState.frozen, windowed);
   }
 
   // Lightweight capability guard for mutating handlers that do NOT write to a pane PTY
@@ -612,16 +668,26 @@ export function createGating(deps: GatingDeps): Gating {
     const paneGates = findPaneOwningProject(manager, paneId)?.pane.capabilityGates;
     const isActivePane = coreState.activePaneId === paneId;
     const base = deriveEffectiveGates(paneGates, globalGates, isActivePane);
-    if (!coreState.frozen) return base;
-    // Frozen overlay — mirror the resolver's single-choke-point short-circuit on the surface.
+    // f09.2 + frozen overlay, in the SAME order the resolver applies them (window BEFORE frozen), so the
+    // chip surface stays byte-for-byte in lockstep with effectiveCapabilityGateFor. With no live window
+    // and no freeze this is the identity of `base` (behavior-preserving for the common case).
+    const now = Date.now();
     const out = {} as Record<CapabilityGate, GateValue>;
-    for (const cap of ALL_CAPABILITIES) out[cap] = applyFrozenShortCircuit(true, base[cap]);
+    for (const cap of ALL_CAPABILITIES) {
+      const windowed = applyAutonomyWindow(base[cap], autonomyWindows.isCapabilityLive(paneId, cap, now));
+      out[cap] = applyFrozenShortCircuit(coreState.frozen, windowed);
+    }
     return out;
   }
-  function posturePayloadForPane(paneId: string): { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord> } {
+  function posturePayloadForPane(paneId: string): { id: string; effective_gates: Record<CapabilityGate, GateValue>; posture: ReturnType<typeof derivePostureWord>; autonomy_until?: number } {
     const effective = effectiveGatesForPane(paneId);
     const mode = effectiveModeFor(paneId) as GateSurfaceMode;
-    return { id: paneId, effective_gates: effective, posture: derivePostureWord(effective, mode) };
+    // f09.2: surface the live window's expiry so the pane chip can render a countdown badge.
+    const live = autonomyWindows.liveWindowFor(paneId, Date.now());
+    return {
+      id: paneId, effective_gates: effective, posture: derivePostureWord(effective, mode),
+      ...(live ? { autonomy_until: live.expires_at } : {}),
+    };
   }
   function allPanePostures() {
     return Object.keys(manager.terminals).map((id) => posturePayloadForPane(id));
@@ -630,6 +696,78 @@ export function createGating(deps: GatingDeps): Gating {
   // carrying the per-pane posture payload (chips repaint from this without a /api/terminals refetch).
   function broadcastTerminalsUpdated() {
     broadcast({ type: "terminals_updated", postures: allPanePostures() });
+  }
+
+  // ── f09.2: timed autonomy window mutators + sweep ──────────────────────────────────────────────
+  // grant/end are the STATE-CHANGING seam the grant_autonomy_window / end_autonomy_window action defs
+  // reach through the ActionContext. grant is a LOOSEN (the def routes it through the operator Ask
+  // path via gateOrDefer before this ever runs); end is a TIGHTEN (applied immediately). Both persist
+  // to settings_kv (so the boot-revoke has something to audit), record an audit row, and repaint the
+  // chips. The persist is best-effort; the in-memory store is the authoritative truth for resolution.
+  function grantAutonomyWindow(paneId: string, minutes: number, capabilities?: CapabilityGate[]): AutonomyWindow {
+    const now = Date.now();
+    const mins = clampAutonomyMinutes(minutes);
+    // Authoritative safety net (Wave-7 blocker): a window may cover ONLY the productive-write
+    // allowlist — never a META (set_capability_gate) or DESTRUCTIVE (delete_pane/execute_plan)
+    // capability. This is the single choke point BOTH the voice def and the ungated REST surface
+    // route through, so no caller — even one that bypasses gateOrDefer — can widen a window.
+    const caps = sanitizeAutonomyCapabilities(capabilities);
+    const w = autonomyWindows.grant(paneId, caps, now, mins * 60_000);
+    persistAutonomyWindows();
+    recordActivitySafe({
+      type: "permission_changed", pane_id: paneId,
+      summary: `GRANTED autonomy window on pane ${paneId} (${mins} min, until ${new Date(w.expires_at).toISOString()})`,
+      payload: { action: "autonomy_window_granted", window_id: w.id, expires_at: w.expires_at, capabilities: caps },
+    });
+    broadcastTerminalsUpdated();
+    return w;
+  }
+  function endAutonomyWindow(paneId: string): AutonomyWindow | null {
+    const removed = autonomyWindows.end(paneId);
+    if (!removed) return null;
+    persistAutonomyWindows();
+    recordActivitySafe({
+      type: "permission_changed", pane_id: paneId,
+      summary: `ENDED autonomy window on pane ${paneId} (operator revert)`,
+      payload: { action: "autonomy_window_ended", window_id: removed.id },
+    });
+    broadcastTerminalsUpdated();
+    return removed;
+  }
+
+  // The sweep leg (called from sweepExpiredApprovalsUnsafe, inside the non-fatal try/catch): for each
+  // window, either fire the ONE spoken T-minus warning (~2 min out) or expire it. Expiry is enforced
+  // HERE (remove + persist + audit + broadcast) AND lazily in resolution — so a swallowed sweep
+  // exception can never leave a pane hot past its clock. The warning goes through the SAME injected
+  // narration seam the approval last-call uses, redacted before it leaves the process.
+  function warnAutonomyWindow(w: AutonomyWindow, now: number): void {
+    const session = coreState.activeLiveSession;
+    if (session === null) return; // cannot speak a last-call into no session; retry next tick.
+    const mins = Math.max(1, Math.round((w.expires_at - now) / 60_000));
+    const line = redactSecrets(`Heads up — the autonomy window on pane ${w.pane_id} ends in about ${mins} minute${mins === 1 ? "" : "s"}.`);
+    if (pushApprovalNarration(session, line) !== false) {
+      w.warned_at = now; // stamp only on a HEARD warning so it fires exactly once.
+      persistAutonomyWindows();
+    }
+  }
+  function expireAutonomyWindow(w: AutonomyWindow, now: number): void {
+    autonomyWindows.end(w.pane_id);
+    persistAutonomyWindows();
+    recordActivitySafe({
+      type: "permission_changed", pane_id: w.pane_id,
+      summary: `EXPIRED autonomy window on pane ${w.pane_id} — reverted to the prior posture`,
+      payload: { action: "autonomy_window_expired", window_id: w.id, capabilities: w.capabilities },
+    });
+    if (coreState.activeLiveSession) {
+      pushApprovalNarration(coreState.activeLiveSession, redactSecrets(`The autonomy window on pane ${w.pane_id} has ended — back to asking first.`));
+    }
+    broadcastTerminalsUpdated();
+  }
+  function sweepAutonomyWindows(now: number): void {
+    for (const w of autonomyWindows.all()) {
+      if (now >= w.expires_at) expireAutonomyWindow(w, now);
+      else if (!w.warned_at && now >= w.expires_at - AUTONOMY_WARN_LEAD_MS) warnAutonomyWindow(w, now);
+    }
   }
 
   // ── TWO-STAGE EMERGENCY STOP-ALL (bead 8sq, spec §2.C / §3) ───────────────────────────────────
@@ -1134,6 +1272,9 @@ export function createGating(deps: GatingDeps): Gating {
     for (const act of pendingActions.expired(APPROVAL_TTL_MS, now)) {
       sweepActionItem(act, now, actionsConnected);
     }
+    // f09.2: the autonomy-window leg (warn ~2 min out, then auto-revert). Inside the same non-fatal
+    // sweep guard as the approval/action legs — a window throw can never take down the tick.
+    sweepAutonomyWindows(now);
   }
 
   /**
@@ -1190,6 +1331,9 @@ export function createGating(deps: GatingDeps): Gating {
     effectiveGatesForPane,
     posturePayloadForPane,
     allPanePostures,
+    grantAutonomyWindow,
+    endAutonomyWindow,
+    autonomyWindows,
     broadcastTerminalsUpdated,
     runningPaneIds,
     stopAll,

@@ -87,6 +87,45 @@ export const DEFAULT_CAPABILITY_GATES: CapabilityGateMap = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Posture profiles (f09.3) — named bundles of the GLOBAL capability-gate matrix
+// (+ optional globalPermissionsMode) applied in one BoH tap or one voice phrase via
+// apply_posture. A profile is pure DATA — applying it is a global-map REPLACEMENT with
+// ZERO new gating semantics (it compiles down to the same settings.advanced.capabilityGates
+// write set_capability_gate performs). Per operator decision (2026-07-06) applying a profile
+// touches the GLOBAL layer ONLY — per-pane overrides persist untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+export interface PostureProfile {
+  /** Operator-facing name (seeds: "Heads-down" / "Demo" / "Locked"). Matched case/punct-insensitively. */
+  name: string;
+  /** Optional global autonomy mode to set alongside the matrix. Seeds leave this unset (matrix IS the posture). */
+  globalPermissionsMode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only" | "Inherit";
+  /** The GLOBAL capability-gate map this profile installs (replaces settings.advanced.capabilityGates). */
+  capabilityGates: CapabilityGateMap;
+}
+
+/** Build a full matrix (every DEFAULT capability) pinned to one gate value — the Demo/Locked seeds. */
+function allCapabilityGatesTo(v: GateValue): CapabilityGateMap {
+  const out: CapabilityGateMap = {};
+  for (const k of Object.keys(DEFAULT_CAPABILITY_GATES)) (out as Record<string, GateValue>)[k] = v;
+  return out;
+}
+
+// The three SEED profiles (operator decision 2026-07-06: seed-only + save-current-as + delete; the
+// matrix editor IS the profile editor — no dedicated editor UI). Each carries a FULL matrix so an
+// applied posture is deterministic (an omitted capability would resolve to the permissive "Auto"
+// fallback, which the voice loosen-check would read as a loosen — full maps avoid that surprise).
+//   - Heads-down: the director is heads-down on their own work — let agents cook. Productive writes
+//     loosen to Auto; everything else keeps its safe default. LOOSENS ⇒ defers on voice.
+//   - Demo: predictable in front of an audience — nothing fires on its own; every capability asks
+//     first. TIGHTENS-or-equal vs the default matrix ⇒ instant on voice.
+//   - Locked: not in my kitchen — every gated capability is Off. Pure tighten ⇒ instant on voice.
+export const SEED_POSTURE_PROFILES: readonly PostureProfile[] = [
+  { name: "Heads-down", capabilityGates: { ...DEFAULT_CAPABILITY_GATES, write_to_pane: "Auto", deliver_handoff: "Auto" } },
+  { name: "Demo", capabilityGates: allCapabilityGatesTo("Ask") },
+  { name: "Locked", capabilityGates: allCapabilityGatesTo("Off") },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Handoff artifact (design §4). A first-class, persisted artifact whose only
 // gated transition is staged → delivered (rides deliver_handoff → write_to_pane).
 // `composed_prompt` is delivered VERBATIM/unredacted; `source_context` IS redacted.
@@ -143,6 +182,27 @@ export interface Terminal {
   // that omit them degrade gracefully (no chip).
   effective_gates?: CapabilityGateMap;
   posture?: "OPEN" | "GUARDED" | "LOCKED";
+  // f09.2 (timed autonomy windows): epoch-ms expiry of a LIVE autonomy window on this pane, when one
+  // is open. Server truth (posturePayloadForPane); the pane chip renders a countdown badge from it.
+  // Absent ⇒ no live window (the normal ask-first posture). Optional so older payloads/mocks omit it.
+  autonomy_until?: number;
+}
+
+/**
+ * f09.2 (timed autonomy windows): a bounded, auto-reverting grant of FULL AUTO on ONE pane's
+ * productive capabilities. It LOOSENS the safety matrix (Ask→Auto for `capabilities`) only while
+ * live (`now < expires_at`), NEVER loosens an explicit Off or a STOP-ALL freeze, and NEVER survives
+ * a server restart (revoked at boot, fail-closed). One live window per pane (a new grant replaces).
+ */
+export interface AutonomyWindow {
+  id: string;
+  pane_id: string;
+  /** The capabilities the window loosens Ask→Auto (default: the productive writes). */
+  capabilities: CapabilityGate[];
+  granted_at: number;
+  expires_at: number;
+  /** Set once the spoken T-minus last-call warning has been narrated (so it fires exactly once). */
+  warned_at?: number;
 }
 
 export interface PendingCommand {
@@ -357,6 +417,11 @@ export interface SystemSettings {
     historyMaxOutputLength?: number;
     // Global default capability-gate matrix (design §3/§7). Absent/empty ⇒ all "Auto".
     capabilityGates?: CapabilityGateMap;
+    // f09.3: operator-saved posture profiles (the three seeds live in SEED_POSTURE_PROFILES as
+    // constants; this array holds ONLY the operator's "save current as profile" additions). MUST
+    // survive the SettingsDialog save/load round-trip (see preservePostureProfiles) — dropping it is
+    // the same silent-erase data-loss class the capabilityGates round-trip guard pins.
+    postureProfiles?: PostureProfile[];
     // Janus Memory Synthesis P0a (advanced, all optional/additive). Tune the in-process
     // anti-rot brief: total char budget (~4 chars/token), and the decaying breadcrumb ring's
     // cap + max age. Absent ⇒ DEFAULT_MEMORY_CONFIG (4800 / 12 / 900000ms). See src/memory/types.ts.

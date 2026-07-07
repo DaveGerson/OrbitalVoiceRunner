@@ -15,7 +15,7 @@
 
 import type { z } from "zod";
 import type { OrchestratorManager } from "../terminal";
-import type { CapabilityGate, GateValue } from "../types";
+import type { AutonomyWindow, CapabilityGate, GateValue } from "../types";
 import type {
   ApprovalKind,
   PendingApprovalStore,
@@ -403,7 +403,16 @@ export interface ActionContext {
     id: string;
     effective_gates: Record<CapabilityGate, GateValue>;
     posture: unknown;
+    autonomy_until?: number;
   };
+
+  // ── f09.2: timed autonomy windows (gating seam) ───────────────────────────────────────────────
+  /** Open (or replace) a bounded autonomy window on a pane — persists, audits, broadcasts. The def
+   *  routes the LOOSEN through gateOrDefer first; this runs only once the operator confirms. Optional:
+   *  absent on hand-built test contexts (the def null-chains and reports it is unavailable). */
+  grantAutonomyWindow?: (paneId: string, minutes: number, capabilities?: CapabilityGate[]) => AutonomyWindow;
+  /** End (revert) a pane's autonomy window immediately (tighten). Returns the removed record or null. */
+  endAutonomyWindow?: (paneId: string) => AutonomyWindow | null;
 
   // ── Voice-UX wave 3 (optional — voice lane only) ────────────────────────────────────────────
   /** The optional "policies" Python daemon facade (focus resolution + SITREP ranking). Wired on the

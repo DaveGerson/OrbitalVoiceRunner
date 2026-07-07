@@ -15,9 +15,12 @@ import {
   normalizeGateMap,
   preservePresetGates,
   withAdvancedGates,
+  preservePostureProfiles,
+  normalizePostureProfiles,
 } from "../src/settingsGatesRoundTrip";
 import { parsePresetsSafe as serverParsePresetsSafe } from "../src/terminal";
-import type { CliPreset } from "../src/types";
+import { SEED_POSTURE_PROFILES } from "../src/types";
+import type { CliPreset, PostureProfile } from "../src/types";
 
 describe("settings capabilityGates round-trip (drop-on-save regression)", () => {
   describe("normalizeGateMap", () => {
@@ -79,6 +82,43 @@ describe("settings capabilityGates round-trip (drop-on-save regression)", () => 
     it("omits capabilityGates entirely when there is no matrix (back-compat: absent => all Auto)", () => {
       const out = withAdvancedGates({ globalPermissionsMode: "Inherit" }, undefined);
       assert.ok(!("capabilityGates" in out), "no empty capabilityGates key injected");
+    });
+  });
+
+  // f09.3: the SAME silent-erase class for the new advanced.postureProfiles field. The landmine is
+  // identical — getCompiledSettings rebuilds `advanced` from a literal that omits postureProfiles, so
+  // without preservePostureProfiles every save would delete the operator's saved profiles.
+  describe("preservePostureProfiles (f09.3 posture profiles round-trip)", () => {
+    it("re-attaches operator-saved profiles to a freshly-built advanced literal", () => {
+      const advanced = { globalPermissionsMode: "Inherit", capabilityGates: { write_to_pane: "Off" } };
+      const profiles: PostureProfile[] = [{ name: "Night shift", capabilityGates: { write_to_pane: "Off", close_pane: "Off" } }];
+      const out = preservePostureProfiles(advanced, profiles);
+      assert.deepStrictEqual(out.postureProfiles, profiles, "profiles carried through the rebuild");
+      // A save with BOTH present must erase NEITHER (the landmine guard extended).
+      assert.deepStrictEqual(out.capabilityGates, { write_to_pane: "Off" }, "capabilityGates untouched by the profiles carry");
+    });
+
+    it("preserves the three seeds PLUS a custom through the round-trip when all are present", () => {
+      const withSeeds: PostureProfile[] = [...SEED_POSTURE_PROFILES, { name: "Custom", capabilityGates: { write_to_pane: "Auto" } }];
+      const out = preservePostureProfiles({ globalPermissionsMode: "Inherit" }, withSeeds);
+      assert.strictEqual(out.postureProfiles?.length, 4, "seeds + custom all survive");
+      assert.ok(out.postureProfiles?.some((p) => p.name === "Custom"));
+      assert.ok(out.postureProfiles?.some((p) => p.name === "Locked"));
+    });
+
+    it("omits postureProfiles entirely when there are none (no empty [] injected)", () => {
+      const out = preservePostureProfiles({ globalPermissionsMode: "Inherit" }, undefined);
+      assert.ok(!("postureProfiles" in out), "no empty postureProfiles key injected");
+      assert.ok(!("postureProfiles" in preservePostureProfiles({ x: 1 }, [])), "empty array normalizes to omission");
+    });
+
+    it("normalizePostureProfiles keeps a valid globalPermissionsMode and drops an invalid one", () => {
+      const out = normalizePostureProfiles([
+        { name: "A", capabilityGates: { write_to_pane: "Off" }, globalPermissionsMode: "Read-Only" },
+        { name: "B", capabilityGates: {}, globalPermissionsMode: "Nonsense" },
+      ]);
+      assert.strictEqual(out?.[0].globalPermissionsMode, "Read-Only");
+      assert.strictEqual(out?.[1].globalPermissionsMode, undefined, "invalid mode dropped");
     });
   });
 

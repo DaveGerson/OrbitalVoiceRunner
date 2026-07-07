@@ -237,6 +237,23 @@ export function resolveCapabilityGateWithContext(
 }
 
 /**
+ * f09.2 (timed autonomy windows): overlay a LIVE autonomy window onto an already-resolved gate.
+ * A window is the FIRST thing that ever LOOSENS the matrix at runtime, so the direction is strictly
+ * bounded here:
+ *   - It loosens ONLY "Ask" → "Auto" (act freely on productive work for the window's lifetime).
+ *   - It NEVER loosens an explicit "Off" (the veto) — Off stays Off. This is the safety guarantee.
+ *   - It NEVER tightens "Auto".
+ *   - `windowLive === false` (no window, or an expired one) is a pure pass-through.
+ * Applied in effectiveCapabilityGateFor AFTER the override→spotlight→global resolution but BEFORE the
+ * frozen short-circuit (applyFrozenShortCircuit) — so a STOP-ALL freeze ALWAYS wins over a window.
+ * Pure + unit-testable; the caller decides liveness (a lazy `now < expires_at` check inside the gate).
+ */
+export function applyAutonomyWindow(resolved: GateValue, windowLive: boolean): GateValue {
+  if (!windowLive) return resolved;
+  return resolved === "Ask" ? "Auto" : resolved;
+}
+
+/**
  * Staged-handoff staleness (director posture 2026-06-01: "friction is worse" — a staged draft
  * NEVER auto-expires/deletes; it is merely FLAGGED stale so the operator can notice and act).
  * Default threshold 15 min. Pure; the caller derives this at read time from staged_at.

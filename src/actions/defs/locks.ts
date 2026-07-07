@@ -19,9 +19,13 @@
 
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
-import type { CapabilityGate, CapabilityGateMap, GateValue } from "../../types";
+import type { CapabilityGate, CapabilityGateMap, GateValue, PostureProfile } from "../../types";
+import { DEFAULT_CAPABILITY_GATES } from "../../types";
 import { isLoosening } from "../../pendingApprovals";
 import { findPaneOwningProject } from "../../paneOwnership";
+import { clampAutonomyMinutes, sanitizeAutonomyCapabilities } from "../../gating/autonomyWindows";
+import { profileLoosens } from "../../gating/postureProfiles";
+import { findPostureProfileByName, normalizeGateMap } from "../../settingsGatesRoundTrip";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_global_permissions — server.ts:2887 (GATED, durable Ask-defer via gateOrDefer)
@@ -422,6 +426,109 @@ function applyCapabilityGate(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// grant_autonomy_window / end_autonomy_window — f09.2 timed autonomy windows.
+//
+// A window is the FIRST thing that ever LOOSENS the safety matrix at runtime, so the two verbs sit
+// on opposite sides of the directional contract this file already enforces for set_capability_gate:
+//   grant = LOOSEN → routes through ctx.gateOrDefer (capability set_capability_gate). It NEVER applies
+//     silently: on Ask it defers to the operator confirm/spoken path; on Off it is refused; only on
+//     Auto does it open immediately. The gate/frozen/Off invariants are enforced downstream in
+//     effectiveCapabilityGateFor — a window can never loosen an explicit Off or beat a STOP-ALL freeze.
+//   end   = TIGHTEN → applies immediately (ctx.endAutonomyWindow), no gateOrDefer, mirroring the
+//     always-allowed de-escalation direction (like the STOP-ALL brake / a voice gate-tighten).
+// Both ride the EXISTING set_capability_gate capability row (no new matrix row — deriveCapabilities
+// de-dupes on def.capability, exactly as promote_pane_mode rides set_pane_permissions).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GrantAutonomyWindowParams = z.object({
+  pane_id: z.string(),
+  /** Requested minutes; clamped server-side to [1, 120] (default 20 when omitted). */
+  minutes: z.number().optional(),
+  /** Optional capability subset; defaults to the pane's productive writes. */
+  capabilities: z.array(z.string()).optional(),
+});
+
+export const grantAutonomyWindow: ActionDef<typeof GrantAutonomyWindowParams> = {
+  name: "grant_autonomy_window",
+  description:
+    "Grant a bounded full-auto window (default 20 minutes, hard-capped at 120) on ONE pane's productive work, so an agent runs unattended and the window auto-reverts with a spoken last-call warning. This LOOSENS safety, so it needs your confirmation; it never overrides an 'Off' gate or a STOP-ALL freeze, and never survives a server restart.",
+  params: GrantAutonomyWindowParams,
+  // Rides the meta lock-change row (no new matrix row); gated via gateOrDefer just like the other
+  // loosening lock-changes, so a misheard grant defers to a deliberate operator confirm.
+  capability: "set_capability_gate",
+  readOnly: false,
+  // voice + rest. VOICE is the dangerous misheard-loosen surface → defers via gateOrDefer. REST is the
+  // DELIBERATE operator-UI loosening surface (the sibling of the ungated set_pane_gates) → applies now;
+  // the operator physically clicked the Back-of-House grant button. Either way the window can never
+  // loosen an explicit Off or beat a STOP-ALL freeze (enforced downstream in effectiveCapabilityGateFor).
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/terminals/:pane_id/autonomy-window" },
+  handler: (args, ctx): ActionResult => {
+    const { pane_id, minutes, capabilities } = args;
+    const mins = clampAutonomyMinutes(minutes);
+    // Sanitize to the productive-write allowlist BEFORE the summary + forward (Wave-7 blocker): a
+    // window can never cover META (set_capability_gate) or DESTRUCTIVE (delete_pane/execute_plan)
+    // capabilities, so a granted window can never silently self-renew or widen the matrix. gating's
+    // grantAutonomyWindow re-sanitizes (idempotent) as the authoritative safety net.
+    const caps = sanitizeAutonomyCapabilities(capabilities);
+    // Disclose BOTH the duration AND the exact capability set in the operator-confirm summary — the
+    // deferral must never conceal what the window would loosen.
+    const summary = `Grant a ${mins}-minute autonomy window on pane ${pane_id} for ${caps.join(", ")}`;
+    // The (possibly deferred) side effect: opens the window (persist + audit + broadcast live in gating).
+    const applyWindow = (): string => {
+      if (!ctx.grantAutonomyWindow) return `Autonomy windows are not available in this context.`;
+      ctx.grantAutonomyWindow(pane_id, mins, caps);
+      return `Autonomy window granted on pane ${pane_id} for ${mins} minutes — full auto on its productive work until it auto-reverts.`;
+    };
+    // REST = deliberate UI loosen → immediate (sibling of ungated set_pane_gates). No gateOrDefer.
+    if (ctx.surface === "rest") {
+      return { kind: "ok", output: applyWindow() };
+    }
+    const g = ctx.gateOrDefer(
+      "set_capability_gate",
+      pane_id,
+      summary,
+      applyWindow,
+      // NB: no PLM3 versionStamp is spread in. A window is a runtime-only loosen that MUST NOT survive
+      // a restart (operator decision) — omitting the stamp makes a not-yet-confirmed deferral quarantine
+      // (drop) at boot rather than rebuild, so it can never re-open a window against a stale process.
+      { paneId: pane_id, minutes: mins, capabilities: caps },
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'set_capability_gate' capability is gated Off; granting an autonomy window is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' loosens safety, so it needs your confirmation. I've queued it — confirm to open the window.` };
+    }
+    return { kind: "ok", output: applyWindow() };
+  },
+};
+
+const EndAutonomyWindowParams = z.object({ pane_id: z.string() });
+
+export const endAutonomyWindow: ActionDef<typeof EndAutonomyWindowParams> = {
+  name: "end_autonomy_window",
+  description:
+    "End an active autonomy window on a pane right now, reverting it to the normal ask-first posture. Tightening safety, so it applies immediately.",
+  params: EndAutonomyWindowParams,
+  capability: "set_capability_gate",
+  readOnly: false,
+  // voice + rest — a TIGHTEN (de-escalation), so it applies immediately on BOTH surfaces.
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "delete", path: "/api/terminals/:pane_id/autonomy-window" },
+  handler: (args, ctx): ActionResult => {
+    const { pane_id } = args;
+    // TIGHTEN → immediate. No gateOrDefer: de-escalation is always allowed (mirrors the STOP-ALL brake
+    // and voice gate-tighten). ctx.endAutonomyWindow persists + audits + broadcasts.
+    const removed = ctx.endAutonomyWindow?.(pane_id) ?? null;
+    if (!removed) {
+      return { kind: "ok", output: `No active autonomy window on pane ${pane_id}.` };
+    }
+    return { kind: "ok", output: `Autonomy window on pane ${pane_id} ended — back to asking first.` };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // set_pane_gates — server.ts:868 (the BULK whole-map per-pane override writer; the operator
 // matrix-editor's "Save". REST-ONLY, UNGATED, VERBATIM — the deliberate UI loosening surface).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -562,6 +669,119 @@ function recordPaneGatesActivity(
   } catch { /* store optional */ }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// apply_posture — f09.3 named posture profiles (Heads-down / Demo / Locked + operator-saved).
+//
+// A profile is a whole-matrix REPLACEMENT: applying it writes settings.advanced.capabilityGates
+// (and optionally globalPermissionsMode) to the profile's map, then audits + broadcasts — ZERO new
+// gating semantics (it compiles down to the SAME global-map write set_capability_gate performs).
+// It rides the meta set_capability_gate row (no new matrix row — deriveCapabilities de-dupes on
+// def.capability, exactly like set_pane_gates / promote_pane_mode). Directional contract is
+// byte-identical to set_capability_gate via the shared isLoosening machinery (profileLoosens):
+//   VOICE: tighten-or-equal → applies immediately ("lock it down" is instant); loosen-any → defers
+//     through ctx.gateOrDefer (capability set_capability_gate), mirroring grant_autonomy_window — a
+//     misheard "go heads down" can never silently loosen the matrix.
+//   REST:  the deliberate operator-UI loosen surface (sibling of the ungated set_pane_gates) →
+//     applies immediately. Per operator decision (2026-07-06) applying a profile touches the GLOBAL
+//     layer ONLY; per-pane overrides are never cleared.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ApplyPostureParams = z.object({ name: z.string() });
+
+export const applyPosture: ActionDef<typeof ApplyPostureParams> = {
+  name: "apply_posture",
+  description:
+    "Apply a named safety posture — say 'go heads down' to let agents run on their own work, 'demo mode' to make everything ask first, or 'lock it down' to block everything. It swaps the whole safety matrix at once. Tightening (locking down) applies instantly; a posture that LOOSENS any rule needs your confirmation by voice.",
+  params: ApplyPostureParams,
+  // Rides the meta lock-change row (no new matrix row); a loosening apply defers via gateOrDefer.
+  capability: "set_capability_gate",
+  readOnly: false,
+  // voice + rest. VOICE is the misheard-loosen surface → defers on loosen via gateOrDefer. REST is the
+  // DELIBERATE operator-UI loosening surface (the sibling of ungated set_pane_gates) → applies now.
+  surfaces: new Set(["voice", "rest"]),
+  rest: { method: "post", path: "/api/posture" },
+  handler: (args, ctx): ActionResult => {
+    const { name } = args;
+    const profile = findPostureProfileByName(name, ctx.manager.settings.advanced.postureProfiles);
+    if (!profile) {
+      // Unknown name → a spoken-friendly refusal; NO partial apply.
+      return { kind: "ok", output: `I don't know a posture called "${name}". Try heads down, demo mode, or lock it down.` };
+    }
+    const applyIt = (): string => applyPostureProfile(ctx, profile);
+    // REST = deliberate UI loosen → immediate (sibling of ungated set_pane_gates). No gateOrDefer.
+    if (ctx.surface === "rest") {
+      return { kind: "ok", output: applyIt() };
+    }
+    // VOICE: tighten-or-equal applies immediately; a loosening posture defers to a deliberate confirm.
+    const loosens = profileLoosens(
+      normalizeGateMap(profile.capabilityGates) ?? {},
+      ctx.manager.settings.advanced.capabilityGates,
+      (cap) => ctx.effectiveCapabilityGateFor(null, cap),
+    );
+    if (!loosens) {
+      return { kind: "ok", output: applyIt() };
+    }
+    const g = ctx.gateOrDefer(
+      "set_capability_gate",
+      null,
+      `Apply the '${profile.name}' posture`,
+      applyIt,
+      // NB: no PLM3 versionStamp — a not-yet-confirmed deferred posture quarantines (drops) at boot
+      // rather than rebuilding, so a stale process can never re-open a loosened matrix (fail-closed).
+      { postureName: profile.name },
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "ok", output: `Error: the 'set_capability_gate' capability is gated Off; changing posture is forbidden by policy.` };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "ok", output: `'${g.summary}' loosens safety, so it needs your confirmation. I've queued it — confirm to apply.` };
+    }
+    return { kind: "ok", output: applyIt() };
+  },
+};
+
+/**
+ * Apply a posture profile to the GLOBAL layer: replace settings.advanced.capabilityGates with the
+ * profile's normalized map (empty ⇒ undefined, never a masking `{}` — normalizeGateMap semantics),
+ * optionally set the global mode, persist, audit (attributed to the set_capability_gate row, like
+ * set_pane_gates), then broadcast settings_updated + terminals postures so the matrix editor AND every
+ * pane chip repaint from the same server truth in one tick. Per-pane overrides are NEVER touched.
+ */
+function applyPostureProfile(
+  ctx: Parameters<ActionDef<typeof ApplyPostureParams>["handler"]>[1],
+  profile: PostureProfile,
+): string {
+  const normalized = normalizeGateMap(profile.capabilityGates);
+  // DEEP-MERGE over DEFAULT (Wave-7 major, mirrors terminal.ts:1514-1518's fail-open fix): a PARTIAL
+  // profile must never flip an UNMENTIONED capability to the permissive `?? "Auto"` resolver fallback,
+  // and an EMPTY profile must never clear the ENTIRE matrix. Byte-identical to the profile map for the
+  // full-matrix seeds (which already carry every DEFAULT capability), so the seed pills are unchanged.
+  const applied: CapabilityGateMap = { ...DEFAULT_CAPABILITY_GATES, ...(normalized ?? {}) };
+  ctx.manager.settings.advanced.capabilityGates = applied;
+  if (profile.globalPermissionsMode) {
+    ctx.manager.settings.advanced.globalPermissionsMode = profile.globalPermissionsMode;
+    ctx.manager.globalPermissionsMode = profile.globalPermissionsMode;
+  }
+  ctx.manager.saveSettings();
+  if (ctx.store) {
+    const activeProjectId = ctx.manager.ledger.activeProjectId || "default_project";
+    ctx.store.recordActivity({
+      type: "permission_changed",
+      project_id: activeProjectId,
+      pane_id: null,
+      summary: `posture '${profile.name}' applied (global)`,
+      payload: { action: "apply_posture", profile: profile.name, capabilityGates: applied },
+    });
+  }
+  ctx.broadcast({
+    type: "settings_updated",
+    settings: ctx.sanitizeSettingsForClient(ctx.manager.settings),
+  });
+  // Repaint every pane chip from the new global posture in the same tick (dialog == chip == engine).
+  ctx.broadcastTerminalsUpdated();
+  return `Applied the '${profile.name}' posture.`;
+}
+
 /** The "Changing the locks" group, in dispatch order. */
 export const LOCKS_ACTIONS: ActionDef[] = [
   setGlobalPermissions,
@@ -569,4 +789,7 @@ export const LOCKS_ACTIONS: ActionDef[] = [
   promotePaneMode,
   setCapabilityGate,
   setPaneGates,
+  grantAutonomyWindow,
+  endAutonomyWindow,
+  applyPosture,
 ];

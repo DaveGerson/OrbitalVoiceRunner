@@ -1488,6 +1488,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     gateCapability,
     gateOrDefer,
     posturePayloadForPane,
+    grantAutonomyWindow,
+    endAutonomyWindow,
     broadcastTerminalsUpdated,
     runningPaneIds,
     stopAll,
@@ -1982,6 +1984,9 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       // REST array both read SERVER truth — the live running-pane set and the frozen-aware posture.
       runningPaneIds,
       posturePayloadForPane,
+      // f09.2: the timed-autonomy-window seam (grant defers via gateOrDefer; end is immediate).
+      grantAutonomyWindow,
+      endAutonomyWindow,
       audit: (row) => {
         if (!store) return;
         let argsRedacted: string | null = null;

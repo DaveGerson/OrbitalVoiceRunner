@@ -32,6 +32,8 @@ export interface Station {
   // permissions_mode fallback for older payloads that omit posture.
   posture?: "OPEN" | "GUARDED" | "LOCKED";
   mode?: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
+  // f09.2: epoch-ms expiry of a LIVE timed-autonomy window on this pane (server truth), or undefined.
+  autonomy_until?: number;
 }
 
 export interface StationProject {
@@ -162,6 +164,9 @@ function buildStation(
     outputTail: tail(t.output),
     needsInput,
     posture: t.posture,
+    // f09.2: only carry the key when a window is live (mirrors gating's posturePayloadForPane), so
+    // the common no-window Station shape is unchanged.
+    ...(t.autonomy_until !== undefined ? { autonomy_until: t.autonomy_until } : {}),
   };
 }
 

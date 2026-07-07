@@ -1,7 +1,7 @@
 // ── ORBITAL · shared kitchen primitives ─────────────────────────────────
 // Faithful TSX port of the design's kitchen/components.jsx. Visuals match the
 // prototype (inline styles, exact hex); props are typed; data is real.
-import { useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import iconSprite from "./assets/icons.svg?raw";
 import { INK, STATUS, CHEFS, type ChefKey, type StationStatus } from "./theme";
 
@@ -201,6 +201,40 @@ export function PostureChip({ posture, mode, style = {} }: {
       fontFamily: "DM Sans, sans-serif", fontSize: 12, fontWeight: 800,
       letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
     }}>{skin.label}</span>
+  );
+}
+
+/**
+ * f09.2: the timed-autonomy-window countdown badge. Renders next to the PostureChip while a pane has
+ * a LIVE autonomy window (server truth `autonomy_until`, epoch ms). Ticks each second and vanishes at
+ * expiry client-side; the authoritative revert still comes from the server (a fresh terminals_updated
+ * drops autonomy_until, and the sweep reverts the gate) — this is just the at-a-glance clock.
+ */
+export function formatAutonomyRemaining(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `${m}m ${s.toString().padStart(2, "0")}s` : `${s}s`;
+}
+
+export function AutonomyBadge({ until, style = {} }: { until?: number; style?: CSSProperties }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!until) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [until]);
+  if (!until) return null;
+  const remaining = until - now;
+  if (remaining <= 0) return null;
+  return (
+    <span data-testid="autonomy-countdown" data-autonomy-until={until}
+      title="full-auto window — auto-reverts when it runs out" style={{
+        display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 7px", borderRadius: 999,
+        border: "1.5px solid " + INK, background: "#4db892", color: "#08301f",
+        fontFamily: "JetBrains Mono, monospace", fontSize: 12, fontWeight: 800,
+        whiteSpace: "nowrap", lineHeight: 1.5, ...style,
+      }}>⏱ {formatAutonomyRemaining(remaining)}</span>
   );
 }
 
