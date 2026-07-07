@@ -37,26 +37,26 @@ complete; the live work is P1/P2 riding the hardened matrix).
 
 ## Recommended next steps (priority order)
 
-1. [ ] **z5c — cortex session/connection management** (P1, brainstorm in flight 2026-07-07).
-   Hot/hot connection redundancy + per-project warm agents; Python decides lifecycle/failover
-   over a TS health snapshot. Folds in **1d6w** (inject-leg delivery class vs the PaneSignalBus
-   L1 cooldown). Sweep **f2om** (pytest basename collision) and **ud10** (dead-pane
-   false-positive) in-wave.
-2. [ ] **cvg — Fleet legibility**: live output tiles on Kitchen station cards. ⚠️ Design spec
-   `docs/superpowers/specs/2026-06-25-fleet-view-design.md` is sitting **untracked** in the main
-   checkout — commit or park it before starting.
+1. [ ] **z5c — cortex session/connection management** (P1). Spec approved 2026-07-07
+   (per-project session pool, hybrid LRU: `docs/superpowers/specs/2026-07-07-z5c-session-pool-design.md`).
+   **Slice 1 is PR #131** (inject delivery class — closed 1d6w); slices 2 (handle tier) and
+   3 (hot slots + `pool.plan`) each get their own plan after #131 merges. **f2om** fix is
+   already open as **PR #130**; sweep **ud10** (dead-pane false-positive) in slice 2/3.
+2. [ ] **cvg — Fleet legibility**: live output tiles on Kitchen station cards. Design spec
+   `docs/superpowers/specs/2026-06-25-fleet-view-design.md` is parked in-tree (this PR).
 3. [ ] **qs3 — Reach & automation** (consolidated epic post-re-scope): recipes primary surface
    (33c.1), watch-rule voice twin decision (dvn), webhook/phone push (qs3.1), tip jar (9ql.5).
 4. [ ] **reg2 — Python catalog authority + codegen**: Pydantic source-of-truth → generated
    TS/JSON; aligns with the Python-owns-decisions seam ADR.
-5. [ ] Decisions parked: **9ou** (Nova Sonic 2 backend). Blocked: **2if** (Codex live
-   verification, now also carrying the ngw paste-gap checklist — needs a Codex install).
+5. [ ] Decisions parked: **9ou** (Nova Sonic 2 backend). **2if** (Codex live verification,
+   now also carrying the ngw paste-gap checklist) is **UNBLOCKED** as of 2026-07-07 —
+   codex-cli 0.142.5 is installed and authed; it needs a live interactive session, not an install.
 
 ## Open bugs / risks (live)
 
 | # | Severity | Item | Where | Status |
 |---|---|---|---|---|
-| R1 | Med | **Concurrent-session churn** — foreign uncommitted changes live in the main checkout right now (`package-lock.json`, `tests/test_catalog.ts`, deleted `stubs/node-domexception/`, `handover/`, untracked fleet-view spec). Don't stash/rescue; owner should commit or park. | repo-wide | **Live** — work in isolated worktrees. |
+| R1 | Med | **Concurrent-session churn** — multiple orchestrator sessions run against this repo simultaneously; on 2026-07-07 one hard-reset another's worktree branch mid-integration, and the shared main checkout's dirty files (`package-lock.json`, `tests/test_catalog.ts`, `stubs/`) were restored by a session with no commit trail. Residual main-checkout dirt: `handover/`. Don't stash/rescue foreign changes; coordinate before touching a branch another session owns. | repo-wide | **Live** — work in isolated worktrees; one committer per tree. |
 | R2 | Low | **Smoke test not in CI** — accepted manual gate (bead pox tombstoned 2026-07-07); PR #119's opt-in live lane partially covers. | `scripts/smoke-claude-pane.ts` | **Accepted / closed**. |
 | R3 | Low | **`bytesAfter>0`-style weak assertions may exist elsewhere** — audit smoke/integration checks for "some output" vs "expected content". | `scripts/`, smoke tests | **Open** — sweep. |
 | R4 | Info | **Roadmap line anchors stale** — `docs/roadmap/*` still reference 2026-05/06 commits; re-anchor per item before acting. | `docs/roadmap/` | **Known**. |
