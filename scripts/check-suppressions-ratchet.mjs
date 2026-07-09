@@ -51,10 +51,17 @@ function parseBase(argv) {
   return process.env.RATCHET_BASE || 'origin/main';
 }
 
+// DELTA(plan): The z5c sandbox runs under a different Windows user than the clone owner. Child
+// git calls in this ratchet must trust this repo path explicitly; otherwise HEAD looks unresolved
+// and the unit battery false-reds while still failing closed in genuinely missing-base clones.
+function git(args, opts) {
+  return execFileSync('git', ['-c', `safe.directory=${process.cwd().replace(/\\/g, '/')}`, ...args], opts);
+}
+
 // Does the base ref actually resolve to a commit in this clone?
 function refResolves(ref) {
   try {
-    execFileSync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
+    git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
       stdio: ['ignore', 'ignore', 'ignore'],
     });
     return true;
@@ -81,7 +88,7 @@ function main() {
 
   let baseObj;
   try {
-    const raw = execFileSync('git', ['show', `${base}:${SUPP}`], {
+    const raw = git(['show', `${base}:${SUPP}`], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });

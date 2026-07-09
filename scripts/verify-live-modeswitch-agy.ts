@@ -26,6 +26,8 @@
  * Requires agy installed (+ authenticated for a full session). agy is NOT on PATH —
  * pass AGY_BIN or it defaults to the known install path.
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { UniversalTerminal } from "../src/terminal";
 
 const AGY_BIN = process.env.AGY_BIN || "C:\\Users\\gerso\\AppData\\Local\\agy\\bin\\agy.exe";
@@ -239,4 +241,11 @@ async function main() {
   process.exit(verdict.inconclusive ? 2 : 0);
 }
 
-main().catch((e) => { console.error("[p5-agy] ERROR:", e); process.exit(1); });
+// DELTA(plan): Task 3's required `npm test` exposed that this verifier started a real agy
+// ConPTY session when imported by its pure characterization test. Keep direct CLI behavior, but
+// make helper imports side-effect-free so the full unit battery can terminate deterministically.
+const invokedDirectly =
+  process.argv[1] != null && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) {
+  main().catch((e) => { console.error("[p5-agy] ERROR:", e); process.exit(1); });
+}
