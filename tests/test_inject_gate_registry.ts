@@ -22,18 +22,18 @@ describe("InjectGateRegistry (z5c slice 1 groundwork)", () => {
     const b = reg.forSession("b");
     assert.notStrictEqual(a, b);
     // Session A injected hash H; session B's gate must not deduplicate against A's state.
-    a.noteInjected("H", 1000000);
-    assert.deepStrictEqual(a.evaluate("H", "pane-switch", 1000001), { inject: false, skip: "unchanged-brief" });
-    assert.deepStrictEqual(b.evaluate("H", "pane-switch", 1000001), { inject: true, skip: null });
+    a.noteInjected("H", 1000);
+    assert.deepStrictEqual(a.evaluate("H", "pane-switch", 1001), { inject: false, skip: "unchanged-brief" });
+    assert.deepStrictEqual(b.evaluate("H", "pane-switch", 1001), { inject: true, skip: null });
   });
 
   it("gates share one live debounceMs getter (settings PUT reaches every session)", () => {
     let floor = 3000;
     const reg = new InjectGateRegistry(() => floor);
     const g = reg.forSession("s1");
-    g.noteInjected("H1", 1000000);
-    assert.deepStrictEqual(g.evaluate("H2", "pane-switch", 1002000), { inject: false, skip: "debounce" });
+    g.noteInjected("H1", 1000);
+    assert.deepStrictEqual(g.evaluate("H2", "pane-switch", 2000), { inject: false, skip: "debounce" });
     floor = 500; // runtime settings change
-    assert.deepStrictEqual(g.evaluate("H2", "pane-switch", 1002000), { inject: true, skip: null });
+    assert.deepStrictEqual(g.evaluate("H2", "pane-switch", 2000), { inject: true, skip: null });
   });
 });
