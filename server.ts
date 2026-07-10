@@ -359,6 +359,15 @@ export interface HistoryEntry {
   timestamp: string;
   output: string;
   finalResponse?: string;
+  /**
+   * AgentExchange spine correlation (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md
+   * §5/§6 discovery 2: command history is file-backed, so this is an additive optional JSON
+   * field, not a SQLite column). Stamped ONLY by an exchange-driven write (the flag
+   * JANUS_EXCHANGE_SPINE gated dispatch/approval paths); the raw WS input path and every
+   * legacy/manual command NEVER set it — never adopted heuristically, even for byte-identical
+   * text (spec §5 correlation-map row, "command-history entry").
+   */
+  exchangeId?: string;
 }
 
 // 4E.1: HistoryManager used to fs.readFileSync + JSON.parse the WHOLE multi-pane
@@ -466,12 +475,13 @@ export class HistoryManager {
     this.scheduleFlush(filePath);
   }
 
-  public addCommand(terminalId: string, command: string) {
+  public addCommand(terminalId: string, command: string, exchangeId?: string) {
     const history = this.loadHistory(terminalId);
     const newEntry: HistoryEntry = {
       command,
       timestamp: new Date().toISOString(),
-      output: ""
+      output: "",
+      ...(exchangeId ? { exchangeId } : {}),
     };
     history.push(newEntry);
     this.saveHistory(terminalId, history);
@@ -1474,7 +1484,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     announcementBus,
     pushApprovalNarration,
     sanitizeSettingsForClient,
-    addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
+    addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
   });
   // Destructure the gating seam so the existing inline call sites across the REST + WS surfaces keep
   // referencing these by name. ONE shared object by reference — the pending stores + the posture
@@ -1838,7 +1848,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttention,
     interactionLog,
     recipes,
-    addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
+    addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
     ai,
     boundLiveConnector,
     boundSessionAiFactory,

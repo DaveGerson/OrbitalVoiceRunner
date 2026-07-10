@@ -35,6 +35,10 @@ export interface StoredPendingApproval {
   id: string; session_id: string; workspace_id: string; pane_id: string;
   command: string; kind: ApprovalKind; rationale: string | null;
   claimed: boolean; timestamp: number; expires_at: number;
+  /** AgentExchange spine correlation (schema v12, nullable — the v2 handoff_id precedent).
+   *  Set ONLY when this approval was requested by the exchange service (spec §5); a legacy/
+   *  uncorrelated approval keeps this NULL forever. */
+  exchange_id?: string | null;
 }
 /**
  * Row shape for the pending_actions table (schema v5, bead wsm-e2e-pinned-kzt). A deferred Ask-tier
@@ -121,6 +125,7 @@ export interface PendingApprovalRow {
   id: string; session_id: string; workspace_id: string; pane_id: string;
   command: string; kind: string; rationale: string | null;
   claimed: SqlBool; timestamp: number; expires_at: number;
+  exchange_id?: string | null;
 }
 /** Raw `pending_actions` row (claimed as 0|1). */
 export interface PendingActionRow {

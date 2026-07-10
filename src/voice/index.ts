@@ -37,8 +37,9 @@ import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
 import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
-import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
+import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -337,8 +338,12 @@ export interface VoiceDeps {
   };
   recipes: any;
   /** record a command in the HistoryManager singleton (server.ts-internal; passed in, not imported) —
-   *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was. */
-  addCommand: (terminalId: string, command: string) => void;
+   *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was.
+   *  `exchangeId` is an ADDITIVE optional 3rd arg (AgentExchange spine, task C) — this file's own
+   *  wiring never has occasion to use it today (the DispatchDeps.addCommand paneWrite.ts calls into
+   *  is a strict 2-arg contract out of this step's scope), but widening the TYPE here costs nothing
+   *  and keeps this deps bag's addCommand shape consistent with GatingDeps' (src/gating/index.ts). */
+  addCommand: (terminalId: string, command: string, exchangeId?: string) => void;
   ai: GoogleGenAI;
   boundLiveConnector: (ai: GoogleGenAI, params: any, key?: string | null) => Promise<any>;
   boundSessionAiFactory: (key: string, fallback: GoogleGenAI) => GoogleGenAI;
@@ -933,6 +938,65 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       applyResolution(messageId, approve ? "approve" : "reject", { vocal: true });
     }
 
+    // AgentExchange spine (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md, flag
+    // JANUS_EXCHANGE_SPINE, task C of step 1.3): mint an exchange for this dispatch BEFORE the
+    // gate/effect decision, so the exchange_id exists no matter which arm the decision resolves
+    // to (spec §5: "exchange_id mints BEFORE approval/delivery is possible"). `off` (the default)
+    // short-circuits to undefined so no exchange is ever created; every call below is best-effort
+    // and swallows its own errors — a spine fault must never affect the real dispatch outcome
+    // (spec §9.6).
+    //
+    // SCOPE NOTE: the strict two-phase "delivery_attempted event durably precedes the pane write"
+    // ordering (spec §2b) needs a hook INSIDE applyDispatchDecision's auto_execute arm
+    // (src/dispatch/paneWrite.ts), which is out of this step's allowed-paths scope. What follows
+    // is a best-effort approximation that derives the exchange's transitions from the returned
+    // DispatchOutcome AFTER the (synchronous, single-turn) call returns — correct for normal
+    // operation, but it does not close the crash-window between "attempt recorded" and "write
+    // fired" the way the strict ordering would. Flagged as a step 1.4 follow-up in the report.
+    function stampExchangeForDispatch(targetId: string, instruction: string, trigger: string): string | undefined {
+      if (!exchangeSpineActive()) return undefined;
+      try {
+        const projectId =
+          manager.terminals[targetId]?.projectId ||
+          manager.ledger.getActiveProject?.()?.id ||
+          "default_project";
+        return getExchangeService().createExchange({
+          projectId,
+          paneId: targetId,
+          operatorUtterance: trigger,
+          distilledInstruction: instruction,
+        }).exchangeId;
+      } catch (e) {
+        console.error("[exchange-spine] createExchange failed:", e);
+        return undefined;
+      }
+    }
+
+    /** Progress (or cancel) the just-created draft exchange to match what `applyDispatchDecision`
+     *  actually did, entirely from its returned outcome (see SCOPE NOTE above). Never throws. */
+    function settleExchangeForDispatch(
+      exchangeId: string | undefined,
+      pendingId: string,
+      decision: ProposalDecision,
+      outcome: DispatchOutcome
+    ): void {
+      if (!exchangeId) return;
+      try {
+        const svc = getExchangeService();
+        if (outcome.kind === "executed") {
+          svc.stageForDelivery(exchangeId);
+          svc.recordDelivery(exchangeId);
+        } else if (outcome.kind === "pending" && decision.type === "pending_approval") {
+          svc.requestApproval(exchangeId, pendingId);
+          pendingApprovals.bindExchange(pendingId, exchangeId);
+        } else {
+          svc.cancel(exchangeId, `dispatch_outcome:${outcome.kind}`);
+        }
+      } catch (e) {
+        console.error("[exchange-spine] settle failed:", e);
+      }
+    }
+
     // WS-E.1 + R1/R2/R4: the SINGLE gated dispatch path. Used by both `propose_command` and
     // `execute_plan` so plan steps respect the effective-mode gate (R4 closes the bypass).
     // Returns the model-facing outcome text; the HiTL case stores a non-blocking pending entry
@@ -978,7 +1042,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
       const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist, capability, gate });
 
-      return applyDispatchDecision(
+      // AgentExchange spine (task C): mint BEFORE the effect switch (spec §5) — a no-op when the
+      // flag is off.
+      const exchangeId = stampExchangeForDispatch(targetId, instruction, opts.trigger);
+
+      const outcome = applyDispatchDecision(
         decision,
         {
           manager,
@@ -1012,6 +1080,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           origin: "voice",
         }
       );
+
+      settleExchangeForDispatch(exchangeId, pendingId, decision, outcome);
+      return outcome;
     }
 
     // PLM4 (2): the session-establish logic, extracted into a reusable closure callable on BOTH the

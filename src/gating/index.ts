@@ -43,6 +43,7 @@ import {
   type ResolveReason,
 } from "../pendingApprovals";
 import { PendingActionStore } from "../pendingActions";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { applyPaneMode, type PaneModeResult } from "../applyPaneMode";
 import { buildActionRun, checkActionVersion } from "../actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
@@ -99,7 +100,11 @@ export interface GatingDeps {
   announcementBus: AnnouncementBus;
   pushApprovalNarration: (session: any, text: string) => boolean | void;
   sanitizeSettingsForClient: (settings: any) => any;
-  addCommand: (terminalId: string, command: string) => void;
+  /** `exchangeId` is an ADDITIVE optional 3rd arg (AgentExchange spine, task C): the approved-write
+   *  path passes it through ONLY when this approval was exchange-correlated (flag on); server.ts's
+   *  HistoryManager.addCommand accepts (and ignores when absent) the same optional param, so a
+   *  legacy caller passing 2 args is byte-identical. */
+  addCommand: (terminalId: string, command: string, exchangeId?: string) => void;
 }
 
 /** The cohesive seam createGating returns. The pending stores + the constants are exposed so the
@@ -1035,10 +1040,55 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  /**
+   * AgentExchange spine (task C): the SAME two-phase ordering the spec wants for the auto_execute
+   * arm (spec §2b), for real this time — renderApproved is the single approved-write path, so a
+   * durable `delivery_attempted` (here: the in-memory `beginDeliveryAttempt`) genuinely precedes
+   * the pane write, and `completeDelivery` genuinely follows it. Best-effort; never throws; a
+   * no-op unless the resolved record carries an `exchangeId` (flag on AND this approval was
+   * exchange-correlated at proposal time, src/voice/index.ts's dispatchProposal).
+   */
+  function beginExchangeDeliveryOnApprove(record: ResolvedRecord): void {
+    if (!exchangeSpineActive() || !record.exchangeId) return;
+    try {
+      const svc = getExchangeService();
+      const snap = svc.get(record.exchangeId);
+      if (snap?.state === "awaiting_approval" && snap.approvalDraftVersion != null) {
+        svc.confirmApproval(record.exchangeId, record.messageId, snap.approvalDraftVersion);
+      }
+      svc.stageForDelivery(record.exchangeId); // no-op (illegal transition) if already staged
+      svc.beginDeliveryAttempt(record.exchangeId);
+    } catch (e) {
+      console.error("[exchange-spine] beginExchangeDeliveryOnApprove failed:", e);
+    }
+  }
+
+  function completeExchangeDeliveryOnApprove(record: ResolvedRecord): void {
+    if (!exchangeSpineActive() || !record.exchangeId) return;
+    try {
+      getExchangeService().completeDelivery(record.exchangeId);
+    } catch (e) {
+      console.error("[exchange-spine] completeExchangeDeliveryOnApprove failed:", e);
+    }
+  }
+
+  /** Non-approve terminal resolutions (reject/expire/dead-pane) never deliver — cancel whatever
+   *  exchange this approval was bound to (best-effort; a no-op without a flag+binding). */
+  function cancelExchangeOnResolve(record: ResolvedRecord, reason: string): void {
+    if (!exchangeSpineActive() || !record.exchangeId) return;
+    try {
+      getExchangeService().cancel(record.exchangeId, reason);
+    } catch (e) {
+      console.error("[exchange-spine] cancelExchangeOnResolve failed:", e);
+    }
+  }
+
   function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
     // Claim already won inside resolveDecision — this is the single write path.
-    addCommand(record.terminalId, record.instruction);
+    beginExchangeDeliveryOnApprove(record);
+    addCommand(record.terminalId, record.instruction, record.exchangeId);
     manager.terminals[record.terminalId]!.writeInput(record.instruction);
+    completeExchangeDeliveryOnApprove(record);
     clearMatchingDraftOnApprove(record);
     if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
     // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
@@ -1048,19 +1098,32 @@ export function createGating(deps: GatingDeps): Gating {
   function renderDeadPane(record: ResolvedRecord, safeInstr: string, session: any): void {
     if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+    cancelExchangeOnResolve(record, "dead_pane");
   }
 
   function renderRejected(record: ResolvedRecord, safeInstr: string, session: any, opts?: { vocal?: boolean }): void {
     if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+    cancelExchangeOnResolve(record, "rejected");
   }
 
   function renderExpired(record: ResolvedRecord, safeInstr: string, session: any): void {
     if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
     // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its severity,
     // which rendered "Pane 'x' exited." for a pane that merely lost an approval.
-    announcementBus.enqueue({ kind: "approval_expired", terminalId: record.terminalId, summary: "Approval expired." });
+    // AgentExchange spine (task C, spec §5 "attention rows"): carry exchange_id in the item's
+    // details when this approval was exchange-correlated. The durable `attention` table + its
+    // `attention.exchange_id` column (schema v12) and the live `manager.attentionQueue` push
+    // call sites live in src/terminal.ts / src/observe/index.ts, both out of this step's
+    // allowed-paths scope — this is the one attention-adjacent enqueue point reachable from here.
+    announcementBus.enqueue({
+      kind: "approval_expired",
+      terminalId: record.terminalId,
+      summary: "Approval expired.",
+      ...(record.exchangeId ? { exchangeId: record.exchangeId } : {}),
+    });
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+    cancelExchangeOnResolve(record, "expired");
   }
 
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {

@@ -96,6 +96,16 @@ export interface PendingApproval {
   lastCallFailures?: number;
   /** The capability this approval rides (design §3). Defaults to "write_to_pane". */
   capability?: string;
+  /**
+   * AgentExchange spine correlation (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md
+   * §5, flag JANUS_EXCHANGE_SPINE). Set ONLY when this approval was requested by the exchange
+   * service on behalf of a tracked exchange (shadow/primary mode) — legacy/uncorrelated
+   * approvals leave this undefined forever (never adopted heuristically). The bound
+   * `draft_version` itself is NOT duplicated here: it lives on the exchange row
+   * (`approval_draft_version`), addressed by `exchangeId`, so there is a single source of truth
+   * for the CAS binding (spec §3).
+   */
+  exchangeId?: string;
 }
 
 /**
@@ -653,11 +663,27 @@ export class PendingApprovalStore {
       claimed: record.claimed ?? false,
       timestamp: record.timestamp,
       expires_at: record.timestamp + ttlMs,
+      exchange_id: record.exchangeId ?? null,
     });
   }
 
   get(messageId: string): PendingApproval | undefined {
     return this.records[messageId];
+  }
+
+  /**
+   * AgentExchange spine correlation (spec §5, flag JANUS_EXCHANGE_SPINE): bind an `exchangeId`
+   * onto an ALREADY-ADDED pending-approval record. The caller only learns the pendingId once
+   * `gateOrDefer`/`applyDispatchDecision` returns it, so this is a post-add correlation step, not
+   * part of `add()` itself. In-memory ONLY — the durable row's `exchange_id` column is populated
+   * at add()-time when the caller already knows the exchange (an add() carrying `record.exchangeId`
+   * set); rewriting the durable row here would require reconstructing (and risk perturbing) its
+   * anchored `expires_at`, so a late bind is a best-effort, in-process-only correlation. No-op if
+   * the record no longer exists (already resolved/expired) — never throws.
+   */
+  bindExchange(messageId: string, exchangeId: string): void {
+    const rec = this.records[messageId];
+    if (rec) rec.exchangeId = exchangeId;
   }
 
   sessionFor(messageId: string): any {
@@ -873,6 +899,7 @@ export class PendingApprovalStore {
       claimed: rec.claimed ?? false, // carry claimed through (spec §9 N-1 exactly-once guard).
       timestamp: rec.timestamp,
       expires_at: nowExpiresAt,
+      exchange_id: rec.exchangeId ?? null, // carry the exchange correlation through re-attach too.
     });
   }
 
@@ -937,5 +964,6 @@ function hydrateApproval(row: StoredPendingApproval): PendingApproval {
     claimed: row.claimed,
     // capability has no column (option A): survivors default it; not read by any resolve path.
     capability: "write_to_pane",
+    exchangeId: row.exchange_id ?? undefined,
   };
 }

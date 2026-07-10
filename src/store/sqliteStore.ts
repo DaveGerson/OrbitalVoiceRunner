@@ -295,14 +295,14 @@ export class JanusStore {
    */
   insertPendingApproval(a: StoredPendingApproval): void {
     this.db.prepare(
-      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
-       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)
+      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at,exchange_id)
+       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at,@exchange_id)
        ON CONFLICT(id) DO UPDATE SET
          session_id=excluded.session_id, workspace_id=excluded.workspace_id, pane_id=excluded.pane_id,
          command=excluded.command, kind=excluded.kind, rationale=excluded.rationale,
-         timestamp=excluded.timestamp, expires_at=excluded.expires_at,
+         timestamp=excluded.timestamp, expires_at=excluded.expires_at, exchange_id=excluded.exchange_id,
          claimed=CASE WHEN pending_approvals.claimed=1 THEN 1 ELSE excluded.claimed END`
-    ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null });
+    ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null, exchange_id: a.exchange_id ?? null });
   }
   /** Atomic claim: flips 0->1 only if currently 0. True == this caller won. */
   claimApproval(id: string): boolean {
@@ -375,10 +375,14 @@ export class JanusStore {
     surface?: string | null;
     idempotency_key?: string | null;
     interaction_id?: string | null;
+    /** AgentExchange spine correlation (schema v12's action_log.exchange_id, ALTER-added but not
+     *  previously exposed here — storage-API gap closed for step 1.3 task C). Nullable; only an
+     *  exchange-correlated dispatch (flag on) ever sets it. */
+    exchange_id?: string | null;
   }): void {
     this.db.prepare(
-      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key,interaction_id)
-       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key,@interaction_id)`
+      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key,interaction_id,exchange_id)
+       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key,@interaction_id,@exchange_id)`
     ).run({
       ts: Date.now(),
       name: row.name,
@@ -387,6 +391,7 @@ export class JanusStore {
       ms: row.ms,
       args_redacted: row.args_redacted ?? null,
       surface: row.surface ?? null,
+      exchange_id: row.exchange_id ?? null,
       idempotency_key: row.idempotency_key ?? null,
       interaction_id: row.interaction_id ?? null,
     });
