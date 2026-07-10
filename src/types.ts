@@ -306,6 +306,39 @@ export interface ExchangeDraftView {
   readiness: ExchangeReadiness;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5, Step 5.1 — Fleet View "communication-by-exception": a small, read-only,
+// per-pane projection off the durable AgentExchange spine (src/exchanges/fleetProjection.ts),
+// mirroring ExchangeDraftView's client-facing-projection idiom (viewOpenDraft) but for a
+// pane's MOST RECENT exchange regardless of whether its draft is still "open" — so a pane
+// whose exchange has already moved to running/agent_complete/agent_failed/interrupted still
+// carries a summary. GET /api/fleet/exchange-summary; additive, bounded (one row per pane),
+// absent/undefined for a pane with no exchange history at all (zero visual delta).
+// ─────────────────────────────────────────────────────────────────────────────
+export type FleetExchangeTier = 1 | 2 | 3 | 4 | 5 | 6;
+export type FleetExchangeKind =
+  | "needs_input" | "approval" | "failed" | "complete" | "running" | "staged" | "decision";
+
+export interface FleetExchangeSummary {
+  exchangeId: string;
+  /** The exchange's raw lifecycle state (ExchangeState) — carried as a string at this client
+   *  boundary (mirrors PersistedDraftEnvelope's cross-boundary convention) so this type has no
+   *  dependency on src/exchanges/types.ts's server-only union. */
+  state: string;
+  /** Six-tier priority (spec docs/superpowers/specs/2026-06-25-fleet-view-design.md + the 4.2
+   *  composeExchangeBoard tiers) — 1 = most urgent (needs input / approval). */
+  tier: FleetExchangeTier;
+  kind: FleetExchangeKind;
+  /** Already-redacted, capped instruction summary (distilled_instruction), or null. */
+  instructionSummary: string | null;
+  /** Already-redacted, capped terminal_state text — the reason the pane is waiting, or null. */
+  waitingReason: string | null;
+  /** Already-redacted, capped result_summary — the last meaningful agent report, or null. */
+  resultSummary: string | null;
+  /** Epoch ms this exchange row last changed (updated_at) — the card's age anchor. */
+  updatedAt: number;
+}
+
 export interface PaneMeta {
   pane_id: string;
   name: string;
@@ -437,6 +470,13 @@ export interface SystemSettings {
   projects: {
     activeContext: string;
     localWorkspacePath: string;
+    // Phase 5, Step 5.1 (Fleet View communication-by-exception): project ids whose PROACTIVE
+    // announcements (AnnouncementBus earcon + on-screen notification) are muted. Absent/empty ⇒
+    // every project announces (today's behavior, byte-identical). Persists through the existing
+    // PUT /api/settings idiom — no new settings surface. Does NOT affect the durable attention
+    // queue / SITREP / exchange board — those stay visible on the fleet board itself; muting only
+    // silences the proactive earcon+toast+desktop-notification triad for that project.
+    mutedProjectIds?: string[];
   };
   presets: CliPreset[];
   // WS-D: operator-editable proactive-announcement message templates. `{pane}` and

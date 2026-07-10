@@ -34,6 +34,12 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   { method: "get", path: "/api/panes/:projectId/:paneId/draft", category: "exception", reason: "draft buffer read on pane-switch; operator hand-rail" },
   { method: "put", path: "/api/panes/:projectId/:paneId/draft", category: "exception", reason: "draft buffer persist (WS draft_edit primary; REST fallback)" },
   { method: "get", path: "/api/projects/:projectId/drafts", category: "exception", reason: "WIP draft list indicator; operator hand-rail" },
+  // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): a small, bounded, read-only
+  // projection of every live pane's latest AgentExchange (src/exchanges/fleetProjection.ts) —
+  // mirrors GET .../draft's shape/placement exactly (structured {summaries:{...}} body, not the
+  // ActionDef default {output} wrapper); a voice/registry twin has no natural verb (it is a
+  // client-board read, not an operator-speakable action).
+  { method: "get", path: "/api/fleet/exchange-summary", category: "exception", reason: "bounded per-pane exchange-summary projection for the Fleet View board; structured body, no voice-natural verb" },
   { method: "post", path: "/api/panes/:projectId/:paneId/draft/send", category: "exception", reason: "operator sends own draft; above-the-gate by design" },
   // ── exception: settings (config; client reads structured body; separate track) ──
   { method: "get", path: "/api/settings", category: "exception", reason: "settings read on load; structured body; settings->WS rewrite is a follow-up" },

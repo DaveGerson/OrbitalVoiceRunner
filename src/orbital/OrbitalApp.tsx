@@ -12,6 +12,7 @@ import { useConversationalState, chipColorForKind, type ConversationalState } fr
 import { groupHandoffsByPane } from "./useOrbitalDataHelpers";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
+import { FleetExchangeView } from "./FleetExchangeView";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
@@ -298,6 +299,38 @@ export default function OrbitalApp() {
       <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
         <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: dotBg, backgroundSize: "18px 18px" }}>
+          {/* Phase 5, Step 5.1: the Fleet View's "communication-by-exception" lane — only in the
+              All-Projects scope (selectedProject === "all"), and renders NOTHING when the fleet has
+              no exception (zero visual delta otherwise — see FleetExchangeView's own doc). */}
+          {selectedProject === "all" && (
+            <FleetExchangeView
+              stations={stations}
+              pendingCommands={data.pendingCommands}
+              attentionQueue={data.attentionQueue}
+              exchangeByPane={exchangeByPane}
+              exchangeSummaries={data.fleetExchangeSummaries}
+              mutedProjectIds={data.settings?.projects.mutedProjectIds}
+              dark={t.dark}
+              onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }}
+              /* A fleet card's held approval comes from one of TWO existing sources (fleetExchangeOrdering
+                 .ts's precedence ladder): the active pane's pendingCommands (resolve via approveCommand/
+                 rejectCommand directly) or a background pane's attention-inbox item (bead 8xn — resolve via
+                 approveAttention/denyAttention, which ALSO optimistically clears the inbox row/badge, not
+                 just pendingCommands). Both are the SAME canonical POST /api/commands/approve resolver
+                 underneath; this is only choosing which existing wrapper clears the right client-side queue. */
+              onApprove={(messageId) => {
+                const item = data.attentionQueue.find((a) => a.messageId === messageId);
+                if (item) data.approveAttention(item); else data.approveCommand(messageId);
+              }}
+              onDeny={(messageId) => {
+                const item = data.attentionQueue.find((a) => a.messageId === messageId);
+                if (item) data.denyAttention(item); else data.rejectCommand(messageId);
+              }}
+              onRetry={data.retryExchange}
+              onCancelExchange={data.cancelExchangeAction}
+              onToggleMute={data.toggleProjectMute}
+            />
+          )}
           <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts} attention={data.attentionQueue}
             stations={stations} activePaneId={data.activeTerminalId}
             jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}

@@ -1532,6 +1532,20 @@ export class JanusStore {
   }
 
   /**
+   * Phase 5, Step 5.1 (Fleet View): the SINGLE most-recently-updated exchange for `paneId`, or
+   * null when the pane has no exchange history at all. Bounded (`LIMIT 1`, uses
+   * idx_agent_exchanges_pane_state) — the read the fleet-card projection needs ("what is this
+   * pane's current/most-recent exchange"), as opposed to `listExchangesByPane`'s full oldest-first
+   * history (a plan/replay read, unbounded per pane).
+   */
+  getLatestExchangeForPane(paneId: string): AgentExchange | null {
+    const r = this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE pane_id=? ORDER BY updated_at DESC LIMIT 1"
+    ).get(paneId) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /**
    * CAS-guarded update — the SQL half of spec §2(a): `UPDATE … WHERE exchange_id=? AND state=?
    * [AND approval_id=? AND approval_draft_version=?]`. Every legal transition in the lifecycle
    * machine (step 1.3) is exactly one such guarded UPDATE, so repeated/racing application of the

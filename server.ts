@@ -39,6 +39,7 @@ import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migr
 import { initExchangeSpineOnBoot, getExchangeService, exchangeSpineActive } from "./src/exchanges/spine";
 import { reviseDraft, renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
 import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, serializeDraftEnvelope } from "./src/exchanges/draftRegistry";
+import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -1224,6 +1225,18 @@ function registerDraftAndSettingsRoutes(
     res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
   });
 
+  // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): a small, bounded, read-only
+  // projection of every LIVE pane's most-recent AgentExchange (src/exchanges/fleetProjection.ts) —
+  // mirrors GET .../draft's viewOpenDraft pattern, but covers a pane whose exchange has already
+  // moved PAST the open-draft stage (running/agent_complete/agent_failed/interrupted), which the
+  // draft registry alone cannot. No store ⇒ an empty map (never an error — the fleet board just
+  // shows no exchange enhancement for that pane, falling back to its plain Station fields).
+  app.get("/api/fleet/exchange-summary", (_req, res) => {
+    if (!store) { res.json({ summaries: {} }); return; }
+    const paneIds = Object.keys(manager.terminals);
+    res.json({ summaries: projectFleetExchangeSummaries(store, paneIds, redactSecrets) });
+  });
+
   // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
   // architecture §2): clicking Send IS the approval, so it writes immediately. The draft is then
   // cleared. Janus never calls this — it only fills the draft for the operator to send.
@@ -1589,6 +1602,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const announcementBus = new AnnouncementBus({
     broadcast,
     getTemplates: () => manager.settings.announcements || DEFAULT_ANNOUNCEMENT_TEMPLATES,
+    // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): per-project mute — resolve the
+    // announcing pane's project the same way the rest of the server does (Terminal.projectId) and
+    // check it against the operator-editable settings.projects.mutedProjectIds. Absent/empty list
+    // ⇒ never muted (today's behavior). Read fresh every call, so a live PUT /api/settings mute
+    // toggle takes effect on the very next announcement.
+    isPaneMuted: (terminalId) => {
+      const projectId = manager.terminals[terminalId]?.projectId;
+      if (!projectId) return false;
+      return (manager.settings.projects.mutedProjectIds || []).includes(projectId);
+    },
   });
 
   // BUG-035: keep the attentionQueue bounded + TTL-evicted wherever it is mutated.

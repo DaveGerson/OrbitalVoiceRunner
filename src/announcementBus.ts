@@ -133,6 +133,16 @@ export interface AnnouncementBusOptions {
   /** Returns the current operator-editable templates (read fresh each flush so a
    *  Settings edit takes effect without a restart). */
   getTemplates?: () => AnnouncementTemplates;
+  /**
+   * Phase 5, Step 5.1 (Fleet View "communication-by-exception"): per-project mute. Checked FIRST
+   * on every `enqueue()`, read fresh each call (mirrors `getTemplates`) so an operator's mute
+   * toggle (PUT /api/settings) takes effect immediately, no restart/reconnect needed. Returns
+   * `true` to DROP the item entirely — no earcon, no notification, no debounce/coalesce
+   * bookkeeping touched (a muted project must not even warm the per-pane debounce window, so
+   * un-muting later doesn't inherit a stale cold/hot state from while it was muted). Absent ⇒
+   * nothing is ever muted (today's behavior, byte-identical).
+   */
+  isPaneMuted?: (terminalId: string) => boolean;
 }
 
 function applyTemplate(tpl: string, pane: string, summary: string): string {
@@ -155,6 +165,7 @@ export class AnnouncementBus {
   private rateLimitBurst: number;
   private itemTtlMs: number;
   private getTemplates: () => AnnouncementTemplates;
+  private isPaneMuted: (terminalId: string) => boolean;
 
   private buffer: AnnouncementItem[] = [];
   private flushTimer: any = null;
@@ -178,6 +189,7 @@ export class AnnouncementBus {
     this.rateLimitBurst = opts.rateLimitBurst ?? 2;
     this.itemTtlMs = opts.itemTtlMs ?? ATTENTION_TTL_MS;
     this.getTemplates = opts.getTemplates || (() => DEFAULT_ANNOUNCEMENT_TEMPLATES);
+    this.isPaneMuted = opts.isPaneMuted || (() => false);
   }
 
   /**
@@ -202,12 +214,25 @@ export class AnnouncementBus {
    *   - normal severity, hot (pane,kind) window: COALESCES-TO-LATEST into a pending slot and is
    *     delivered (earcon + notification) when the window expires; the flush re-stamps the window,
    *     so sustained flapping keeps collapsing to one announcement per window. */
-  enqueue(item: AnnouncementItem): boolean {
-    const now = this.clock.now();
-    // 4D.1: every genuine edge reaches the listeners, even when the announcement defers.
+  /** 4D.1: notify every onEnqueue listener (the durable activity recorder), containing a throw so
+   *  one bad listener can never break enqueue's own control flow. Split out of enqueue() purely to
+   *  keep that method's own branch count flat (complexity gate). */
+  private notifyEnqueueListeners(item: AnnouncementItem): void {
     for (const listener of this.enqueueListeners) {
       try { listener(item); } catch (e) { console.error("AnnouncementBus onEnqueue listener failed:", e); }
     }
+  }
+
+  enqueue(item: AnnouncementItem): boolean {
+    const now = this.clock.now();
+    // 4D.1: every genuine edge reaches the listeners, even when the announcement defers.
+    this.notifyEnqueueListeners(item);
+
+    // Phase 5, Step 5.1: a muted project's announcements are DROPPED here — before the debounce
+    // window, the earcon, and the notification stack all touch it. Unlike the debounce path this
+    // is a genuine drop, not a defer: there is no pending slot to flush once the operator un-mutes
+    // (that would surprise them with a stale earcon for something that happened while muted).
+    if (this.isPaneMuted(item.terminalId)) return false;
 
     if (!isHighSeverity(item.kind)) {
       const key = `${item.terminalId} ${item.kind}`;
