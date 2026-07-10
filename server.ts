@@ -37,6 +37,8 @@ import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
+import { reviseDraft, instructionEnvelopeIsPrimary } from "./src/exchanges/instructionEnvelope";
+import { getOpenDraft, setOpenDraft, setProseOverride } from "./src/exchanges/draftRegistry";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -1042,6 +1044,25 @@ function registerRawInputRoute(
 // `requestVoiceReconnect` are in module scope; only the connection-bound `broadcast` +
 // `broadcastDraft` (and the module `requestVoiceReconnect`, passed for locality) are injected. Every
 // route path, verb, branch, status code, and broadcast is byte-identical to the inline block.
+/**
+ * Instruction-envelope convergence bridge, REST twin (spec docs/superpowers/specs/
+ * 2026-07-09-instruction-routing.md §5.2; see src/voice/index.ts's `convergeTypedDraftEdit` for
+ * the WS `draft_edit` twin — both mutate the SAME per-pane EnvelopeDraft registry,
+ * src/exchanges/draftRegistry.ts). JANUS_INSTRUCTION_ENVELOPE=primary only; best-effort and never
+ * throws back into the route handler.
+ */
+function convergeTypedDraftEditRest(projectId: string, paneId: string): void {
+  if (!instructionEnvelopeIsPrimary()) return;
+  try {
+    const existing = getOpenDraft(projectId, paneId);
+    if (!existing) return;
+    setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
+    setProseOverride(projectId, paneId);
+  } catch (e) {
+    console.error("[instruction-envelope] REST draft_edit convergence failed:", e);
+  }
+}
+
 function registerDraftAndSettingsRoutes(
   app: express.Express,
   deps: {
@@ -1065,6 +1086,7 @@ function registerDraftAndSettingsRoutes(
     const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
     if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
     broadcastDraft(req.params.projectId, req.params.paneId);
+    convergeTypedDraftEditRest(req.params.projectId, req.params.paneId);
     res.json({ success: true });
   });
 

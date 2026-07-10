@@ -134,8 +134,15 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // voice declaration),
     // then 62 -> 65 by Wave 7 (f09.2 grant_autonomy_window + end_autonomy_window timed-autonomy verbs +
     // f09.3 apply_posture named-posture verb — all three are voice+rest, so each adds one voice
-    // declaration; they ride the existing set_capability_gate capability row, no new matrix row).
-    assert.strictEqual(decls.length, 65, "exactly 65 voice tools declared");
+    // declaration; they ride the existing set_capability_gate capability row, no new matrix row),
+    // then 65 -> 71 by Phase 3 Step 3.3 (instruction-routing spec,
+    // docs/superpowers/specs/2026-07-09-instruction-routing.md): six exchange-aware instruction-
+    // envelope verbs — draft_instruction / revise_instruction / retarget_instruction /
+    // confirm_instruction / cancel_instruction / send_instruction (src/actions/defs/voice_ux.ts) —
+    // are voice-only, so each adds one voice declaration; draft/revise/retarget/confirm/cancel ride
+    // the existing compose_draft capability row and send_instruction rides write_to_pane, so no new
+    // matrix row.
+    assert.strictEqual(decls.length, 71, "exactly 71 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

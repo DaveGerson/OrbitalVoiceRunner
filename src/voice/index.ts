@@ -40,6 +40,8 @@ import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
 import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { reviseDraft, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
+import { getOpenDraft, setOpenDraft, setProseOverride } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -413,6 +415,30 @@ function applyDraftEditFrame(
   const paneId = msg.paneId || coreState.activePaneId;
   if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
     broadcastDraft(projectId, paneId);
+    convergeTypedDraftEdit(projectId, paneId);
+  }
+}
+
+/**
+ * Instruction-envelope convergence bridge (spec docs/superpowers/specs/2026-07-09-instruction-
+ * routing.md §5.2), JANUS_INSTRUCTION_ENVELOPE=primary only: a typed `draft_edit` (this WS frame,
+ * and the REST PUT twin at server.ts's `/api/panes/:projectId/:paneId/draft` route) ALSO revises
+ * the pane's OPEN envelope draft, if one exists, and marks prose-override so the operator's
+ * hand-edited text is never clobbered by a subsequent re-render — a voice field revision
+ * (revise_instruction) clears the override and re-renders. Both surfaces mutate the SAME
+ * `EnvelopeDraft` (src/exchanges/draftRegistry.ts's per-pane registry); last writer wins the
+ * prose; every write bumps the same `draftVersion`. Best-effort and never throws back into the
+ * message handler — a convergence-bridge failure must never break plain draft editing.
+ */
+function convergeTypedDraftEdit(projectId: string, paneId: string): void {
+  if (!instructionEnvelopeIsPrimary()) return;
+  try {
+    const existing = getOpenDraft(projectId, paneId);
+    if (!existing) return;
+    setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
+    setProseOverride(projectId, paneId);
+  } catch (e) {
+    console.error("[instruction-envelope] draft_edit convergence failed:", e);
   }
 }
 

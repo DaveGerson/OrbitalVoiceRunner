@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**104** actions across **26** gated capabilities, plus the always-allowed group.
+**110** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -112,10 +112,15 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `apply_prompt_template` | voice / rest | no | Instantiate a saved prompt template (filling its {{slot}} values) into a pane's WIP draft for the operator to review and send |
+| `cancel_instruction` | voice | no | Cancel the instruction draft for the operator's open pane and clear its WIP draft text |
+| `confirm_instruction` | voice | no | Finalize a pending 'which pane did you mean' / 'did you mean X' / cross-project confirmation for the instruction draft (from retarget_instruction) by naming th… |
+| `draft_instruction` | voice | no | Compose (or revise) the structured instruction envelope for the pane the operator currently has open — objective plus, only when the operator said them, contex… |
 | `handoff_context_between_panes` | voice / rest | no | Gather context from a source CLI pane and package summaries/learnings to prime a model agent in another target pane |
 | `propose_handoff` | voice / rest | no | Draft a first-class handoff to a target pane (UNGATED — never touches the pane) |
 | `reject_handoff` | voice / rest | no | Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path) |
+| `retarget_instruction` | voice | no | Move the instruction draft for the operator's open pane to a DIFFERENT pane the operator names ('send this to the codex pane instead') |
 | `revise_handoff` | voice / rest | no | Rewrite a handoff's composed prompt (UNGATED co-authoring; increments revision_count) |
+| `revise_instruction` | voice | no | Revise the instruction envelope currently drafted for the operator's open pane — change the objective and/or add/replace operator-stated context, constraints,… |
 | `stage_handoff` | voice / rest | no | Freeze a handoff draft and mark it 'staged' (UNGATED; validates the target pane is live) |
 | `update_draft_prompt` | voice | no | Compose or refine the WIP draft prompt for the pane the operator currently has open, so they can review/edit and send it |
 
@@ -361,3 +366,4 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | --- | --- | --- | --- |
 | `dispatch_to_panes` | voice / rest | no | Send one instruction (raw text or a prompt template with slot values) to SEVERAL panes at once |
 | `propose_command` | voice | no | Direct work to the pane the operator currently has OPEN (the active pane) |
+| `send_instruction` | voice | no | Send the finished instruction draft for the operator's open pane to its agent |

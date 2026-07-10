@@ -236,6 +236,19 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // rest-only READ twin (the download route) — no voice twin BY DESIGN (voice never reads the body aloud).
   export_project: new Set<Surface>(["voice"]),
   get_project_export: new Set<Surface>(["rest"]),
+
+  // ── Phase 3 Step 3.3 instruction-envelope verbs (spec 2026-07-09-instruction-routing.md §5.3):
+  // voice-only by design. These compose/revise/route the CONVERSATIONAL instruction envelope for the
+  // operator's open pane — the typed/UI twin for the same intent is the EXISTING Workbench draft
+  // surface (WS draft_edit + PUT /api/panes/:p/:id/draft + POST /draft/send), which the convergence
+  // bridge (spec §5.2) keeps mutating the SAME per-pane exchange draft. A separate REST registry twin
+  // for each verb would be a redundant affordance (same reasoning as update_draft_prompt/focus_pane). ─
+  draft_instruction: new Set<Surface>(["voice"]),
+  revise_instruction: new Set<Surface>(["voice"]),
+  retarget_instruction: new Set<Surface>(["voice"]),
+  confirm_instruction: new Set<Surface>(["voice"]),
+  cancel_instruction: new Set<Surface>(["voice"]),
+  send_instruction: new Set<Surface>(["voice"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */
