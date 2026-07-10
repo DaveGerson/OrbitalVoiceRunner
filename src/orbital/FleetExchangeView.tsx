@@ -20,6 +20,7 @@ import type { AttentionItem, ExchangeDraftView, FleetExchangeSummary, PendingCom
 import { attentionResolveTarget } from "./useOrbitalDataHelpers";
 import {
   attentionApprovalsByPane, buildFleetRows, computeFleetCounters, sortFleetRows,
+  fleetRetryOffered, fleetCancelOffered,
   type FleetRow, type FleetRowKind,
 } from "./fleetExchangeOrdering";
 
@@ -164,10 +165,15 @@ function FleetCardActions({
   if (row.kind === "needs_input") {
     actions.push(btn("fleet-answer", "Answer", onOpen, true));
   }
-  if (row.kind === "failed" && row.exchangeId) {
+  // Phase 5.5 (release review): action offers key off the exchange's LIFECYCLE state, not the
+  // display kind — the "failed" chip covers both terminal `agent_failed` (never retryable; the
+  // service refuses it unconditionally) and `interrupted` (retryable via a follow-up draft), and
+  // Hold/cancel is only real for a cancellable (non-terminal) exchange. See fleetRetryOffered/
+  // fleetCancelOffered (fleetExchangeOrdering.ts) for the exact rules.
+  if (fleetRetryOffered(row)) {
     actions.push(btn("fleet-retry", "Retry", onRetry));
   }
-  if (row.exchangeId && row.kind !== "decision") {
+  if (fleetCancelOffered(row)) {
     actions.push(btn("fleet-cancel-exchange", "Hold / cancel", onCancelExchange));
   }
   actions.push(btn("fleet-open", "Open pane", onOpen));

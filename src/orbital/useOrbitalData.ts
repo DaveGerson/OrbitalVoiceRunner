@@ -2089,8 +2089,13 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     if (isMockModeRef.current) { showToast("Held it back.", "warn"); return; }
     try {
       const res = await apiFetch(`/api/exchanges/${exchangeId}/cancel`, { method: "POST" });
+      const body = await res.json().catch(() => null);
       if (!res.ok) throw new Error(`cancel ${res.status}`);
-      showToast("Held it back.", "warn");
+      // Phase 5.5 (release review): surface the SERVER's outcome text, not an unconditional
+      // "Held it back." — cancel_exchange returns 200 with an honest refusal message when the
+      // exchange settled first (a lost race / an already-terminal row), and the old fixed toast
+      // reported that refusal as success.
+      showToast(typeof body?.output === "string" ? body.output : "Held it back.", "warn");
       refetchFleetExchangeSummaries();
     } catch {
       showToast("That didn't go through, Chef — try again.", "warn");

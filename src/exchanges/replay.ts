@@ -97,10 +97,13 @@ function redactedPayload(json: string, redact: (s: string) => string): Record<st
 }
 
 /** Pull the first present free-text field off a redacted event payload, trying the field names this
- *  spine's various writers actually use (`clarification`/`detail`/`question`/`summary`) in priority
- *  order. `null` when none are present as non-empty strings — never fabricated. */
+ *  spine's various writers actually use (`clarification`/`detail`/`question`/`summary`, plus
+ *  `cause` — the `clarification_requested` payload key `ExchangeService.recordClarificationRequested`
+ *  writes and metrics.ts's countClarificationCauses reads; Phase 5.5 fix — replay used to render
+ *  those events with `text: null`, silently dropping the cause) in priority order. `null` when none
+ *  are present as non-empty strings — never fabricated. */
 function pickText(payload: Record<string, unknown>): string | null {
-  for (const key of ["clarification", "detail", "question", "summary"]) {
+  for (const key of ["clarification", "detail", "question", "summary", "cause"]) {
     const v = payload[key];
     if (typeof v === "string" && v.length > 0) return v;
   }

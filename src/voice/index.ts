@@ -203,13 +203,27 @@ function composeNarrationText(manager: OrchestratorManager, backgroundProjectId:
   return `In project '${projectName}', ${line.charAt(0).toLowerCase()}${line.slice(1)}`;
 }
 
+/** The three-way outcome of the exchange-aware narration decision (Phase 5.5 release-review fix —
+ *  this used to be a bare `string | null`, which conflated two different nulls):
+ *  - `narrate`  — speak/inject this enriched line;
+ *  - `fallback` — nothing exchange-specific to say; the caller uses formatPaneSignal(sig) as before;
+ *  - `suppress` — deliberately SILENT: a backgrounded project's non-exception outcome
+ *    (agent_complete) must reach the operator via that project's own resume/catch-up (the z5c
+ *    routing the 'inject' subscription already applies), NOT leak into the foreground session as a
+ *    plain "PANE STATUS UPDATE" context line — which is exactly what the old null-means-fallback
+ *    contract did despite this module's own doc claiming suppression. */
+export type ExchangeSignalNarration =
+  | { kind: "narrate"; text: string }
+  | { kind: "fallback" }
+  | { kind: "suppress" };
+
 /**
  * The decision core behind pushSignal's exchange-aware enrichment: EXACTLY-ONCE narration (the
  * ExchangeNarrationGate, keyed off the exchange's own durable `updatedAt`), background-project
  * exception routing (an exception crosses over named explicitly; a plain completion waits for that
- * project's own catch-up), and voice terseness (one clause, via terseExchangeOutcomeLine — shared
- * with the on-demand board in src/voice/sitrep.ts so both surfaces read identically). Returns null
- * for "nothing exchange-specific to say"; the caller falls back to formatPaneSignal(sig).
+ * project's own catch-up — now a REAL `suppress`, see ExchangeSignalNarration), and voice
+ * terseness (one clause, via terseExchangeOutcomeLine — shared with the on-demand board in
+ * src/voice/sitrep.ts so both surfaces read identically).
  */
 function buildExchangeAwareSignalText(
   manager: OrchestratorManager,
@@ -217,20 +231,22 @@ function buildExchangeAwareSignalText(
   sig: PaneSignal,
   snap: ExchangeSnapshot,
   exchangeId: string,
-): string | null {
+): ExchangeSignalNarration {
   const narrationClass = exchangeNarrationClass(snap.state);
-  if (!narrationClass) return null;
+  if (!narrationClass) return { kind: "fallback" };
 
   const paneProjectId = findPaneOwningProject(manager, sig.paneId)?.projectId ?? snap.projectId ?? null;
   const backgroundProjectId = backgroundProjectForSignal(sessionPool, paneProjectId);
-  if (backgroundProjectId && narrationClass !== "exception") return null;
+  if (backgroundProjectId && narrationClass !== "exception") return { kind: "suppress" };
 
-  if (!getExchangeNarrationGate().shouldNarrate(exchangeId, snap.state, snap.updatedAt)) return null;
+  // Already narrated this exact transition (same durable anchor): stay silent rather than degrade
+  // to the plain fallback — the fallback would re-announce the same settled edge in weaker words.
+  if (!getExchangeNarrationGate().shouldNarrate(exchangeId, snap.state, snap.updatedAt)) return { kind: "suppress" };
 
   const line = terseExchangeOutcomeLine(
     resolvePaneLabel(manager, paneProjectId, sig.paneId), snap.state, snap.terminalState, snap.resultSummary, redactSecrets,
   );
-  return line ? composeNarrationText(manager, backgroundProjectId, line) : null;
+  return line ? { kind: "narrate", text: composeNarrationText(manager, backgroundProjectId, line) } : { kind: "fallback" };
 }
 
 /** Phase 2 Step 2.5 review fix (the Step 2.4 documented switch_context mixed-brief bug): on a
@@ -2256,10 +2272,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         const READY_DEFER_MAX_MS = 10_000;
 
         // Phase 4, Step 4.2 — exchange-aware enrichment of a pane signal's spoken/context text.
-        // Returns null when there is nothing exchange-specific to say (spine off, no active
-        // exchange bound to this pane, an exchange state with no terse line, an already-narrated
-        // transition per the exactly-once gate, or a non-exception background-project event) — the
-        // caller falls back to the plain formatPaneSignal(sig) text exactly as before this step.
+        // Three-way decision (Phase 5.5 fix — see ExchangeSignalNarration's doc): `narrate` sends
+        // the enriched line; `fallback` (spine off, no active exchange bound to this pane, an
+        // exchange state with no terse line) sends the plain formatPaneSignal(sig) text exactly as
+        // before this step; `suppress` sends NOTHING — a backgrounded project's non-exception
+        // outcome (agent_complete) and an already-narrated transition (the exactly-once gate) are
+        // deliberately silent instead of degrading to a plain context line about another project's
+        // pane in the foreground session.
         //
         // VOICE TERSENESS: one clause (project + pane + outcome/question), never the full
         // instruction/evidence — that detail lives in the action panel / replay.
@@ -2272,18 +2291,18 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // catch_me_up are exchange-aware and query the durable store directly), mirroring the z5c
         // session-pool routing the 'inject' subscription below already applies to command-outcome
         // memory briefs.
-        const exchangeAwareSignalText = (sig: PaneSignal): string | null => {
-          if (!exchangeSpineActive() || !isNarratableSignalKind(sig.kind)) return null;
+        const exchangeAwareSignalDecision = (sig: PaneSignal): ExchangeSignalNarration => {
+          if (!exchangeSpineActive() || !isNarratableSignalKind(sig.kind)) return { kind: "fallback" };
           try {
             const svc = getExchangeService();
             const exchangeId = svc.activeExchangeForPane(sig.paneId);
-            if (!exchangeId) return null;
+            if (!exchangeId) return { kind: "fallback" };
             const snap = svc.get(exchangeId);
-            if (!snap) return null;
+            if (!snap) return { kind: "fallback" };
             return buildExchangeAwareSignalText(manager, sessionPool, sig, snap, exchangeId);
           } catch (e) {
             console.error("[voice] exchange-aware signal narration failed:", e);
-            return null;
+            return { kind: "fallback" };
           }
         };
 
@@ -2291,7 +2310,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // and every pane with no exchange correlation).
         const pushSignal = (sig: PaneSignal) => {
           try {
-            const text = exchangeAwareSignalText(sig) ?? formatPaneSignal(sig);
+            const decision = exchangeAwareSignalDecision(sig);
+            if (decision.kind === "suppress") return; // deliberately silent — never a plain-text leak
+            const text = decision.kind === "narrate" ? decision.text : formatPaneSignal(sig);
             justConnected.sendClientContent({
               turns: [{ role: "user", parts: [{ text }] }],
               turnComplete: false, // L1 fix: inject as passive context, not a forced spoken turn

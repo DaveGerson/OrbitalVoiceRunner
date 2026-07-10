@@ -102,8 +102,21 @@ test("resolveFocus: no response at all (daemon down) resolves null", async () =>
 test("resolveFocus: a hung daemon resolves null once the race timer fires (never rejects)", async () => {
   const core = makeFakeCore({ onRequest: () => "hang" });
   const client = createPythonPolicyClient(core, { timeoutMs: 10 });
-  const res = await client.resolveFocus("x", []);
-  assert.equal(res, null);
+  // The race timer is deliberately unref'd in production (policyClient.ts — a pending 300ms
+  // fallback timer must never hold the process open). Under `node --test`, when this await is the
+  // only pending work, an unref'd timer doesn't keep the event loop alive — the loop drains and
+  // node:test cancels this test (and everything queued behind it in the file) with "Promise
+  // resolution is still pending but the event loop has already resolved". Environment-timing
+  // dependent: reproduced deterministically in a quiet Linux container, invisible on a busier
+  // loop. A REF'D keep-alive timer for the await window fixes the harness physics without
+  // weakening the contract — the null still arrives via the unref'd race timer itself.
+  const keepAlive = setTimeout(() => { /* keep the event loop alive for the race window */ }, 5_000);
+  try {
+    const res = await client.resolveFocus("x", []);
+    assert.equal(res, null);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("rankSitrep: a valid ok:true response returns the ranking", async () => {

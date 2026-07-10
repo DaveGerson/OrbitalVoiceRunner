@@ -9,13 +9,17 @@
 // `durableDuplicatePaneCount`/`wrongPaneRefusals`/`approvalExactlyOnceSuccessRate`).
 //
 // EVENT-VOCABULARY CAVEATS worth reading before trusting a number here:
-//   - `target_resolved` and `clarification_requested` (src/exchanges/types.ts's ExchangeEventType
-//     union) are not fired by any producer in this codebase YET — `wrongTargetDeliveries` and
-//     `clarificationCauses` are fully implemented and tested against PLANTED fixture events, but will
-//     read as 0/empty against today's live traffic until a producer starts emitting them. This module
-//     defines the payload CONVENTION the first such producer must follow (see the per-metric doc
-//     comments below) so the report is ready the day that wiring lands, rather than needing a second
-//     redesign.
+//   - `target_resolved` and `clarification_requested` ARE live as of Phase 5.4 (this header used to
+//     say "no producer yet"; that is stale): every `createExchange` appends `target_resolved`
+//     (ExchangeService.persistCreate) and the dispatch clarify seam appends `clarification_requested`
+//     (recordClarificationRequested, called from src/voice/index.ts settleExchangeForDispatch). Two
+//     honest consequences, both documented at their producers: (a) `wrongTargetDeliveries` still
+//     reads 0 on live traffic — the payload's paneId is stamped from the row's own immutable
+//     pane_id, so a non-zero value means a future resolver bug diverged them (the metric is a live
+//     TRIPWIRE, not unwired); (b) `clarificationCauses` counts only POST-exchange clarifies — the
+//     target resolver's own pre-exchange "which pane did you mean" turn cannot carry an exchange
+//     event (exchange_events.exchange_id is NOT NULL; decision of record in
+//     docs/review/2026-07-10-release-validation-5.5.md).
 //   - `delivery_succeeded`/`delivery_failed` events do not carry `draft_version` in their payload
 //     today (`ExchangeService.completeDelivery`/`failDelivery` append them with no `opts.payload`) —
 //     `duplicateDeliveries` is therefore derived from EVENT ADJACENCY (two `delivery_succeeded`

@@ -31,6 +31,14 @@ export interface PruneOpts {
    *  honestly (replay.ts's detectDegradation) instead of leaving orphaned delivery rows pointing
    *  at pruned exchanges. */
   contextDeliveriesTtlDays?: number;
+  /** context_injections TTL in days (schema v10 cortex telemetry). Default 30 — closes the
+   *  pre-existing gap the Phase 5.4 security review reported-not-fixed (out of that review's
+   *  scope; Step 5.5 completes it): the table is append-only observability (hashes, dispositions,
+   *  counters, plus a bounded `error` string), written on every injection attempt, and had NO
+   *  retention anywhere. Same 30d posture as its v9 siblings (cortex_decision/gemini_turn_usage)
+   *  that it three-way-joins via inject_id — pruning all three on the same cadence keeps the join
+   *  honest instead of leaving orphaned halves. */
+  contextInjectionsTtlDays?: number;
 }
 
 /**
@@ -56,6 +64,15 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
   const arCutoff = opts.now - opts.archiveTtlDays * day;
   // Reclaim cutoff for deferred pending rows: anything expired MORE than the grace ago.
   const pendingCutoff = opts.now - PENDING_PRUNE_GRACE_MS;
+  // 30d-default cutoffs, precomputed OUTSIDE the transaction arrow (hoisting the `??` defaults
+  // via ttlCutoffMs keeps the tx body's cyclomatic count under the CC-10 gate as tables accrue).
+  const alCutoff = ttlCutoffMs(opts.now, opts.actionLogTtlDays);
+  const cdCutoff = ttlCutoffMs(opts.now, opts.cortexDecisionTtlDays);
+  const gtuCutoff = ttlCutoffMs(opts.now, opts.geminiTurnUsageTtlDays);
+  const ciCutoff = ttlCutoffMs(opts.now, opts.contextInjectionsTtlDays);
+  const eeCutoff = ttlCutoffMs(opts.now, opts.exchangeEventsTtlDays);
+  const exCutoff = ttlCutoffMs(opts.now, opts.exchangesTtlDays);
+  const cdelCutoff = ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays);
   const tx = db.transaction(() => {
     db.prepare("DELETE FROM events WHERE ts < ?").run(evCutoff);          // triggers keep events_fts in sync
     db.prepare("DELETE FROM panes_archive WHERE archived_at < ?").run(arCutoff);
@@ -74,19 +91,24 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     db.prepare("DELETE FROM pending_approvals WHERE claimed=1").run();
     // 4E.3c: action_log had NO retention at all. TTL default 30d — see ACTION_LOG_TTL_DAYS
     // for why that is safely above the PLM4 idempotency replay window.
-    db.prepare("DELETE FROM action_log WHERE ts < ?").run(opts.now - (opts.actionLogTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+    db.prepare("DELETE FROM action_log WHERE ts < ?").run(alCutoff);
     // B-3 measurement spine: cortex_decision + gemini_turn_usage are append-only observability
     // tables with no replay requirement — 30d TTL keeps enough history for trend analysis while
     // bounding unbounded growth. Only runs if the tables exist (v9+ DB).
     try {
-      db.prepare("DELETE FROM cortex_decision WHERE ts < ?").run(opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
-      db.prepare("DELETE FROM gemini_turn_usage WHERE ts < ?").run(opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+      db.prepare("DELETE FROM cortex_decision WHERE ts < ?").run(cdCutoff);
+      db.prepare("DELETE FROM gemini_turn_usage WHERE ts < ?").run(gtuCutoff);
     } catch { /* pre-v9 DB: tables absent, skip */ }
+    // Cortex context-injection telemetry (schema v10): same append-only posture and 30d TTL as
+    // the v9 pair it joins via inject_id. Own guard — a v9 DB has cortex_decision but not this.
+    try {
+      db.prepare("DELETE FROM context_injections WHERE ts < ?").run(ciCutoff);
+    } catch { /* pre-v10 DB: table absent, skip */ }
     // AgentExchange spine (schema v12): exchange_events is append-only like action_log/
     // cortex_decision, so it gets the same bounded TTL. Guarded for the same reason as the B-3
     // pair above — a pre-v12 DB (tables absent) must not fail the whole boot-prune transaction.
     try {
-      db.prepare("DELETE FROM exchange_events WHERE ts < ?").run(opts.now - (opts.exchangeEventsTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+      db.prepare("DELETE FROM exchange_events WHERE ts < ?").run(eeCutoff);
     } catch { /* pre-v12 DB: table absent, skip */ }
     // Phase 5.4 security review: TERMINAL agent_exchanges head rows + context_deliveries get the
     // same bounded TTL (see the PruneOpts doc comments for the exact scope — in-flight and
@@ -95,8 +117,8 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     try {
       db.prepare(
         "DELETE FROM agent_exchanges WHERE state IN ('agent_complete','agent_failed','cancelled') AND updated_at < ?"
-      ).run(opts.now - (opts.exchangesTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
-      db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(opts.now - (opts.contextDeliveriesTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+      ).run(exCutoff);
+      db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(cdelCutoff);
     } catch { /* pre-v12 DB: tables absent, skip */ }
   });
   tx();
@@ -143,6 +165,8 @@ export interface SweepOpts {
   exchangesTtlDays?: number;
   /** context_deliveries TTL in days (schema v12, Phase 5.4). Default 30 — see PruneOpts. */
   contextDeliveriesTtlDays?: number;
+  /** context_injections TTL in days (schema v10, Phase 5.5). Default 30 — see PruneOpts. */
+  contextInjectionsTtlDays?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
 }
@@ -213,6 +237,13 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM gemini_turn_usage WHERE id IN (SELECT id FROM gemini_turn_usage WHERE ts < ? ORDER BY id LIMIT ?)",
       [gtuCutoff]);
   } catch { /* pre-v9 DB: tables absent, skip */ }
+  // Cortex context-injection telemetry (schema v10, Phase 5.5): same batched pattern, own
+  // try/catch so a pre-v10 DB (table absent) doesn't fail the whole sweep tick.
+  try {
+    step("context_injections",
+      "DELETE FROM context_injections WHERE id IN (SELECT id FROM context_injections WHERE ts < ? ORDER BY rowid LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.contextInjectionsTtlDays)]);
+  } catch { /* pre-v10 DB: table absent, skip */ }
   // AgentExchange spine (schema v12): same batched-append-only pattern, own try/catch so a
   // pre-v12 DB (table absent) doesn't fail the whole sweep tick.
   try {

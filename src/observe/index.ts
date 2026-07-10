@@ -80,8 +80,9 @@ function activeExchangeForPane(terminalId: string): string | undefined {
 }
 
 /** Feed one observed pane signal to the exchange correlator (advances the active exchange's own
- *  lifecycle — terminal_running/terminal_quiescing/terminal_idle/needs_input_detected/
- *  agent_failure_reported; a no-op when there is no active exchange on this pane). */
+ *  lifecycle — terminal_running/terminal_idle/needs_input_detected/agent_failure_reported; a
+ *  `quiescing` signal is advisory-only per spec §1.4 and never reaches the machine; a no-op when
+ *  there is no active exchange on this pane). */
 function settleExchangeSignal(terminalId: string, kind: PaneSignalKind, detail?: string): void {
   if (!exchangeSpineActive()) return;
   try {

@@ -53,6 +53,7 @@ import { getHistoryBridge } from "../../historyBridge";
 import { findPaneOwningProject } from "../../paneOwnership";
 import { respawnFromLedger } from "../respawnFromLedger";
 import { withPaneLifecycleLock } from "../../lifecycleLock";
+import { exchangeSpineActive, getExchangeService } from "../../exchanges/spine";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HistoryManager re-derivation (faithful port of server.ts:129-217 load/save/add).
@@ -286,6 +287,17 @@ export const sendKeys: ActionDef<typeof SendKeysParams> = {
     // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
     const sendEffect = (): string => {
       addCommand(ctx, id, command);
+      // AgentExchange spine, Phase 5.5 (the 4.5 review's "recordManualCommand has zero call
+      // sites" finding): send_keys is THE manual-write seam — the one gated write path that
+      // deliberately carries NO exchange (spine spec §5: legacy/manual entries stay
+      // exchange_id-less forever, never adopted). Record it so the correlator's per-pane command
+      // log stays a faithful ordered history (exchangeId: null by contract; the call never
+      // touches the pane's active-exchange binding — pinned by tests/test_exchange_correlation.ts
+      // "manual writes on the pane do not advance the exchange lifecycle"). Best-effort, in-memory
+      // bookkeeping only; guarded so a spine fault can never block the operator's keystroke.
+      if (exchangeSpineActive()) {
+        try { getExchangeService().recordManualCommand(id, command); } catch { /* never blocks the write */ }
+      }
       term.writeInput(command);
       ctx.broadcastLedgerUpdate();
       return `Command successfully dispatched to terminal ${id}.`;

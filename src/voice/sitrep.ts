@@ -65,6 +65,13 @@ export interface ExchangeBoardItem {
 const BOARD_TEXT_CAP = 160;
 const DECISION_WINDOW_MS = 30 * 60 * 1000; // 30 minutes — "relevant RECENT decisions" only
 const MAX_DECISION_ITEMS = 3;
+/** Phase 5.5 (the 4.5 review's B11 finding): tier-3 completions are WINDOWED, mirroring tier 6's
+ *  DECISION_WINDOW_MS rationale — "delivered exchanges with a meaningful result" means RECENT
+ *  results. Unwindowed, every terminal `agent_complete` row (retained up to the 30-DAY store TTL,
+ *  src/store/retention.ts) re-surfaced on every single SITREP until pruned. A completion older
+ *  than this window falls off the spoken board; its durable record stays reachable via replay /
+ *  the attention queue / catch_me_up's own away-window filter (src/actions/defs/catchup.ts). */
+export const COMPLETION_WINDOW_MS = 30 * 60 * 1000;
 
 function capBoardText(s: string, max: number = BOARD_TEXT_CAP): string {
   return s.length > max ? s.slice(0, max) : s;
@@ -207,6 +214,7 @@ function gatherExchangeStoreItems(ctx: ActionContext, store: NonNullable<ActionC
   for (const ex of safeList(() => store.listExchangesByStates(["needs_input"]))) items.push(needsInputItem(ctx, ex));
   for (const ex of safeList(() => store.listExchangesByStates(["agent_failed", "interrupted"]))) items.push(failedItem(ctx, ex));
   for (const ex of safeList(() => store.listExchangesByStates(["agent_complete"]))) {
+    if (ex.updated_at < now - COMPLETION_WINDOW_MS) continue; // B11: recent results only (see COMPLETION_WINDOW_MS)
     const it = completeItem(ctx, ex);
     if (it) items.push(it);
   }
@@ -322,12 +330,39 @@ function newExchangeAttentionItem(
   };
 }
 
+/** Phase 5.5 (the 4.5 review's B11 finding): COMPLETION attention items are minted exactly once
+ *  per (exchange_id, updated_at) anchor for the process lifetime — the ExchangeNarrationGate's
+ *  derived-anchor idea (src/announcementBus.ts) applied to the attention mint. Without it, a
+ *  completion whose attention item was dismissed or TTL-pruned (pruneAttentionQueue) was re-minted
+ *  by the very next board sync, nagging forever. Scoped to `complete` ONLY: needs_input/failed are
+ *  the operator's OUTSTANDING backlog, and their dismiss-then-re-push behavior is pinned intended
+ *  (tests/test_exchange_notifications.ts "a DISMISSED prior item does not block a fresh push") —
+ *  an unanswered question should keep resurfacing; a finished result should not. A NEW completion
+ *  on the same exchange (a fresh transition ⇒ fresh updated_at) is a fresh anchor, minted again. */
+const mintedCompletionAnchors = new Set<string>();
+
+/** Test-only reset — mirrors resetExchangeNarrationGateForTests (src/announcementBus.ts). */
+export function resetCompletionAttentionMintMemoryForTests(): void {
+  mintedCompletionAnchors.clear();
+}
+
+/** True when this completion board item's (exchange, updated_at) anchor was already minted once —
+ *  and remembers it, so every later sync of the SAME settled completion is a no-op. */
+function completionAlreadyMinted(item: ExchangeBoardItem): boolean {
+  if (item.kind !== "complete") return false;
+  const key = `${item.exchangeId} ${item.updatedAt}`;
+  if (mintedCompletionAnchors.has(key)) return true;
+  mintedCompletionAnchors.add(key);
+  return false;
+}
+
 export function syncExchangeAttentionItems(ctx: ActionContext, board: ExchangeBoardItem[], now: number): void {
   const queue = ctx.manager.attentionQueue;
   if (!queue) return;
   for (const item of board) {
     const type = item.exchangeId ? attentionTypeForBoardItem(item) : null;
     if (!type || !item.exchangeId) continue;
+    if (completionAlreadyMinted(item)) continue;
     if (attentionAlreadyCovers(queue, item.exchangeId, type)) continue;
     queue.push(newExchangeAttentionItem(ctx, item, type, now));
   }

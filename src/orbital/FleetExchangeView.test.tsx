@@ -159,19 +159,36 @@ describe('FleetExchangeView — exception lane rendering', () => {
     expect(screen.getByTestId('fleet-exception-card')).toHaveAttribute('data-kind', 'approval');
   });
 
-  it('shows a failed/interrupted exchange with Retry, and Retry fires onRetry with the exchange id', async () => {
+  it('shows an INTERRUPTED exchange with Retry, and Retry fires onRetry with the exchange id', async () => {
     const user = userEvent.setup();
     const onRetry = vi.fn();
     render(
       <FleetExchangeView {...baseProps({
         stations: [stn('p1', 'Exited')],
-        exchangeSummaries: { p1: summary({ resultSummary: null }) },
+        exchangeSummaries: { p1: summary({ resultSummary: null, state: 'interrupted' }) },
         onRetry,
       })} />,
     );
     const card = screen.getByTestId('fleet-exception-card');
     await user.click(within(card).getByTestId('fleet-retry'));
     expect(onRetry).toHaveBeenCalledWith('exch_1');
+  });
+
+  // Phase 5.5 (release review): quick actions key off the LIFECYCLE state, not the display kind —
+  // the service refuses a retry of terminal `agent_failed` unconditionally and a cancel of any
+  // terminal row, so the card must never offer them (they were guaranteed-refused buttons before).
+  it('a terminal agent_failed exchange shows NO Retry and NO Hold/cancel (both would always be refused)', () => {
+    render(
+      <FleetExchangeView {...baseProps({
+        stations: [stn('p1', 'Exited')],
+        exchangeSummaries: { p1: summary({ state: 'agent_failed' }) },
+      })} />,
+    );
+    const card = screen.getByTestId('fleet-exception-card');
+    expect(card).toHaveAttribute('data-kind', 'failed');
+    expect(within(card).queryByTestId('fleet-retry')).toBeNull();
+    expect(within(card).queryByTestId('fleet-cancel-exchange')).toBeNull();
+    expect(within(card).getByTestId('fleet-open')).toBeInTheDocument();
   });
 
   it('renders last meaningful result and age when the summary carries them', () => {
@@ -202,7 +219,7 @@ describe('FleetExchangeView — exception lane rendering', () => {
     render(
       <FleetExchangeView {...baseProps({
         stations: [stn('p1', 'Needs Input')],
-        exchangeSummaries: { p1: summary({ tier: 1, kind: 'needs_input', exchangeId: 'exch_hold' }) },
+        exchangeSummaries: { p1: summary({ tier: 1, kind: 'needs_input', state: 'needs_input', exchangeId: 'exch_hold' }) },
         onCancelExchange,
       })} />,
     );

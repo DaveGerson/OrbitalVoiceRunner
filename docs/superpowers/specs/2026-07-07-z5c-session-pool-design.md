@@ -6,6 +6,17 @@ Operator-approved design (2026-07-07 brainstorm) for `wsm-e2e-pinned-z5c`
 
 - **Date:** 2026-07-07
 - **Status:** Approved (operator, brainstorm 2026-07-07; spec review waived by operator).
+  **Implementation status as of 2026-07-10 (Phase 5.5 release review — honest accounting):**
+  Slice 1 (delivery classes, 1d6w) and Slice 2 (handle tier: per-project KV handles,
+  resume-and-catch-up switching, legacy handle migration) are SHIPPED. Slice 3 is **partially
+  shipped**: the DECISION layer landed (`src/voice/sessionPool.ts` — D2 entry state machine,
+  D4 switch plans, D6 `pool.plan` + TS fail-closed floor, D7 `sessionPoolHotSlots` config,
+  `python/policies` pool op), but the PHYSICAL hot-warm socket execution (multiple concurrent
+  live Gemini sockets, background feeding) is **deferred** — the runtime remains
+  single-physical-socket; `hot-warm` is a planned state the executor does not yet realize, and
+  a backgrounded project's inject-class events are dropped-not-queued (D6) with `lastEventAtMs`
+  bookkeeping for catch-up. `sessionPoolHotSlots` > 1 therefore shapes plans, not sockets.
+  See `docs/runbooks/communication-cockpit-operations.md` §5 (known limitations).
 - **Related:** parent spec `docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md`
   (deferred item 5) · cutover spec `docs/superpowers/specs/2026-07-02-cortex-cutover-design.md`
   (D8 deferral) · seam ADR `docs/design/2026-06-19-python-ts-seam.md` ·

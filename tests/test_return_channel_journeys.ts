@@ -600,6 +600,43 @@ describe("return-channel journeys (real server, real observation pipeline, real 
   });
 
   // ═════════════════════════════════════════════════════════════════════════════════════════════
+  // Phase 5.5 (release review): the z5c routing contract for a BACKGROUNDED project's non-exception
+  // outcome is now a REAL suppression (src/voice/index.ts ExchangeSignalNarration) — the module doc
+  // always claimed "a plain 'complete' for a backgrounded project is deferred to that project's own
+  // catch-up", but the old null-means-fallback plumbing leaked it into the foreground session as a
+  // plain "PANE STATUS UPDATE" context line anyway. This journey pins the fixed behavior end to
+  // end: nothing (enriched OR plain) reaches the live session; the completion is durably settled
+  // and surfaces on catch_me_up.
+  describe("journey 13: a BACKGROUNDED project's completion is silent in the foreground session — and surfaces on catch-up", () => {
+    it("agent_complete on backgrounded rcj-proj-a -> no narration, no plain PANE STATUS UPDATE leak; catch_me_up still reports it", async () => {
+      const pane = "rcj-j13";
+      makePane(running, pane, "rcj-proj-a"); // journey 9 backgrounded rcj-proj-a (foreground is rcj-proj-b)
+      const id = deliverExchange(pane, "rcj-proj-a", "roll the archive logs");
+      running.manager.onRunning!(pane);
+      assert.strictEqual(svc.get(id)!.state, "running");
+      await sleep(PAST_COOLDOWN_MS); // past the bus's cross-kind cooldown so the idle publish genuinely reaches pushSignal
+
+      const idx = session.clientContents.length;
+      (running.manager.terminals as any)[pane].status = "Idle";
+      seedHistory(pane, "roll the archive logs", JSON.stringify({
+        exchange_id: id, status: "complete", summary: "archives rolled, 2 files pruned",
+      }), "rolled");
+      await running.manager.onIdle!(pane);
+
+      assert.strictEqual(store().getExchange(id)!.state, "agent_complete", "the completion settled durably");
+      // The foreground session hears NOTHING about it — neither the enriched line nor the plain
+      // context fallback (the pre-fix leak this journey exists to pin).
+      assert.deepStrictEqual(exchangeNarrationsSince(session, idx), [], "no enriched completion narration crosses over from a backgrounded project");
+      const plainLeak = clientTextsSince(session, idx).filter((t) => t.startsWith("PANE STATUS UPDATE") && t.includes(pane));
+      assert.deepStrictEqual(plainLeak, [], "the suppression is real — no plain PANE STATUS UPDATE leak about the backgrounded pane");
+
+      // Deferred, not lost: the operator's own pull-based catch-up reports the result.
+      const digest = await callTool("catch_me_up", { window_minutes: 30 });
+      assert.ok(digest.includes("archives rolled, 2 files pruned"), `catch_me_up must surface the backgrounded completion: ${digest}`);
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════════════════════════════════
   // Journey 7 runs LAST in this shared-server battery: it exercises the exchange-agnostic scenario
   // of "an exchange got interrupted, a follow-up was minted, a stale report for the ORIGINAL
   // arrives late" purely against the store/service (no timing dependency), but to keep every OTHER

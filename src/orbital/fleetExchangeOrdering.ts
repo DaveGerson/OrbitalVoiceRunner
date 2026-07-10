@@ -44,8 +44,39 @@ export interface FleetRow {
   lastResult: string | null;
   /** The exchange this row correlates to (retry/cancel target), or null when there is none. */
   exchangeId: string | null;
+  /** The exchange's durable lifecycle state (FleetExchangeSummary.state), or null when this row's
+   *  exchangeId came from an open draft view / there is no durable summary. Phase 5.5 (release
+   *  review): the quick-action offers below key off THIS, not off the display `kind` — `kind`
+   *  collapses `agent_failed` (terminal, never retryable) and `interrupted` (retryable via a
+   *  follow-up draft) into one "failed" chip, which made the card offer a Retry the service
+   *  refuses unconditionally (src/exchanges/recoveryActions.ts classifyRetryEligibility). */
+  exchangeState: string | null;
   /** Epoch ms this row's underlying signal last changed, or null when unknown (no durable summary). */
   updatedAt: number | null;
+}
+
+// ── quick-action offers (Phase 5.5 — keyed to the lifecycle's legal-transition table) ───────────
+
+/** The three terminal states (mirrors src/exchanges/lifecycle.ts TERMINAL_STATES — duplicated as
+ *  literals here because src/orbital/** deliberately never imports from src/exchanges/**, the same
+ *  client/server boundary OpenDraftView/ExchangeDraftView already keep). */
+const TERMINAL_EXCHANGE_STATES: ReadonlySet<string> = new Set(["agent_complete", "agent_failed", "cancelled"]);
+
+/** Offer Retry ONLY for a state the recovery action will actually accept from a fleet card:
+ *  `interrupted` (→ a new follow-up draft, recoveryActions.ts's new_exchange leg). A terminal
+ *  `agent_failed` row is never retryable (the service refuses it unconditionally); a
+ *  `draft`-after-delivery_failed same-exchange retry needs the event timeline to prove the failure,
+ *  which this projection deliberately does not carry — that leg stays reachable via REST/inspect. */
+export function fleetRetryOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState">): boolean {
+  return row.exchangeId != null && row.exchangeState === "interrupted";
+}
+
+/** Offer Hold/cancel only when the exchange is actually cancellable: every state except the three
+ *  terminal ones (lifecycle CANCELLABLE_STATES). A null exchangeState (an open draft view with no
+ *  durable summary) stays offered — an open draft is always cancellable. */
+export function fleetCancelOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState" | "kind">): boolean {
+  if (!row.exchangeId || row.kind === "decision") return false;
+  return row.exchangeState == null || !TERMINAL_EXCHANGE_STATES.has(row.exchangeState);
 }
 
 /** A held approval this row can act on directly (Approve/Deny) — either source below projects to
@@ -116,6 +147,7 @@ function baseRow(station: Station, draft: ExchangeDraftView | null | undefined):
     station,
     instructionSummary: cap(draft?.objective || station.scribble || null),
     exchangeId: draft?.exchangeId ?? null,
+    exchangeState: null,
     updatedAt: null,
   };
 }
@@ -139,6 +171,9 @@ function approvalRow(
     pendingApproval: { messageId: approval.messageId, summary: cap(approval.summary) ?? approval.summary },
     lastResult: null,
     exchangeId: summary?.exchangeId ?? draft?.exchangeId ?? null,
+    // The state must follow the same source as the id it describes (summary first, else null —
+    // a draft-view id has no durable state to report).
+    exchangeState: summary?.exchangeId ? summary.state : null,
     updatedAt: summary?.updatedAt ?? null,
   };
 }
@@ -155,6 +190,7 @@ function summaryRow(station: Station, summary: FleetExchangeSummary, draft: Exch
     pendingApproval: null,
     lastResult: cap(summary.resultSummary),
     exchangeId: summary.exchangeId,
+    exchangeState: summary.state,
     updatedAt: summary.updatedAt,
   };
 }

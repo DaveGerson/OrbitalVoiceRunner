@@ -15,6 +15,8 @@ import {
   buildFleetRow,
   buildFleetRows,
   computeFleetCounters,
+  fleetCancelOffered,
+  fleetRetryOffered,
   sortFleetRows,
   type FleetRowInputs,
 } from "../src/orbital/fleetExchangeOrdering";
@@ -257,5 +259,47 @@ describe("computeFleetCounters", () => {
 
   it("empty board: all zero", () => {
     assert.deepEqual(computeFleetCounters([]), { total: 0, needsYou: 0, running: 0 });
+  });
+});
+
+// ── Phase 5.5 (release review): quick-action offers key off the LIFECYCLE state ────────────────
+//
+// The display `kind` collapses terminal `agent_failed` and recoverable `interrupted` into one
+// "failed" chip; offers must instead follow what the recovery actions will actually accept
+// (src/exchanges/recoveryActions.ts: retry -> interrupted only from a fleet card; cancel -> any
+// non-terminal state).
+describe("fleetRetryOffered / fleetCancelOffered — lifecycle-consistent quick actions", () => {
+  it("retry is offered ONLY for an interrupted exchange", () => {
+    const row = (state: string) =>
+      buildFleetRow(stn("p1", "Exited"), { summaryByPane: { p1: summary({ state: state as FleetExchangeSummary["state"], tier: 2, kind: "failed" }) } });
+    assert.equal(fleetRetryOffered(row("interrupted")), true);
+    assert.equal(fleetRetryOffered(row("agent_failed")), false, "terminal — the service refuses it unconditionally");
+    assert.equal(fleetRetryOffered(row("running")), false, "not provably failed yet");
+    assert.equal(fleetRetryOffered({ exchangeId: null, exchangeState: "interrupted" }), false, "no exchange id -> nothing to retry");
+  });
+
+  it("cancel is offered for cancellable (non-terminal) states and refused for terminal ones", () => {
+    const row = (state: string, kind: FleetExchangeSummary["kind"] = "failed") =>
+      buildFleetRow(stn("p1", "Exited"), { summaryByPane: { p1: summary({ state: state as FleetExchangeSummary["state"], tier: 2, kind }) } });
+    assert.equal(fleetCancelOffered(row("interrupted")), true);
+    assert.equal(fleetCancelOffered(row("needs_input", "needs_input")), true);
+    assert.equal(fleetCancelOffered(row("running", "running")), true);
+    assert.equal(fleetCancelOffered(row("agent_failed")), false, "already settled — nothing to cancel");
+    assert.equal(fleetCancelOffered(row("agent_complete", "complete")), false);
+    assert.equal(fleetCancelOffered(row("cancelled", "decision")), false, "decision kind is never actionable");
+  });
+
+  it("a draft-view-derived exchange id (no durable summary) still offers cancel — an open draft is cancellable", () => {
+    const row = buildFleetRow(stn("p1", "Needs Input"), { exchangeByPane: { p1: draft() } });
+    assert.equal(row.exchangeState, null);
+    assert.equal(fleetCancelOffered(row), true);
+    assert.equal(fleetRetryOffered(row), false, "a draft is sent normally, never retried from the fleet card");
+  });
+
+  it("buildFleetRow stamps exchangeState from the durable summary and null elsewhere", () => {
+    const withSummary = buildFleetRow(stn("p1", "Running"), { summaryByPane: { p1: summary({ state: "interrupted", tier: 2, kind: "failed" }) } });
+    assert.equal(withSummary.exchangeState, "interrupted");
+    const fallback = buildFleetRow(stn("p2", "Exited"), {});
+    assert.equal(fallback.exchangeState, null);
   });
 });

@@ -90,11 +90,15 @@ test.describe("Orbital Kitchen — Fleet View exceptions (Phase 5.1)", () => {
     await expect(page.locator(`[data-testid="station-card"][data-pane-id="${MOCK_TERMINAL_ID_2}"]`)).toContainText("active");
   });
 
-  test("a failed exchange offers Retry, which honestly cannot confirm the outcome in this harness", async ({ page }) => {
+  // Phase 5.5 (release review): quick actions key off the LIFECYCLE state, not the display kind.
+  // Retry is offered only for an INTERRUPTED exchange (the one state the recovery action accepts
+  // from a fleet card — a terminal agent_failed retry is refused unconditionally by the service,
+  // so the card no longer offers it).
+  test("an interrupted exchange offers Retry, which honestly cannot confirm the outcome in this harness", async ({ page }) => {
     await gotoKitchen(page);
     await injectFleetSummary(page, {
       [MOCK_TERMINAL_ID]: {
-        exchangeId: "exch_fail1", state: "agent_failed", tier: 2, kind: "failed",
+        exchangeId: "exch_fail1", state: "interrupted", tier: 2, kind: "failed",
         instructionSummary: "deploy the release", waitingReason: null, resultSummary: null,
         updatedAt: Date.now(),
       },
@@ -106,11 +110,27 @@ test.describe("Orbital Kitchen — Fleet View exceptions (Phase 5.1)", () => {
     await expect(page.getByTestId("toast")).toContainText("can't confirm");
   });
 
+  test("a terminal agent_failed exchange offers neither Retry nor Hold/cancel (both would be refused by the lifecycle)", async ({ page }) => {
+    await gotoKitchen(page);
+    await injectFleetSummary(page, {
+      [MOCK_TERMINAL_ID]: {
+        exchangeId: "exch_dead", state: "agent_failed", tier: 2, kind: "failed",
+        instructionSummary: "deploy the release", waitingReason: null, resultSummary: null,
+        updatedAt: Date.now(),
+      },
+    });
+    const card = page.getByTestId("fleet-exception-card");
+    await expect(card).toHaveAttribute("data-kind", "failed");
+    await expect(card.getByTestId("fleet-retry")).toHaveCount(0);
+    await expect(card.getByTestId("fleet-cancel-exchange")).toHaveCount(0);
+    await expect(card.getByTestId("fleet-open")).toBeVisible(); // navigation always remains
+  });
+
   test("Hold/cancel dismisses a live exchange", async ({ page }) => {
     await gotoKitchen(page);
     await injectFleetSummary(page, {
       [MOCK_TERMINAL_ID]: {
-        exchangeId: "exch_c1", state: "agent_failed", tier: 2, kind: "failed",
+        exchangeId: "exch_c1", state: "interrupted", tier: 2, kind: "failed",
         instructionSummary: null, waitingReason: null, resultSummary: null, updatedAt: Date.now(),
       },
     });

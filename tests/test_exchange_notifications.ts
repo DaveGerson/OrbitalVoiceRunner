@@ -20,6 +20,8 @@ import {
   renderExchangeBoard,
   terseExchangeOutcomeLine,
   syncExchangeAttentionItems,
+  resetCompletionAttentionMintMemoryForTests,
+  COMPLETION_WINDOW_MS,
   type ExchangeBoardItem,
 } from "../src/voice/sitrep";
 import { ExchangeNarrationGate, getExchangeNarrationGate, resetExchangeNarrationGateForTests } from "../src/announcementBus";
@@ -178,6 +180,28 @@ describe("composeExchangeBoard + rankExchangeBoard — priority ordering", () =>
     store.close();
   });
 
+  // Phase 5.5 (4.5 review B11): tier-3 completions are WINDOWED — an old completion falls off the
+  // spoken board instead of re-surfacing on every SITREP until the 30-day store TTL prunes it.
+  it("a completion older than COMPLETION_WINDOW_MS is excluded from the board; a recent one stays", () => {
+    const store = freshStore();
+    const now = 1_000_000_000;
+    seedExchange(store, { project_id: "proj-1", pane_id: "p-stale", state: "agent_complete", result_summary: "old result", updated_at: now - COMPLETION_WINDOW_MS - 1 });
+    seedExchange(store, { project_id: "proj-1", pane_id: "p-recent", state: "agent_complete", result_summary: "fresh result", updated_at: now - 1000 });
+    const ctx = makeCtx({ store });
+    const board = composeExchangeBoard(ctx, now);
+    assert.deepStrictEqual(board.map((i) => i.paneId), ["p-recent"], "only the recent completion surfaces");
+    store.close();
+  });
+
+  it("an ONLY-stale-completions world composes an empty board (callers fall back to the legacy pipeline)", () => {
+    const store = freshStore();
+    const now = 1_000_000_000;
+    seedExchange(store, { project_id: "proj-1", pane_id: "p-stale", state: "agent_complete", result_summary: "old result", updated_at: now - COMPLETION_WINDOW_MS - 1 });
+    const ctx = makeCtx({ store });
+    assert.deepStrictEqual(composeExchangeBoard(ctx, now), []);
+    store.close();
+  });
+
   it("within a tier, items sort newest-updated first", () => {
     const store = freshStore();
     const now = 1_000_000;
@@ -256,6 +280,25 @@ describe("syncExchangeAttentionItems", () => {
     syncExchangeAttentionItems(ctx, [item], 5000);
     assert.strictEqual(queue.length, 2);
     assert.strictEqual(queue[1].dismissed, false);
+  });
+
+  // Phase 5.5 (4.5 review B11): COMPLETION items are minted exactly once per (exchange, updated_at)
+  // anchor — a dismissed/TTL-pruned "finished" item is never re-minted for the same settled result,
+  // while a genuinely NEW completion (fresh updated_at) still mints fresh.
+  it("a COMPLETION whose item was dismissed or pruned is NOT re-minted for the same updated_at anchor", () => {
+    resetCompletionAttentionMintMemoryForTests();
+    const queue: any[] = [];
+    const ctx = makeCtx({ attentionQueue: queue });
+    const item: ExchangeBoardItem = { tier: 3, kind: "complete", exchangeId: "ex-done", paneId: "p1", projectId: "proj-1", text: "Pane 'p1' finished: ok", updatedAt: 42_000 };
+    syncExchangeAttentionItems(ctx, [item], 50_000);
+    assert.strictEqual(queue.length, 1, "first sync mints");
+    queue.length = 0; // TTL prune / dismissal-sweep removed it entirely
+    syncExchangeAttentionItems(ctx, [item], 60_000);
+    assert.strictEqual(queue.length, 0, "same settled completion never re-mints");
+    // A NEW completion on the same exchange (fresh transition => fresh updated_at) mints again.
+    syncExchangeAttentionItems(ctx, [{ ...item, updatedAt: 99_000 }], 70_000);
+    assert.strictEqual(queue.length, 1, "a fresh anchor is a fresh mint");
+    resetCompletionAttentionMintMemoryForTests();
   });
 });
 

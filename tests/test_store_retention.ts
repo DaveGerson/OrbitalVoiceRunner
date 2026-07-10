@@ -59,3 +59,41 @@ test("pruneOnBoot sweeps claimed + expired pending_actions, keeps the live one",
   assert.equal(s.getExpiredActions(now).length, 0, "no expired unclaimed rows remain at boot time");
   s.close();
 });
+
+// Phase 5.5: context_injections TTL — the pre-existing gap the 5.4 security review reported
+// (schema v10 telemetry had no retention anywhere). Same 30d default as its v9 join siblings.
+const mkInjection = (id: string, ts: number) => ({
+  id, ts,
+  session_id: null, interaction_id: null, inject_id: null,
+  trigger: "session_start" as const,
+  active_project_id: null, active_pane_id: null, brief_active_pane_id: null,
+  source: "fallback" as const, disposition: "injected" as const,
+  skipped_reason: null, source_snapshot_hash: null, brief_hash: null,
+  brief_chars: 0, estimated_tokens: 0, elapsed_ms: null, error: null,
+});
+
+test("pruneOnBoot sweeps context_injections past the 30d TTL, keeps fresh rows", () => {
+  const s = new JanusStore(":memory:"); s.init();
+  const now = 1_000_000_000_000;
+  const day = 86_400_000;
+  s.recordContextInjection(mkInjection("old-inj", now - 100 * day));
+  s.recordContextInjection(mkInjection("fresh-inj", now - 1 * day));
+  s.bootMaintenance({ now, eventsTtlDays: 90, archiveTtlDays: 30, scrollbackDirs: [] });
+  const remaining = s.getContextInjections().map((r) => r.id);
+  assert.deepEqual(remaining, ["fresh-inj"], "old telemetry row pruned, fresh kept");
+  s.close();
+});
+
+test("sweepMaintenance batches context_injections and reports `more` at the batch cap", () => {
+  const s = new JanusStore(":memory:"); s.init();
+  const now = 1_000_000_000_000;
+  const day = 86_400_000;
+  for (let i = 0; i < 3; i++) s.recordContextInjection(mkInjection(`inj-${i}`, now - 100 * day));
+  const first = s.sweepMaintenance({ now, eventsTtlDays: 90, archiveTtlDays: 30, batchLimit: 1 });
+  assert.equal(first.deleted["context_injections"], 1, "one row per tick at batchLimit=1");
+  assert.equal(first.more, true, "backlog remains");
+  s.sweepMaintenance({ now, eventsTtlDays: 90, archiveTtlDays: 30, batchLimit: 1 });
+  s.sweepMaintenance({ now, eventsTtlDays: 90, archiveTtlDays: 30, batchLimit: 1 });
+  assert.equal(s.getContextInjections().length, 0, "backlog drains over ticks");
+  s.close();
+});
