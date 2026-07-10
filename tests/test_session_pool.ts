@@ -21,8 +21,15 @@ import {
 } from "../src/voice/sessionPool";
 import { InjectGateRegistry } from "../src/memory/injectGate";
 import { ContextVersionRegistry } from "../src/memory/contextVersions";
-import { LEGACY_RESUME_HANDLE_KV_KEY, resumptionHandleKvKeyFor, wrapHandleForPersist } from "../src/voiceResumption";
-import type { PythonPolicyClient, PoolPlan } from "../src/voice/policyClient";
+import {
+  LEGACY_RESUME_HANDLE_KV_KEY,
+  resumptionHandleKvKeyFor,
+  wrapHandleForPersist,
+  shouldClearHandleOnClose,
+} from "../src/voiceResumption";
+import { createPythonPolicyClient, POLICY_OP_TIMEOUT_MS, type PythonPolicyClient, type PoolPlan } from "../src/voice/policyClient";
+import type { PythonModuleClient, ModuleResponse } from "../src/memory/pythonClient";
+import { WIRE_VERSION } from "../src/memory/types";
 
 function makeKv(): PoolKVSource & { dump(): Record<string, string> } {
   const map = new Map<string, string>();
@@ -354,5 +361,227 @@ describe("SessionPool — hot/warm/handle transitions from a resolved pool.plan 
     // planPool (like planSwitch) is a pure read, matching D2's "TS keeps mechanics" seam: this
     // module hands back a plan, it does not mutate itself into hot-warm on the daemon's say-so.
     assert.strictEqual(pool.stateFor("proj_c"), "cold");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 2 Step 2.4 — cross-project journeys 6/7/8/9/11 (docs/superpowers/specs/
+// 2026-07-07-z5c-session-pool-design.md). These stay at the SessionPool/policyClient unit seam
+// (no full server boot) because the production wiring only calls `planSwitch`/`noteSwitch`/
+// `gateFor`/`noteEvent` today — `SessionPool.planPool` itself has NO live call site yet in
+// src/voice/index.ts (syncSessionPoolOnTrigger only calls planSwitch+noteSwitch; grep confirms no
+// `sessionPool.planPool(` in src/voice/index.ts). That is a documented Slice-3 deferral (the
+// module doc: "EXECUTING that decision... is Slice 3 scope"), not a gap introduced by this test
+// suite — so "daemon death mid-journey" / "pool.plan timeout" are exercised exactly where the
+// feature actually lives (this seam), using the REAL `createPythonPolicyClient` facade (the
+// genuine 300ms race + zod validation) rather than a hand-rolled stub, and we additionally prove
+// the REST of the pool machinery (planSwitch/noteSwitch/gateFor) is completely unaffected by a
+// dead/hung/malformed policies daemon — which is the actual end-to-end guarantee "the voice loop
+// continues" reduces to at this slice.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/** A hand-built PythonModuleClient core whose `request` is fully scriptable: hang forever, resolve
+ *  a canned response, or resolve null (simulating "daemon absent/unavailable" at the transport
+ *  layer) — lets these tests drive `createPythonPolicyClient`'s REAL 300ms race + zod validation
+ *  rather than re-implementing the fallback contract by hand. */
+function makeFakeCore(opts: { hang?: boolean; respond?: ModuleResponse; available?: boolean }): PythonModuleClient {
+  return {
+    async request(): Promise<ModuleResponse> {
+      if (opts.hang) return new Promise(() => { /* never resolves — exercises the timeout race */ });
+      return opts.respond ?? null;
+    },
+    available: () => opts.available ?? true,
+    state: () => "python",
+    dispose() { /* no child process to tear down in this fake */ },
+  };
+}
+
+describe("SessionPool — poisoned handle (1008-close) journey (journey 6)", () => {
+  it("a handle poisoned by a real 1008 self-heal is cleared from KV; the next planSwitch yields fresh, never resume; the journey continues without crashing", () => {
+    const store = makeKv();
+    const pool = makePool({ store, now: () => 1000 });
+    pool.persistHandle("proj_a", { newHandle: "h-a" }, 1000);
+
+    // Before poisoning: a fresh persisted handle resumes (D4).
+    assert.strictEqual(pool.planSwitch("proj_a", 1500).flow, "resume");
+
+    // The REAL 1008 decision (src/voiceResumption.ts, the production self-heal used by
+    // src/voice/index.ts's connect-failure/onclose handlers): a connect attempt that FED this
+    // handle closed with Gemini's "session expired" code — the handle is poisoned.
+    assert.strictEqual(shouldClearHandleOnClose(1008, /* usedHandle */ true), true, "1008 on an attempt that fed a handle IS the poison signal");
+    // The self-heal's own clear step, mirrored here at the per-project KV slot (persistHandle(null)
+    // deletes the slot — SessionPool's own documented null-deletes-the-slot contract).
+    pool.persistHandle("proj_a", null, 2000);
+
+    const plan = pool.planSwitch("proj_a", 2500);
+    assert.strictEqual(plan.flow, "fresh", "a poisoned/cleared handle must NEVER resume");
+    assert.strictEqual(plan.fromState, "cold");
+
+    // No crash; the pool keeps functioning for this (and other) projects afterward.
+    assert.doesNotThrow(() => pool.noteSwitch("proj_a", 2500));
+    assert.strictEqual(pool.stateFor("proj_a"), "hot-foreground");
+    assert.doesNotThrow(() => pool.noteSwitch("proj_b", 3000));
+    assert.strictEqual(pool.stateFor("proj_a"), "handle", "proj_a demotes normally on the next switch, exactly as an unpoisoned project would");
+  });
+
+  it("a NON-1008 close never poisons the handle — a legitimate reconnect can still resume", () => {
+    assert.strictEqual(shouldClearHandleOnClose(1006, true), false, "a transient drop must not poison a good handle");
+    const pool = makePool({ now: () => 1000 });
+    pool.persistHandle("proj_a", { newHandle: "h-a" }, 1000);
+    assert.strictEqual(pool.planSwitch("proj_a", 1500).flow, "resume", "handle survives a non-1008 close");
+  });
+});
+
+describe("SessionPool.planPool via the REAL policy facade — daemon death / hung daemon (journeys 7 & 8)", () => {
+  it("no policies client at all (daemon never configured) floors immediately; planSwitch/noteSwitch/gateFor are unaffected (journey 7)", async () => {
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+    const plan = await pool.planPool(undefined, ["proj_a"]);
+    assert.deepStrictEqual(plan, floorPlan("proj_a"));
+
+    // The REST of the pool machinery — what the live voice loop actually depends on today — keeps
+    // working exactly as if nothing happened. This is what "the voice loop continues, briefs still
+    // deliver" reduces to at this slice (planPool has no production call site yet — see file header).
+    assert.strictEqual(pool.planSwitch("proj_b", 1500).flow, "fresh");
+    pool.noteSwitch("proj_b", 1500);
+    assert.strictEqual(pool.stateFor("proj_a"), "handle");
+    const gate = pool.gateFor("proj_a");
+    assert.deepStrictEqual(gate.evaluate("H", "pane-switch", 1600), { inject: true, skip: null });
+    gate.noteInjected("H", 1600);
+    assert.deepStrictEqual(gate.evaluate("H", "pane-switch", 1601), { inject: false, skip: "unchanged-brief" });
+  });
+
+  it("a daemon core that never responds loses the REAL 300ms race -> resolves null -> the pool floors; no unhandled rejection (journey 8)", async () => {
+    const core = makeFakeCore({ hang: true });
+    const policies = createPythonPolicyClient(core); // uses the production POLICY_OP_TIMEOUT_MS (300ms)
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+
+    // raceRequest's own timeout timer is deliberately UNREF'd (production: a hung daemon must never
+    // keep the real server process alive). In this isolated unit test there is nothing else on the
+    // event loop, so an unref'd-only timer would never actually fire before the process considers
+    // itself idle — keep a trivial REF'd interval alive for the duration of the await so the
+    // process has a reason to keep ticking long enough for the real timer to fire, exactly as it
+    // would in the live server (which always has other ref'd handles — the HTTP server, sockets).
+    const keepAlive = setInterval(() => { /* keep the event loop alive */ }, 25);
+    let plan: PoolPlan;
+    let elapsed: number;
+    try {
+      const start = Date.now();
+      plan = await pool.planPool(policies, ["proj_a"]);
+      elapsed = Date.now() - start;
+    } finally {
+      clearInterval(keepAlive);
+    }
+
+    assert.deepStrictEqual(plan, floorPlan("proj_a"), "the pool falls to the D6 floor on a hung daemon");
+    assert.ok(elapsed >= POLICY_OP_TIMEOUT_MS - 50, `expected the ~${POLICY_OP_TIMEOUT_MS}ms race to actually elapse (bounded, not instant), got ${elapsed}ms`);
+    assert.ok(elapsed < POLICY_OP_TIMEOUT_MS + 2000, `the race must not hang far past its own timeout, got ${elapsed}ms`);
+
+    // No crash / continues functioning after the timeout resolves.
+    assert.doesNotThrow(() => pool.noteSwitch("proj_b", 2000));
+    assert.strictEqual(pool.stateFor("proj_b"), "hot-foreground");
+  });
+
+  it("a daemon that answers ok:false (malformed/refused) ALSO floors — not just absence/timeout", async () => {
+    const core = makeFakeCore({
+      respond: { id: "x", v: WIRE_VERSION, ok: false, error: { code: "POOL_FAILED", message: "bad snapshot" } },
+    });
+    const policies = createPythonPolicyClient(core);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+    const plan = await pool.planPool(policies, ["proj_a"]);
+    assert.deepStrictEqual(plan, floorPlan("proj_a"));
+  });
+
+  it("a daemon that answers ok:true with an off-schema plan (fails zod validation) ALSO floors, never throws", async () => {
+    const core = makeFakeCore({ respond: { id: "x", v: WIRE_VERSION, ok: true, plan: { foregroundProjectId: 42 } } as unknown as ModuleResponse });
+    const policies = createPythonPolicyClient(core);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+    await assert.doesNotReject(async () => {
+      const plan = await pool.planPool(policies, ["proj_a"]);
+      assert.deepStrictEqual(plan, floorPlan("proj_a"));
+    });
+  });
+});
+
+describe("SessionPool — per-project gate debounce isolation under rapid A/B alternation (journey 9)", () => {
+  it("each project's gate runs its OWN debounce clock — no cross-project suppression under rapid alternation", () => {
+    let now = 1000;
+    const debounceMs = () => 3000;
+    const pool = new SessionPool({
+      store: makeKv(),
+      gates: new InjectGateRegistry(debounceMs),
+      contextVersions: new ContextVersionRegistry(null),
+      sessionId: "vsess-alt",
+      hotSlotBudget: 1,
+      now: () => now,
+    });
+    const gateA = pool.gateFor("proj_a");
+    const gateB = pool.gateFor("proj_b");
+
+    // A injects at t=1000 (its own gate had never fired — always injects on the first call).
+    assert.deepStrictEqual(gateA.evaluate("A-hash-1", "pane-switch", now), { inject: true, skip: null });
+    gateA.noteInjected("A-hash-1", now);
+
+    // B injects at t=1010 — a DIFFERENT project's gate, unaffected by A having just fired.
+    now = 1010;
+    assert.deepStrictEqual(gateB.evaluate("B-hash-1", "pane-switch", now), { inject: true, skip: null }, "B is not suppressed by A's just-fired debounce");
+    gateB.noteInjected("B-hash-1", now);
+
+    // Rapid alternation, both still inside their OWN 3000ms floors with genuinely CHANGED hashes:
+    // both debounce — on their OWN clocks, not each other's.
+    now = 1500;
+    assert.deepStrictEqual(gateA.evaluate("A-hash-2", "pane-switch", now), { inject: false, skip: "debounce" });
+    assert.deepStrictEqual(gateB.evaluate("B-hash-2", "pane-switch", now), { inject: false, skip: "debounce" });
+
+    // Push past A's OWN floor (1000+3000=4000) but still inside B's (1010+3000=4010) — prove the
+    // two clocks clear INDEPENDENTLY, proving no cross-project suppression in either direction.
+    now = 4001;
+    assert.deepStrictEqual(gateA.evaluate("A-hash-2", "pane-switch", now), { inject: true, skip: null }, "A's debounce cleared on A's own clock");
+    assert.deepStrictEqual(gateB.evaluate("B-hash-2", "pane-switch", now), { inject: false, skip: "debounce" }, "B's debounce is still running on B's OWN clock (not yet 4010)");
+    gateA.noteInjected("A-hash-2", now);
+
+    now = 4011;
+    assert.deepStrictEqual(gateB.evaluate("B-hash-2", "pane-switch", now), { inject: true, skip: null }, "B's debounce clears on ITS own clock, unaffected by A having already fired again");
+  });
+});
+
+describe("SessionPool — single-session floor regression (journey 11)", () => {
+  it("with no durable store and no policies daemon, ONE project's briefs/versions/gate behave exactly as the pre-pool single-session world", async () => {
+    const cv = new ContextVersionRegistry(null);
+    const pool = new SessionPool({
+      store: null,
+      gates: new InjectGateRegistry(() => 3000),
+      contextVersions: cv,
+      sessionId: "vsess-floor",
+      hotSlotBudget: 1,
+      now: () => 1000,
+    });
+
+    pool.noteSwitch("proj_solo", 1000);
+    assert.strictEqual(pool.isForegroundProject("proj_solo"), true);
+    assert.strictEqual(pool.isLiveDeliverable("proj_solo"), true);
+
+    // context_version registry still mints/acks correctly with no store attached.
+    const d1 = cv.recordDelivery({
+      projectId: "proj_solo", sessionId: "vsess-floor", trigger: "session_start",
+      includedSourceIds: ["project"], droppedSourceIds: [], snapshotHash: null, briefHash: null,
+    });
+    assert.strictEqual(d1.contextVersion, "1");
+    assert.strictEqual(cv.acknowledgeDelivery(d1.deliveryId), true);
+    assert.strictEqual(cv.currentAcknowledgedVersion("proj_solo", "vsess-floor"), "1");
+
+    // gate: first inject always fires, an identical repeat skips as unchanged, exactly pre-pool.
+    const gate = pool.gateFor("proj_solo");
+    assert.deepStrictEqual(gate.evaluate("H1", "pane-switch", 1000), { inject: true, skip: null });
+    gate.noteInjected("H1", 1000);
+    assert.deepStrictEqual(gate.evaluate("H1", "pane-switch", 1001), { inject: false, skip: "unchanged-brief" });
+
+    // planPool still resolves the D6 floor with no daemon configured — a single-project floor plan
+    // is INDISTINGUISHABLE from "the pool doesn't exist" (byte-identical shape).
+    const plan = await pool.planPool(undefined, ["proj_solo"]);
+    assert.deepStrictEqual(plan, floorPlan("proj_solo"));
   });
 });

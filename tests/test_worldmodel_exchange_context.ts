@@ -15,6 +15,7 @@ import { WorldModel } from "../src/memory/worldModel";
 import { BreadcrumbRing } from "../src/memory/breadcrumbs";
 import { assembleBrief } from "../src/memory/assembler";
 import { DEFAULT_MEMORY_CONFIG } from "../src/memory/types";
+import { ExchangeService } from "../src/exchanges/service";
 
 const SECRET = "sk-supersecret789";
 const REDACTED_MARK = "[REDACTED]";
@@ -307,6 +308,66 @@ test("assembleBrief: enriched tiers (decisions/warnings/todos/pane-recent/eventF
     `budget respected even under a heavily enriched snapshot (got ${brief.text.length} chars)`,
   );
 });
+
+// ── BUG (Phase 2 Step 2.4, cross-project journey 10 — planted-secret redaction at rest) ─────────
+//
+// Every test above proves WorldModel redacts secrets on READ (getProjectTier/getPaneTier/
+// getEventFocusTier all call `this.deps.redact(...)` before rendering). That is NOT the same
+// guarantee as "secrets never land in the DB" — tests/test_secrets_at_rest.ts and
+// tests/test_history_redaction_at_rest.ts exist precisely because those are two different
+// invariants for other tables. For the AgentExchange spine, they are NOT both held:
+//
+//   1. src/exchanges/service.ts `persistTransition` (the ONLY writer of exchange_events rows for
+//      real transitions) does:
+//        payload_redacted_json: JSON.stringify(opts?.payload ?? {})
+//      with NO redaction call anywhere in between. `opts.payload` traces back to `onPaneSignal`'s
+//      `sig.detail` (service.ts ~line 257: `sig.detail !== undefined ? { payload: { detail:
+//      sig.detail } } : undefined`) — real, unredacted pane-output text for a "needs_input_detected"
+//      signal. The column name promises redaction; the code never performs it.
+//
+//   2. `distilled_instruction` (agent_exchanges) is populated verbatim from the operator's
+//      propose_command instruction: src/voice/index.ts:1134 `distilledInstruction: instruction` —
+//      again with no `redactSecrets` pass before it reaches `ExchangeService.createExchange` ->
+//      `store.insertExchange`.
+//
+// This test exercises the REAL production write path end-to-end (ExchangeService, not a
+// hand-built fixture) and is RED against current code — filed here rather than fixed, per this
+// task's test-only scope. See the session report for the full finding.
+{
+  const SECRET = "sk-ant-SECRET123";
+
+  test("BUG: distilled_instruction and payload_redacted_json both retain the raw secret after a real create -> stage -> deliver -> needs_input cycle (ExchangeService writes secrets to agent_exchanges/exchange_events UNREDACTED at rest)", () => {
+    const store = seedStore();
+    const svc = new ExchangeService({ store, now: () => 1000 });
+
+    const snap = svc.createExchange({
+      projectId: "proj",
+      paneId: "p2",
+      operatorUtterance: `please rotate the key to ${SECRET}`,
+      distilledInstruction: `export API_KEY=${SECRET}`,
+    });
+    assert.ok(svc.stageForDelivery(snap.exchangeId).ok, "stageForDelivery succeeded");
+    assert.ok(svc.recordDelivery(snap.exchangeId).ok, "recordDelivery succeeded");
+    svc.onPaneSignal({ paneId: "p2", kind: "prompt", detail: `confirm? current key is ${SECRET}` });
+
+    const row = store.getExchange(snap.exchangeId)!;
+    const events = store.listExchangeEvents(snap.exchangeId);
+    const promptEvent = events.find(e => e.event_type === "needs_input_detected")!;
+    assert.ok(promptEvent, "the needs_input_detected event was recorded");
+
+    // Desired/expected behavior — CURRENTLY FALSE (the bug):
+    assert.ok(
+      !row.distilled_instruction.includes(SECRET),
+      "BUG: agent_exchanges.distilled_instruction stores the raw secret verbatim at rest " +
+      "(src/voice/index.ts:1134 passes the operator's raw instruction straight through, never redacted)",
+    );
+    assert.ok(
+      !promptEvent.payload_redacted_json.includes(SECRET),
+      "BUG: exchange_events.payload_redacted_json stores the raw secret verbatim at rest " +
+      "(src/exchanges/service.ts persistTransition JSON.stringify(opts.payload) with no redaction pass)",
+    );
+  });
+}
 
 // ── tests/test_memory_worldmodel.ts stays green — this suite is additive, not a replacement ─────
 test("sanity: a store with none of the new data sources still yields empty (never throwing) enriched fields", () => {

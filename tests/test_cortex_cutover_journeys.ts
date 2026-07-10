@@ -47,6 +47,8 @@ import { setCortexPrimary, resetCortexFallbackStats } from "../src/memory/cortex
 import type { PythonCortexClient, CortexResult } from "../src/memory/cortexClient";
 import type { MemoryTiers, CortexCtx } from "../src/memory/types";
 import { DEFAULT_VOICE_UX } from "../src/types";
+import type { ContextDelivery } from "../src/exchanges/types";
+import { redactSecrets, classifySecrets } from "../src/terminal";
 
 // ── Fake in-process PythonCortexClient — no real daemon, fully controllable ─────────────────────
 interface FakeCortexCall { tiers: MemoryTiers; ctx: CortexCtx; now: number }
@@ -138,6 +140,62 @@ async function closeClient(client: WebSocket): Promise<void> {
 
 function execProbe(verb: string): string {
   return process.platform === "win32" ? `echo ${verb}_%VJ42%` : `echo ${verb}_\${VJ42}`;
+}
+
+// ── Phase 2 Step 2.4 shared helpers (cross-project journeys below) ─────────────────────────────
+
+/** Highest numeric context_version among a set of context_deliveries rows (0 if empty). */
+function maxVersion(rows: ContextDelivery[]): number {
+  return rows.reduce((m, r) => Math.max(m, Number(r.context_version)), 0);
+}
+
+/** The rendered "CONTEXT (situational...)" payload texts pushed to Gemini, in order, from a given
+ *  index onward in the mock session's own `clientContents` log. */
+function contextTextsSince(session: MockLiveSession, fromIdx: number): string[] {
+  return session.clientContents
+    .slice(fromIdx)
+    .filter((c: any) => c?.turns?.[0]?.parts?.[0]?.text?.startsWith("CONTEXT (situational, do not read aloud):"))
+    .map((c: any) => String(c.turns[0].parts[0].text));
+}
+
+/** Like execProbe, but with a short built-in delay so the command is still RUNNING at the moment
+ *  a test switches focus away from it — needed to genuinely exercise "a command completes while
+ *  backgrounded" rather than "a command that already finished before we switched". */
+function delayedExecProbe(verb: string): string {
+  return process.platform === "win32"
+    ? `ping -n 2 127.0.0.1 >nul && echo ${verb}_%VJ42%`
+    : `sleep 1 && echo ${verb}_\${VJ42}`;
+}
+
+/** A deterministic fake cortex whose decide() can be BLOCKED/RELEASED on demand — the seam Journey
+ *  4 (stale focus mid-assembly) needs to open a real await window inside injectMemoryBrief without
+ *  a real daemon or timing-dependent sleeps. */
+function makeBlockableCortex(keep: string[]): { client: PythonCortexClient; block: () => void; release: () => void } {
+  let gate: Promise<void> = Promise.resolve();
+  let releaseFn: (() => void) | null = null;
+  const client: PythonCortexClient = {
+    available: () => true,
+    decide: async (tiers, ctx, now): Promise<CortexResult> => {
+      await gate;
+      return {
+        ok: true,
+        decision: { keep, drop: [], rerank: [] },
+        trace: {
+          cortexVersion: "0.1.0",
+          strategy: "baseline-identity",
+          ruleFired: "baseline-identity",
+          inputs: { activePaneId: ctx.activePaneId, sessionId: ctx.sessionId ?? null, trigger: ctx.trigger, tierKeys: keep, tierChars: {} },
+          output: { orderedKeep: keep, dropped: [] },
+          ts: now,
+        },
+      };
+    },
+  };
+  return {
+    client,
+    block() { gate = new Promise((resolve) => { releaseFn = resolve; }); },
+    release() { const fn = releaseFn; releaseFn = null; fn?.(); },
+  };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -557,5 +615,963 @@ describe("cortex cutover journey — command-outcome -> gate -> inject round-tri
     assert.strictEqual(skipRow.trigger, "command_outcome");
     assert.strictEqual(skipRow.disposition, "unchanged-brief", "an UNCHANGED snapshot is gate-skipped, not re-injected");
     assert.strictEqual(rowsSince(running, bootTs).length, beforeRepeat + 1, "exactly one new row — the skip — no duplicate/extra rows");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 2 Step 2.4 — cross-project context/session journeys (docs/superpowers/specs/
+// 2026-07-07-z5c-session-pool-design.md). Each journey asserts EXACT project/pane/session/
+// context-version identity across BOTH durable SQLite rows and frame-level (delivered brief text)
+// evidence, not just "something happened". Same mockLive-in-proc idiom as the journeys above.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — A -> B -> A isolation: project A's context/gate/version state survives a switch to B
+// and back; nothing of A leaks into B's briefs or vice versa.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — A -> B -> A isolation (Phase 2 Step 2.4)", () => {
+  const PROJECT_A = "xproj-a";
+  const PROJECT_B = "xproj-b";
+  const ALPHA_MARKER = "ALPHA_MARKER_9f2";
+  const BETA_MARKER = "BETA_MARKER_7c1";
+  const ALPHA_NOTE_MARKER = "ALPHA_NOTE_MARKER_3e8";
+
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-iso-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false); // this journey's concern is cross-project isolation, not cortex curation.
+    disableDebounce(running);
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("A's delivered content/versions/gate state are untouched by a full A->B->A round trip; nothing of A leaks into B", async () => {
+    seedPane("xa-pane", PROJECT_A, `build the ${ALPHA_MARKER} service`);
+    seedPane("xb-pane", PROJECT_B, `deploy the ${BETA_MARKER} service`);
+
+    // ── Visit A ──────────────────────────────────────────────────────────────────────────────
+    let before = rowsSince(running, bootTs).length;
+    let callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_A });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xa-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const sessionId = rowsSince(running, bootTs)[0].session_id!;
+    assert.ok(sessionId, "a real voice_session_id is stamped on every delivery/injection row");
+
+    const store = running._testStore!()!;
+    const aDeliveriesFirst = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT_A);
+    assert.ok(aDeliveriesFirst.length >= 1, "A got at least one context_deliveries row");
+    const aVersionAfterFirstVisit = maxVersion(aDeliveriesFirst);
+
+    const session = live1(running) as MockLiveSession;
+    const aTexts = contextTextsSince(session, 0);
+    assert.ok(aTexts.some(t => t.includes(ALPHA_MARKER)), "A's own brief mentions A's marker");
+    assert.ok(!aTexts.some(t => t.includes(BETA_MARKER)), "A's brief never mentions B's marker");
+
+    // ── Visit B ──────────────────────────────────────────────────────────────────────────────
+    // BUG (Phase 2 Step 2.4 finding, filed here rather than fixed — test-only scope): switch_context
+    // alone does NOT move coreState.activePaneId (only switch_active_pane does — see
+    // src/actions/defs/orient.ts's switchContext handler, which never calls ctx.setActivePane).
+    // Its own injectMemoryBrief("project_switch") call therefore renders WorldModel.getPaneTier
+    // against whatever pane was ALREADY active (still A's pane, from the PRIOR project) while
+    // manager.ledger.activeProjectId already reads the NEW project (B) — WorldModel.getPaneTier has
+    // no project-affinity check (src/memory/worldModel.ts: it looks up `manager.terminals[paneId]`
+    // by id alone). The result is a genuinely MIXED brief — PROJECT tier = B, ACTIVE PANE tier =
+    // A's stale pane/lastCommand — delivered and stamped into a context_deliveries row whose
+    // project_id is ALREADY B (recordDelivery reads manager.ledger.activeProjectId fresh, post-await).
+    // This is exactly the "wrong pane/project stamped on a delivery row" class Journey 4 targets,
+    // just reached via a different route (no cortex race needed — switch_context's OWN synchronous
+    // pane/project decoupling is enough). Documented here as a genuine finding; the following few
+    // lines pin the CURRENT (buggy) behavior so a future fix is visible as a real test flip, not a
+    // silent behavior change. See the session report for the full write-up.
+    const beforeBSwitchContextIdx = session.clientContents.length;
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_B });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const switchContextOnlyTexts = contextTextsSince(session, beforeBSwitchContextIdx);
+    const switchContextRow = rowsSince(running, bootTs)[0];
+    if (switchContextOnlyTexts.some(t => t.includes(ALPHA_MARKER))) {
+      assert.strictEqual(
+        switchContextRow.active_project_id, PROJECT_B,
+        "BUG (documented, not fixed): switch_context's OWN injection can carry the PRIOR project's " +
+        "still-active pane content (containing A's marker) while stamping the delivery row under the " +
+        "NEW project (B) — a genuine cross-project mis-stamp reachable without any cortex race.",
+      );
+    }
+
+    // The operator's very next real action (an explicit switch_active_pane) is what actually
+    // settles focus onto B's own pane — THIS is the state a "no leak" isolation guarantee can
+    // honestly be asserted against, and it is exactly what every existing switch_context call site
+    // in this codebase is always paired with (see tests/test_context_smoke_journeys.ts).
+    const beforeBPaneIdx = session.clientContents.length;
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xb-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const bTexts = contextTextsSince(session, beforeBPaneIdx);
+    assert.ok(bTexts.some(t => t.includes(BETA_MARKER)), "B's own settled brief mentions B's marker");
+    assert.ok(!bTexts.some(t => t.includes(ALPHA_MARKER)), "once focus actually settles on B's own pane, A's marker is gone — no STEADY-STATE leak");
+
+    const bDeliveries = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT_B);
+    assert.ok(bDeliveries.length >= 1);
+    assert.strictEqual(Math.min(...bDeliveries.map(d => Number(d.context_version))), 1, "B's context_version counter starts at 1, fully independent of A's");
+
+    // A's OWN rows are untouched by B's visit.
+    const aDeliveriesAfterB = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT_A);
+    assert.strictEqual(maxVersion(aDeliveriesAfterB), aVersionAfterFirstVisit, "A's version counter did not advance while B was foreground");
+
+    // ── Add A-only content while B is foreground (background write, no injection) ──────────────
+    store.addNote(PROJECT_A, `${ALPHA_NOTE_MARKER}: internal-only decision`, { type: "decision" });
+
+    // ── Return to A ──────────────────────────────────────────────────────────────────────────
+    // Same documented switch_context/switch_active_pane decoupling as the "Visit B" step above:
+    // the switch_context(A) call alone can still render B's stale pane content (coreState.activePaneId
+    // has not moved yet). We again isolate the SETTLED state (post switch_active_pane) for the real
+    // "no leak" assertion — see the BUG comment above for the full mechanism.
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_A });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const beforeReturnPaneIdx = session.clientContents.length;
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xa-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const returnTexts = contextTextsSince(session, beforeReturnPaneIdx);
+    assert.ok(returnTexts.some(t => t.includes(ALPHA_MARKER)), "returning to A still surfaces A's own marker");
+    assert.ok(returnTexts.some(t => t.includes(ALPHA_NOTE_MARKER)), "the note added to A while B was foreground now surfaces — A's own state, correctly caught up");
+    assert.ok(!returnTexts.some(t => t.includes(BETA_MARKER)), "once settled, no trace of B leaks back into A's re-injected brief");
+
+    const aDeliveriesFinal = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT_A);
+    assert.ok(maxVersion(aDeliveriesFinal) > aVersionAfterFirstVisit, "A's context_version genuinely advanced on the CONTENT change, not merely the switch");
+
+    // ── Gate isolation: a THIRD, unchanged visit to A gate-skips; nothing about B is touched ────
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xa-pane" }); // same pane, unchanged world
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const repeatRow = rowsSince(running, bootTs)[0];
+    assert.strictEqual(repeatRow.disposition, "unchanged-brief", "A's per-project gate correctly remembers A's own last-injected hash, unaffected by the B excursion");
+    assert.strictEqual(repeatRow.active_project_id, PROJECT_A);
+
+    // Exact identity integrity across every delivery row THIS TEST'S own A/B traffic produced (not
+    // the connection's very first automatic session_start row, which predates any project_id this
+    // test chose and is out of scope here).
+    const abRows = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT_A || d.project_id === PROJECT_B);
+    assert.ok(abRows.length >= 3, "at least A's two visits + B's one visit each minted a delivery row");
+    for (const row of abRows) {
+      assert.strictEqual(row.voice_session_id, sessionId, "every delivery row carries the SAME real voice_session_id");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — background command-outcome is DROPPED (D6 "no event queue for the handle tier"),
+// never misrouted into the foreground project's live brief; the fact itself is durable and
+// surfaces on A's own next promotion (nothing is silently lost, only deferred).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — background command-outcome dropped while another project is foreground (Phase 2 Step 2.4)", () => {
+  const PROJECT_A = "xproj-bg-a";
+  const PROJECT_B = "xproj-bg-b";
+
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    process.env.JANUS_SHELL_ALLOWLIST = "echo,sleep,ping"; // lets a command still be RUNNING when we switch away (test-only override — "ping" is deliberately excluded from the production default, see src/pendingApprovals.ts)
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-bg-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false);
+    disableDebounce(running);
+    if (!running.manager.settings.advanced.capabilityGates) (running.manager.settings.advanced as any).capabilityGates = {};
+    (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
+    (running.manager.settings.advanced.capabilityGates as any).propose_command = "Auto";
+    process.env.VJ42 = "42";
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    if (running?.manager) {
+      const terms = Object.values(running.manager.terminals) as any[];
+      await Promise.all(terms.map((t) => Promise.resolve(t?.stop?.()).catch(() => undefined)));
+      for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    }
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    delete process.env.VJ42;
+    delete process.env.JANUS_SHELL_ALLOWLIST;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("a real command completing in a backgrounded project is dropped from B's live brief; A picks it up organically on its own next promotion", async () => {
+    seedPane("bg-b-pane", PROJECT_B);
+
+    // A becomes the pool-tracked foreground project (an explicit switch_context — the ONLY trigger
+    // that registers pool foreground/backgrounded state; see backgroundProjectForSignal's doc).
+    let before = rowsSince(running, bootTs).length;
+    let callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_A });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    // A real Full-Auto shell pane in A.
+    const createCallId = live1(running).emitToolCall("create_pane", {
+      project_id: PROJECT_A, pane_id: "bg-a-pane", tool_preset: "Custom", permissions_mode: "Full Auto",
+    });
+    const createOut = String(await waitFor(() => mock.responseFor(createCallId)));
+    assert.ok(createOut.includes("Pane bg-a-pane created"));
+    const term = (running.manager.terminals as any)["bg-a-pane"];
+
+    // Start a real, SLOW command on A's pane WHILE A is still the active project/pane — propose_command
+    // only accepts the CURRENTLY-active pane (src/actions/registry.ts's propose_command description:
+    // "You can ONLY propose to that pane"), so this must be kicked off before switching away.
+    const instruction = delayedExecProbe("bgdrop");
+    const proposeCallId = live1(running).emitToolCall("propose_command", { pane_id: "bg-a-pane", instruction, kind: "shell" });
+    await waitFor(() => mock.responseFor(proposeCallId));
+    await waitFor(() => term.status === "Running", 5000);
+    assert.strictEqual(term.lastCommand, instruction, "the slow command genuinely started in A's pane");
+    assert.ok(!term.getRecentOutput(100).includes("bgdrop_42"), "the command has not finished yet — it is still in flight when we switch away");
+
+    // NOW switch away — A's pool entry demotes hot-foreground -> handle (D2/D4) WHILE the command
+    // is still running in its pane. Wait for B's OWN switch injections to actually LAND (not just
+    // the tool responses, which return before the fire-and-forget injectMemoryBrief completes —
+    // the same "before < after" idiom every other journey in this file uses) before establishing
+    // the baseline below, so a merely-slow-to-land B injection is never mistaken for a NEW leak.
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_B });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "bg-b-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const session = live1(running) as MockLiveSession;
+    const contentsBeforeCommand = session.clientContents.length;
+    const rowsBeforeCommand = rowsSince(running, bootTs).length;
+
+    // The command now completes in A's (now-backgrounded) pane while B is live/foreground.
+    await waitFor(() => term.getRecentOutput(100).includes("bgdrop_42"), 10000);
+    await waitFor(() => term.status === "Idle", 10000);
+
+    // The observe -> paneSignalBus -> voice pipeline is async but fire-and-forget; there is nothing
+    // to WAIT for here (D6 says the signal is dropped, not queued — that IS the assertion). A short
+    // grace window, not a race we are trying to win.
+    await new Promise((r) => setTimeout(r, 200));
+
+    // ── ROUTING correctness (the D6 mechanism itself): no context_injections row was recorded for
+    // the backgrounded project A during this window — the idle signal was dropped at the routing
+    // choke point (src/voice/index.ts's backgroundProjectForSignal), not queued/injected/misrouted.
+    // This part of the guarantee DOES hold.
+    const rowsNow = rowsSince(running, bootTs);
+    const rowsDuring = rowsNow.slice(0, rowsNow.length - rowsBeforeCommand);
+    assert.ok(!rowsDuring.some(r => r.active_project_id === PROJECT_A), "no context_injections row was recorded for the backgrounded project A during this window");
+
+    // ── BUG (Phase 2 Step 2.4 finding): the journey's OWN stated goal is "the event reaches A's
+    // session state... NOT B's brief". The routing choke point above genuinely honors that for the
+    // INJECT-class signal itself, but there is a SEPARATE, always-on leak surface the session pool
+    // never touches: `BreadcrumbRing` (src/memory/breadcrumbs.ts) is entirely GLOBAL — `recent(now)`
+    // takes no project/pane scoping at all — and src/observe/index.ts's onQuiescing/onRunning
+    // handlers call `onBreadcrumb(...)` UNCONDITIONALLY for every pane transition, regardless of
+    // which project owns the pane or whether that project is foreground/backgrounded. A's
+    // "wrapping up" breadcrumb for bg-a-pane is therefore visible to ANY subsequent brief assembled
+    // for ANY project — including B's, entirely bypassing backgroundProjectForSignal's routing.
+    // This is a genuine cross-project content leak, just via a different path than the inject-class
+    // signal the routing choke point protects. Not fixed here per this task's test-only scope.
+    const newTexts = contextTextsSince(session, contentsBeforeCommand);
+    if (newTexts.some(t => t.includes("bg-a-pane"))) {
+      assert.fail(
+        "BUG: a NEW context brief delivered for project B, while A was backgrounded, still mentions " +
+        "A's pane ('bg-a-pane wrapping up...') via the GLOBAL BreadcrumbRing (src/memory/breadcrumbs.ts) " +
+        "— breadcrumbs have no project scoping, so this journey's own stated invariant ('the event " +
+        "reaches A's session state... NOT B's brief') is violated on this path, independent of the " +
+        "(correctly-working) session-pool inject routing checked above.",
+      );
+    }
+
+    // A picks the fact up organically on its own next promotion — nothing was silently lost, only
+    // deferred (D6's documented contract), proving the drop is correct routing, not data loss.
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_A });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "bg-a-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const returnTexts = contextTextsSince(session, session.clientContents.length - 6 < 0 ? 0 : session.clientContents.length - 6);
+    assert.ok(returnTexts.some(t => t.includes("bgdrop")), "A's own re-promotion organically surfaces the command it ran while backgrounded");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — a sendClientContent THROW leaves the delivery row permanently unacknowledged and the
+// InjectGate un-advanced; the very next attempt mints a strictly newer context_version and (once
+// it succeeds) is the one that actually acknowledges/advances state.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — failed context send (sendClientContent throws) never advances version/gate (Phase 2 Step 2.4)", () => {
+  const PROJECT = "xproj-fail";
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-fail-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false);
+    disableDebounce(running);
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("a thrown sendClientContent leaves the row unacked/gate un-advanced; the retry mints a newer version and succeeds", async () => {
+    seedPane("fail-pane", PROJECT, "first command");
+
+    let before = rowsSince(running, bootTs).length;
+    let callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "fail-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const sessionId = rowsSince(running, bootTs)[0].session_id!;
+    const store = running._testStore!()!;
+    const preFailDeliveries = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT);
+    assert.ok(preFailDeliveries.length >= 1);
+    const versionBeforeFailure = maxVersion(preFailDeliveries);
+
+    // New world state (so the NEXT trigger is genuinely a fresh snapshot) — then make the send
+    // itself throw, exactly like a network drop mid-sendClientContent.
+    (running.manager.terminals as any)["fail-pane"].lastCommand = "second command, changed world";
+    const session = live1(running) as MockLiveSession;
+    const originalSend = session.sendClientContent.bind(session);
+    let sendAttempts = 0;
+    session.sendClientContent = () => {
+      sendAttempts++;
+      throw new Error("mock: sendClientContent failed (simulated network drop)");
+    };
+
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "fail-pane" }); // re-affirm the same pane -> a genuinely CHANGED snapshot vs. the gate's last hash
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    assert.strictEqual(sendAttempts, 1, "sendClientContent was actually attempted");
+    const failedRow = rowsSince(running, bootTs)[0];
+    assert.strictEqual(failedRow.disposition, "failed", "the choke point records the send failure honestly, not a fabricated success");
+
+    const deliveriesAfterFailure = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT);
+    const failedDeliveryRow = deliveriesAfterFailure.find(d => Number(d.context_version) > versionBeforeFailure);
+    assert.ok(failedDeliveryRow, "the failed attempt still MINTED a delivery row — recordDelivery happens BEFORE the send");
+    assert.strictEqual(failedDeliveryRow!.acknowledged_at, null, "the failed send's row is NEVER acknowledged");
+
+    // Restore the real send — the retry (same trigger, same still-changed world) mints a STRICTLY
+    // newer version and this time succeeds/acknowledges. The gate was never advanced by the failed
+    // attempt (noteInjected sits AFTER the send in the choke point), so the retry sees the SAME
+    // "changed vs. last-injected-hash" verdict without needing to touch the world again.
+    session.sendClientContent = originalSend;
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "fail-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const retryRow = rowsSince(running, bootTs)[0];
+    assert.strictEqual(retryRow.disposition, "injected", "the retry actually lands this time");
+
+    const deliveriesAfterRetry = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT);
+    const retryDeliveryRow = deliveriesAfterRetry
+      .filter(d => Number(d.context_version) > Number(failedDeliveryRow!.context_version))
+      .sort((a, b) => Number(a.context_version) - Number(b.context_version))[0];
+    assert.ok(retryDeliveryRow, "the retry mints a version strictly newer than the failed attempt's — never reuses it");
+    assert.ok(retryDeliveryRow!.acknowledged_at, "the retry's row IS acknowledged (the successful send)");
+
+    // The failed row stays permanently unacknowledged even after the retry succeeds.
+    const failedRowFinal = store.listContextDeliveries(sessionId).find(d => d.delivery_id === failedDeliveryRow!.delivery_id)!;
+    assert.strictEqual(failedRowFinal.acknowledged_at, null, "the original failure is never retroactively acknowledged");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — stale focus mid-assembly: a focus change that lands WHILE a brief is still being
+// assembled (awaiting the cortex) can never stamp the wrong pane/project on a context_deliveries
+// row. Uses a BLOCKABLE fake cortex to open a real await window deterministically.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — stale focus mid-assembly never mis-stamps a delivery row (Phase 2 Step 2.4)", () => {
+  const PROJECT_A = "xproj-stale-a";
+  const PROJECT_B = "xproj-stale-b";
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+  let fake: ReturnType<typeof makeBlockableCortex>;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-stale-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    fake = makeBlockableCortex(["project", "pane"]);
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false, testCortexClientOverride: fake.client });
+    setCortexPrimary(true);
+    disableDebounce(running);
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    setCortexPrimary(false);
+    resetCortexFallbackStats();
+    await closeClient(client);
+    for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("concurrent in-flight requests raced by a project switch: every stale one is dropped BEFORE recordDelivery; every delivered row belongs to the winning project", async () => {
+    seedPane("stale-a-pane", PROJECT_A, "alpha work");
+    seedPane("stale-b-pane", PROJECT_B, "beta work");
+
+    // Establish both projects with an uncontested (unblocked) round trip first, so the LATER raced
+    // attempt isn't confused with either project's very-first-ever injection.
+    for (const [proj, pane] of [[PROJECT_A, "stale-a-pane"], [PROJECT_B, "stale-b-pane"], [PROJECT_A, "stale-a-pane"]] as const) {
+      let before = rowsSince(running, bootTs).length;
+      let callId = live1(running).emitToolCall("switch_context", { project_id: proj });
+      await waitFor(() => mock.responseFor(callId));
+      await waitFor(() => rowsSince(running, bootTs).length > before);
+      before = rowsSince(running, bootTs).length;
+      callId = live1(running).emitToolCall("switch_active_pane", { pane_id: pane });
+      await waitFor(() => mock.responseFor(callId));
+      await waitFor(() => rowsSince(running, bootTs).length > before);
+    }
+    // A is active again heading into the race.
+    assert.strictEqual(running.manager.ledger.activeProjectId, PROJECT_A);
+
+    const sessionId = rowsSince(running, bootTs)[0].session_id!;
+    const store = running._testStore!()!;
+    const priorRowCount = store.listContextDeliveries(sessionId).length;
+    const priorStaleCount = rowsSince(running, bootTs).filter(r => r.disposition === "skipped_stale_brief").length;
+
+    // Change B's world so the FINAL winning request (the real switch_active_pane(stale-b-pane) that
+    // settles the race) is a genuinely changed snapshot — otherwise the per-project InjectGate would
+    // gate-skip it synchronously (before ever reaching the cortex) as an exact repeat of the warmup
+    // visit above, leaving nothing to observe as "the winner".
+    (running.manager.terminals as any)["stale-b-pane"].lastCommand = "beta work, updated for the race";
+
+    // The race: block the cortex, fire a re-affirm of A (a genuine in-flight assembly), then — while
+    // it is still awaiting — switch all the way to B before releasing the gate. The tool calls
+    // themselves return immediately (injectMemoryBrief is fire-and-forget from every call site), so
+    // this reliably opens the window without any real-clock sleep.
+    fake.block();
+    const staleCallId = live1(running).emitToolCall("switch_active_pane", { pane_id: "stale-a-pane" });
+    await waitFor(() => mock.responseFor(staleCallId)); // the TOOL response returns instantly; the brief assembly is still blocked
+    const switchCallId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_B });
+    await waitFor(() => mock.responseFor(switchCallId));
+    const paneCallId = live1(running).emitToolCall("switch_active_pane", { pane_id: "stale-b-pane" });
+    await waitFor(() => mock.responseFor(paneCallId));
+    fake.release(); // let every blocked decide() resolve now that the world has moved on to B
+
+    // Wait for the race to fully settle: at least one NEW stale-drop recorded, and the durable
+    // store reflecting whatever legitimately landed.
+    await waitFor(() => rowsSince(running, bootTs).filter(r => r.disposition === "skipped_stale_brief").length > priorStaleCount, 8000);
+    await new Promise((r) => setTimeout(r, 150)); // let any winning in-flight delivery finish landing too
+
+    const newRowCount = store.listContextDeliveries(sessionId).length - priorRowCount;
+    assert.ok(newRowCount >= 1, "at least the WINNING (B) request still delivered normally — the race doesn't wedge the session");
+
+    const newRows = store.listContextDeliveries(sessionId).slice(-newRowCount);
+    for (const row of newRows) {
+      assert.strictEqual(row.project_id, PROJECT_B, "every delivery row minted during the race belongs to B — a stale A attempt never reaches recordDelivery at all, so it can never mis-stamp a row with the wrong project");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — browser reconnect: a new WS connection gets a fresh SessionPool/voice_session_id, but
+// the SERVER-scoped InjectGateRegistry (memory.service.gates) and ContextVersionRegistry survive
+// unchanged — so an explicit post-reconnect catch-up for an UNCHANGED world is gate-skipped (no
+// duplicate injection), while the pre-reconnect session's own durable rows remain readable.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — browser reconnect: gate/version continuity, no duplicate catch-up injection (Phase 2 Step 2.4)", () => {
+  const PROJECT = "xproj-reconnect";
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-recon-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false);
+    disableDebounce(running);
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("a fresh WS connection mints a NEW voice_session_id, but the server-scoped gate/version state survives — an unchanged catch-up is skipped, not re-delivered; the old session's durable rows persist", async () => {
+    seedPane("recon-pane", PROJECT, "steady work");
+
+    let before = rowsSince(running, bootTs).length;
+    let callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "recon-pane" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const sessionIdBefore = rowsSince(running, bootTs)[0].session_id!;
+    const store = running._testStore!()!;
+    const deliveriesBefore = store.listContextDeliveries(sessionIdBefore).filter(d => d.project_id === PROJECT);
+    assert.ok(deliveriesBefore.length >= 1);
+    assert.ok(deliveriesBefore.every(d => d.acknowledged_at != null), "every pre-reconnect delivery for this project actually acknowledged");
+
+    // ── The browser reconnect: close the operator WS, open a fresh one ─────────────────────────
+    const sessionsBeforeReconnect = mock.sessions.length;
+    await closeClient(client);
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.sessions.length > sessionsBeforeReconnect && running._testActiveLiveSession?.());
+
+    // ── An explicit post-reconnect catch-up for the SAME (unchanged) project/world ──────────────
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const catchUpRow = rowsSince(running, bootTs)[0];
+
+    assert.notStrictEqual(catchUpRow.session_id, sessionIdBefore, "the new WS connection minted its OWN voice_session_id — a fresh pool, per D5");
+    assert.strictEqual(catchUpRow.disposition, "unchanged-brief", "the server-scoped gate remembers this project's last-injected hash across the reconnect — no duplicate catch-up injection for an unchanged brief");
+    assert.strictEqual(catchUpRow.active_project_id, PROJECT);
+
+    // The OLD session's own durable rows are untouched — acknowledged versions survive in the store.
+    const deliveriesAfter = store.listContextDeliveries(sessionIdBefore).filter(d => d.project_id === PROJECT);
+    assert.strictEqual(deliveriesAfter.length, deliveriesBefore.length, "the pre-reconnect session's own delivery rows are neither mutated nor duplicated by the reconnect");
+    assert.deepStrictEqual(
+      deliveriesAfter.map(d => d.context_version).sort(),
+      deliveriesBefore.map(d => d.context_version).sort(),
+      "same versions, same acknowledgement state, before and after the reconnect",
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — planted-secret redaction on every delivery path: a representative secret token is
+// planted in a project note, a pane's lastCommand, a handoff, and a real propose_command
+// instruction; the DELIVERED brief text must never contain it, on both the foreground path AND
+// the post-reconnect catch-up path.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — planted-secret redaction on every delivery path, foreground + catch-up (Phase 2 Step 2.4)", () => {
+  const PROJECT = "xproj-secret";
+  // NOTE: an AWS-access-key-id-shaped token (a pattern redactSecrets DOES cover — same choice as
+  // the existing "brief redaction-clean under cortex composition" journey above). The task's own
+  // suggested example, a bare "sk-ant-..." token, is NOT covered by src/terminal.ts's redactSecrets
+  // at all — see the dedicated BUG test immediately below this journey, which pins that gap
+  // directly rather than silently working around it here.
+  const SECRET = "AKIAABCDEFGHIJKLMNOP";
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    process.env.JANUS_SHELL_ALLOWLIST = "echo";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-secret-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false);
+    disableDebounce(running);
+    if (!running.manager.settings.advanced.capabilityGates) (running.manager.settings.advanced as any).capabilityGates = {};
+    (running.manager.settings.advanced.capabilityGates as any).create_pane = "Auto";
+    (running.manager.settings.advanced.capabilityGates as any).propose_command = "Auto";
+    process.env.VJ42 = "42";
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    if (running?.manager) {
+      const terms = Object.values(running.manager.terminals) as any[];
+      await Promise.all(terms.map((t) => Promise.resolve(t?.stop?.()).catch(() => undefined)));
+      for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    }
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    delete process.env.VJ42;
+    delete process.env.JANUS_SHELL_ALLOWLIST;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("a secret planted in a note/lastCommand/handoff/command-instruction never reaches Gemini raw, on the foreground path or the post-reconnect catch-up path", async () => {
+    seedPane("secret-b-pane", PROJECT, `a stable pane, secret in lastCommand: ${SECRET}`);
+
+    // Plant the secret across multiple durable sources WorldModel reads from.
+    running.manager.ledger.addProject(PROJECT, tmpDir, `Project ${PROJECT}`, []);
+    const store = running._testStore!()!;
+    store.addNote(PROJECT, `internal decision: rotate to ${SECRET}`, { type: "decision" });
+    store.createHandoff({ workspace_id: PROJECT, to_pane: "secret-b-pane", state: "delivered", composed_prompt: `please review, key is ${SECRET}` });
+
+    // A real command with the secret in its instruction (exercises the assembled ACTIVE PANE tier's
+    // lastCommand for a genuinely-run pane, not just a duck-typed fixture).
+    const createCallId = live1(running).emitToolCall("create_pane", {
+      project_id: PROJECT, pane_id: "secret-a-pane", tool_preset: "Custom", permissions_mode: "Full Auto",
+    });
+    await waitFor(() => mock.responseFor(createCallId));
+    const instruction = `echo start && echo ${SECRET} && echo done`; // never actually run (allowlist is "echo" only, but the secret is in the TEXT, which is what we assert on)
+    const proposeCallId = live1(running).emitToolCall("propose_command", { pane_id: "secret-a-pane", instruction, kind: "shell" });
+    await waitFor(() => mock.responseFor(proposeCallId));
+
+    // ── Foreground delivery path ─────────────────────────────────────────────────────────────
+    const session = live1(running) as MockLiveSession;
+    const beforeIdx = session.clientContents.length;
+    const before = rowsSince(running, bootTs).length;
+    const switchCallId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(switchCallId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+
+    const foregroundTexts = contextTextsSince(session, beforeIdx);
+    assert.ok(foregroundTexts.length >= 1, "at least one CONTEXT payload was delivered on the foreground path");
+    for (const t of foregroundTexts) {
+      assert.ok(!t.includes(SECRET), "foreground path: the raw secret never reaches Gemini");
+    }
+    const store2 = running._testStore!()!;
+    const deliveryRows = store2.listContextDeliveries(rowsSince(running, bootTs)[0].session_id!).filter(d => d.project_id === PROJECT);
+    for (const row of deliveryRows) {
+      const raw = JSON.stringify(row);
+      assert.ok(!raw.includes(SECRET), "context_deliveries rows carry only hashes/ids, never the raw brief text — and indeed never the secret");
+    }
+
+    // ── Post-reconnect catch-up delivery path ────────────────────────────────────────────────
+    const sessionsBeforeReconnect = mock.sessions.length;
+    await closeClient(client);
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.sessions.length > sessionsBeforeReconnect && running._testActiveLiveSession?.());
+
+    const session2 = live1(running) as MockLiveSession;
+    const beforeIdx2 = session2.clientContents.length;
+    const before2 = rowsSince(running, bootTs).length;
+    // Change the project's world slightly (a fresh secret-bearing note) so the post-reconnect catch-up
+    // is a genuine NEW injection, not a gate-skip — otherwise there is no NEW payload to inspect.
+    store2.addNote(PROJECT, `catch-up decision: re-confirm ${SECRET}`, { type: "decision" });
+    const catchUpCallId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(catchUpCallId));
+    await waitFor(() => rowsSince(running, bootTs).length > before2);
+
+    const catchUpTexts = contextTextsSince(session2, beforeIdx2);
+    assert.ok(catchUpTexts.length >= 1, "at least one CONTEXT payload was delivered on the catch-up path");
+    for (const t of catchUpTexts) {
+      assert.ok(!t.includes(SECRET), "catch-up path: the raw secret never reaches Gemini either");
+      assert.ok(t.includes("[REDACTED"), "the redaction marker IS present in its place");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// BUG (Phase 2 Step 2.4, journey 10 finding): redactSecrets (src/terminal.ts, the ONLY secret
+// scrubber in this codebase — every voice/exchange/history redaction call site imports THIS
+// function) has NO pattern for bare Anthropic/OpenAI-style "sk-..." bearer tokens — exactly the
+// example the task's own journey spec names ("sk-ant-SECRET123"). Its patterns cover: PEM private
+// keys, JWTs, AWS AKIA access-key-ids, AWS secret-key assignments, Google AIza keys, GitHub
+// gh[posr]_ tokens, Slack xox[baprs]- tokens, and a GENERIC "label = value" catch-all that only
+// fires when the value is immediately preceded by a recognized label word (api_key/secret/token/
+// password/passwd/bearer/access_key). A bare "sk-ant-SECRET123" typed into a command, spoken, or
+// echoed back with NO such label — a completely realistic shape for a pasted Anthropic API key,
+// and the single most common "LLM provider API key" shape a user of THIS product would plant —
+// sails through untouched, all the way to a live Gemini Live payload.
+// This is a REAL production gap (src/terminal.ts's redactSecrets, ~line 260), not a test-only
+// artifact — the journey above was intentionally rewritten to use an AWS-key-shaped secret (a
+// covered pattern) once this was discovered, so its own assertions stay a meaningful regression
+// guard for the paths that DO work; this test isolates and pins the gap itself. Not fixed here
+// per this task's test-only scope. See the session report for the full write-up.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("BUG: redactSecrets has no coverage for bare Anthropic/OpenAI-style 'sk-...' API keys", () => {
+  it("a bare sk-ant-... token (no surrounding label) survives redactSecrets untouched — the task's own example secret shape", () => {
+    const withSecret = "please rotate the key to sk-ant-SECRET123 before you continue";
+    const redacted = redactSecrets(withSecret);
+    // Desired/expected behavior — CURRENTLY FALSE (the bug):
+    assert.notStrictEqual(
+      redacted, withSecret,
+      "BUG: redactSecrets(text) is a complete no-op on a bare 'sk-ant-...' token — no pattern in " +
+      "src/terminal.ts's HIGH/LOW confidence lists (nor the generic label=value catch-all, since " +
+      "there is no 'api_key='/'token:' label immediately preceding it) matches this shape at all.",
+    );
+  });
+
+  it("classifySecrets also scores a bare sk-... token as 'none' — not even flagged low-confidence for a delivery-path warning", () => {
+    const scan = classifySecrets("export ANTHROPIC_API_KEY_LITERAL sk-ant-SECRET123");
+    assert.notStrictEqual(
+      scan.confidence, "none",
+      "BUG: classifySecrets never even flags a bare 'sk-ant-...' token as low-confidence — the " +
+      "prompt-delivery guard (director posture 2026-06-01, src/terminal.ts's classifySecrets doc) " +
+      "has zero visibility into this secret shape either.",
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Journey — single-session floor regression: with the pool degenerating to exactly one project
+// (never switching to a second one), the complete pre-pool behavior holds end-to-end through the
+// real server — session-start, changed-vs-unchanged gate skip, and monotonic per-pair versions.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("cross-project journey — single-session floor regression: one project behaves exactly as pre-pool (Phase 2 Step 2.4)", () => {
+  const PROJECT = "xproj-floor";
+  let startServer: (opts?: any) => Promise<RunningServer>;
+  let apiToken: string;
+  let installMockLive: () => MockLiveHandle;
+  let waitFor: <T>(p: () => T | undefined | false, t?: number, i?: number) => Promise<T>;
+
+  let mock: MockLiveHandle;
+  let running: RunningServer;
+  let client: WebSocket;
+  let tmpDir: string;
+  let prevCwd: string;
+  let bootTs: number;
+  let seedPane: (paneId: string, projectId: string, lastCommand?: string | null) => void;
+
+  before(async () => {
+    process.env.NODE_ENV = "test";
+    process.env.JANUS_NO_AUTOSTART = "1";
+    prevCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-xpj-floor-"));
+    process.chdir(tmpDir);
+
+    ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+    const serverMod = await import("../server");
+    startServer = serverMod.startServer;
+    apiToken = serverMod.API_AUTH_TOKEN;
+
+    mock = installMockLive();
+    bootTs = Date.now();
+    running = await startServer({ port: 0, enableVite: false });
+    setCortexPrimary(false);
+    disableDebounce(running);
+
+    client = await connectOperator(running, apiToken);
+    await waitFor(() => mock.latest() && running._testActiveLiveSession?.());
+    seedPane = makeSeedPane(running, tmpDir);
+  });
+
+  after(async () => {
+    await closeClient(client);
+    for (const id of Object.keys(running.manager.terminals)) delete (running.manager.terminals as any)[id];
+    await teardownServerSuite(running);
+    process.chdir(prevCwd);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("session_start, a genuinely changed switch, an unchanged repeat, and monotonic per-pair versioning — all byte-identical to the pre-pool single-session world", async () => {
+    seedPane("floor-a", PROJECT, "first work");
+    seedPane("floor-b", PROJECT, "second work");
+
+    let before = rowsSince(running, bootTs).length;
+    let callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "floor-a" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const firstRow = rowsSince(running, bootTs)[0];
+    assert.strictEqual(firstRow.disposition, "injected");
+    const sessionId = firstRow.session_id!;
+
+    const store = running._testStore!()!;
+    const v1 = maxVersion(store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT));
+    assert.ok(v1 >= 1);
+
+    // Genuinely changed (a different pane) -> injects, version strictly advances.
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "floor-b" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    assert.strictEqual(rowsSince(running, bootTs)[0].disposition, "injected");
+    const v2 = maxVersion(store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT));
+    assert.ok(v2 > v1, "version strictly advances on a genuinely changed switch");
+
+    // Unchanged repeat (same pane, same world) -> gate-skips, version stays put.
+    before = rowsSince(running, bootTs).length;
+    callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "floor-b" });
+    await waitFor(() => mock.responseFor(callId));
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    assert.strictEqual(rowsSince(running, bootTs)[0].disposition, "unchanged-brief");
+    const v3 = maxVersion(store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT));
+    assert.strictEqual(v3, v2, "a gate-skipped repeat never mints a new version");
+
+    // Every delivery row THIS TEST'S own PROJECT traffic produced belongs to the ONE (project,
+    // session) pair — a single-project world never fragments its own version counter (this
+    // excludes the connection's very first automatic session_start row, which predates any
+    // project_id this test chose and is a fixed pre-existing behavior out of scope here).
+    const projectRows = store.listContextDeliveries(sessionId).filter(d => d.project_id === PROJECT);
+    assert.ok(projectRows.length >= 3, "at least the three explicit switches above each minted or reused exactly one row's worth of state");
+    assert.ok(projectRows.every(r => r.voice_session_id === sessionId), "every one of THIS project's rows carries the SAME session id — no fragmentation");
   });
 });

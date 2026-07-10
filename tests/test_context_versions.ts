@@ -150,6 +150,74 @@ describe("ContextVersionRegistry (Phase 2 Step 2.2)", () => {
     assert.strictEqual(reg.currentAcknowledgedVersion(null, null), "1");
   });
 
+  // ── Phase 2 Step 2.4 (cross-project journeys) ────────────────────────────────────────────────
+
+  it("journey 3 companion: a failed send's row stays unacknowledged FOREVER; the retry mints a strictly newer version and acks normally", () => {
+    const s = freshStore();
+    const reg = new ContextVersionRegistry(s);
+
+    // recordDelivery ALWAYS happens before the send (src/voice/index.ts's choke point) — simulate
+    // sendClientContent throwing by simply never calling acknowledgeDelivery for this one.
+    const failed = reg.recordDelivery({ projectId: "proj-a", sessionId: "sess-1", ...BASE_DELIVERY }); // v1
+    assert.strictEqual(reg.currentAcknowledgedVersion("proj-a", "sess-1"), null);
+
+    // The NEXT delivery attempt (the retry — same trigger, same still-changed world) mints a
+    // STRICTLY newer version; it never reuses v1's number even though v1 never landed.
+    const retry = reg.recordDelivery({ projectId: "proj-a", sessionId: "sess-1", ...BASE_DELIVERY }); // v2
+    assert.ok(Number(retry.contextVersion) > Number(failed.contextVersion), "the retry's version is strictly newer than the failed attempt's");
+    assert.strictEqual(reg.acknowledgeDelivery(retry.deliveryId), true);
+    assert.strictEqual(reg.currentAcknowledgedVersion("proj-a", "sess-1"), retry.contextVersion);
+
+    // The failed row is durably distinguishable from the retry: same pair, different delivery ids,
+    // only the retry ever got acknowledged.
+    const rows = s.listContextDeliveries("sess-1");
+    const failedRow = rows.find(r => r.delivery_id === failed.deliveryId)!;
+    const retryRow = rows.find(r => r.delivery_id === retry.deliveryId)!;
+    assert.strictEqual(failedRow.acknowledged_at, null, "the failed attempt's row NEVER gets acknowledged, not even retroactively by the retry's success");
+    assert.ok(retryRow.acknowledged_at, "the retry's own row is acknowledged");
+
+    s.close();
+  });
+
+  it("journey 5 companion: a browser reconnect mints a FRESH (project, NEW session) pair; the OLD session's acknowledged delivery stays durably readable in the store", () => {
+    const s = freshStore();
+    // Phase 2 Step 2.2: ContextVersionRegistry is SERVER-scoped in production (one shared instance
+    // across every WS connection — src/voice/index.ts constructs it once, outside attachVoiceSession's
+    // per-connection closure) — a browser reconnect reuses the SAME registry instance. What changes on
+    // reconnect is the CONNECTION's own voice_session_id (Phase 2 Step 2.2: minted once per WS
+    // connection, including across bounded auto-reconnects, but NOT across a fresh browser
+    // reconnect, which is a brand-new WS connection with its own mintVoiceSessionId() call).
+    const reg = new ContextVersionRegistry(s);
+    const oldSession = "vsess-OLD";
+    const newSession = "vsess-NEW";
+
+    const d = reg.recordDelivery({ projectId: "proj-a", sessionId: oldSession, ...BASE_DELIVERY });
+    reg.acknowledgeDelivery(d.deliveryId);
+    assert.strictEqual(reg.currentAcknowledgedVersion("proj-a", oldSession), "1");
+
+    // The reconnect: a genuinely NEW (project, session) pair. Versioning starts fresh for it — by
+    // design (one voice_session_id per WS connection) — but this is NOT data loss: the OLD session's
+    // own acknowledged row is untouched and durably readable. "acknowledged versions survive (from
+    // store)" means the audit trail survives, not that the new connection inherits the old number.
+    assert.strictEqual(reg.currentAcknowledgedVersion("proj-a", newSession), null, "a new connection's session pair starts with no acknowledged version of its own");
+    assert.strictEqual(reg.nextVersionFor("proj-a", newSession), "1", "the new pair's counter starts at 1, independent of the old session's v1");
+
+    const oldRows = s.listContextDeliveries(oldSession);
+    assert.strictEqual(oldRows.length, 1);
+    assert.ok(oldRows[0].acknowledged_at, "the pre-reconnect session's acknowledged delivery is still durably readable after the reconnect");
+    assert.strictEqual(oldRows[0].context_version, "1");
+    assert.strictEqual(oldRows[0].project_id, "proj-a");
+
+    // The two sessions' rows never intermingle.
+    const newD = reg.recordDelivery({ projectId: "proj-a", sessionId: newSession, ...BASE_DELIVERY });
+    reg.acknowledgeDelivery(newD.deliveryId);
+    const newRows = s.listContextDeliveries(newSession);
+    assert.strictEqual(newRows.length, 1);
+    assert.notStrictEqual(newRows[0].delivery_id, oldRows[0].delivery_id);
+
+    s.close();
+  });
+
   it("a restart-equivalent registry (fresh instance, same store) seeds numbering past prior deliveries", () => {
     const s = freshStore();
     const reg1 = new ContextVersionRegistry(s);
