@@ -344,6 +344,16 @@ export interface VoiceUxSettings {
   // event is allowed to inject again (session-start always bypasses). Reuses this block's
   // existing strip/validate idiom (VOICE_UX_KNOWN_KEYS + a dedicated validator in server.ts).
   contextInjectDebounceMs: number;
+  // z5c design D7 (docs/superpowers/specs/2026-07-07-z5c-session-pool-design.md): the number
+  // of ADDITIONAL hot-warm background sessions (beyond the one foreground session) the
+  // per-project session pool holds open. 0 = handle-tier only (no background sockets), default
+  // 1, capped at 3 (a quota guard against Gemini Live's concurrent-session limits). Read ONCE
+  // at connect time (src/voice/sessionPool.ts's resolveHotSlotBudget) — per D10 this is
+  // deliberately NOT hot-reloaded mid-session; a PUT here applies on the NEXT voice session,
+  // same "Apply & Reconnect" idiom as voiceAi.systemPrompt/voiceAi.voice. Optional so a
+  // persisted settings file from before this field existed keeps loading (shallow-merged with
+  // DEFAULT_VOICE_UX, same as every other field in this block).
+  sessionPoolHotSlots?: number;
 }
 
 export const DEFAULT_VOICE_UX: VoiceUxSettings = {
@@ -351,6 +361,11 @@ export const DEFAULT_VOICE_UX: VoiceUxSettings = {
   focusBindPolicy: "confirm",
   confirmTimeoutMs: 10_000,
   contextInjectDebounceMs: 3000,
+  // z5c D7: sessionPoolHotSlots is deliberately ABSENT here (left undefined), not defaulted to 1 —
+  // src/voice/sessionPool.ts's resolveHotSlotBudget() already treats "absent" as "default to 1", so
+  // this constant's SHAPE stays byte-identical to every pre-z5c snapshot/round-trip test that
+  // asserts DEFAULT_VOICE_UX's exact key set (tests/test_voice_ux_settings.ts, out of this task's
+  // edit scope). Setting a literal value here would add a key those tests don't expect.
 };
 
 export interface SystemSettings {

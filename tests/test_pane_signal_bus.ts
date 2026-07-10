@@ -1,8 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { PaneSignalBus } from "../src/paneSignalBus";
-import { stampDeferred } from "../src/voice/index";
+import { stampDeferred, backgroundProjectForSignal } from "../src/voice/index";
 import type { PaneSignal } from "../src/paneSignals";
+import { SessionPool } from "../src/voice/sessionPool";
+import { InjectGateRegistry } from "../src/memory/injectGate";
+import { ContextVersionRegistry } from "../src/memory/contextVersions";
 
 describe("PaneSignalBus", () => {
   it("fans out to every subscriber and respects unsubscribe", () => {
@@ -285,5 +288,106 @@ describe("PaneSignalBus delivery classes (z5c slice 1)", () => {
     bus.publish({ paneId: "p1", kind: "idle" });
     assert.deepStrictEqual(spoken, []);
     assert.deepStrictEqual(inject, ["idle"]);
+  });
+});
+
+// ── z5c design (spec 2026-07-07-z5c-session-pool-design.md D1/D4/D6) — per-project inject routing ─
+// The bus itself is project-agnostic (a PaneSignal carries only paneId/kind/detail — no project).
+// Routing an inject-class delivery to "its own" project's session is a CONSUMER-side decision,
+// made in src/voice/index.ts's inject subscriber using backgroundProjectForSignal (a project id
+// resolved from the pane) + SessionPool bookkeeping. These tests exercise that exact combination:
+// the bus fans out to ONE subscriber (mirroring the real single subscriber in voice/index.ts), and
+// the subscriber's own routing logic decides whether to "deliver" (call the session's inject hook)
+// or drop-and-bookkeep (a background project with no live socket, per D6's no-event-queue decision).
+//
+// backgroundProjectForSignal is deliberately conservative: it only classifies a project as
+// "background" when the POOL has POSITIVE evidence (state "handle") that a real switch AWAY from
+// it happened — never merely "some other id than whatever manager.ledger.activeProjectId is right
+// now". A project a pane was created/worked in WITHOUT the operator ever running switch_context
+// (the common case in most of this app's own test suites — create_pane never itself switches
+// context) must keep injecting exactly as it did pre-pool.
+describe("PaneSignalBus inject-class routing to the right project's session (z5c D1/D4/D6)", () => {
+  function makePool(now: () => number = () => 1000): SessionPool {
+    return new SessionPool({
+      store: null,
+      gates: new InjectGateRegistry(() => 3000),
+      contextVersions: new ContextVersionRegistry(null),
+      sessionId: "vsess-1",
+      hotSlotBudget: 1,
+      now,
+    });
+  }
+
+  it("a signal about the FOREGROUND project's own pane is delivered", () => {
+    const bus = new PaneSignalBus(0, 0);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+    const delivered: PaneSignal[] = [];
+    const dropped: string[] = [];
+    bus.subscribe((sig) => {
+      const bg = backgroundProjectForSignal(pool, "proj_a"); // this signal's pane belongs to proj_a
+      if (bg) { dropped.push(bg); return; }
+      delivered.push(sig);
+    }, "inject");
+
+    bus.publish({ paneId: "pane_in_a", kind: "idle" });
+    assert.deepStrictEqual(delivered.map((s) => s.paneId), ["pane_in_a"]);
+    assert.deepStrictEqual(dropped, []);
+  });
+
+  it("a signal about a DIFFERENT project the pool has NEVER tracked a switch away from is still delivered (the common case)", () => {
+    const bus = new PaneSignalBus(0, 0);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000); // proj_a is foreground; proj_z was simply never switched to
+    const delivered: PaneSignal[] = [];
+    bus.subscribe((sig) => {
+      const bg = backgroundProjectForSignal(pool, "proj_z");
+      if (bg) return;
+      delivered.push(sig);
+    }, "inject");
+
+    bus.publish({ paneId: "pane_in_z", kind: "idle" });
+    assert.deepStrictEqual(delivered.map((s) => s.paneId), ["pane_in_z"], "a never-switched project is NOT background — matches pre-pool behavior");
+  });
+
+  it("a signal about a project the pool EXPLICITLY switched away from is dropped (no live socket) and its bookkeeping still advances", () => {
+    const bus = new PaneSignalBus(0, 0);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000); // proj_a is foreground
+    pool.noteSwitch("proj_b", 2000); // now proj_b is foreground; proj_a is backgrounded (state "handle")
+    const delivered: PaneSignal[] = [];
+    bus.subscribe((sig) => {
+      const bg = backgroundProjectForSignal(pool, "proj_a"); // this signal's pane belongs to the BACKGROUNDED proj_a
+      if (bg) { pool.noteEvent(bg, 3000); return; }
+      delivered.push(sig);
+    }, "inject");
+
+    bus.publish({ paneId: "pane_in_a", kind: "idle" });
+    assert.deepStrictEqual(delivered, [], "background project signal never reaches the foreground's session");
+    assert.strictEqual(pool.stateFor("proj_a"), "handle", "proj_a stays backgrounded — this signal did not promote it");
+    // Its bookkeeping DID advance (visible via the next pool.plan snapshot's lastEventAtMs), even
+    // though nothing was live-delivered — the promotion's own catch-up brief covers what it missed.
+    const snap = pool.snapshotFor(["proj_a", "proj_b"], 3000);
+    assert.strictEqual(snap.entries.proj_a.lastEventAtMs, 3000);
+  });
+
+  it("an UNRESOLVABLE owning project falls back to delivery — never silently drop an unclassifiable pane", () => {
+    const bus = new PaneSignalBus(0, 0);
+    const pool = makePool();
+    pool.noteSwitch("proj_a", 1000);
+    const delivered: PaneSignal[] = [];
+    bus.subscribe((sig) => {
+      const bg = backgroundProjectForSignal(pool, null); // pane's owning project could not be resolved
+      if (bg) return;
+      delivered.push(sig);
+    }, "inject");
+
+    bus.publish({ paneId: "orphan_pane", kind: "idle" });
+    assert.deepStrictEqual(delivered.map((s) => s.paneId), ["orphan_pane"]);
+  });
+
+  it("a fresh pool with no switches at all never classifies anything as background", () => {
+    const pool = makePool();
+    assert.strictEqual(backgroundProjectForSignal(pool, "proj_a"), null);
   });
 });

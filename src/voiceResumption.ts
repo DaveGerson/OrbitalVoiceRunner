@@ -114,6 +114,27 @@ export function wrapHandleForPersist(token: unknown, now: number): string {
 }
 
 /**
+ * z5c design (spec 2026-07-07-z5c-session-pool-design.md D5): the legacy KV key a single global
+ * resumption handle lived under before the per-project session pool. Kept as a named constant
+ * (not just a literal) so the one-way migration into a per-project slot (src/voice/sessionPool.ts)
+ * and the original single-session read/write site (src/voice/index.ts) both name the SAME key —
+ * a typo'd duplicate literal would silently split the value into two dead KV rows.
+ */
+export const LEGACY_RESUME_HANDLE_KV_KEY = "voiceResumptionToken";
+
+/**
+ * z5c design D5: per-project resumption handles. Each pool entry gets its OWN durable KV slot
+ * (was one global slot for the whole app) so switching A->B->A can resume EACH project's own
+ * server-side Gemini conversation instead of all projects racing to overwrite one shared handle.
+ * Pure string-building only — the actual get/set/delete + migration lives in
+ * src/voice/sessionPool.ts (this module stays scoped to "resilience for the resumption handle",
+ * not KV I/O).
+ */
+export function resumptionHandleKvKeyFor(projectId: string): string {
+  return `${LEGACY_RESUME_HANDLE_KV_KEY}:project:${projectId}`;
+}
+
+/**
  * Read a persisted handle back, returning the token + its persist time ONLY if it parses as the
  * age-stamped wrapper and is still within the TTL. Anything else — null/empty, malformed JSON, or a
  * legacy bare token with no persist stamp (unknown age) — fails CLOSED to null so the caller connects

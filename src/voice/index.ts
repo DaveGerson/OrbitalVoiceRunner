@@ -76,6 +76,7 @@ import {
 } from "../memory/contextTelemetry";
 import { ContextVersionRegistry } from "../memory/contextVersions";
 import type { PythonPolicyClient } from "./policyClient";
+import { SessionPool, resolveHotSlotBudget, type PoolEntryState } from "./sessionPool";
 import { createSpokenConfirm } from "./spokenConfirm";
 import { DEFAULT_VOICE_UX } from "../types";
 import { matchMacroUtterance, fireMacro } from "../macros";
@@ -100,6 +101,60 @@ export function mintInjectId(): string {
 let voiceSessionSeq = 0;
 export function mintVoiceSessionId(): string {
   return `vsess-${Date.now()}-${++voiceSessionSeq}`;
+}
+
+// ── z5c design (spec 2026-07-07-z5c-session-pool-design.md) small pure helpers ─────────────────
+// Pulled OUT of their call sites (inside attachVoiceSession's per-connection closures) so their
+// own branching does not load the caller's cyclomatic count — the complexity gate is a hard error
+// (CC<=10) and both connectLiveSession's connection handler and injectMemoryBrief are already
+// near the cap. Each is a standalone, easily-unit-testable pure function.
+
+/** D7: resolve `voiceUx.sessionPoolHotSlots` at connect time — read ONCE (not hot-reloaded
+ *  mid-session, same "Apply & Reconnect" idiom as every other voiceAi/voiceUx knob this file
+ *  reads at connect). */
+export function resolveConnectionHotSlotBudget(settings: { voiceUx?: { sessionPoolHotSlots?: number } }): number {
+  return resolveHotSlotBudget((settings.voiceUx ?? DEFAULT_VOICE_UX).sessionPoolHotSlots);
+}
+
+/** D4: the triggers that establish "what project is live right now" — the only ones
+ *  injectMemoryBrief should use to advance SessionPool's LRU/state bookkeeping. */
+export function isForegroundEstablishingTrigger(trigger: ContextInjectionTrigger): boolean {
+  return trigger === "session_start" || trigger === "reconnect" || trigger === "project_switch";
+}
+
+/** D4: keep the pool's LRU/state bookkeeping in sync with a foreground-establishing trigger.
+ *  `planSwitch` is computed here for observability/telemetry (a real decision trace exists on
+ *  every switch) even though EXECUTING that decision — actually resuming/connecting a per-project
+ *  socket — is Slice 3 scope; see the module doc + this task's reported deferrals. A no-op for
+ *  every other trigger, or when there is no active project to track. */
+export function syncSessionPoolOnTrigger(
+  pool: SessionPool,
+  projectId: string | null,
+  trigger: ContextInjectionTrigger,
+  now: number,
+): void {
+  if (!projectId || !isForegroundEstablishingTrigger(trigger)) return;
+  pool.planSwitch(projectId, now);
+  pool.noteSwitch(projectId, now);
+}
+
+/** D1/D4/D6: the pane's owning project when it is a project the POOL has POSITIVE evidence was
+ *  explicitly backgrounded (state "handle" — reached only via SessionPool.noteSwitch demoting a
+ *  PRIOR foreground when a real project_switch/session_start/reconnect trigger moved somewhere
+ *  else). Deliberately NOT "any project other than manager.ledger.activeProjectId": a project a
+ *  pane was simply created/worked in WITHOUT the operator ever running switch_context (a normal,
+ *  long-supported workflow — see tests/test_cortex_cutover_journeys.ts's command-outcome journey)
+ *  stays "cold" in the pool forever and must keep injecting exactly as it did pre-pool — there is
+ *  no meaningful "background" distinction for a project the pool has never actually seen switched
+ *  away from. Returns null (never "background") for the foreground project, an unresolvable pane,
+ *  or any project the pool hasn't tracked as a real switch-away — an unclassifiable or never-
+ *  switched pane always falls through to today's unconditional inject at the call site. */
+export function backgroundProjectForSignal(
+  pool: { isForegroundProject(projectId: string | null): boolean; stateFor(projectId: string): PoolEntryState },
+  paneProjectId: string | null,
+): string | null {
+  if (!paneProjectId || pool.isForegroundProject(paneProjectId)) return null;
+  return pool.stateFor(paneProjectId) === "handle" ? paneProjectId : null;
 }
 
 // Phase 2 Step 2.2: the six canonical context-tier keys (mirrors src/memory/assembler.ts's
@@ -728,6 +783,25 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       voiceSessionId: mintVoiceSessionId(),
     };
 
+    // z5c design (spec 2026-07-07-z5c-session-pool-design.md D2/D5): the per-project session pool's
+    // decision layer, scoped to THIS WS connection (dies with it, exactly like `state.session` — D5's
+    // "pool scope = the browser WS connection"). `memory.service.gates` is the SAME server-scoped
+    // InjectGateRegistry every connection shares (a browser refresh should not forget a project's
+    // "last injected hash"), so per-project gate state outlives any one connection even though the
+    // pool's own hot/warm/handle bookkeeping does not. hotSlotBudget is read ONCE at connect time
+    // (D7/D10 — not hot-reloaded mid-session, same "Apply & Reconnect" idiom as the rest of voiceAi).
+    const sessionPool = new SessionPool({
+      store,
+      gates: memory.service.gates,
+      contextVersions,
+      sessionId: state.voiceSessionId,
+      hotSlotBudget: resolveConnectionHotSlotBudget(manager.settings),
+    });
+    // D5: one-way migration of the legacy single-slot resumption handle into whatever project is
+    // ACTIVE right now (best guess for "the foreground project" before this connection has switched
+    // anywhere) — a total no-op once it has already run once, or if there is nothing to migrate.
+    sessionPool.migrateLegacyHandle(manager.ledger.activeProjectId);
+
     // Voice-UX wave 3: the spoken destructive-confirm protocol (src/voice/spokenConfirm.ts, f09-owned).
     // Constructed ONCE per WS connection (NOT per Gemini reconnect inside connectLiveSession) so its
     // state machine (idle / awaiting_phrase / reprompted) persists across reconnects on THIS session,
@@ -896,12 +970,22 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         injectId = mintInjectId();
         const now = Date.now();
         const wire = toCortexTrigger(trigger);
+        // z5c design (spec 2026-07-07-z5c-session-pool-design.md D5): the project this brief is
+        // ABOUT to shape — every actual send below still goes through the ONE physical socket
+        // (`sess`), so this is the pool's foreground project, not necessarily `activeId`'s owning
+        // project (that distinction matters for the inject-class ROUTING decision at the
+        // paneSignalBus subscription below, not here).
+        const poolProjectId = manager.ledger.activeProjectId;
+        syncSessionPoolOnTrigger(sessionPool, poolProjectId, trigger, now);
         // Phase 2 Step 2.2: affectedPaneId now threads into the gate's own hash (closing the Step
         // 2.1 KNOWN GAP note on snapshotHashFor) so the gate can never make a skip/inject decision
         // against a snapshot that doesn't yet reflect the SAME eventFocus block the cortex/renderer
         // build moments later for this trigger.
         const snapshotHash = memory.service.snapshotHashFor(activeId, now, affectedPaneId);
-        const gateDecision = memory.service.gate.evaluate(snapshotHash, wire, now);
+        // D5: per-project gate isolation — was the single shared `memory.service.gate` (key null)
+        // regardless of active project; now keyed by the pool's foreground project so a stale hash
+        // from project A can never skip a genuinely-changed brief for project B.
+        const gateDecision = sessionPool.gateFor(poolProjectId).evaluate(snapshotHash, wire, now);
         if (gateDecision.skip) {
           recordGateSkip(trigger, activeId, injectId, startedAt, gateDecision.skip, snapshotHash);
           return;
@@ -968,8 +1052,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
         state.lastInjectId = injectId;
         // Wave 4 (D2): the gate only advances state AFTER a confirmed send — a dropped/stale/empty
-        // brief above returned before this point and never counts as "injected".
-        memory.service.gate.noteInjected(snapshotHash, now);
+        // brief above returned before this point and never counts as "injected". D5: the SAME
+        // per-project gate `evaluate` read above, so the advance lands on the right project's state.
+        sessionPool.gateFor(poolProjectId).noteInjected(snapshotHash, now);
         recordInjectionEvent({
           trigger, activeId, injectId, startedAt,
           disposition: dispositionForBrief(brief), skippedReason: null, brief, error: null,
@@ -2034,6 +2119,24 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // pane is currently focused, so a command-outcome cortex profile can lead with it.
         const unsubscribeInject = paneSignalBus.subscribe((sig: PaneSignal) => {
           if (sig.kind !== "idle") return;
+          // z5c design (spec 2026-07-07-z5c-session-pool-design.md D1/D4/D6): route a command-outcome
+          // signal to the project it's ABOUT. A signal about the FOREGROUND project's own pane still
+          // injects exactly as before. A signal about a project the pool has POSITIVE evidence was
+          // explicitly backgrounded (a real switch away from it — see backgroundProjectForSignal's doc
+          // comment) is a background event with no live socket to reach in today's single-physical-
+          // socket world — D6 non-goal 6 ("no event queue for the handle tier") means it is dropped,
+          // not misrouted into the wrong project's conversation; that project's own `lastEventAtMs`
+          // bookkeeping still advances so a later promotion's pool.plan snapshot (and its catch-up
+          // brief, sourced from durable stores via planSwitch) has accurate freshness to reason over.
+          // A project the pool has never seen switched away from (the common case — most projects are
+          // simply worked in without ever calling switch_context) is NOT treated as background, so
+          // this is byte-identical to pre-pool behavior until the operator actually starts switching.
+          const paneProjectId = findPaneOwningProject(manager, sig.paneId)?.projectId ?? null;
+          const backgroundProjectId = backgroundProjectForSignal(sessionPool, paneProjectId);
+          if (backgroundProjectId) {
+            sessionPool.noteEvent(backgroundProjectId, Date.now());
+            return;
+          }
           void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
         }, "inject");
         state.unsubscribePaneSignals = () => { unsubscribeSpoken(); unsubscribeInject(); };

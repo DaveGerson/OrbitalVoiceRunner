@@ -150,7 +150,7 @@ function validateCapabilityGatesField(adv: Record<string, unknown>): string | nu
 // validateCapabilityGatesField), never a 400 — a newer client's extra knob must not brick the PUT.
 const SettingsSitrepShapeSchema = z.enum(["brief", "walk", "full"]);
 const SettingsFocusBindPolicySchema = z.enum(["confirm", "echo", "tiered"]);
-const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs"]);
+const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs", "sessionPoolHotSlots"]);
 
 /** Strip unknown voiceUx keys IN PLACE (forward compat, mirrors validateCapabilityGatesField's
  *  unknown-key strip). Pure side effect, no validation — kept separate to hold each function's own
@@ -200,6 +200,19 @@ function validateVoiceUxDebounceMs(voiceUx: Record<string, unknown>): string | n
   return null;
 }
 
+/** Validate voiceUx.sessionPoolHotSlots (when present): must be a finite integer in [0, 3].
+ *  z5c design D7 (docs/superpowers/specs/2026-07-07-z5c-session-pool-design.md): the hot-warm
+ *  background-session budget — 0 (handle-tier only) through 3 (the quota-guard ceiling against
+ *  Gemini Live concurrent-session limits). Same shape as the other voiceUx validators above. */
+function validateVoiceUxHotSlots(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.sessionPoolHotSlots === undefined) return null;
+  const v = voiceUx.sessionPoolHotSlots;
+  if (typeof v !== "number" || !Number.isFinite(v) || !Number.isInteger(v) || v < 0 || v > 3) {
+    return "Invalid settings field 'voiceUx.sessionPoolHotSlots': must be an integer between 0 and 3.";
+  }
+  return null;
+}
+
 /** Validate (and forward-compat-strip) settings.voiceUx (when present). Returns an error message
  *  string for an invalid value on a KNOWN field, else null. Pure over everything except the
  *  unknown-key strip (mirrors validateCapabilityGatesField). */
@@ -210,7 +223,10 @@ function validateVoiceUxField(body: Record<string, unknown>): string | null {
     return "Invalid settings field 'voiceUx': expected an object.";
   }
   stripUnknownVoiceUxKeys(voiceUx);
-  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx) ?? validateVoiceUxDebounceMs(voiceUx);
+  return validateVoiceUxEnumFields(voiceUx)
+    ?? validateVoiceUxConfirmTimeout(voiceUx)
+    ?? validateVoiceUxDebounceMs(voiceUx)
+    ?? validateVoiceUxHotSlots(voiceUx);
 }
 
 export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
