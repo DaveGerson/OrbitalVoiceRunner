@@ -207,7 +207,16 @@ export interface RenderProfile {
 }
 
 /** The ONE fixed protocol line requestCompletionEnvelope may append — communication framing, not
- *  a technical requirement (spec §6.2). The only non-operator content the renderer ever adds. */
+ *  a technical requirement (spec §6.2). The only non-operator content the renderer ever adds.
+ *
+ *  Coherence with `JANUS_AGENT_RESULT_ENVELOPE` (Phase 4, Step 4.1, src/exchanges/resultEnvelope.ts):
+ *  that flag's "request" mode does NOT introduce a second, competing "please answer in JSON" prompt
+ *  string. This line is the ONE invitation an adapter ever appends; a terminal agent may answer it
+ *  either in plain prose (picked up by the conservative legacy finalResponse heuristic,
+ *  src/observe/index.ts) or with a structured result envelope (picked up by
+ *  resultEnvelope.ts's scanner) — both funnel into the same trust boundary and settlement path
+ *  (`ExchangeService.recordReportedOutcome`). Keep it that way: do not add a JSON-specific request
+ *  line here without updating that module's "request mode coherence" doc comment to match. */
 export const COMPLETION_REQUEST_LINE: string =
   "When you finish, report completion clearly (e.g. a final line stating done or blocked, and why).";
 

@@ -74,6 +74,12 @@ export interface SettleOutcome {
   state: ExchangeState;
 }
 
+/** Phase 4, Step 4.1: the outcome vocabulary a self-report can carry — either a matched result
+ *  envelope (src/exchanges/resultEnvelope.ts) or the conservative legacy finalResponse heuristic
+ *  (src/observe/index.ts). Deliberately narrower than `ExchangeEventType`: both report sources
+ *  settle through the exact same three machine outcomes. */
+export type ReportedOutcome = "complete" | "failed" | "needs_input";
+
 interface CommandLogEntry {
   command: string;
   exchangeId: string | null;
@@ -255,6 +261,138 @@ export class ExchangeService {
     return this.mirrored(id, () => this.machine.markAgentComplete(id, summary), "agent_completion_reported");
   }
 
+  /**
+   * Phase 4, Step 4.1 — settle the pane's ACTIVE exchange against an explicit, self-reported
+   * outcome: either a validated+matched result envelope (src/exchanges/resultEnvelope.ts) or the
+   * conservative legacy finalResponse heuristic (src/observe/index.ts's onIdle). Both callers
+   * funnel through here so the multi-hop-safe sequencing (only `terminal_idle` has an outgoing
+   * edge to `agent_complete`; `needs_input` is only reachable from `delivered`/`running`) lives in
+   * exactly one place, and so the trust-boundary check — `exchangeId` MUST equal the pane's current
+   * active delivery marker — is enforced identically for every report source.
+   *
+   * A mismatched/absent active marker (wrong pane, forged id, or a STALE id from an
+   * already-superseded/retried delivery — `paneActive` only ever points at the CURRENT in-flight
+   * exchange, so a superseded id can never match) is IGNORED and logged as uncorrelated; nothing is
+   * read or written. An id that DOES match but whose current state has no legal path to the
+   * requested outcome (e.g. the exchange already settled) is refused by the underlying machine CAS
+   * and logged, also with no side effect — never a crash, never a partial application.
+   */
+  recordReportedOutcome(
+    paneId: string,
+    exchangeId: string,
+    outcome: ReportedOutcome,
+    summary: string,
+    envelopeJson?: string | null,
+  ): SettleOutcome | null {
+    const activeId = this.paneActive.get(paneId);
+    if (!activeId || activeId !== exchangeId) {
+      console.log(
+        `[exchange-spine] reported outcome '${outcome}' for ${exchangeId} on pane ${paneId} is ` +
+        `UNCORRELATED (active exchange: ${activeId ?? "none"}) — ignored, nothing settled.`,
+      );
+      return null;
+    }
+    const before = this.machine.get(activeId);
+    if (!before) return null;
+    const result = this.settleReportedOutcome(before, outcome, summary, envelopeJson);
+    // NOTE: `result.ok === false` (not `!result.ok`) — this file's tsconfig has strictNullChecks
+    // off, under which TS does not narrow a discriminated union via negated property-access
+    // truthiness (`!x.ok`); only an explicit equality check reliably narrows to the `reason`-bearing
+    // member. `!x.ok` early-returns elsewhere in this file are fine (they never touch `.reason`).
+    if (result.ok === false) {
+      console.log(
+        `[exchange-spine] reported outcome '${outcome}' for ${activeId} refused (${result.reason}) ` +
+        `from state '${before.state}'.`,
+      );
+      return null;
+    }
+    return { exchangeId: activeId, state: result.snapshot.state };
+  }
+
+  /** Dispatch table for `recordReportedOutcome` — kept as a single-branch switch so each arm's own
+   *  (possibly multi-hop) sequencing stays in its own small method. */
+  private settleReportedOutcome(
+    before: ExchangeSnapshot,
+    outcome: ReportedOutcome,
+    summary: string,
+    envelopeJson?: string | null,
+  ): LifecycleResult {
+    switch (outcome) {
+      case "failed":
+        return this.settleReportedFailed(before, summary, envelopeJson);
+      case "needs_input":
+        return this.settleReportedNeedsInput(before, summary, envelopeJson);
+      case "complete":
+        return this.settleReportedComplete(before, summary, envelopeJson);
+    }
+  }
+
+  /** agent_failed is legal from every in-flight state (delivered/running/needs_input/terminal_idle)
+   *  — no hop needed. Illegal from draft/staged/etc. (an envelope arriving before any delivery
+   *  landed, which real wiring cannot produce but a forged/malformed report might attempt) is
+   *  refused by the CAS below exactly like any other illegal transition. */
+  private settleReportedFailed(before: ExchangeSnapshot, summary: string, envelopeJson?: string | null): LifecycleResult {
+    const result = this.machine.markAgentFailed(before.exchangeId, summary);
+    this.persistTransition(before, result, "agent_failure_reported", this.reportOpts(summary, envelopeJson));
+    return result;
+  }
+
+  /** needs_input is directly legal from delivered/running. Already-needs_input is an idempotent
+   *  no-op (never a self-loop attempt against the machine). From terminal_idle, spec §1.2's
+   *  "terminal_idle --> running: pane resumed (idle premature)" edge is the sanctioned bounce: an
+   *  explicit report saying "actually I need input" means the prior idle was premature — hop
+   *  through `running` (persisted as its own `terminal_running` event) before landing on
+   *  `needs_input`. Unlike the ambient-idle stickiness guard in `onPaneSignal`, this path is driven
+   *  by an EXPLICIT self-report, which is exactly the stronger evidence that guard is reserving room
+   *  for. */
+  private settleReportedNeedsInput(before: ExchangeSnapshot, summary: string, envelopeJson?: string | null): LifecycleResult {
+    if (before.state === "needs_input") return { ok: true, snapshot: before };
+    let cur = before;
+    if (cur.state === "terminal_idle") {
+      const resumed = this.machine.markRunning(cur.exchangeId);
+      this.persistTransition(cur, resumed, "terminal_running");
+      if (!resumed.ok) return resumed;
+      cur = resumed.snapshot;
+    }
+    const result = this.machine.markNeedsInput(cur.exchangeId, summary);
+    this.persistTransition(cur, result, "needs_input_detected", this.reportOpts(summary, envelopeJson));
+    return result;
+  }
+
+  /** agent_complete is legal ONLY from terminal_idle (spec §1.3 — the diagram's ONE edge into it).
+   *  From delivered/running/needs_input, hop through terminal_idle first (persisted as its own
+   *  `terminal_idle` event, `before`'s state as the CAS anchor) — an explicit "complete" report is
+   *  the strongest available evidence the terminal is now idle, even if the correlator's own
+   *  ambient observation hasn't independently confirmed it yet. Already-terminal_idle skips the hop. */
+  private settleReportedComplete(before: ExchangeSnapshot, summary: string, envelopeJson?: string | null): LifecycleResult {
+    let cur = before;
+    if (cur.state !== "terminal_idle") {
+      const idled = this.machine.markTerminalIdle(cur.exchangeId, summary);
+      this.persistTransition(cur, idled, "terminal_idle");
+      if (!idled.ok) return idled;
+      cur = idled.snapshot;
+    }
+    const result = this.machine.markAgentComplete(cur.exchangeId, summary);
+    this.persistTransition(cur, result, "agent_completion_reported", this.reportOpts(summary, envelopeJson));
+    return result;
+  }
+
+  /** The event payload + `result_envelope_json` column stamp shared by every reported-outcome leg
+   *  (spec: "result_summary + result_envelope_json persisted (redacted)"). `envelopeJson` is
+   *  ALREADY redacted by the caller (resultEnvelope.ts's `redactedEnvelopeJson`, or `undefined` for
+   *  the legacy prose heuristic, which has no structured envelope to persist) — `persistTransition`
+   *  redacts it again anyway (redactSecrets is pure + idempotent, the same double-safe posture the
+   *  rest of this file already relies on), so a caller mistake here can never leak raw text. */
+  private reportOpts(
+    summary: string,
+    envelopeJson?: string | null,
+  ): { payload: Record<string, unknown>; resultEnvelopeJson?: string | null } {
+    return {
+      payload: envelopeJson != null ? { summary, has_envelope: true } : { summary },
+      ...(envelopeJson !== undefined ? { resultEnvelopeJson: envelopeJson } : {}),
+    };
+  }
+
   /** Route one observed pane signal to whatever exchange is currently ACTIVE on that pane, if
    *  any. Signals for a pane with no active exchange (unrelated pane, pre-delivery pane, unknown
    *  pane, or a pane whose active exchange already settled) are a harmless no-op. `quiescing` is
@@ -265,6 +403,21 @@ export class ExchangeService {
     const activeId = this.paneActive.get(sig.paneId);
     if (!activeId) return [];
     const before = this.machine.get(activeId);
+    // Phase 4, Step 4.1 (needs-input stickiness, spec §10.2): once the pane's active exchange is
+    // sitting at needs_input (an unanswered agent question), an AMBIENT 'idle' pane signal must
+    // never be the thing that advances it — even though the pure machine's legal-transition table
+    // still technically permits needs_input->terminal_idle (spec §1.3 note ᵍ, the "fast command"
+    // case). That edge stays legal and untouched at the machine level (still pinned by
+    // tests/test_exchange_lifecycle.ts); this is a SERVICE-layer policy on top of it: a passive
+    // "the pane went quiet" observation is not the same kind of evidence as an explicit report, and
+    // must never be read as "the outstanding question no longer needs an answer" (no flapping
+    // needs_input -> terminal_idle -> ... on every repeated idle edge). The only ways off
+    // needs_input are (a) a genuine 'running' signal (operator answered, a gated write landed), (b)
+    // an explicit terminal outcome — `recordReportedOutcome` below, which DOES deliberately hop
+    // through terminal_idle for a matched envelope/legacy report, because that is a stronger,
+    // self-reported signal, not an ambient one — or (c) interruption/cancellation. Repeated idle
+    // signals here are therefore idempotent no-ops, never persisted (nothing changed).
+    if (sig.kind === "idle" && before?.state === "needs_input") return [];
     const result = this.applySignal(activeId, sig.kind, sig.detail);
     if (before) {
       this.persistTransition(before, result, PANE_SIGNAL_EVENT[sig.kind] ?? null,
@@ -360,7 +513,7 @@ export class ExchangeService {
     id: string,
     run: () => LifecycleResult,
     eventType: ExchangeEventType | null,
-    opts?: { gateApproval?: boolean; payload?: Record<string, unknown> },
+    opts?: { gateApproval?: boolean; payload?: Record<string, unknown>; resultEnvelopeJson?: string | null },
   ): LifecycleResult {
     const before = this.machine.get(id);
     const result = run();
@@ -378,49 +531,80 @@ export class ExchangeService {
    *  this bridge existed). Fail-soft (spec §9.6 / the QW5 never-throw philosophy in src/observe/):
    *  a store failure is logged and the live in-memory result is left untouched — the caller always
    *  gets the correct in-memory `LifecycleResult` regardless of what happened here. */
+  /** The CAS predicate half of a mirrored write (spec §2a) — `before`'s state, plus (when
+   *  `gateApproval` is set) its approval binding. Split out of `persistTransition` purely to keep
+   *  that method's own branch count low (complexity gate). */
+  private buildPersistCas(
+    before: ExchangeSnapshot,
+    opts?: { gateApproval?: boolean },
+  ): { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null } {
+    const cas: { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null } =
+      { state: before.state };
+    if (opts?.gateApproval) {
+      cas.approvalId = before.approvalId;
+      cas.approvalDraftVersion = before.approvalDraftVersion;
+    }
+    return cas;
+  }
+
+  /** The `updateExchange` patch half of a mirrored write. Every free-text column is redacted at
+   *  THIS write boundary (Phase 2 Step 2.4/2.5 fix — secrets at rest; the in-memory snapshot keeps
+   *  the raw text, only the durable copy is scrubbed). Split out of `persistTransition` for the
+   *  same complexity-gate reason as `buildPersistCas`. */
+  private buildPersistPatch(
+    after: ExchangeSnapshot,
+    opts?: { resultEnvelopeJson?: string | null },
+  ): Record<string, unknown> {
+    const patch: Record<string, unknown> = {
+      state: after.state,
+      draft_version: after.draftVersion,
+      approval_id: after.approvalId,
+      approval_draft_version: after.approvalDraftVersion,
+      delivery_attempt: after.deliveryAttempt,
+      delivered_at: after.deliveredAt,
+      completed_at: after.completedAt,
+      result_summary: this.redactText(after.resultSummary),
+      terminal_state: after.terminalState,
+      distilled_instruction: this.redactText(after.distilledInstruction),
+      updated_at: after.updatedAt,
+    };
+    // Phase 4, Step 4.1: stamp the redacted result-envelope JSON on the row itself (not just the
+    // event payload) whenever a reported-outcome leg supplies one, so getExchange(...) reflects
+    // the latest report without needing to replay the event timeline.
+    if (opts?.resultEnvelopeJson !== undefined) {
+      patch.result_envelope_json = this.redactText(opts.resultEnvelopeJson);
+    }
+    return patch;
+  }
+
+  /** The `appendExchangeEvent` half of a mirrored write — only called when `eventType` is
+   *  non-null. Split out purely for the same complexity-gate reason as its siblings above. */
+  private appendMirroredEvent(
+    after: ExchangeSnapshot,
+    eventType: ExchangeEventType,
+    opts?: { payload?: Record<string, unknown> },
+  ): void {
+    this.store!.appendExchangeEvent({
+      exchange_id: after.exchangeId,
+      event_type: eventType,
+      pane_id: after.paneId,
+      project_id: after.projectId,
+      payload_redacted_json: this.redact(JSON.stringify(opts?.payload ?? {})),
+      ts: after.updatedAt,
+    });
+  }
+
   private persistTransition(
     before: ExchangeSnapshot,
     result: LifecycleResult,
     eventType: ExchangeEventType | null,
-    opts?: { gateApproval?: boolean; payload?: Record<string, unknown> },
+    opts?: { gateApproval?: boolean; payload?: Record<string, unknown>; resultEnvelopeJson?: string | null },
   ): void {
     if (!this.store || !result.ok) return;
     const after = result.snapshot;
     try {
-      const cas: { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null } =
-        { state: before.state };
-      if (opts?.gateApproval) {
-        cas.approvalId = before.approvalId;
-        cas.approvalDraftVersion = before.approvalDraftVersion;
-      }
-      // Phase 2 Step 2.4/2.5 fix (secrets at rest): every free-text column is redacted at THIS
-      // write boundary — the column name `payload_redacted_json` finally tells the truth. The
-      // in-memory snapshot keeps the raw text (delivery must not be silently altered); only the
-      // durable copies are scrubbed. redactSecrets never touches JSON structure (values only),
-      // so the payload stays parseable.
-      this.store.updateExchange(after.exchangeId, {
-        state: after.state,
-        draft_version: after.draftVersion,
-        approval_id: after.approvalId,
-        approval_draft_version: after.approvalDraftVersion,
-        delivery_attempt: after.deliveryAttempt,
-        delivered_at: after.deliveredAt,
-        completed_at: after.completedAt,
-        result_summary: this.redactText(after.resultSummary),
-        terminal_state: after.terminalState,
-        distilled_instruction: this.redactText(after.distilledInstruction),
-        updated_at: after.updatedAt,
-      }, cas);
-      if (eventType) {
-        this.store.appendExchangeEvent({
-          exchange_id: after.exchangeId,
-          event_type: eventType,
-          pane_id: after.paneId,
-          project_id: after.projectId,
-          payload_redacted_json: this.redact(JSON.stringify(opts?.payload ?? {})),
-          ts: after.updatedAt,
-        });
-      }
+      this.store.updateExchange(after.exchangeId, this.buildPersistPatch(after, opts), this.buildPersistCas(before, opts));
+      if (eventType) this.appendMirroredEvent(after, eventType, opts);
     } catch (e) {
       console.error(
         `[exchange-spine] durable mirror failed for ${eventType ?? "state-only"} on ${after.exchangeId} (continuing in-memory only):`,

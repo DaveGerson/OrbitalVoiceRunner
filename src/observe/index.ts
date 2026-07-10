@@ -31,7 +31,8 @@ import { SHELL_PROMPT } from "../statusConstants";
 import { classifyPaneOutput } from "../paneSignals";
 import { dispatchJoinTracker } from "../dispatch/joinTracker";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
-import type { PaneSignalKind } from "../exchanges/service";
+import type { PaneSignalKind, ReportedOutcome } from "../exchanges/service";
+import { scanForResultEnvelope, resultEnvelopeActive } from "../exchanges/resultEnvelope";
 import { findPaneOwningProject } from "../paneOwnership";
 import type { PaneSignalBus } from "../paneSignalBus";
 import type { AnnouncementBus } from "../announcementBus";
@@ -95,6 +96,73 @@ function settleExchangeSignal(terminalId: string, kind: PaneSignalKind, detail?:
  *  agent_failure_reported edge; spec §1.4 never distinguishes build-failed from a plain error). */
 function toExchangeSignalKind(t: Transition): PaneSignalKind {
   return t === "build-failed" ? "error" : t;
+}
+
+// ── Phase 4, Step 4.1: agent result envelope / legacy completion-report settlement ─────────────
+// Two independent, best-effort report sources — both funnel into the SAME trust boundary and
+// settlement path (ExchangeService.recordReportedOutcome, which re-checks the pane's active
+// delivery marker before doing anything): a structured result envelope
+// (src/exchanges/resultEnvelope.ts, flag-gated) and the conservative legacy finalResponse
+// heuristic below. Neither ever runs when the exchange spine itself is off (exchangeSpineActive())
+// — a no-op scan is still cheap, but there is no point paying for it when nothing downstream can
+// act on the result.
+
+/** The ONE literal-prefix pattern the conservative legacy heuristic matches (spec §5.6/§9.3): a
+ *  final line that STARTS with an explicit completion token — exactly the shape
+ *  COMPLETION_REQUEST_LINE invites ("a final line stating done or blocked, and why"). Deliberately
+ *  narrow: a summary that merely mentions "done" mid-sentence, or a bare idle pane with no such
+ *  line, does not match — a false negative just leaves the exchange at terminal_idle (always
+ *  safe); a false positive is caught by the underlying machine's own CAS (agent_complete is legal
+ *  ONLY from terminal_idle — see ExchangeService.settleReportedComplete), so this can never
+ *  mis-fire against an exchange still legitimately waiting on an unanswered question. */
+const LEGACY_DONE_LINE_RE = /^(done|complete|completed|finished|all done)\b[:.,!]?\s*/i;
+
+/** True when the LAST non-empty line of `text` is an explicit completion statement. Bounded to the
+ *  same already-capped/redacted text callers already have in hand (historyManager's stored output,
+ *  or the WS-D summary) — no additional scanning budget spent here. */
+function isLegacyDoneLine(text: string): boolean {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return LEGACY_DONE_LINE_RE.test(lines[lines.length - 1]);
+}
+
+/** Envelope-declared outcome, with `needs_operator: true` overriding the declared `status` (spec
+ *  §10.2, "needs-input detection... explicit envelope with needs_operator true" — an operator-needed
+ *  flag always wins over whatever terminal status the agent also reported, since it is the stronger,
+ *  more conservative reading: keep the exchange open for the operator rather than close it out). */
+function effectiveEnvelopeOutcome(status: ReportedOutcome, needsOperator: boolean): ReportedOutcome {
+  return needsOperator ? "needs_input" : status;
+}
+
+/** The detected-question TEXT for a 'prompt' transition (spec §10.2: "the detected question text
+ *  redacted, capped, attached to the exchange (needs_input_detected event payload)"). Deliberately
+ *  mirrors classifyPaneOutput's own prompt-detail contract byte-for-byte (src/paneSignals.ts: last
+ *  non-empty line, redactSecrets, capped to 80 chars) rather than threading that classifier's
+ *  result across the module — classifyTransition's idle/prompt refinement and classifyPaneOutput's
+ *  error/prompt classifier are deliberately independent passes over the same chunk (this file's
+ *  header doc), but both may derive the identical redacted tail-line detail without coupling. */
+function promptDetailFor(cleanChunk: string): string {
+  const lines = cleanChunk.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const last = lines.length > 0 ? lines[lines.length - 1] : "";
+  return redactSecrets(last).slice(0, 80);
+}
+
+/** Phase 4, Step 4.1: opportunistic MID-RUN envelope detection — scans ONLY the current output
+ *  chunk (the per-chunk half of resultEnvelope.ts's two-pass detection contract; see that module's
+ *  doc for the full story). Handles ONLY 'failed'/'needs_input' (or any status carrying
+ *  needs_operator:true) here — a 'complete' report with no needs_operator flag is always DEFERRED
+ *  to the idle-time pass (`settleTerminalOutcome` below), which additionally requires genuine
+ *  terminal idleness to corroborate it before Orbital calls an exchange done (belt-and-suspenders:
+ *  even an explicit self-report of "complete" waits for the terminal to actually go quiet). */
+function settleChunkResultEnvelope(terminalId: string, cleanChunk: string): void {
+  if (!exchangeSpineActive() || !resultEnvelopeActive()) return;
+  if (!activeExchangeForPane(terminalId)) return;
+  const scan = scanForResultEnvelope(cleanChunk);
+  if (!scan.found || !scan.envelope) return;
+  const env = scan.envelope;
+  if (env.status === "complete" && !env.needsOperator) return; // deferred to idle-time settle.
+  const outcome = effectiveEnvelopeOutcome(env.status, env.needsOperator);
+  getExchangeService().recordReportedOutcome(terminalId, env.exchangeId, outcome, env.summary, env.redactedEnvelopeJson);
 }
 
 /** A structural view of the bits of a UniversalTerminal the transition classifier reads. */
@@ -370,6 +438,44 @@ ${redact(rawOutput.slice(-3000))}`;
     return "finished";
   }
 
+  /**
+   * Phase 4, Step 4.1 — the IDLE-TIME settlement pass, run once per genuine Running->Idle
+   * completion edge, AFTER `settleExchangeSignal(terminalId, "idle")` has already run (so the
+   * pane's active exchange is at `terminal_idle`, or was deliberately left at `needs_input` by the
+   * stickiness guard — ExchangeService.onPaneSignal). Two independent report sources are tried, in
+   * a fixed order, and BOTH funnel into the exact same trust boundary + settlement path
+   * (`ExchangeService.recordReportedOutcome`), so trying the second even when the first already
+   * settled the exchange is always safe (a redundant attempt is just a harmless machine CAS no-op):
+   *   1. A matched result envelope, scanned from the FULL accumulated command-output tail
+   *      (historyManager already bounds + secret-redacts it at save time — the definitive pass
+   *      that also catches an envelope whose JSON happened to straddle two PTY chunks, which the
+   *      per-chunk pass in settleChunkResultEnvelope can miss).
+   *   2. The conservative legacy finalResponse heuristic (`isLegacyDoneLine`), checked against both
+   *      the WS-D summary text and the raw output tail.
+   * No active exchange on this pane (spine off, or no in-flight exchange at all) is checked first
+   * so a busy shell pane never pays for either scan.
+   */
+  function settleTerminalOutcome(terminalId: string, summaryText: string): void {
+    if (!exchangeSpineActive()) return;
+    const activeId = activeExchangeForPane(terminalId);
+    if (!activeId) return;
+    const history = historyManager.loadHistory(terminalId);
+    const lastOutput = history.length > 0 ? (history[history.length - 1].output ?? "") : "";
+    const scan = scanForResultEnvelope(lastOutput);
+    if (scan.found && scan.envelope) {
+      const env = scan.envelope;
+      const outcome = effectiveEnvelopeOutcome(env.status, env.needsOperator);
+      const settled = getExchangeService().recordReportedOutcome(terminalId, env.exchangeId, outcome, env.summary, env.redactedEnvelopeJson);
+      // Only short-circuit when the envelope actually settled something (a matched, correlated
+      // report). An envelope that parsed fine but was ignored (wrong/stale/forged exchange_id)
+      // must not suppress the legacy fallback below — it is simply as if no envelope were there.
+      if (settled) return;
+    }
+    if (isLegacyDoneLine(summaryText) || isLegacyDoneLine(lastOutput)) {
+      getExchangeService().recordReportedOutcome(terminalId, activeId, "complete", summaryText);
+    }
+  }
+
   const onIdle = async (terminalId: string): Promise<void> => {
     // AgentExchange spine (step 1.4): the genuine Running→Idle completion edge also settles the
     // pane's active exchange (delivered/running/needs_input -> terminal_idle). Best-effort/no-op
@@ -388,6 +494,15 @@ ${redact(rawOutput.slice(-3000))}`;
     if (!term) return;
 
     const summaryText = await computeIdleSummary(terminalId);
+
+    // Phase 4, Step 4.1: settle a matched result envelope or the conservative legacy
+    // finalResponse heuristic against the active exchange. Guarded per QW5 — a settlement fault
+    // must never skip the announcement/breadcrumb tail below.
+    try {
+      settleTerminalOutcome(terminalId, summaryText);
+    } catch (e) {
+      console.error(`[onIdle] result-envelope/legacy-completion settle failed for ${terminalId}:`, e);
+    }
 
     // WS-D (BUG-024): announce on this genuine WS-C Running->Idle completion edge — no new
     // idle inference. Fires regardless of whether there was substantive output / an existing
@@ -698,7 +813,13 @@ ${redact(rawOutput.slice(-3000))}`;
     // (needs_input_detected on 'prompt', agent_failure_reported on error/build-failed/exited, and
     // terminal_idle here is a harmless idempotent repeat of onIdle's own signal — the underlying
     // state CAS makes a duplicate edge a structural no-op). Best-effort/no-op internally.
-    settleExchangeSignal(terminalId, toExchangeSignalKind(transition));
+    // Phase 4, Step 4.1: the 'prompt' edge additionally attaches the detected question text
+    // (redacted+capped) so the needs_input_detected event payload carries it (spec §10.2).
+    settleExchangeSignal(
+      terminalId,
+      toExchangeSignalKind(transition),
+      transition === "prompt" ? promptDetailFor(cleanChunk) : undefined,
+    );
 
     handleWatchRulesTrigger(terminalId, transition);
     handlePlansTrigger(terminalId, transition);
@@ -743,6 +864,13 @@ ${redact(rawOutput.slice(-3000))}`;
       detectAndTriggerTransitions(terminalId, cleanChunk);
     } catch (e) {
       console.error(`[ONOUTPUT] transition step failed for ${terminalId}:`, e);
+    }
+    try {
+      // Phase 4, Step 4.1: opportunistic mid-run result-envelope detection (failed/needs_input
+      // only — see settleChunkResultEnvelope's doc for why 'complete' is deferred to idle-time).
+      settleChunkResultEnvelope(terminalId, cleanChunk);
+    } catch (e) {
+      console.error(`[ONOUTPUT] result-envelope step failed for ${terminalId}:`, e);
     }
   }
 
