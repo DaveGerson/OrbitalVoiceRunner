@@ -109,7 +109,18 @@ export class MemoryService {
    *  hysteresis hash, exposed for src/voice/index.ts's choke point to feed `gate.evaluate`. A
    *  getTiers throw yields `""` (never throws itself) — an empty-string hash can never equal a
    *  real prior injected hash, so a hashing fault fails toward INJECTING, not toward silently
-   *  suppressing forever. */
+   *  suppressing forever.
+   *
+   *  KNOWN GAP (Phase 2 Step 2.1): this call intentionally omits `affectedPaneId` — the
+   *  voice/index.ts call site (outside this module's allowed edit surface for this step) does not
+   *  thread one through. So a gate decision can be made against a snapshot that doesn't yet
+   *  reflect the eventFocus block synthesizeAsync/observeCortexShadow build moments later for the
+   *  SAME trigger. In practice this rarely causes a false "unchanged-brief" skip: BoardTier is
+   *  already enriched with per-pane exchange state (Phase 2 Step 2.1) and IS part of this hash, so
+   *  the exact background transition that would populate eventFocus (a pane flipping into
+   *  needs_input/awaiting_approval/etc.) also flips that pane's board entry, changing this hash
+   *  too. A fast-follow should thread affectedPaneId here once voice/index.ts's call site is in
+   *  scope. */
   snapshotHashFor(paneId: string | null, now: number): string {
     try {
       return this._snapshotHash(this.wm.getTiers(paneId, now));
@@ -195,7 +206,9 @@ export class MemoryService {
     const client = this.cortexClient;
     if (!client || !client.available()) return;
     try {
-      const tiers = this.wm.getTiers(activePaneId, now);
+      // Phase 2 Step 2.1: thread affectedPaneId into the tiers snapshot so a background-outcome
+      // trigger's event-focus block is actually present for the cortex to see/select.
+      const tiers = this.wm.getTiers(activePaneId, now, affectedPaneId);
       const shouldFire = this._shouldFireCortex(tiers, now);
       this._advanceCortexState(tiers, now); // 4ey: advance BEFORE the isCortexPrimary early-return.
       // csw: primary path decides+records via cortexCuratedBrief; suppress the shadow hit here to
@@ -309,7 +322,9 @@ export class MemoryService {
     affectedPaneId: string | null = null,
   ): Promise<SynthesizedBrief> {
     try {
-      const tiers = this.wm.getTiers(activePaneId, now);
+      // Phase 2 Step 2.1: same affectedPaneId wiring as observeCortexShadow above — the rendered
+      // (or cortex-curated) brief must carry the event-focus block for a background trigger too.
+      const tiers = this.wm.getTiers(activePaneId, now, affectedPaneId);
       this._advanceCortexState(tiers, now); // 4ey: advance BEFORE the primary/shadow branch.
       const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
       // B-1: cortex-primary curation (default OFF). On a clean hit this REPLACES the synth race below
