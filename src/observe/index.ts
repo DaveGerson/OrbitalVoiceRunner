@@ -30,6 +30,8 @@ import { OrchestratorManager, stripAnsiSequences, redactSecrets } from "../termi
 import { SHELL_PROMPT } from "../statusConstants";
 import { classifyPaneOutput } from "../paneSignals";
 import { dispatchJoinTracker } from "../dispatch/joinTracker";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import type { PaneSignalKind } from "../exchanges/service";
 import type { PaneSignalBus } from "../paneSignalBus";
 import type { AnnouncementBus } from "../announcementBus";
 import type { InteractionLogger } from "../interactionLog";
@@ -55,6 +57,43 @@ const FAILURE_TRANSITIONS = new Set<FailureTransition>(["build-failed", "error",
 /** Type guard: narrows a Transition to the high-severity FailureTransition subset. */
 function isFailureTransition(t: Transition): t is FailureTransition {
   return FAILURE_TRANSITIONS.has(t as FailureTransition);
+}
+
+// ── AgentExchange spine wiring (step 1.4, spec §5 "pane signals") ──────────────────────────────
+// The correlator taps the SAME observe call sites that already feed the dispatch join tracker —
+// NOT a PaneSignalBus subscription (the bus lanes debounce/dedupe for their consumers; a
+// debounced-away edge must still settle an exchange). Every helper below is best-effort and NEVER
+// throws (spec §9.6 — a spine outage must never affect real observation); `off` mode short-circuits
+// before even allocating the ExchangeService singleton, so this is zero behavior delta by default.
+
+/** The pane's currently-ACTIVE exchange (its delivery marker), or undefined off/unbound/unknown. */
+function activeExchangeForPane(terminalId: string): string | undefined {
+  if (!exchangeSpineActive()) return undefined;
+  try {
+    return getExchangeService().activeExchangeForPane(terminalId);
+  } catch (e) {
+    console.error(`[exchange-spine] activeExchangeForPane failed for ${terminalId}:`, e);
+    return undefined;
+  }
+}
+
+/** Feed one observed pane signal to the exchange correlator (advances the active exchange's own
+ *  lifecycle — terminal_running/terminal_quiescing/terminal_idle/needs_input_detected/
+ *  agent_failure_reported; a no-op when there is no active exchange on this pane). */
+function settleExchangeSignal(terminalId: string, kind: PaneSignalKind, detail?: string): void {
+  if (!exchangeSpineActive()) return;
+  try {
+    getExchangeService().onPaneSignal({ paneId: terminalId, kind, detail });
+  } catch (e) {
+    console.error(`[exchange-spine] onPaneSignal(${kind}) failed for ${terminalId}:`, e);
+  }
+}
+
+/** Map the observe pipeline's Transition vocabulary onto the exchange service's PaneSignalKind —
+ *  `build-failed` has no distinct exchange-level kind, so it folds into `error` (both are the same
+ *  agent_failure_reported edge; spec §1.4 never distinguishes build-failed from a plain error). */
+function toExchangeSignalKind(t: Transition): PaneSignalKind {
+  return t === "build-failed" ? "error" : t;
 }
 
 /** A structural view of the bits of a UniversalTerminal the transition classifier reads. */
@@ -204,7 +243,11 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     terminalId: string,
     transition: "idle" | "prompt" | "error" | "build-failed" | "exited"
   ): void {
-    for (const g of dispatchJoinTracker.noteTransition(terminalId, transition)) {
+    // Step 1.4: gate exchange-correlated members to the pane's ACTIVE exchange (the delivery
+    // marker) instead of the old blind paneId match — legacy/flag-off members (no exchangeId) are
+    // unaffected (see joinTracker.ts's noteTransition/settleGroupMembers).
+    const activeExchangeId = activeExchangeForPane(terminalId);
+    for (const g of dispatchJoinTracker.noteTransition(terminalId, transition, Date.now(), activeExchangeId)) {
       const total = g.members.length;
       const done = g.members.filter((m) => m.status === "done").length;
       const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
@@ -307,6 +350,10 @@ ${redact(rawOutput.slice(-3000))}`;
   }
 
   const onIdle = async (terminalId: string): Promise<void> => {
+    // AgentExchange spine (step 1.4): the genuine Running→Idle completion edge also settles the
+    // pane's active exchange (delivered/running/needs_input -> terminal_idle). Best-effort/no-op
+    // internally (settleExchangeSignal never throws); off by default.
+    settleExchangeSignal(terminalId, "idle");
     // Dispatch join: the genuine Running→Idle completion edge is the SUCCESS settle signal (the
     // chunk classifier below dedups on lastStates, so shell panes that return to a prompt never
     // produce a fresh "idle" edge there). Guarded per QW5 — a join fault must not skip the
@@ -353,12 +400,16 @@ ${redact(rawOutput.slice(-3000))}`;
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "running", detail });
     broadcast({ type: "pane_status", terminalId, status: "Running" });
+    // AgentExchange spine (step 1.4): the genuine Running edge advances the pane's active exchange
+    // (delivered|needs_input -> running). Best-effort/no-op internally; off by default.
+    settleExchangeSignal(terminalId, "running", detail);
     // Dispatch join (templates-layouts-dispatch §5): the genuine Running edge is what flips a
     // staged dispatch member to in-flight (its approved write landed and the pane started). Pure
     // bookkeeping — settling/announcing happens on the transition edges below. Guarded so a join
-    // fault can never break the Running observation (QW5 philosophy).
+    // fault can never break the Running observation (QW5 philosophy). Step 1.4: gated to the
+    // pane's ACTIVE exchange for exchange-correlated members (see joinTracker.ts).
     try {
-      dispatchJoinTracker.noteRunning(terminalId);
+      dispatchJoinTracker.noteRunning(terminalId, activeExchangeForPane(terminalId));
     } catch (e) {
       console.error(`[ONRUNNING] dispatch-join step failed for ${terminalId}:`, e);
     }
@@ -382,6 +433,8 @@ ${redact(rawOutput.slice(-3000))}`;
     const detail = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : undefined;
     paneSignalBus.publish({ paneId: terminalId, kind: "quiescing", detail });
     broadcast({ type: "pane_quiescing", terminalId });
+    // AgentExchange spine (step 1.4): advisory only (spec §1.4) — never changes exchange state.
+    settleExchangeSignal(terminalId, "quiescing", detail);
     // P0a memory: drop a redacted one-liner breadcrumb on the pre-idle "wrapping up" edge.
     if (onBreadcrumb) {
       const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
@@ -619,6 +672,12 @@ ${redact(rawOutput.slice(-3000))}`;
     if (isFailureTransition(transition)) {
       emitHighSeverityTransition(terminalId, transition, cleanChunk);
     }
+
+    // AgentExchange spine (step 1.4): feed this classified edge to the pane's active exchange too
+    // (needs_input_detected on 'prompt', agent_failure_reported on error/build-failed/exited, and
+    // terminal_idle here is a harmless idempotent repeat of onIdle's own signal — the underlying
+    // state CAS makes a duplicate edge a structural no-op). Best-effort/no-op internally.
+    settleExchangeSignal(terminalId, toExchangeSignalKind(transition));
 
     handleWatchRulesTrigger(terminalId, transition);
     handlePlansTrigger(terminalId, transition);

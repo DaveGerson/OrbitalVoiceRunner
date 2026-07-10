@@ -311,6 +311,14 @@ export class JanusStore {
   deletePendingApproval(id: string): void {
     this.db.prepare("DELETE FROM pending_approvals WHERE id=?").run(id);
   }
+  /** AgentExchange spine boot recovery (step 1.4, spec §4): does a durable pending_approval row
+   *  still exist for this id (claimed or not)? Used to decide whether an `awaiting_approval`
+   *  exchange can be safely KEPT (the approval survivor re-hydrates via the existing path) or must
+   *  revert to `draft` (the row was claimed+deleted or TTL-swept mid-crash — never assume the
+   *  missing approval was confirmed). */
+  hasPendingApproval(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM pending_approvals WHERE id=?").get(id);
+  }
   getPendingApprovals(sessionId: string): StoredPendingApproval[] {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));

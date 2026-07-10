@@ -25,6 +25,17 @@ export interface DispatchMember {
   paneId: string;
   status: DispatchMemberStatus;
   detail?: string;
+  /**
+   * AgentExchange spine correlation (step 1.4, docs/superpowers/specs/2026-07-09-agent-exchange-
+   * spine.md §5). Set ONLY when this member's write was exchange-correlated at staging time (flag
+   * shadow/primary AND the approval store bound an exchange to the member's synthetic pendingId —
+   * src/actions/defs/dispatch_group.ts's recordDispatchOutcome). Undefined for legacy/flag-off
+   * members, which keep the original pane-scoped (paneId-only) matching FOREVER — never adopted
+   * retroactively. When set, `noteRunning`/`noteTransition` below only advance this member on the
+   * edge where it is the pane's currently ACTIVE exchange (its delivery marker) — an unrelated
+   * exchange's delivery, or a manual write, on the same pane must never settle it.
+   */
+  exchangeId?: string;
 }
 
 export interface DispatchGroup {
@@ -65,7 +76,9 @@ export class DispatchJoinTracker {
     return [...this.groups];
   }
 
-  /** Stamp a member's dispatch-time outcome (executed -> running, pending -> staged, …). */
+  /** Stamp a member's dispatch-time outcome (executed -> running, pending -> staged, …). Matches
+   *  the FIRST member on `paneId` — fine for the common case (one member per pane), but a macro
+   *  fanning multiple steps onto the SAME pane needs `recordOutcomeAt` (index-addressed) instead. */
   recordOutcome(groupId: string, paneId: string, status: DispatchMemberStatus, detail?: string): void {
     const m = this.get(groupId)?.members.find((x) => x.paneId === paneId);
     if (!m) return;
@@ -73,31 +86,69 @@ export class DispatchJoinTracker {
     if (detail !== undefined) m.detail = detail;
   }
 
-  /** A pane started Running: confirmed staged members on that pane are now in flight. */
-  noteRunning(paneId: string): void {
+  /**
+   * Index-addressed outcome recording (step 1.4): dispatch_group.ts's fan-out loop knows the
+   * target's POSITION (targets[i] <-> group.members[i], set 1:1 by `create`), which disambiguates
+   * repeated pane_ids — `recordOutcome`'s paneId lookup cannot. Also threads the exchange_id bound
+   * to this member's synthetic pendingId (spec §5) so later pane edges can be gated to the ONE
+   * member whose delivery marker is active (see noteRunning/noteTransition below) instead of
+   * flipping every same-pane member blindly.
+   */
+  recordOutcomeAt(
+    groupId: string,
+    index: number,
+    status: DispatchMemberStatus,
+    detail?: string,
+    exchangeId?: string
+  ): void {
+    const m = this.get(groupId)?.members[index];
+    if (!m) return;
+    m.status = status;
+    if (detail !== undefined) m.detail = detail;
+    if (exchangeId !== undefined) m.exchangeId = exchangeId;
+  }
+
+  /**
+   * A pane started Running: confirmed staged members on that pane are now in flight.
+   *
+   * `activeExchangeId` (step 1.4, spec §5): the pane's currently-ACTIVE exchange
+   * (ExchangeService.activeExchangeForPane) — the delivery marker that just landed. A member
+   * correlated to a SPECIFIC exchange (`m.exchangeId` set) may only advance when it IS that
+   * marker: an unrelated exchange's delivery on the same pane, or a manual write (which never
+   * moves the marker), must never flip it. A member with no exchangeId (legacy / flag off) keeps
+   * the original pane-scoped behavior UNCONDITIONALLY — omitting the second argument (every
+   * pre-1.4 call site) reproduces that exactly, since `m.exchangeId` is then always undefined and
+   * the guard below is a no-op.
+   */
+  noteRunning(paneId: string, activeExchangeId?: string): void {
     for (const g of this.groups) {
       if (g.completed) continue;
       for (const m of g.members) {
-        if (m.paneId === paneId && m.status === "staged") m.status = "running";
+        if (m.paneId !== paneId || m.status !== "staged") continue;
+        if (m.exchangeId && m.exchangeId !== activeExchangeId) continue;
+        m.status = "running";
       }
     }
   }
 
   /**
    * A pane hit a terminal transition. Settle matching in-flight members and return every group
-   * this edge NEWLY completed (the caller announces those — once each).
+   * this edge NEWLY completed (the caller announces those — once each). `activeExchangeId` gates
+   * exchange-correlated members exactly as `noteRunning` does (spec §5) — omitted, it reproduces
+   * the pre-1.4 pane-scoped behavior byte-for-byte.
    */
   noteTransition(
     paneId: string,
     transition: "idle" | "prompt" | "error" | "build-failed" | "exited",
-    now: number = Date.now()
+    now: number = Date.now(),
+    activeExchangeId?: string
   ): DispatchGroup[] {
     if (transition === "prompt") return []; // awaiting input is not a settle edge
     const settled: DispatchMemberStatus = transition === "idle" ? "done" : "error";
     const newlyCompleted: DispatchGroup[] = [];
     for (const g of this.groups) {
       if (g.completed) continue;
-      const touched = this.settleGroupMembers(g, paneId, transition, settled);
+      const touched = this.settleGroupMembers(g, paneId, transition, settled, activeExchangeId);
       if (touched && this.settledAtDispatch(g)) {
         g.completed = true;
         g.completedAt = now;
@@ -110,22 +161,25 @@ export class DispatchJoinTracker {
   /**
    * Settle every running member of `group` on `paneId` to `settled` (error members also get the
    * pane-edge detail). Returns whether any member was touched. Verbatim extraction of the inner
-   * settle loop from noteTransition — semantics IDENTICAL (including the `every` completion check,
-   * which settledAtDispatch already expresses).
+   * settle loop from noteTransition — semantics IDENTICAL when `activeExchangeId` is omitted
+   * (including the `every` completion check, which settledAtDispatch already expresses), plus the
+   * step 1.4 exchange-marker guard: an exchange-correlated member only settles when it IS the
+   * pane's active exchange.
    */
   private settleGroupMembers(
     group: DispatchGroup,
     paneId: string,
     transition: "idle" | "error" | "build-failed" | "exited",
-    settled: DispatchMemberStatus
+    settled: DispatchMemberStatus,
+    activeExchangeId?: string
   ): boolean {
     let touched = false;
     for (const m of group.members) {
-      if (m.paneId === paneId && m.status === "running") {
-        m.status = settled;
-        if (settled === "error") m.detail = `pane ${transition}`;
-        touched = true;
-      }
+      if (m.paneId !== paneId || m.status !== "running") continue;
+      if (m.exchangeId && m.exchangeId !== activeExchangeId) continue;
+      m.status = settled;
+      if (settled === "error") m.detail = `pane ${transition}`;
+      touched = true;
     }
     return touched;
   }

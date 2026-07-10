@@ -34,6 +34,7 @@ import type {
 import { isPaneActiveForWrite, inactivePaneClarify } from "../activePane";
 import type { CapabilityGate, GateValue } from "../types";
 import type { LiveSessionLike, DispatchOutcome } from "../actions/types";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 
 /**
  * The connection-AGNOSTIC collaborators + the per-call request context the effect-switch needs. This
@@ -92,6 +93,55 @@ export interface DispatchDeps {
    * that. Strictly more cautious than the normal path; false/absent everywhere else.
    */
   forceStage?: boolean;
+  /**
+   * AgentExchange spine correlation (step 1.4, spec §2b / §5): the exchange bound to THIS write,
+   * if the caller resolved one before calling applyDispatchDecision (mints happen upstream — this
+   * module never creates an exchange). When set AND the flag is shadow/primary, the auto_execute
+   * arm below performs the SAME two-phase durable-intent ordering renderApproved already does for
+   * the approved-write path (src/gating/index.ts): `beginDeliveryAttempt` genuinely precedes the
+   * pane write, `completeDelivery` genuinely follows it, and the two certain-failure pre-write
+   * guards (no live pane / pane Exited) `failDelivery` instead of silently no-oping. Optional and
+   * best-effort everywhere — absent (every call site today; voice/index.ts still does its own
+   * post-hoc approximation) is a complete no-op, byte-identical to before this field existed.
+   */
+  exchangeId?: string;
+}
+
+// ── AgentExchange spine (step 1.4): the auto_execute two-phase delivery hooks ─────────────────────
+// Mirrors src/gating/index.ts's beginExchangeDeliveryOnApprove/completeExchangeDeliveryOnApprove
+// verbatim in spirit: best-effort, never throws, a no-op unless the flag is active AND the caller
+// supplied deps.exchangeId (spec §9.6 — a spine outage must never affect the real dispatch outcome).
+
+function beginExchangeDeliveryOnAutoExecute(deps: DispatchDeps): void {
+  if (!exchangeSpineActive() || !deps.exchangeId) return;
+  try {
+    const svc = getExchangeService();
+    svc.stageForDelivery(deps.exchangeId); // no-op (illegal transition) if already staged
+    svc.beginDeliveryAttempt(deps.exchangeId);
+  } catch (e) {
+    console.error("[exchange-spine] beginExchangeDeliveryOnAutoExecute failed:", e);
+  }
+}
+
+function completeExchangeDeliveryOnAutoExecute(deps: DispatchDeps): void {
+  if (!exchangeSpineActive() || !deps.exchangeId) return;
+  try {
+    getExchangeService().completeDelivery(deps.exchangeId);
+  } catch (e) {
+    console.error("[exchange-spine] completeExchangeDeliveryOnAutoExecute failed:", e);
+  }
+}
+
+/** Certain-failure leg (spec §1.3 note ᵉ): the two pre-write guards below (no live pane / pane
+ *  Exited) know FOR CERTAIN nothing landed, so this re-arms the exchange to `draft` instead of
+ *  quarantining it — a re-send just needs a fresh approval, not operator intervention. */
+function failExchangeDeliveryOnAutoExecute(deps: DispatchDeps, reason: string): void {
+  if (!exchangeSpineActive() || !deps.exchangeId) return;
+  try {
+    getExchangeService().failDelivery(deps.exchangeId, reason);
+  } catch (e) {
+    console.error("[exchange-spine] failExchangeDeliveryOnAutoExecute failed:", e);
+  }
 }
 
 /**
@@ -202,6 +252,7 @@ function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcom
   // write: if there is no live terminal, refuse instead of crashing on `term!.writeInput`. (The
   // pending-approval path re-checks liveness at resolve time.)
   if (!term) {
+    failExchangeDeliveryOnAutoExecute(deps, "no_live_pane");
     return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
   }
   // res2: a REGISTERED-but-dead pane (the process crashed/exited in place, term still present in
@@ -211,10 +262,16 @@ function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcom
   // same way the never-spawned/archived case above does (kind:'error', same message shape) instead
   // of a silent no-op success.
   if (term.status === "Exited") {
+    failExchangeDeliveryOnAutoExecute(deps, "pane_exited");
     return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
   }
+  // AgentExchange spine (step 1.4): the durable pre-write intent genuinely precedes the write —
+  // a crash between this call and `term.writeInput` leaves exactly the "uncertain delivery"
+  // signature boot recovery quarantines (spec §2b/§4); best-effort no-op without deps.exchangeId.
+  beginExchangeDeliveryOnAutoExecute(deps);
   addCommand(targetId, instruction);
   term.writeInput(instruction);
+  completeExchangeDeliveryOnAutoExecute(deps);
   broadcast({ type: "command_auto_executed", terminalId: targetId, cmd: safeInstr });
   return { kind: "executed", text: `Command executed automatically on pane ${targetId}: "${safeInstr}"` };
 }
