@@ -185,6 +185,24 @@ describe("targetResolver: no referent and anaphora (spec §3.2)", () => {
     );
     assert.deepStrictEqual(d, { kind: "bind", paneId: "codex-1", projectId: "proj-a" });
   });
+
+  it("(step 3.5) anaphora whose recent referent lives OUTSIDE the active project -> confirm(cross_project), never a silent cross-project bind", async () => {
+    const d = await resolveTarget(
+      input({ reference: "it", recentReferent: { paneId: "docs-pane", projectId: "proj-b" }, rank: deadRank })
+    );
+    assert.strictEqual(d.kind, "confirm", "continuing a thread does not waive the project boundary (spec §3.2 hard rule)");
+    if (d.kind === "confirm") {
+      assert.strictEqual(d.reason, "cross_project");
+      assert.deepStrictEqual(d.candidates, [{ paneId: "docs-pane", projectId: "proj-b" }]);
+    }
+  });
+
+  it("(step 3.5) anaphora whose recent referent pane is GONE from the candidate set -> clarify, never a ghost bind", async () => {
+    const d = await resolveTarget(
+      input({ reference: "that one", recentReferent: { paneId: "deleted-pane", projectId: "proj-a" }, rank: deadRank })
+    );
+    assert.strictEqual(d.kind, "clarify", "a TTL-live referent to a deleted/archived pane must not bind");
+  });
 });
 
 // ── cross-project ───────────────────────────────────────────────────────────────────────────────
@@ -249,6 +267,12 @@ describe("targetResolver: Python ranking seam — ranking only, floor never wide
     assert.deepStrictEqual(d, { kind: "bind", paneId: "codex-1", projectId: "proj-a" });
     const fuzzy = await resolveTarget(input({ reference: "the biuld one", rank }));
     assert.strictEqual(fuzzy.kind, "clarify");
+  });
+
+  it("(step 3.5) a ranker naming a pane OUTSIDE the candidate set -> clarify — a confused daemon can never bind or confirm a ghost target", async () => {
+    const ghost = async (): Promise<FocusResolution> => ({ paneId: "not-a-real-pane", confidence: 1, alternatives: [] });
+    const d = await resolveTarget(input({ reference: "the mystery pane", rank: ghost }));
+    assert.strictEqual(d.kind, "clarify", "the ranker names candidates, it does not create them (D2: never widen)");
   });
 });
 

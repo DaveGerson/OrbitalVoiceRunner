@@ -37,8 +37,8 @@ import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
-import { reviseDraft, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft } from "./src/exchanges/draftRegistry";
+import { reviseDraft, renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval } from "./src/exchanges/draftRegistry";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -1051,16 +1051,64 @@ function registerRawInputRoute(
  * src/exchanges/draftRegistry.ts). JANUS_INSTRUCTION_ENVELOPE=primary only; best-effort and never
  * throws back into the route handler.
  */
-function convergeTypedDraftEditRest(projectId: string, paneId: string): void {
+function convergeTypedDraftEditRest(
+  projectId: string,
+  paneId: string,
+  text: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
   if (!instructionEnvelopeIsPrimary()) return;
   try {
     const existing = getOpenDraft(projectId, paneId);
     if (!existing) return;
+    // Step 3.5 (BUG-B): the typed edit bumps the version, so any approval staged from the prior
+    // version is invalidated through the resolve choke-point — it can never deliver stale text.
+    invalidateOutstandingApproval(projectId, paneId, applyResolution);
+    // Step 3.5: the Workbench's Cancel/Scrap affordance is PUT {text:""} (see
+    // src/orbital/InstructionWorkbench.tsx header) — an emptied draft CANCELS the open exchange
+    // instead of leaving a ghost registry entry (a ghost blocked retargets and re-materialized on
+    // the next GET, while the panel only hid it client-side).
+    if (text.trim().length === 0) {
+      clearOpenDraft(projectId, paneId);
+      clearProseOverride(projectId, paneId);
+      return;
+    }
     setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
     setProseOverride(projectId, paneId);
   } catch (e) {
     console.error("[instruction-envelope] REST draft_edit convergence failed:", e);
   }
+}
+
+/**
+ * Step 3.5: settle the open envelope draft when the OPERATOR sends via the Workbench lane
+ * (spec §5.3 — under `primary` the operator-direct send stamps the same exchange as delivered).
+ * Any approval a prior voice send staged for this draft is invalidated FIRST — the operator's
+ * direct send supersedes it, and letting it resolve later would double-type the pane. Best-effort.
+ */
+function settleEnvelopeDraftOnOperatorSend(
+  projectId: string,
+  paneId: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
+  if (!instructionEnvelopeIsPrimary()) return;
+  try {
+    invalidateOutstandingApproval(projectId, paneId, applyResolution);
+    clearOpenDraft(projectId, paneId);
+    clearProseOverride(projectId, paneId);
+  } catch (e) {
+    console.error("[instruction-envelope] operator-send settle failed:", e);
+  }
+}
+
+/** Step 3.5 (BUG-D, spec §6.2): the Workbench send refuses an over-limit draft — never silent
+ *  truncation. Returns the overflow character count (0 = within the pane preset's ceiling).
+ *  `primary` only: the legacy lanes are byte-identical with the flag off. */
+function operatorSendOverflow(paneId: string, text: string): number {
+  if (!instructionEnvelopeIsPrimary()) return 0;
+  const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
+  const profile = RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom;
+  return renderedOverflow(text, profile);
 }
 
 function registerDraftAndSettingsRoutes(
@@ -1069,9 +1117,12 @@ function registerDraftAndSettingsRoutes(
     broadcast: (msg: any) => void;
     broadcastDraft: (projectId: string, paneId: string) => void;
     requestVoiceReconnect: () => void;
+    /** Step 3.5: the gating resolve choke-point — the typed-edit convergence + operator-direct
+     *  send use it to invalidate a pending approval staged from a now-stale draft version. */
+    applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown;
   }
 ): void {
-  const { broadcast, broadcastDraft, requestVoiceReconnect } = deps;
+  const { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution } = deps;
 
   // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
   app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
@@ -1088,8 +1139,8 @@ function registerDraftAndSettingsRoutes(
     if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
     const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
     if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    convergeTypedDraftEditRest(req.params.projectId, req.params.paneId, String(text), applyResolution);
     broadcastDraft(req.params.projectId, req.params.paneId);
-    convergeTypedDraftEditRest(req.params.projectId, req.params.paneId);
     res.json({ success: true });
   });
 
@@ -1108,9 +1159,18 @@ function registerDraftAndSettingsRoutes(
     if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
     const term = manager.terminals[paneId];
     if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
+    // Step 3.5 (BUG-D, spec §6.2): refuse an over-limit send — never silent truncation. Primary only.
+    const overflow = operatorSendOverflow(paneId, text);
+    if (overflow > 0) {
+      res.status(400).json({ error: `Draft is ${overflow} characters over this pane's size limit — shorten it before sending.` });
+      return;
+    }
     HistoryManager.getInstance().addCommand(paneId, text);
     term.writeInput(text);
     broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
+    // Step 3.5 (spec §5.3): the operator-direct send DELIVERED the draft — close the open envelope
+    // exchange and withdraw any voice-staged approval for it (it would otherwise double-deliver).
+    settleEnvelopeDraftOnOperatorSend(projectId, paneId, applyResolution);
     manager.ledger.setDraft(projectId, paneId, "", "operator");
     broadcastDraft(projectId, paneId);
     res.json({ success: true });
@@ -1850,7 +1910,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // VERBATIM extraction (CC paydown): the four per-pane WIP draft routes (GET/PUT pane draft, GET
   // project drafts, POST draft/send) then the two settings routes (GET/PUT) — registered together,
   // IN THE SAME ORDER, by this helper at the SAME point in the boot sequence.
-  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect });
+  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution });
 
   // dec-4 (DBT5): the WS-E pending-approval store + the deferred-action store + their durable boot
   // hydration, effectiveModeFor / effectiveCapabilityGateFor / gateCapability / gateOrDefer, the

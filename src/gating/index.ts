@@ -44,6 +44,14 @@ import {
 } from "../pendingApprovals";
 import { PendingActionStore } from "../pendingActions";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { instructionEnvelopeActive } from "../exchanges/instructionEnvelope";
+import {
+  findApprovalBindingByMessageId,
+  getOpenDraft,
+  clearApprovalBinding,
+  clearOpenDraft,
+  clearProseOverride,
+} from "../exchanges/draftRegistry";
 import { applyPaneMode, type PaneModeResult } from "../applyPaneMode";
 import { buildActionRun, checkActionVersion } from "../actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
@@ -1126,6 +1134,46 @@ export function createGating(deps: GatingDeps): Gating {
     cancelExchangeOnResolve(record, "expired");
   }
 
+  // ── Phase 3 step 3.5 (instruction-envelope draft-version CAS — BUG-B) ────────────────────────
+  // The envelope layer binds a pending approval to the EXACT draft version it was staged from
+  // (src/exchanges/draftRegistry.ts bindApprovalToDraft) and eagerly invalidates the approval on
+  // every version bump. This pair is the belt-and-suspenders at the resolve choke-point itself —
+  // the envelope twin of the exchange spine's confirmApproval(approvalId, draftVersion) CAS
+  // (src/exchanges/lifecycle.ts): even if some future path bumps the version WITHOUT invalidating,
+  // an approve whose bound version no longer matches the live draft resolves as a REJECT — a stale
+  // approval can never deliver old text. Both helpers are best-effort in-memory reads/writes and
+  // never throw into the resolution path.
+
+  /** Approve → reject downgrade when the approval's bound draft version is no longer the live one
+   *  (draft revised, retargeted, or cancelled since staging). No binding / no flag → mode as-is. */
+  function envelopeCasMode(messageId: string, mode: ResolveMode): ResolveMode {
+    if (mode !== "approve" || !instructionEnvelopeActive()) return mode;
+    const found = findApprovalBindingByMessageId(messageId);
+    if (!found) return mode;
+    const open = getOpenDraft(found.projectId, found.paneId);
+    return open && open.draftVersion === found.binding.draftVersion ? mode : "reject";
+  }
+
+  /** Consume the envelope binding once its approval reaches a terminal resolution. An APPROVED
+   *  delivery also closes the open draft (the confirmed version landed on the pane — the draft's
+   *  lifecycle is complete); reject/expire/dead-pane leave the draft open and revisable.
+   *  Best-effort (owns its try/catch) — envelope bookkeeping never breaks the resolution. */
+  function settleEnvelopeBindingOnResolve(messageId: string, reason: ResolveReason): void {
+    if (!instructionEnvelopeActive() || reason === "lost_race" || reason === "not_found") return;
+    try {
+      const found = findApprovalBindingByMessageId(messageId);
+      if (!found) return;
+      clearApprovalBinding(found.projectId, found.paneId);
+      if (reason === "approved") {
+        clearOpenDraft(found.projectId, found.paneId);
+        clearProseOverride(found.projectId, found.paneId);
+        broadcastDraft(found.projectId, found.paneId);
+      }
+    } catch (e) {
+      console.error("[instruction-envelope] binding settle on resolve failed:", e);
+    }
+  }
+
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
     // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
@@ -1134,7 +1182,7 @@ export function createGating(deps: GatingDeps): Gating {
     const action = resolveDecision(
       pendingApprovals,
       messageId,
-      mode,
+      envelopeCasMode(messageId, mode),
       (terminalId) => !!manager.terminals[terminalId]
     );
     const { reason, record } = action;
@@ -1151,6 +1199,10 @@ export function createGating(deps: GatingDeps): Gating {
       case "expired":   renderExpired(record, safeInstr, session); break;
       case "lost_race": break;
     }
+    // Phase 3 step 3.5: consume the instruction-envelope draft binding in the SAME choke-point
+    // (approved → close the delivered draft; reject/expire/dead-pane → binding cleared, draft
+    // stays open + revisable). Best-effort inside the helper — never breaks the resolution.
+    settleEnvelopeBindingOnResolve(messageId, reason);
     // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
     if (isFlipReason(reason)) {
       flipHandoffOnResolve(messageId, reason, opts);

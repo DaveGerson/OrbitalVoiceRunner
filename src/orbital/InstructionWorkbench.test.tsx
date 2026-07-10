@@ -105,6 +105,17 @@ describe('InstructionWorkbench — approval / stale-approval state', () => {
     expect(screen.getByTestId('exchange-approval-chip')).toHaveAttribute('data-approval-state', 'stale');
   });
 
+  it("'awaiting approval' (step 3.5) when the CURRENT version is parked as a pending operator approval — never mislabeled 'delivered'", () => {
+    render(
+      <InstructionWorkbench
+        exchange={makeExchange({ draftVersion: 1, sentVersions: [1], pendingApprovalVersion: 1 })}
+        dark={false} onRevise={vi.fn()} onCancel={vi.fn()} onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId('exchange-approval-chip')).toHaveTextContent('awaiting approval');
+    expect(screen.getByTestId('exchange-approval-chip')).toHaveAttribute('data-approval-state', 'pending');
+  });
+
   it('an optimisticDeliveredVersion (REST Workbench-lane send ack) covers the delivered/stale states honestly', () => {
     const { rerender } = render(
       <InstructionWorkbench exchange={makeExchange({ draftVersion: 1, sentVersions: [] })} optimisticDeliveredVersion={1} dark={false} onRevise={vi.fn()} onCancel={vi.fn()} onSend={vi.fn()} />,
@@ -216,11 +227,17 @@ describe('ExchangeStateChip — the compact pane-card indicator', () => {
     expect(screen.getByTestId('exchange-card-chip')).toHaveTextContent('delivered');
     expect(screen.queryByTestId('exchange-card-waiting')).toBeNull();
   });
+
+  it("(step 3.5) says 'awaiting approval' — not 'delivered' — while the current version is parked at the gate", () => {
+    render(<ExchangeStateChip exchange={makeExchange({ draftVersion: 2, sentVersions: [2], pendingApprovalVersion: 2 })} />);
+    expect(screen.getByTestId('exchange-card-chip')).toHaveTextContent('awaiting approval');
+  });
 });
 
 describe('pure helpers', () => {
-  it('approvalChipSkin covers all three states with distinct labels', () => {
+  it('approvalChipSkin covers all four states with distinct labels', () => {
     expect(approvalChipSkin('none').label).toBe('not sent');
+    expect(approvalChipSkin('pending').label).toBe('awaiting approval');
     expect(approvalChipSkin('sent').label).toBe('delivered');
     expect(approvalChipSkin('stale').label).toBe('revised since delivery');
   });

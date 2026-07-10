@@ -322,6 +322,17 @@ export function renderEnvelope(envelope: InstructionEnvelope, profile: RenderPro
   return applyEol(body, profile.eol);
 }
 
+/**
+ * §6.2 size-ceiling guard: how many characters a rendered instruction is OVER the profile's
+ * maxChars (0 when within limit). The renderer itself NEVER truncates (spec §6.2: "over-limit
+ * REFUSES at send … never silent truncation") — send lanes (send_instruction, the Workbench
+ * POST /draft/send) call this and REFUSE with a clarify/400 naming the overflow, leaving the
+ * draft open so the operator can shorten it. Pure.
+ */
+export function renderedOverflow(rendered: string, profile: RenderProfile): number {
+  return Math.max(0, rendered.length - profile.maxChars);
+}
+
 // ── §7 feature flag — JANUS_INSTRUCTION_ENVELOPE: off | shadow | primary ───────────────────────
 //
 // Exactly the src/exchanges/flag.ts idiom: a plain module-level env read (no config framework),

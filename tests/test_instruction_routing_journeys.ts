@@ -25,39 +25,37 @@
 //   1  exact target, silent bind, byte-exact delivery         -> describe "journey 1"
 //   2  two ambiguous targets -> exactly one clarification     -> describe "journey 2"
 //   3  missing referent -> clarify, no draft mutation         -> describe "journey 3"
-//   4  cross-project retarget + gate re-eval (+ BUG)          -> describe "journey 4"
+//   4  cross-project retarget + gate re-eval (BUG-A fixed)    -> describe "journey 4"
 //   5  long dictation distilled then revised, no fabrication  -> describe "journey 5"
-//   6  typed edit then voice edit, prose-override lifecycle   -> describe "journey 6"
-//   7  old approval after draft edit (BUG: no CAS at all)     -> describe "journey 7"
-//   8  explicit send idempotent per version (+ BUG edge case) -> describe "journey 8"
+//   6  typed/voice convergence + prose-override send fidelity -> describe "journey 6"
+//   7  approval CAS-bound to the draft version (BUG-B fixed)  -> describe "journey 7"
+//   8  explicit send idempotent per version (BUG-C fixed)     -> describe "journey 8"
 //   9  cancel clears draft + exchange                         -> describe "journey 9"
 //   10 reconnect with draft recovery (REST GET path)          -> describe "journey 10"
-//   11 adapter rendering: formatting-only + maxChars gap      -> describe "journey 11" (pure)
+//   11 adapter rendering: formatting-only + overflow guard    -> describe "journey 11" (pure)
+//   12 maxChars enforced AT SEND, voice + REST (BUG-D fixed)  -> describe "journey 12"
 //
-// ── BUGS FOUND (see the full writeup in the final report) ─────────────────────────────────────
-//   BUG-A (journey 4): performRetarget (src/actions/defs/voice_ux.ts) moves the active PANE via
-//     ctx.setActivePane but never advances manager.ledger.activeProjectId. activeDraftTarget()
-//     (server.ts:1420-1423) derives its projectId SOLELY from manager.ledger.activeProjectId, so
-//     after a confirmed CROSS-PROJECT retarget, activeDraftTarget() reports the OLD project with
-//     the NEW pane id — a key that was never written to the draft registry. revise_instruction /
-//     send_instruction / cancel_instruction on the retargeted draft all then report "no open
-//     instruction draft", even though a real, ready draft exists under the correct key.
-//   BUG-B (journey 7): sendInstruction's own draftVersion/sentVersions bookkeeping
-//     (src/exchanges/instructionEnvelope.ts) is COMPLETELY DISCONNECTED from the durable approval
-//     record staged by ctx.dispatchProposal (src/dispatch/paneWrite.ts applyPendingApproval /
-//     src/gating/index.ts renderApproved). renderApproved delivers `record.instruction` VERBATIM
-//     with no reference to any draft version — there is no CAS at all. Compounding this,
-//     sendInstruction clears the open draft on a `pending` outcome (not just `executed`), so the
-//     operator cannot even voice-revise the in-flight instruction before it is approved.
-//   BUG-C (journey 8): recordSend() marks a draftVersion as "sent" BEFORE dispatchProposal's
-//     outcome is known. A `blocked`/`clarify`/`error` outcome (e.g. a gate flipped to Off) still
-//     locks that version into `sentVersions`, so retrying the SAME never-delivered instruction
-//     after fixing the blocker is wrongly refused as "already sent — revise it before sending
-//     again" — the operator must gratuitously mutate the draft just to retry.
-//   BUG-D (journey 11): every RenderProfile carries `maxChars`, but renderEnvelope() never reads
-//     it (no truncation) and send_instruction/assessReadiness never refuse an over-limit draft.
-//     Spec §6.2's "over-limit REFUSES at send... never silent truncation" is unimplemented in
-//     BOTH directions — there is neither a refusal nor a truncation; maxChars is a dead field.
+// ── BUGS FOUND in step 3.4 — ALL FIXED in step 3.5; each journey below pins the FIX ───────────
+//   BUG-A (journey 4) — FIXED: performRetarget moved the active PANE (ctx.setActivePane) but never
+//     advanced manager.ledger.activeProjectId, so activeDraftTarget() (server.ts) orphaned a
+//     confirmed cross-project retargeted draft. Fix: a confirmed cross-project retarget now
+//     advances the active project through the SAME authoritative switch path switch_context uses
+//     (advanceActiveProjectForRetarget, src/actions/defs/voice_ux.ts) — no shadow focus state.
+//   BUG-B (journey 7) — FIXED: a `pending` outcome no longer clears the open draft; the approval
+//     record is CAS-BOUND to the exact draft version it was staged from (draftRegistry
+//     bindApprovalToDraft), EVERY version-bumping path (voice revise/retarget/cancel, typed WS
+//     draft_edit, typed REST PUT) invalidates the outstanding approval through the resolve
+//     choke-point, and applyResolution (src/gating/index.ts envelopeCasMode) downgrades an approve
+//     whose bound version no longer matches the live draft to a REJECT — a stale approval can
+//     never deliver old text.
+//   BUG-C (journey 8) — FIXED: the sent-version marking is now settled AFTER the dispatch outcome
+//     (applySendOutcome, voice_ux.ts): only `executed` (delivered) and `pending` (in motion) mark
+//     the version; `blocked`/`clarify`/`error` leave the draft open and UNMARKED so a retry of the
+//     same never-delivered version after fixing the blocker is allowed.
+//   BUG-D (journey 11/12) — FIXED per spec §6.2: renderedOverflow() (instructionEnvelope.ts) +
+//     send-time guards in send_instruction (clarify naming the overflow) and the Workbench
+//     POST /draft/send (400 naming the overflow). NEVER a truncation — the renderer still passes
+//     bodies through byte-exact; the refusal lives at the send seams and the draft stays open.
 //
 // Runner: npx tsx --test --test-force-exit tests/test_instruction_routing_journeys.ts
 
@@ -87,6 +85,7 @@ const {
   buildEnvelope,
   createDraft,
   renderEnvelope,
+  renderedOverflow,
   RENDER_PROFILES,
   COMPLETION_REQUEST_LINE,
 } = await import("../src/exchanges/instructionEnvelope");
@@ -94,6 +93,7 @@ const {
   getOpenDraft,
   setOpenDraft,
   hasProseOverride,
+  getApprovalBinding,
   resetDraftRegistryForTests,
 } = await import("../src/exchanges/draftRegistry");
 
@@ -154,30 +154,28 @@ describe("journey 11: adapter rendering — formatting-only across presets; maxC
     }
   });
 
-  it("(documents current behavior) renderEnvelope does NOT enforce maxChars — an over-limit body passes through UNTRUNCATED", () => {
+  it("renderEnvelope NEVER truncates — an over-limit body passes through byte-exact (spec §6.2: the refusal lives at the SEND seams, 'never silent truncation')", () => {
     const bigObjective = "x".repeat(20_000);
     const out = renderEnvelope(buildEnvelope({ objective: bigObjective }), RENDER_PROFILES.Custom);
-    assert.ok(
-      out.length > RENDER_PROFILES.Custom.maxChars,
-      "current (gap) behavior: content is never truncated or refused, despite maxChars being defined",
-    );
+    assert.ok(out.length > RENDER_PROFILES.Custom.maxChars, "the renderer does not enforce the ceiling — the send guards do");
     assert.ok(out.startsWith(bigObjective), "no truncation occurred — the full body passed through");
   });
 
-  it("(BUG-D, spec §6.2) an over-limit draft SHOULD refuse at send ('never silent truncation') — no such guard exists anywhere in the codebase", { todo: "BUG-D: maxChars is a dead field; assessReadiness/renderEnvelope/sendInstruction have no size-ceiling guard at all" }, () => {
-    // assessReadiness(draft) (src/exchanges/instructionEnvelope.ts) branches ONLY on target/objective
-    // (spec §2.2) — it has no maxChars-aware branch, so an envelope whose rendered form vastly
-    // exceeds every profile's maxChars is reported READY, and send_instruction would deliver it.
+  it("(BUG-D regression, spec §6.2) renderedOverflow() is the pure send-seam guard: exact character overflow over the profile ceiling, 0 when within", () => {
     const bigObjective = "y".repeat(50_000);
     const draft = createDraft({
       target: { projectId: "p", paneId: "pane" },
       envelope: buildEnvelope({ objective: bigObjective }),
     });
     const rendered = renderEnvelope(draft.envelope, RENDER_PROFILES.Custom);
-    assert.ok(
-      rendered.length <= RENDER_PROFILES.Custom.maxChars,
-      "EXPECTED (spec §6.2): an over-limit render should never reach the pane-write seam unrefused",
+    assert.strictEqual(
+      renderedOverflow(rendered, RENDER_PROFILES.Custom),
+      rendered.length - RENDER_PROFILES.Custom.maxChars,
+      "overflow names the exact excess so the refusal prose can say how much to cut",
     );
+    assert.strictEqual(renderedOverflow("short and sweet", RENDER_PROFILES.Custom), 0, "within-limit renders are never refused");
+    // The end-to-end refusal (send_instruction clarifies, nothing reaches the pane, the draft
+    // survives unmarked) is pinned by journey 12 below against the real server.
   });
 });
 
@@ -478,7 +476,7 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       assert.strictEqual(ledgerDraftText(PA, "a-pane"), "", "the source project's ledger draft is cleared");
     });
 
-    it("BUG-A: activeDraftTarget()'s stale project id orphans send_instruction/revise_instruction after a confirmed cross-project retarget", async () => {
+    it("(BUG-A regression) a confirmed cross-project retarget advances the ACTIVE PROJECT through the authoritative switch path — pane and project move together, and the draft stays reachable", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PA = "ir_proj_j4c";
@@ -493,32 +491,32 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const confirm = await callTool("confirm_instruction", { pane_id: "d-pane" });
       assert.match(confirm.output, /Retargeted the instruction draft to pane 'd-pane'/);
 
-      // performRetarget (src/actions/defs/voice_ux.ts) calls ctx.setActivePane("d-pane") — the
-      // ACTIVE PANE genuinely moved to project B's pane...
+      // performRetarget moves the active PANE (ctx.setActivePane("d-pane"))...
       await waitFor(() => switchFrames().find((f) => f.paneId === "d-pane"));
-      // ...but manager.ledger.activeProjectId (the ONLY input activeDraftTarget() reads for its
-      // projectId, server.ts:1420-1423) was NEVER advanced — root cause, pinned directly:
+      // ...AND (the BUG-A fix) advances the active PROJECT through the SAME authoritative path
+      // switch_context uses (ledger.switchContext + settings.activeContext, voice_ux.ts
+      // advanceActiveProjectForRetarget) — activeDraftTarget() is consistent again, no shadow
+      // focus state anywhere.
       assert.strictEqual(
         running.manager.ledger.activeProjectId,
-        PA,
-        "BUG-A root cause: the cross-project retarget moved the active PANE but not the active PROJECT",
+        PB,
+        "BUG-A regression: the cross-project retarget must move the active PROJECT with the active pane",
+      );
+      assert.strictEqual(
+        running.manager.settings.projects.activeContext,
+        PB,
+        "the settings activeContext advanced through the switch_context-paired write, not a shadow copy",
       );
 
-      // Consequence: send_instruction computes activeDraftTarget() = {projectId: PA (stale),
-      // paneId: 'd-pane'} — a key that was never written (the real entry lives under
-      // PB::d-pane, exactly as journey 4's first test proved). The confirmed, ready draft is
-      // unreachable via voice.
-      const send = await callTool("send_instruction", {});
-      assert.match(
-        send.output,
-        /no open instruction draft for pane 'd-pane'/,
-        "BUG-A: send_instruction cannot find the draft it just confirmed retargeting, because activeDraftTarget()'s projectId is stale",
-      );
-      // The draft is NOT gone — it is exactly where confirm_instruction put it, under the CORRECT key.
-      assert.ok(getOpenDraft(PB, "d-pane"), "the draft genuinely still exists under the correct (new-project, new-pane) key");
+      // The confirmed draft is reachable by every follow-up verb: revise it, then check the key.
+      const revise = await callTool("revise_instruction", { objective: "restart the ingest worker and tail its log" });
+      assert.strictEqual(revise.status, undefined, "revise_instruction reaches the retargeted draft");
+      const draft = getOpenDraft(PB, "d-pane");
+      assert.ok(draft, "the draft lives under the (new-project, new-pane) key");
+      assert.strictEqual(draft!.envelope.objective, "restart the ingest worker and tail its log");
     });
 
-    it("(BUG-A, spec §5.3) a confirmed cross-project retarget SHOULD let send_instruction deliver to the new pane, applying ITS gate", { todo: "BUG-A: activeDraftTarget() never advances manager.ledger.activeProjectId on retarget (see the preceding test for the root cause)" }, async () => {
+    it("(BUG-A regression, spec §5.3) a confirmed cross-project retarget lets send_instruction deliver to the new pane, applying ITS gate", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PA = "ir_proj_j4e";
@@ -619,11 +617,57 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const expected = renderEnvelope(buildEnvelope({ objective: "tighten the retry backoff and cap retries" }), RENDER_PROFILES.Custom);
       assert.strictEqual(rerendered, expected, "re-rendered from the envelope now that the override is cleared");
     });
+
+    it("(step 3.5 finding F2) a voice send while prose-override is live delivers the operator's TYPED text byte-exact — never the stale envelope render", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j6b";
+      registerPane(PJ, "prose-pane", "prose-pane", "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane("prose-pane");
+
+      await callTool("draft_instruction", { objective: "rotate the API keys" });
+      const typedText = "rotate the API keys, staging first, and post the new key ids in #ops";
+      const putRes = await api(`/api/panes/${PJ}/prose-pane/draft`, { method: "PUT", body: JSON.stringify({ text: typedText }) });
+      assert.strictEqual(putRes.status, 200);
+      assert.strictEqual(hasProseOverride(PJ, "prose-pane"), true);
+
+      const send = await callTool("send_instruction", {});
+      assert.match(send.output, /Command executed automatically on pane prose-pane/);
+      const term = running.manager.terminals["prose-pane"] as unknown as StubTerminal;
+      assert.strictEqual(
+        term.lastCommand,
+        typedText,
+        "spec §5.2 'last writer wins the prose': the hand-edited draft IS the instruction — the displayed draft and the delivered text are identical",
+      );
+    });
+
+    it("(step 3.5) PUT {text:''} — the Workbench Cancel/Scrap — CANCELS the open exchange server-side instead of leaving a ghost draft", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j6c";
+      registerPane(PJ, "scrap-pane", "scrap-pane", "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane("scrap-pane");
+
+      await callTool("draft_instruction", { objective: "archive the old sessions" });
+      assert.ok(getOpenDraft(PJ, "scrap-pane"));
+
+      const putRes = await api(`/api/panes/${PJ}/scrap-pane/draft`, { method: "PUT", body: JSON.stringify({ text: "" }) });
+      assert.strictEqual(putRes.status, 200);
+      assert.strictEqual(getOpenDraft(PJ, "scrap-pane"), undefined, "the emptied draft cancels the exchange — no ghost registry entry");
+      assert.strictEqual(hasProseOverride(PJ, "scrap-pane"), false);
+
+      // The GET the Workbench issues on reload agrees — the exchange does not re-materialize.
+      const res = await api(`/api/panes/${PJ}/scrap-pane/draft`);
+      const body = await res.json();
+      assert.strictEqual(body.exchange, null, "the scrapped exchange stays gone across a reload");
+    });
   });
 
   // ═════════════════════════════════════════════════════════════════════════════════════════════
-  describe("journey 7: an approval bound to a stale draft (BUG-B: no CAS at all)", () => {
-    it("send_instruction stages a pending approval, then CLEARS the open draft (even though nothing was delivered yet) — the operator cannot voice-revise the in-flight instruction", async () => {
+  describe("journey 7: the approval is CAS-bound to the draft version (BUG-B regressions)", () => {
+    it("(BUG-B regression) a `pending` outcome keeps the draft OPEN and CAS-binds the approval to the staged version — the operator can still revise the in-flight instruction", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j7";
@@ -635,14 +679,30 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const send1 = await callTool("send_instruction", {});
       assert.match(send1.output, /Pending approval:.*worker-pane/);
 
-      assert.strictEqual(getOpenDraft(PJ, "worker-pane"), undefined, "BUG-B: the open draft is gone even though the instruction only PENDED, never delivered");
-      assert.strictEqual(ledgerDraftText(PJ, "worker-pane"), "");
+      // The draft survives a pending (staged, NOT delivered) send, with the version marked sent
+      // and the approval bound to exactly that version.
+      const open = getOpenDraft(PJ, "worker-pane");
+      assert.ok(open, "the open draft survives a pending outcome — nothing was delivered yet");
+      assert.deepStrictEqual([...open!.sentVersions], [1], "v1 is in motion (idempotency key)");
+      assert.deepStrictEqual(
+        getApprovalBinding(PJ, "worker-pane"),
+        { messageId: send1.callId, draftVersion: 1 },
+        "the approval record is CAS-bound to the exact staged draft version",
+      );
+      assert.ok(ledgerDraftText(PJ, "worker-pane").includes("restart the worker pool"), "the mirrored draft stays visible while in flight");
+
+      // A repeat send while the approval is outstanding refuses with the real remedy — it does
+      // NOT stage a second approval for the same version.
+      const send2 = await callTool("send_instruction", {});
+      assert.match(send2.output, /already awaiting operator approval/);
 
       const revise2 = await callTool("revise_instruction", { objective: "restart the worker pool AND clear the queue" });
-      assert.match(revise2.output, /no open instruction draft/, "the operator literally cannot amend the in-flight instruction via voice");
+      assert.strictEqual(revise2.status, undefined, "the operator CAN amend the in-flight instruction via voice");
+      assert.strictEqual(getOpenDraft(PJ, "worker-pane")!.draftVersion, 2);
+      assert.strictEqual(getApprovalBinding(PJ, "worker-pane"), undefined, "the revise invalidated the v1 approval binding");
     });
 
-    it("BUG-B: approving the stale pending approval delivers the ORIGINAL text unconditionally — no draft-version CAS exists at the approval layer", async () => {
+    it("approving an UNREVISED pending approval delivers the bound text exactly once, then closes the draft (the confirmed version landed)", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j7b";
@@ -654,11 +714,8 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const send1 = await callTool("send_instruction", {});
       assert.match(send1.output, /Pending approval:.*cache-pane/);
 
-      // src/gating/index.ts renderApproved writes `record.instruction` VERBATIM — it never checks
-      // any draft version, because DispatchProposalArgs (src/actions/types.ts) carries no
-      // exchangeId/draftVersion field on this path at all (the AgentExchange spine's exchangeId
-      // hook, src/dispatch/paneWrite.ts:97-107, is threaded by an ENTIRELY SEPARATE flag/system
-      // — JANUS_EXCHANGE_SPINE — that the instruction-envelope voice verbs never populate).
+      // Nothing changed since staging, so the CAS holds (bound v1 === live v1) and the approve
+      // delivers through renderApproved exactly as before.
       const approve = await api("/api/commands/approve", {
         method: "POST",
         body: JSON.stringify({ messageId: send1.callId, approved: true }),
@@ -668,10 +725,13 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const term = running.manager.terminals["cache-pane"] as unknown as StubTerminal;
       await waitFor(() => term.writeInputCount > 0);
       assert.strictEqual(term.writeInputCount, 1);
-      assert.match(term.lastCommand, /flush the stale cache entries/, "the stale, un-revisable text was delivered unconditionally");
+      assert.match(term.lastCommand, /flush the stale cache entries/, "the bound, un-revised text is what landed");
+      // The delivered draft's lifecycle is complete: registry closed, binding consumed.
+      assert.strictEqual(getOpenDraft(PJ, "cache-pane"), undefined, "an approved delivery closes the open draft");
+      assert.strictEqual(getApprovalBinding(PJ, "cache-pane"), undefined, "the binding is consumed on delivery");
     });
 
-    it("(BUG-B, spec §4/§5.3) revising a draft with an outstanding approval SHOULD bump draft_version and invalidate the pending approval so it can never deliver", { todo: "BUG-B: no CAS binds the pending-approval record to any EnvelopeDraft version; sendInstruction also clears the draft on `pending`, so there is no live draft left to revise" }, async () => {
+    it("(BUG-B regression, spec §4/§5.3) revising a draft with an outstanding approval bumps draft_version and INVALIDATES the pending approval — the stale approval can never deliver", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j7c";
@@ -683,18 +743,54 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const send1 = await callTool("send_instruction", {});
       assert.match(send1.output, /Pending approval/);
 
-      // EXPECTED (spec): the draft should still be revisable (not cleared) while the approval is
-      // outstanding, and revising it should invalidate the v1 approval.
+      // The draft is still revisable (not cleared) while the approval is outstanding, and
+      // revising it invalidates the v1 approval through the resolve choke-point.
       const revise = await callTool("revise_instruction", { objective: "trigger a manual GC pass and log heap stats" });
-      assert.strictEqual(revise.status, undefined, "EXPECTED: revising while an approval is outstanding should succeed");
+      assert.strictEqual(revise.status, undefined, "revising while an approval is outstanding succeeds");
 
-      // EXPECTED: the STALE v1 approval can no longer deliver.
+      // The STALE v1 approval can no longer deliver — the record was already resolved (rejected).
       const approve = await api("/api/commands/approve", {
         method: "POST",
         body: JSON.stringify({ messageId: send1.callId, approved: true }),
       });
       const body = await approve.json().catch(() => ({}));
-      assert.notStrictEqual(body?.success, true, "EXPECTED: the CAS-invalidated stale approval should fail to deliver");
+      assert.notStrictEqual(body?.success, true, "the CAS-invalidated stale approval fails to deliver");
+
+      const term = running.manager.terminals["gc-pane"] as unknown as StubTerminal;
+      assert.strictEqual(term.writeInputCount, 0, "nothing was ever written — the stale text never reached the pane");
+      // The REVISED draft is intact and re-sendable at its new version.
+      const open = getOpenDraft(PJ, "gc-pane");
+      assert.strictEqual(open!.draftVersion, 2);
+      assert.strictEqual(open!.envelope.objective, "trigger a manual GC pass and log heap stats");
+    });
+
+    it("(REST Workbench lane) the operator-direct POST /draft/send supersedes a voice-staged approval: one delivery, the stale approval is withdrawn, the exchange closes", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j7d";
+      registerPane(PJ, "direct-pane", "direct-pane", "Custom", "Human-in-the-Loop");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane("direct-pane");
+
+      await callTool("draft_instruction", { objective: "compact the session store" });
+      const send1 = await callTool("send_instruction", {});
+      assert.match(send1.output, /Pending approval/);
+
+      // The operator clicks Send in the Workbench (above the gate) — delivers immediately.
+      const rest = await api(`/api/panes/${PJ}/direct-pane/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(rest.status, 200);
+      const term = running.manager.terminals["direct-pane"] as unknown as StubTerminal;
+      assert.strictEqual(term.writeInputCount, 1, "the direct send delivered once");
+      assert.strictEqual(getOpenDraft(PJ, "direct-pane"), undefined, "the exchange closed on the operator-direct delivery");
+
+      // The voice-staged approval was withdrawn — approving it later must NOT double-type the pane.
+      const approve = await api("/api/commands/approve", {
+        method: "POST",
+        body: JSON.stringify({ messageId: send1.callId, approved: true }),
+      });
+      const body = await approve.json().catch(() => ({}));
+      assert.notStrictEqual(body?.success, true, "the superseded approval cannot fire");
+      assert.strictEqual(term.writeInputCount, 1, "exactly ONE delivery — no double-type from the stale approval");
     });
   });
 
@@ -719,7 +815,7 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       assert.strictEqual(term.writeInputCount, 1, "exactly one delivery for the double send");
     });
 
-    it("BUG-C: a BLOCKED (never-delivered) send still locks the version — a legitimate retry after fixing the blocker is wrongly refused as 'already sent'", async () => {
+    it("(BUG-C regression) a BLOCKED (never-delivered) send does NOT lock the version — the draft survives UNMARKED, so a legitimate retry is allowed", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j8b";
@@ -739,28 +835,16 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const send1 = await callTool("send_instruction", {});
       assert.match(send1.output, /gated Off/, "the write is blocked — nothing was delivered");
 
-      // The draft was NOT cleared (only `executed`/`pending` clear it) — it is still open,
-      // still v1, but recordSend already (wrongly) marked v1 as sent.
+      // The draft survives the blocked send with NOTHING marked sent (the BUG-C fix: only
+      // executed/pending — delivery actually in motion — mark a version; blocked never does).
       const stillOpen = getOpenDraft(PJ, "gated-pane");
       assert.ok(stillOpen, "the draft survives a blocked send");
-      assert.deepStrictEqual([...stillOpen!.sentVersions], [1], "BUG-C root cause: v1 is marked 'sent' even though the write was blocked, not delivered");
-
-      // Operator fixes the blocker (clears the per-pane override — capability_gates is ALWAYS
-      // rewritten from the update payload, NULL when absent, src/store/sqliteStore.ts:844) and
-      // retries the SAME, never-delivered instruction.
-      registerPane(PJ, "gated-pane", "gated-pane", "Custom", "Full Auto");
-      await setActivePane("gated-pane");
-      const send2 = await callTool("send_instruction", {});
-      assert.match(
-        send2.output,
-        /already sent — revise it before sending again/,
-        "BUG-C: the legitimate retry is wrongly refused as a duplicate, even though nothing was ever delivered",
-      );
+      assert.deepStrictEqual([...stillOpen!.sentVersions], [], "a blocked outcome marks nothing as sent");
       const term = running.manager.terminals["gated-pane"] as unknown as StubTerminal;
-      assert.strictEqual(term.writeInputCount, 0, "confirms nothing was EVER actually delivered, despite the 'already sent' refusal");
+      assert.strictEqual(term.writeInputCount, 0, "nothing reached the pane while blocked");
     });
 
-    it("(BUG-C, spec §5.3) a retry of a never-delivered version SHOULD be allowed to deliver, not refused as a duplicate", { todo: "BUG-C: recordSend() marks sentVersions before dispatchProposal's outcome is known" }, async () => {
+    it("(BUG-C regression, spec §5.3) a retry of a never-delivered version is allowed to deliver after the blocker is fixed", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j8c";
@@ -845,6 +929,60 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       assert.match(body.exchange.objective, /audit the rate limiter/);
       assert.deepStrictEqual(body.exchange.target, { projectId: PJ, paneId: "reconnect-pane" });
       assert.strictEqual(body.draft.text, renderEnvelope(buildEnvelope({ objective: "audit the rate limiter" }), RENDER_PROFILES.Custom));
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════════════════════════════════
+  describe("journey 12: maxChars is enforced AT SEND (BUG-D regressions, spec §6.2) — refusal naming the overflow, never truncation", () => {
+    it("send_instruction refuses an over-limit draft with a clarify naming the overflow; nothing reaches the pane; the draft survives UNMARKED for a shorten-and-retry", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j12";
+      registerPane(PJ, "long-pane", "long-pane", "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane("long-pane");
+
+      const bigObjective = "z".repeat(RENDER_PROFILES.Custom.maxChars + 500);
+      await callTool("draft_instruction", { objective: bigObjective });
+
+      const send = await callTool("send_instruction", {});
+      assert.strictEqual(send.status, "clarify", "an over-limit send REFUSES — a clarify, not a delivery, not a truncation");
+      assert.match(send.output, /500 characters over/, "the refusal names the exact overflow");
+      assert.match(send.output, new RegExp(`${RENDER_PROFILES.Custom.maxChars}-character limit`));
+
+      const term = running.manager.terminals["long-pane"] as unknown as StubTerminal;
+      assert.strictEqual(term.writeInputCount, 0, "nothing was written — no silent truncation ever");
+      const open = getOpenDraft(PJ, "long-pane");
+      assert.ok(open, "the draft survives the refusal");
+      assert.deepStrictEqual([...open!.sentVersions], [], "the refused version is NOT marked sent");
+
+      // Shorten (a revise) and the same draft sends normally.
+      await callTool("revise_instruction", { objective: "trim the oversized payload" });
+      const retry = await callTool("send_instruction", {});
+      assert.match(retry.output, /Command executed automatically on pane long-pane/);
+      assert.strictEqual(term.lastCommand, renderEnvelope(buildEnvelope({ objective: "trim the oversized payload" }), RENDER_PROFILES.Custom));
+    });
+
+    it("the Workbench REST send lane refuses an over-limit draft with a 400 naming the overflow (primary only) — the operator-direct lane cannot silently truncate either", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j12b";
+      registerPane(PJ, "long-rest-pane", "long-rest-pane", "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane("long-rest-pane");
+
+      const bigText = "w".repeat(RENDER_PROFILES.Custom.maxChars + 42);
+      const putRes = await api(`/api/panes/${PJ}/long-rest-pane/draft`, { method: "PUT", body: JSON.stringify({ text: bigText }) });
+      assert.strictEqual(putRes.status, 200);
+
+      const sendRes = await api(`/api/panes/${PJ}/long-rest-pane/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(sendRes.status, 400);
+      const body = await sendRes.json();
+      assert.match(String(body.error), /42 characters over/, "the 400 names the exact overflow");
+
+      const term = running.manager.terminals["long-rest-pane"] as unknown as StubTerminal;
+      assert.strictEqual(term.writeInputCount, 0, "nothing was written");
+      assert.strictEqual(ledgerDraftText(PJ, "long-rest-pane"), bigText, "the draft text survives byte-exact — no truncation");
     });
   });
 });

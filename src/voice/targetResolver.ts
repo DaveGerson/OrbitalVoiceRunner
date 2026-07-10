@@ -208,6 +208,12 @@ function resolveViaRanker(
   candidates: FocusCandidate[],
   activeProjectId: string | null,
 ): TargetDecision {
+  // Fail-closed candidate check (step 3.5 review): the ranker names panes, it does not create
+  // them — a paneId outside the candidate set (a confused/stale daemon) must clarify, never bind
+  // or confirm a ghost target ("a dead daemon must never widen matching", D2).
+  if (!candidates.some((c) => c.paneId === resolution.paneId)) {
+    return clarifyNoMatch(candidates);
+  }
   const close = resolution.alternatives.filter(
     (a) => a.paneId !== resolution.paneId && resolution.confidence - a.score <= 0.15,
   );
@@ -222,15 +228,26 @@ function resolveViaRanker(
 
 /** The anaphora row of the decision table (spec §3.2): a live recent referent binds silently (the
  *  operator is continuing the same thread); no referent -> clarify, never a guess at the active
- *  pane. Extracted so resolveTarget stays under the CC<=10 lint gate. */
+ *  pane. Extracted so resolveTarget stays under the CC<=10 lint gate.
+ *
+ *  Two fail-closed tightenings (step 3.5 review):
+ *   - a referent whose pane is NO LONGER in the candidate set (deleted/archived since it was
+ *     recorded — the register is TTL-bounded, not liveness-bounded) clarifies instead of binding
+ *     a ghost pane;
+ *   - a referent that lives OUTSIDE the active project routes through the cross-project confirm
+ *     like every other resolution (spec §3.2's hard rule: "NEVER a silent bind, even for an exact
+ *     name" — continuing a thread does not waive the project boundary, because a retarget also
+ *     moves the operator's active project/posture context). */
 function resolveAnaphora(
   recentReferent: TargetResolverInput["recentReferent"],
   candidates: FocusCandidate[],
+  activeProjectId: string | null,
 ): TargetDecision {
-  if (recentReferent) {
-    return { kind: "bind", paneId: recentReferent.paneId, projectId: recentReferent.projectId };
+  if (!recentReferent) return clarifyNoMatch(candidates);
+  if (!candidates.some((c) => c.paneId === recentReferent.paneId)) {
+    return clarifyNoMatch(candidates);
   }
-  return clarifyNoMatch(candidates);
+  return bindOrCrossProjectConfirm(recentReferent.paneId, candidates, activeProjectId);
 }
 
 /** True when the ranker was absent/dead/empty-handed — the caller falls to clarify (the floor
@@ -250,7 +267,7 @@ export async function resolveTarget(input: TargetResolverInput): Promise<TargetD
   const reference = (input.reference ?? "").trim();
 
   if (!reference) return clarifyNoMatch(candidates);
-  if (isAnaphora(reference)) return resolveAnaphora(input.recentReferent, candidates);
+  if (isAnaphora(reference)) return resolveAnaphora(input.recentReferent, candidates, input.activeProjectId);
 
   const floor = resolveFloor(reference, candidates);
   if (floor.kind === "bind") return bindOrCrossProjectConfirm(floor.paneId, candidates, input.activeProjectId);

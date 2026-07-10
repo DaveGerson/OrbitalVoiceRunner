@@ -65,6 +65,24 @@ describe("composerLogic — deriveExchangeApprovalState", () => {
     assert.strictEqual(deriveExchangeApprovalState(2, [2], 1), "sent");
     assert.strictEqual(deriveExchangeApprovalState(2, [1], 2), "sent");
   });
+
+  // Step 3.5 (BUG-B fix follow-through): a version parked as a pending operator approval is IN
+  // MOTION, not delivered — the chip must say "awaiting approval", never "delivered".
+  it("'pending' when the CURRENT version is parked as a pending approval — even though it is in sentVersions (the idempotency key)", () => {
+    assert.strictEqual(deriveExchangeApprovalState(1, [1], null, 1), "pending");
+    assert.strictEqual(deriveExchangeApprovalState(3, [1, 3], null, 3), "pending");
+  });
+
+  it("a pending marker for an OLDER version does not shadow the live draft's state (the revise invalidates it server-side; the view degrades to stale/none)", () => {
+    assert.strictEqual(deriveExchangeApprovalState(2, [1], null, 1), "stale");
+    assert.strictEqual(deriveExchangeApprovalState(2, [], null, 1), "none");
+  });
+
+  it("absent/null pendingApprovalVersion changes nothing for the existing three states", () => {
+    assert.strictEqual(deriveExchangeApprovalState(1, [], null, null), "none");
+    assert.strictEqual(deriveExchangeApprovalState(1, [1], null, null), "sent");
+    assert.strictEqual(deriveExchangeApprovalState(2, [1], null, undefined), "stale");
+  });
 });
 
 describe("composerLogic — exchangeReadinessSummary", () => {

@@ -31,30 +31,36 @@ export function shouldSendDraftOverWs(
 // tests/test_composer_logic.ts.
 
 /**
- * "none"  — this draft has never been sent (no version recorded as delivered).
- * "sent"  — the CURRENT draft_version is the one most recently delivered — nothing has changed
- *           since; what's on screen is what the pane received.
- * "stale" — a delivery happened, but the draft has since been revised (draft_version has moved past
- *           the last delivered version) — what's on screen is NOT what the pane received.
+ * "none"    — this draft has never been sent (no version recorded as delivered).
+ * "pending" — the CURRENT draft_version is parked as a pending operator approval: it left for the
+ *             gate but has NOT been written to the pane (step 3.5 — before this state existed the
+ *             chip claimed "delivered" for an undelivered staged approval).
+ * "sent"    — the CURRENT draft_version is the one most recently delivered — nothing has changed
+ *             since; what's on screen is what the pane received.
+ * "stale"   — a delivery happened, but the draft has since been revised (draft_version has moved
+ *             past the last delivered version) — what's on screen is NOT what the pane received.
  */
-export type ExchangeApprovalState = "none" | "sent" | "stale";
+export type ExchangeApprovalState = "none" | "pending" | "sent" | "stale";
 
 /**
  * Derives the approval/delivery state from `draftVersion` + the exchange machinery's own
- * `sentVersions` (bumped today only by the voice `send_instruction` verb — spec
- * docs/superpowers/specs/2026-07-09-instruction-routing.md §5.3). The Workbench's REST send lane
- * (`POST /api/panes/:projectId/:paneId/draft/send`) is documented in that spec as eventually
- * stamping the same exchange, but does not yet (a real, pre-existing backend gap, not something
- * this UI layer can close without a new mutating route) — so a caller MAY pass
- * `optimisticDeliveredVersion` (a client-local "I clicked Send and the server accepted it" marker,
- * the same optimistic-then-reconciled idiom useOrbitalData already uses for e.g. attention dismiss)
- * to reflect that lane honestly without inventing server-side bookkeeping. Pure: no clocks, no I/O.
+ * `sentVersions` and `pendingApprovalVersion` (spec docs/superpowers/specs/
+ * 2026-07-09-instruction-routing.md §5.3; both stamped server-side by the voice
+ * `send_instruction` verb — src/exchanges/draftRegistry.ts). The pending check runs FIRST: a
+ * version awaiting approval is in `sentVersions` too (the idempotency key), but calling it
+ * "delivered" would be a lie. `optimisticDeliveredVersion` is the client-local "I clicked Send and
+ * the server accepted it" latency bridge for the REST Workbench lane (which since step 3.5 closes
+ * the exchange server-side — the marker only covers the broadcast round-trip window, and because
+ * the REST lane sends the SERVER's current draft text, marking an older client-known version can
+ * only ever under-claim, never mask a real mismatch). Pure: no clocks, no I/O.
  */
 export function deriveExchangeApprovalState(
   draftVersion: number,
   sentVersions: readonly number[],
   optimisticDeliveredVersion?: number | null,
+  pendingApprovalVersion?: number | null,
 ): ExchangeApprovalState {
+  if (pendingApprovalVersion != null && pendingApprovalVersion === draftVersion) return "pending";
   const lastDelivered = Math.max(-1, ...sentVersions, optimisticDeliveredVersion ?? -1);
   if (lastDelivered < 0) return "none";
   return lastDelivered >= draftVersion ? "sent" : "stale";

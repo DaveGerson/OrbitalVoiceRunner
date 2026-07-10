@@ -38,6 +38,7 @@ import { deriveExchangeApprovalState, exchangeReadinessSummary, type ExchangeApp
 
 const APPROVAL_CHIP: Record<ExchangeApprovalState, { label: string; bg: string; fg: string }> = {
   none: { label: "not sent", bg: "#f3e4c2", fg: INK },
+  pending: { label: "awaiting approval", bg: "#ffd166", fg: INK },
   sent: { label: "delivered", bg: "#4db892", fg: INK },
   stale: { label: "revised since delivery", bg: "#ff8a3d", fg: INK },
 };
@@ -62,7 +63,7 @@ export function targetLabel(target: ExchangeDraftView["target"]): string {
  */
 export function ExchangeStateChip({ exchange }: { exchange: ExchangeDraftView | null | undefined }) {
   if (!exchange) return null;
-  const approval = deriveExchangeApprovalState(exchange.draftVersion, exchange.sentVersions);
+  const approval = deriveExchangeApprovalState(exchange.draftVersion, exchange.sentVersions, null, exchange.pendingApprovalVersion);
   const skin = approvalChipSkin(approval);
   // NOTE: `=== false` narrowing — see composerLogic.ts's exchangeReadinessSummary doc comment.
   const waiting = exchange.readiness.ready === false ? exchange.readiness.clarification : null;
@@ -114,9 +115,10 @@ function fieldValueStyle(dark: boolean): CSSProperties {
 export interface InstructionWorkbenchProps {
   exchange: ExchangeDraftView | null;
   dark: boolean;
-  /** Client-local "I clicked Send and the server accepted it" marker for the REST Workbench lane,
-   *  which does not yet stamp `sentVersions` server-side (see composerLogic.ts's
-   *  deriveExchangeApprovalState doc comment) — the honest bridge for an otherwise-invisible send. */
+  /** Client-local "I clicked Send and the server accepted it" marker for the REST Workbench lane.
+   *  Since step 3.5 the server CLOSES the exchange on an operator-direct send, so this only bridges
+   *  the broadcast round-trip window; it can only ever under-claim (the REST lane sends the
+   *  SERVER's current draft text), never mask a real mismatch — see composerLogic.ts. */
   optimisticDeliveredVersion?: number | null;
   /** Focuses the existing composer editing this SAME durable draft. */
   onRevise: () => void;
@@ -133,7 +135,7 @@ export interface InstructionWorkbenchProps {
  */
 export function InstructionWorkbench({ exchange, dark, optimisticDeliveredVersion, onRevise, onCancel, onSend }: InstructionWorkbenchProps) {
   if (!exchange) return null;
-  const approval = deriveExchangeApprovalState(exchange.draftVersion, exchange.sentVersions, optimisticDeliveredVersion);
+  const approval = deriveExchangeApprovalState(exchange.draftVersion, exchange.sentVersions, optimisticDeliveredVersion, exchange.pendingApprovalVersion);
   const approvalSkin = approvalChipSkin(approval);
   const readinessText = exchangeReadinessSummary(exchange.readiness);
   const canSend = exchange.readiness.ready;

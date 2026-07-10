@@ -21,6 +21,7 @@ import {
   reviseDraft,
   recordSend,
   renderEnvelope,
+  renderedOverflow,
   assessReadiness,
   RENDER_PROFILES,
   type EnvelopeDraft,
@@ -35,7 +36,12 @@ import {
   clearProseOverride,
   recordRecentReferent,
   getRecentReferent,
+  bindApprovalToDraft,
+  getApprovalBinding,
+  clearApprovalBinding,
+  invalidateOutstandingApproval,
 } from "../../exchanges/draftRegistry";
+import type { DispatchOutcome } from "../types";
 
 const NoParams = z.object({});
 
@@ -147,6 +153,13 @@ function mirrorDraftToLedger(projectId: string, paneId: string, draft: EnvelopeD
   ctx.broadcastDraft(projectId, paneId);
 }
 
+/** Every draft-version-bumping voice path routes through here (spec §4: "the old approval can
+ *  never fire against new text") — a revision/retarget with a pending approval outstanding
+ *  invalidates that approval through the one resolve choke-point (ctx.applyResolution). */
+function invalidateApprovalForVoiceRevise(projectId: string, paneId: string, ctx: ActionContext): void {
+  invalidateOutstandingApproval(projectId, paneId, (messageId, mode) => ctx.applyResolution(messageId, mode));
+}
+
 function draftPatchFromArgs(args: {
   objective?: string;
   relevant_context?: string[];
@@ -188,6 +201,8 @@ export const draftInstruction: ActionDef<typeof DraftInstructionParams> = {
     const existing = getOpenDraft(target.projectId, target.paneId);
     const patch = draftPatchFromArgs(args);
     const draft = existing ? reviseDraft(existing, patch) : createDraft({ target, envelope: buildEnvelope(patch) });
+    // A version bump supersedes any approval staged from the prior version (spec §4).
+    if (existing) invalidateApprovalForVoiceRevise(target.projectId, target.paneId, ctx);
     setOpenDraft(target.projectId, target.paneId, draft);
     clearProseOverride(target.projectId, target.paneId);
     recordRecentReferent(target.paneId, target.projectId);
@@ -214,6 +229,9 @@ export const reviseInstruction: ActionDef<typeof InstructionFieldsParams> = {
     const existing = getOpenDraft(target.projectId, target.paneId);
     if (!existing) return noOpenDraftText(target.paneId);
     const draft = reviseDraft(existing, draftPatchFromArgs(args));
+    // BUG-B (step 3.5): the version bump invalidates any approval staged from the prior version —
+    // the stale approval is rejected through the resolve choke-point and can never deliver.
+    invalidateApprovalForVoiceRevise(target.projectId, target.paneId, ctx);
     setOpenDraft(target.projectId, target.paneId, draft);
     // A voice field revision always wins over a stale typed hand-edit override (spec §5.2).
     clearProseOverride(target.projectId, target.paneId);
@@ -221,6 +239,34 @@ export const reviseInstruction: ActionDef<typeof InstructionFieldsParams> = {
     return { kind: "ok", output: `Updated the instruction draft for pane '${target.paneId}'.` };
   },
 };
+
+/**
+ * BUG-A (step 3.5): a CONFIRMED cross-project retarget moves the operator's ACTIVE PROJECT through
+ * the SAME authoritative switch path switch_context uses (orient.ts — ledger.switchContext + the
+ * paired settings writes + broadcastLedgerUpdate + the memory-brief freshness trigger), never a
+ * shadow copy. performRetarget already moves the active PANE (ctx.setActivePane); without this
+ * paired advance, activeDraftTarget() (server.ts — projectId comes SOLELY from
+ * manager.ledger.activeProjectId) reported the OLD project with the NEW pane id, orphaning the
+ * just-confirmed draft for every subsequent verb. This also delivers spec §5.3's "project context
+ * is re-evaluated": the switch re-briefs the model on the NEW project (injectMemoryBrief), and the
+ * safety posture is re-read naturally at send time against the new pane/project.
+ *
+ * ASYMMETRY-HAZARD NOTE (orient.ts:118-123): switch_context writes settings even when
+ * ledger.switchContext no-ops on an unknown id. Here dest.projectId always names a project the
+ * resolver/confirm verified against the live candidate set, and we guard anyway — an unknown
+ * project is a no-op (the hazard is deliberately NOT replicated onto a second call site).
+ */
+function advanceActiveProjectForRetarget(destProjectId: string, ctx: ActionContext): void {
+  if (ctx.manager.ledger.activeProjectId === destProjectId) return;
+  if (!ctx.manager.ledger.getProject(destProjectId)) return;
+  ctx.manager.ledger.switchContext(destProjectId);
+  ctx.manager.settings.projects.activeContext = destProjectId;
+  const wsPath = ctx.manager.ledger.workspaces[destProjectId]?.directory || process.cwd();
+  ctx.manager.settings.projects.localWorkspacePath = wsPath;
+  ctx.manager.saveSettings();
+  ctx.broadcastLedgerUpdate();
+  ctx.injectMemoryBrief?.("project_switch");
+}
 
 /** Shared move logic for both retarget_instruction (bind from a fresh reference) and
  *  confirm_instruction (bind from an operator-picked candidate id) — spec §5.3: pane_id updates +
@@ -241,13 +287,31 @@ function performRetarget(
       text: `Pane '${dest.paneId}' already has its own open instruction draft — cancel one before retargeting.`,
     };
   }
+  // A cross-project retarget IS a context switch — it must honor the same Off veto switch_context
+  // enforces (gates only ever tighten; retarget must not become a bypass of that veto).
+  if (
+    dest.projectId !== ctx.manager.ledger.activeProjectId &&
+    ctx.effectiveCapabilityGateFor(null, "switch_context") === "Off"
+  ) {
+    return {
+      kind: "ok",
+      output:
+        "Error: the 'switch_context' capability is gated Off; retargeting the draft to a pane in a different project is forbidden by policy.",
+    };
+  }
   const draft = reviseDraft(existing, { target: dest });
+  // BUG-B (step 3.5): a retarget is a revision — any approval staged from the old version/target
+  // is invalidated before the move (spec §5.3: retarget re-evaluates posture; §4: no stale fire).
+  invalidateApprovalForVoiceRevise(source.projectId, source.paneId, ctx);
   clearOpenDraft(source.projectId, source.paneId);
   ctx.manager.ledger.setDraft(source.projectId, source.paneId, "", "janus");
   ctx.broadcastDraft(source.projectId, source.paneId);
   setOpenDraft(dest.projectId, dest.paneId, draft);
   clearProseOverride(dest.projectId, dest.paneId);
   recordRecentReferent(dest.paneId, dest.projectId);
+  // BUG-A (step 3.5): advance the active PROJECT through the authoritative switch path BEFORE the
+  // pane move so activeDraftTarget() = (new project, new pane) — one consistent focus, no shadow.
+  advanceActiveProjectForRetarget(dest.projectId, ctx);
   mirrorDraftToLedger(dest.projectId, dest.paneId, draft, ctx);
   ctx.setActivePane(dest.paneId);
   ctx.broadcast({ type: "switch_active_pane", paneId: dest.paneId });
@@ -313,6 +377,8 @@ export const cancelInstruction: ActionDef<typeof NoParams> = {
     const target = ctx.activeDraftTarget();
     if (!target) return noPaneOpenText("cancel");
     if (!getOpenDraft(target.projectId, target.paneId)) return noOpenDraftText(target.paneId);
+    // A cancelled draft's staged approval must never deliver (spec §4) — withdraw it too.
+    invalidateApprovalForVoiceRevise(target.projectId, target.paneId, ctx);
     clearOpenDraft(target.projectId, target.paneId);
     clearProseOverride(target.projectId, target.paneId);
     ctx.manager.ledger.setDraft(target.projectId, target.paneId, "", "janus");
@@ -340,15 +406,18 @@ export const sendInstruction: ActionDef<typeof NoParams> = {
     // focusResolver.ts's bindAndNarrate note on the exact same pattern).
     if (readiness.ready === false) return { kind: "clarify", text: readiness.clarification };
     const sent = recordSend(existing);
-    if (sent.ok === false) {
-      const output =
-        sent.reason === "duplicate_version"
-          ? "This instruction was already sent — revise it before sending again."
-          : "The instruction draft is not ready to send yet.";
-      return { kind: "ok", output };
+    if (sent.ok === false) return duplicateOrUnreadyText(sent.reason, target);
+    const profile = renderProfileForPane(target.paneId, ctx);
+    const rendered = deliverableTextFor(target, sent.draft, profile, ctx);
+    // BUG-D (spec §6.2): an over-limit instruction REFUSES at send — never silent truncation. The
+    // draft stays open and UNMARKED (nothing was sent), so the operator shortens it and retries.
+    const overflow = renderedOverflow(rendered, profile);
+    if (overflow > 0) {
+      return {
+        kind: "clarify",
+        text: `The drafted instruction is ${overflow} characters over pane '${target.paneId}'s ${profile.maxChars}-character limit — shorten it before sending.`,
+      };
     }
-    setOpenDraft(target.projectId, target.paneId, sent.draft);
-    const rendered = renderEnvelope(sent.draft.envelope, renderProfileForPane(target.paneId, ctx));
     const outcome = ctx.dispatchProposal({
       sess: ctx.session,
       callId: ctx.callId ?? "",
@@ -356,15 +425,81 @@ export const sendInstruction: ActionDef<typeof NoParams> = {
       instruction: rendered,
       trigger: ctx.userUtterance || "Instruction envelope send",
     });
-    if (outcome.kind === "executed" || outcome.kind === "pending") {
-      clearOpenDraft(target.projectId, target.paneId);
-      clearProseOverride(target.projectId, target.paneId);
-      ctx.manager.ledger.setDraft(target.projectId, target.paneId, "", "janus");
-      ctx.broadcastDraft(target.projectId, target.paneId);
-    }
+    applySendOutcome(target, sent.draft, outcome, ctx);
     return { kind: "ok", output: outcome.text };
   },
 };
+
+/** The refusal prose for a send that recordSend rejected. A duplicate version with a LIVE pending
+ *  approval names the real remedy (resolve or revise) instead of the generic "already sent". */
+function duplicateOrUnreadyText(
+  reason: "duplicate_version" | "not_ready",
+  target: { projectId: string; paneId: string },
+): ActionResult {
+  if (reason !== "duplicate_version") {
+    return { kind: "ok", output: "The instruction draft is not ready to send yet." };
+  }
+  const pending = getApprovalBinding(target.projectId, target.paneId);
+  return {
+    kind: "ok",
+    output: pending
+      ? "This instruction is already awaiting operator approval — approve or reject it, or revise the draft to send a new version."
+      : "This instruction was already sent — revise it before sending again.",
+  };
+}
+
+/** What actually goes to the pane: the deterministic envelope render — UNLESS the operator
+ *  hand-edited the prose (prose-override, spec §5.2 "last writer wins the prose"), in which case
+ *  the ledger draft text IS the instruction. Pre-fix, a voice send after a typed edit silently
+ *  delivered the STALE envelope render, dropping the operator's edit (step 3.5 finding F2). */
+function deliverableTextFor(
+  target: { projectId: string; paneId: string },
+  draft: EnvelopeDraft,
+  profile: RenderProfile,
+  ctx: ActionContext,
+): string {
+  if (hasProseOverride(target.projectId, target.paneId)) {
+    const proseText = ctx.manager.ledger.getDraft(target.projectId, target.paneId)?.text ?? "";
+    if (proseText.trim().length > 0) return proseText;
+  }
+  return renderEnvelope(draft.envelope, profile);
+}
+
+/**
+ * BUG-B + BUG-C (step 3.5): settle the registry AFTER the dispatch outcome is known.
+ *  - executed  → delivered: the draft (and any binding) closes, the mirrored ledger draft clears.
+ *  - pending   → delivery is IN MOTION but not landed: the version is marked sent (idempotency)
+ *                and the draft STAYS OPEN so the operator can still revise the in-flight
+ *                instruction — the approval is CAS-bound to this exact version, and a revise
+ *                invalidates it (spec §4).
+ *  - blocked / clarify / error → nothing left the process: the draft stays open and UNMARKED, so
+ *                a retry of the same never-delivered version after fixing the blocker is allowed.
+ */
+function applySendOutcome(
+  target: { projectId: string; paneId: string },
+  sentDraft: EnvelopeDraft,
+  outcome: DispatchOutcome,
+  ctx: ActionContext,
+): void {
+  if (outcome.kind === "executed") {
+    clearOpenDraft(target.projectId, target.paneId);
+    clearProseOverride(target.projectId, target.paneId);
+    clearApprovalBinding(target.projectId, target.paneId);
+    ctx.manager.ledger.setDraft(target.projectId, target.paneId, "", "janus");
+    ctx.broadcastDraft(target.projectId, target.paneId);
+    return;
+  }
+  if (outcome.kind === "pending") {
+    setOpenDraft(target.projectId, target.paneId, sentDraft);
+    bindApprovalToDraft(target.projectId, target.paneId, {
+      messageId: ctx.callId ?? "",
+      draftVersion: sentDraft.draftVersion,
+    });
+    // Repaint the Workbench: sentVersions + pendingApprovalVersion changed for this pane.
+    ctx.broadcastDraft(target.projectId, target.paneId);
+  }
+  // blocked / clarify / error: deliberately no registry write — see the doc comment.
+}
 
 /** The voice-UX trio's canonical defs (aggregated into REGISTRY). */
 export const VOICE_UX_ACTIONS: ActionDef[] = [

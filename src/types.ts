@@ -295,10 +295,14 @@ export interface ExchangeDraftView {
   completionSignal: string | null;
   /** Bumps on every revise (voice field edit or typed hand-edit convergence) — spec §5. */
   draftVersion: number;
-  /** Versions the exchange machinery has recorded as sent (voice `send_instruction` only today —
-   *  the Workbench's own REST send lane does not yet stamp this array, a known backend gap; see
-   *  ExchangeApprovalState below for how the client covers the REST lane honestly). */
+  /** Versions the exchange machinery has recorded as sent — stamped by the voice
+   *  `send_instruction` verb; the Workbench REST send lane (step 3.5) now CLOSES the exchange
+   *  server-side on delivery, so a surviving view with sentVersions implies a pending/blocked
+   *  send, never a completed REST one. */
   sentVersions: number[];
+  /** The draft version currently parked as a PENDING operator approval, or null/absent when none
+   *  is outstanding (step 3.5) — distinguishes "awaiting approval" from "delivered" honestly. */
+  pendingApprovalVersion?: number | null;
   readiness: ExchangeReadiness;
 }
 

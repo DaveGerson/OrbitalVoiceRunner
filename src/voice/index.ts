@@ -41,7 +41,7 @@ import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } f
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { reviseDraft, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride } from "../exchanges/draftRegistry";
+import { getOpenDraft, setOpenDraft, setProseOverride, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -410,12 +410,15 @@ function applyDraftEditFrame(
   manager: OrchestratorManager,
   coreState: CoreState,
   broadcastDraft: (projectId: string, paneId: string) => void,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
 ): void {
   const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
   const paneId = msg.paneId || coreState.activePaneId;
   if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
+    // Converge BEFORE broadcasting so the draft_updated frame carries the post-edit exchange
+    // projection (bumped version / cancelled), not the pre-edit one.
+    convergeTypedDraftEdit(projectId, paneId, String(msg.text ?? ""), applyResolution);
     broadcastDraft(projectId, paneId);
-    convergeTypedDraftEdit(projectId, paneId);
   }
 }
 
@@ -430,11 +433,27 @@ function applyDraftEditFrame(
  * prose; every write bumps the same `draftVersion`. Best-effort and never throws back into the
  * message handler — a convergence-bridge failure must never break plain draft editing.
  */
-function convergeTypedDraftEdit(projectId: string, paneId: string): void {
+function convergeTypedDraftEdit(
+  projectId: string,
+  paneId: string,
+  text: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
   if (!instructionEnvelopeIsPrimary()) return;
   try {
     const existing = getOpenDraft(projectId, paneId);
     if (!existing) return;
+    // Step 3.5 (BUG-B): the typed edit bumps the draft version — any approval staged from the
+    // prior version is invalidated through the resolve choke-point (it must never deliver stale
+    // text; spec §4). Mirrors convergeTypedDraftEditRest (server.ts) exactly.
+    invalidateOutstandingApproval(projectId, paneId, applyResolution);
+    // Step 3.5: an emptied draft (the Workbench Cancel/Scrap = PUT/edit with "") CANCELS the open
+    // exchange instead of leaving a ghost registry entry — mirrors the REST twin.
+    if (text.trim().length === 0) {
+      clearOpenDraft(projectId, paneId);
+      clearProseOverride(projectId, paneId);
+      return;
+    }
     setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
     setProseOverride(projectId, paneId);
   } catch (e) {
@@ -761,7 +780,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
           } else if (msg.type === "draft_edit" && msg.text !== undefined) {
             // Per-pane WIP draft edit (ungated — composing is not a CLI write). Defaults to the active pane.
-            applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+            applyDraftEditFrame(msg, manager, coreState, broadcastDraft, applyResolution);
           } else if (msg.type === "pane_input") {
             // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
             // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.
@@ -2374,7 +2393,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           handleVoiceAudioFrame(msg);
         } else if (msg.type === "draft_edit" && msg.text !== undefined) {
           // Step 6: operator editing a pane's WIP draft (ungated). Defaults to the active pane.
-          applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+          applyDraftEditFrame(msg, manager, coreState, broadcastDraft, applyResolution);
         } else if (msg.type === "pane_input") {
           // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
           // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.

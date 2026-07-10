@@ -40,6 +40,77 @@ export function clearOpenDraft(projectId: string, paneId: string): void {
   openDrafts.delete(keyFor(projectId, paneId));
 }
 
+// ── outstanding-approval binding (spec §4/§5.3 — the draft-version CAS, Phase 3 step 3.5) ───────
+//
+// When send_instruction's dispatch parks as a PENDING APPROVAL (gate=Ask), the draft stays OPEN
+// (the operator may still revise the in-flight instruction) and the approval record is BOUND here
+// to the exact draft version it was staged from. The binding is the envelope layer's twin of the
+// exchange spine's (approvalId, approval_draft_version) pair (src/exchanges/lifecycle.ts
+// requestApproval/confirmApproval): any version bump (voice revise, typed edit, retarget) MUST
+// invalidate the outstanding approval (invalidateOutstandingApproval below), and the resolve
+// choke-point (src/gating/index.ts applyResolution) CAS-checks the binding before an approve can
+// deliver — a stale approval can never deliver old text.
+
+export interface DraftApprovalBinding {
+  /** The pending-approval record's messageId (the pendingApprovals store key). */
+  messageId: string;
+  /** The exact draftVersion the approval was staged from. */
+  draftVersion: number;
+}
+
+const approvalBindings = new Map<string, DraftApprovalBinding>();
+
+export function bindApprovalToDraft(projectId: string, paneId: string, binding: DraftApprovalBinding): void {
+  approvalBindings.set(keyFor(projectId, paneId), binding);
+}
+
+export function getApprovalBinding(projectId: string, paneId: string): DraftApprovalBinding | undefined {
+  return approvalBindings.get(keyFor(projectId, paneId));
+}
+
+export function clearApprovalBinding(projectId: string, paneId: string): void {
+  approvalBindings.delete(keyFor(projectId, paneId));
+}
+
+/** Reverse lookup for the resolve choke-point: which pane's draft is bound to this approval? */
+export function findApprovalBindingByMessageId(
+  messageId: string,
+): { projectId: string; paneId: string; binding: DraftApprovalBinding } | undefined {
+  for (const [key, binding] of approvalBindings) {
+    if (binding.messageId === messageId) {
+      const sep = key.indexOf("::");
+      return { projectId: key.slice(0, sep), paneId: key.slice(sep + 2), binding };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Invalidate the outstanding pending approval bound to this pane's draft, if any — the envelope
+ * twin of the exchange spine's revise-invalidates-approval rule (spec §4 "the old approval can
+ * never fire against new text"; lifecycle.ts reviseDraft clears approvalId/approvalDraftVersion).
+ * Called by EVERY draft-version-bumping path (voice revise/retarget, typed WS draft_edit, typed
+ * REST PUT) and by the operator-direct Workbench send (which supersedes a staged approval).
+ * `applyResolution` is the caller's injected resolve choke-point (src/gating applyResolution) —
+ * resolving as "reject" claims + deletes the record through the one authoritative path, so the
+ * stale approval broadcasts a normal cancellation and can never deliver. Best-effort: a throw
+ * from the resolver must never break the draft edit itself.
+ */
+export function invalidateOutstandingApproval(
+  projectId: string,
+  paneId: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
+  const binding = approvalBindings.get(keyFor(projectId, paneId));
+  if (!binding) return;
+  approvalBindings.delete(keyFor(projectId, paneId));
+  try {
+    applyResolution(binding.messageId, "reject");
+  } catch (e) {
+    console.error("[instruction-envelope] failed to invalidate a stale pending approval:", e);
+  }
+}
+
 // ── client-facing getter (Phase 3, Step 3.3 — instruction-routing spec §5, UI surfacing) ──────────
 //
 // A pure, read-only projection of an EnvelopeDraft onto a flat, JSON-serializable shape for the
@@ -58,6 +129,10 @@ export interface OpenDraftView {
   completionSignal: string | null;
   draftVersion: number;
   sentVersions: number[];
+  /** The draft version currently parked as a PENDING operator approval, or null when none is
+   *  outstanding (Phase 3 step 3.5 — lets the UI say "awaiting approval" instead of falsely
+   *  claiming "delivered" for a version that has only been STAGED, never written to the pane). */
+  pendingApprovalVersion: number | null;
   readiness: ReadinessResult;
 }
 
@@ -77,6 +152,7 @@ export function viewOpenDraft(projectId: string, paneId: string): OpenDraftView 
     completionSignal: draft.envelope.completion_signal,
     draftVersion: draft.draftVersion,
     sentVersions: [...draft.sentVersions],
+    pendingApprovalVersion: getApprovalBinding(projectId, paneId)?.draftVersion ?? null,
     readiness: assessReadiness(draft),
   };
 }
@@ -144,5 +220,6 @@ export function getRecentReferent(now: number = Date.now()): { paneId: string; p
 export function resetDraftRegistryForTests(): void {
   openDrafts.clear();
   proseOverride.clear();
+  approvalBindings.clear();
   recentReferent = null;
 }
