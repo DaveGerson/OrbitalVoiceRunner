@@ -139,10 +139,68 @@ test("buildContextMetricsReport produces the exact expected JSON for a hand-seed
     // null — the injected SET is non-empty, just none of it is cortex-sourced/floored).
     cortexPrimaryRate: 0,
     cortexFallbackRate: 0,
+    // Phase 2 Step 2.2: no context_deliveries rows seeded in this fixture -> zero counts, and
+    // version-advance stats are null (undefined, not zero — same convention as focusCorrectnessRate).
+    contextDeliveryCount: 0,
+    contextDeliveryAcknowledgedCount: 0,
+    contextDeliveryUnacknowledgedCount: 0,
+    contextVersionAdvanceStats: null,
     notes: [DEDUPE_NOTE, SESSION_ID_NOTE, NOT_DERIVABLE_NOTE],
   });
 
   s.close();
+});
+
+// ── Phase 2 Step 2.2: delivery/acknowledgment counts + version-advance stats ────────────────────
+test("buildContextMetricsReport: delivery/acknowledgment counts and version-advance stats", () => {
+  const s = seed();
+
+  // Pair (proj-a, sess-1): two deliveries, v1 acknowledged, v2 NOT (a send failure never acked it).
+  const d1 = s.insertContextDelivery({
+    project_id: "proj-a", voice_session_id: "sess-1", context_version: "1",
+    trigger: "session_start", ts: BASE_TS + 1,
+  });
+  s.acknowledgeContextDelivery(d1.delivery_id, BASE_TS + 2);
+  s.insertContextDelivery({
+    project_id: "proj-a", voice_session_id: "sess-1", context_version: "2",
+    trigger: "pane_switch", ts: BASE_TS + 3,
+  });
+
+  // Pair (proj-a, sess-2): one delivery, acknowledged at v1.
+  const d3 = s.insertContextDelivery({
+    project_id: "proj-a", voice_session_id: "sess-2", context_version: "1",
+    trigger: "session_start", ts: BASE_TS + 4,
+  });
+  s.acknowledgeContextDelivery(d3.delivery_id, BASE_TS + 5);
+
+  const report = buildContextMetricsReport(s, { sinceMs: 0 });
+
+  assert.strictEqual(report.contextDeliveryCount, 3);
+  assert.strictEqual(report.contextDeliveryAcknowledgedCount, 2);
+  assert.strictEqual(report.contextDeliveryUnacknowledgedCount, 1);
+  assert.deepStrictEqual(report.contextVersionAdvanceStats, {
+    pairs: 2, // (proj-a,sess-1) and (proj-a,sess-2)
+    maxVersionSeen: 2, // (proj-a,sess-1) climbed to version 2
+    averageVersionsPerPair: 1.5, // (2 + 1) / 2
+  });
+
+  s.close();
+});
+
+test("buildContextMetricsReport: delivery stats respect sinceMs like every other field", () => {
+  const s = seed();
+  s.insertContextDelivery({
+    project_id: "proj-a", voice_session_id: "sess-1", context_version: "1",
+    trigger: "session_start", ts: BASE_TS + 1,
+  });
+  s.insertContextDelivery({
+    project_id: "proj-a", voice_session_id: "sess-1", context_version: "2",
+    trigger: "pane_switch", ts: BASE_TS + 100,
+  });
+
+  const report = buildContextMetricsReport(s, { sinceMs: BASE_TS + 50 });
+  assert.strictEqual(report.contextDeliveryCount, 1, "only the ts+100 row is in-window");
+  assert.deepStrictEqual(report.contextVersionAdvanceStats, { pairs: 1, maxVersionSeen: 2, averageVersionsPerPair: 2 });
 });
 
 // ── Wave 4 (D6): cortexPrimaryRate / cortexFallbackRate arithmetic ──────────────────────────────
@@ -257,6 +315,10 @@ test("buildContextMetricsReport on an empty DB returns a well-formed zeroed/null
   assert.strictEqual(report.approvalExactlyOnceSuccessRate, null);
   assert.strictEqual(report.cortexPrimaryRate, null, "primacy of zero injections is undefined, not 0");
   assert.strictEqual(report.cortexFallbackRate, null, "fallback rate of zero injections is undefined, not 0");
+  assert.strictEqual(report.contextDeliveryCount, 0);
+  assert.strictEqual(report.contextDeliveryAcknowledgedCount, 0);
+  assert.strictEqual(report.contextDeliveryUnacknowledgedCount, 0);
+  assert.strictEqual(report.contextVersionAdvanceStats, null, "version-advance stats of zero deliveries are undefined, not zeroed");
 });
 
 test("buildContextMetricsReport is deterministic — the same seeded DB yields byte-identical JSON across repeated calls", () => {

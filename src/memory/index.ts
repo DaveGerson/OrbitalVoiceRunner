@@ -111,19 +111,15 @@ export class MemoryService {
    *  real prior injected hash, so a hashing fault fails toward INJECTING, not toward silently
    *  suppressing forever.
    *
-   *  KNOWN GAP (Phase 2 Step 2.1): this call intentionally omits `affectedPaneId` — the
-   *  voice/index.ts call site (outside this module's allowed edit surface for this step) does not
-   *  thread one through. So a gate decision can be made against a snapshot that doesn't yet
-   *  reflect the eventFocus block synthesizeAsync/observeCortexShadow build moments later for the
-   *  SAME trigger. In practice this rarely causes a false "unchanged-brief" skip: BoardTier is
-   *  already enriched with per-pane exchange state (Phase 2 Step 2.1) and IS part of this hash, so
-   *  the exact background transition that would populate eventFocus (a pane flipping into
-   *  needs_input/awaiting_approval/etc.) also flips that pane's board entry, changing this hash
-   *  too. A fast-follow should thread affectedPaneId here once voice/index.ts's call site is in
-   *  scope. */
-  snapshotHashFor(paneId: string | null, now: number): string {
+   *  Phase 2 Step 2.2: `affectedPaneId` (optional, default null) is now threaded straight into
+   *  `getTiers` — CLOSES the Step 2.1 KNOWN GAP note that used to live here. voice/index.ts's
+   *  injectMemoryBrief call site is in this step's edit scope, so the gate's hash now sees the
+   *  SAME eventFocus-bearing snapshot that observeCortexShadow/synthesizeAsync build moments later
+   *  for the SAME trigger — a gate decision can no longer be made against a stale pre-eventFocus
+   *  snapshot. */
+  snapshotHashFor(paneId: string | null, now: number, affectedPaneId: string | null = null): string {
     try {
-      return this._snapshotHash(this.wm.getTiers(paneId, now));
+      return this._snapshotHash(this.wm.getTiers(paneId, now, affectedPaneId));
     } catch {
       return "";
     }
@@ -165,11 +161,14 @@ export class MemoryService {
   }
 
   /** Build the wire `CortexCtx` for one decide call — shared by the shadow and primary paths so
-   *  both carry the SAME history/tierHashes/affectedPaneId shape (Wave 4 D4/D5). */
-  private _buildCtx(tiers: MemoryTiers, activePaneId: string | null, trigger: string, affectedPaneId: string | null): CortexCtx {
+   *  both carry the SAME history/tierHashes/affectedPaneId shape (Wave 4 D4/D5). Phase 2 Step 2.2:
+   *  `sessionId` now carries the caller's REAL per-connection voice-session identity (previously
+   *  hardcoded null) — the "multi-session-ready interface from the shadow slice, finally
+   *  exercised" per the z5c design doc D5. */
+  private _buildCtx(tiers: MemoryTiers, activePaneId: string | null, trigger: string, affectedPaneId: string | null, sessionId: string | null): CortexCtx {
     return {
       activePaneId,
-      sessionId: null,
+      sessionId,
       trigger,
       history: this.ring.snapshot(),
       tierHashes: this._allTierHashes(tiers),
@@ -202,6 +201,8 @@ export class MemoryService {
     trigger: string = "brief-inject",
     injectId: string | null = null,
     affectedPaneId: string | null = null,
+    // Phase 2 Step 2.2: the caller's real per-connection voice-session identity — see _buildCtx.
+    sessionId: string | null = null,
   ): void {
     const client = this.cortexClient;
     if (!client || !client.available()) return;
@@ -215,7 +216,7 @@ export class MemoryService {
       // avoid the double daemon call.
       if (isCortexPrimary()) return;
       if (!shouldFire) return;
-      const ctx = this._buildCtx(tiers, activePaneId, trigger, affectedPaneId);
+      const ctx = this._buildCtx(tiers, activePaneId, trigger, affectedPaneId, sessionId);
       // Fire-and-forget: do NOT await. The facade never rejects, but guard the rejection arm anyway so
       // an unexpected throw can never surface as an unhandled rejection in the live loop. B-3: on a clean
       // hit, persist the decision-trace (SHADOW counterfactual, applied:false) via the durable sink, and
@@ -320,6 +321,8 @@ export class MemoryService {
     injectId: string | null = null,
     trigger: CortexWireTrigger = "catch-up",
     affectedPaneId: string | null = null,
+    // Phase 2 Step 2.2: the caller's real per-connection voice-session identity — see _buildCtx.
+    sessionId: string | null = null,
   ): Promise<SynthesizedBrief> {
     try {
       // Phase 2 Step 2.1: same affectedPaneId wiring as observeCortexShadow above — the rendered
@@ -329,7 +332,7 @@ export class MemoryService {
       const fallback = (): SynthesizedBrief => assembleBrief(tiers, this.cfg, now);
       // B-1: cortex-primary curation (default OFF). On a clean hit this REPLACES the synth race below
       // (the cortex already curated the tiers); on any miss it returns null and we fall through.
-      const ctx = this._buildCtx(tiers, activePaneId, trigger, affectedPaneId);
+      const ctx = this._buildCtx(tiers, activePaneId, trigger, affectedPaneId, sessionId);
       const curated = await this.cortexCuratedBrief(tiers, now, injectId, ctx);
       if (curated) return curated;
       // csw: primary + cortex-miss ⇒ tiers are already the full floor; the synth race only re-derives

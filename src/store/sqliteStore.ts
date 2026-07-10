@@ -1662,4 +1662,21 @@ export class JanusStore {
       return [];
     }
   }
+
+  /** All context-delivery rows since `since` (ts >=), most-recent-first, capped by `limit`
+   *  (default 1000) — powers report-style aggregation across EVERY voice session (unlike
+   *  `listContextDeliveries`, which is scoped to one session). Mirrors `getContextInjections`'
+   *  shape/fail-soft contract (src/memory/contextMetricsReport.ts, Phase 2 Step 2.2). */
+  getContextDeliveries(filter?: { since?: number; limit?: number }): ContextDelivery[] {
+    const since = filter?.since ?? 0;
+    const limit = filter?.limit ?? 1000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM context_deliveries WHERE ts >= ? ORDER BY ts DESC LIMIT ?"
+      ).all(since, limit) as ContextDeliveryRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] getContextDeliveries failed:", e);
+      return [];
+    }
+  }
 }

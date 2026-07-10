@@ -83,6 +83,13 @@ interface CreateExchangeInput {
   paneId: string;
   operatorUtterance: string;
   distilledInstruction: string;
+  // Phase 2 Step 2.2: the durable mirror ONLY — the pure in-memory ExchangeMachine (lifecycle.ts)
+  // has no concept of these fields (they carry no transition-legality semantics), so they are
+  // threaded straight past `this.machine.create` into `persistCreate`'s store write rather than
+  // added to ExchangeSnapshot/CreateInput. Absent ⇒ the store's existing NULL defaults, unchanged.
+  voiceSessionId?: string | null;
+  interactionId?: string | null;
+  contextVersion?: string | null;
 }
 
 export class ExchangeService {
@@ -115,7 +122,11 @@ export class ExchangeService {
 
   createExchange(input: CreateExchangeInput): ExchangeSnapshot {
     const snap = this.machine.create(input);
-    this.persistCreate(snap);
+    this.persistCreate(snap, {
+      voiceSessionId: input.voiceSessionId ?? null,
+      interactionId: input.interactionId ?? null,
+      contextVersion: input.contextVersion ?? null,
+    });
     return snap;
   }
 
@@ -400,8 +411,13 @@ export class ExchangeService {
   }
 
   /** `exchange_created` — the one transition with no prior row to CAS against (`insertExchange`,
-   *  not `updateExchange`). Same fail-soft contract as `persistTransition`. */
-  private persistCreate(snap: ExchangeSnapshot): void {
+   *  not `updateExchange`). Same fail-soft contract as `persistTransition`. `extra` (Phase 2 Step
+   *  2.2) carries the durable-only identity/correlation fields `createExchange` received but the
+   *  pure in-memory snapshot does not model — see `CreateExchangeInput`'s doc comment. */
+  private persistCreate(
+    snap: ExchangeSnapshot,
+    extra?: { voiceSessionId: string | null; interactionId: string | null; contextVersion: string | null },
+  ): void {
     if (!this.store) return;
     try {
       this.store.insertExchange({
@@ -410,6 +426,9 @@ export class ExchangeService {
         pane_id: snap.paneId,
         operator_utterance: snap.operatorUtterance,
         distilled_instruction: snap.distilledInstruction,
+        voice_session_id: extra?.voiceSessionId ?? null,
+        interaction_id: extra?.interactionId ?? null,
+        context_version: extra?.contextVersion ?? null,
         created_at: snap.createdAt,
         updated_at: snap.updatedAt,
       });

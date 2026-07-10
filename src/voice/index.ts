@@ -74,6 +74,7 @@ import {
   type ContextInjectionTrigger,
   type ContextInjectionDisposition,
 } from "../memory/contextTelemetry";
+import { ContextVersionRegistry } from "../memory/contextVersions";
 import type { PythonPolicyClient } from "./policyClient";
 import { createSpokenConfirm } from "./spokenConfirm";
 import { DEFAULT_VOICE_UX } from "../types";
@@ -88,6 +89,23 @@ export function mintInjectId(): string {
   return `inj-${Date.now()}-${++injectSeq}`;
 }
 
+// Phase 2 Step 2.2 (real session identity): one voice_session_id per WEBSOCKET CONNECTION, minted
+// once when the connection's VoiceSessionState is constructed and held for the connection's whole
+// life (including across bounded auto-reconnects — a reconnect is the SAME operator session, not
+// a new one). This is deliberately NOT the z5c per-project session-pool identity (docs/superpowers/
+// specs/2026-07-07-z5c-session-pool-design.md D5's `ctx.sessionId` scoping is a later slice) — it
+// is the minimal "real, non-null, stable-per-connection identity" every telemetry/exchange row
+// that used to hardcode `session_id: null` needed so "no live telemetry row uses a null session
+// when a session exists" holds. Mirrors the mintInjectId idiom exactly.
+let voiceSessionSeq = 0;
+export function mintVoiceSessionId(): string {
+  return `vsess-${Date.now()}-${++voiceSessionSeq}`;
+}
+
+// Phase 2 Step 2.2: the six canonical context-tier keys (mirrors src/memory/assembler.ts's
+// CANONICAL_ORDER) — the universe deliverySourcesFromBrief below splits into included/dropped.
+const CONTEXT_SOURCE_KEYS = ["project", "pane", "eventFocus", "breadcrumbs", "board", "frame"];
+
 /**
  * B-3 measurement spine (Task 7): capture per-turn Gemini token cost at the turn-complete boundary.
  * Reads `message.usageMetadata` (top-level on @google/genai LiveServerMessage; fields
@@ -95,14 +113,23 @@ export function mintInjectId(): string {
  * gemini_turn_usage row joined to the nearest preceding injection (`lastInjectId`). Fail-soft: an
  * absent `usageMetadata`, a null store, or a writer throw is a no-op — the voice turn never blocks.
  * Exported as a pure unit so the capture is testable without booting a live session.
+ *
+ * `sessionId` (Phase 2 Step 2.2, default null so every pre-existing direct call in the test suite
+ * keeps its prior byte-identical behavior): the connection's real voice_session_id, threaded from
+ * `state.voiceSessionId` at the one live call site below.
  */
-export function captureTurnUsage(message: any, store: JanusStore | null, lastInjectId: string | null): void {
+export function captureTurnUsage(
+  message: any,
+  store: JanusStore | null,
+  lastInjectId: string | null,
+  sessionId: string | null = null,
+): void {
   const u = message?.usageMetadata;
   if (!store || !u) return;
   try {
     store.recordGeminiTurnUsage({
       ts: Date.now(),
-      sessionId: null,
+      sessionId,
       injectId: lastInjectId ?? null,
       promptTokens: u.promptTokenCount ?? null,
       responseTokens: u.responseTokenCount ?? null,
@@ -421,6 +448,11 @@ interface VoiceSessionState {
   // connection. The Gemini turn-usage capture joins each turn's usageMetadata to the nearest
   // preceding injection by reading this (null until the first brief is injected).
   lastInjectId: string | null;
+  // Phase 2 Step 2.2 (real session identity): this connection's stable, non-null voice_session_id
+  // (mintVoiceSessionId, minted once at connect and held across bounded auto-reconnects — see the
+  // minter's own doc comment). Threaded onto context-injection telemetry rows, cortex decision
+  // rows, gemini_turn_usage rows, and AgentExchange.voice_session_id at creation.
+  voiceSessionId: string;
 }
 
 /**
@@ -489,6 +521,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     runningPaneIds,
     composeAwayDigest,
   } = gating;
+
+  // Phase 2 Step 2.2: ONE shared per-server context_version registry (mirrors the store itself —
+  // its internal state is keyed per (project_id, voice_session_id), so every connection's/pair's
+  // versions/acks stay independent even though they share one instance). `store` may be null in a
+  // hand-built test harness — the registry degrades to pure in-memory tracking, never throws.
+  const contextVersions = new ContextVersionRegistry(store);
 
   // PLM4 (1): RESUMPTION-TOKEN PERSISTENCE. The Gemini Live resume handle was in-memory only, so a
   // process restart lost it and the next connect could not resume the conversation. Persist the FULL
@@ -685,6 +723,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       voiceLostSinceLastRestore: false,
       // B-3: no brief injected yet on this connection — the turn-usage join has no key until the first.
       lastInjectId: null,
+      // Phase 2 Step 2.2: one stable identity for this connection's whole life (including
+      // reconnects) — see mintVoiceSessionId's doc comment.
+      voiceSessionId: mintVoiceSessionId(),
     };
 
     // Voice-UX wave 3: the spoken destructive-confirm protocol (src/voice/spokenConfirm.ts, f09-owned).
@@ -757,7 +798,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         store.recordContextInjection({
           id: mintContextInjectionEventId(),
           ts: Date.now(),
-          session_id: null, // no per-connection session id concept exists yet — matches captureTurnUsage's own null.
+          // Phase 2 Step 2.2: this connection's real voice_session_id (was hardcoded null).
+          session_id: state.voiceSessionId,
           interaction_id: state.currentInteractionId,
           inject_id: injectId,
           trigger,
@@ -785,6 +827,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // primary is live means the choke point rendered today's default composition instead.
     const dispositionForBrief = (brief: SynthesizedBrief): ContextInjectionDisposition =>
       (isCortexPrimary() && brief.source !== "cortex-primary") ? "cortex-miss" : "injected";
+
+    // Phase 2 Step 2.2: split a rendered brief's tiers into "included" (present in perTierChars —
+    // assembleBrief/cortex curation only ever writes an entry for a tier it actually rendered) vs
+    // "dropped" (the canonical six-tier set minus included). Feeds the context_deliveries row's
+    // included_sources_json/dropped_sources_json (src/memory/contextVersions.ts's recordDelivery).
+    const deliverySourcesFromBrief = (b: SynthesizedBrief): { included: string[]; dropped: string[] } => {
+      const included = Object.keys(b.perTierChars);
+      const dropped = CONTEXT_SOURCE_KEYS.filter((k) => !included.includes(k));
+      return { included, dropped };
+    };
 
     // Wave 4 (D2): record + exit for an InjectGate skip — pulled out of injectMemoryBrief to keep
     // its cyclomatic count down (the complexity gate is a hard error).
@@ -844,7 +896,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         injectId = mintInjectId();
         const now = Date.now();
         const wire = toCortexTrigger(trigger);
-        const snapshotHash = memory.service.snapshotHashFor(activeId, now);
+        // Phase 2 Step 2.2: affectedPaneId now threads into the gate's own hash (closing the Step
+        // 2.1 KNOWN GAP note on snapshotHashFor) so the gate can never make a skip/inject decision
+        // against a snapshot that doesn't yet reflect the SAME eventFocus block the cortex/renderer
+        // build moments later for this trigger.
+        const snapshotHash = memory.service.snapshotHashFor(activeId, now, affectedPaneId);
         const gateDecision = memory.service.gate.evaluate(snapshotHash, wire, now);
         if (gateDecision.skip) {
           recordGateSkip(trigger, activeId, injectId, startedAt, gateDecision.skip, snapshotHash);
@@ -854,10 +910,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // this trigger when NOT primary; a no-op when primary (that path decides via synthesizeAsync
         // below instead, avoiding a double daemon call). Synchronous void; never blocks or alters the
         // brief below. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
-        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId);
+        // Phase 2 Step 2.2: `state.voiceSessionId` is this connection's real session identity — the
+        // cortex_decision row this observation persists no longer hardcodes sessionId null.
+        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId, state.voiceSessionId);
         // P0b/Wave 4 D5: race the cortex (when primary) / the Python synthesizer against the
         // in-process floor. synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId);
+        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId, state.voiceSessionId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
@@ -879,6 +937,21 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           });
           return;
         }
+        // Phase 2 Step 2.2: record the delivery ATTEMPT — mints the next context_version for this
+        // (project, voice_session_id) pair and persists an UNACKNOWLEDGED context_deliveries row
+        // BEFORE the send. If sendClientContent below throws, control jumps straight to the outer
+        // catch and this row is never acknowledged (src/memory/contextVersions.ts's ack-on-success
+        // contract) — a skip/stale/empty brief never reaches this line at all.
+        const { included: includedSources, dropped: droppedSources } = deliverySourcesFromBrief(brief);
+        const delivery = contextVersions.recordDelivery({
+          projectId: manager.ledger.activeProjectId ?? null,
+          sessionId: state.voiceSessionId,
+          trigger,
+          includedSourceIds: includedSources,
+          droppedSourceIds: droppedSources,
+          snapshotHash,
+          briefHash: hashText(brief.text),
+        });
         // Redaction invariant: every string injected toward Gemini goes through the redaction pass
         // regardless of who composed it — identity on already-clean tier text, load-bearing when the
         // cortex-curated path renders text this choke point did not itself sanitize upstream.
@@ -886,6 +959,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}` }] }],
           turnComplete: true,
         });
+        // Phase 2 Step 2.2: acknowledge ONLY now that the send returned without throwing — this is
+        // the ack-on-success seam. A reconnect race (an older delivery's ack landing after a newer
+        // one already advanced the pair's acknowledged version) can never move it backward — see
+        // ContextVersionRegistry.acknowledgeDelivery's monotonic guard.
+        contextVersions.acknowledgeDelivery(delivery.deliveryId);
         // Join key: only NOW (the brief actually entered Gemini) does this injection become the
         // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
         state.lastInjectId = injectId;
@@ -960,11 +1038,18 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           manager.terminals[targetId]?.projectId ||
           manager.ledger.getActiveProject?.()?.id ||
           "default_project";
+        // Phase 2 Step 2.2: stamp this connection's real voice_session_id + interaction_id, and the
+        // context_version currently ACKNOWLEDGED for this (project, session) pair — "the context
+        // version that shaped this instruction" (the most recent brief the model actually saw
+        // before this dispatch was drafted).
         return getExchangeService().createExchange({
           projectId,
           paneId: targetId,
           operatorUtterance: trigger,
           distilledInstruction: instruction,
+          voiceSessionId: state.voiceSessionId,
+          interactionId: state.currentInteractionId,
+          contextVersion: contextVersions.currentAcknowledgedVersion(projectId, state.voiceSessionId),
         }).exchangeId;
       } catch (e) {
         console.error("[exchange-spine] createExchange failed:", e);
@@ -1617,7 +1702,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               state.muteCurrentModelTurn = false;
               // B-3 measurement spine (Task 7): capture this turn's Gemini token cost (usageMetadata)
               // joined to the nearest preceding injection. Fail-soft no-op when usageMetadata is absent.
-              captureTurnUsage(message, store, state.lastInjectId);
+              captureTurnUsage(message, store, state.lastInjectId, state.voiceSessionId);
             }
           };
 
