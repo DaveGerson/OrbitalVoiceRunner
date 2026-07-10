@@ -328,7 +328,7 @@ export interface VoiceDeps {
   activeDraftTarget: () => { projectId: string; paneId: string } | null;
   sanitizeSettingsForClient: (settings: any) => any;
   coreState: CoreState;
-  paneSignalBus: { subscribe: (fn: (sig: any) => void) => () => void };
+  paneSignalBus: { subscribe: (fn: (sig: any) => void, cls?: "spoken" | "inject") => () => void };
   announcementBus: { enqueue: (item: any) => void };
   pruneAttention: () => void;
   interactionLog: {
@@ -1848,7 +1848,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
         };
 
-        state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
+        const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
           // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
           // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
           // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
@@ -1865,18 +1865,22 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           }
           pushSignal(sig);
-          // Wave 4 (D1, cortex cutover design): the observe layer's EXISTING onIdle 'idle' pane
-          // signal (src/observe/index.ts) IS the command-completion edge — no new observe-layer
-          // wiring needed. Fire a fourth injectMemoryBrief trigger here, threading the pane the
-          // signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever pane is
-          // currently focused, so a command-outcome cortex profile can lead with it. Fire-and-forget
-          // (injectMemoryBrief owns its own try/catch and never rejects) + gated by the SAME
-          // InjectGate every other trigger goes through — a burst of idle edges across panes still
-          // collapses to at most one cortex round-trip per debounce floor.
-          if (sig.kind === "idle") {
-            void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
-          }
         });
+        // Wave 4 (D1, cortex cutover design) + z5c slice 1 (spec 2026-07-07 D1, closes bead
+        // wsm-e2e-pinned-1d6w): the observe layer's EXISTING onIdle 'idle' pane signal IS the
+        // command-completion edge. It now arrives on the bus's `inject` delivery class, which is
+        // NOT subject to the spoken-turn L1 cross-kind cooldown — a fast command completing
+        // within 5s of its own 'running' edge still injects. Anti-spam for this leg is the SAME
+        // InjectGate every other trigger goes through (hash + debounce floor) — a burst of idle
+        // edges across panes still collapses to at most one cortex round-trip per floor.
+        // Fire-and-forget (injectMemoryBrief owns its own try/catch and never rejects). It threads
+        // the pane the signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever
+        // pane is currently focused, so a command-outcome cortex profile can lead with it.
+        const unsubscribeInject = paneSignalBus.subscribe((sig: PaneSignal) => {
+          if (sig.kind !== "idle") return;
+          void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
+        }, "inject");
+        state.unsubscribePaneSignals = () => { unsubscribeSpoken(); unsubscribeInject(); };
       };
       hoistAndSubscribe();
     } catch (err: any) {

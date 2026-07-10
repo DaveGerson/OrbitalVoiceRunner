@@ -20,11 +20,14 @@ export interface InjectGateDecision {
 
 export class InjectGate {
   private lastInjectedHash: string | null = null;
-  // Epoch-ms of the last confirmed injection. Defaults to 0 (not "no prior injection" sentinel
-  // logic) — production `now` is always a real Date.now() epoch, so `now - 0` is astronomically
-  // larger than any debounce floor on the very first call, which is the desired "never debounce
-  // before anything has ever been injected" behavior without a separate first-call flag.
-  private lastInjectedAt = 0;
+  // Epoch-ms of the last confirmed injection. Defaults to a true "no prior injection" sentinel
+  // (z5c s1 review graft, from the codex executor branch): with the old `0` default the
+  // never-debounce-before-first-injection guarantee held only because production `now` is
+  // epoch-scale — a per-session gate evaluated under a relative/fake clock (small `now`) would
+  // spuriously debounce its very first non-session-start call. NEGATIVE_INFINITY makes the
+  // guarantee unconditional (`now - (-Infinity)` is +Infinity at any clock scale), which matters
+  // once slices 2/3 unit-test per-session gates under fake timers.
+  private lastInjectedAt = Number.NEGATIVE_INFINITY;
 
   constructor(private debounceMs: () => number) {}
 
@@ -46,5 +49,26 @@ export class InjectGate {
   noteInjected(hash: string, now: number): void {
     this.lastInjectedHash = hash;
     this.lastInjectedAt = now;
+  }
+}
+
+/** z5c slice 1 groundwork (spec 2026-07-07 D5): per-session gate state. One InjectGate per
+ *  session key, created on demand; `null` (today's single implicit session) maps to a stable
+ *  default key so current behavior is byte-identical. The debounceMs getter is shared by every
+ *  gate so a runtime settings PUT reaches all sessions at once. Naming follows the existing
+ *  `pendingApprovals.forSession(...)` idiom. */
+export class InjectGateRegistry {
+  private gates = new Map<string, InjectGate>();
+
+  constructor(private debounceMs: () => number) {}
+
+  forSession(sessionId: string | null): InjectGate {
+    const key = sessionId ?? "__single_session__";
+    let gate = this.gates.get(key);
+    if (!gate) {
+      gate = new InjectGate(this.debounceMs);
+      this.gates.set(key, gate);
+    }
+    return gate;
   }
 }

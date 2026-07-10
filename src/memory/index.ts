@@ -14,7 +14,7 @@ import {
 import type { PythonSynthClient } from "./pythonClient";
 import type { PythonCortexClient, CortexResult } from "./cortexClient";
 import { isCortexPrimary, resolveWithCortex, cortexPrimaryTimeoutMs } from "./cortexShadow";
-import { InjectGate } from "./injectGate";
+import { InjectGate, InjectGateRegistry } from "./injectGate";
 import { DecisionRing } from "./decisionRing";
 
 /** Default quiet-window for cortex hysteresis (ms). Same hash within this window → suppress. */
@@ -65,10 +65,11 @@ export class MemoryService {
   // Wave 4 D4: the last HISTORY_K decide outcomes, fed to Python as CortexCtx.history so its pure
   // core can apply the resurface-suppression rule without retaining any daemon-side state.
   private readonly ring = new DecisionRing();
-  // Wave 4 D2: the pre-cortex inject gate. Public — src/voice/index.ts's injectMemoryBrief choke
-  // point calls `.evaluate` BEFORE any cortex round-trip and `.noteInjected` only after a brief
-  // actually reaches Gemini.
-  readonly gate: InjectGate;
+  // Wave 4 D2 + z5c slice 1 (spec 2026-07-07 D5): the pre-cortex inject gates, keyed per session.
+  // src/voice/index.ts's injectMemoryBrief choke point calls `.evaluate` BEFORE any cortex
+  // round-trip and `.noteInjected` only after a brief actually reaches Gemini. Today there is one
+  // session, reached via the `gate` getter (key null); slices 2/3 pass real session ids.
+  readonly gates: InjectGateRegistry;
 
   constructor(
     private wm: WorldModel,
@@ -85,7 +86,13 @@ export class MemoryService {
     // gate.evaluate() call, never cached, so a settings PUT takes effect immediately.
     debounceMs: () => number = () => DEFAULT_INJECT_DEBOUNCE_MS,
   ) {
-    this.gate = new InjectGate(debounceMs);
+    this.gates = new InjectGateRegistry(debounceMs);
+  }
+
+  /** Today's single-session gate (registry key null). Existing call sites and tests keep working
+   *  unchanged; per-session callers use `gates.forSession(id)` directly. */
+  get gate(): InjectGate {
+    return this.gates.forSession(null);
   }
 
   /** Cheap 16-hex-char SHA-256 fingerprint of an arbitrary JSON-serializable value. Shared by the
