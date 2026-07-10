@@ -17,9 +17,29 @@
 // Exported as a function (not a frozen module constant) so tests can pass an explicit env map
 // without mutating process.env or relying on import order/caching.
 
+/**
+ * Shared env-flag reader for the tri-state off/shadow/primary (and off/accept/request) idiom used
+ * across this subsystem — this exact reader backs `readExchangeSpineMode` below,
+ * `readInstructionEnvelopeMode` (src/exchanges/instructionEnvelope.ts), and
+ * `readResultEnvelopeMode` (src/exchanges/resultEnvelope.ts). Re-exported from its own
+ * side-effect-free module (src/exchanges/flagReader.ts — see that file's doc comment for WHY it is
+ * not defined directly in this file: importing it from the other two flag modules must never
+ * transitively trigger THIS module's own eager `EXCHANGE_SPINE_MODE` read).
+ *
+ * FLAG LATTICE (which flag implies which — read before flipping one on in isolation):
+ * `JANUS_EXCHANGE_SPINE` gates whether an `agent_exchanges` row exists AT ALL; every other
+ * exchange-adjacent flag below it (`JANUS_INSTRUCTION_ENVELOPE`, `JANUS_AGENT_RESULT_ENVELOPE`) is
+ * only meaningful once the spine itself is `shadow`/`primary` — there is nothing durable for an
+ * envelope/result-envelope to attach to otherwise. No flag silently forces another's value, though:
+ * each is read and validated independently, so turning one on with the spine off is a harmless,
+ * inert no-op rather than an error.
+ */
+export { readEnumFlag } from "./flagReader";
+import { readEnumFlag } from "./flagReader";
+
 export type ExchangeSpineMode = "off" | "shadow" | "primary";
 
-const VALID_MODES: ReadonlySet<string> = new Set(["off", "shadow", "primary"]);
+const EXCHANGE_SPINE_MODES: readonly ExchangeSpineMode[] = ["off", "shadow", "primary"];
 
 /**
  * Default mode when the env var is unset/empty/unrecognized: **off**.
@@ -37,8 +57,7 @@ const VALID_MODES: ReadonlySet<string> = new Set(["off", "shadow", "primary"]);
  * `primary` only after that.
  */
 export function readExchangeSpineMode(env: NodeJS.ProcessEnv = process.env): ExchangeSpineMode {
-  const raw = (env.JANUS_EXCHANGE_SPINE ?? "").trim().toLowerCase();
-  return VALID_MODES.has(raw) ? (raw as ExchangeSpineMode) : "off";
+  return readEnumFlag("JANUS_EXCHANGE_SPINE", EXCHANGE_SPINE_MODES, "off", env);
 }
 
 /** Cached at module load (the established env-flag idiom) — one process, one mode. */
@@ -48,6 +67,7 @@ export function exchangeSpineWrites(mode: ExchangeSpineMode = EXCHANGE_SPINE_MOD
   return mode === "shadow" || mode === "primary";
 }
 
-export function exchangeSpineIsAuthoritative(mode: ExchangeSpineMode = EXCHANGE_SPINE_MODE): boolean {
-  return mode === "primary";
-}
+// `exchangeSpineIsAuthoritative` (mode === "primary") was removed here — dead API, zero consumers
+// anywhere in src/ or tests/ beyond its own definition (Fix 5, dead-API removal pass). `primary`
+// mode is still read via `EXCHANGE_SPINE_MODE`/`readExchangeSpineMode` directly wherever a caller
+// actually needs it.

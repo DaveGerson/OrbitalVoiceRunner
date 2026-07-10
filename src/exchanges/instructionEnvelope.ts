@@ -12,6 +12,11 @@
 // Missing content is reported (assessReadiness's clarification), never guessed.
 
 import { z } from "zod";
+// NOTE: imports the side-effect-free src/exchanges/flagReader.ts, NOT src/exchanges/flag.ts — see
+// that file's doc comment. Importing flag.ts itself here would transitively trigger ITS eager
+// `EXCHANGE_SPINE_MODE` read (module-load-order-sensitive; a real regression this avoided).
+import { readEnumFlag } from "./flagReader";
+import { mintSeqId } from "./types";
 
 // ── schema (zod, matching the repo's zod usage — src/voice/policyClient.ts's op-local pattern) ──
 
@@ -114,13 +119,11 @@ export function buildEnvelope(input: BuildEnvelopeInput): InstructionEnvelope {
 
 // ── §5 draft creation / revision / send idempotency ─────────────────────────────────────────────
 
-let draftSeq = 0;
-/** Mint a fresh envelope-draft id, mirroring the repo's `<prefix>_<epoch36>_<seq36>` idiom
- *  (src/exchanges/types.ts mintExchangeId). This is the ENVELOPE draft's own local id when the
- *  caller does not already have a real exchange_id to bind to (createDraft accepts one). */
-function mintDraftExchangeId(now: number = Date.now()): string {
-  return `envd_${now.toString(36)}_${(draftSeq++).toString(36)}`;
-}
+/** Mint a fresh envelope-draft id via the shared `<prefix>_<epoch36>_<seq36>` factory
+ *  (src/exchanges/types.ts `mintSeqId`, the same one backing `mintExchangeId`). This is the
+ *  ENVELOPE draft's own local id when the caller does not already have a real exchange_id to bind
+ *  to (createDraft accepts one). */
+const mintDraftExchangeId = mintSeqId("envd");
 
 export interface CreateDraftInput {
   exchangeId?: string;
@@ -356,11 +359,12 @@ export function renderedOverflow(rendered: string, profile: RenderProfile): numb
 
 export type InstructionEnvelopeMode = "off" | "shadow" | "primary";
 
-const VALID_ENVELOPE_MODES: ReadonlySet<string> = new Set(["off", "shadow", "primary"]);
+const INSTRUCTION_ENVELOPE_MODES: readonly InstructionEnvelopeMode[] = ["off", "shadow", "primary"];
 
+/** Shared reader (src/exchanges/flag.ts's `readEnumFlag`) — see that module's "FLAG LATTICE" doc
+ *  comment for how this flag relates to `JANUS_EXCHANGE_SPINE`. */
 export function readInstructionEnvelopeMode(env: NodeJS.ProcessEnv = process.env): InstructionEnvelopeMode {
-  const raw = (env.JANUS_INSTRUCTION_ENVELOPE ?? "").trim().toLowerCase();
-  return VALID_ENVELOPE_MODES.has(raw) ? (raw as InstructionEnvelopeMode) : "off";
+  return readEnumFlag("JANUS_INSTRUCTION_ENVELOPE", INSTRUCTION_ENVELOPE_MODES, "off", env);
 }
 
 /** Cached at module load (the established env-flag idiom) — one process, one mode. */

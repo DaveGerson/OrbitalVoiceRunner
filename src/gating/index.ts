@@ -44,6 +44,7 @@ import {
 } from "../pendingApprovals";
 import { PendingActionStore } from "../pendingActions";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { beginExchangeDelivery, completeExchangeDelivery } from "../exchanges/deliveryHooks";
 import { instructionEnvelopeActive } from "../exchanges/instructionEnvelope";
 import {
   findApprovalBindingByMessageId,
@@ -1054,30 +1055,29 @@ export function createGating(deps: GatingDeps): Gating {
    * durable `delivery_attempted` (here: the in-memory `beginDeliveryAttempt`) genuinely precedes
    * the pane write, and `completeDelivery` genuinely follows it. Best-effort; never throws; a
    * no-op unless the resolved record carries an `exchangeId` (flag on AND this approval was
-   * exchange-correlated at proposal time, src/voice/index.ts's dispatchProposal).
+   * exchange-correlated at proposal time, src/voice/index.ts's dispatchProposal). The
+   * stageForDelivery/beginDeliveryAttempt pair is the SHARED hook (src/exchanges/deliveryHooks.ts,
+   * also used by src/dispatch/paneWrite.ts's auto_execute arm and server.ts's Workbench send seam)
+   * — this function keeps ONLY the confirmApproval prelude that is unique to the approved-write
+   * path (the CAS binding must be confirmed before delivery can be staged for THIS path).
    */
   function beginExchangeDeliveryOnApprove(record: ResolvedRecord): void {
-    if (!exchangeSpineActive() || !record.exchangeId) return;
-    try {
-      const svc = getExchangeService();
-      const snap = svc.get(record.exchangeId);
-      if (snap?.state === "awaiting_approval" && snap.approvalDraftVersion != null) {
-        svc.confirmApproval(record.exchangeId, record.messageId, snap.approvalDraftVersion);
+    if (exchangeSpineActive() && record.exchangeId) {
+      try {
+        const svc = getExchangeService();
+        const snap = svc.get(record.exchangeId);
+        if (snap?.state === "awaiting_approval" && snap.approvalDraftVersion != null) {
+          svc.confirmApproval(record.exchangeId, record.messageId, snap.approvalDraftVersion);
+        }
+      } catch (e) {
+        console.error("[exchange-spine] beginExchangeDeliveryOnApprove (confirmApproval) failed:", e);
       }
-      svc.stageForDelivery(record.exchangeId); // no-op (illegal transition) if already staged
-      svc.beginDeliveryAttempt(record.exchangeId);
-    } catch (e) {
-      console.error("[exchange-spine] beginExchangeDeliveryOnApprove failed:", e);
     }
+    beginExchangeDelivery(record.exchangeId, "beginExchangeDeliveryOnApprove");
   }
 
   function completeExchangeDeliveryOnApprove(record: ResolvedRecord): void {
-    if (!exchangeSpineActive() || !record.exchangeId) return;
-    try {
-      getExchangeService().completeDelivery(record.exchangeId);
-    } catch (e) {
-      console.error("[exchange-spine] completeExchangeDeliveryOnApprove failed:", e);
-    }
+    completeExchangeDelivery(record.exchangeId, "completeExchangeDeliveryOnApprove");
   }
 
   /** Non-approve terminal resolutions (reject/expire/dead-pane) never deliver — cancel whatever

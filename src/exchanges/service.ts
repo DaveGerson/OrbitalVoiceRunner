@@ -53,6 +53,9 @@ import { redactSecrets } from "../terminal";
 
 export type PaneSignalKind = "running" | "quiescing" | "idle" | "prompt" | "error" | "exited";
 
+/** Bound on the per-pane `commandLogs` ring (see that field's own doc comment). */
+const COMMAND_LOG_RING_SIZE = 50;
+
 /** event_type each pane-signal kind records, straight from spec §1.4's table — `quiescing` is
  *  intentionally absent (advisory-only, never reaches the machine, see `onPaneSignal` below). */
 const PANE_SIGNAL_EVENT: Partial<Record<PaneSignalKind, ExchangeEventType>> = {
@@ -112,6 +115,10 @@ export class ExchangeService {
    *  mechanism — deliberately dumb (last-delivery-wins), because the spec forbids anything
    *  smarter (no text matching, no timing heuristics). */
   private readonly paneActive = new Map<string, string>();
+  /** Per-pane command-log ring, bounded to `COMMAND_LOG_RING_SIZE` entries (oldest dropped first —
+   *  production-invisible: this is a debug/observability convenience, never a durable audit trail
+   *  — the durable one is `exchange_events`). Unbounded growth here would otherwise leak for the
+   *  lifetime of a long-running pane/process. */
   private readonly commandLogs = new Map<string, CommandLogEntry[]>();
   /** Optional durable mirror (Phase 1, Step 1.5b) — constructor-injected or attached later via
    *  `attachStore`. Undefined by default, so every `new ExchangeService()` a unit test constructs
@@ -552,6 +559,7 @@ export class ExchangeService {
   private pushCommandLog(paneId: string, command: string, exchangeId: string | null): void {
     const log = this.commandLogs.get(paneId) ?? [];
     log.push({ command, exchangeId });
+    if (log.length > COMMAND_LOG_RING_SIZE) log.splice(0, log.length - COMMAND_LOG_RING_SIZE);
     this.commandLogs.set(paneId, log);
   }
 
@@ -604,8 +612,18 @@ export class ExchangeService {
   /** The `updateExchange` patch half of a mirrored write. Every free-text column is redacted at
    *  THIS write boundary (Phase 2 Step 2.4/2.5 fix — secrets at rest; the in-memory snapshot keeps
    *  the raw text, only the durable copy is scrubbed). Split out of `persistTransition` for the
-   *  same complexity-gate reason as `buildPersistCas`. */
+   *  same complexity-gate reason as `buildPersistCas`.
+   *
+   *  A free-text column (`result_summary`/`terminal_state`/`distilled_instruction`) is only
+   *  INCLUDED in the patch — and therefore only redacted — when THIS transition actually changed
+   *  its raw value (`before` vs. `after`, compared pre-redaction: every field `transition()`
+   *  didn't touch carries the identical raw value forward, so the comparison is exact, never a
+   *  guess). Skipping an unchanged column costs nothing observable: `redactSecrets` is
+   *  deterministic on the same raw input, so re-deriving and re-writing the SAME already-stored
+   *  redacted string every transition (the old behavior) always produced the identical row value —
+   *  this only removes the redundant recompute-and-rewrite, never changes what ends up persisted. */
   private buildPersistPatch(
+    before: ExchangeSnapshot,
     after: ExchangeSnapshot,
     opts?: { resultEnvelopeJson?: string | null },
   ): Record<string, unknown> {
@@ -617,15 +635,20 @@ export class ExchangeService {
       delivery_attempt: after.deliveryAttempt,
       delivered_at: after.deliveredAt,
       completed_at: after.completedAt,
-      result_summary: this.redactText(after.resultSummary),
-      // Phase 4.5 review hardening: terminal_state carries free text too (the detected question
-      // line, an envelope summary) — every writer already redacts at source, but this column was
-      // the one free-text field not double-scrubbed at the write boundary like its siblings.
-      // redactSecrets is idempotent, so this is defense in depth, never a double-mangle.
-      terminal_state: this.redactText(after.terminalState),
-      distilled_instruction: this.redactText(after.distilledInstruction),
       updated_at: after.updatedAt,
     };
+    if (after.resultSummary !== before.resultSummary) {
+      patch.result_summary = this.redactText(after.resultSummary);
+    }
+    // Phase 4.5 review hardening: terminal_state carries free text too (the detected question
+    // line, an envelope summary) — every writer already redacts at source, but this column was
+    // the one free-text field not double-scrubbed at the write boundary like its siblings.
+    if (after.terminalState !== before.terminalState) {
+      patch.terminal_state = this.redactText(after.terminalState);
+    }
+    if (after.distilledInstruction !== before.distilledInstruction) {
+      patch.distilled_instruction = this.redactText(after.distilledInstruction);
+    }
     // Phase 4, Step 4.1: stamp the redacted result-envelope JSON on the row itself (not just the
     // event payload) whenever a reported-outcome leg supplies one, so getExchange(...) reflects
     // the latest report without needing to replay the event timeline.
@@ -661,7 +684,7 @@ export class ExchangeService {
     if (!this.store || !result.ok) return;
     const after = result.snapshot;
     try {
-      this.store.updateExchange(after.exchangeId, this.buildPersistPatch(after, opts), this.buildPersistCas(before, opts));
+      this.store.updateExchange(after.exchangeId, this.buildPersistPatch(before, after, opts), this.buildPersistCas(before, opts));
       if (eventType) this.appendMirroredEvent(after, eventType, opts);
     } catch (e) {
       console.error(

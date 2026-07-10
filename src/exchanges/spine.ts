@@ -18,33 +18,32 @@
 // later, e.g. by a stray call in `off` mode) stays store-less.
 
 import { ExchangeService } from "./service";
-import { EXCHANGE_SPINE_MODE, type ExchangeSpineMode } from "./flag";
+import { EXCHANGE_SPINE_MODE } from "./flag";
 import { recoverExchangesOnBoot, type ExchangeRecoveryReport } from "./recovery";
 import { rehydrateDraftRegistryOnBoot, type DraftRegistryRehydrationReport } from "./draftRegistry";
 import { instructionEnvelopeActive } from "./instructionEnvelope";
 import type { JanusStore } from "../store/sqliteStore";
 
 let singleton: ExchangeService | null = null;
-/** Set by `initExchangeSpineOnBoot` so a singleton constructed AFTER boot wiring (the common
- *  case — nothing touches `getExchangeService()` until real pane/voice activity, and panes boot
- *  inert) still picks up the store on first construction, without requiring boot to run after
- *  the first `getExchangeService()` call. */
-let bootStore: JanusStore | null = null;
 
 /** The one process-wide correlator, created lazily on first use so a process that never turns
- *  the flag on never even allocates it. */
+ *  the flag on never even allocates it. `initExchangeSpineOnBoot` (below) constructs it EAGERLY at
+ *  boot and attaches the store immediately afterward — synchronously, before panes/voice can
+ *  produce any activity (panes boot INERT) — so a lazily-constructed store-less singleton here is
+ *  purely the "boot wiring never ran / flag is off" fallback, never a race with real traffic. */
 export function getExchangeService(): ExchangeService {
-  if (!singleton) singleton = new ExchangeService({ store: bootStore ?? undefined });
+  if (!singleton) singleton = new ExchangeService();
   return singleton;
-}
-
-export function exchangeSpineMode(): ExchangeSpineMode {
-  return EXCHANGE_SPINE_MODE;
 }
 
 export function exchangeSpineActive(): boolean {
   return EXCHANGE_SPINE_MODE !== "off";
 }
+
+// `exchangeSpineMode()` (a plain `() => EXCHANGE_SPINE_MODE` accessor) was removed here — dead API,
+// zero consumers anywhere in src/ or tests/ beyond its own definition (Fix 5, dead-API removal
+// pass). Every real caller either wants `exchangeSpineActive()` (the boolean it actually branches
+// on) or reads `EXCHANGE_SPINE_MODE` directly.
 
 /**
  * Boot-time wiring (Phase 1, Step 1.5b) — called once from server.ts's boot sequence, AFTER the
@@ -93,7 +92,6 @@ function rehydrateDraftRegistryOnBootBestEffort(store: JanusStore): DraftRegistr
 
 export function initExchangeSpineOnBoot(store: JanusStore): ExchangeBootRecoveryResult | undefined {
   if (!exchangeSpineActive()) return undefined;
-  bootStore = store;
   const svc = getExchangeService();
   svc.attachStore(store);
   try {
@@ -108,10 +106,9 @@ export function initExchangeSpineOnBoot(store: JanusStore): ExchangeBootRecovery
   }
 }
 
-/** Test-only reset (fresh singleton + fresh in-memory state, and forgets any boot-wired store) —
- *  mirrors the reset seams other process-wide singletons in this codebase expose for test
- *  isolation. Not used by production wiring. */
+/** Test-only reset (fresh singleton + fresh in-memory state) — mirrors the reset seams other
+ *  process-wide singletons in this codebase expose for test isolation. Not used by production
+ *  wiring. */
 export function resetExchangeServiceForTests(): void {
   singleton = null;
-  bootStore = null;
 }

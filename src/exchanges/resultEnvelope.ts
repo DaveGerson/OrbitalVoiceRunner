@@ -63,6 +63,10 @@
 
 import { z } from "zod";
 import { redactSecrets } from "../terminal";
+// NOTE: imports the side-effect-free src/exchanges/flagReader.ts, NOT src/exchanges/flag.ts — see
+// that file's doc comment (importing flag.ts here would transitively trigger ITS eager
+// `EXCHANGE_SPINE_MODE` read, a module-load-order hazard).
+import { readEnumFlag } from "./flagReader";
 import { COMPLETION_REQUEST_LINE } from "./instructionEnvelope";
 
 // Re-exported purely for callers that want the ONE existing "please report completion" prompt
@@ -98,16 +102,25 @@ export { COMPLETION_REQUEST_LINE };
 //                    are told it is worth inviting one.
 export type ResultEnvelopeMode = "off" | "accept" | "request";
 
-const VALID_RESULT_ENVELOPE_MODES: ReadonlySet<string> = new Set(["off", "accept", "request"]);
+const RESULT_ENVELOPE_MODES: readonly ResultEnvelopeMode[] = ["off", "accept", "request"];
 
+/** Shared reader (src/exchanges/flag.ts's `readEnumFlag`) — see that module's "FLAG LATTICE" doc
+ *  comment for how this flag relates to `JANUS_EXCHANGE_SPINE`. */
 export function readResultEnvelopeMode(env: NodeJS.ProcessEnv = process.env): ResultEnvelopeMode {
-  const raw = (env.JANUS_AGENT_RESULT_ENVELOPE ?? "").trim().toLowerCase();
-  return VALID_RESULT_ENVELOPE_MODES.has(raw) ? (raw as ResultEnvelopeMode) : "off";
+  return readEnumFlag("JANUS_AGENT_RESULT_ENVELOPE", RESULT_ENVELOPE_MODES, "off", env);
 }
 
 /** Cached at module load (the established env-flag idiom) — one process, one mode. */
 export const RESULT_ENVELOPE_MODE: ResultEnvelopeMode = readResultEnvelopeMode();
 
+/**
+ * `"request"` is an ACCEPTED ALIAS of `"accept"` for every scanning purpose below —
+ * `resultEnvelopeActive` treats them identically (both enable `scanForResultEnvelope`); the ONLY
+ * behavioral difference the two modes carry anywhere in this codebase is the "request mode
+ * coherence" note above (a caller MAY additionally invite a completion report via the
+ * already-existing `COMPLETION_REQUEST_LINE` when the mode is `"request"`). No parsing/validation/
+ * redaction rule below ever branches on which of the two is active.
+ */
 export function resultEnvelopeActive(mode: ResultEnvelopeMode = RESULT_ENVELOPE_MODE): boolean {
   return mode === "accept" || mode === "request";
 }

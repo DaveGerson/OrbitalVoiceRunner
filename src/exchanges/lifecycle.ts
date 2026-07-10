@@ -10,20 +10,13 @@
 // machine, the legal-transition relation, draft-version/approval CAS binding, two-phase delivery
 // ordering, cancellation, and boot-quarantine disposition.
 
-/** The 12 lifecycle states (spec §1.1). */
-export type ExchangeState =
-  | "draft"
-  | "awaiting_clarification"
-  | "awaiting_approval"
-  | "staged"
-  | "delivered"
-  | "running"
-  | "needs_input"
-  | "terminal_idle"
-  | "agent_complete"
-  | "agent_failed"
-  | "interrupted"
-  | "cancelled";
+import { type ExchangeState, mintExchangeId } from "./types";
+
+/** The 12 lifecycle states (spec §1.1) — the canonical type lives in ./types (schema-layer,
+ *  column-for-column with the DB); re-exported here for compatibility with every existing
+ *  `import { ExchangeState } from "./lifecycle"` call site (this machine module is where most
+ *  consumers first met the type). */
+export type { ExchangeState };
 
 export const EXCHANGE_STATES: readonly ExchangeState[] = [
   "draft", "awaiting_clarification", "awaiting_approval", "staged", "delivered",
@@ -88,15 +81,11 @@ export function isLegalTransition(from: ExchangeState, to: ExchangeState): boole
   return LEGAL_TRANSITIONS.has(`${from}->${to}`);
 }
 
-/** Convenience assertion wrapper (throws) for callers that want a hard fail on a wiring bug
- *  rather than a soft `LifecycleResult`. The service layer never uses this — it always wants the
- *  soft form — but it's exposed for tooling / debug call sites per the spec's `assertTransition`
- *  naming. */
-export function assertTransition(from: ExchangeState, to: ExchangeState): void {
-  if (!isLegalTransition(from, to)) {
-    throw new Error(`illegal exchange transition: ${from} -> ${to}`);
-  }
-}
+// `assertTransition` (a throwing wrapper around `isLegalTransition`) was removed here — dead API,
+// zero consumers anywhere in src/ or tests/ beyond its own definition (Fix 5, dead-API removal
+// pass). The service layer always wants the soft `LifecycleResult` form (`transition` below); a
+// future tooling/debug call site that genuinely wants a hard throw can trivially re-add a one-line
+// wrapper around `isLegalTransition`.
 
 /**
  * Boot-recovery disposition, per state (spec §4 table). Pure: no store access, no scanning of
@@ -147,11 +136,6 @@ interface CreateInput {
   exchangeId?: string;
 }
 
-let localSeq = 0;
-function mintLocalExchangeId(now: number): string {
-  return `exch_${now.toString(36)}_${(localSeq++).toString(36)}`;
-}
-
 function copy(snap: ExchangeSnapshot): ExchangeSnapshot {
   return { ...snap };
 }
@@ -173,7 +157,7 @@ export class ExchangeMachine {
   create(input: CreateInput): ExchangeSnapshot {
     const ts = this.now();
     const snap: ExchangeSnapshot = {
-      exchangeId: input.exchangeId ?? mintLocalExchangeId(ts),
+      exchangeId: input.exchangeId ?? mintExchangeId(ts),
       projectId: input.projectId,
       paneId: input.paneId,
       state: "draft",

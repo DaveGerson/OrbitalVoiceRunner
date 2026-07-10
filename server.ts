@@ -36,9 +36,10 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
-import { initExchangeSpineOnBoot, getExchangeService, exchangeSpineActive } from "./src/exchanges/spine";
-import { reviseDraft, renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, serializeDraftEnvelope } from "./src/exchanges/draftRegistry";
+import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
+import { mintExchangeForSend, beginExchangeDelivery, completeExchangeDelivery, failExchangeDelivery } from "./src/exchanges/deliveryHooks";
+import { renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, convergeTypedDraftEdit } from "./src/exchanges/draftRegistry";
 import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
@@ -1054,41 +1055,10 @@ function registerRawInputRoute(
 // `requestVoiceReconnect` are in module scope; only the connection-bound `broadcast` +
 // `broadcastDraft` (and the module `requestVoiceReconnect`, passed for locality) are injected. Every
 // route path, verb, branch, status code, and broadcast is byte-identical to the inline block.
-/**
- * Instruction-envelope convergence bridge, REST twin (spec docs/superpowers/specs/
- * 2026-07-09-instruction-routing.md §5.2; see src/voice/index.ts's `convergeTypedDraftEdit` for
- * the WS `draft_edit` twin — both mutate the SAME per-pane EnvelopeDraft registry,
- * src/exchanges/draftRegistry.ts). JANUS_INSTRUCTION_ENVELOPE=primary only; best-effort and never
- * throws back into the route handler.
- */
-function convergeTypedDraftEditRest(
-  projectId: string,
-  paneId: string,
-  text: string,
-  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
-): void {
-  if (!instructionEnvelopeIsPrimary()) return;
-  try {
-    const existing = getOpenDraft(projectId, paneId);
-    if (!existing) return;
-    // Step 3.5 (BUG-B): the typed edit bumps the version, so any approval staged from the prior
-    // version is invalidated through the resolve choke-point — it can never deliver stale text.
-    invalidateOutstandingApproval(projectId, paneId, applyResolution);
-    // Step 3.5: the Workbench's Cancel/Scrap affordance is PUT {text:""} (see
-    // src/orbital/InstructionWorkbench.tsx header) — an emptied draft CANCELS the open exchange
-    // instead of leaving a ghost registry entry (a ghost blocked retargets and re-materialized on
-    // the next GET, while the panel only hid it client-side).
-    if (text.trim().length === 0) {
-      clearOpenDraft(projectId, paneId);
-      clearProseOverride(projectId, paneId);
-      return;
-    }
-    setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
-    setProseOverride(projectId, paneId);
-  } catch (e) {
-    console.error("[instruction-envelope] REST draft_edit convergence failed:", e);
-  }
-}
+// `convergeTypedDraftEdit` (spec docs/superpowers/specs/2026-07-09-instruction-routing.md §5.2) is
+// the single shared implementation exported by src/exchanges/draftRegistry.ts — this REST route's
+// own byte-identical copy (and the WS `draft_edit` twin that used to live in src/voice/index.ts)
+// were folded into it.
 
 /**
  * Step 3.5: settle the open envelope draft when the OPERATOR sends via the Workbench lane
@@ -1135,20 +1105,13 @@ function operatorSendOverflow(paneId: string, text: string): number {
  * this existed in that case).
  */
 function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: string): string | undefined {
-  if (!exchangeSpineActive() || !instructionEnvelopeIsPrimary()) return undefined;
-  try {
-    const openDraft = getOpenDraft(projectId, paneId);
-    return getExchangeService().createExchange({
-      projectId,
-      paneId,
-      operatorUtterance: "Workbench direct send",
-      distilledInstruction: text,
-      instructionEnvelopeJson: openDraft ? serializeDraftEnvelope(openDraft) : undefined,
-    }).exchangeId;
-  } catch (e) {
-    console.error("[exchange-spine] Workbench send: createExchange failed:", e);
-    return undefined;
-  }
+  if (!instructionEnvelopeIsPrimary()) return undefined;
+  return mintExchangeForSend({
+    projectId,
+    paneId,
+    operatorUtterance: "Workbench direct send",
+    distilledInstruction: text,
+  });
 }
 
 /** The two-phase durable-intent ordering (spec §2b) around the Workbench's direct pane write —
@@ -1156,34 +1119,19 @@ function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: 
  *  exactly: `delivery_attempted` genuinely precedes the write, `delivery_succeeded` genuinely
  *  follows it, and a write that throws certainly-fails the exchange back to `draft` instead of
  *  leaving it stranded `staged` (which boot recovery would otherwise have to quarantine as merely
- *  UNCERTAIN). Every function below is a no-op without an exchangeId (the flag-off case above). */
+ *  UNCERTAIN). Thin wrappers over the shared hooks (src/exchanges/deliveryHooks.ts, also used by
+ *  src/gating/index.ts's approved-write path and src/dispatch/paneWrite.ts's auto_execute arm) —
+ *  every one is a no-op without an exchangeId (the flag-off case above). */
 function beginExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
-  if (!exchangeId) return;
-  try {
-    const svc = getExchangeService();
-    svc.stageForDelivery(exchangeId);
-    svc.beginDeliveryAttempt(exchangeId);
-  } catch (e) {
-    console.error("[exchange-spine] Workbench send: beginDeliveryAttempt failed:", e);
-  }
+  beginExchangeDelivery(exchangeId, "Workbench send: beginDeliveryAttempt");
 }
 
 function completeExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
-  if (!exchangeId) return;
-  try {
-    getExchangeService().completeDelivery(exchangeId);
-  } catch (e) {
-    console.error("[exchange-spine] Workbench send: completeDelivery failed:", e);
-  }
+  completeExchangeDelivery(exchangeId, "Workbench send: completeDelivery");
 }
 
 function failExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined, reason: string): void {
-  if (!exchangeId) return;
-  try {
-    getExchangeService().failDelivery(exchangeId, reason);
-  } catch (e) {
-    console.error("[exchange-spine] Workbench send: failDelivery failed:", e);
-  }
+  failExchangeDelivery(exchangeId, reason, "Workbench send: failDelivery");
 }
 
 function registerDraftAndSettingsRoutes(
@@ -1214,7 +1162,7 @@ function registerDraftAndSettingsRoutes(
     if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
     const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
     if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
-    convergeTypedDraftEditRest(req.params.projectId, req.params.paneId, String(text), applyResolution);
+    convergeTypedDraftEdit(req.params.projectId, req.params.paneId, String(text), applyResolution);
     broadcastDraft(req.params.projectId, req.params.paneId);
     res.json({ success: true });
   });

@@ -57,6 +57,8 @@ import type { ExchangeService } from "./service";
 import type { AgentExchange, ExchangeEvent } from "./types";
 import { TERMINAL_STATES } from "./lifecycle";
 import { fetchExchangeCore } from "./replay";
+import { casTransitionWithEvent } from "./recovery";
+import { containsRedactionMarker } from "../terminal";
 
 // ── resume-inspect ──────────────────────────────────────────────────────────────────────────────
 
@@ -213,7 +215,7 @@ function createFollowUpExchange(store: JanusStore, original: AgentExchange, now:
   // Phase 5.4 (B12 sibling case): the follow-up is a DRAFT the operator reviews before sending, so
   // a scrubbed pre-fill is visible and editable rather than silently delivered — but say so
   // explicitly instead of leaving the operator to notice the placeholder themselves.
-  const scrubNote = REDACTION_MARKER_RE.test(original.distilled_instruction)
+  const scrubNote = containsRedactionMarker(original.distilled_instruction)
     ? " NOTE: the pre-filled text was scrubbed of a secret at rest — restore any needed secret before sending."
     : "";
   return {
@@ -223,19 +225,17 @@ function createFollowUpExchange(store: JanusStore, original: AgentExchange, now:
   };
 }
 
-/** Phase 5.4 security review (the 4.5 B12 retry-fidelity finding): the durable row's
- *  `distilled_instruction` is REDACTED at rest ("deliver raw, persist redacted" — the raw text is
- *  never persisted anywhere, and the retry target may predate this process, so no raw copy can
- *  exist to fall back to). When the stored copy visibly carries a redaction placeholder, it is
- *  provably NOT the text the operator originally sent — silently re-delivering it would hand the
- *  agent corrupted instructions (a literal "[REDACTED:api-key]" token) while looking like a
- *  faithful retry. DECISION (implemented): refuse the automatic same-exchange redelivery and tell
- *  the operator to recompose — the only option that neither regresses secrets-at-rest (holding
- *  raw text durably for retry would) nor silently degrades fidelity. For the overwhelming
- *  majority of instructions (no secret ⇒ redaction is a byte-identical no-op) retry is unaffected.
- *  The pattern matches redactSecrets' replacement vocabulary (src/terminal.ts — every substitution
- *  is `[REDACTED:<label>]` with a lowercase/hyphen label). */
-const REDACTION_MARKER_RE = /\[REDACTED:[a-z-]+\]/;
+// Phase 5.4 security review (the 4.5 B12 retry-fidelity finding): the durable row's
+// `distilled_instruction` is REDACTED at rest ("deliver raw, persist redacted" — the raw text is
+// never persisted anywhere, and the retry target may predate this process, so no raw copy can
+// exist to fall back to). When the stored copy visibly carries a redaction placeholder
+// (`containsRedactionMarker`, src/terminal.ts — the same marker vocabulary `redactSecrets` writes),
+// it is provably NOT the text the operator originally sent — silently re-delivering it would hand
+// the agent corrupted instructions (a literal "[REDACTED:api-key]" token) while looking like a
+// faithful retry. DECISION (implemented): refuse the automatic same-exchange redelivery and tell
+// the operator to recompose — the only option that neither regresses secrets-at-rest (holding raw
+// text durably for retry would) nor silently degrades fidelity. For the overwhelming majority of
+// instructions (no secret ⇒ redaction is a byte-identical no-op) retry is unaffected.
 
 /** draft (via delivery_failed) -> staged -> delivery_attempted -> write -> succeeded/failed, on
  *  the SAME exchange row. Mirrors the two-phase durable-intent ordering every other delivery path
@@ -252,7 +252,7 @@ function performSameExchangeRetry(
   if (!term || term.status === "Exited") {
     return { kind: "refused", message: `Cannot retry ${exchange.exchange_id}: pane ${exchange.pane_id} is not live.` };
   }
-  if (REDACTION_MARKER_RE.test(exchange.distilled_instruction)) {
+  if (containsRedactionMarker(exchange.distilled_instruction)) {
     return {
       kind: "refused",
       message: `Cannot retry ${exchange.exchange_id} automatically: the stored copy of its instruction was ` +
@@ -265,27 +265,34 @@ function performSameExchangeRetry(
     return { kind: "refused", message: `Cannot retry ${exchange.exchange_id}: it changed state before this retry could apply (lost race).` };
   }
   svc.adoptExchangeSnapshot(staged.exchange);
-  const attempted = store.updateExchange(
-    exchange.exchange_id,
-    { delivery_attempt: exchange.delivery_attempt + 1 },
-    { state: "staged" },
+  // `nextAttempt` is exactly the patch value below (`exchange.delivery_attempt + 1`) whether or not
+  // the CAS actually wins — the original code derived it from `attempted.exchange?.delivery_attempt`
+  // with this SAME value as its `??` fallback, so precomputing it here (needed for the event
+  // payload, built before the call below) is byte-identical, never a guess.
+  const nextAttempt = exchange.delivery_attempt + 1;
+  // `alwaysAppendEvent: true` — this CAS's predicate (state:"staged") is uncontested-by-construction
+  // within this synchronous action (the `staged` CAS above just won it, single-threaded), so the
+  // audit event was always appended unconditionally here, even before this shared helper existed.
+  casTransitionWithEvent(
+    store, exchange.exchange_id,
+    { delivery_attempt: nextAttempt }, { state: "staged" },
+    {
+      event_type: "retry_initiated", project_id: exchange.project_id, pane_id: exchange.pane_id,
+      payload_redacted_json: JSON.stringify({ delivery_attempt: nextAttempt }), ts: now(),
+    },
+    { alwaysAppendEvent: true },
   );
-  const nextAttempt = attempted.exchange?.delivery_attempt ?? exchange.delivery_attempt + 1;
-  store.appendExchangeEvent({
-    exchange_id: exchange.exchange_id, event_type: "retry_initiated",
-    project_id: exchange.project_id, pane_id: exchange.pane_id,
-    payload_redacted_json: JSON.stringify({ delivery_attempt: nextAttempt }), ts: now(),
-  });
   try {
     term.writeInput(exchange.distilled_instruction);
   } catch (e) {
     return failRetryWrite(store, svc, exchange, now, e);
   }
-  const delivered = store.updateExchange(exchange.exchange_id, { state: "delivered", delivered_at: now() }, { state: "staged" });
-  store.appendExchangeEvent({
-    exchange_id: exchange.exchange_id, event_type: "delivery_succeeded",
-    project_id: exchange.project_id, pane_id: exchange.pane_id, ts: now(),
-  });
+  const delivered = casTransitionWithEvent(
+    store, exchange.exchange_id,
+    { state: "delivered", delivered_at: now() }, { state: "staged" },
+    { event_type: "delivery_succeeded", project_id: exchange.project_id, pane_id: exchange.pane_id, ts: now() },
+    { alwaysAppendEvent: true },
+  );
   if (delivered.exchange) svc.adoptExchangeSnapshot(delivered.exchange);
   return {
     kind: "same_exchange", exchangeId: exchange.exchange_id,
@@ -296,16 +303,15 @@ function performSameExchangeRetry(
 function failRetryWrite(
   store: JanusStore, svc: ExchangeService, exchange: AgentExchange, now: () => number, err: unknown,
 ): RetryOutcome {
-  const failed = store.updateExchange(
-    exchange.exchange_id,
-    { state: "draft", approval_id: null, approval_draft_version: null },
-    { state: "staged" },
+  const failed = casTransitionWithEvent(
+    store, exchange.exchange_id,
+    { state: "draft", approval_id: null, approval_draft_version: null }, { state: "staged" },
+    {
+      event_type: "delivery_failed", project_id: exchange.project_id, pane_id: exchange.pane_id,
+      payload_redacted_json: JSON.stringify({ detail: "retry_write_threw" }), ts: now(),
+    },
+    { alwaysAppendEvent: true },
   );
-  store.appendExchangeEvent({
-    exchange_id: exchange.exchange_id, event_type: "delivery_failed",
-    project_id: exchange.project_id, pane_id: exchange.pane_id,
-    payload_redacted_json: JSON.stringify({ detail: "retry_write_threw" }), ts: now(),
-  });
   if (failed.exchange) svc.adoptExchangeSnapshot(failed.exchange);
   return { kind: "refused", message: `Retry of ${exchange.exchange_id} failed to write to pane ${exchange.pane_id}: ${String(err)}` };
 }
@@ -333,15 +339,17 @@ export function cancelExchangeDurable(
   if (TERMINAL_STATES.has(exchange.state)) {
     return { ok: false, message: `Exchange ${exchangeId} already ${exchange.state} — nothing to cancel.` };
   }
-  const res = store.updateExchange(exchangeId, { state: "cancelled" }, { state: exchange.state });
+  const res = casTransitionWithEvent(
+    store, exchangeId,
+    { state: "cancelled" }, { state: exchange.state },
+    {
+      event_type: "exchange_cancelled", project_id: exchange.project_id, pane_id: exchange.pane_id,
+      payload_redacted_json: JSON.stringify({ reason: reason ?? "operator_cancelled" }), ts: now(),
+    },
+  );
   if (!res.changed) {
     return { ok: false, message: `Exchange ${exchangeId} could not be cancelled (it changed state first — lost race).` };
   }
-  store.appendExchangeEvent({
-    exchange_id: exchangeId, event_type: "exchange_cancelled",
-    project_id: exchange.project_id, pane_id: exchange.pane_id,
-    payload_redacted_json: JSON.stringify({ reason: reason ?? "operator_cancelled" }), ts: now(),
-  });
   if (res.exchange) svc.adoptExchangeSnapshot(res.exchange);
   return { ok: true, message: `Exchange ${exchangeId} cancelled.` };
 }

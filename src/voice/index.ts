@@ -40,11 +40,11 @@ import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
 import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { mintExchangeForSend } from "../exchanges/deliveryHooks";
 import type { ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine } from "./sitrep";
-import { reviseDraft, instructionEnvelopeActive, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, serializeDraftEnvelope } from "../exchanges/draftRegistry";
+import { convergeTypedDraftEdit } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -512,44 +512,10 @@ function applyDraftEditFrame(
   }
 }
 
-/**
- * Instruction-envelope convergence bridge (spec docs/superpowers/specs/2026-07-09-instruction-
- * routing.md §5.2), JANUS_INSTRUCTION_ENVELOPE=primary only: a typed `draft_edit` (this WS frame,
- * and the REST PUT twin at server.ts's `/api/panes/:projectId/:paneId/draft` route) ALSO revises
- * the pane's OPEN envelope draft, if one exists, and marks prose-override so the operator's
- * hand-edited text is never clobbered by a subsequent re-render — a voice field revision
- * (revise_instruction) clears the override and re-renders. Both surfaces mutate the SAME
- * `EnvelopeDraft` (src/exchanges/draftRegistry.ts's per-pane registry); last writer wins the
- * prose; every write bumps the same `draftVersion`. Best-effort and never throws back into the
- * message handler — a convergence-bridge failure must never break plain draft editing.
- */
-function convergeTypedDraftEdit(
-  projectId: string,
-  paneId: string,
-  text: string,
-  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
-): void {
-  if (!instructionEnvelopeIsPrimary()) return;
-  try {
-    const existing = getOpenDraft(projectId, paneId);
-    if (!existing) return;
-    // Step 3.5 (BUG-B): the typed edit bumps the draft version — any approval staged from the
-    // prior version is invalidated through the resolve choke-point (it must never deliver stale
-    // text; spec §4). Mirrors convergeTypedDraftEditRest (server.ts) exactly.
-    invalidateOutstandingApproval(projectId, paneId, applyResolution);
-    // Step 3.5: an emptied draft (the Workbench Cancel/Scrap = PUT/edit with "") CANCELS the open
-    // exchange instead of leaving a ghost registry entry — mirrors the REST twin.
-    if (text.trim().length === 0) {
-      clearOpenDraft(projectId, paneId);
-      clearProseOverride(projectId, paneId);
-      return;
-    }
-    setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
-    setProseOverride(projectId, paneId);
-  } catch (e) {
-    console.error("[instruction-envelope] draft_edit convergence failed:", e);
-  }
-}
+// `convergeTypedDraftEdit` (the instruction-envelope convergence bridge, spec docs/superpowers/
+// specs/2026-07-09-instruction-routing.md §5.2) is now the SINGLE shared implementation exported by
+// src/exchanges/draftRegistry.ts — this file's own byte-identical copy (and the REST twin that used
+// to live in server.ts) were folded into it; both call sites now just call the shared function.
 
 // DispatchOutcome (the result shape returned by `dispatchProposal`) is the single canonical type in
 // ../actions/types — imported above. The byte-identical local duplicate that used to live here was
@@ -1304,31 +1270,20 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       );
     }
 
-    /** Phase 4, Step 4.3: when this dispatch correlates to the pane's OPEN envelope draft (the
-     *  Workbench/voice instruction-envelope flow — send_instruction's dispatchProposal call fires
-     *  while the registry still holds the exact version being sent, see
-     *  src/exchanges/draftRegistry.ts's rehydration doc), serialize its structured envelope for
-     *  the new row's `instruction_envelope_json`. This is the durable source a restart's
-     *  `rehydrateDraftRegistryOnBoot` reads back — without it, a sent-but-not-yet-delivered draft
-     *  would have no way to recover its objective/context/constraints split after a crash.
-     *  Best-effort: a plain (non-envelope) dispatch has no matching open draft and returns
-     *  `undefined`, leaving the column at its schema default, unchanged from before this existed.
-     *  Split out of `stampExchangeForDispatch` for the same complexity-gate reason as its sibling. */
-    function draftEnvelopeJsonForDispatch(projectId: string, targetId: string): string | undefined {
-      if (!instructionEnvelopeActive()) return undefined;
-      const openDraft = getOpenDraft(projectId, targetId);
-      return openDraft ? (serializeDraftEnvelope(openDraft) ?? undefined) : undefined;
-    }
-
+    /** Mint the exchange for this dispatch BEFORE the effect switch (spec §5) via the shared
+     *  `mintExchangeForSend` core (src/exchanges/deliveryHooks.ts) — the same core server.ts's
+     *  Workbench-send seam uses. That core already folds in "serialize this pane's OPEN envelope
+     *  draft, if any, into `instructionEnvelopeJson`" (Phase 4, Step 4.3 — the durable source a
+     *  restart's `rehydrateDraftRegistryOnBoot` reads back), so this wrapper only supplies the
+     *  fields specific to a voice dispatch: the resolved owning project (Phase 2 Step 2.5 review
+     *  fix — never "whatever project happens to be active"), and this connection's real
+     *  voice_session_id/interaction_id/context_version stamps (Phase 2 Step 2.2 — "the context
+     *  version that shaped this instruction"). */
     function stampExchangeForDispatch(targetId: string, instruction: string, trigger: string): string | undefined {
       if (!exchangeSpineActive()) return undefined;
       try {
         const projectId = projectIdForExchangeDispatch(targetId);
-        // Phase 2 Step 2.2: stamp this connection's real voice_session_id + interaction_id, and the
-        // context_version currently ACKNOWLEDGED for this (project, session) pair — "the context
-        // version that shaped this instruction" (the most recent brief the model actually saw
-        // before this dispatch was drafted).
-        return getExchangeService().createExchange({
+        return mintExchangeForSend({
           projectId,
           paneId: targetId,
           operatorUtterance: trigger,
@@ -1336,8 +1291,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           voiceSessionId: state.voiceSessionId,
           interactionId: state.currentInteractionId,
           contextVersion: contextVersions.currentAcknowledgedVersion(projectId, state.voiceSessionId),
-          instructionEnvelopeJson: draftEnvelopeJsonForDispatch(projectId, targetId),
-        }).exchangeId;
+        });
       } catch (e) {
         console.error("[exchange-spine] createExchange failed:", e);
         return undefined;

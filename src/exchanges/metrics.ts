@@ -27,6 +27,7 @@
 //     them), not a literal `(exchange, draft_version)` key. Documented here so this derivation is an
 //     auditable choice, not a silent approximation.
 import type { AgentExchange, ContextDelivery, ExchangeEvent, ExchangeEventType } from "./types";
+import { parseJsonObject, safeArrayLength } from "./payload";
 
 /** Structural read surface this report needs — mirrors ContextMetricsSource's convention (small
  *  interface, not a full JanusStore import). `JanusStore` satisfies this directly.
@@ -118,25 +119,8 @@ export interface ExchangeMetricsReport {
   notes: string[];
 }
 
-// ── shared parsing helpers ──────────────────────────────────────────────────────────────────────
-
-function parsePayload(json: string): Record<string, unknown> {
-  try {
-    const v = JSON.parse(json || "{}");
-    return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function safeArrayLength(json: string): number {
-  try {
-    const v = JSON.parse(json);
-    return Array.isArray(v) ? v.length : 0;
-  } catch {
-    return 0;
-  }
-}
+// `parseJsonObject`/`safeArrayLength` (the shared parsing helpers this module used to carry its own
+// copies of) now live in src/exchanges/payload.ts, shared with src/exchanges/replay.ts.
 
 /** Group a globally `ts ASC, event_id ASC`-ordered event stream by exchange_id. Grouping a
  *  pre-sorted sequence preserves each group's own chronological order — no per-group re-sort
@@ -180,7 +164,7 @@ function countWrongTargetDeliveries(byExchange: Map<string, ExchangeEvent[]>): n
   for (const evs of byExchange.values()) {
     for (const e of evs) {
       if (e.event_type !== "target_resolved") continue;
-      const payload = parsePayload(e.payload_redacted_json);
+      const payload = parseJsonObject(e.payload_redacted_json);
       const resolvedPaneId = typeof payload.paneId === "string" ? payload.paneId : null;
       if (resolvedPaneId && e.pane_id && resolvedPaneId !== e.pane_id) n++;
     }
@@ -218,7 +202,7 @@ function countClarificationCauses(events: ExchangeEvent[]): Record<string, numbe
   const out: Record<string, number> = {};
   for (const e of events) {
     if (e.event_type !== "clarification_requested") continue;
-    const payload = parsePayload(e.payload_redacted_json);
+    const payload = parseJsonObject(e.payload_redacted_json);
     const raw = typeof payload.cause === "string" ? payload.cause.trim() : "";
     const cause = raw ? raw.slice(0, CLARIFICATION_CAUSE_CAP) : "unspecified";
     out[cause] = (out[cause] ?? 0) + 1;
@@ -313,7 +297,7 @@ function computeRecoveryState(exchanges: AgentExchange[], events: ExchangeEvent[
   let interruptedEvents = 0, revertedMissingApprovalEvents = 0, retriedEvents = 0;
   for (const e of events) {
     if (e.event_type === "exchange_recovered") {
-      const payload = parsePayload(e.payload_redacted_json);
+      const payload = parseJsonObject(e.payload_redacted_json);
       if (payload.disposition === "interrupted") interruptedEvents++;
       else if (payload.disposition === "reverted_missing_approval") revertedMissingApprovalEvents++;
     } else if (e.event_type === "retry_initiated") {

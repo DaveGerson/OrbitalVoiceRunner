@@ -2,6 +2,14 @@
 import type Database from "better-sqlite3";
 import * as fs from "fs";
 import * as path from "path";
+import { TERMINAL_STATES } from "../exchanges/lifecycle";
+
+/** The `agent_exchanges.state IN (...)` clause for the three TERMINAL states (agent_complete/
+ *  agent_failed/cancelled) — built ONCE from the single source of truth (`TERMINAL_STATES`,
+ *  src/exchanges/lifecycle.ts) instead of two hand-synced SQL string literals (pruneOnBoot's and
+ *  pruneIncremental's used to drift-risk independently). The three values are this module's own
+ *  compile-time-fixed vocabulary (never user input), so inlining them into the SQL text is safe. */
+const TERMINAL_STATES_SQL_LIST = [...TERMINAL_STATES].map((s) => `'${s}'`).join(",");
 
 export interface PruneOpts {
   now: number; eventsTtlDays: number; archiveTtlDays: number;
@@ -116,7 +124,7 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     // is aged from when it SETTLED, not when it was created.
     try {
       db.prepare(
-        "DELETE FROM agent_exchanges WHERE state IN ('agent_complete','agent_failed','cancelled') AND updated_at < ?"
+        `DELETE FROM agent_exchanges WHERE state IN (${TERMINAL_STATES_SQL_LIST}) AND updated_at < ?`
       ).run(exCutoff);
       db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(cdelCutoff);
     } catch { /* pre-v12 DB: tables absent, skip */ }
@@ -256,7 +264,7 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
   // (see PruneOpts.exchangesTtlDays).
   try {
     step("agent_exchanges",
-      "DELETE FROM agent_exchanges WHERE exchange_id IN (SELECT exchange_id FROM agent_exchanges WHERE state IN ('agent_complete','agent_failed','cancelled') AND updated_at < ? LIMIT ?)",
+      `DELETE FROM agent_exchanges WHERE exchange_id IN (SELECT exchange_id FROM agent_exchanges WHERE state IN (${TERMINAL_STATES_SQL_LIST}) AND updated_at < ? LIMIT ?)`,
       [ttlCutoffMs(opts.now, opts.exchangesTtlDays)]);
     step("context_deliveries",
       "DELETE FROM context_deliveries WHERE delivery_id IN (SELECT delivery_id FROM context_deliveries WHERE ts < ? LIMIT ?)",

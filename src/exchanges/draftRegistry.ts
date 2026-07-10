@@ -20,6 +20,8 @@
 
 import {
   assessReadiness,
+  instructionEnvelopeIsPrimary,
+  reviseDraft,
   type EnvelopeDraft,
   type EnvelopeTarget,
   type InstructionEnvelope,
@@ -115,6 +117,48 @@ export function invalidateOutstandingApproval(
     applyResolution(binding.messageId, "reject");
   } catch (e) {
     console.error("[instruction-envelope] failed to invalidate a stale pending approval:", e);
+  }
+}
+
+/**
+ * Shared instruction-envelope convergence bridge (spec docs/superpowers/specs/2026-07-09-
+ * instruction-routing.md §5.2), JANUS_INSTRUCTION_ENVELOPE=primary only: a typed `draft_edit` (the
+ * WS frame, src/voice/index.ts, and its REST twin — the PUT /api/panes/:projectId/:paneId/draft
+ * route, server.ts) ALSO revises the pane's OPEN envelope draft, if one exists, and marks
+ * prose-override so the operator's hand-edited text is never clobbered by a subsequent re-render —
+ * a voice field revision (revise_instruction) clears the override. Both surfaces mutate the SAME
+ * `EnvelopeDraft` registry above; last writer wins the prose; every write bumps the same
+ * `draftVersion`. `applyResolution` is the caller's injected resolve choke-point
+ * (src/gating/index.ts) — used to invalidate a pending approval staged from a now-stale draft
+ * version. Best-effort and never throws back into the caller's message/route handler — a
+ * convergence-bridge failure must never break plain draft editing. This one implementation replaces
+ * the two byte-identical copies that used to live in src/voice/index.ts and server.ts.
+ */
+export function convergeTypedDraftEdit(
+  projectId: string,
+  paneId: string,
+  text: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
+  if (!instructionEnvelopeIsPrimary()) return;
+  try {
+    const existing = getOpenDraft(projectId, paneId);
+    if (!existing) return;
+    // Step 3.5 (BUG-B): the typed edit bumps the draft version — any approval staged from the
+    // prior version is invalidated through the resolve choke-point (it must never deliver stale
+    // text; spec §4).
+    invalidateOutstandingApproval(projectId, paneId, applyResolution);
+    // Step 3.5: an emptied draft (the Workbench Cancel/Scrap = PUT/edit with "") CANCELS the open
+    // exchange instead of leaving a ghost registry entry.
+    if (text.trim().length === 0) {
+      clearOpenDraft(projectId, paneId);
+      clearProseOverride(projectId, paneId);
+      return;
+    }
+    setOpenDraft(projectId, paneId, reviseDraft(existing, {}));
+    setProseOverride(projectId, paneId);
+  } catch (e) {
+    console.error("[instruction-envelope] draft_edit convergence failed:", e);
   }
 }
 

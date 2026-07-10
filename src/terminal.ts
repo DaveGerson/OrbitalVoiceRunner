@@ -325,6 +325,19 @@ export function redactSecrets(text: string): string {
   return text;
 }
 
+/** Every substitution `redactSecrets` makes is a `[REDACTED:<label>]` token (lowercase/hyphen
+ *  label) — this is that vocabulary's own marker pattern, exported so callers that need to detect
+ *  "was this text scrubbed of a secret at rest" (e.g. src/exchanges/recoveryActions.ts's retry-
+ *  fidelity guard) own no second, hand-copied regex of `redactSecrets`' replacement shape. */
+export const REDACTION_MARKER_RE = /\[REDACTED:[a-z-]+\]/;
+
+/** True iff `text` contains at least one `redactSecrets` redaction marker — the common case
+ *  callers actually want (a boolean test), leaving `REDACTION_MARKER_RE` itself available for a
+ *  caller that needs the pattern directly (e.g. `.test()` against a value it also needs to log). */
+export function containsRedactionMarker(text: string): boolean {
+  return REDACTION_MARKER_RE.test(text);
+}
+
 /**
  * Secret classification for a COMPOSED PROMPT before it is delivered to a pane (director
  * posture 2026-06-01: "prompts must never contain secrets"). Unlike redactSecrets (which

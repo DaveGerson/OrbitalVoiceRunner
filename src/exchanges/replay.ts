@@ -34,6 +34,7 @@ import type { AgentExchange, ContextDelivery, ExchangeEvent, ExchangeEventType }
 import type { StoredPendingApproval } from "../store/types";
 import { redactSecrets } from "../terminal";
 import { hashText } from "../memory/contextTelemetry";
+import { parseJsonObject, safeArrayLength } from "./payload";
 
 /** Structural read surface this module needs — mirrors ContextMetricsSource's convention (a small
  *  interface, not a full JanusStore import) so a hand-built test double can satisfy it. `JanusStore`
@@ -82,15 +83,9 @@ function safeRedact(s: string | null | undefined, redact: (s: string) => string)
  *  part of this spine's payload vocabulary today. Never throws: a malformed/foreign payload yields
  *  `{}` rather than surfacing a parse error to a replay consumer. */
 function redactedPayload(json: string, redact: (s: string) => string): Record<string, unknown> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json || "{}");
-  } catch {
-    return {};
-  }
-  if (!parsed || typeof parsed !== "object") return {};
+  const parsed = parseJsonObject(json);
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+  for (const [k, v] of Object.entries(parsed)) {
     out[k] = typeof v === "string" ? redact(v) : v;
   }
   return out;
@@ -108,15 +103,6 @@ function pickText(payload: Record<string, unknown>): string | null {
     if (typeof v === "string" && v.length > 0) return v;
   }
   return null;
-}
-
-function safeArrayLength(json: string): number {
-  try {
-    const v = JSON.parse(json);
-    return Array.isArray(v) ? v.length : 0;
-  } catch {
-    return 0;
-  }
 }
 
 // ── the flat, redacted event entry every bucket view below reads from ──────────────────────────────
@@ -166,31 +152,41 @@ export interface ReplayResultSummary {
   summary: string | null;
 }
 
-function bucketTargetResolutions(entries: ReplayEventEntry[]): ReplayTargetResolution[] {
-  return entries
-    .filter((e) => e.eventType === "target_resolved")
-    .map((e) => ({
-      ts: e.ts,
-      paneId: typeof e.payload.paneId === "string" ? e.payload.paneId : null,
-      projectId: typeof e.payload.projectId === "string" ? e.payload.projectId : null,
-    }));
+/** Generic bucket builder: filter `entries` to the ones whose `eventType` is in `typeSet`, then
+ *  project each survivor through `project` — the shared shape every bucket*() view below is (was
+ *  five near-identical hand-written filter+map pairs; interfaces/payload shapes are unchanged, this
+ *  only removes the duplication). */
+function bucket<T>(
+  entries: ReplayEventEntry[],
+  typeSet: ReadonlySet<ExchangeEventType>,
+  project: (e: ReplayEventEntry) => T,
+): T[] {
+  return entries.filter((e) => typeSet.has(e.eventType)).map(project);
 }
 
+const TARGET_RESOLVED_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set(["target_resolved"]);
+
+function bucketTargetResolutions(entries: ReplayEventEntry[]): ReplayTargetResolution[] {
+  return bucket(entries, TARGET_RESOLVED_EVENT_TYPES, (e) => ({
+    ts: e.ts,
+    paneId: typeof e.payload.paneId === "string" ? e.payload.paneId : null,
+    projectId: typeof e.payload.projectId === "string" ? e.payload.projectId : null,
+  }));
+}
+
+const DRAFT_REVISED_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set(["draft_revised"]);
+
 function bucketDraftRevisions(entries: ReplayEventEntry[]): ReplayDraftRevision[] {
-  return entries
-    .filter((e) => e.eventType === "draft_revised")
-    .map((e) => ({
-      ts: e.ts,
-      supersededApprovalId: typeof e.payload.superseded_approval_id === "string" ? e.payload.superseded_approval_id : null,
-    }));
+  return bucket(entries, DRAFT_REVISED_EVENT_TYPES, (e) => ({
+    ts: e.ts,
+    supersededApprovalId: typeof e.payload.superseded_approval_id === "string" ? e.payload.superseded_approval_id : null,
+  }));
 }
 
 const QUESTION_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set(["clarification_requested", "needs_input_detected"]);
 
 function bucketQuestions(entries: ReplayEventEntry[]): ReplayQuestion[] {
-  return entries
-    .filter((e) => QUESTION_EVENT_TYPES.has(e.eventType))
-    .map((e) => ({ ts: e.ts, eventType: e.eventType, text: pickText(e.payload) }));
+  return bucket(entries, QUESTION_EVENT_TYPES, (e) => ({ ts: e.ts, eventType: e.eventType, text: pickText(e.payload) }));
 }
 
 const TERMINAL_TRANSITION_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set([
@@ -199,9 +195,7 @@ const TERMINAL_TRANSITION_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set(
 ]);
 
 function bucketTerminalTransitions(entries: ReplayEventEntry[]): ReplayTerminalTransition[] {
-  return entries
-    .filter((e) => TERMINAL_TRANSITION_EVENT_TYPES.has(e.eventType))
-    .map((e) => ({ ts: e.ts, eventType: e.eventType, detail: pickText(e.payload) }));
+  return bucket(entries, TERMINAL_TRANSITION_EVENT_TYPES, (e) => ({ ts: e.ts, eventType: e.eventType, detail: pickText(e.payload) }));
 }
 
 const RESULT_SUMMARY_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set([
@@ -209,9 +203,7 @@ const RESULT_SUMMARY_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set([
 ]);
 
 function bucketResultSummaries(entries: ReplayEventEntry[]): ReplayResultSummary[] {
-  return entries
-    .filter((e) => RESULT_SUMMARY_EVENT_TYPES.has(e.eventType))
-    .map((e) => ({ ts: e.ts, eventType: e.eventType, summary: pickText(e.payload) }));
+  return bucket(entries, RESULT_SUMMARY_EVENT_TYPES, (e) => ({ ts: e.ts, eventType: e.eventType, summary: pickText(e.payload) }));
 }
 
 // ── approval records (durable, exchange_id-stamped `pending_approvals` rows) ────────────────────

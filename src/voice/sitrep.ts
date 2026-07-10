@@ -666,13 +666,16 @@ function rankingCoversPendingWork(payload: SitrepPayload, ranking: SitrepRanking
 // ─────────────────────────────────────────────────────────────────────────────
 // runStatusSummary — the impure entry point the get_status_summary tool def delegates to.
 // ─────────────────────────────────────────────────────────────────────────────
-/** Count of currently-idle panes, appended as a one-line tail after an exchange-aware board so
- *  "what's free right now" is never silently dropped just because real exchange activity exists
- *  elsewhere. Deliberately NOT routed through renderSitrep (whose isEmptyWorld() treats an
- *  idle-only ranking as "nothing to report" — correct for the LEGACY empty-world sentence, wrong
- *  here where the board has already established there IS something to report). */
-function idleTail(payload: SitrepPayload): string {
-  const idleCount = payload.panes.filter((p) => !p.isBusy).length;
+/** Count of currently-idle panes, straight from `ctx.manager.terminals` — the SAME `isBusy` rule
+ *  `composeSitrep` uses (`term.status === "Running"`), without paying for that function's full
+ *  legacy gather (panes/approvals/attention/plans) just to read one field of it. Appended as a
+ *  one-line tail after an exchange-aware board so "what's free right now" is never silently
+ *  dropped just because real exchange activity exists elsewhere. Deliberately NOT routed through
+ *  renderSitrep (whose isEmptyWorld() treats an idle-only ranking as "nothing to report" — correct
+ *  for the LEGACY empty-world sentence, wrong here where the board has already established there
+ *  IS something to report). */
+function idleTailFromTerminals(ctx: ActionContext): string {
+  const idleCount = Object.values(ctx.manager.terminals).filter((t) => t.status !== "Running").length;
   return idleCount === 0 ? "" : `${idleCount} pane${idleCount === 1 ? "" : "s"} idle.`;
 }
 
@@ -685,8 +688,13 @@ export async function runStatusSummary(ctx: ActionContext): Promise<ActionResult
     // golden). Never throws (composeExchangeBoard/rankExchangeBoard are pure/guarded internally).
     const board = rankExchangeBoard(composeExchangeBoard(ctx, now));
     if (board.length > 0) {
-      const payload = composeSitrep(ctx, now);
-      const tail = idleTail(payload);
+      // This path used to call composeSitrep(ctx, now) purely to read its idle-pane count back out
+      // — composeSitrep's BUG-035-style attention-queue hygiene (pruneAttention() BEFORE reading
+      // the queue) was a side effect of that call, not something idleTailFromTerminals needs, so it
+      // is preserved explicitly here rather than silently dropped now that composeSitrep itself is
+      // no longer on this path.
+      ctx.pruneAttention();
+      const tail = idleTailFromTerminals(ctx);
       const text = tail ? `${renderExchangeBoard(board)} ${tail}` : renderExchangeBoard(board);
       return { kind: "ok", output: text };
     }

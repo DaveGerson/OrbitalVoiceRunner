@@ -34,7 +34,7 @@ import type {
 import { isPaneActiveForWrite, inactivePaneClarify } from "../activePane";
 import type { CapabilityGate, GateValue } from "../types";
 import type { LiveSessionLike, DispatchOutcome } from "../actions/types";
-import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { beginExchangeDelivery, completeExchangeDelivery, failExchangeDelivery } from "../exchanges/deliveryHooks";
 
 /**
  * The connection-AGNOSTIC collaborators + the per-call request context the effect-switch needs. This
@@ -108,40 +108,24 @@ export interface DispatchDeps {
 }
 
 // ── AgentExchange spine (step 1.4): the auto_execute two-phase delivery hooks ─────────────────────
-// Mirrors src/gating/index.ts's beginExchangeDeliveryOnApprove/completeExchangeDeliveryOnApprove
-// verbatim in spirit: best-effort, never throws, a no-op unless the flag is active AND the caller
-// supplied deps.exchangeId (spec §9.6 — a spine outage must never affect the real dispatch outcome).
+// Thin, named wrappers over the shared hooks (src/exchanges/deliveryHooks.ts) — mirrors
+// src/gating/index.ts's beginExchangeDeliveryOnApprove/completeExchangeDeliveryOnApprove in spirit:
+// best-effort, never throws, a no-op unless the flag is active AND the caller supplied
+// deps.exchangeId (spec §9.6 — a spine outage must never affect the real dispatch outcome).
 
 function beginExchangeDeliveryOnAutoExecute(deps: DispatchDeps): void {
-  if (!exchangeSpineActive() || !deps.exchangeId) return;
-  try {
-    const svc = getExchangeService();
-    svc.stageForDelivery(deps.exchangeId); // no-op (illegal transition) if already staged
-    svc.beginDeliveryAttempt(deps.exchangeId);
-  } catch (e) {
-    console.error("[exchange-spine] beginExchangeDeliveryOnAutoExecute failed:", e);
-  }
+  beginExchangeDelivery(deps.exchangeId, "beginExchangeDeliveryOnAutoExecute");
 }
 
 function completeExchangeDeliveryOnAutoExecute(deps: DispatchDeps): void {
-  if (!exchangeSpineActive() || !deps.exchangeId) return;
-  try {
-    getExchangeService().completeDelivery(deps.exchangeId);
-  } catch (e) {
-    console.error("[exchange-spine] completeExchangeDeliveryOnAutoExecute failed:", e);
-  }
+  completeExchangeDelivery(deps.exchangeId, "completeExchangeDeliveryOnAutoExecute");
 }
 
 /** Certain-failure leg (spec §1.3 note ᵉ): the two pre-write guards below (no live pane / pane
  *  Exited) know FOR CERTAIN nothing landed, so this re-arms the exchange to `draft` instead of
  *  quarantining it — a re-send just needs a fresh approval, not operator intervention. */
 function failExchangeDeliveryOnAutoExecute(deps: DispatchDeps, reason: string): void {
-  if (!exchangeSpineActive() || !deps.exchangeId) return;
-  try {
-    getExchangeService().failDelivery(deps.exchangeId, reason);
-  } catch (e) {
-    console.error("[exchange-spine] failExchangeDeliveryOnAutoExecute failed:", e);
-  }
+  failExchangeDelivery(deps.exchangeId, reason, "failExchangeDeliveryOnAutoExecute");
 }
 
 /**

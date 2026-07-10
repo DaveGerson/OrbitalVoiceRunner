@@ -30,8 +30,45 @@
 // at the group level beyond what each member's exchange row already carries.
 
 import type { JanusStore } from "../store/sqliteStore";
-import type { AgentExchange } from "./types";
+import type { AgentExchange, ExchangeEvent } from "./types";
 import { EXCHANGE_STATES, recoveryDisposition, type ExchangeState } from "./lifecycle";
+
+/** The event half of `casTransitionWithEvent` — everything `appendExchangeEvent` needs EXCEPT
+ *  `exchange_id` (the caller already supplies that as its own parameter). */
+export interface CasTransitionEvent {
+  event_type: ExchangeEvent["event_type"];
+  project_id?: string | null;
+  pane_id?: string | null;
+  payload_redacted_json?: string;
+  ts?: number;
+}
+
+/**
+ * Shared "guarded CAS update, then append the matching audit event" pair — the shape every
+ * boot-recovery/recovery-action write in this subsystem uses: a `store.updateExchange` CAS,
+ * and (by default) an `appendExchangeEvent` row ONLY when the CAS actually won (a lost race is a
+ * harmless no-op, never a duplicate/invented write — spec §4 hard rules). `opts.alwaysAppendEvent`
+ * opts OUT of that guard for the handful of call sites (src/exchanges/recoveryActions.ts's
+ * same-exchange retry steps) whose CAS predicate is, by construction, uncontested within the same
+ * synchronous action — those sites always appended their event unconditionally before this helper
+ * existed, and keep doing so here for byte-identical behavior. Returns the same `{changed,
+ * exchange}` shape `updateExchange` does, so a caller that also needs the fresh row (e.g. to
+ * `adoptExchangeSnapshot` it into the live correlator) doesn't need a second store read.
+ */
+export function casTransitionWithEvent(
+  store: JanusStore,
+  exchangeId: string,
+  patch: Parameters<JanusStore["updateExchange"]>[1],
+  cas: Parameters<JanusStore["updateExchange"]>[2],
+  event: CasTransitionEvent,
+  opts?: { alwaysAppendEvent?: boolean },
+): { changed: boolean; exchange: AgentExchange | null } {
+  const res = store.updateExchange(exchangeId, patch, cas);
+  if (res.changed || opts?.alwaysAppendEvent) {
+    store.appendExchangeEvent({ exchange_id: exchangeId, ...event });
+  }
+  return res;
+}
 
 /** Which exchanges this boot pass touched, and how — for the operator-facing recovery digest
  *  (spec §4: "quarantined exchanges surface once as an attention item"). */
@@ -59,25 +96,24 @@ function quarantineOne(
   now: () => number,
   report: ExchangeRecoveryReport,
 ): void {
-  const res = store.updateExchange(
+  const res = casTransitionWithEvent(
+    store,
     row.exchange_id,
     { state: "interrupted" },
     { state: row.state },
+    {
+      event_type: "exchange_recovered",
+      project_id: row.project_id,
+      pane_id: row.pane_id,
+      payload_redacted_json: JSON.stringify({
+        disposition: "interrupted",
+        reason: "boot_quarantine",
+        from_state: row.state,
+      }),
+      ts: now(),
+    },
   );
-  if (!res.changed) return; // lost race / already moved on — never invent history, never retry
-  report.interrupted.push(row.exchange_id);
-  store.appendExchangeEvent({
-    exchange_id: row.exchange_id,
-    event_type: "exchange_recovered",
-    project_id: row.project_id,
-    pane_id: row.pane_id,
-    payload_redacted_json: JSON.stringify({
-      disposition: "interrupted",
-      reason: "boot_quarantine",
-      from_state: row.state,
-    }),
-    ts: now(),
-  });
+  if (res.changed) report.interrupted.push(row.exchange_id); // else: lost race — never invent history, never retry
 }
 
 /** awaiting_approval (spec §4 table row + prose): kept when the durable approval survives; reverted
@@ -92,24 +128,24 @@ function recoverAwaitingApproval(
     report.kept.push(row.exchange_id);
     return;
   }
-  const res = store.updateExchange(
+  const res = casTransitionWithEvent(
+    store,
     row.exchange_id,
     { state: "draft", approval_id: null, approval_draft_version: null },
     { state: "awaiting_approval" },
+    {
+      event_type: "exchange_recovered",
+      project_id: row.project_id,
+      pane_id: row.pane_id,
+      payload_redacted_json: JSON.stringify({
+        disposition: "reverted_missing_approval",
+        reason: "boot_recovery",
+      }),
+      ts: now(),
+    },
   );
-  if (!res.changed) { report.kept.push(row.exchange_id); return; } // lost race — leave it be
-  report.reverted.push(row.exchange_id);
-  store.appendExchangeEvent({
-    exchange_id: row.exchange_id,
-    event_type: "exchange_recovered",
-    project_id: row.project_id,
-    pane_id: row.pane_id,
-    payload_redacted_json: JSON.stringify({
-      disposition: "reverted_missing_approval",
-      reason: "boot_recovery",
-    }),
-    ts: now(),
-  });
+  if (res.changed) report.reverted.push(row.exchange_id);
+  else report.kept.push(row.exchange_id); // lost race — leave it be
 }
 
 function recoverOne(

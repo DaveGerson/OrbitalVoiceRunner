@@ -139,11 +139,21 @@ export interface ContextDelivery {
 // `ctxevt-<ts>-<seq>` (src/memory/contextTelemetry.ts). Module-scope monotonic counters keep both
 // families cheap, collision-free, and sortable without a UUID dependency.
 
-let exchangeSeq = 0;
-/** Mint a fresh exchange id: `exch_<epoch36>_<seq36>` (spec §2, "ID minting"). */
-export function mintExchangeId(now: number = Date.now()): string {
-  return `exch_${now.toString(36)}_${(exchangeSeq++).toString(36)}`;
+/**
+ * Factory for the `<prefix>_<epoch36>_<seq36>` id-minting idiom (spec §2, "ID minting"). Each call
+ * returns an independent minter with its OWN private monotonic counter — never shared across
+ * prefixes/callers, so two minters from two `mintSeqId` calls can never collide or interleave
+ * sequence numbers. `mintExchangeId` below is this factory's own first consumer; other modules
+ * needing the identical shape with a different prefix (e.g. instructionEnvelope.ts's envelope-draft
+ * ids) may adopt it too instead of hand-rolling their own counter.
+ */
+export function mintSeqId(prefix: string): (now?: number) => string {
+  let seq = 0;
+  return (now: number = Date.now()) => `${prefix}_${now.toString(36)}_${(seq++).toString(36)}`;
 }
+
+/** Mint a fresh exchange id: `exch_<epoch36>_<seq36>` (spec §2, "ID minting"). */
+export const mintExchangeId: (now?: number) => string = mintSeqId("exch");
 
 let contextDeliverySeq = 0;
 /** Mint a fresh context-delivery id, mirroring the `ctxevt-<ts>-<seq>` shape (spec §2). */
