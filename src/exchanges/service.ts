@@ -728,8 +728,55 @@ export class ExchangeService {
         project_id: snap.projectId,
         ts: snap.createdAt,
       });
+      // Phase 5.4 (observability wiring, closing the 5.3 gap): every exchange is minted with an
+      // ALREADY-RESOLVED target (the resolver/Workbench decided the pane before createExchange
+      // runs — src/voice/index.ts stampExchangeForDispatch, server.ts stampExchangeForWorkbenchSend),
+      // so the `target_resolved` audit event lands here, immediately after `exchange_created`, with
+      // the payload convention src/exchanges/metrics.ts defined for its first producer
+      // ({ paneId, projectId }). Pure audit trail: ids only, no free text, append-only, no state
+      // transition. NOTE the metrics consequence: countWrongTargetDeliveries compares this payload
+      // against the row's own immutable pane_id, so live traffic reads 0 unless a future resolver
+      // bug stamps a divergent pane — exactly the tripwire that metric exists to be.
+      this.store.appendExchangeEvent({
+        exchange_id: snap.exchangeId,
+        event_type: "target_resolved",
+        pane_id: snap.paneId,
+        project_id: snap.projectId,
+        payload_redacted_json: JSON.stringify({ paneId: snap.paneId, projectId: snap.projectId }),
+        ts: snap.createdAt,
+      });
     } catch (e) {
       console.error(`[exchange-spine] durable insertExchange failed for ${snap.exchangeId} (continuing in-memory only):`, e);
+    }
+  }
+
+  /**
+   * Phase 5.4 (observability wiring, closing the 5.3 gap): append a `clarification_requested`
+   * audit event for an exchange whose dispatch came back needing the operator's clarification
+   * (the dispatch-outcome clarify seam in src/voice/index.ts settleExchangeForDispatch). Append-
+   * only — no state transition, no CAS; the exchange's own lifecycle disposition (typically the
+   * `cancel` that follows at that seam) is recorded separately by its own event. `cause` follows
+   * the payload convention src/exchanges/metrics.ts's countClarificationCauses defined (a short
+   * label, capped there at 64 chars). Fail-soft + never throws (spec §9.6). The OTHER clarify seam
+   * — the target resolver's own "which pane did you mean" (src/voice/targetResolver.ts) — fires
+   * BEFORE any exchange exists (exchange_events.exchange_id is NOT NULL), so it cannot be wired
+   * here; see the Phase 5.4 report (deferred to 5.5).
+   */
+  recordClarificationRequested(id: string, cause: string): void {
+    if (!this.store) return;
+    const snap = this.machine.get(id);
+    if (!snap) return;
+    try {
+      this.store.appendExchangeEvent({
+        exchange_id: id,
+        event_type: "clarification_requested",
+        pane_id: snap.paneId,
+        project_id: snap.projectId,
+        payload_redacted_json: this.redact(JSON.stringify({ cause })),
+        ts: Date.now(),
+      });
+    } catch (e) {
+      console.error(`[exchange-spine] clarification_requested event append failed for ${id} (audit trail only):`, e);
     }
   }
 }

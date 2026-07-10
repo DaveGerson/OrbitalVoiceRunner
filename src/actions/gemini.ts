@@ -14,6 +14,7 @@
 
 import { Type } from "@google/genai";
 import { z } from "zod";
+import { redactSecrets } from "../terminal";
 import { ALWAYS_ALLOWED } from "./types";
 import type {
   ActionContext,
@@ -381,6 +382,10 @@ function voiceResponse(result: ActionResult): Record<string, unknown> {
     case "blocked":
       return { output: result.reason };
     case "error":
-      return { output: `Internal error: ${result.message}` };
+      // Phase 5.4 security review: this string is MODEL-BOUND (sendToolResponse), and a handler
+      // throw / zod parse failure may embed raw argument text (which can carry a pasted secret)
+      // in its message — scrub it like every other model-bound string. Idempotent no-op on the
+      // ordinary secret-free case.
+      return { output: `Internal error: ${redactSecrets(result.message)}` };
   }
 }

@@ -1346,6 +1346,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           svc.requestApproval(exchangeId, pendingId);
           pendingApprovals.bindExchange(pendingId, exchangeId);
         } else {
+          // Phase 5.4 (observability wiring): a clarify outcome means the operator was asked to
+          // disambiguate before anything could be delivered — record it as its own audit event
+          // (metrics.ts's clarificationCauses convention) before the cancel disposition below.
+          if (outcome.kind === "clarify") svc.recordClarificationRequested(exchangeId, "dispatch_clarify");
           svc.cancel(exchangeId, `dispatch_outcome:${outcome.kind}`);
         }
       } catch (e) {
@@ -2090,8 +2094,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             } catch (toolErr) {
               console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
               try {
+                // Phase 5.4 security review: the exception message is MODEL-BOUND (sendToolResponse)
+                // and a throwing handler may embed argument text (a pasted key, an env assignment) in
+                // its Error message — scrub it like every other model-bound string. Idempotent on the
+                // overwhelmingly common secret-free case.
+                const errText = redactSecrets(toolErr instanceof Error ? toolErr.message : String(toolErr));
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
+                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${errText}` } }]
                 });
               } catch { /* session already torn down; nothing more we can do */ }
             }

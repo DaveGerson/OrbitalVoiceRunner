@@ -210,12 +210,32 @@ function createFollowUpExchange(store: JanusStore, original: AgentExchange, now:
     payload_redacted_json: JSON.stringify({ follow_up_of: original.exchange_id }),
     ts: nowTs,
   });
+  // Phase 5.4 (B12 sibling case): the follow-up is a DRAFT the operator reviews before sending, so
+  // a scrubbed pre-fill is visible and editable rather than silently delivered — but say so
+  // explicitly instead of leaving the operator to notice the placeholder themselves.
+  const scrubNote = REDACTION_MARKER_RE.test(original.distilled_instruction)
+    ? " NOTE: the pre-filled text was scrubbed of a secret at rest — restore any needed secret before sending."
+    : "";
   return {
     kind: "new_exchange",
     exchangeId: fresh.exchange_id,
-    message: `Exchange ${original.exchange_id} is interrupted and can never auto-resume — created a new follow-up draft ${fresh.exchange_id} for pane ${original.pane_id}, pre-filled from the original instruction. Review and send it explicitly; the original stays interrupted until cancelled.`,
+    message: `Exchange ${original.exchange_id} is interrupted and can never auto-resume — created a new follow-up draft ${fresh.exchange_id} for pane ${original.pane_id}, pre-filled from the original instruction. Review and send it explicitly; the original stays interrupted until cancelled.${scrubNote}`,
   };
 }
+
+/** Phase 5.4 security review (the 4.5 B12 retry-fidelity finding): the durable row's
+ *  `distilled_instruction` is REDACTED at rest ("deliver raw, persist redacted" — the raw text is
+ *  never persisted anywhere, and the retry target may predate this process, so no raw copy can
+ *  exist to fall back to). When the stored copy visibly carries a redaction placeholder, it is
+ *  provably NOT the text the operator originally sent — silently re-delivering it would hand the
+ *  agent corrupted instructions (a literal "[REDACTED:api-key]" token) while looking like a
+ *  faithful retry. DECISION (implemented): refuse the automatic same-exchange redelivery and tell
+ *  the operator to recompose — the only option that neither regresses secrets-at-rest (holding
+ *  raw text durably for retry would) nor silently degrades fidelity. For the overwhelming
+ *  majority of instructions (no secret ⇒ redaction is a byte-identical no-op) retry is unaffected.
+ *  The pattern matches redactSecrets' replacement vocabulary (src/terminal.ts — every substitution
+ *  is `[REDACTED:<label>]` with a lowercase/hyphen label). */
+const REDACTION_MARKER_RE = /\[REDACTED:[a-z-]+\]/;
 
 /** draft (via delivery_failed) -> staged -> delivery_attempted -> write -> succeeded/failed, on
  *  the SAME exchange row. Mirrors the two-phase durable-intent ordering every other delivery path
@@ -231,6 +251,14 @@ function performSameExchangeRetry(
 ): RetryOutcome {
   if (!term || term.status === "Exited") {
     return { kind: "refused", message: `Cannot retry ${exchange.exchange_id}: pane ${exchange.pane_id} is not live.` };
+  }
+  if (REDACTION_MARKER_RE.test(exchange.distilled_instruction)) {
+    return {
+      kind: "refused",
+      message: `Cannot retry ${exchange.exchange_id} automatically: the stored copy of its instruction was ` +
+        `scrubbed of a secret at rest (secrets are never persisted), so redelivering it would send the agent ` +
+        `corrupted text. Recompose the instruction (including the secret, if it is genuinely needed) and send it as a fresh message.`,
+    };
   }
   const staged = store.updateExchange(exchange.exchange_id, { state: "staged" }, { state: "draft" });
   if (!staged.changed || !staged.exchange) {

@@ -13,10 +13,24 @@ export interface PruneOpts {
   /** gemini_turn_usage TTL in days (B-3 spine). Default 30. */
   geminiTurnUsageTtlDays?: number;
   /** exchange_events TTL in days (AgentExchange spine, schema v12). Default 30 — same append-only,
-   *  no-replay-requirement rationale as action_log/cortex_decision (ACTION_LOG_TTL_DAYS). The
-   *  `agent_exchanges` head rows and `context_deliveries` are NOT pruned here (out of scope for
-   *  this pass — only the append-only event timeline gets bounded retention). */
+   *  no-replay-requirement rationale as action_log/cortex_decision (ACTION_LOG_TTL_DAYS). */
   exchangeEventsTtlDays?: number;
+  /** agent_exchanges TERMINAL-row TTL in days (Phase 5.4 security review). Default 30. Only rows
+   *  whose `state` is one of the three terminal states (agent_complete/agent_failed/cancelled —
+   *  src/exchanges/lifecycle.ts TERMINAL_STATES) are ever pruned: their redacted free-text columns
+   *  (operator_utterance/distilled_instruction/result_summary/result_envelope_json) are the
+   *  longest-lived at-rest copies of operator/agent text, so they get the same bounded retention
+   *  as the event timeline that references them. In-flight rows and `interrupted` rows are NEVER
+   *  pruned — `interrupted` is the operator's recovery backlog (spec §4: "the only path out of
+   *  interrupted is the operator"), so automatic disposal would silently revoke a decision the
+   *  spec reserves for a human. */
+  exchangesTtlDays?: number;
+  /** context_deliveries TTL in days (schema v12). Default 30 — append-only observability ledger
+   *  (hashes + source-id lists, no free text), same posture as exchange_events. Pruning it in the
+   *  same pass as the terminal exchange rows means a replay for a TTL-expired exchange degrades
+   *  honestly (replay.ts's detectDegradation) instead of leaving orphaned delivery rows pointing
+   *  at pruned exchanges. */
+  contextDeliveriesTtlDays?: number;
 }
 
 /**
@@ -74,6 +88,16 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     try {
       db.prepare("DELETE FROM exchange_events WHERE ts < ?").run(opts.now - (opts.exchangeEventsTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
     } catch { /* pre-v12 DB: table absent, skip */ }
+    // Phase 5.4 security review: TERMINAL agent_exchanges head rows + context_deliveries get the
+    // same bounded TTL (see the PruneOpts doc comments for the exact scope — in-flight and
+    // `interrupted` rows are never touched). Uses updated_at (the last transition time) so a row
+    // is aged from when it SETTLED, not when it was created.
+    try {
+      db.prepare(
+        "DELETE FROM agent_exchanges WHERE state IN ('agent_complete','agent_failed','cancelled') AND updated_at < ?"
+      ).run(opts.now - (opts.exchangesTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+      db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(opts.now - (opts.contextDeliveriesTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+    } catch { /* pre-v12 DB: tables absent, skip */ }
   });
   tx();
   // Orphaned scrollback sweep: delete .log files not referenced by any live or archived pane.
@@ -115,6 +139,10 @@ export interface SweepOpts {
   geminiTurnUsageTtlDays?: number;
   /** exchange_events TTL in days (AgentExchange spine, schema v12). Default 30. */
   exchangeEventsTtlDays?: number;
+  /** agent_exchanges TERMINAL-row TTL in days (Phase 5.4). Default 30 — see PruneOpts. */
+  exchangesTtlDays?: number;
+  /** context_deliveries TTL in days (schema v12, Phase 5.4). Default 30 — see PruneOpts. */
+  contextDeliveriesTtlDays?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
 }
@@ -126,15 +154,22 @@ export interface SweepResult {
   more: boolean;
 }
 
+/** `now - <days or the 30d default> in ms` — the shared TTL-cutoff shape every 30d-default table
+ *  uses. Hoisted so the `??` default lives in ONE place instead of one branch per table inside
+ *  `pruneIncremental` (complexity gate). */
+function ttlCutoffMs(now: number, ttlDays: number | undefined): number {
+  return now - (ttlDays ?? ACTION_LOG_TTL_DAYS) * 86_400_000;
+}
+
 export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepResult {
   const day = 86_400_000;
   const limit = Math.max(1, opts.batchLimit ?? 1000);
   const evCutoff = opts.now - opts.eventsTtlDays * day;
   const arCutoff = opts.now - opts.archiveTtlDays * day;
-  const alCutoff = opts.now - (opts.actionLogTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
-  const cdCutoff = opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
-  const gtuCutoff = opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
-  const eeCutoff = opts.now - (opts.exchangeEventsTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
+  const alCutoff = ttlCutoffMs(opts.now, opts.actionLogTtlDays);
+  const cdCutoff = ttlCutoffMs(opts.now, opts.cortexDecisionTtlDays);
+  const gtuCutoff = ttlCutoffMs(opts.now, opts.geminiTurnUsageTtlDays);
+  const eeCutoff = ttlCutoffMs(opts.now, opts.exchangeEventsTtlDays);
   const pendingCutoff = opts.now - PENDING_PRUNE_GRACE_MS;
 
   const deleted: Record<string, number> = {};
@@ -185,6 +220,17 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM exchange_events WHERE event_id IN (SELECT event_id FROM exchange_events WHERE ts < ? ORDER BY event_id LIMIT ?)",
       [eeCutoff]);
   } catch { /* pre-v12 DB: table absent, skip */ }
+  // Phase 5.4 security review: TERMINAL agent_exchanges rows + context_deliveries — the same
+  // predicates as pruneOnBoot, batched. In-flight and `interrupted` rows are never touched
+  // (see PruneOpts.exchangesTtlDays).
+  try {
+    step("agent_exchanges",
+      "DELETE FROM agent_exchanges WHERE exchange_id IN (SELECT exchange_id FROM agent_exchanges WHERE state IN ('agent_complete','agent_failed','cancelled') AND updated_at < ? LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.exchangesTtlDays)]);
+    step("context_deliveries",
+      "DELETE FROM context_deliveries WHERE delivery_id IN (SELECT delivery_id FROM context_deliveries WHERE ts < ? LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays)]);
+  } catch { /* pre-v12 DB: tables absent, skip */ }
 
   return { deleted, more };
 }

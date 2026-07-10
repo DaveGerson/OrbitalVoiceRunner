@@ -176,7 +176,7 @@ describe("scenario 1: two exchanges on one pane, only one approved", () => {
     assert.equal(aRow.delivery_attempt, 1);
     assert.ok(aRow.delivered_at !== null);
     assert.deepEqual(store.listExchangeEvents(a).map((e) => e.event_type), [
-      "exchange_created", "approval_requested", "approval_confirmed",
+      "exchange_created", "target_resolved", "approval_requested", "approval_confirmed",
       "delivery_attempted", "delivery_succeeded", "terminal_running", "terminal_idle",
     ]);
 
@@ -185,7 +185,7 @@ describe("scenario 1: two exchanges on one pane, only one approved", () => {
     assert.equal(bRow.approval_id, "appr-b");
     assert.equal(bRow.delivery_attempt, 0);
     assert.equal(bRow.delivered_at, null);
-    assert.deepEqual(store.listExchangeEvents(b).map((e) => e.event_type), ["exchange_created", "approval_requested"],
+    assert.deepEqual(store.listExchangeEvents(b).map((e) => e.event_type), ["exchange_created", "target_resolved", "approval_requested"],
       "no delivery/settlement event ever touched B");
 
     // -- Dispatch-join member assertions --
@@ -277,7 +277,7 @@ describe("scenario 3: draft edit while approval pending", () => {
     assert.equal(row.draft_version, 2);
     assert.equal(row.distilled_instruction, "actually, run only the store tests");
     assert.deepEqual(store.listExchangeEvents(id).map((e) => e.event_type),
-      ["exchange_created", "approval_requested", "draft_revised"]);
+      ["exchange_created", "target_resolved", "approval_requested", "draft_revised"]);
 
     // Approving the STALE (pre-edit) version is rejected — in-memory...
     const staleConfirm = h.confirmApproval(id, "appr-1", 1);
@@ -448,7 +448,7 @@ describe("scenario 6: failed pane write", () => {
 
     const events = store.listExchangeEvents(id);
     assert.deepEqual(events.map((e) => e.event_type), [
-      "exchange_created", "approval_requested", "approval_confirmed", "delivery_attempted", "delivery_failed",
+      "exchange_created", "target_resolved", "approval_requested", "approval_confirmed", "delivery_attempted", "delivery_failed",
     ]);
     assert.equal(JSON.parse(events.at(-1)!.payload_redacted_json).detail, "pane_exited");
 
@@ -657,13 +657,13 @@ describe("scenario 10: the production persistence bridge survives a real restart
       assert.equal(store.getExchange(b)!.state, "interrupted");
 
       assert.deepEqual(store.listExchangeEvents(a).map((e) => e.event_type), [
-        "exchange_created", "approval_requested", "approval_confirmed", "delivery_attempted",
+        "exchange_created", "target_resolved", "approval_requested", "approval_confirmed", "delivery_attempted",
         "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
       ], "A's full timeline — entirely written by the production bridge across two process instances");
 
       const bEvents = store.listExchangeEvents(b);
       assert.deepEqual(bEvents.map((e) => e.event_type), [
-        "exchange_created", "approval_requested", "approval_confirmed",
+        "exchange_created", "target_resolved", "approval_requested", "approval_confirmed",
         "delivery_attempted", "delivery_succeeded", "terminal_running", "exchange_recovered",
       ]);
       const recoveredPayload = JSON.parse(bEvents.at(-1)!.payload_redacted_json);

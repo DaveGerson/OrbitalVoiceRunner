@@ -300,7 +300,7 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       assert.strictEqual(row.state, "agent_complete");
       assert.strictEqual(row.result_summary, "142 tests passing");
       assert.deepStrictEqual(store().listExchangeEvents(j1Id).map((e: any) => e.event_type), [
-        "exchange_created", "delivery_attempted", "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
+        "exchange_created", "target_resolved", "delivery_attempted", "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
       ]);
 
       // ONE narration, exactly the terse completion line.
@@ -767,7 +767,7 @@ describe("journey 12: python daemon death mid-journey — communication continue
     assert.strictEqual(row.state, "agent_complete", "the exchange settles correctly regardless of cortex health");
     assert.strictEqual(row.result_summary, "all green");
     assert.deepStrictEqual(store().listExchangeEvents(id).map((e: any) => e.event_type), [
-      "exchange_created", "delivery_attempted", "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
+      "exchange_created", "target_resolved", "delivery_attempted", "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
     ], "no corruption of the durable event chain from the dead daemon");
 
     const narrations = exchangeNarrationsSince(session, idx);
