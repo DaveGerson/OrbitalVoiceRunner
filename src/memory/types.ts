@@ -36,7 +36,12 @@ export interface JanusFrame {
   gatePosture: string;         // global permissions mode summary
   prefs: string[];             // redacted global operator prefs, may be empty
 }
-export interface Breadcrumb { ts: number; paneId: string | null; text: string; } // text already redacted
+// text already redacted. `projectId` (Phase 2 Step 2.4/2.5 fix — cross-project breadcrumb leak):
+// the pane's OWNING project at drop time, stamped by the observe-layer call sites so the render
+// path can scope crumbs to the brief's project. OPTIONAL + nullable: a crumb with no project
+// affinity (system/global, unresolvable pane, or any pre-existing caller/test that never stamps
+// it) stays visible everywhere — byte-identical to the pre-scoping behavior for those callers.
+export interface Breadcrumb { ts: number; paneId: string | null; text: string; projectId?: string | null; }
 
 /**
  * Phase 2 Step 2.1: the "affected pane" / event-focus block. Populated ONLY when a background

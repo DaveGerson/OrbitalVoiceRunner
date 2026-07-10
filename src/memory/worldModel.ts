@@ -285,7 +285,10 @@ export class WorldModel {
       pane: activePaneId ? this.getPaneTier(activePaneId) : null,
       board: this.getBoardTier(),
       frame: this.getJanusFrameTier(),
-      breadcrumbs: this.deps.breadcrumbs.recent(now),
+      // Phase 2 Step 2.4/2.5 fix (cross-project breadcrumb leak): scope crumbs to the brief's own
+      // project. Crumbs with no project stamp still pass (see BreadcrumbRing.recent); with no
+      // active project the filter is off entirely — byte-identical to the pre-scoping floor.
+      breadcrumbs: this.deps.breadcrumbs.recent(now, projectId || null),
       eventFocus: this.getEventFocusTier(affectedPaneId, activePaneId),
     };
   }

@@ -157,6 +157,29 @@ export function backgroundProjectForSignal(
   return pool.stateFor(paneProjectId) === "handle" ? paneProjectId : null;
 }
 
+/** Phase 2 Step 2.5 review fix (the Step 2.4 documented switch_context mixed-brief bug): on a
+ *  `project_switch` trigger the operator's focused pane may still belong to the PRIOR project —
+ *  switch_context alone never moves `coreState.activePaneId` (only switch_active_pane does, see
+ *  src/actions/defs/orient.ts), so rendering the brief against that pane produced a genuinely
+ *  MIXED payload (PROJECT tier = the NEW project, ACTIVE PANE tier = the OLD project's pane)
+ *  stamped under the new project's delivery row. Resolution: for a project_switch whose focused
+ *  pane is NOT owned by the new foreground project, render the brief with NO active-pane tier —
+ *  the pane tier arrives on the operator's own next switch_active_pane, exactly the settled state
+ *  every existing call site pairs a switch_context with. Every other trigger, and a pane that DOES
+ *  belong to the new project, is byte-identical to before. A pane whose owner cannot be resolved
+ *  is dropped too (fail toward isolation — we cannot confirm affinity). Pure + exported for unit
+ *  coverage; extracted so injectMemoryBrief's own cyclomatic count is unchanged. */
+export function resolveBriefPane(
+  manager: Pick<OrchestratorManager, "terminals" | "ledger">,
+  trigger: ContextInjectionTrigger,
+  activePaneId: string | null,
+  foregroundProjectId: string | null,
+): string | null {
+  if (trigger !== "project_switch" || !activePaneId) return activePaneId;
+  const owner = findPaneOwningProject(manager, activePaneId)?.projectId ?? null;
+  return owner !== null && owner === foregroundProjectId ? activePaneId : null;
+}
+
 // Phase 2 Step 2.2: the six canonical context-tier keys (mirrors src/memory/assembler.ts's
 // CANONICAL_ORDER) — the universe deliverySourcesFromBrief below splits into included/dropped.
 const CONTEXT_SOURCE_KEYS = ["project", "pane", "eventFocus", "breadcrumbs", "board", "frame"];
@@ -619,7 +642,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     if (!store) return;
     try {
       if (token == null) store.deleteKV(VOICE_RESUMPTION_KV);
-      else store.setKV(VOICE_RESUMPTION_KV, wrapHandleForPersist(token, Date.now()));
+      // Phase 2 Step 2.5 review fix: stamp the OWNING project on every rotation write — the
+      // handle resumes ONE project's server-side conversation, and the stamp is what lets
+      // SessionPool.migrateLegacyHandle refuse to mis-file it into a different project's
+      // per-project slot. Additive: readFreshHandle/rehydrate ignore unknown fields.
+      else store.setKV(VOICE_RESUMPTION_KV, wrapHandleForPersist(token, Date.now(), manager.ledger.activeProjectId ?? null));
     } catch (e) {
       console.error("[SESSION RESUMPTION] failed to persist token:", e);
     }
@@ -977,11 +1004,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // paneSignalBus subscription below, not here).
         const poolProjectId = manager.ledger.activeProjectId;
         syncSessionPoolOnTrigger(sessionPool, poolProjectId, trigger, now);
+        // Phase 2 Step 2.5 review fix: the pane the brief RENDERS — identical to activeId except
+        // on a project_switch whose focused pane still belongs to the PRIOR project (see
+        // resolveBriefPane's doc). The latest-wins guard below still compares the REAL activeId
+        // against the live focus (focus itself did not move).
+        const briefPaneId = resolveBriefPane(manager, trigger, activeId, poolProjectId);
         // Phase 2 Step 2.2: affectedPaneId now threads into the gate's own hash (closing the Step
         // 2.1 KNOWN GAP note on snapshotHashFor) so the gate can never make a skip/inject decision
         // against a snapshot that doesn't yet reflect the SAME eventFocus block the cortex/renderer
         // build moments later for this trigger.
-        const snapshotHash = memory.service.snapshotHashFor(activeId, now, affectedPaneId);
+        const snapshotHash = memory.service.snapshotHashFor(briefPaneId, now, affectedPaneId);
         // D5: per-project gate isolation — was the single shared `memory.service.gate` (key null)
         // regardless of active project; now keyed by the pool's foreground project so a stale hash
         // from project A can never skip a genuinely-changed brief for project B.
@@ -996,10 +1028,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // brief below. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
         // Phase 2 Step 2.2: `state.voiceSessionId` is this connection's real session identity — the
         // cortex_decision row this observation persists no longer hardcodes sessionId null.
-        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId, state.voiceSessionId);
+        memory.service.observeCortexShadow(briefPaneId, now, wire, injectId, affectedPaneId, state.voiceSessionId);
         // P0b/Wave 4 D5: race the cortex (when primary) / the Python synthesizer against the
         // in-process floor. synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId, state.voiceSessionId);
+        brief = await memory.service.synthesizeAsync(briefPaneId, now, injectId, wire, affectedPaneId, state.voiceSessionId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
@@ -1027,8 +1059,15 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // catch and this row is never acknowledged (src/memory/contextVersions.ts's ack-on-success
         // contract) — a skip/stale/empty brief never reaches this line at all.
         const { included: includedSources, dropped: droppedSources } = deliverySourcesFromBrief(brief);
+        // Phase 2 Step 2.5 review fix: stamp the delivery row with poolProjectId — the project
+        // this brief was hashed/gated/assembled FOR (read once, pre-await) — NOT a fresh
+        // manager.ledger.activeProjectId re-read. The tiers snapshot is built synchronously under
+        // poolProjectId before the first await in synthesizeAsync, so a switch_context landing
+        // DURING the await used to mis-stamp the OLD project's brief under the NEW project's
+        // (project, session) version counter (the same class as the documented switch_context
+        // mis-stamp, reached from the other side).
         const delivery = contextVersions.recordDelivery({
-          projectId: manager.ledger.activeProjectId ?? null,
+          projectId: poolProjectId ?? null,
           sessionId: state.voiceSessionId,
           trigger,
           includedSourceIds: includedSources,
@@ -1119,8 +1158,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     function stampExchangeForDispatch(targetId: string, instruction: string, trigger: string): string | undefined {
       if (!exchangeSpineActive()) return undefined;
       try {
+        // Phase 2 Step 2.5 review fix: resolve the pane's OWNING project through the canonical
+        // resolver before ever falling back to "whatever project happens to be active" — a
+        // ledger pane in a NON-active project (no live terminal) used to stamp the exchange row
+        // (and its context_version join) under the WRONG project.
         const projectId =
           manager.terminals[targetId]?.projectId ||
+          findPaneOwningProject(manager, targetId)?.projectId ||
           manager.ledger.getActiveProject?.()?.id ||
           "default_project";
         // Phase 2 Step 2.2: stamp this connection's real voice_session_id + interaction_id, and the

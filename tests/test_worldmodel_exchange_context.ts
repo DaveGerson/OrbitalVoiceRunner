@@ -309,34 +309,22 @@ test("assembleBrief: enriched tiers (decisions/warnings/todos/pane-recent/eventF
   );
 });
 
-// ── BUG (Phase 2 Step 2.4, cross-project journey 10 — planted-secret redaction at rest) ─────────
+// ── Phase 2 Step 2.5 fix of the Step 2.4 pinned bug: exchange-spine redaction AT REST ───────────
 //
-// Every test above proves WorldModel redacts secrets on READ (getProjectTier/getPaneTier/
-// getEventFocusTier all call `this.deps.redact(...)` before rendering). That is NOT the same
-// guarantee as "secrets never land in the DB" — tests/test_secrets_at_rest.ts and
-// tests/test_history_redaction_at_rest.ts exist precisely because those are two different
-// invariants for other tables. For the AgentExchange spine, they are NOT both held:
-//
-//   1. src/exchanges/service.ts `persistTransition` (the ONLY writer of exchange_events rows for
-//      real transitions) does:
-//        payload_redacted_json: JSON.stringify(opts?.payload ?? {})
-//      with NO redaction call anywhere in between. `opts.payload` traces back to `onPaneSignal`'s
-//      `sig.detail` (service.ts ~line 257: `sig.detail !== undefined ? { payload: { detail:
-//      sig.detail } } : undefined`) — real, unredacted pane-output text for a "needs_input_detected"
-//      signal. The column name promises redaction; the code never performs it.
-//
-//   2. `distilled_instruction` (agent_exchanges) is populated verbatim from the operator's
-//      propose_command instruction: src/voice/index.ts:1134 `distilledInstruction: instruction` —
-//      again with no `redactSecrets` pass before it reaches `ExchangeService.createExchange` ->
-//      `store.insertExchange`.
-//
-// This test exercises the REAL production write path end-to-end (ExchangeService, not a
-// hand-built fixture) and is RED against current code — filed here rather than fixed, per this
-// task's test-only scope. See the session report for the full finding.
+// WorldModel redacts on READ; the store rows must ALSO be clean at rest (the same two-invariant
+// split tests/test_secrets_at_rest.ts and tests/test_history_redaction_at_rest.ts pin for other
+// tables). src/exchanges/service.ts now applies redactSecrets at ITS write boundary — the single
+// choke point every caller (voice dispatch, REST, tests) funnels through:
+//   - persistCreate: operator_utterance + distilled_instruction persisted redacted;
+//   - persistTransition: distilled_instruction/result_summary mirrors + payload_redacted_json
+//     (the column name finally tells the truth) redacted on every event append.
+// The IN-MEMORY machine keeps the raw instruction — delivery to the pane is never silently
+// altered (spec §13 nuance: deliver raw, persist redacted); the pane write path reads its own raw
+// `instruction`, not the store row.
 {
   const SECRET = "sk-ant-SECRET123";
 
-  test("BUG: distilled_instruction and payload_redacted_json both retain the raw secret after a real create -> stage -> deliver -> needs_input cycle (ExchangeService writes secrets to agent_exchanges/exchange_events UNREDACTED at rest)", () => {
+  test("distilled_instruction and payload_redacted_json are both redacted at rest after a real create -> stage -> deliver -> needs_input cycle", () => {
     const store = seedStore();
     const svc = new ExchangeService({ store, now: () => 1000 });
 
@@ -355,19 +343,40 @@ test("assembleBrief: enriched tiers (decisions/warnings/todos/pane-recent/eventF
     const promptEvent = events.find(e => e.event_type === "needs_input_detected")!;
     assert.ok(promptEvent, "the needs_input_detected event was recorded");
 
-    // Desired/expected behavior — CURRENTLY FALSE (the bug):
+    // The in-memory snapshot keeps the RAW instruction — delivery must never be silently altered.
+    assert.ok(svc.get(snap.exchangeId)!.distilledInstruction.includes(SECRET), "in-memory (delivery-side) instruction stays raw");
+    // The durable rows are clean at rest.
     assert.ok(
       !row.distilled_instruction.includes(SECRET),
-      "BUG: agent_exchanges.distilled_instruction stores the raw secret verbatim at rest " +
-      "(src/voice/index.ts:1134 passes the operator's raw instruction straight through, never redacted)",
+      "agent_exchanges.distilled_instruction is redacted at the persistCreate write boundary",
     );
+    assert.ok(!row.operator_utterance.includes(SECRET), "agent_exchanges.operator_utterance is redacted at rest too");
     assert.ok(
       !promptEvent.payload_redacted_json.includes(SECRET),
-      "BUG: exchange_events.payload_redacted_json stores the raw secret verbatim at rest " +
-      "(src/exchanges/service.ts persistTransition JSON.stringify(opts.payload) with no redaction pass)",
+      "exchange_events.payload_redacted_json is redacted at the persistTransition write boundary",
     );
+    // The redacted payload stays parseable JSON (redaction touches values, not structure).
+    const parsed = JSON.parse(promptEvent.payload_redacted_json);
+    assert.ok(String(parsed.detail).includes("[REDACTED"), "the redaction marker lands inside the payload's detail value");
   });
 }
+
+// ── Phase 2 Step 2.5 (fix of the Step 2.4 pinned cross-project breadcrumb leak) ─────────────────
+test("getTiers scopes breadcrumbs to the ACTIVE project; unstamped crumbs stay visible", () => {
+  const store = seedStore();
+  const breadcrumbs = new BreadcrumbRing({ breadcrumbMax: 12, breadcrumbMaxAgeMs: 1e9 });
+  breadcrumbs.add({ ts: 100, paneId: "z9", projectId: "other-proj", text: "pane z9 wrapping up: background work" });
+  breadcrumbs.add({ ts: 200, paneId: "p1", projectId: "proj", text: "pane p1 finished: npm test" });
+  breadcrumbs.add({ ts: 300, paneId: null, text: "system note" });
+  const model = new WorldModel({
+    manager: fakeManager({ activeId: "p1", activeProjectId: "proj", terminals: TERMINALS, panes: PANES }) as any,
+    store, redact, breadcrumbs,
+  });
+  const texts = model.getTiers("p1", 1000).breadcrumbs.map(b => b.text);
+  assert.ok(texts.includes("pane p1 finished: npm test"), "the active project's own crumb renders");
+  assert.ok(texts.includes("system note"), "an unstamped (system/global) crumb stays visible");
+  assert.ok(!texts.some(t => t.includes("z9")), "another project's crumb NEVER enters this project's tiers snapshot");
+});
 
 // ── tests/test_memory_worldmodel.ts stays green — this suite is additive, not a replacement ─────
 test("sanity: a store with none of the new data sources still yields empty (never throwing) enriched fields", () => {

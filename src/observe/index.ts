@@ -32,6 +32,7 @@ import { classifyPaneOutput } from "../paneSignals";
 import { dispatchJoinTracker } from "../dispatch/joinTracker";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import type { PaneSignalKind } from "../exchanges/service";
+import { findPaneOwningProject } from "../paneOwnership";
 import type { PaneSignalBus } from "../paneSignalBus";
 import type { AnnouncementBus } from "../announcementBus";
 import type { InteractionLogger } from "../interactionLog";
@@ -178,7 +179,9 @@ export interface ObserveDeps {
   historyManager: ObserveHistoryManager;
   ai: GoogleGenAI;
   // P0a memory: optional sink for decaying cross-pane breadcrumbs (redacted one-liners).
-  onBreadcrumb?: (b: { ts: number; paneId: string | null; text: string }) => void;
+  // `projectId` (Phase 2 Step 2.4/2.5 fix): the pane's OWNING project at drop time, so the
+  // render path can scope crumbs per project (src/memory/breadcrumbs.ts). null = no affinity.
+  onBreadcrumb?: (b: { ts: number; paneId: string | null; text: string; projectId?: string | null }) => void;
 }
 
 /** The handlers wired onto the manager. */
@@ -227,6 +230,20 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
     ai,
     onBreadcrumb,
   } = deps;
+
+  // Phase 2 Step 2.4/2.5 fix (cross-project breadcrumb leak): every breadcrumb is stamped with
+  // the pane's OWNING project so the render path (src/memory/breadcrumbs.ts recent(now, project))
+  // can scope crumbs per project. Null when unresolvable — such a crumb stays globally visible
+  // (fail-open to the pre-scoping behavior for panes with no project affinity). try/catch: a
+  // structural test double may omit `manager.ledger` entirely — a lookup fault must never break
+  // the observation edge it rides on (QW5 philosophy).
+  const breadcrumbProjectFor = (terminalId: string): string | null => {
+    try {
+      return findPaneOwningProject(manager, terminalId)?.projectId ?? null;
+    } catch {
+      return null;
+    }
+  };
 
   // ── Private observation state (was server-local; moves here as locals scoped to this server) ──
   const lastStates: Record<string, string> = {};
@@ -342,7 +359,11 @@ ${redact(rawOutput.slice(-3000))}`;
         return summary;
       }
       if (lastEntry.finalResponse) return lastEntry.finalResponse; // already WS-B redacted
-      if (lastEntry.command) return `${lastEntry.command} finished`;
+      // Phase 2 Step 2.5 review fix: this fallback was the ONE unredacted branch of the idle
+      // summary — the raw command (which can carry a pasted secret) flowed into the 'idle'
+      // pane-signal detail (model-bound via formatPaneSignal), the completion announcement, AND
+      // the exchange settle's result_summary. Redact it like every sibling branch.
+      if (lastEntry.command) return `${redact(lastEntry.command)} finished`;
     } catch (err) {
       console.error("Auto-summarization failed for command outcomes:", err);
     }
@@ -377,7 +398,7 @@ ${redact(rawOutput.slice(-3000))}`;
     // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
     if (onBreadcrumb) {
       const lc = redact(summaryText).slice(0, 80);
-      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, projectId: breadcrumbProjectFor(terminalId), text: `pane ${terminalId} finished${lc ? `: ${lc}` : ""}` });
     }
   };
 
@@ -416,7 +437,7 @@ ${redact(rawOutput.slice(-3000))}`;
     // P0a memory: drop a redacted one-liner breadcrumb on the Running edge (cross-pane working memory).
     if (onBreadcrumb) {
       const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
-      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} started${lc ? `: ${lc}` : ""}` });
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, projectId: breadcrumbProjectFor(terminalId), text: `pane ${terminalId} started${lc ? `: ${lc}` : ""}` });
     }
   };
 
@@ -438,7 +459,7 @@ ${redact(rawOutput.slice(-3000))}`;
     // P0a memory: drop a redacted one-liner breadcrumb on the pre-idle "wrapping up" edge.
     if (onBreadcrumb) {
       const lc = term?.lastCommand ? redact(term.lastCommand).slice(0, 80) : "";
-      onBreadcrumb({ ts: Date.now(), paneId: terminalId, text: `pane ${terminalId} wrapping up${lc ? `: ${lc}` : ""}` });
+      onBreadcrumb({ ts: Date.now(), paneId: terminalId, projectId: breadcrumbProjectFor(terminalId), text: `pane ${terminalId} wrapping up${lc ? `: ${lc}` : ""}` });
     }
   };
 

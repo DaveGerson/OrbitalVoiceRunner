@@ -708,41 +708,31 @@ describe("cross-project journey — A -> B -> A isolation (Phase 2 Step 2.4)", (
     assert.ok(!aTexts.some(t => t.includes(BETA_MARKER)), "A's brief never mentions B's marker");
 
     // ── Visit B ──────────────────────────────────────────────────────────────────────────────
-    // BUG (Phase 2 Step 2.4 finding, filed here rather than fixed — test-only scope): switch_context
-    // alone does NOT move coreState.activePaneId (only switch_active_pane does — see
-    // src/actions/defs/orient.ts's switchContext handler, which never calls ctx.setActivePane).
-    // Its own injectMemoryBrief("project_switch") call therefore renders WorldModel.getPaneTier
-    // against whatever pane was ALREADY active (still A's pane, from the PRIOR project) while
-    // manager.ledger.activeProjectId already reads the NEW project (B) — WorldModel.getPaneTier has
-    // no project-affinity check (src/memory/worldModel.ts: it looks up `manager.terminals[paneId]`
-    // by id alone). The result is a genuinely MIXED brief — PROJECT tier = B, ACTIVE PANE tier =
-    // A's stale pane/lastCommand — delivered and stamped into a context_deliveries row whose
-    // project_id is ALREADY B (recordDelivery reads manager.ledger.activeProjectId fresh, post-await).
-    // This is exactly the "wrong pane/project stamped on a delivery row" class Journey 4 targets,
-    // just reached via a different route (no cortex race needed — switch_context's OWN synchronous
-    // pane/project decoupling is enough). Documented here as a genuine finding; the following few
-    // lines pin the CURRENT (buggy) behavior so a future fix is visible as a real test flip, not a
-    // silent behavior change. See the session report for the full write-up.
+    // Phase 2 Step 2.5 fix of the Step 2.4 pinned bug: switch_context alone does NOT move
+    // coreState.activePaneId (only switch_active_pane does), so its own project_switch injection
+    // used to render the PRIOR project's still-focused pane into a genuinely MIXED brief (PROJECT
+    // tier = B, ACTIVE PANE tier = A's stale pane/lastCommand) stamped under B's delivery row.
+    // src/voice/index.ts's resolveBriefPane now drops a cross-project stale pane from the
+    // project_switch brief entirely — the pane tier arrives on the operator's next
+    // switch_active_pane (the settled state every real call site pairs a switch_context with).
     const beforeBSwitchContextIdx = session.clientContents.length;
     before = rowsSince(running, bootTs).length;
     callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_B });
     await waitFor(() => mock.responseFor(callId));
     await waitFor(() => rowsSince(running, bootTs).length > before);
     const switchContextOnlyTexts = contextTextsSince(session, beforeBSwitchContextIdx);
-    const switchContextRow = rowsSince(running, bootTs)[0];
-    if (switchContextOnlyTexts.some(t => t.includes(ALPHA_MARKER))) {
-      assert.strictEqual(
-        switchContextRow.active_project_id, PROJECT_B,
-        "BUG (documented, not fixed): switch_context's OWN injection can carry the PRIOR project's " +
-        "still-active pane content (containing A's marker) while stamping the delivery row under the " +
-        "NEW project (B) — a genuine cross-project mis-stamp reachable without any cortex race.",
+    for (const t of switchContextOnlyTexts) {
+      assert.ok(
+        !t.includes(ALPHA_MARKER),
+        "switch_context's OWN injection carries NOTHING of the prior project's pane — the stale " +
+        "cross-project pane tier is dropped from the project_switch brief (resolveBriefPane fix)",
       );
     }
 
     // The operator's very next real action (an explicit switch_active_pane) is what actually
-    // settles focus onto B's own pane — THIS is the state a "no leak" isolation guarantee can
-    // honestly be asserted against, and it is exactly what every existing switch_context call site
-    // in this codebase is always paired with (see tests/test_context_smoke_journeys.ts).
+    // settles focus onto B's own pane — the full (pane-bearing) brief lands there, and it is
+    // exactly what every existing switch_context call site in this codebase is always paired with
+    // (see tests/test_context_smoke_journeys.ts).
     const beforeBPaneIdx = session.clientContents.length;
     before = rowsSince(running, bootTs).length;
     callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xb-pane" });
@@ -765,14 +755,17 @@ describe("cross-project journey — A -> B -> A isolation (Phase 2 Step 2.4)", (
     store.addNote(PROJECT_A, `${ALPHA_NOTE_MARKER}: internal-only decision`, { type: "decision" });
 
     // ── Return to A ──────────────────────────────────────────────────────────────────────────
-    // Same documented switch_context/switch_active_pane decoupling as the "Visit B" step above:
-    // the switch_context(A) call alone can still render B's stale pane content (coreState.activePaneId
-    // has not moved yet). We again isolate the SETTLED state (post switch_active_pane) for the real
-    // "no leak" assertion — see the BUG comment above for the full mechanism.
+    // Same switch_context/switch_active_pane decoupling as the "Visit B" step above — and the same
+    // Step 2.5 guarantee: the switch_context(A) brief drops B's still-focused stale pane, so
+    // nothing of B rides along even on the switch injection itself.
+    const beforeReturnSwitchIdx = session.clientContents.length;
     before = rowsSince(running, bootTs).length;
     callId = live1(running).emitToolCall("switch_context", { project_id: PROJECT_A });
     await waitFor(() => mock.responseFor(callId));
     await waitFor(() => rowsSince(running, bootTs).length > before);
+    for (const t of contextTextsSince(session, beforeReturnSwitchIdx)) {
+      assert.ok(!t.includes(BETA_MARKER), "the return switch_context(A) brief carries nothing of B's stale pane either");
+    }
     const beforeReturnPaneIdx = session.clientContents.length;
     before = rowsSince(running, bootTs).length;
     callId = live1(running).emitToolCall("switch_active_pane", { pane_id: "xa-pane" });
@@ -873,6 +866,14 @@ describe("cross-project journey — background command-outcome dropped while ano
 
   it("a real command completing in a backgrounded project is dropped from B's live brief; A picks it up organically on its own next promotion", async () => {
     seedPane("bg-b-pane", PROJECT_B);
+    // Step 2.5 review fix to this journey's own setup: project A must EXIST before switch_context(A)
+    // below — ledger.switchContext is a documented no-op on an unknown id (src/store/sqliteStore.ts
+    // "Only switches if it exists"), so without this line activeProjectId never actually became A,
+    // the pool never tracked A as foreground, A was never demoted to "handle" on the switch to B,
+    // and the background 'idle' signal was NOT dropped (stateFor(A) === "cold" keeps pre-pool
+    // inject behavior BY DESIGN — see backgroundProjectForSignal's doc). The journey's stated
+    // premise ("A becomes the pool-tracked foreground project") silently didn't hold.
+    running.manager.ledger.addProject(PROJECT_A, tmpDir, `Project ${PROJECT_A}`, []);
 
     // A becomes the pool-tracked foreground project (an explicit switch_context — the ONLY trigger
     // that registers pool foreground/backgrounded state; see backgroundProjectForSignal's doc).
@@ -929,31 +930,33 @@ describe("cross-project journey — background command-outcome dropped while ano
     // ── ROUTING correctness (the D6 mechanism itself): no context_injections row was recorded for
     // the backgrounded project A during this window — the idle signal was dropped at the routing
     // choke point (src/voice/index.ts's backgroundProjectForSignal), not queued/injected/misrouted.
-    // This part of the guarantee DOES hold.
     const rowsNow = rowsSince(running, bootTs);
     const rowsDuring = rowsNow.slice(0, rowsNow.length - rowsBeforeCommand);
     assert.ok(!rowsDuring.some(r => r.active_project_id === PROJECT_A), "no context_injections row was recorded for the backgrounded project A during this window");
-
-    // ── BUG (Phase 2 Step 2.4 finding): the journey's OWN stated goal is "the event reaches A's
-    // session state... NOT B's brief". The routing choke point above genuinely honors that for the
-    // INJECT-class signal itself, but there is a SEPARATE, always-on leak surface the session pool
-    // never touches: `BreadcrumbRing` (src/memory/breadcrumbs.ts) is entirely GLOBAL — `recent(now)`
-    // takes no project/pane scoping at all — and src/observe/index.ts's onQuiescing/onRunning
-    // handlers call `onBreadcrumb(...)` UNCONDITIONALLY for every pane transition, regardless of
-    // which project owns the pane or whether that project is foreground/backgrounded. A's
-    // "wrapping up" breadcrumb for bg-a-pane is therefore visible to ANY subsequent brief assembled
-    // for ANY project — including B's, entirely bypassing backgroundProjectForSignal's routing.
-    // This is a genuine cross-project content leak, just via a different path than the inject-class
-    // signal the routing choke point protects. Not fixed here per this task's test-only scope.
+    // Step 2.5 (strengthened, now that the setup genuinely tracks A — see the addProject note
+    // above): the backgrounded command-outcome signal produced NO injection row AT ALL, under any
+    // project — dropped at the routing choke point, not injected-under-B (the pre-fix journey run
+    // showed a command_outcome row stamped under B here).
+    assert.ok(!rowsDuring.some(r => r.trigger === "command_outcome"), "the backgrounded 'idle' signal minted NO command_outcome injection row at all — dropped, not misrouted under the foreground project");
     const newTexts = contextTextsSince(session, contentsBeforeCommand);
-    if (newTexts.some(t => t.includes("bg-a-pane"))) {
-      assert.fail(
-        "BUG: a NEW context brief delivered for project B, while A was backgrounded, still mentions " +
-        "A's pane ('bg-a-pane wrapping up...') via the GLOBAL BreadcrumbRing (src/memory/breadcrumbs.ts) " +
-        "— breadcrumbs have no project scoping, so this journey's own stated invariant ('the event " +
-        "reaches A's session state... NOT B's brief') is violated on this path, independent of the " +
-        "(correctly-working) session-pool inject routing checked above.",
-      );
+    assert.strictEqual(newTexts.length, 0, "no NEW context brief of any kind was delivered during the backgrounded-command window");
+
+    // ── Breadcrumb project scoping (Phase 2 Step 2.5 fix of the Step 2.4 pinned bug): breadcrumbs
+    // are now stamped with the pane's owning project (src/observe/index.ts) and filtered per
+    // project at render time (src/memory/breadcrumbs.ts recent(now, projectId)). Drive a REAL new
+    // brief for B while A's fresh "started/wrapping up/finished" crumbs for bg-a-pane exist and
+    // prove none of them leak into B's brief. (The BOARD tier still lists every pane NAME across
+    // projects by long-standing design — the crumb text's distinctive "pane bg-a-pane" prefix is
+    // what must never appear.)
+    const beforeBOutcomeIdx = session.clientContents.length;
+    before = rowsSince(running, bootTs).length;
+    const deliveredProbe = running._testPublishPaneSignal!({ paneId: "bg-b-pane", kind: "idle", detail: "b pane settled (crumb-scope probe)" });
+    assert.strictEqual(deliveredProbe, true, "the bus delivered the foreground-project probe signal");
+    await waitFor(() => rowsSince(running, bootTs).length > before);
+    const bProbeTexts = contextTextsSince(session, beforeBOutcomeIdx);
+    assert.ok(bProbeTexts.length >= 1, "the foreground project's own command-outcome still injects");
+    for (const t of bProbeTexts) {
+      assert.ok(!t.includes("pane bg-a-pane"), "B's fresh brief carries NONE of A's pane breadcrumbs ('pane bg-a-pane started/wrapping up/finished') — crumbs are project-scoped now");
     }
 
     // A picks the fact up organically on its own next promotion — nothing was silently lost, only
@@ -1436,44 +1439,35 @@ describe("cross-project journey — planted-secret redaction on every delivery p
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// BUG (Phase 2 Step 2.4, journey 10 finding): redactSecrets (src/terminal.ts, the ONLY secret
-// scrubber in this codebase — every voice/exchange/history redaction call site imports THIS
-// function) has NO pattern for bare Anthropic/OpenAI-style "sk-..." bearer tokens — exactly the
-// example the task's own journey spec names ("sk-ant-SECRET123"). Its patterns cover: PEM private
-// keys, JWTs, AWS AKIA access-key-ids, AWS secret-key assignments, Google AIza keys, GitHub
-// gh[posr]_ tokens, Slack xox[baprs]- tokens, and a GENERIC "label = value" catch-all that only
-// fires when the value is immediately preceded by a recognized label word (api_key/secret/token/
-// password/passwd/bearer/access_key). A bare "sk-ant-SECRET123" typed into a command, spoken, or
-// echoed back with NO such label — a completely realistic shape for a pasted Anthropic API key,
-// and the single most common "LLM provider API key" shape a user of THIS product would plant —
-// sails through untouched, all the way to a live Gemini Live payload.
-// This is a REAL production gap (src/terminal.ts's redactSecrets, ~line 260), not a test-only
-// artifact — the journey above was intentionally rewritten to use an AWS-key-shaped secret (a
-// covered pattern) once this was discovered, so its own assertions stay a meaningful regression
-// guard for the paths that DO work; this test isolates and pins the gap itself. Not fixed here
-// per this task's test-only scope. See the session report for the full write-up.
+// Phase 2 Step 2.5 fix of the Step 2.4 pinned gap: redactSecrets/classifySecrets (src/terminal.ts,
+// the ONLY secret scrubber in this codebase) now cover bare Anthropic/OpenAI-style "sk-..." keys
+// with two deliberately BOUNDED shapes — a known vendor prefix (sk-ant-…/sk-proj-… with a >= 8
+// char tail) and a generic long token (>= 20 chars after "sk-", the legacy OpenAI shape) — so a
+// pasted bare key with NO surrounding "api_key=" label is scrubbed before any model-bound sink and
+// hard-blocked by the prompt-delivery guard, while ordinary prose ("sk-learn") stays untouched.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-describe("BUG: redactSecrets has no coverage for bare Anthropic/OpenAI-style 'sk-...' API keys", () => {
-  it("a bare sk-ant-... token (no surrounding label) survives redactSecrets untouched — the task's own example secret shape", () => {
+describe("redactSecrets/classifySecrets cover bare Anthropic/OpenAI-style 'sk-...' API keys (Step 2.5 fix)", () => {
+  it("a bare sk-ant-... token (no surrounding label) is redacted — the task's own example secret shape", () => {
     const withSecret = "please rotate the key to sk-ant-SECRET123 before you continue";
     const redacted = redactSecrets(withSecret);
-    // Desired/expected behavior — CURRENTLY FALSE (the bug):
-    assert.notStrictEqual(
-      redacted, withSecret,
-      "BUG: redactSecrets(text) is a complete no-op on a bare 'sk-ant-...' token — no pattern in " +
-      "src/terminal.ts's HIGH/LOW confidence lists (nor the generic label=value catch-all, since " +
-      "there is no 'api_key='/'token:' label immediately preceding it) matches this shape at all.",
-    );
+    assert.ok(!redacted.includes("sk-ant-SECRET123"), "the bare key never survives redactSecrets");
+    assert.ok(redacted.includes("[REDACTED:api-key]"), "the api-key redaction marker takes its place");
+    // sk-proj-… (the OpenAI project-key prefix) and the generic long legacy shape are covered too.
+    assert.ok(!redactSecrets("use sk-proj-AbCdEf123456 now").includes("sk-proj-AbCdEf123456"));
+    assert.ok(!redactSecrets("legacy sk-AbCdEfGhIjKlMnOpQrStUv123 key").includes("sk-AbCdEfGhIjKlMnOpQrStUv123"));
   });
 
-  it("classifySecrets also scores a bare sk-... token as 'none' — not even flagged low-confidence for a delivery-path warning", () => {
+  it("the patterns stay BOUNDED — short/prose sk- shapes are never mangled", () => {
+    for (const benign of ["pip install sk-learn", "task sk-1 is done", "sk-ant-x", "the sk- prefix itself"]) {
+      assert.strictEqual(redactSecrets(benign), benign, `benign text must pass untouched: ${benign}`);
+    }
+  });
+
+  it("classifySecrets flags a bare sk-... token HIGH-confidence so the prompt-delivery guard can block it", () => {
     const scan = classifySecrets("export ANTHROPIC_API_KEY_LITERAL sk-ant-SECRET123");
-    assert.notStrictEqual(
-      scan.confidence, "none",
-      "BUG: classifySecrets never even flags a bare 'sk-ant-...' token as low-confidence — the " +
-      "prompt-delivery guard (director posture 2026-06-01, src/terminal.ts's classifySecrets doc) " +
-      "has zero visibility into this secret shape either.",
-    );
+    assert.strictEqual(scan.confidence, "high", "a bare vendor-prefixed key is as format-distinctive as ghp_/AKIA — high confidence");
+    assert.ok(scan.labels.includes("api-key"));
+    assert.strictEqual(classifySecrets("pip install sk-learn").confidence, "none", "benign prose stays unflagged");
   });
 });
 

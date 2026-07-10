@@ -301,7 +301,21 @@ export function redactSecrets(text: string): string {
     "[REDACTED:slack-token]"
   );
 
-  // 8. Generic env/secret assignments — redact VALUE only, keep key name
+  // 8. Bare Anthropic/OpenAI-style secret keys (Phase 2 Step 2.4 gap fix). Two deliberately
+  //    BOUNDED shapes so ordinary prose ("sk-learn", "sk-1") is never mangled:
+  //    (a) a known vendor prefix (sk-ant-…, sk-proj-…) with a real tail (>= 8 token chars);
+  //    (b) a generic long sk- token (>= 20 token chars after the prefix — legacy OpenAI keys
+  //        are sk-+48). No surrounding label required: a pasted bare key must still be caught.
+  text = text.replace(
+    /\bsk-(?:ant|proj)-[A-Za-z0-9_-]{8,}\b/g,
+    "[REDACTED:api-key]"
+  );
+  text = text.replace(
+    /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+    "[REDACTED:api-key]"
+  );
+
+  // 9. Generic env/secret assignments — redact VALUE only, keep key name
   //    Matches: api_key=secret, TOKEN: "abc123", password=\'hunter2\'
   text = text.replace(
     /\b(api[_-]?key|secret|token|password|passwd|bearer|access[_-]?key)\b(\s*[=:]\s*)["\']?([^\s"\']{6,})["\']?/gi,
@@ -338,6 +352,12 @@ const HIGH_CONFIDENCE_SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAIza[0-9A-Za-z_-]{35}\b/, "google-api-key"],
   [/\bgh[posr]_[A-Za-z0-9]{36,}\b/, "github-token"],
   [/\bxox[baprs]-[A-Za-z0-9-]+/, "slack-token"],
+  // Phase 2 Step 2.4 gap fix: bare Anthropic/OpenAI-style keys are as format-distinctive as
+  // ghp_/AKIA — near-certain leaks, so the delivery path hard-blocks them too. Same bounds as
+  // redactSecrets rule 8 (vendor-prefixed >= 8 tail chars; generic >= 20) so classify/redact
+  // can never disagree about whether a given token is a secret.
+  [/\bsk-(?:ant|proj)-[A-Za-z0-9_-]{8,}\b/, "api-key"],
+  [/\bsk-[A-Za-z0-9_-]{20,}\b/, "api-key"],
 ];
 const LOW_CONFIDENCE_SECRET_PATTERN =
   /\b(api[_-]?key|secret|token|password|passwd|bearer|access[_-]?key)\b\s*[=:]\s*["']?([^\s"']{6,})["']?/i;

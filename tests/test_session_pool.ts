@@ -23,6 +23,7 @@ import { InjectGateRegistry } from "../src/memory/injectGate";
 import { ContextVersionRegistry } from "../src/memory/contextVersions";
 import {
   LEGACY_RESUME_HANDLE_KV_KEY,
+  readHandleOwner,
   resumptionHandleKvKeyFor,
   wrapHandleForPersist,
   shouldClearHandleOnClose,
@@ -237,6 +238,37 @@ describe("SessionPool — per-project handle KV persistence + legacy migration (
     const pool = makePool();
     assert.doesNotThrow(() => pool.migrateLegacyHandle(null));
     assert.doesNotThrow(() => pool.migrateLegacyHandle("proj_a"));
+  });
+
+  // Phase 2 Step 2.5 review fix: the legacy slot is rewritten on every rotation by the live
+  // single-socket path, now OWNER-STAMPED (src/voice/index.ts persistResumptionToken). A stamped
+  // handle resumes ONE project's server-side conversation — migrating it into a DIFFERENT
+  // project's slot would hand that project the wrong conversation (cross-project handle mis-file,
+  // and a wrong planSwitch "resume" flow today).
+  it("migrateLegacyHandle refuses to mis-file an owner-stamped handle into a DIFFERENT project's slot", () => {
+    const store = makeKv();
+    store.setKV(LEGACY_RESUME_HANDLE_KV_KEY, wrapHandleForPersist({ newHandle: "convo-of-a" }, 1000, "proj_a"));
+    const pool = makePool({ store, now: () => 1000 });
+    pool.migrateLegacyHandle("proj_b"); // a later connection whose foreground is B
+    assert.strictEqual(pool.readHandle("proj_b", 1500), null, "B never receives A's conversation handle");
+    assert.ok(store.getKV(LEGACY_RESUME_HANDLE_KV_KEY), "the legacy slot is left intact (not consumed by the refused migration)");
+    assert.strictEqual(pool.planSwitch("proj_b", 1500).flow, "fresh", "B's switch plan stays 'fresh', never 'resume' on A's conversation");
+  });
+
+  it("migrateLegacyHandle still migrates an owner-stamped handle into ITS OWN project's slot", () => {
+    const store = makeKv();
+    store.setKV(LEGACY_RESUME_HANDLE_KV_KEY, wrapHandleForPersist({ newHandle: "convo-of-a" }, 1000, "proj_a"));
+    const pool = makePool({ store, now: () => 1000 });
+    pool.migrateLegacyHandle("proj_a");
+    assert.deepStrictEqual(pool.readHandle("proj_a", 1500)?.token, { newHandle: "convo-of-a" });
+    assert.strictEqual(store.getKV(LEGACY_RESUME_HANDLE_KV_KEY), null, "consumed once migrated to the rightful owner");
+  });
+
+  it("persistHandle stamps its own project as the owner (readHandleOwner round-trip)", () => {
+    const store = makeKv();
+    const pool = makePool({ store });
+    pool.persistHandle("proj_a", { newHandle: "h-a" }, 1000);
+    assert.strictEqual(readHandleOwner(store.getKV(resumptionHandleKvKeyFor("proj_a"))), "proj_a");
   });
 });
 

@@ -114,6 +114,11 @@ export function assembleBrief(tiers: MemoryTiers, cfg: MemoryConfig, _now: numbe
     if (!render || seen.has(key)) return; // unknown/duplicate key — ignored
     seen.add(key);
     const capChars = caps[key] ?? Math.floor(B * (weights[key] ?? 0));
+    // Phase 2 Step 2.5 review fix: a tier with NO budget (weight/cap absent or 0 — e.g. a caller
+    // whose weights literal predates the eventFocus tier) is ABSENT, exactly as its type doc
+    // promises ("Missing ⇒ tier renders empty/absent") — cap(s, 0) used to render a lone "…"
+    // (a garbage 1-char block that still claimed a perTierChars entry).
+    if (capChars <= 0) return;
     const body = render(tiers, capChars);
     if (body === null) return;
     perTierChars[key] = body.length;

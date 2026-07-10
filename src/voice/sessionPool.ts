@@ -25,6 +25,7 @@ import {
   DEFAULT_RESUME_HANDLE_TTL_MS,
   LEGACY_RESUME_HANDLE_KV_KEY,
   readFreshHandle,
+  readHandleOwner,
   resumptionHandleKvKeyFor,
   wrapHandleForPersist,
 } from "../voiceResumption";
@@ -159,6 +160,13 @@ export class SessionPool {
     try {
       const raw = this.deps.store.getKV(LEGACY_RESUME_HANDLE_KV_KEY);
       if (!raw) return;
+      // Phase 2 Step 2.5 review fix: the legacy slot is rewritten on every rotation by the live
+      // single-socket path (an OWNER-STAMPED write since this fix). A stamped handle belongs to
+      // ONE project's server-side conversation — migrating it into a DIFFERENT project's slot
+      // would hand that project the wrong conversation to resume (cross-project handle mis-file).
+      // An unstamped (genuinely pre-pool) handle keeps the original best-guess migration.
+      const owner = readHandleOwner(raw);
+      if (owner && owner !== targetProjectId) return;
       const targetKey = resumptionHandleKvKeyFor(targetProjectId);
       if (this.deps.store.getKV(targetKey)) return; // target already has its own — never clobber.
       this.deps.store.setKV(targetKey, raw);
@@ -175,7 +183,7 @@ export class SessionPool {
     try {
       const key = resumptionHandleKvKeyFor(projectId);
       if (token == null) this.deps.store.deleteKV(key);
-      else this.deps.store.setKV(key, wrapHandleForPersist(token, now));
+      else this.deps.store.setKV(key, wrapHandleForPersist(token, now, projectId));
     } catch (e) {
       console.error("[session-pool] persistHandle failed:", e);
     }

@@ -49,6 +49,7 @@ import {
 } from "./lifecycle";
 import type { ExchangeEventType } from "./types";
 import type { JanusStore } from "../store/sqliteStore";
+import { redactSecrets } from "../terminal";
 
 export type PaneSignalKind = "running" | "quiescing" | "idle" | "prompt" | "error" | "exited";
 
@@ -106,10 +107,23 @@ export class ExchangeService {
    *  call below starts with `if (!this.store) return`. Production wiring: src/exchanges/spine.ts
    *  attaches the real `JanusStore` singleton at boot, once the flag is active. */
   private store?: JanusStore;
+  /** Phase 2 Step 2.4/2.5 fix (secrets at rest): the redaction pass applied to every FREE-TEXT
+   *  field the durable mirror persists (distilled_instruction, operator_utterance,
+   *  result_summary, event payload JSON). The in-memory machine keeps the RAW text — delivery to
+   *  the pane must never be silently altered (spec §13 nuance: deliver raw, persist redacted);
+   *  only the at-rest copies are scrubbed. Injectable for tests; defaults to the ONE production
+   *  scrubber (src/terminal.ts redactSecrets). */
+  private readonly redact: (s: string) => string;
 
-  constructor(opts?: { now?: () => number; store?: JanusStore }) {
+  constructor(opts?: { now?: () => number; store?: JanusStore; redact?: (s: string) => string }) {
     this.machine = new ExchangeMachine(opts);
     this.store = opts?.store;
+    this.redact = opts?.redact ?? redactSecrets;
+  }
+
+  /** Redact a nullable free-text column for persistence (null/undefined pass through). */
+  private redactText<T extends string | null | undefined>(s: T): T {
+    return (s == null ? s : this.redact(s)) as T;
   }
 
   /** Attach (or replace/detach with `undefined`) the durable store sink after construction — the
@@ -379,6 +393,11 @@ export class ExchangeService {
         cas.approvalId = before.approvalId;
         cas.approvalDraftVersion = before.approvalDraftVersion;
       }
+      // Phase 2 Step 2.4/2.5 fix (secrets at rest): every free-text column is redacted at THIS
+      // write boundary — the column name `payload_redacted_json` finally tells the truth. The
+      // in-memory snapshot keeps the raw text (delivery must not be silently altered); only the
+      // durable copies are scrubbed. redactSecrets never touches JSON structure (values only),
+      // so the payload stays parseable.
       this.store.updateExchange(after.exchangeId, {
         state: after.state,
         draft_version: after.draftVersion,
@@ -387,9 +406,9 @@ export class ExchangeService {
         delivery_attempt: after.deliveryAttempt,
         delivered_at: after.deliveredAt,
         completed_at: after.completedAt,
-        result_summary: after.resultSummary,
+        result_summary: this.redactText(after.resultSummary),
         terminal_state: after.terminalState,
-        distilled_instruction: after.distilledInstruction,
+        distilled_instruction: this.redactText(after.distilledInstruction),
         updated_at: after.updatedAt,
       }, cas);
       if (eventType) {
@@ -398,7 +417,7 @@ export class ExchangeService {
           event_type: eventType,
           pane_id: after.paneId,
           project_id: after.projectId,
-          payload_redacted_json: JSON.stringify(opts?.payload ?? {}),
+          payload_redacted_json: this.redact(JSON.stringify(opts?.payload ?? {})),
           ts: after.updatedAt,
         });
       }
@@ -420,12 +439,15 @@ export class ExchangeService {
   ): void {
     if (!this.store) return;
     try {
+      // Phase 2 Step 2.4/2.5 fix (secrets at rest): the operator's utterance and the distilled
+      // instruction are persisted REDACTED (the raw instruction still reaches the pane through
+      // the dispatch path untouched — deliver raw, persist redacted).
       this.store.insertExchange({
         exchange_id: snap.exchangeId,
         project_id: snap.projectId,
         pane_id: snap.paneId,
-        operator_utterance: snap.operatorUtterance,
-        distilled_instruction: snap.distilledInstruction,
+        operator_utterance: this.redactText(snap.operatorUtterance),
+        distilled_instruction: this.redactText(snap.distilledInstruction),
         voice_session_id: extra?.voiceSessionId ?? null,
         interaction_id: extra?.interactionId ?? null,
         context_version: extra?.contextVersion ?? null,

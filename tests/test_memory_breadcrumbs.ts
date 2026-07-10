@@ -62,6 +62,39 @@ test("per-pane fairness: null paneId (system) is its own bucket", () => {
   assert.ok(texts.includes("system-latest"), "null-pane (system) breadcrumb gets its guaranteed slot");
 });
 
+// ── Phase 2 Step 2.5 (fix of the Step 2.4 pinned cross-project leak): project scoping ──────────
+test("recent(now, projectId) scopes crumbs to the brief's project; unstamped crumbs always pass", () => {
+  const ring = new BreadcrumbRing({ breadcrumbMax: 12, breadcrumbMaxAgeMs: 10_000 });
+  ring.add({ ts: 100, paneId: "a1", projectId: "projA", text: "a-crumb" });
+  ring.add({ ts: 200, paneId: "b1", projectId: "projB", text: "b-crumb" });
+  ring.add({ ts: 300, paneId: null, text: "system-crumb" }); // no stamp — global
+  ring.add({ ts: 400, paneId: "x1", projectId: null, text: "unresolved-crumb" }); // explicit null — global
+
+  const forB = ring.recent(2000, "projB").map(b => b.text);
+  assert.ok(forB.includes("b-crumb"), "the project's own crumb renders");
+  assert.ok(!forB.includes("a-crumb"), "another project's crumb NEVER leaks into this project's view");
+  assert.ok(forB.includes("system-crumb") && forB.includes("unresolved-crumb"), "unstamped/null-stamped crumbs stay globally visible (pre-scoping floor)");
+
+  // Omitting projectId (every pre-existing call site) keeps the original unscoped behavior.
+  const unscoped = ring.recent(2000).map(b => b.text);
+  assert.deepEqual(unscoped, ["unresolved-crumb", "system-crumb", "b-crumb", "a-crumb"]);
+  // Passing null is the explicit "no active project" floor — also unscoped.
+  assert.deepEqual(ring.recent(2000, null).map(b => b.text), unscoped);
+});
+
+test("project scoping composes with the age window and per-pane fairness", () => {
+  const ring = new BreadcrumbRing({ breadcrumbMax: 2, breadcrumbMaxAgeMs: 1000 });
+  ring.add({ ts: 100, paneId: "b1", projectId: "projB", text: "b-too-old" });
+  ring.add({ ts: 1600, paneId: "a1", projectId: "projA", text: "a-new" });
+  ring.add({ ts: 1700, paneId: "b1", projectId: "projB", text: "b-new1" });
+  ring.add({ ts: 1800, paneId: "b2", projectId: "projB", text: "b-new2" });
+  ring.add({ ts: 1900, paneId: "b2", projectId: "projB", text: "b-new3" });
+  const r = ring.recent(2000, "projB").map(b => b.text);
+  // Filtered to projB, aged, then fairness/cap applied over the SURVIVORS only:
+  // b1 keeps its newest (b-new1) despite b2's flood; a-new never competes for a slot.
+  assert.deepEqual(r, ["b-new3", "b-new1"]);
+});
+
 test("per-pane fairness fallback: more distinct in-window panes than breadcrumbMax", () => {
   // 5 distinct panes, each ONE crumb, but breadcrumbMax=3 — we cannot give every pane a slot.
   // Fallback: keep the most-recent crumb of the breadcrumbMax MOST-RECENTLY-ACTIVE panes.

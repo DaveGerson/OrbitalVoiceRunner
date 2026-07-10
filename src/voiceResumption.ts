@@ -108,9 +108,26 @@ export function shouldClearHandleOnClose(
   return usedHandle && closeCode === GEMINI_SESSION_EXPIRED_CODE;
 }
 
-/** Serialize a resume token for the durable KV, stamping the persist time for the age guard. */
-export function wrapHandleForPersist(token: unknown, now: number): string {
-  return JSON.stringify({ token, persistedAt: now });
+/** Serialize a resume token for the durable KV, stamping the persist time for the age guard.
+ *  `ownerProjectId` (Phase 2 Step 2.5 review fix, optional so every existing caller/row shape is
+ *  unchanged): the project whose CONVERSATION this handle belongs to at persist time. The legacy
+ *  single slot is rewritten on every rotation, so without this stamp a later connection's
+ *  one-way migration (src/voice/sessionPool.ts migrateLegacyHandle) could copy project A's
+ *  conversation handle into project B's per-project slot — a cross-project handle mis-file. */
+export function wrapHandleForPersist(token: unknown, now: number, ownerProjectId?: string | null): string {
+  return JSON.stringify({ token, persistedAt: now, ...(ownerProjectId ? { ownerProjectId } : {}) });
+}
+
+/** Read the owner stamp back from a persisted handle, or null for a legacy/unstamped/garbage
+ *  value (an unstamped handle has UNKNOWN ownership — the caller decides how conservative to be). */
+export function readHandleOwner(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.ownerProjectId === "string" ? parsed.ownerProjectId : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

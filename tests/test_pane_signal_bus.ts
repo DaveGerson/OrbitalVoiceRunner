@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { PaneSignalBus } from "../src/paneSignalBus";
-import { stampDeferred, backgroundProjectForSignal } from "../src/voice/index";
+import { stampDeferred, backgroundProjectForSignal, resolveBriefPane } from "../src/voice/index";
 import type { PaneSignal } from "../src/paneSignals";
 import { SessionPool } from "../src/voice/sessionPool";
 import { InjectGateRegistry } from "../src/memory/injectGate";
@@ -389,5 +389,56 @@ describe("PaneSignalBus inject-class routing to the right project's session (z5c
   it("a fresh pool with no switches at all never classifies anything as background", () => {
     const pool = makePool();
     assert.strictEqual(backgroundProjectForSignal(pool, "proj_a"), null);
+  });
+});
+
+// ── Phase 2 Step 2.5 (fix of the Step 2.4 documented switch_context mixed-brief bug) ───────────
+// resolveBriefPane: on a project_switch whose focused pane still belongs to the PRIOR project,
+// the brief renders with NO active-pane tier (the pane tier arrives on the operator's next
+// switch_active_pane). Every other trigger — and a pane that DOES belong to the new foreground
+// project — is byte-identical to before. Unresolvable pane ownership fails toward isolation.
+describe("resolveBriefPane — project_switch drops a cross-project stale pane from the brief", () => {
+  function makeManager(paneProject: Record<string, string>): any {
+    const terminals: Record<string, any> = {};
+    const workspaces: Record<string, any> = {};
+    for (const [paneId, projectId] of Object.entries(paneProject)) {
+      terminals[paneId] = { projectId };
+      workspaces[projectId] = workspaces[projectId] ?? { id: projectId, panes: {} };
+      workspaces[projectId].panes[paneId] = { pane_id: paneId };
+    }
+    return {
+      terminals,
+      ledger: {
+        workspaces,
+        getProject: (id: string) => workspaces[id] ?? null,
+      },
+    };
+  }
+
+  it("project_switch + pane owned by the PRIOR project -> pane dropped (null)", () => {
+    const manager = makeManager({ "pane-a": "proj_a" });
+    assert.strictEqual(resolveBriefPane(manager, "project_switch", "pane-a", "proj_b"), null);
+  });
+
+  it("project_switch + pane owned by the NEW foreground project -> pane kept", () => {
+    const manager = makeManager({ "pane-b": "proj_b" });
+    assert.strictEqual(resolveBriefPane(manager, "project_switch", "pane-b", "proj_b"), "pane-b");
+  });
+
+  it("project_switch + UNRESOLVABLE pane ownership -> dropped (fail toward isolation)", () => {
+    const manager = makeManager({});
+    assert.strictEqual(resolveBriefPane(manager, "project_switch", "ghost-pane", "proj_b"), null);
+  });
+
+  it("project_switch with no focused pane at all -> stays null (the common fresh-connection case)", () => {
+    const manager = makeManager({});
+    assert.strictEqual(resolveBriefPane(manager, "project_switch", null, "proj_b"), null);
+  });
+
+  it("every NON-project_switch trigger keeps the pane verbatim — no ownership lookup, no behavior change", () => {
+    const manager = makeManager({ "pane-a": "proj_a" });
+    for (const trigger of ["session_start", "reconnect", "pane_switch", "command_outcome", "catch_up"] as const) {
+      assert.strictEqual(resolveBriefPane(manager, trigger as any, "pane-a", "proj_b"), "pane-a", trigger);
+    }
   });
 });

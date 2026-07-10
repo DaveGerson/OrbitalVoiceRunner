@@ -1298,7 +1298,7 @@ function createMemorySubsystem(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
       totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
-      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05, eventFocus: 0.15 },
       breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
       breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
     },

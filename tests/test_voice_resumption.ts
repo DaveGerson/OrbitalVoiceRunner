@@ -28,6 +28,7 @@ import {
   isBlankApiKey,
   LEGACY_RESUME_HANDLE_KV_KEY,
   resumptionHandleKvKeyFor,
+  readHandleOwner,
 } from "../src/voiceResumption";
 
 test("GEMINI_SESSION_EXPIRED_CODE is the WebSocket 1008 'session expired' code", () => {
@@ -177,4 +178,17 @@ test("poison-handle self-heal is independent per project — clearing project A'
   assert.deepStrictEqual(readFreshHandle(rawB, now + 500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h-b" });
   // And re-reading A's (now-cleared) slot never resurrects the poisoned handle.
   assert.deepStrictEqual(readFreshHandle(rawA, now + 500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h-a" }, "the RAW row is unaffected by another project's clear — clearing is the caller's job (delete the row), not this predicate's");
+});
+
+// ── Phase 2 Step 2.5 review fix — owner-stamped handles ─────────────────────────────────────────
+test("wrapHandleForPersist owner stamp round-trips through readHandleOwner; unstamped/garbage reads null", () => {
+  const stamped = wrapHandleForPersist({ newHandle: "h" }, 1000, "proj_a");
+  assert.strictEqual(readHandleOwner(stamped), "proj_a");
+  // The stamp is ADDITIVE — the age-guarded read is unaffected by its presence.
+  assert.deepStrictEqual(readFreshHandle(stamped, 1500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h" });
+  // Unstamped (legacy/pre-pool) rows, explicit-null owners, and garbage all read null owner.
+  assert.strictEqual(readHandleOwner(wrapHandleForPersist({ newHandle: "h" }, 1000)), null);
+  assert.strictEqual(readHandleOwner(wrapHandleForPersist({ newHandle: "h" }, 1000, null)), null);
+  assert.strictEqual(readHandleOwner("not json"), null);
+  assert.strictEqual(readHandleOwner(null), null);
 });

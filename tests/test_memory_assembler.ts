@@ -31,3 +31,19 @@ test("each tier is truncated to its char slice under pressure", () => {
   const a = assembleBrief(big, { ...DEFAULT_MEMORY_CONFIG, totalBudgetChars: 400 }, 1000);
   assert.ok(a.perTierChars.project <= Math.ceil(400 * 0.40) + 1);
 });
+
+// Phase 2 Step 2.5 review fix: a tier with NO budget (weight/cap absent or 0 — e.g. server.ts's
+// weights literal, which predates the eventFocus tier) must be ABSENT, not a lone "…" garbage
+// block (cap(s, 0) used to render exactly that, and it still claimed a perTierChars entry).
+test("a zero/absent-weight tier renders ABSENT, never a lone '…' block", () => {
+  const t = tiers();
+  t.eventFocus = { paneId: "p2", name: "p2", eventText: "Outcome: build finished", exchangeState: null, waitingReason: null };
+  const legacyWeights = { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 }; // no eventFocus key
+  const a = assembleBrief(t, { ...DEFAULT_MEMORY_CONFIG, weights: legacyWeights }, 1000);
+  assert.ok(!("eventFocus" in a.perTierChars), "the zero-budget tier claims no perTierChars entry");
+  assert.ok(!a.text.includes("EVENT FOCUS"), "the zero-budget tier renders nothing");
+  assert.ok(!a.text.split("\n").includes("…"), "no bare-ellipsis garbage block");
+  // With a real weight the SAME tier renders normally (control).
+  const b = assembleBrief(t, DEFAULT_MEMORY_CONFIG, 1000);
+  assert.ok(b.text.includes("EVENT FOCUS p2: Outcome: build finished"));
+});
