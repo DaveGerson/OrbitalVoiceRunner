@@ -1,5 +1,5 @@
 /**
- * tests/test_exchange_integration_battery.ts — AgentExchange spine, Phase 1 Step 1.5: the
+ * tests/test_exchange_integration_battery.ts — AgentExchange spine, Phase 1 Step 1.5 / 1.5b: the
  * INTEGRATION battery (spec docs/superpowers/specs/2026-07-09-agent-exchange-spine.md).
  *
  * This suite sits ON TOP OF the already-landed unit/store/correlation suites
@@ -11,41 +11,21 @@
  * dispatch-join member state — at every step, not just an in-memory snapshot or an output string.
  *
  * ═══════════════════════════════════════════════════════════════════════════════════════════════
- * CRITICAL FINDING (reported prominently per the test-engineer brief — NOT fixed here, no
- * production code was touched by this pass):
- *
- * The ExchangeService <-> SQLite persistence bridge described throughout the spec (§2, §4, §6) is
- * NOT WIRED in production. src/exchanges/spine.ts says so explicitly in its own module doc: "It
- * does NOT yet dual-write to the agent_exchanges / exchange_events SQLite tables that landed in
- * step 1.2 ... that persistence bridge ... was deliberately deferred rather than rushed." Verified
- * by grep across the whole src/ tree: EVERY live call site that touches exchanges
- * (src/gating/index.ts, src/dispatch/paneWrite.ts, src/observe/index.ts, src/voice/index.ts) goes
- * through the in-memory `getExchangeService()` singleton ONLY. Not one of them calls
- * `store.insertExchange` / `store.updateExchange` / `store.appendExchangeEvent`. The ONLY
- * production code that touches the durable `agent_exchanges` table at all is
- * `src/exchanges/recovery.ts`'s `recoverExchangesOnBoot` — and grep finds ZERO call sites for that
- * function outside its own test file (tests/test_exchange_recovery.ts). Nothing in server.ts's
- * boot sequence invokes it.
- *
- * Net effect: **a real process restart today loses 100% of in-flight exchange state, silently.**
- * `agent_exchanges` never has any rows in it in production (nothing ever inserts them), so even if
- * boot recovery WERE wired up, it would find nothing to quarantine. There is no `exchange_recovered`
- * event, no quarantine, no attention-item surfacing — despite spec §4 ("Restart behavior: durable
- * state, recovery, quarantine") describing exactly that behavior as the whole point of the schema.
- * This is the exact failure mode §4's hard rules are written to prevent, and it is currently
- * un-prevented for the ONLY mode (`primary`) where it would matter operationally.
- *
- * Per the task brief ("if you find a real product bug, do NOT fix it — write the failing test,
- * mark it with test.todo ... and report it prominently"): see the `it.todo(...)` at the bottom of
- * this file titled "BUG-shaped gap: production journeys never persist". This is also why every
- * scenario below that needs "durable state" uses `ExchangeHarness` (defined next) instead of the
- * real `getExchangeService()` singleton for the store-writing half of each step — there IS no real
- * seam that does both today. `ExchangeHarness` is the closest real seam available without doing
- * production-code work: every store call it makes is a real, unmodified `JanusStore` method (the
- * exact ones `src/exchanges/recovery.ts` already uses), applied in lockstep with the REAL
- * `ExchangeService`'s in-memory transition. If the in-memory transition is illegal, no store write
- * happens — mirroring spec §9.6 ("a spine outage must never block or loosen a write decision") in
- * reverse: a refused in-memory transition must never leave a lying durable record either.
+ * STEP 1.5b UPDATE: the persistence bridge this file's Step 1.5 pass found missing is now WIRED.
+ * `ExchangeService` (src/exchanges/service.ts) durably mirrors every successful transition through
+ * an optionally-attached `JanusStore` (constructor injection or `attachStore`), and
+ * `src/exchanges/spine.ts`'s singleton attaches the real store at boot (`initExchangeSpineOnBoot`,
+ * called from server.ts right after the store initializes and before panes/voice can produce any
+ * exchange) — which also now runs `recoverExchangesOnBoot` (src/exchanges/recovery.ts) against
+ * the durable table. `ExchangeHarness` below is therefore now a THIN wrapper: it constructs a real
+ * `ExchangeService` with the store attached and simply delegates every call to it — the store
+ * writes happen INSIDE the service now, not by hand in this file. What used to be the harness's
+ * own `assert.ok(res.changed, ...)` drift check ("harness/production drift: store CAS lost even
+ * though the in-memory transition succeeded") is preserved as `assertMirrored`: after every
+ * delegated call, it reads the durable row back and asserts its state matches the in-memory
+ * result — same drift-detection property, now checking the REAL production bridge instead of a
+ * hand-rolled parallel one. See the former CRITICAL FINDING / `it.todo` at the bottom of this
+ * file, now a real passing test ("scenario 10").
  * ═══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * Runner: npx tsx --test --test-force-exit tests/test_exchange_integration_battery.ts
@@ -59,8 +39,7 @@ import path from "node:path";
 
 import { JanusStore } from "../src/store/sqliteStore";
 import { ExchangeService, type PaneSignalKind, type SettleOutcome } from "../src/exchanges/service";
-import type { ExchangeSnapshot, ExchangeState, LifecycleResult } from "../src/exchanges/lifecycle";
-import type { ExchangeEventType } from "../src/exchanges/types";
+import type { LifecycleResult } from "../src/exchanges/lifecycle";
 import { recoverExchangesOnBoot } from "../src/exchanges/recovery";
 import { DispatchJoinTracker } from "../src/dispatch/joinTracker";
 import { PendingApprovalStore } from "../src/pendingApprovals";
@@ -85,23 +64,15 @@ function cleanupDbFile(p: string): void {
   }
 }
 
-// ── ExchangeHarness — see the file-header CRITICAL FINDING for why this exists ────────────────────
-
-const SIGNAL_EVENT: Partial<Record<PaneSignalKind, ExchangeEventType>> = {
-  running: "terminal_running",
-  idle: "terminal_idle",
-  prompt: "needs_input_detected",
-  error: "agent_failure_reported",
-  exited: "agent_failure_reported",
-  // quiescing intentionally omitted: advisory-only, spec §1.4 — never a store event either.
-};
+// ── ExchangeHarness — see the STEP 1.5b UPDATE file-header note ───────────────────────────────────
 
 /**
- * Drives a REAL `ExchangeService` for every lifecycle/correlation decision, and mirrors each
- * resulting transition into a REAL `JanusStore` via the store's own unmodified CAS/event APIs.
- * See the file-header CRITICAL FINDING for why this is necessary (no production bridge exists) and
- * why this is the "closest real seam" rather than new production logic: every store call is an
- * ordinary `updateExchange`/`appendExchangeEvent` call, gated on the in-memory result.
+ * A thin pass-through over a REAL `ExchangeService` constructed with the real store attached —
+ * every store write below now happens INSIDE `svc`'s own production bridge
+ * (src/exchanges/service.ts), not by hand in this file. `assertMirrored` preserves the drift
+ * check this harness used to do by hand (`assert.ok(res.changed, ...)`): after every delegated
+ * call, it reads the durable row back and asserts its state matches the in-memory result, so a
+ * regression that silently breaks the production bridge still fails this suite loudly.
  */
 class ExchangeHarness {
   readonly svc: ExchangeService;
@@ -110,120 +81,63 @@ class ExchangeHarness {
 
   constructor(store: JanusStore, opts?: { projectId?: string }) {
     this.store = store;
-    this.svc = new ExchangeService();
     this.projectId = opts?.projectId ?? "proj-1";
+    this.svc = new ExchangeService({ store });
+  }
+
+  /** No-op when the in-memory transition was refused (`result.ok === false`) — nothing durable
+   *  should have changed either, which is exactly what a refused transition means (no CAS to
+   *  check). Otherwise: the durable row's state must match what the in-memory machine landed on. */
+  private assertMirrored(id: string, result: LifecycleResult): LifecycleResult {
+    if (result.ok) {
+      assert.strictEqual(
+        this.store.getExchange(id)?.state, result.snapshot.state,
+        `harness/production drift: durable row state doesn't match the in-memory transition result for ${id}`,
+      );
+    }
+    return result;
   }
 
   create(paneId: string, utterance: string, instruction: string): string {
     const snap = this.svc.createExchange({
       projectId: this.projectId, paneId, operatorUtterance: utterance, distilledInstruction: instruction,
     });
-    this.store.insertExchange({
-      exchange_id: snap.exchangeId, project_id: this.projectId, pane_id: paneId,
-      operator_utterance: utterance, distilled_instruction: instruction,
-      created_at: snap.createdAt, updated_at: snap.updatedAt,
-    });
-    this.store.appendExchangeEvent({
-      exchange_id: snap.exchangeId, event_type: "exchange_created",
-      pane_id: paneId, project_id: this.projectId, ts: snap.createdAt,
-    });
+    assert.ok(this.store.getExchange(snap.exchangeId), "harness/production drift: createExchange did not persist a durable row");
     return snap.exchangeId;
   }
 
-  /** Persist one in-memory transition. No-op (no store write at all) when the in-memory transition
-   *  was refused — a refused transition must never produce a durable record either. */
-  private mirror(
-    id: string, before: ExchangeSnapshot, result: LifecycleResult, eventType: ExchangeEventType,
-    opts?: { gateApproval?: boolean; payload?: Record<string, unknown> },
-  ): boolean {
-    if (!result.ok) return false;
-    const after = result.snapshot;
-    const cas: { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null } = { state: before.state };
-    if (opts?.gateApproval) { cas.approvalId = before.approvalId; cas.approvalDraftVersion = before.approvalDraftVersion; }
-    const res = this.store.updateExchange(id, {
-      state: after.state,
-      draft_version: after.draftVersion,
-      approval_id: after.approvalId,
-      approval_draft_version: after.approvalDraftVersion,
-      delivery_attempt: after.deliveryAttempt,
-      delivered_at: after.deliveredAt,
-      completed_at: after.completedAt,
-      result_summary: after.resultSummary,
-      terminal_state: after.terminalState,
-      distilled_instruction: after.distilledInstruction,
-      updated_at: after.updatedAt,
-    }, cas);
-    assert.ok(res.changed, `harness/production drift: store CAS lost for ${eventType} on ${id} even though the in-memory transition succeeded`);
-    this.store.appendExchangeEvent({
-      exchange_id: id, event_type: eventType,
-      pane_id: after.paneId, project_id: after.projectId,
-      payload_redacted_json: JSON.stringify(opts?.payload ?? {}),
-      ts: after.updatedAt,
-    });
-    return true;
-  }
-
   requestApproval(id: string, approvalId: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.requestApproval(id, approvalId);
-    this.mirror(id, before, r, "approval_requested", { payload: { approval_id: approvalId } });
-    return r;
+    return this.assertMirrored(id, this.svc.requestApproval(id, approvalId));
   }
 
   confirmApproval(id: string, approvalId: string, draftVersion: number): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.confirmApproval(id, approvalId, draftVersion);
-    this.mirror(id, before, r, "approval_confirmed", { gateApproval: true, payload: { approval_id: approvalId, draft_version: draftVersion } });
-    return r;
+    return this.assertMirrored(id, this.svc.confirmApproval(id, approvalId, draftVersion));
   }
 
   reviseDraft(id: string, instruction: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.reviseDraft(id, instruction);
-    this.mirror(id, before, r, "draft_revised", { payload: { superseded_approval_id: before.approvalId } });
-    return r;
+    return this.assertMirrored(id, this.svc.reviseDraft(id, instruction));
   }
 
   beginDeliveryAttempt(id: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.beginDeliveryAttempt(id);
-    this.mirror(id, before, r, "delivery_attempted");
-    return r;
+    return this.assertMirrored(id, this.svc.beginDeliveryAttempt(id));
   }
 
   completeDelivery(id: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.completeDelivery(id);
-    this.mirror(id, before, r, "delivery_succeeded");
-    return r;
+    return this.assertMirrored(id, this.svc.completeDelivery(id));
   }
 
   failDelivery(id: string, detail: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.failDelivery(id, detail);
-    this.mirror(id, before, r, "delivery_failed", { payload: { detail } });
-    return r;
+    return this.assertMirrored(id, this.svc.failDelivery(id, detail));
   }
 
   onPaneSignal(paneId: string, kind: PaneSignalKind, detail?: string): SettleOutcome[] {
-    const activeId = this.svc.activeExchangeForPane(paneId);
-    const before = activeId ? this.svc.get(activeId) : undefined;
     const settled = this.svc.onPaneSignal({ paneId, kind, detail });
-    if (before && activeId && settled.some((s) => s.exchangeId === activeId)) {
-      const eventType = SIGNAL_EVENT[kind];
-      if (eventType) {
-        const after = this.svc.get(activeId)!;
-        this.mirror(activeId, before, { ok: true, snapshot: after }, eventType, detail ? { payload: { detail } } : undefined);
-      }
-    }
+    for (const s of settled) this.assertMirrored(s.exchangeId, { ok: true, snapshot: this.svc.get(s.exchangeId)! });
     return settled;
   }
 
   cancel(id: string, reason?: string): LifecycleResult {
-    const before = this.svc.get(id)!;
-    const r = this.svc.cancel(id, reason);
-    this.mirror(id, before, r, "exchange_cancelled", reason ? { payload: { reason } } : undefined);
-    return r;
+    return this.assertMirrored(id, this.svc.cancel(id, reason));
   }
 }
 
@@ -688,22 +602,84 @@ describe("scenario 9: uncorrelated legacy command", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// CRITICAL FINDING — pinned as an explicit, visible test.todo (see the file-header comment block).
+// 10. Former CRITICAL FINDING (see the STEP 1.5b UPDATE file-header note), now a real, passing
+//     test: a production journey through the ACTUAL `ExchangeService` bridge — no ExchangeHarness,
+//     no hand-mirroring — survives a genuine restart with the correct kept/interrupted disposition
+//     and an `exchange_recovered` event.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-describe("CRITICAL FINDING: the ExchangeService <-> SQLite persistence bridge is not wired in production", () => {
-  it.todo(
-    "BUG-shaped gap (not fixed here — out of this pass's allowed paths): a real production journey " +
-    "through the ACTUAL singleton (getExchangeService(), exactly as gating/index.ts + " +
-    "dispatch/paneWrite.ts + observe/index.ts call it) writes NOTHING to agent_exchanges/" +
-    "exchange_events — grep across src/ finds zero call sites for store.insertExchange/" +
-    "updateExchange/appendExchangeEvent outside src/exchanges/recovery.ts, and zero call sites for " +
-    "recoverExchangesOnBoot itself outside its own test file. Every scenario in this suite therefore " +
-    "has to hand-mirror ExchangeService transitions into the store itself (see ExchangeHarness) " +
-    "because the real bridge does not exist. Consequence: a real process restart in `primary` mode " +
-    "loses 100% of in-flight exchange state — no quarantine, no exchange_recovered event, no " +
-    "attention-item surfacing — even though spec §4 describes exactly that behavior as the schema's " +
-    "reason to exist. Fix = wire getExchangeService()'s call sites (or ExchangeService itself) to " +
-    "dual-write through the store's CAS/event APIs, and call recoverExchangesOnBoot from the real " +
-    "boot sequence (server.ts)."
-  );
+describe("scenario 10: the production persistence bridge survives a real restart (formerly it.todo)", () => {
+  it("a real ExchangeService with a store sink attached persists every transition with NO test-only mirroring; after a genuine close+reopen, recoverExchangesOnBoot keeps the settled exchange and quarantines the mid-flight one, appending exchange_recovered", () => {
+    const dbPath = tempDbPath("s10-bridge");
+    try {
+      let store = freshStore(dbPath);
+      // The REAL production class, constructed exactly how src/exchanges/spine.ts wires it at boot
+      // (constructor injection of the store) — every store write below happens INSIDE `svc`.
+      let svc = new ExchangeService({ store });
+
+      // Exchange A: runs the full journey to a SETTLED terminal state before the crash.
+      const a = svc.createExchange({
+        projectId: "proj-1", paneId: "pane-1", operatorUtterance: "run the tests", distilledInstruction: "run the unit test suite",
+      }).exchangeId;
+      svc.requestApproval(a, "appr-a");
+      svc.confirmApproval(a, "appr-a", 1);
+      svc.beginDeliveryAttempt(a);
+      svc.completeDelivery(a);
+      svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
+      svc.onPaneSignal({ paneId: "pane-1", kind: "idle" });
+      svc.recordCompletionReport(a, "tests passed");
+      assert.equal(store.getExchange(a)!.state, "agent_complete", "the production bridge — not a test harness — wrote this row");
+
+      // Exchange B: left mid-flight (delivered, then running) when the crash hits.
+      const b = svc.createExchange({
+        projectId: "proj-1", paneId: "pane-2", operatorUtterance: "run the deploy", distilledInstruction: "run scripts/deploy.sh",
+      }).exchangeId;
+      svc.requestApproval(b, "appr-b");
+      svc.confirmApproval(b, "appr-b", 1);
+      svc.beginDeliveryAttempt(b);
+      svc.completeDelivery(b);
+      svc.onPaneSignal({ paneId: "pane-2", kind: "running" });
+      assert.equal(store.getExchange(b)!.state, "running");
+
+      store.close(); // simulate the crash — no clean shutdown hook fires
+
+      // "Restart": a FRESH JanusStore instance opens the SAME on-disk file, and a FRESH
+      // ExchangeService (a brand-new process constructs one with an empty in-memory machine, then
+      // gets the store re-attached — exactly src/exchanges/spine.ts's initExchangeSpineOnBoot).
+      store = freshStore(dbPath);
+      svc = new ExchangeService({ store });
+      assert.equal(store.getExchange(a)!.state, "agent_complete", "A's terminal state survived the file round-trip");
+      assert.equal(store.getExchange(b)!.state, "running", "B's mid-flight state survived too");
+
+      const report = recoverExchangesOnBoot(store);
+      assert.ok(report.kept.includes(a), "A was already settled — kept, untouched");
+      assert.ok(report.interrupted.includes(b), "B was mid-flight — quarantined, never auto-resumed");
+      assert.equal(store.getExchange(a)!.state, "agent_complete");
+      assert.equal(store.getExchange(b)!.state, "interrupted");
+
+      assert.deepEqual(store.listExchangeEvents(a).map((e) => e.event_type), [
+        "exchange_created", "approval_requested", "approval_confirmed", "delivery_attempted",
+        "delivery_succeeded", "terminal_running", "terminal_idle", "agent_completion_reported",
+      ], "A's full timeline — entirely written by the production bridge across two process instances");
+
+      const bEvents = store.listExchangeEvents(b);
+      assert.deepEqual(bEvents.map((e) => e.event_type), [
+        "exchange_created", "approval_requested", "approval_confirmed",
+        "delivery_attempted", "delivery_succeeded", "terminal_running", "exchange_recovered",
+      ]);
+      const recoveredPayload = JSON.parse(bEvents.at(-1)!.payload_redacted_json);
+      assert.equal(recoveredPayload.disposition, "interrupted");
+      assert.equal(recoveredPayload.from_state, "running");
+
+      // Unified recovery story (Step 1.5b): the fresh-process ExchangeService's own recoverOnBoot
+      // (which src/exchanges/spine.ts's initExchangeSpineOnBoot also calls, right after the durable
+      // walk above) is a harmless no-op — its machine starts empty on a real restart — but it must
+      // not throw and must leave no stale pane binding.
+      assert.deepEqual(svc.recoverOnBoot(), { interrupted: [] });
+      assert.equal(svc.activeExchangeForPane("pane-2"), undefined, "no post-boot binding survives");
+
+      store.close();
+    } finally {
+      cleanupDbFile(dbPath);
+    }
+  });
 });

@@ -11,12 +11,17 @@
 // ExchangeMachine is empty; the truth lives in SQLite) and applies the SAME disposition through the
 // store's own guarded CAS — so a lost race is a no-op, never a second write, never invented history.
 
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
 
 import { JanusStore } from "../src/store/sqliteStore";
 import { recoverExchangesOnBoot } from "../src/exchanges/recovery";
 import type { ExchangeState } from "../src/exchanges/lifecycle";
+import { teardownServerSuite } from "./helpers/teardown";
+import type { RunningServer } from "../server";
 
 function freshStore(): JanusStore {
   const s = new JanusStore(":memory:");
@@ -223,5 +228,86 @@ describe("AgentExchange spine: boot recovery — idempotent, never-throws", () =
     const report = recoverExchangesOnBoot(s);
     assert.deepStrictEqual(report, { kept: [], interrupted: [], reverted: [] });
     s.close();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Step 1.5b — boot recovery wired into the REAL server boot sequence (additive: proves the
+// server.ts call site itself, not just the pure recoverExchangesOnBoot/spine.ts unit seams above).
+// Mirrors the tests/test_boot_quarantine.ts / tests/test_boot_recovery_summary.ts idiom: seed a
+// durable store BEFORE boot, point a fresh server process at it via env, import+boot the REAL
+// server, then read the SAME on-disk file back through a second reader connection.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+describe("AgentExchange spine: boot recovery wired into the REAL server boot sequence", () => {
+  let tmpDir: string;
+  let dbPath: string;
+  let running: RunningServer;
+  let reader: JanusStore | null = null;
+  const midFlightId = "exch-boot-wiring-midflight";
+  const settledId = "exch-boot-wiring-settled";
+
+  const prevEnv: Record<string, string | undefined> = {};
+  function setEnv(k: string, v: string | undefined) {
+    prevEnv[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+
+  before(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "janus-boot-exchange-recovery-"));
+    dbPath = join(tmpDir, "boot.db");
+
+    // Seed the durable store BEFORE boot — models "the server was killed mid-flight".
+    const seed = new JanusStore(dbPath);
+    seed.init();
+    seed.insertExchange({
+      exchange_id: midFlightId, project_id: "p1", pane_id: "pane-1",
+      state: "running", delivery_attempt: 1, delivered_at: 1000,
+    });
+    seed.insertExchange({
+      exchange_id: settledId, project_id: "p1", pane_id: "pane-1", state: "agent_complete",
+    });
+    seed.close();
+
+    // JANUS_EXCHANGE_SPINE must be set BEFORE the first import of anything touching
+    // src/exchanges/flag.ts in THIS process — this file's earlier describe blocks only import
+    // JanusStore/recoverExchangesOnBoot/lifecycle types, none of which touch the flag module, so
+    // this is genuinely the first read. `node --test` runs each test FILE as its own process, so
+    // this frozen value cannot leak into any other test file either.
+    setEnv("JANUS_EXCHANGE_SPINE", "primary");
+    setEnv("JANUS_DB", dbPath);
+    setEnv("JANUS_NO_AUTOSTART", "1");
+    setEnv("NODE_ENV", "test");
+
+    const serverMod = await import("../server");
+    // listen:false — the boot-recovery call site runs at module scope, before startServer() is
+    // even invoked, let alone before any optional listen(); no bound port needed for this proof.
+    running = await serverMod.startServer({ port: 0, enableVite: false, listen: false });
+
+    reader = new JanusStore(dbPath);
+    reader.init();
+  });
+
+  after(async () => {
+    try { reader?.close(); } catch { /* best-effort; distinct connection from the server singleton */ }
+    await teardownServerSuite(running);
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it("the mid-flight exchange is quarantined to interrupted, with an exchange_recovered event, by the real boot sequence", () => {
+    const row = reader!.getExchange(midFlightId)!;
+    assert.strictEqual(row.state, "interrupted");
+    const events = reader!.listExchangeEvents(midFlightId);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].event_type, "exchange_recovered");
+    assert.strictEqual(JSON.parse(events[0].payload_redacted_json).from_state, "running");
+  });
+
+  it("the already-settled exchange is left untouched by the real boot sequence", () => {
+    const row = reader!.getExchange(settledId)!;
+    assert.strictEqual(row.state, "agent_complete");
+    assert.deepStrictEqual(reader!.listExchangeEvents(settledId), []);
   });
 });

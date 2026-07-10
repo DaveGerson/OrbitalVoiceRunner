@@ -36,6 +36,7 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
+import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -648,6 +649,22 @@ let store: JanusStore | null = null;
     // to start rather than run in an undefined, silently-broken state.
     console.error("[STORE] JanusStore unavailable even after the quarantine retry — SQLite is the only ledger backend, so the server cannot boot. Check disk space/permissions for JANUS_DB (or the CWD default .janus.db); the preceding [STORE] log lines carry the underlying error.");
     throw new Error("[STORE] JanusStore failed to initialize and there is no fallback ledger backend (dbt3 retired JANUS_LEDGER_BACKEND=legacy). Refusing to boot.");
+  }
+}
+
+// AgentExchange spine (Phase 1, Step 1.5b): wire the durable persistence bridge + run boot
+// recovery — MUST happen after the store above is live and BEFORE the manager/panes exist (this
+// is still synchronous module-scope boot; panes boot INERT — CLAUDE.md — so nothing can race this
+// with a real exchange write). `off` mode (the production default) is a complete no-op: the store
+// is never wired, recovery never walks agent_exchanges. Never fatal — a recovery failure is
+// logged loudly and boot continues (initExchangeSpineOnBoot's own try/catch); only the store-init
+// failure above is fatal.
+{
+  const exchangeRecovery = initExchangeSpineOnBoot(store);
+  if (exchangeRecovery) {
+    console.log(
+      `[exchange-spine] boot recovery: kept=${exchangeRecovery.kept.length} interrupted=${exchangeRecovery.interrupted.length} reverted=${exchangeRecovery.reverted.length}`
+    );
   }
 }
 
