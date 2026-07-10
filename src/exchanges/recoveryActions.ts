@@ -151,10 +151,42 @@ export function retryExchange(
   return performSameExchangeRetry(store, svc, exchange, term, now);
 }
 
+/** Phase 4.5 (adversarial review, finding B8 — retry double-fire idempotency): an OPEN follow-up
+ *  draft already minted for `originalId` on the same pane, if any. A rapid REST repeat of
+ *  retry_exchange for an `interrupted` exchange (a client retrying a timed-out POST, a
+ *  double-click) must not mint a SECOND identical follow-up draft; the linkage is read back from
+ *  the follow-up's own `exchange_created` event payload (`follow_up_of`), so the ORIGINAL row and
+ *  its (deliberately empty) event timeline stay untouched — the "never touches the original"
+ *  contract pinned by tests/test_exchange_recovery_actions.ts holds. Bounded: one drafts query +
+ *  one per-draft timeline read, on an operator-initiated recovery action (never a hot path). A
+ *  follow-up that has already MOVED past draft (sent/cancelled) no longer blocks a fresh one —
+ *  retrying again after acting on the first follow-up is a genuinely new operator decision. */
+function findOpenFollowUpDraft(store: JanusStore, originalId: string, paneId: string): AgentExchange | null {
+  for (const row of store.listExchangesByStates(["draft"])) {
+    if (row.pane_id !== paneId) continue;
+    const created = store.listExchangeEvents(row.exchange_id).find((e) => e.event_type === "exchange_created");
+    if (!created?.payload_redacted_json) continue;
+    try {
+      if (JSON.parse(created.payload_redacted_json).follow_up_of === originalId) return row;
+    } catch { /* an unparseable payload is simply not a follow-up linkage */ }
+  }
+  return null;
+}
+
 /** Interrupted -> a brand-new sibling exchange (spec §4's "follow-up"), pre-filled from the
  *  original's distilled instruction. The ORIGINAL exchange is left exactly as it was (still
- *  `interrupted`, still cancellable/dismissable on its own) — this never touches it. */
+ *  `interrupted`, still cancellable/dismissable on its own) — this never touches it. Idempotent
+ *  under double-fire: an already-open follow-up draft for the same original is returned instead
+ *  of minting a duplicate (see findOpenFollowUpDraft above). */
 function createFollowUpExchange(store: JanusStore, original: AgentExchange, now: () => number): RetryOutcome {
+  const existing = findOpenFollowUpDraft(store, original.exchange_id, original.pane_id);
+  if (existing) {
+    return {
+      kind: "new_exchange",
+      exchangeId: existing.exchange_id,
+      message: `Exchange ${original.exchange_id} already has an open follow-up draft ${existing.exchange_id} for pane ${original.pane_id} — review and send that draft instead of minting another (idempotent retry).`,
+    };
+  }
   const nowTs = now();
   const fresh = store.insertExchange({
     project_id: original.project_id,

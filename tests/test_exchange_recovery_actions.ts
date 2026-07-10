@@ -138,6 +138,40 @@ describe("recoveryActions: retryExchange — interrupted -> ALWAYS a new follow-
     assert.strictEqual(svc.activeExchangeForPane("pane-1"), undefined);
     s.close();
   });
+
+  it("DOUBLE-FIRE idempotency (4.5 review): a rapid repeat returns the SAME open follow-up draft instead of minting a duplicate", () => {
+    const s = freshStore();
+    const svc = freshSvc(s);
+    const original = s.insertExchange({
+      project_id: "p1", pane_id: "pane-1", state: "interrupted", distilled_instruction: "fix the bug",
+    });
+
+    const first = retryExchange(s, svc, original.exchange_id, liveTerm());
+    const second = retryExchange(s, svc, original.exchange_id, liveTerm()); // e.g. a client retrying a timed-out POST
+
+    assert.strictEqual(first.kind, "new_exchange");
+    assert.strictEqual(second.kind, "new_exchange");
+    assert.strictEqual(second.exchangeId, first.exchangeId, "the repeat resolves to the SAME open follow-up draft");
+    assert.match(second.message, /already has an open follow-up draft/);
+    const drafts = s.listExchangesByStates(["draft"]).filter((r) => r.pane_id === "pane-1");
+    assert.strictEqual(drafts.length, 1, "exactly ONE follow-up draft exists after the double-fire");
+    // The original is still untouched by both calls (the pinned "never touches the original" contract).
+    assert.deepStrictEqual(s.listExchangeEvents(original.exchange_id), []);
+    s.close();
+  });
+
+  it("a follow-up that already MOVED past draft no longer blocks a fresh retry (a later retry is a new operator decision)", () => {
+    const s = freshStore();
+    const svc = freshSvc(s);
+    const original = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "interrupted", distilled_instruction: "fix it" });
+    const first = retryExchange(s, svc, original.exchange_id, liveTerm());
+    // The operator cancelled the first follow-up draft; a fresh retry may mint a new one.
+    assert.ok(s.updateExchange(first.exchangeId!, { state: "cancelled" }, { state: "draft" }).changed);
+    const second = retryExchange(s, svc, original.exchange_id, liveTerm());
+    assert.strictEqual(second.kind, "new_exchange");
+    assert.notStrictEqual(second.exchangeId, first.exchangeId, "a genuinely fresh follow-up draft this time");
+    s.close();
+  });
 });
 
 describe("recoveryActions: retryExchange — provably-failed draft -> SAME exchange", () => {

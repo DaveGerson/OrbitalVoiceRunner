@@ -618,7 +618,11 @@ export class ExchangeService {
       delivered_at: after.deliveredAt,
       completed_at: after.completedAt,
       result_summary: this.redactText(after.resultSummary),
-      terminal_state: after.terminalState,
+      // Phase 4.5 review hardening: terminal_state carries free text too (the detected question
+      // line, an envelope summary) — every writer already redacts at source, but this column was
+      // the one free-text field not double-scrubbed at the write boundary like its siblings.
+      // redactSecrets is idempotent, so this is defense in depth, never a double-mangle.
+      terminal_state: this.redactText(after.terminalState),
       distilled_instruction: this.redactText(after.distilledInstruction),
       updated_at: after.updatedAt,
     };

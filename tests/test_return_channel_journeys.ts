@@ -353,18 +353,18 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       assert.ok(payload.detail.length <= 80, "the attached question text is capped");
       assert.ok(!payload.detail.includes("SECRETVALUE"), "the attached question text is redacted");
 
-      // BUG (see the dedicated "BUG:" describe block below for the isolated pin + full report):
-      // the 'prompt' kind's paneSignalBus publish (src/paneSignals.ts's classifyPaneOutput, called
-      // from src/observe/index.ts's runObservationSteps STEP 1) fires BEFORE detectAndTriggerTransitions
-      // (STEP 3) ever calls settleExchangeSignal — so pushSignal's exchange-aware enrichment reads the
-      // exchange's PRE-transition state ('running') and always falls back to the plain fallback text,
-      // never the enriched "Pane 'x' needs your input: ..." line. Only 'idle' (published from onIdle,
-      // AFTER settleTerminalOutcome) is correctly ordered. Pinning TODAY'S actual behavior here so this
-      // journey's real subject — redaction/capping + durable event attachment — stays green; the
-      // narration gap is a separate, isolated, explicitly-marked finding, not silently swallowed.
-      assert.deepStrictEqual(exchangeNarrationsSince(session, idx), [], "BUG: no exchange-aware narration reaches the operator for this needs_input edge (see BUG block below)");
+      // FIXED (step 4.5): the exchange settles BEFORE the 'prompt' paneSignalBus publish
+      // (src/observe/index.ts runObservationSteps' settle-before-publish ordering, mirroring
+      // onIdle), so pushSignal's enrichment reads POST-transition state and produces exactly ONE
+      // enriched needs_input narration — with the question text redacted+capped, REPLACING (not
+      // duplicating) the plain fallback line.
+      assert.deepStrictEqual(
+        exchangeNarrationsSince(session, idx),
+        [`Pane '${j3Pane}' needs your input: "proceed with token=[REDACTED:secret] (y/n)? $"`],
+        "exactly ONE enriched needs_input narration, redacted",
+      );
       const plainPrompt = clientTextsSince(session, idx).filter((t) => t.startsWith("PANE STATUS UPDATE") && t.includes("waiting at a prompt"));
-      assert.ok(plainPrompt.length >= 1, "the PLAIN (non-exchange-aware) prompt signal still reaches the operator — comms are not fully silent, just not enriched");
+      assert.strictEqual(plainPrompt.length, 0, "the enriched line REPLACES the plain fallback — never a double delivery");
 
       // The operator answers (a gated write lands) -> a genuine `running` edge is the ONLY way off
       // needs_input via observation (pinned by tests/test_exchange_observation.ts).
@@ -464,15 +464,13 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       await running.manager.onIdle!(j8Pane);
       assert.strictEqual(svc.get(j8Id)!.state, "needs_input", "sticky across repeated idle edges — never flaps to terminal_idle");
 
-      // "ONE narration total" holds — vacuously TODAY (see the BUG block below: the 'prompt' publish
-      // that would carry the needs_input narration fires before the machine settles, so it never
-      // narrates at all), but ALSO genuinely: the repeated idle edges never add a SECOND narration on
-      // top, whether the count is 0 or 1. This assertion is what would need to flip to
-      // narrations.length===1 once the BUG below is fixed — it is intentionally count-based (<=1),
-      // not narration-content-based, so it stays meaningful either way.
+      // FIXED (step 4.5): exactly ONE narration total — the needs_input question narrates once at
+      // the prompt edge (settle now precedes the publish), and the repeated idle edges never add a
+      // second one (the ExchangeNarrationGate's anchor is the exchange's unchanged updated_at, and
+      // the sticky needs_input state never re-transitions under ambient idles).
       const narrations = exchangeNarrationsSince(session, idx);
-      assert.ok(narrations.length <= 1, `expected AT MOST one narration total (never re-narrated by the repeats), got: ${JSON.stringify(narrations)}`);
-      for (const n of narrations) assert.ok(n.startsWith(`Pane '${j8Pane}' needs your input:`));
+      assert.strictEqual(narrations.length, 1, `expected EXACTLY one narration total (never re-narrated by the repeats), got: ${JSON.stringify(narrations)}`);
+      assert.strictEqual(narrations[0], `Pane '${j8Pane}' needs your input: "continue? y/n $"`);
     });
   });
 
@@ -500,13 +498,15 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       running.manager.onOutput!(j9PaneA, "overwrite existing file? $ ");
       assert.strictEqual(svc.get(j9Id)!.state, "needs_input");
 
-      // BUG (same root cause as journey 3's note; see the dedicated "BUG:" block below): the
-      // 'prompt' pane-signal publish precedes exchange-machine settlement, so the exchange-aware
-      // "In project 'X', pane 'Y' needs your input" enrichment never fires today — pushSignal falls
-      // back to the plain, non-project-scoped pane-status text instead. The structural safety
-      // properties below (no focus steal, B's own state untouched) hold regardless, and are
-      // asserted on their own merits.
-      assert.deepStrictEqual(exchangeNarrationsSince(session, idx), [], "BUG: the background-project exception line never reaches the operator today (see BUG block below)");
+      // FIXED (step 4.5): settlement precedes the 'prompt' publish, so the background-project
+      // EXCEPTION narration now reaches the foreground session exactly once — named explicitly
+      // ("In project 'X', ..."; the ledger's project NAME defaults to its id under addProject),
+      // and never via a focus change (asserted below).
+      assert.deepStrictEqual(
+        exchangeNarrationsSince(session, idx),
+        [`In project 'rcj-proj-a', pane '${j9PaneA}' needs your input: "overwrite existing file? $"`],
+        "the background-project exception is narrated once, named explicitly",
+      );
 
       // No focus change: no NEW switch_active_pane broadcast was fired as a side effect of the
       // exception narration (the code path never calls setActivePane — src/voice/index.ts's
@@ -532,14 +532,18 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       assert.strictEqual(svc.get(id)!.state, "agent_failed");
       assert.strictEqual(store().listExchangeEvents(id).at(-1)!.event_type, "agent_failure_reported");
 
-      // BUG (same root cause as journey 3's note; see the dedicated "BUG:" block below): the
-      // 'exited' paneSignalBus publish (src/observe/index.ts emitHighSeverityTransition) is called
-      // BEFORE settleExchangeSignal in detectAndTriggerTransitions — so the exchange-aware "Pane 'x'
-      // failed" enrichment reads the PRE-transition state and never fires. The plain fallback still
-      // reaches the operator (the pane's death is not silent, just not exchange-enriched).
-      assert.deepStrictEqual(exchangeNarrationsSince(session, idx), [], "BUG: no exchange-aware failure narration today (see BUG block below)");
+      // FIXED (step 4.5): settleExchangeSignal now runs BEFORE emitHighSeverityTransition's
+      // 'exited' publish, so the enriched failure line fires exactly once. NOTE the project prefix:
+      // journey 9 (which runs before this one in declaration order) switched the foreground to
+      // rcj-proj-b, so rcj-proj-a is a genuinely backgrounded project here — agent_failed is an
+      // EXCEPTION class and still crosses over, named explicitly, with no focus change.
+      assert.deepStrictEqual(
+        exchangeNarrationsSince(session, idx),
+        [`In project 'rcj-proj-a', pane '${pane}' failed.`],
+        "exactly ONE enriched failure narration for the pane death",
+      );
       const plainExited = clientTextsSince(session, idx).filter((t) => t.startsWith("PANE STATUS UPDATE"));
-      assert.ok(plainExited.length >= 1, "the plain exit signal still reaches the operator");
+      assert.strictEqual(plainExited.length, 0, "the enriched line REPLACES the plain fallback — never a double delivery");
     });
   });
 
@@ -556,12 +560,18 @@ describe("return-channel journeys (real server, real observation pipeline, real 
       (running.manager.terminals as any)[j11Pane].runtimeType = "shell";
       running.manager.onOutput!(j11Pane, "continue? y/n $ ");
       assert.strictEqual(svc.get(j11Id)!.state, "needs_input");
-      // BUG (same root cause as journey 3's note; see the dedicated "BUG:" block below): today this
-      // is 0, not 1 — the 'prompt' publish precedes settlement, so the enriched line never fires.
-      // The reconnect/no-duplicate property under test here is orthogonal to that gap and holds
-      // either way: AT MOST one narration on the first session, whatever that count is.
+      // FIXED (step 4.5): exactly ONE enriched narration on the first session. The project prefix
+      // is present for the same reason as journey 10's: journey 9 backgrounded rcj-proj-a, and
+      // needs_input is an exception class that crosses over named explicitly.
       const first = exchangeNarrationsSince(session, idx);
-      assert.ok(first.length <= 1, `expected at most one narration on the first session, got: ${JSON.stringify(first)}`);
+      assert.deepStrictEqual(
+        first,
+        [`In project 'rcj-proj-a', pane '${j11Pane}' needs your input: "continue? y/n $"`],
+        "exactly one narration on the first session",
+      );
+      // Anchor the "no re-narration" checks below at the CURRENT stream position (not idx +
+      // first.length — clientContents may interleave non-narration pushes).
+      const idxAfterFirst = session.clientContents.length;
 
       // "Reconnect": a SECOND, independent WS client connects (a fresh browser tab / the operator's
       // reconnect) — the exchange spine's own delivery is completely unaffected by this (spec §4.3
@@ -579,7 +589,7 @@ describe("return-channel journeys (real server, real observation pipeline, real 
         running.manager.onOutput!(j11Pane, "continue? y/n $ ");
         assert.strictEqual(svc.get(j11Id)!.state, "needs_input", "unchanged — a genuine repeat, not a new transition");
         assert.deepStrictEqual(exchangeNarrationsSince(session2, idx2), [], "the NEW session never receives a duplicate narration for the unchanged exchange");
-        assert.deepStrictEqual(exchangeNarrationsSince(session, idx + first.length), [], "nor does the original session re-narrate");
+        assert.deepStrictEqual(exchangeNarrationsSince(session, idxAfterFirst), [], "nor does the original session re-narrate");
       } finally {
         await new Promise<void>((resolve) => { client2.once("close", () => resolve()); try { client2.terminate(); } catch { resolve(); } });
       }
@@ -643,61 +653,45 @@ describe("return-channel journeys (real server, real observation pipeline, real 
   });
 
   // ═════════════════════════════════════════════════════════════════════════════════════════════
-  // BUG (found by this integration battery; not visible to any pure/unit suite): the exchange-aware
-  // voice narration enrichment (src/voice/index.ts's pushSignal -> buildExchangeAwareSignalText,
-  // gated on exchangeNarrationClass(snap.state)) can NEVER fire for the 'prompt' or 'exited'
-  // paneSignalBus kinds, because the publish for those kinds happens BEFORE the exchange machine's
-  // OWN transition settles, within the SAME synchronous onOutput call:
-  //   - 'prompt'/'error': published unconditionally from src/paneSignals.ts's classifyPaneOutput,
-  //     called at src/observe/index.ts's runObservationSteps STEP 1 — before detectAndTriggerTransitions
-  //     (STEP 3) ever runs settleExchangeSignal (which is what actually moves the exchange to
-  //     needs_input/agent_failed).
-  //   - 'exited': published from emitHighSeverityTransition, called INSIDE detectAndTriggerTransitions
-  //     but still textually and temporally BEFORE that same function's own settleExchangeSignal call
-  //     a few lines later.
-  // Only 'idle' is correctly ordered (published from onIdle, AFTER settleTerminalOutcome runs) —
-  // which is exactly why journeys 1/2/4 (all idle-based) narrate correctly while journeys 3/8/9/10/11
-  // (prompt/exited-based) above observe zero exchange-aware narrations and had to be adjusted to pin
-  // TODAY'S actual behavior rather than the Phase 4.2 design's intent. Net effect: needs_input and
-  // agent_failed — arguably the two MOST important "the operator should hear about this" exchange
-  // states — never get the enriched "Pane 'x' needs your input: ..." / "Pane 'x' failed: ..." line
-  // in production; the operator only ever hears the generic, non-exchange-aware pane-status text.
-  //
-  // Likely fix shape (NOT applied here — no production changes in this suite): move the
-  // paneSignalBus.publish call(s) for 'prompt'/'error' (classifyPaneOutput's publish in
-  // runObservationSteps) and for 'exited' (emitHighSeverityTransition) to AFTER
-  // settleExchangeSignal/detectAndTriggerTransitions has run its exchange-settling step, mirroring
-  // how onIdle already orders settleTerminalOutcome before its own paneSignalBus.publish.
-  describe("BUG: exchange-aware narration for 'prompt'/'exited' pane-signal kinds reads PRE-transition state", () => {
-    it("PINS today's actual behavior: a needs_input-shaped prompt chunk transitions the exchange correctly but produces ZERO exchange-aware narration — only the plain fallback reaches the operator", async () => {
+  // FIXED (step 4.5) — was the battery's pinned BUG: the exchange-aware voice narration enrichment
+  // (src/voice/index.ts's pushSignal -> buildExchangeAwareSignalText) could never fire for the
+  // 'prompt'/'error'/'exited' paneSignalBus kinds because their publishes happened BEFORE the
+  // exchange machine's own transition settled within the same synchronous onOutput call. The fix
+  // (src/observe/index.ts) mirrors onIdle's settle-then-publish ordering everywhere:
+  //   - runObservationSteps now runs the mid-run envelope settle + detectAndTriggerTransitions
+  //     (which owns settleExchangeSignal) BEFORE classifyPaneOutput's 'error'/'prompt' publish;
+  //   - detectAndTriggerTransitions calls settleExchangeSignal BEFORE emitHighSeverityTransition's
+  //     'exited' publish.
+  // This block is the isolated fix-pin the old `it.todo` demanded: the same scenario that used to
+  // pin ZERO exchange-aware narrations now produces exactly ONE enriched line, replacing (never
+  // duplicating) the plain fallback. Journeys 3/8/9/10/11 above carry the tightened exactly-once
+  // assertions in their full end-to-end contexts.
+  describe("FIXED: exchange-aware narration for 'prompt'/'exited' pane-signal kinds reads POST-transition state", () => {
+    it("a needs_input-shaped prompt chunk transitions the exchange AND produces exactly ONE enriched narration (plain fallback replaced)", async () => {
       const pane = "rcj-bug-prompt";
       makePane(running, pane, "rcj-proj-a");
       const id = deliverExchange(pane, "rcj-proj-a");
       running.manager.onRunning!(pane);
       (running.manager.terminals as any)[pane].status = "Idle";
       (running.manager.terminals as any)[pane].runtimeType = "shell";
-      await sleep(PAST_COOLDOWN_MS); // past the bus's own cross-kind cooldown — isolates the finding from that separate, expected timing behavior.
+      await sleep(PAST_COOLDOWN_MS); // past the bus's own cross-kind cooldown — isolates the assertion from that separate, expected timing behavior.
 
       const idx = session.clientContents.length;
       running.manager.onOutput!(pane, "continue? y/n $ ");
 
-      // The MACHINE settled correctly (this half of the pipeline is NOT the bug).
+      // The MACHINE settled (as it always did)...
       assert.strictEqual(svc.get(id)!.state, "needs_input");
-      // But NO exchange-aware line reached the operator — this IS the bug.
-      assert.deepStrictEqual(exchangeNarrationsSince(session, idx), []);
-      // Confirms it is a NARRATION-ORDERING gap, not a narration-content gap: the plain fallback
-      // (built from the classifier's OWN cls.detail, independent of exchange state) did fire.
+      // ...AND the operator now hears exactly one enriched line for it ("In project" prefix:
+      // journey 9 backgrounded rcj-proj-a earlier in this battery; needs_input is an exception
+      // class, so it crosses over named explicitly).
+      assert.deepStrictEqual(
+        exchangeNarrationsSince(session, idx),
+        [`In project 'rcj-proj-a', pane '${pane}' needs your input: "continue? y/n $"`],
+      );
+      // Exactly-once means REPLACING the plain fallback, not adding to it.
       const plain = clientTextsSince(session, idx).filter((t) => t.startsWith("PANE STATUS UPDATE") && t.includes("waiting at a prompt"));
-      assert.strictEqual(plain.length, 1);
+      assert.strictEqual(plain.length, 0);
     });
-
-    it.todo(
-      "FIX TARGET: once paneSignalBus.publish for 'prompt'/'error'/'exited' is reordered to AFTER " +
-      "the exchange machine settles (see the BUG comment above for the exact call sites), this same " +
-      "scenario should produce exactly ONE exchange-aware narration: \"Pane 'x' needs your input: " +
-      "continue? y/n\" — flip journeys 3/8/9/10/11's relaxed (BUG-aware) assertions back to their " +
-      "strict originals (narrations.length === 1, exact text match) once this lands.",
-    );
   });
 });
 

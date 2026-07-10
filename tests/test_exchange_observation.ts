@@ -27,6 +27,7 @@ import type { OrchestratorManager } from "../src/terminal";
 // ── dynamic, flag-gated imports (see file header) ──────────────────────────────────────────────
 
 let attachObserve: typeof import("../src/observe").attachObserve;
+let legacyCompletionEligible: typeof import("../src/observe").legacyCompletionEligible;
 let AnnouncementBus: typeof import("../src/announcementBus").AnnouncementBus;
 let DEFAULT_ANNOUNCEMENT_TEMPLATES: typeof import("../src/announcementBus").DEFAULT_ANNOUNCEMENT_TEMPLATES;
 let PaneSignalBus: typeof import("../src/paneSignalBus").PaneSignalBus;
@@ -46,7 +47,7 @@ before(async () => {
   setEnv("JANUS_EXCHANGE_SPINE", "shadow"); // active (writes), not authoritative — sufficient here.
   setEnv("JANUS_AGENT_RESULT_ENVELOPE", "accept");
 
-  ({ attachObserve } = await import("../src/observe"));
+  ({ attachObserve, legacyCompletionEligible } = await import("../src/observe"));
   ({ AnnouncementBus, DEFAULT_ANNOUNCEMENT_TEMPLATES } = await import("../src/announcementBus"));
   ({ PaneSignalBus } = await import("../src/paneSignalBus"));
   ({ InteractionLogger } = await import("../src/interactionLog"));
@@ -276,7 +277,9 @@ describe("exchange observation: legacy finalResponse heuristic (conservative)", 
     const id = deliverExchange("p1");
     getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
     const { manager } = makeManager("p1");
-    const entries: HistoryEntry[] = [{ command: "npm test", timestamp: "t", output: "", finalResponse: "Done: build succeeded." }];
+    // Real agent output behind the report (4.5 review fix: the heuristic requires non-empty real
+    // output — a done-line with NOTHING behind it never settles; see the hazard battery below).
+    const entries: HistoryEntry[] = [{ command: "npm test", timestamp: "t", output: "142 passing\nall suites green\n", finalResponse: "Done: build succeeded." }];
     const { onIdle } = attachObserve(manager, makeDeps([], entries));
     await onIdle("p1");
     assert.equal(stateOf(id), "agent_complete");
@@ -288,7 +291,9 @@ describe("exchange observation: legacy finalResponse heuristic (conservative)", 
     const id = deliverExchange("p1");
     getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
     const { manager } = makeManager("p1");
-    const entries: HistoryEntry[] = [{ command: "npm test", timestamp: "t", output: "", finalResponse: "not done yet, still 3 tests to go" }];
+    // Real output present, so the 4.5 non-empty-output guard is NOT what blocks this — the
+    // line-shape rule itself is what's under test here.
+    const entries: HistoryEntry[] = [{ command: "npm test", timestamp: "t", output: "running suite 2 of 5\n", finalResponse: "not done yet, still 3 tests to go" }];
     const { onIdle } = attachObserve(manager, makeDeps([], entries));
     await onIdle("p1");
     assert.equal(stateOf(id), "terminal_idle", "a loose mention of 'done' must not complete the exchange");
@@ -301,6 +306,88 @@ describe("exchange observation: legacy finalResponse heuristic (conservative)", 
     const { onIdle } = attachObserve(manager, makeDeps([], entries));
     await onIdle("p-ghost"); // must not throw
     assert.equal(getExchangeService().activeExchangeForPane("p-ghost"), undefined);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// 4b. Phase 4.5 (adversarial review) — the idle-summary hazard: computeIdleSummary's synthesized
+// fallbacks ("finished", "`<command>` finished") match LEGACY_DONE_LINE_RE, and pre-fix could
+// settle agent_complete with ZERO real agent output. legacyCompletionEligible now requires real
+// output, an at-rest exchange, an agent-authored line, and never the instruction's own PTY echo.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+describe("exchange observation: idle-summary hazard — synthesized/echoed text never settles (4.5 review)", () => {
+  it("EMPTY history at idle (the bare synthesized 'finished' summary) never settles agent_complete", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const { onIdle } = attachObserve(manager, makeDeps([], [])); // no history entries at all
+    await onIdle("p1");
+    assert.equal(stateOf(id), "terminal_idle", "the synthesized 'finished' fallback must never read as a completion report");
+  });
+
+  it("the synthesized '<command> finished' fallback for an instruction STARTING with a completion token never settles", async () => {
+    // Instruction "complete the deploy" + empty output + no finalResponse -> computeIdleSummary
+    // synthesizes "complete the deploy finished", which matches the done-line prefix. Pre-fix
+    // this settled agent_complete off Orbital's OWN synthesized string with zero real output.
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1", "complete the deploy");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const entries: HistoryEntry[] = [{ command: "complete the deploy", timestamp: "t", output: "" }];
+    const { onIdle } = attachObserve(manager, makeDeps([], entries));
+    await onIdle("p1");
+    assert.equal(stateOf(id), "terminal_idle");
+  });
+
+  it("the pane's ECHO of the delivered instruction (echo-only output) never settles", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1", "complete the deploy");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const entries: HistoryEntry[] = [
+      { command: "complete the deploy", timestamp: "t", output: "complete the deploy\n", finalResponse: "no summary available" },
+    ];
+    const { onIdle } = attachObserve(manager, makeDeps([], entries));
+    await onIdle("p1");
+    assert.equal(stateOf(id), "terminal_idle", "the instruction's own echo must never settle the exchange it delivered");
+  });
+
+  it("...but a REAL agent done-line after the echo still settles (the echo guard never overblocks)", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1", "complete the deploy");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const entries: HistoryEntry[] = [
+      { command: "complete the deploy", timestamp: "t", output: "complete the deploy\nDeploying...\nDone.\n", finalResponse: "deploy went out" },
+    ];
+    const { onIdle } = attachObserve(manager, makeDeps([], entries));
+    await onIdle("p1");
+    assert.equal(stateOf(id), "agent_complete");
+    assert.equal(getExchangeService().get(id)!.resultSummary, "deploy went out");
+  });
+
+  it("a completion token followed by failure language ('Completed with errors.') never settles", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1", "run the build");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const entries: HistoryEntry[] = [
+      { command: "run the build", timestamp: "t", output: "building...\nCompleted with errors.\n", finalResponse: "build had problems" },
+    ];
+    const { onIdle } = attachObserve(manager, makeDeps([], entries));
+    await onIdle("p1");
+    assert.equal(stateOf(id), "terminal_idle", "a self-contradicting 'completion' line must never present as success");
+  });
+
+  it("legacyCompletionEligible (pure): refuses a non-at-rest exchange — a pane that RESUMED during the async summary's await gap", () => {
+    const base = { command: "npm test", output: "Done.", finalResponse: "" };
+    assert.equal(legacyCompletionEligible({ ...base, exchangeState: "running" }), false, "resumed mid-await -> the idle behind this summary is stale");
+    assert.equal(legacyCompletionEligible({ ...base, exchangeState: "delivered" }), false);
+    assert.equal(legacyCompletionEligible({ ...base, exchangeState: undefined }), false);
+    assert.equal(legacyCompletionEligible({ ...base, exchangeState: "terminal_idle" }), true);
+    assert.equal(legacyCompletionEligible({ ...base, exchangeState: "needs_input" }), true, "an explicit final done-line is the stronger evidence the stickiness guard reserves room for");
   });
 });
 
