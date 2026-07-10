@@ -11,15 +11,26 @@
 // ExchangeMachine is empty; the truth lives in SQLite) and applies the SAME disposition through the
 // store's own guarded CAS — so a lost race is a no-op, never a second write, never invented history.
 
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 
 import { JanusStore } from "../src/store/sqliteStore";
-import { recoverExchangesOnBoot } from "../src/exchanges/recovery";
+import { recoverExchangesOnBoot, interruptionDispositionFor } from "../src/exchanges/recovery";
 import type { ExchangeState } from "../src/exchanges/lifecycle";
+import { ExchangeService } from "../src/exchanges/service";
+import {
+  rehydrateDraftRegistryOnBoot,
+  serializeDraftEnvelope,
+  parsePersistedDraftEnvelope,
+  getOpenDraft,
+  setOpenDraft,
+  getApprovalBinding,
+  resetDraftRegistryForTests,
+} from "../src/exchanges/draftRegistry";
+import { createDraft, buildEnvelope } from "../src/exchanges/instructionEnvelope";
 import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 
@@ -309,5 +320,183 @@ describe("AgentExchange spine: boot recovery wired into the REAL server boot seq
     const row = reader!.getExchange(settledId)!;
     assert.strictEqual(row.state, "agent_complete");
     assert.deepStrictEqual(reader!.listExchangeEvents(settledId), []);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 4, Step 4.3 — the interruption class → disposition table (recovery.ts
+// `interruptionDispositionFor`). Only `process_boot` triggers real machinery (proven by every
+// describe block above); the other three classes are documented, TESTED no-ops — pinned here so a
+// future "let's also quarantine on reconnect, just to be safe" patch fails a test instead of
+// silently regressing operator experience (spuriously interrupting perfectly-delivered exchanges).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+describe("AgentExchange spine: interruption class -> disposition table (Phase 4, Step 4.3)", () => {
+  it("process_boot is the ONLY class that quarantines uncertain in-flight exchanges", () => {
+    assert.strictEqual(interruptionDispositionFor("process_boot"), "quarantine_uncertain_inflight");
+  });
+  it("browser_ws_reconnect is a no-op: the server process (and every PTY) survives a client tab reconnect", () => {
+    assert.strictEqual(interruptionDispositionFor("browser_ws_reconnect"), "no_op_delivery_unaffected");
+  });
+  it("gemini_session_reconnect is a no-op: a Live-socket drop is a narration-channel event, not a delivery one", () => {
+    assert.strictEqual(interruptionDispositionFor("gemini_session_reconnect"), "no_op_delivery_unaffected");
+  });
+  it("python_daemon_reconnect is a no-op: the memory/policy daemon never holds a PTY or an exchange row", () => {
+    assert.strictEqual(interruptionDispositionFor("python_daemon_reconnect"), "no_op_delivery_unaffected");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 4, Step 4.3 — instruction_envelope_json now actually gets persisted at createExchange
+// (previously always defaulted to '{}' — no code path populated it). This is the durable source
+// `rehydrateDraftRegistryOnBoot` (below) reads back after a restart.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+describe("AgentExchange spine: createExchange persists instructionEnvelopeJson (Phase 4, Step 4.3)", () => {
+  it("createExchange with instructionEnvelopeJson stamps (redacted) instruction_envelope_json on the row", () => {
+    const s = freshStore();
+    const svc = new ExchangeService({ store: s });
+    const json = JSON.stringify({ kind: "envelope_draft", envelope: { objective: "ship it" }, target: { projectId: "p1", paneId: "pane-1" }, draftVersion: 1 });
+    const snap = svc.createExchange({
+      projectId: "p1", paneId: "pane-1", operatorUtterance: "ship it", distilledInstruction: "ship it",
+      instructionEnvelopeJson: json,
+    });
+    const row = s.getExchange(snap.exchangeId)!;
+    assert.strictEqual(JSON.parse(row.instruction_envelope_json).envelope.objective, "ship it");
+    s.close();
+  });
+
+  it("createExchange WITHOUT instructionEnvelopeJson leaves the schema default '{}' — unchanged from before this field existed", () => {
+    const s = freshStore();
+    const svc = new ExchangeService({ store: s });
+    const snap = svc.createExchange({ projectId: "p1", paneId: "pane-1", operatorUtterance: "x", distilledInstruction: "x" });
+    const row = s.getExchange(snap.exchangeId)!;
+    assert.strictEqual(row.instruction_envelope_json, "{}");
+    s.close();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 4, Step 4.3 — draft-registry rehydration on boot (src/exchanges/draftRegistry.ts
+// `rehydrateDraftRegistryOnBoot`). The registry (openDrafts/approvalBindings) is process-global
+// in-memory — a restart wipes it. This rebuilds it from the durable `agent_exchanges` rows that
+// carry a persisted envelope (the ONLY durable source for a draft that has been sent at least
+// once — see the module's own "accepted limitation" doc for why a never-sent draft cannot
+// rehydrate its structure).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+describe("Draft registry: rehydration from durable exchange rows on boot (Phase 4, Step 4.3)", () => {
+  // Every test in this block shares the SAME process-global registry — reset before each so an
+  // earlier test's (projectId, paneId) entry can never leak into a later one (the registry has no
+  // per-test isolation of its own; that is exactly what production boot rehydration relies on
+  // running once into an EMPTY registry).
+  beforeEach(() => resetDraftRegistryForTests());
+  after(() => resetDraftRegistryForTests());
+
+  it("serializeDraftEnvelope + parsePersistedDraftEnvelope round-trip", () => {
+    const draft = createDraft({ target: { projectId: "p1", paneId: "pane-1" }, envelope: buildEnvelope({ objective: "fix the bug" }) });
+    const json = serializeDraftEnvelope(draft)!;
+    const parsed = parsePersistedDraftEnvelope(json)!;
+    assert.strictEqual(parsed.kind, "envelope_draft");
+    assert.strictEqual(parsed.envelope.objective, "fix the bug");
+    assert.deepStrictEqual(parsed.target, { projectId: "p1", paneId: "pane-1" });
+    assert.strictEqual(parsed.draftVersion, 1);
+  });
+
+  it("serializeDraftEnvelope returns null for a draft with no bound target (defensive — readiness already requires one before a real send)", () => {
+    const draft = createDraft({ envelope: buildEnvelope({ objective: "fix it" }) });
+    assert.strictEqual(serializeDraftEnvelope(draft), null);
+  });
+
+  it("parsePersistedDraftEnvelope never confuses a dispatch-group label or the schema default with an envelope draft", () => {
+    assert.strictEqual(parsePersistedDraftEnvelope("{}"), null);
+    assert.strictEqual(parsePersistedDraftEnvelope(JSON.stringify({ dispatch_group_id: "dg-1" })), null);
+    assert.strictEqual(parsePersistedDraftEnvelope("not json{"), null);
+  });
+
+  it("a 'draft' row (reverted from a failed delivery) with a persisted envelope rehydrates into the registry, sentVersions empty (a re-send must not be refused as a false duplicate)", () => {
+    const s = freshStore();
+    const json = JSON.stringify({ kind: "envelope_draft", envelope: { objective: "retry me" }, target: { projectId: "p1", paneId: "pane-1" }, draftVersion: 2 });
+    const row = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft", draft_version: 2, instruction_envelope_json: json });
+
+    const report = rehydrateDraftRegistryOnBoot(s);
+
+    assert.ok(report.rehydratedDrafts.includes(row.exchange_id));
+    assert.deepStrictEqual(report.rehydratedApprovalBindings, []);
+    const draft = getOpenDraft("p1", "pane-1")!;
+    assert.strictEqual(draft.exchangeId, row.exchange_id);
+    assert.strictEqual(draft.envelope.objective, "retry me");
+    assert.strictEqual(draft.draftVersion, 2);
+    assert.deepStrictEqual(draft.sentVersions, [], "a failed/reverted draft must allow a re-send of the SAME version");
+    s.close();
+  });
+
+  it("an 'awaiting_approval' row whose pending_approvals row SURVIVED rehydrates the draft AND rebinds the approval, sentVersions=[draftVersion]", () => {
+    const s = freshStore();
+    s.insertPendingApproval({
+      id: "appr-1", session_id: "sess-1", workspace_id: "w1", pane_id: "pane-1",
+      command: "do it", kind: "agent_instruction", rationale: null,
+      claimed: false, timestamp: Date.now(), expires_at: Date.now() + 100000, exchange_id: null,
+    });
+    const json = JSON.stringify({ kind: "envelope_draft", envelope: { objective: "ship it" }, target: { projectId: "p1", paneId: "pane-1" }, draftVersion: 1 });
+    const row = s.insertExchange({
+      project_id: "p1", pane_id: "pane-1", state: "awaiting_approval",
+      approval_id: "appr-1", approval_draft_version: 1, instruction_envelope_json: json,
+    });
+
+    const report = rehydrateDraftRegistryOnBoot(s);
+
+    assert.ok(report.rehydratedDrafts.includes(row.exchange_id));
+    assert.ok(report.rehydratedApprovalBindings.includes(row.exchange_id));
+    const draft = getOpenDraft("p1", "pane-1")!;
+    assert.deepStrictEqual(draft.sentVersions, [1], "the sent version must stay refused for a duplicate re-send while approval is outstanding");
+    const binding = getApprovalBinding("p1", "pane-1")!;
+    assert.strictEqual(binding.messageId, "appr-1");
+    assert.strictEqual(binding.draftVersion, 1);
+    s.close();
+  });
+
+  it("an 'awaiting_approval' row whose pending_approvals row is GONE rehydrates the draft but NEVER binds a dead approval (never deliver stale)", () => {
+    const s = freshStore();
+    const json = JSON.stringify({ kind: "envelope_draft", envelope: { objective: "ship it" }, target: { projectId: "p1", paneId: "pane-1" }, draftVersion: 1 });
+    const row = s.insertExchange({
+      project_id: "p1", pane_id: "pane-1", state: "awaiting_approval",
+      approval_id: "appr-GONE", approval_draft_version: 1, instruction_envelope_json: json,
+    });
+
+    const report = rehydrateDraftRegistryOnBoot(s);
+
+    assert.ok(report.rehydratedDrafts.includes(row.exchange_id));
+    assert.ok(!report.rehydratedApprovalBindings.includes(row.exchange_id));
+    assert.strictEqual(getApprovalBinding("p1", "pane-1"), undefined, "no binding to a vanished approval — never deliver stale");
+    assert.ok(getOpenDraft("p1", "pane-1"), "the draft itself still rehydrates — the operator can revise/resend it");
+    s.close();
+  });
+
+  it("a row with no persisted envelope (accepted limitation — never sent, or a plain non-envelope dispatch) is silently skipped, not fabricated", () => {
+    const s = freshStore();
+    s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft" }); // schema default '{}'
+    const report = rehydrateDraftRegistryOnBoot(s);
+    assert.deepStrictEqual(report.rehydratedDrafts, []);
+    assert.strictEqual(getOpenDraft("p1", "pane-1"), undefined);
+    s.close();
+  });
+
+  it("never clobbers an ALREADY-LIVE registry entry for the same pane (only ever seeds a cold registry)", () => {
+    const s = freshStore();
+    const live = createDraft({ target: { projectId: "p1", paneId: "pane-1" }, envelope: buildEnvelope({ objective: "the LIVE one" }) });
+    setOpenDraft("p1", "pane-1", live);
+    const json = JSON.stringify({ kind: "envelope_draft", envelope: { objective: "the durable one" }, target: { projectId: "p1", paneId: "pane-1" }, draftVersion: 1 });
+    s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft", instruction_envelope_json: json });
+
+    const report = rehydrateDraftRegistryOnBoot(s);
+
+    assert.deepStrictEqual(report.rehydratedDrafts, [], "the live entry wins — nothing rehydrated over it");
+    assert.strictEqual(getOpenDraft("p1", "pane-1")!.envelope.objective, "the LIVE one");
+    s.close();
+  });
+
+  it("an empty store rehydrates cleanly (no rows, no throw, empty report)", () => {
+    const s = freshStore();
+    const report = rehydrateDraftRegistryOnBoot(s);
+    assert.deepStrictEqual(report, { rehydratedDrafts: [], rehydratedApprovalBindings: [] });
+    s.close();
   });
 });

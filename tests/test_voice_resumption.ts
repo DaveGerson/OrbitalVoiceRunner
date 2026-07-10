@@ -30,6 +30,7 @@ import {
   resumptionHandleKvKeyFor,
   readHandleOwner,
 } from "../src/voiceResumption";
+import { interruptionDispositionFor } from "../src/exchanges/recovery";
 
 test("GEMINI_SESSION_EXPIRED_CODE is the WebSocket 1008 'session expired' code", () => {
   assert.strictEqual(GEMINI_SESSION_EXPIRED_CODE, 1008);
@@ -191,4 +192,23 @@ test("wrapHandleForPersist owner stamp round-trips through readHandleOwner; unst
   assert.strictEqual(readHandleOwner(wrapHandleForPersist({ newHandle: "h" }, 1000, null)), null);
   assert.strictEqual(readHandleOwner("not json"), null);
   assert.strictEqual(readHandleOwner(null), null);
+});
+
+// ── AgentExchange spine (Phase 4, Step 4.3) — a Gemini Live session reconnect never interrupts an
+// exchange's DELIVERY. This file is the resumption/reconnect module; this is the resumption-
+// relevant HALF of src/exchanges/recovery.ts's interruption class -> disposition table (the other
+// half, browser reconnect + the actual process-boot quarantine machinery, is pinned in
+// tests/test_exchange_recovery.ts). Everything ELSE in this file (the poison-handle self-heal, the
+// TTL freshness guard) is exactly WHY a session can reconnect cleanly without ever touching an
+// AgentExchange: the handle/session churn this module manages is entirely upstream of the PTY
+// write path (`term.writeInput` never round-trips through the Live session), so nothing about it
+// creates delivery uncertainty. ──────────────────────────────────────────────────────────────────
+test("AgentExchange spine: a Gemini Live session reconnect (handle-poison clear, TTL expiry, or a plain drop) never quarantines an exchange — delivery already landed (or didn't) independently of the Live socket", () => {
+  assert.strictEqual(interruptionDispositionFor("gemini_session_reconnect"), "no_op_delivery_unaffected");
+});
+test("AgentExchange spine: a browser WS reconnect never quarantines an exchange either — the server process (and every live PTY) is untouched by the operator's tab reconnecting", () => {
+  assert.strictEqual(interruptionDispositionFor("browser_ws_reconnect"), "no_op_delivery_unaffected");
+});
+test("AgentExchange spine: only a real process restart creates delivery uncertainty worth quarantining", () => {
+  assert.strictEqual(interruptionDispositionFor("process_boot"), "quarantine_uncertain_inflight");
 });

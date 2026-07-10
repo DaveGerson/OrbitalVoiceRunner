@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**110** actions across **26** gated capabilities, plus the always-allowed group.
+**114** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -18,6 +18,7 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `add_pane_context` | rest | no | Operator-UI |
 | `approve_pending_command` | rest | no | Approve or reject a pending spoken-command approval by messageId (approved=true approves, false rejects) |
+| `cancel_exchange` | rest | no | Cancel/dismiss an exchange (including an interrupted one — this is its only way out besides a retry follow-up) |
 | `cancel_pending_action` | rest | no | Cancel (discard, no side effect) a pending NON-PTY deferred action by id |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
 | `confirm_pending_action` | rest | no | Confirm (run) a pending NON-PTY deferred action by id |
@@ -36,10 +37,12 @@ These bypass the capability gate entirely — they work even while the system is
 | `list_pending_actions` | rest | no | List the pending NON-PTY deferred actions (gated-Ask staging) with their age |
 | `list_pending_commands` | rest | no | List the pending spoken-command approvals (the HiTL queue the ApprovalDialog renders) |
 | `list_watch_rules` | rest | no | List all configured watch-automation rules |
+| `open_exchange_pane` | rest | no | Resolve the (project, pane) an exchange belongs to, so a client holding only an exchange_id can navigate to it |
 | `read_project_notes` | rest | no | Operator-UI |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
 | `remove_note` | rest | no | Operator-UI |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
+| `resume_inspect_exchange` | rest | no | Inspect an interrupted (or any) exchange's current state and recent event history — the recovery drill-down for an attention item |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 | `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
 | `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
@@ -366,4 +369,5 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | --- | --- | --- | --- |
 | `dispatch_to_panes` | voice / rest | no | Send one instruction (raw text or a prompt template with slot values) to SEVERAL panes at once |
 | `propose_command` | voice | no | Direct work to the pane the operator currently has OPEN (the active pane) |
+| `retry_exchange` | rest | no | Retry an exchange |
 | `send_instruction` | voice | no | Send the finished instruction draft for the operator's open pane to its agent |

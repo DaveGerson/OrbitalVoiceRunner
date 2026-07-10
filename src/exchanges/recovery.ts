@@ -150,3 +150,76 @@ export function recoverExchangesOnBoot(
   }
   return report;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Phase 4, Step 4.3 — the interruption class → disposition table.
+//
+// The 4.2 boot-quarantine story above answers ONE question ("what happens to an exchange when
+// THIS process starts fresh"). This step's brief asks the broader question: across every kind of
+// "something got interrupted" event this program can observe — a process restart, a browser tab's
+// WS reconnecting, the Gemini Live socket dropping/reconnecting, the Python daemon (memory/policy
+// synthesis) restarting — which ones create GENUINE delivery uncertainty for an in-flight
+// exchange, and which do not?
+//
+// The answer, reasoned from the ground truth this module already documents (§4 of the spec, the
+// "Ground truth constraints" above): delivery uncertainty for an AgentExchange is entirely a
+// property of whether the SERVER PROCESS that holds the live PTY handle survived. `writeInput`
+// gives no receipt (module doc, spec §2b) — the only reason a delivery's outcome becomes
+// unknowable is that the PROCESS that could have observed the outcome is gone. None of the other
+// three event classes touch that:
+//
+//   - a BROWSER reconnect (the operator's WS socket drops and reconnects) never touches the
+//     server process at all — the PTY, the ExchangeService singleton, and every durable row are
+//     completely unaffected. The operator's browser was a SPECTATOR of the delivery, never a
+//     participant in it.
+//   - a GEMINI LIVE session reconnect (or the resumption-handle churn src/voiceResumption.ts
+//     exists to manage) drops the VOICE/NARRATION channel, not the PTY: `term.writeInput` already
+//     happened (or didn't) independently of whether Gemini's socket is currently open — the write
+//     path never round-trips through the Live session. Pending approvals already survive a
+//     session detach/reattach untouched (this module's own "Ground truth constraints" list,
+//     `detachSession`/`reattachSession`), and the exchange spine rides the SAME approval rows.
+//   - a PYTHON DAEMON restart (memory/policy synthesis, the stdio-JSON bridge,
+//     docs/design/2026-06-19-python-ts-seam.md) is entirely downstream of the exchange spine — it
+//     never holds a PTY handle, never owns a pending_approvals/agent_exchanges row, and the seam's
+//     own contract (fail-soft, `src/memory/pythonClient.ts`) means a daemon outage degrades
+//     synthesis quality, never delivery certainty.
+//
+// So the table has exactly one "does something" row. This is intentionally a PURE, no-op-for-most-
+// classes classification — the whole point of writing it down explicitly (rather than leaving it
+// implicit in "well, nothing calls recoverExchangesOnBoot from those places") is to make the
+// reasoning above an auditable, testable artifact instead of an assumption a future change could
+// silently violate (e.g. a well-intentioned "let's also quarantine on Gemini reconnect, just to be
+// safe" patch would be a REGRESSION — it would spuriously interrupt perfectly-delivered exchanges
+// on every ordinary voice reconnect, which is a worse operator experience than doing nothing).
+
+/** Every interruption-shaped event this program can observe, for the purpose of deciding whether
+ *  an in-flight AgentExchange's delivery became uncertain. */
+export type InterruptionEventClass =
+  | "process_boot"
+  | "browser_ws_reconnect"
+  | "gemini_session_reconnect"
+  | "python_daemon_reconnect";
+
+/** `quarantine_uncertain_inflight`: the disposition this module's `recoverOnBoot` machinery
+ *  already implements (walk the durable rows, interrupt the 5 uncertain in-flight states). `no_op`:
+ *  the event class touches nothing an AgentExchange's delivery certainty depends on — no state is
+ *  read or written, by design (see the doc block above). */
+export type InterruptionDisposition = "quarantine_uncertain_inflight" | "no_op_delivery_unaffected";
+
+/**
+ * The class → disposition table (spec-adjacent, Phase 4 Step 4.3). Only `process_boot` triggers
+ * real machinery (`recoverExchangesOnBoot`, wired at server.ts's boot seam via
+ * `initExchangeSpineOnBoot`); the other three classes are documented, TESTED no-ops — there is no
+ * corresponding "quarantine on reconnect" call site anywhere in the codebase, and this function is
+ * the auditable proof that omission is deliberate, not an oversight.
+ */
+export function interruptionDispositionFor(eventClass: InterruptionEventClass): InterruptionDisposition {
+  switch (eventClass) {
+    case "process_boot":
+      return "quarantine_uncertain_inflight";
+    case "browser_ws_reconnect":
+    case "gemini_session_reconnect":
+    case "python_daemon_reconnect":
+      return "no_op_delivery_unaffected";
+  }
+}

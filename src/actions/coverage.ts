@@ -249,6 +249,16 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   confirm_instruction: new Set<Surface>(["voice"]),
   cancel_instruction: new Set<Surface>(["voice"]),
   send_instruction: new Set<Surface>(["voice"]),
+
+  // ── Phase 4, Step 4.3 AgentExchange recovery actions: NEW rest-only defs (no voice twin — see
+  // src/actions/defs/lifecycle_rest.ts's own "SCOPE NOTE (voice)"). All four key off an opaque
+  // exchange_id (the id an attention item/notification already carries), which is not naturally
+  // something an operator would SPEAK; a voice-natural phrasing needs pane-scoped resolution
+  // instead of an id lookup — deferred as a distinct, larger design item, not silently dropped. ──
+  resume_inspect_exchange: new Set<Surface>(["rest"]),
+  retry_exchange: new Set<Surface>(["rest"]),
+  cancel_exchange: new Set<Surface>(["rest"]),
+  open_exchange_pane: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

@@ -47,7 +47,7 @@ import {
   type ExchangeState,
   type LifecycleResult,
 } from "./lifecycle";
-import type { ExchangeEventType } from "./types";
+import type { ExchangeEventType, AgentExchange as AgentExchangeRow } from "./types";
 import type { JanusStore } from "../store/sqliteStore";
 import { redactSecrets } from "../terminal";
 
@@ -97,6 +97,12 @@ interface CreateExchangeInput {
   voiceSessionId?: string | null;
   interactionId?: string | null;
   contextVersion?: string | null;
+  /** Phase 4, Step 4.3: the redacted JSON projection of the pane's open envelope draft (spec
+   *  `instruction_envelope_json` — see src/exchanges/draftRegistry.ts's persisted-envelope shape),
+   *  when this exchange correlates to one. Absent for a plain (non-envelope) dispatch — the
+   *  column keeps its schema default `'{}'`, unchanged from before this field existed. This is
+   *  the durable source `rehydrateDraftRegistryOnBoot` reads back on a fresh boot. */
+  instructionEnvelopeJson?: string | null;
 }
 
 export class ExchangeService {
@@ -146,6 +152,7 @@ export class ExchangeService {
       voiceSessionId: input.voiceSessionId ?? null,
       interactionId: input.interactionId ?? null,
       contextVersion: input.contextVersion ?? null,
+      instructionEnvelopeJson: input.instructionEnvelopeJson ?? null,
     });
     return snap;
   }
@@ -463,6 +470,53 @@ export class ExchangeService {
     return { interrupted: out.interrupted };
   }
 
+  /**
+   * Phase 4, Step 4.3: adopt a DURABLE row (src/store/sqliteStore.ts `AgentExchange`) into this
+   * process's live tracking — the machine's in-memory snapshot (`ExchangeMachine.hydrate`, a raw
+   * no-legality-check seed) AND the pane-correlation binding (`paneActive`). This is the seam a
+   * recovery action (src/exchanges/recoveryActions.ts) calls after it mutates a row DIRECTLY at
+   * the store layer (never through this class's own transition methods — a retry/cancel target
+   * may have been minted in a PRIOR process this machine never saw). Without it, a live pane
+   * signal (idle/running/needs_input) arriving after a same-process retry could never settle the
+   * retried exchange (the correlator's `paneActive` binding would still point nowhere, or at
+   * whatever this pane's PREVIOUS exchange was). Best-effort + never throws: recovery actions are
+   * themselves best-effort (spec §9.6 — a spine outage must never block an operator's explicit
+   * recovery decision); a failure here only means live signal correlation stays stale, not that
+   * the durable row (already written by the caller) is lost.
+   */
+  adoptExchangeSnapshot(row: AgentExchangeRow): void {
+    try {
+      this.machine.hydrate({
+        exchangeId: row.exchange_id,
+        projectId: row.project_id,
+        paneId: row.pane_id,
+        state: row.state,
+        draftVersion: row.draft_version,
+        approvalId: row.approval_id,
+        approvalDraftVersion: row.approval_draft_version,
+        deliveryAttempt: row.delivery_attempt,
+        operatorUtterance: row.operator_utterance,
+        distilledInstruction: row.distilled_instruction,
+        terminalState: row.terminal_state,
+        resultSummary: row.result_summary,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        deliveredAt: row.delivered_at,
+        completedAt: row.completed_at,
+      });
+      // Only an IN-FLIGHT row is worth binding as this pane's "active" exchange — a settled row
+      // (agent_complete/agent_failed/cancelled) or a communication-only one (draft/awaiting_*)
+      // has nothing for a subsequent pane signal to correlate against, and binding one would risk
+      // a later ambient signal wrongly settling a row that was never actually delivered.
+      if (row.state === "staged" || row.state === "delivered" || row.state === "running" ||
+          row.state === "needs_input" || row.state === "terminal_idle") {
+        this.paneActive.set(row.pane_id, row.exchange_id);
+      }
+    } catch (e) {
+      console.error(`[exchange-spine] adoptExchangeSnapshot failed for ${row.exchange_id} (live correlation may be stale):`, e);
+    }
+  }
+
   /** Interrupt whatever was previously active on this pane (if anything, and if it isn't the
    *  exchange being delivered now). Best-effort: if the prior exchange already settled, the
    *  machine's own legal-transition guard refuses the interrupt and we simply move on — an
@@ -617,27 +671,52 @@ export class ExchangeService {
    *  not `updateExchange`). Same fail-soft contract as `persistTransition`. `extra` (Phase 2 Step
    *  2.2) carries the durable-only identity/correlation fields `createExchange` received but the
    *  pure in-memory snapshot does not model — see `CreateExchangeInput`'s doc comment. */
+  /** Build the `insertExchange` payload — split out of `persistCreate` purely to keep that
+   *  method's own branch count low (complexity gate); Phase 4 Step 4.3 added one more optional
+   *  redacted field (`instructionEnvelopeJson`) which would otherwise push `persistCreate` over
+   *  the CC-10 ceiling. */
+  private buildInsertExchangeInput(
+    snap: ExchangeSnapshot,
+    extra?: {
+      voiceSessionId: string | null;
+      interactionId: string | null;
+      contextVersion: string | null;
+      instructionEnvelopeJson?: string | null;
+    },
+  ): Parameters<JanusStore["insertExchange"]>[0] {
+    // Phase 2 Step 2.4/2.5 fix (secrets at rest): the operator's utterance and the distilled
+    // instruction are persisted REDACTED (the raw instruction still reaches the pane through the
+    // dispatch path untouched — deliver raw, persist redacted). Phase 4 Step 4.3: the
+    // envelope-draft JSON projection (when supplied) is redacted the same way — it is free text
+    // (objective/context/constraints) an operator spoke or typed.
+    return {
+      exchange_id: snap.exchangeId,
+      project_id: snap.projectId,
+      pane_id: snap.paneId,
+      operator_utterance: this.redactText(snap.operatorUtterance),
+      distilled_instruction: this.redactText(snap.distilledInstruction),
+      voice_session_id: extra?.voiceSessionId ?? null,
+      interaction_id: extra?.interactionId ?? null,
+      context_version: extra?.contextVersion ?? null,
+      instruction_envelope_json:
+        extra?.instructionEnvelopeJson != null ? this.redactText(extra.instructionEnvelopeJson) : undefined,
+      created_at: snap.createdAt,
+      updated_at: snap.updatedAt,
+    };
+  }
+
   private persistCreate(
     snap: ExchangeSnapshot,
-    extra?: { voiceSessionId: string | null; interactionId: string | null; contextVersion: string | null },
+    extra?: {
+      voiceSessionId: string | null;
+      interactionId: string | null;
+      contextVersion: string | null;
+      instructionEnvelopeJson?: string | null;
+    },
   ): void {
     if (!this.store) return;
     try {
-      // Phase 2 Step 2.4/2.5 fix (secrets at rest): the operator's utterance and the distilled
-      // instruction are persisted REDACTED (the raw instruction still reaches the pane through
-      // the dispatch path untouched — deliver raw, persist redacted).
-      this.store.insertExchange({
-        exchange_id: snap.exchangeId,
-        project_id: snap.projectId,
-        pane_id: snap.paneId,
-        operator_utterance: this.redactText(snap.operatorUtterance),
-        distilled_instruction: this.redactText(snap.distilledInstruction),
-        voice_session_id: extra?.voiceSessionId ?? null,
-        interaction_id: extra?.interactionId ?? null,
-        context_version: extra?.contextVersion ?? null,
-        created_at: snap.createdAt,
-        updated_at: snap.updatedAt,
-      });
+      this.store.insertExchange(this.buildInsertExchangeInput(snap, extra));
       this.store.appendExchangeEvent({
         exchange_id: snap.exchangeId,
         event_type: "exchange_created",

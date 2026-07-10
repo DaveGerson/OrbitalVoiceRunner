@@ -9,6 +9,13 @@
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import { ALWAYS_ALLOWED } from "../types";
+import { getExchangeService } from "../../exchanges/spine";
+import {
+  resumeInspectExchange,
+  retryExchange,
+  cancelExchangeDurable,
+  openExchangePane,
+} from "../../exchanges/recoveryActions";
 
 const UpdateProjectParams = z.object({
   project_id: z.string(),
@@ -136,4 +143,130 @@ export const deletePane: ActionDef<typeof DeletePaneParams> = {
   },
 };
 
-export const LIFECYCLE_REST_ACTIONS: ActionDef[] = [updateProject, stopPane, deleteProject, deletePane];
+// ─────────────────────────────────────────────────────────────────────────────
+// AgentExchange spine — RECOVERY ACTIONS (Phase 4, Step 4.3). The operator-facing surface for
+// what boot recovery (src/exchanges/recovery.ts) leaves behind: an INTERRUPTED (or provably-
+// failed-draft) exchange sits quarantined until the operator explicitly inspects/retries/cancels
+// it — never auto-resumed (spec §4). Logic lives in src/exchanges/recoveryActions.ts (store-level,
+// so it works on an exchange minted in a PRIOR process); these four defs are thin REST wrappers.
+//
+// SCOPE NOTE (voice): these all key off an opaque `exchange_id` (the id an attention item /
+// notification already carries per the correlation map, spec §5) — not naturally something an
+// operator would SPEAK. A voice-natural phrasing ("retry the failed one on the codex pane") needs
+// pane-scoped resolution instead of an id lookup, which is a larger surface than this step owns;
+// deferred, not silently dropped. REST is what the Workbench/attention UI needs today, and is
+// fully wired.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ExchangeIdParams = z.object({ exchange_id: z.string() });
+
+/** resume-inspect: surface an interrupted (or any) exchange's current durable state + its recent
+ *  event timeline. Read-only; ALWAYS_ALLOWED (mirrors get_status_summary's ALWAYS_ALLOWED +
+ *  readOnly:false resolution — the §8.1 invariant only permits readOnly:true for read_pane/
+ *  read_notes, so an ALWAYS_ALLOWED read stays readOnly:false here too). */
+export const resumeInspectExchangeAction: ActionDef<typeof ExchangeIdParams> = {
+  name: "resume_inspect_exchange",
+  description: "Inspect an interrupted (or any) exchange's current state and recent event history — the recovery drill-down for an attention item.",
+  params: ExchangeIdParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: { method: "get", path: "/api/exchanges/:exchange_id/inspect" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: "Exchange spine store unavailable." };
+    const view = resumeInspectExchange(ctx.store, args.exchange_id);
+    if (!view) return { kind: "ok", output: `Exchange ${args.exchange_id} not found.` };
+    return { kind: "ok", output: view };
+  },
+};
+
+/**
+ * retry: re-deliver a provably-failed `draft` exchange under the SAME exchange, or (for an
+ * `interrupted` exchange, which the lifecycle machine never lets resume) create a brand-new
+ * follow-up draft instead — see src/exchanges/recoveryActions.ts's module doc for the full
+ * reconciliation of this policy against the spec's "never auto-resume" hard rule. GATED
+ * write_to_pane (the same-exchange leg performs a real pane write; the whole action is gated
+ * uniformly for a single, simple, conservative rule). Off->blocked->403, Ask->pending->202,
+ * Auto->run-now->200.
+ * NOTE (durable replay): like respawn_pane/send_keys, an IN-PROCESS Ask->confirm replays this
+ * exact closure; a confirm AFTER a process restart has no buildActionRun case for it yet — an
+ * accepted out-of-scope limitation matching the c55 precedent for these rest-only recovery caps.
+ */
+export const retryExchangeAction: ActionDef<typeof ExchangeIdParams> = {
+  name: "retry_exchange",
+  description: "Retry an exchange: re-delivers the SAME exchange only when its prior attempt is provably failed; an interrupted exchange instead gets a brand-new follow-up draft (never an automatic resend). GATED (write_to_pane, default Ask).",
+  params: ExchangeIdParams,
+  capability: "write_to_pane",
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: { method: "post", path: "/api/exchanges/:exchange_id/retry" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: "Exchange spine store unavailable." };
+    const exchange = ctx.store.getExchange(args.exchange_id);
+    if (!exchange) return { kind: "ok", output: `Exchange ${args.exchange_id} not found.` };
+    const term = ctx.manager.terminals[exchange.pane_id];
+    const retryEffect = (): string =>
+      retryExchange(ctx.store!, getExchangeService(), args.exchange_id, term).message;
+    const g = ctx.gateOrDefer(
+      "write_to_pane",
+      exchange.pane_id,
+      `Retry exchange ${args.exchange_id}`,
+      retryEffect,
+      { ...(ctx.versionStamp ?? {}), exchangeId: args.exchange_id }
+    );
+    if (g.disposition === "forbidden") {
+      return { kind: "blocked", reason: "Error: the 'write_to_pane' capability is gated Off; retrying exchanges is forbidden by policy." };
+    }
+    if (g.disposition === "deferred") {
+      return { kind: "pending", messageId: g.actionId, summary: g.summary };
+    }
+    return { kind: "ok", output: retryEffect() };
+  },
+};
+
+/** cancel: dismiss any cancellable exchange (including `interrupted` — its only real legal edge).
+ *  ALWAYS_ALLOWED — a de-escalation, like stop_pane / the brake trio: dismissing something never
+ *  writes to a pane or does anything an Off gate would need to forbid. */
+export const cancelExchangeAction: ActionDef<typeof ExchangeIdParams> = {
+  name: "cancel_exchange",
+  description: "Cancel/dismiss an exchange (including an interrupted one — this is its only way out besides a retry follow-up). Ungated de-escalation.",
+  params: ExchangeIdParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: { method: "post", path: "/api/exchanges/:exchange_id/cancel" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: "Exchange spine store unavailable." };
+    const result = cancelExchangeDurable(ctx.store, getExchangeService(), args.exchange_id, "operator_cancelled");
+    return { kind: "ok", output: result.message };
+  },
+};
+
+/** open-pane: resolve which (project, pane) an exchange belongs to, for a client that only has an
+ *  exchange_id (from an attention item) and needs to navigate the UI there. Read-only. */
+export const openExchangePaneAction: ActionDef<typeof ExchangeIdParams> = {
+  name: "open_exchange_pane",
+  description: "Resolve the (project, pane) an exchange belongs to, so a client holding only an exchange_id can navigate to it.",
+  params: ExchangeIdParams,
+  capability: ALWAYS_ALLOWED,
+  readOnly: false,
+  surfaces: new Set(["rest"]),
+  rest: { method: "get", path: "/api/exchanges/:exchange_id/pane" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: "Exchange spine store unavailable." };
+    const view = openExchangePane(ctx.store, args.exchange_id);
+    if (!view) return { kind: "ok", output: `Exchange ${args.exchange_id} not found.` };
+    return { kind: "ok", output: view };
+  },
+};
+
+export const LIFECYCLE_REST_ACTIONS: ActionDef[] = [
+  updateProject,
+  stopPane,
+  deleteProject,
+  deletePane,
+  resumeInspectExchangeAction,
+  retryExchangeAction,
+  cancelExchangeAction,
+  openExchangePaneAction,
+];

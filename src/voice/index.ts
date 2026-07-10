@@ -43,8 +43,8 @@ import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import type { ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine } from "./sitrep";
-import { reviseDraft, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval } from "../exchanges/draftRegistry";
+import { reviseDraft, instructionEnvelopeActive, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
+import { getOpenDraft, setOpenDraft, setProseOverride, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, serializeDraftEnvelope } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -1274,18 +1274,40 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // DispatchOutcome AFTER the (synchronous, single-turn) call returns — correct for normal
     // operation, but it does not close the crash-window between "attempt recorded" and "write
     // fired" the way the strict ordering would. Flagged as a step 1.4 follow-up in the report.
+    // Phase 2 Step 2.5 review fix: resolve the pane's OWNING project through the canonical
+    // resolver before ever falling back to "whatever project happens to be active" — a ledger
+    // pane in a NON-active project (no live terminal) used to stamp the exchange row (and its
+    // context_version join) under the WRONG project. Split out of `stampExchangeForDispatch`
+    // purely to keep that function's own branch count under the complexity gate.
+    function projectIdForExchangeDispatch(targetId: string): string {
+      return (
+        manager.terminals[targetId]?.projectId ||
+        findPaneOwningProject(manager, targetId)?.projectId ||
+        manager.ledger.getActiveProject?.()?.id ||
+        "default_project"
+      );
+    }
+
+    /** Phase 4, Step 4.3: when this dispatch correlates to the pane's OPEN envelope draft (the
+     *  Workbench/voice instruction-envelope flow — send_instruction's dispatchProposal call fires
+     *  while the registry still holds the exact version being sent, see
+     *  src/exchanges/draftRegistry.ts's rehydration doc), serialize its structured envelope for
+     *  the new row's `instruction_envelope_json`. This is the durable source a restart's
+     *  `rehydrateDraftRegistryOnBoot` reads back — without it, a sent-but-not-yet-delivered draft
+     *  would have no way to recover its objective/context/constraints split after a crash.
+     *  Best-effort: a plain (non-envelope) dispatch has no matching open draft and returns
+     *  `undefined`, leaving the column at its schema default, unchanged from before this existed.
+     *  Split out of `stampExchangeForDispatch` for the same complexity-gate reason as its sibling. */
+    function draftEnvelopeJsonForDispatch(projectId: string, targetId: string): string | undefined {
+      if (!instructionEnvelopeActive()) return undefined;
+      const openDraft = getOpenDraft(projectId, targetId);
+      return openDraft ? (serializeDraftEnvelope(openDraft) ?? undefined) : undefined;
+    }
+
     function stampExchangeForDispatch(targetId: string, instruction: string, trigger: string): string | undefined {
       if (!exchangeSpineActive()) return undefined;
       try {
-        // Phase 2 Step 2.5 review fix: resolve the pane's OWNING project through the canonical
-        // resolver before ever falling back to "whatever project happens to be active" — a
-        // ledger pane in a NON-active project (no live terminal) used to stamp the exchange row
-        // (and its context_version join) under the WRONG project.
-        const projectId =
-          manager.terminals[targetId]?.projectId ||
-          findPaneOwningProject(manager, targetId)?.projectId ||
-          manager.ledger.getActiveProject?.()?.id ||
-          "default_project";
+        const projectId = projectIdForExchangeDispatch(targetId);
         // Phase 2 Step 2.2: stamp this connection's real voice_session_id + interaction_id, and the
         // context_version currently ACKNOWLEDGED for this (project, session) pair — "the context
         // version that shaped this instruction" (the most recent brief the model actually saw
@@ -1298,6 +1320,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           voiceSessionId: state.voiceSessionId,
           interactionId: state.currentInteractionId,
           contextVersion: contextVersions.currentAcknowledgedVersion(projectId, state.voiceSessionId),
+          instructionEnvelopeJson: draftEnvelopeJsonForDispatch(projectId, targetId),
         }).exchangeId;
       } catch (e) {
         console.error("[exchange-spine] createExchange failed:", e);
@@ -1476,6 +1499,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             clearStableResetTimer();
           }
         }
+        // AgentExchange spine (Phase 4, Step 4.3 — src/exchanges/recovery.ts
+        // `interruptionDispositionFor("gemini_session_reconnect")`): this whole handler is about
+        // the VOICE/NARRATION channel, never the PTY. No exchange is interrupted/quarantined here,
+        // by design — a delivery already landed (or didn't) independently of whether Gemini's
+        // socket is open, so a Live session drop creates no delivery uncertainty to recover from.
+        //
         // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
         // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
         // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
@@ -2523,6 +2552,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     });
 
     clientWs.on("close", () => {
+      // AgentExchange spine (Phase 4, Step 4.3 — src/exchanges/recovery.ts
+      // `interruptionDispositionFor("browser_ws_reconnect")`): this is the OPERATOR'S BROWSER
+      // socket, not the server process. Nothing here touches an AgentExchange, on purpose — the
+      // server (and every live PTY it holds) is completely unaffected by the operator's tab
+      // dropping/reloading, so no delivery became uncertain and nothing is quarantined. The
+      // in-memory envelope-draft registry (src/exchanges/draftRegistry.ts) is likewise untouched:
+      // it is keyed by (projectId, paneId), not by connection, so the NEXT connection (the
+      // reconnect) reads the exact same live state via GET /api/panes/:p/:id/draft — no
+      // rehydration needed for a same-process reconnect (only a process RESTART needs that; see
+      // draftRegistry.ts's `rehydrateDraftRegistryOnBoot`).
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
       // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
       // destructive pendingActions record survives and stays resolvable via UI/typed SURE.

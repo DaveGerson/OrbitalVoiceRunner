@@ -20,6 +20,8 @@
 import { ExchangeService } from "./service";
 import { EXCHANGE_SPINE_MODE, type ExchangeSpineMode } from "./flag";
 import { recoverExchangesOnBoot, type ExchangeRecoveryReport } from "./recovery";
+import { rehydrateDraftRegistryOnBoot, type DraftRegistryRehydrationReport } from "./draftRegistry";
+import { instructionEnvelopeActive } from "./instructionEnvelope";
 import type { JanusStore } from "../store/sqliteStore";
 
 let singleton: ExchangeService | null = null;
@@ -63,7 +65,33 @@ export function exchangeSpineActive(): boolean {
  * still attached for new exchanges going forward (only a STORE-INIT failure, handled entirely
  * separately in server.ts before this ever runs, is fatal).
  */
-export function initExchangeSpineOnBoot(store: JanusStore): ExchangeRecoveryReport | undefined {
+/** Boot recovery's report, PLUS (Phase 4, Step 4.3) the draft-registry rehydration report when the
+ *  instruction-envelope flag is active — `undefined` when the envelope flag is off (no registry
+ *  to rehydrate) or when rehydration itself best-effort-failed (logged, never fatal). */
+export type ExchangeBootRecoveryResult = ExchangeRecoveryReport & {
+  draftRegistry?: DraftRegistryRehydrationReport;
+};
+
+/**
+ * Phase 4, Step 4.3: rehydrate the in-memory envelope-draft registry (src/exchanges/draftRegistry
+ * .ts) from the durable rows `recoverExchangesOnBoot` just classified. MUST run AFTER that
+ * quarantine walk (an `awaiting_approval` row it reverted to `draft` because the bound approval
+ * vanished must rehydrate as a plain draft, never with a binding to a dead approval) — this
+ * function's own defensive re-check (`rehydrateApprovalBindingIfSurvived`) also makes it safe on
+ * its own, but the ordering here is the intended, tested one. Only runs when the instruction-
+ * envelope flag is active (off ⇒ no registry exists to rehydrate); never throws back into boot.
+ */
+function rehydrateDraftRegistryOnBootBestEffort(store: JanusStore): DraftRegistryRehydrationReport | undefined {
+  if (!instructionEnvelopeActive()) return undefined;
+  try {
+    return rehydrateDraftRegistryOnBoot(store);
+  } catch (e) {
+    console.error("[exchange-spine] draft-registry rehydration failed (continuing boot; registry stays empty for this process):", e);
+    return undefined;
+  }
+}
+
+export function initExchangeSpineOnBoot(store: JanusStore): ExchangeBootRecoveryResult | undefined {
   if (!exchangeSpineActive()) return undefined;
   bootStore = store;
   const svc = getExchangeService();
@@ -71,7 +99,8 @@ export function initExchangeSpineOnBoot(store: JanusStore): ExchangeRecoveryRepo
   try {
     const report = recoverExchangesOnBoot(store);
     svc.recoverOnBoot();
-    return report;
+    const draftRegistry = rehydrateDraftRegistryOnBootBestEffort(store);
+    return draftRegistry ? { ...report, draftRegistry } : report;
   } catch (e) {
     console.error("[exchange-spine] boot recovery failed (continuing boot; store sink stays attached for new exchanges):", e);
     svc.recoverOnBoot();

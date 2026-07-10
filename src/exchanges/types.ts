@@ -48,7 +48,14 @@ export type ExchangeEventType =
   | "agent_failure_reported"
   | "exchange_cancelled"
   | "exchange_recovered"
-  | "context_version_delivered";
+  | "context_version_delivered"
+  /** Phase 4, Step 4.3: an OPERATOR-initiated retry of a `draft` exchange whose prior delivery
+   *  attempt is PROVABLY failed (the last event before this one is `delivery_failed`) — never an
+   *  automatic resend. Records the SAME exchange re-entering `staged`/`delivery_attempted` for a
+   *  fresh attempt. See src/exchanges/recoveryActions.ts for the full retry-eligibility policy
+   *  (an `interrupted` exchange never gets this event — it can only ever produce a NEW sibling
+   *  exchange, spec §4 hard rule "never auto-resumed"). */
+  | "retry_initiated";
 
 /**
  * Row shape for `agent_exchanges` (schema v12). One durable record per operator communication:

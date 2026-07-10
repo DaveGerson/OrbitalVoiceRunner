@@ -36,9 +36,9 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
-import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
+import { initExchangeSpineOnBoot, getExchangeService, exchangeSpineActive } from "./src/exchanges/spine";
 import { reviseDraft, renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval } from "./src/exchanges/draftRegistry";
+import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, serializeDraftEnvelope } from "./src/exchanges/draftRegistry";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -683,6 +683,15 @@ let store: JanusStore | null = null;
     console.log(
       `[exchange-spine] boot recovery: kept=${exchangeRecovery.kept.length} interrupted=${exchangeRecovery.interrupted.length} reverted=${exchangeRecovery.reverted.length}`
     );
+    // Phase 4, Step 4.3: draft-registry rehydration (only present when JANUS_INSTRUCTION_ENVELOPE
+    // is active) — the count of open Workbench/voice drafts + outstanding-approval bindings this
+    // boot rebuilt from durable agent_exchanges rows, so a restart's effect on in-flight
+    // communication is visible in the same boot log line boot recovery already uses.
+    if (exchangeRecovery.draftRegistry) {
+      console.log(
+        `[exchange-spine] draft-registry rehydration: drafts=${exchangeRecovery.draftRegistry.rehydratedDrafts.length} approvalBindings=${exchangeRecovery.draftRegistry.rehydratedApprovalBindings.length}`
+      );
+    }
   }
 }
 
@@ -1111,6 +1120,71 @@ function operatorSendOverflow(paneId: string, text: string): number {
   return renderedOverflow(text, profile);
 }
 
+/**
+ * Phase 4, Step 4.3 (REST-lane gap closure): the Workbench POST draft/send route writes directly
+ * (`term.writeInput`) — it never goes through dispatchProposal/applyDispatchDecision, so unlike
+ * every voice-side send it never got an AgentExchange, and therefore never got return-channel
+ * correlation (a subsequent pane idle/needs_input/failure signal had nothing to settle). This
+ * mints one, mirroring src/voice/index.ts's `stampExchangeForDispatch` (the only other envelope-
+ * draft exchange mint site) byte-for-byte in spirit: same createExchange call, same
+ * instruction_envelope_json stamp from the pane's open draft when one exists. Best-effort; a
+ * no-op (returns undefined) unless BOTH flags are active — `JANUS_EXCHANGE_SPINE` off means there
+ * is no spine to correlate against, and `JANUS_INSTRUCTION_ENVELOPE` not primary means this route
+ * is sending the LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before
+ * this existed in that case).
+ */
+function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: string): string | undefined {
+  if (!exchangeSpineActive() || !instructionEnvelopeIsPrimary()) return undefined;
+  try {
+    const openDraft = getOpenDraft(projectId, paneId);
+    return getExchangeService().createExchange({
+      projectId,
+      paneId,
+      operatorUtterance: "Workbench direct send",
+      distilledInstruction: text,
+      instructionEnvelopeJson: openDraft ? serializeDraftEnvelope(openDraft) : undefined,
+    }).exchangeId;
+  } catch (e) {
+    console.error("[exchange-spine] Workbench send: createExchange failed:", e);
+    return undefined;
+  }
+}
+
+/** The two-phase durable-intent ordering (spec §2b) around the Workbench's direct pane write —
+ *  mirrors `renderApproved` (src/gating/index.ts) / `applyAutoExecute` (src/dispatch/paneWrite.ts)
+ *  exactly: `delivery_attempted` genuinely precedes the write, `delivery_succeeded` genuinely
+ *  follows it, and a write that throws certainly-fails the exchange back to `draft` instead of
+ *  leaving it stranded `staged` (which boot recovery would otherwise have to quarantine as merely
+ *  UNCERTAIN). Every function below is a no-op without an exchangeId (the flag-off case above). */
+function beginExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
+  if (!exchangeId) return;
+  try {
+    const svc = getExchangeService();
+    svc.stageForDelivery(exchangeId);
+    svc.beginDeliveryAttempt(exchangeId);
+  } catch (e) {
+    console.error("[exchange-spine] Workbench send: beginDeliveryAttempt failed:", e);
+  }
+}
+
+function completeExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
+  if (!exchangeId) return;
+  try {
+    getExchangeService().completeDelivery(exchangeId);
+  } catch (e) {
+    console.error("[exchange-spine] Workbench send: completeDelivery failed:", e);
+  }
+}
+
+function failExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined, reason: string): void {
+  if (!exchangeId) return;
+  try {
+    getExchangeService().failDelivery(exchangeId, reason);
+  } catch (e) {
+    console.error("[exchange-spine] Workbench send: failDelivery failed:", e);
+  }
+}
+
 function registerDraftAndSettingsRoutes(
   app: express.Express,
   deps: {
@@ -1165,8 +1239,20 @@ function registerDraftAndSettingsRoutes(
       res.status(400).json({ error: `Draft is ${overflow} characters over this pane's size limit — shorten it before sending.` });
       return;
     }
-    HistoryManager.getInstance().addCommand(paneId, text);
-    term.writeInput(text);
+    // Phase 4, Step 4.3: mint + stamp the two-phase delivery markers around this direct write —
+    // closes the REST-lane gap (this route bypassed dispatchProposal entirely, so it never got
+    // return-channel correlation like the voice-side send does). Best-effort no-op unless both
+    // flags are active.
+    const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
+    beginExchangeDeliveryForWorkbenchSend(exchangeId);
+    HistoryManager.getInstance().addCommand(paneId, text, exchangeId);
+    try {
+      term.writeInput(text);
+    } catch (e) {
+      failExchangeDeliveryForWorkbenchSend(exchangeId, "workbench_write_threw");
+      throw e;
+    }
+    completeExchangeDeliveryForWorkbenchSend(exchangeId);
     broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
     // Step 3.5 (spec §5.3): the operator-direct send DELIVERED the draft — close the open envelope
     // exchange and withdraw any voice-staged approval for it (it would otherwise double-deliver).

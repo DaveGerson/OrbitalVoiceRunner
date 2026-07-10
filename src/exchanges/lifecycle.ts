@@ -348,6 +348,23 @@ export class ExchangeMachine {
     return this.transition(id, "interrupted");
   }
 
+  /**
+   * Phase 4, Step 4.3: adopt an ALREADY-DURABLE snapshot into this in-memory machine, verbatim,
+   * with NO legality check. This is deliberately not a "transition" — it exists for exactly one
+   * case: a recovery action (retry/cancel/resume-inspect, src/exchanges/recoveryActions.ts)
+   * operates on an exchange the durable store already knows about (possibly minted in a PRIOR
+   * process — the whole point of a recovery action) but this process's `ExchangeMachine` never
+   * created (a fresh boot's machine starts empty, per `recoverOnBoot`'s own doc). Without this
+   * seam, a store-level CAS performed by a recovery action would leave the LIVE machine + the
+   * correlator's active-pane binding (`ExchangeService.paneActive`) unaware the row now exists —
+   * so a later pane signal (idle/running/needs_input) could never correlate back to it. `hydrate`
+   * is the one-line fix: seed the map directly from durable truth. Never used to CREATE new
+   * history, never used to skip a legality check for an ordinary transition — every ordinary
+   * caller still goes through `transition()`/the named methods above. */
+  hydrate(snapshot: ExchangeSnapshot): void {
+    this.exchanges.set(snapshot.exchangeId, copy(snapshot));
+  }
+
   /** Boot recovery (spec §4): quarantine every uncertain in-flight exchange to `interrupted`;
    *  never resend, never invent an outcome for anything else. Pure classification + the same
    *  guarded transition used everywhere else — no history scanning. */
