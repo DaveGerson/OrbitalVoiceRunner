@@ -24,6 +24,7 @@
 
 import { z } from "zod";
 import type { ActionContext, ActionDef, ActionResult } from "../types";
+import { composeExchangeBoard, rankExchangeBoard, renderExchangeBoard } from "../../voice/sitrep";
 
 /** window_minutes arrives structured off the Gemini declaration; the handler clamps it. */
 const CatchMeUpParams = z.object({
@@ -80,6 +81,17 @@ export const catchMeUp: ActionDef<typeof CatchMeUpParams> = {
     const now = Date.now();
     const since = now - minutes * MS_PER_MINUTE;
 
+    // Phase 4, Step 4.2: exchange-aware catch-up, PREPENDED ahead of the legacy away-digest —
+    // needs_input/failed/complete/running/decision content is the higher-value signal (spec's
+    // 6-tier priority, the SAME ordering get_status_summary uses). Windowed to [since, now] via
+    // updatedAt so a repeated catch_me_up call never replays UNCHANGED exchange context; approval
+    // items (no natural "last changed" stamp beyond their own creation timestamp) are exempt from
+    // the window — an unresolved approval is always still relevant regardless of when it arrived.
+    const board = rankExchangeBoard(
+      composeExchangeBoard(ctx, now).filter((item) => item.kind === "approval" || item.updatedAt >= since),
+    );
+    const exchangeText = board.length > 0 ? renderExchangeBoard(board) : null;
+
     // Fire the SAME away-digest composer over the [since, now] window (fires the shipped path, does not
     // rebuild curation). Absent on REST/test paths => null => the graceful "nothing notable" line.
     const compose = (ctx as CatchMeUpContext).composeAwayDigest;
@@ -94,10 +106,15 @@ export const catchMeUp: ActionDef<typeof CatchMeUpParams> = {
       /* fail-open on the cortex leg — the spoken digest is the contract, the injection is best-effort */
     }
 
+    const parts = [exchangeText, digest].filter((s): s is string => !!s);
     const spoken =
-      digest ?? `Nothing notable in the last ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+      parts.length > 0
+        ? parts.join(" ")
+        : `Nothing notable in the last ${minutes} minute${minutes === 1 ? "" : "s"}.`;
     // Redaction pass before the string leaves the process (composeAwayDigest clauses are pane-id/count
     // strings today, but the redact is unconditional so no future raw text can ever escape unredacted).
+    // The exchange board is already redacted internally (composeExchangeBoard uses ctx.redact per
+    // field) — redactSecrets is idempotent, so this is a safe double-pass, not a double-scrub bug.
     return { kind: "ok", output: ctx.redact(spoken) };
   },
 };

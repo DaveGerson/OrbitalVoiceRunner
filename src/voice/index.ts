@@ -40,6 +40,9 @@ import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
 import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import type { ExchangeSnapshot } from "../exchanges/lifecycle";
+import { getExchangeNarrationGate } from "../announcementBus";
+import { terseExchangeOutcomeLine } from "./sitrep";
 import { reviseDraft, instructionEnvelopeIsPrimary } from "../exchanges/instructionEnvelope";
 import { getOpenDraft, setOpenDraft, setProseOverride, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval } from "../exchanges/draftRegistry";
 import {
@@ -157,6 +160,77 @@ export function backgroundProjectForSignal(
 ): string | null {
   if (!paneProjectId || pool.isForegroundProject(paneProjectId)) return null;
   return pool.stateFor(paneProjectId) === "handle" ? paneProjectId : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — exchange-aware pane-signal narration (pushSignal's enrichment, below in the
+// connection handler). Pulled out as small, parameterized pure(-ish) helpers so the connection
+// closure's own call site stays a flat two-line dispatch (complexity gate) — each helper here
+// takes `manager`/`sessionPool` as explicit params rather than capturing them, so they carry no
+// hidden closure state of their own.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+function isNarratableSignalKind(kind: string): boolean {
+  return kind === "idle" || kind === "prompt" || kind === "error" || kind === "exited";
+}
+
+/** "exception" states cross a background-project boundary and narrate immediately (foreground
+ *  session hears about background exceptions); "complete" is a meaningful outcome but is
+ *  SUPPRESSED for a backgrounded project (that project's own session picks it up on resume/
+ *  catch-up); every other state has nothing terse to say here — the plain pane-signal text
+ *  already covers it. */
+function exchangeNarrationClass(state: string): "exception" | "complete" | null {
+  if (state === "needs_input" || state === "agent_failed" || state === "interrupted") return "exception";
+  if (state === "agent_complete") return "complete";
+  return null;
+}
+
+function resolvePaneLabel(manager: OrchestratorManager, projectId: string | null, paneId: string): string {
+  const raw = projectId ? (manager.ledger.workspaces?.[projectId]?.panes?.[paneId]?.name || paneId) : paneId;
+  return redactSecrets(raw);
+}
+
+function resolveProjectLabel(manager: OrchestratorManager, projectId: string): string {
+  return redactSecrets(manager.ledger.workspaces?.[projectId]?.name || projectId);
+}
+
+/** A plain terse line for a foreground/no-project event, or an "In project 'X', ..."
+ *  exception-level summary for a background event — narration TEXT only; focus is never touched
+ *  (no setActivePane anywhere in this path). */
+function composeNarrationText(manager: OrchestratorManager, backgroundProjectId: string | null, line: string): string {
+  if (!backgroundProjectId) return line;
+  const projectName = resolveProjectLabel(manager, backgroundProjectId);
+  return `In project '${projectName}', ${line.charAt(0).toLowerCase()}${line.slice(1)}`;
+}
+
+/**
+ * The decision core behind pushSignal's exchange-aware enrichment: EXACTLY-ONCE narration (the
+ * ExchangeNarrationGate, keyed off the exchange's own durable `updatedAt`), background-project
+ * exception routing (an exception crosses over named explicitly; a plain completion waits for that
+ * project's own catch-up), and voice terseness (one clause, via terseExchangeOutcomeLine — shared
+ * with the on-demand board in src/voice/sitrep.ts so both surfaces read identically). Returns null
+ * for "nothing exchange-specific to say"; the caller falls back to formatPaneSignal(sig).
+ */
+function buildExchangeAwareSignalText(
+  manager: OrchestratorManager,
+  sessionPool: { isForegroundProject(projectId: string | null): boolean; stateFor(projectId: string): PoolEntryState },
+  sig: PaneSignal,
+  snap: ExchangeSnapshot,
+  exchangeId: string,
+): string | null {
+  const narrationClass = exchangeNarrationClass(snap.state);
+  if (!narrationClass) return null;
+
+  const paneProjectId = findPaneOwningProject(manager, sig.paneId)?.projectId ?? snap.projectId ?? null;
+  const backgroundProjectId = backgroundProjectForSignal(sessionPool, paneProjectId);
+  if (backgroundProjectId && narrationClass !== "exception") return null;
+
+  if (!getExchangeNarrationGate().shouldNarrate(exchangeId, snap.state, snap.updatedAt)) return null;
+
+  const line = terseExchangeOutcomeLine(
+    resolvePaneLabel(manager, paneProjectId, sig.paneId), snap.state, snap.terminalState, snap.resultSummary, redactSecrets,
+  );
+  return line ? composeNarrationText(manager, backgroundProjectId, line) : null;
 }
 
 /** Phase 2 Step 2.5 review fix (the Step 2.4 documented switch_context mixed-brief bug): on a
@@ -2143,11 +2217,45 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // already shows the pane, so a 10s-late "it's up" is pure noise).
         const READY_DEFER_MAX_MS = 10_000;
 
-        // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds).
+        // Phase 4, Step 4.2 — exchange-aware enrichment of a pane signal's spoken/context text.
+        // Returns null when there is nothing exchange-specific to say (spine off, no active
+        // exchange bound to this pane, an exchange state with no terse line, an already-narrated
+        // transition per the exactly-once gate, or a non-exception background-project event) — the
+        // caller falls back to the plain formatPaneSignal(sig) text exactly as before this step.
+        //
+        // VOICE TERSENESS: one clause (project + pane + outcome/question), never the full
+        // instruction/evidence — that detail lives in the action panel / replay.
+        //
+        // BACKGROUND PROJECT EVENTS: an exception (needs_input/agent_failed/interrupted) still
+        // reaches the foreground session even from a backgrounded project — but named explicitly
+        // ("In project 'X', ..."), and NEVER via setActivePane (focus is never stolen). A
+        // non-exception outcome (agent_complete) from a backgrounded project is suppressed here —
+        // that project's own session picks it up on resume/catch-up (get_status_summary /
+        // catch_me_up are exchange-aware and query the durable store directly), mirroring the z5c
+        // session-pool routing the 'inject' subscription below already applies to command-outcome
+        // memory briefs.
+        const exchangeAwareSignalText = (sig: PaneSignal): string | null => {
+          if (!exchangeSpineActive() || !isNarratableSignalKind(sig.kind)) return null;
+          try {
+            const svc = getExchangeService();
+            const exchangeId = svc.activeExchangeForPane(sig.paneId);
+            if (!exchangeId) return null;
+            const snap = svc.get(exchangeId);
+            if (!snap) return null;
+            return buildExchangeAwareSignalText(manager, sessionPool, sig, snap, exchangeId);
+          } catch (e) {
+            console.error("[voice] exchange-aware signal narration failed:", e);
+            return null;
+          }
+        };
+
+        // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds
+        // and every pane with no exchange correlation).
         const pushSignal = (sig: PaneSignal) => {
           try {
+            const text = exchangeAwareSignalText(sig) ?? formatPaneSignal(sig);
             justConnected.sendClientContent({
-              turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
+              turns: [{ role: "user", parts: [{ text }] }],
               turnComplete: false, // L1 fix: inject as passive context, not a forced spoken turn
             });
           } catch (e) {

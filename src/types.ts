@@ -494,7 +494,10 @@ export interface AttentionItem {
   id: string;
   // "idle" = informational completion (dispatch-group join, src/observe/index.ts) — consumers only
   // interpolate `type` into text, so the widening is display-safe.
-  type: "approval" | "exited" | "error" | "build-failed" | "confirmation" | "idle";
+  // "needs_input" (Phase 4, Step 4.2): an exchange-correlated agent question surfaced by the
+  // exchange-aware attention sync (src/voice/sitrep.ts syncExchangeAttentionItems) — distinct from
+  // "confirmation" (a co-pilot suggestion) because it names a REAL unanswered agent question.
+  type: "approval" | "exited" | "error" | "build-failed" | "confirmation" | "idle" | "needs_input";
   terminalId: string;
   projectId: string;
   message: string;

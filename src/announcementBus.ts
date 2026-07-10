@@ -331,3 +331,58 @@ export class AnnouncementBus {
     this.buffer = [];
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — EXACTLY-ONCE narration gate for exchange-correlated spoken/caption
+// announcements (src/voice/index.ts's live-session pushSignal enrichment). Keyed by
+// (exchange_id, event_type, narration-id). The narration-id is DERIVED, never separately stored:
+// callers pass the exchange's own durable `updated_at` (or an `exchange_events.event_id`) as the
+// anchor. `persistTransition` (src/exchanges/service.ts) only ever advances `updated_at` on a
+// genuine, CAS-won transition — a repeated pane edge that does NOT change exchange state is a
+// structural no-op there and therefore never produces a fresh anchor here either, so "have I
+// narrated this (exchange, eventType, anchor) triple" is a sufficient exactly-once test without a
+// second durable table. Process-lifetime, in-memory: a live client reconnect (WS drop/resume)
+// does NOT restart this process, so the gate's memory survives it (no re-announce on reconnect);
+// a genuine process restart already quarantines every in-flight exchange to `interrupted`
+// (recoverOnBoot) — a NEW, distinct transition worth narrating once — so losing the cache on an
+// actual restart is correct, not a gap.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+export class ExchangeNarrationGate {
+  private readonly seen = new Set<string>();
+
+  private key(exchangeId: string, eventType: string, anchor: number | string): string {
+    return `${exchangeId} ${eventType} ${anchor}`;
+  }
+
+  /** True the FIRST time this (exchangeId, eventType, anchor) combo is seen — and remembers it, so
+   *  every subsequent call with the SAME triple returns false. A DIFFERENT anchor (a genuine new
+   *  transition) is always a fresh true, even for the same exchange+eventType. */
+  shouldNarrate(exchangeId: string, eventType: string, anchor: number | string): boolean {
+    const k = this.key(exchangeId, eventType, anchor);
+    if (this.seen.has(k)) return false;
+    this.seen.add(k);
+    return true;
+  }
+
+  /** Test/debug hook — clears all narration memory (mirrors what a real process restart implies:
+   *  every in-flight exchange has already moved to `interrupted`, a fresh anchor). */
+  reset(): void {
+    this.seen.clear();
+  }
+}
+
+/** Process-lifetime singleton (mirrors src/exchanges/spine.ts's getExchangeService() idiom) — the
+ *  live voice session's pushSignal enrichment and any other narration surface share ONE gate so a
+ *  transition narrated via one path is never repeated via another. */
+let sharedExchangeNarrationGate: ExchangeNarrationGate | undefined;
+
+export function getExchangeNarrationGate(): ExchangeNarrationGate {
+  if (!sharedExchangeNarrationGate) sharedExchangeNarrationGate = new ExchangeNarrationGate();
+  return sharedExchangeNarrationGate;
+}
+
+/** Test-only reset (mirrors resetExchangeServiceForTests) — each test file that exercises the
+ *  gate should reset it in `before()`/`beforeEach()` so cases don't leak state across each other. */
+export function resetExchangeNarrationGateForTests(): void {
+  sharedExchangeNarrationGate = undefined;
+}

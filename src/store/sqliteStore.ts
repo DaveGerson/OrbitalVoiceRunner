@@ -9,7 +9,7 @@ import type {
   AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow,
 } from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
-import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState } from "../exchanges/types";
+import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState, ExchangeEventType } from "../exchanges/types";
 import { mintExchangeId, mintContextDeliveryId } from "../exchanges/types";
 
 /**
@@ -1593,6 +1593,39 @@ export class JanusStore {
     return (this.db.prepare(
       "SELECT * FROM exchange_events WHERE exchange_id=? ORDER BY ts ASC, event_id ASC"
     ).all(exchangeId) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 4, Step 4.2: exchanges currently in ANY of `states`, most-recently-updated FIRST — the
+   * cross-pane query catch-up/SITREP/attention prioritization needs ("what does the operator need
+   * to hear about right now", newest first), as opposed to `listExchangesByState` (single state,
+   * oldest-first, used by boot recovery). Uses idx_agent_exchanges_state per matched state.
+   */
+  listExchangesByStates(states: ExchangeState[], opts: { limit?: number } = {}): AgentExchange[] {
+    if (states.length === 0) return [];
+    const limit = opts.limit ?? 200;
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE state IN (${placeholders}) ORDER BY updated_at DESC LIMIT ?`
+    ).all(...states, limit) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 4, Step 4.2: recent `exchange_events` rows of the given `eventTypes`, newest first
+   * (idx_exchange_events_type_ts) — feeds the catch-up/SITREP "recent decisions" tier (e.g.
+   * `approval_confirmed`) without walking every exchange's own timeline individually.
+   */
+  listRecentExchangeEventsByTypes(
+    eventTypes: ExchangeEventType[],
+    opts: { sinceTs?: number; limit?: number } = {},
+  ): ExchangeEvent[] {
+    if (eventTypes.length === 0) return [];
+    const limit = opts.limit ?? 20;
+    const sinceTs = opts.sinceTs ?? 0;
+    const placeholders = eventTypes.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM exchange_events WHERE event_type IN (${placeholders}) AND ts >= ? ORDER BY ts DESC, event_id DESC LIMIT ?`
+    ).all(...eventTypes, sinceTs, limit) as ExchangeEventRow[]).map(r => ({ ...r }));
   }
 
   // ── context_deliveries (schema v12) ──────────────────────────────────────────────────────────

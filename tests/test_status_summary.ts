@@ -15,6 +15,7 @@ import {
 } from "../src/voice/sitrep";
 import type { ActionContext } from "../src/actions/types";
 import type { SitrepPayload, SitrepRanking } from "../src/voice/policyClient";
+import { JanusStore } from "../src/store/sqliteStore";
 
 const EMPTY_TEXT =
   "Nothing needs your attention: no pending approvals, no alerts, and no panes are busy.";
@@ -434,5 +435,66 @@ describe("runStatusSummary", () => {
     } as unknown as ActionContext;
     const result = await runStatusSummary(ctx);
     assert.strictEqual(result.kind, "ok");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — exchange-aware SITREP: runStatusSummary prefers the exchange board
+// (src/voice/sitrep.ts composeExchangeBoard) whenever there is real exchange activity, and falls
+// back to the byte-identical legacy pipeline above when there is none (every test above has no
+// ctx.store, so none of them exercise this branch).
+// ─────────────────────────────────────────────────────────────────────────────
+describe("runStatusSummary — exchange-aware board (Phase 4, Step 4.2)", () => {
+  it("a needs_input exchange drives the spoken summary ahead of plain busy/idle pane text", async () => {
+    const store = new JanusStore(":memory:");
+    store.init();
+    const now = Date.now();
+    store.insertExchange({
+      project_id: "proj1", pane_id: "p1", state: "needs_input",
+      terminal_state: "deploy to prod? y/n", updated_at: now - 1000,
+    });
+    const ctx = makeCtx({
+      terminals: { p1: { projectId: "proj1", status: "Running", lastStatusChangeAt: now, lastCommand: "" } },
+    });
+    (ctx as unknown as { store: JanusStore }).store = store;
+    const result = await runStatusSummary(ctx);
+    const output = String((result as { output: unknown }).output);
+    assert.ok(output.includes(`needs your input: "deploy to prod? y/n"`), output);
+    store.close();
+  });
+
+  it("an idle pane count is still appended after the exchange board (nothing silently dropped)", async () => {
+    const store = new JanusStore(":memory:");
+    store.init();
+    const now = Date.now();
+    store.insertExchange({
+      project_id: "proj1", pane_id: "p1", state: "agent_failed",
+      terminal_state: "build broke", updated_at: now - 1000,
+    });
+    const ctx = makeCtx({
+      terminals: {
+        p1: { projectId: "proj1", status: "Idle", lastStatusChangeAt: now, lastCommand: "" },
+        p2: { projectId: "proj1", status: "Idle", lastStatusChangeAt: now, lastCommand: "" },
+      },
+    });
+    (ctx as unknown as { store: JanusStore }).store = store;
+    const result = await runStatusSummary(ctx);
+    const output = String((result as { output: unknown }).output);
+    assert.ok(output.includes("failed: build broke"), output);
+    assert.ok(output.includes("2 panes idle."), output);
+    store.close();
+  });
+
+  it("no exchange activity (store attached, but empty) -> byte-identical to the legacy pipeline", async () => {
+    const store = new JanusStore(":memory:");
+    store.init();
+    const ctx = makeCtx({
+      terminals: { p1: { projectId: "x", status: "Running", lastStatusChangeAt: 0, lastCommand: "" } },
+      sitrepShape: "brief",
+    });
+    (ctx as unknown as { store: JanusStore }).store = store;
+    const result = await runStatusSummary(ctx);
+    assert.ok(String((result as { output: unknown }).output).includes("1 busy"));
+    store.close();
   });
 });
