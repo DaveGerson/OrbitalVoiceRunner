@@ -156,3 +156,12 @@ export interface GeminiTurnUsageRow {
 /** Raw `context_injections` row (schema v10, cortex context-injection telemetry). Column-for-column
  *  with `ContextInjectionEvent` (src/memory/contextTelemetry.ts) — this IS that shape as stored. */
 export type ContextInjectionRow = import("../memory/contextTelemetry").ContextInjectionEvent;
+
+/** Raw `agent_exchanges` row (schema v12, AgentExchange spine). Column-for-column with
+ *  `AgentExchange` (src/exchanges/types.ts) — this IS that shape as stored; no boolean columns to
+ *  coerce, so the row IS the stored shape (mirrors the ContextInjectionRow precedent above). */
+export type AgentExchangeRow = import("../exchanges/types").AgentExchange;
+/** Raw `exchange_events` row (schema v12). Column-for-column with `ExchangeEvent`. */
+export type ExchangeEventRow = import("../exchanges/types").ExchangeEvent;
+/** Raw `context_deliveries` row (schema v12). Column-for-column with `ContextDelivery`. */
+export type ContextDeliveryRow = import("../exchanges/types").ContextDelivery;

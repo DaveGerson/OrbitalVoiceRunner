@@ -1,10 +1,13 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
-/** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn. */
-const MIGRATIONS: ((db: Database.Database) => void)[] = [
+/** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn.
+ *  Exported (not just `applyMigrations`) so tests can build a pre-migration fixture DB by
+ *  running a PREFIX of this array directly (see tests/test_store_migration.ts) — the same
+ *  technique `applyMigrations` itself uses, just index-bounded instead of full-length. */
+export const MIGRATIONS: ((db: Database.Database) => void)[] = [
   // v1: initial schema
   (db) => {
     db.exec(`
@@ -359,6 +362,99 @@ const MIGRATIONS: ((db: Database.Database) => void)[] = [
       "SELECT name FROM sqlite_master WHERE type='table' AND name='notes'"
     ).get();
     if (hasNotes) db.exec(`ALTER TABLE notes ADD COLUMN bead_status TEXT;`);
+  },
+  // v12 (AgentExchange spine, Phase 1 step 1.2 — spec 2026-07-09-agent-exchange-spine.md §6): the
+  // communication-only exchange lifecycle. Purely additive: three new tables + nullable
+  // `ALTER TABLE … ADD COLUMN exchange_id` correlation columns on five existing tables (the v2
+  // `handoff_id` / v7 `interaction_id` precedent), so every existing explicit-column INSERT/UPSERT
+  // is unaffected and every pre-existing row reads back unchanged with exchange_id = NULL. NO
+  // historical correlation is ever backfilled — new columns stay NULL for pre-existing rows
+  // forever; only a NEW exchange-service write (step 1.3+) ever populates them. Storage only here:
+  // no lifecycle/state-machine code lands with this migration (that's src/exchanges/lifecycle.ts,
+  // step 1.3). Terminal command history is file-backed (HistoryManager / .janus_history.json), NOT
+  // SQLite, so it gets no DDL — its `exchange_id` correlation is an additive optional JSON field
+  // (spec §6, "Where a column can't land").
+  //
+  // Each ALTER is guarded on its target table's existence (the v11 `hasNotes` idiom) — NOT because
+  // a real upgrade path can ever be missing these tables (pending_approvals/events/action_log/
+  // attention all predate v9, context_injections is v10, so on any real DB every one of them
+  // exists long before v12 runs), but because a test fixture that bumps `user_version` directly
+  // to isolate ONE later migration's bump-path (tests/test_context_telemetry_store.ts's "v9->v10"
+  // case) legitimately skips the earlier tables' DDL. Guarding keeps this migration robust to that
+  // pattern without weakening it for the real, full-chain upgrade it exists to serve.
+  (db) => {
+    const hasTable = (name: string): boolean =>
+      !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name);
+    db.exec(`
+      CREATE TABLE agent_exchanges (
+        exchange_id            TEXT PRIMARY KEY NOT NULL,
+        project_id             TEXT NOT NULL,
+        pane_id                TEXT NOT NULL,
+        voice_session_id       TEXT,
+        interaction_id         TEXT,
+        operator_utterance     TEXT NOT NULL DEFAULT '',
+        distilled_instruction  TEXT NOT NULL DEFAULT '',
+        instruction_envelope_json TEXT NOT NULL DEFAULT '{}',
+        draft_version          INTEGER NOT NULL DEFAULT 1,
+        context_version        TEXT,
+        state                  TEXT NOT NULL DEFAULT 'draft',
+        approval_id            TEXT,
+        approval_draft_version INTEGER,
+        delivery_attempt       INTEGER NOT NULL DEFAULT 0,
+        terminal_state         TEXT,
+        result_summary         TEXT,
+        result_envelope_json   TEXT,
+        created_at             INTEGER NOT NULL,
+        updated_at             INTEGER NOT NULL,
+        delivered_at           INTEGER,
+        completed_at           INTEGER
+      );
+      CREATE INDEX idx_agent_exchanges_state         ON agent_exchanges(state);
+      CREATE INDEX idx_agent_exchanges_pane_state    ON agent_exchanges(pane_id, state);
+      CREATE INDEX idx_agent_exchanges_project_created ON agent_exchanges(project_id, created_at);
+      CREATE INDEX idx_agent_exchanges_approval      ON agent_exchanges(approval_id);
+
+      CREATE TABLE exchange_events (
+        event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        exchange_id   TEXT NOT NULL,
+        project_id    TEXT,
+        pane_id       TEXT,
+        event_type    TEXT NOT NULL,
+        payload_redacted_json TEXT NOT NULL DEFAULT '{}',
+        source        TEXT NOT NULL DEFAULT 'system',
+        interaction_id TEXT,
+        ts            INTEGER NOT NULL
+      );
+      CREATE INDEX idx_exchange_events_exchange_ts ON exchange_events(exchange_id, ts);
+      CREATE INDEX idx_exchange_events_type_ts     ON exchange_events(event_type, ts);
+
+      CREATE TABLE context_deliveries (
+        delivery_id      TEXT PRIMARY KEY NOT NULL,
+        project_id       TEXT,
+        voice_session_id TEXT,
+        context_version  TEXT NOT NULL,
+        trigger          TEXT NOT NULL,
+        snapshot_hash    TEXT,
+        brief_hash       TEXT,
+        included_sources_json TEXT NOT NULL DEFAULT '[]',
+        dropped_sources_json  TEXT NOT NULL DEFAULT '[]',
+        acknowledged_at  INTEGER,
+        ts               INTEGER NOT NULL
+      );
+      CREATE INDEX idx_context_deliveries_session_ts ON context_deliveries(voice_session_id, ts);
+      CREATE INDEX idx_context_deliveries_version    ON context_deliveries(context_version);
+    `);
+    if (hasTable("pending_approvals")) db.exec(`ALTER TABLE pending_approvals ADD COLUMN exchange_id TEXT;`);
+    if (hasTable("action_log")) db.exec(`
+      ALTER TABLE action_log ADD COLUMN exchange_id TEXT;
+      CREATE INDEX idx_action_log_exchange_id ON action_log(exchange_id);
+    `);
+    if (hasTable("attention")) db.exec(`ALTER TABLE attention ADD COLUMN exchange_id TEXT;`);
+    if (hasTable("context_injections")) db.exec(`ALTER TABLE context_injections ADD COLUMN exchange_id TEXT;`);
+    if (hasTable("events")) db.exec(`
+      ALTER TABLE events ADD COLUMN exchange_id TEXT;
+      CREATE INDEX idx_events_exchange ON events(exchange_id);
+    `);
   },
 ];
 

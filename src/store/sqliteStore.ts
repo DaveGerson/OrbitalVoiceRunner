@@ -6,8 +6,11 @@ import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHand
 import type {
   PaneRow, ArchivedPaneRow, ProjectRow, NoteRow, PendingApprovalRow, PendingActionRow,
   AttentionRow, HandoffRow, ValueRow, CountRow, IdRow, SearchHitRow,
+  AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow,
 } from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
+import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState } from "../exchanges/types";
+import { mintExchangeId, mintContextDeliveryId } from "../exchanges/types";
 
 /**
  * One persisted row of the unified ACTION LOG (schema v6, PLM2). Mirrors F1's ActionAuditRow call
@@ -1445,6 +1448,204 @@ export class JanusStore {
       ).all(since, limit) as import("./types").ContextInjectionRow[];
     } catch (e) {
       console.error("[store] getContextInjections failed:", e);
+      return [];
+    }
+  }
+
+  // ── AgentExchange spine (schema v12, Phase 1 step 1.2) ──────────────────────────────────────────
+  // STORAGE ONLY: pure CRUD + the exchange-level CAS (spec §2a). No transition-legality checking
+  // lives here — src/exchanges/lifecycle.ts (step 1.3) owns the state machine and decides what to
+  // write; this layer just persists it atomically and reports whether a CAS won. Core ledger data
+  // (like handoffs/pending_approvals), so these throw on a genuine DB error rather than fail-soft —
+  // callers need a real signal to distinguish "CAS lost" (changed:false) from "the store broke".
+
+  // Per-column defaults for insertExchange, table-driven (the paneMetaToStoredPane /
+  // PANE_META_DEFAULTS idiom) so the constructor stays well under the CC-10 gate instead of a
+  // 16-field chain of `??` (which alone would trip the complexity rule — each `??` is a branch).
+  private static readonly EXCHANGE_DEFAULTS: ReadonlyArray<readonly [keyof AgentExchange, unknown]> = [
+    ["voice_session_id", null], ["interaction_id", null], ["operator_utterance", ""],
+    ["distilled_instruction", ""], ["instruction_envelope_json", "{}"], ["draft_version", 1],
+    ["context_version", null], ["state", "draft"], ["approval_id", null],
+    ["approval_draft_version", null], ["delivery_attempt", 0], ["terminal_state", null],
+    ["result_summary", null], ["result_envelope_json", null], ["delivered_at", null], ["completed_at", null],
+  ];
+
+  /** Insert a new exchange row. `exchange_id` is minted (spec §2 ID minting) when absent. Every
+   *  other column has a documented default (schema v12) so a caller only needs to pass the fields
+   *  it actually knows at `exchange_created` time (project_id, pane_id, the utterance/instruction). */
+  insertExchange(input: Partial<AgentExchange> & Pick<AgentExchange, "project_id" | "pane_id">): AgentExchange {
+    const now = Date.now();
+    const rec = {
+      exchange_id: input.exchange_id ?? mintExchangeId(now),
+      project_id: input.project_id,
+      pane_id: input.pane_id,
+      created_at: input.created_at ?? now,
+      updated_at: input.updated_at ?? now,
+    } as Record<string, unknown>;
+    for (const [col, dflt] of JanusStore.EXCHANGE_DEFAULTS) {
+      rec[col] = (input as Record<string, unknown>)[col] ?? dflt;
+    }
+    const row = rec as unknown as AgentExchange;
+    this.db.prepare(
+      `INSERT INTO agent_exchanges(exchange_id,project_id,pane_id,voice_session_id,interaction_id,
+         operator_utterance,distilled_instruction,instruction_envelope_json,draft_version,
+         context_version,state,approval_id,approval_draft_version,delivery_attempt,terminal_state,
+         result_summary,result_envelope_json,created_at,updated_at,delivered_at,completed_at)
+       VALUES(@exchange_id,@project_id,@pane_id,@voice_session_id,@interaction_id,
+         @operator_utterance,@distilled_instruction,@instruction_envelope_json,@draft_version,
+         @context_version,@state,@approval_id,@approval_draft_version,@delivery_attempt,@terminal_state,
+         @result_summary,@result_envelope_json,@created_at,@updated_at,@delivered_at,@completed_at)`
+    ).run(row);
+    return row;
+  }
+
+  getExchange(exchangeId: string): AgentExchange | null {
+    const r = this.db.prepare("SELECT * FROM agent_exchanges WHERE exchange_id=?").get(exchangeId) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /** Exchanges currently in `state`, oldest first (idx_agent_exchanges_state). */
+  listExchangesByState(state: ExchangeState): AgentExchange[] {
+    return (this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE state=? ORDER BY created_at ASC"
+    ).all(state) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /** Every exchange ever created for `paneId`, oldest first (idx_agent_exchanges_pane_state). */
+  listExchangesByPane(paneId: string): AgentExchange[] {
+    return (this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE pane_id=? ORDER BY created_at ASC"
+    ).all(paneId) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * CAS-guarded update — the SQL half of spec §2(a): `UPDATE … WHERE exchange_id=? AND state=?
+   * [AND approval_id=? AND approval_draft_version=?]`. Every legal transition in the lifecycle
+   * machine (step 1.3) is exactly one such guarded UPDATE, so repeated/racing application of the
+   * same event is a structural no-op. Returns `changed:false` on a lost/stale CAS — callers must
+   * treat that as "already applied / superseded", never retry it as a fresh write.
+   */
+  updateExchange(
+    exchangeId: string,
+    patch: Partial<Omit<AgentExchange, "exchange_id" | "project_id" | "pane_id" | "created_at">>,
+    cas: { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null },
+  ): { changed: boolean; exchange: AgentExchange | null } {
+    const sets: string[] = [];
+    const params: Record<string, unknown> = { exchange_id: exchangeId, cas_state: cas.state };
+    for (const [col, value] of Object.entries(patch)) { sets.push(`${col}=@${col}`); params[col] = value; }
+    if (!("updated_at" in patch)) { sets.push("updated_at=@updated_at"); params.updated_at = Date.now(); }
+    let where = "exchange_id=@exchange_id AND state=@cas_state";
+    if (cas.approvalId !== undefined) { where += " AND approval_id=@cas_approval_id"; params.cas_approval_id = cas.approvalId; }
+    if (cas.approvalDraftVersion !== undefined) {
+      where += " AND approval_draft_version=@cas_approval_draft_version";
+      params.cas_approval_draft_version = cas.approvalDraftVersion;
+    }
+    const res = this.db.prepare(`UPDATE agent_exchanges SET ${sets.join(", ")} WHERE ${where}`).run(params);
+    return { changed: res.changes === 1, exchange: this.getExchange(exchangeId) };
+  }
+
+  /** Append one exchange_events row (AUTOINCREMENT event_id). Append-only audit spine — the
+   *  exchange row above is the mutable head. Never throws on a genuine insert error (core ledger
+   *  data), mirroring appendEventInTxn's contract for the parallel `events` table. */
+  appendExchangeEvent(event: {
+    exchange_id: string;
+    event_type: ExchangeEvent["event_type"];
+    project_id?: string | null;
+    pane_id?: string | null;
+    payload_redacted_json?: string;
+    source?: ExchangeEvent["source"];
+    interaction_id?: string | null;
+    ts?: number;
+  }): ExchangeEvent {
+    const rec = {
+      exchange_id: event.exchange_id,
+      project_id: event.project_id ?? null,
+      pane_id: event.pane_id ?? null,
+      event_type: event.event_type,
+      payload_redacted_json: event.payload_redacted_json ?? "{}",
+      source: event.source ?? "system",
+      interaction_id: event.interaction_id ?? null,
+      ts: event.ts ?? Date.now(),
+    };
+    const info = this.db.prepare(
+      `INSERT INTO exchange_events(exchange_id,project_id,pane_id,event_type,payload_redacted_json,source,interaction_id,ts)
+       VALUES(@exchange_id,@project_id,@pane_id,@event_type,@payload_redacted_json,@source,@interaction_id,@ts)`
+    ).run(rec);
+    return { event_id: Number(info.lastInsertRowid), ...rec };
+  }
+
+  /** Ordered timeline for one exchange (idx_exchange_events_exchange_ts): `ts ASC, event_id ASC` —
+   *  event_id is the AUTOINCREMENT PK, so same-millisecond bursts still get a deterministic order. */
+  listExchangeEvents(exchangeId: string): ExchangeEvent[] {
+    return (this.db.prepare(
+      "SELECT * FROM exchange_events WHERE exchange_id=? ORDER BY ts ASC, event_id ASC"
+    ).all(exchangeId) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  // ── context_deliveries (schema v12) ──────────────────────────────────────────────────────────
+  // Sibling of the v10 context_injections telemetry spine (same fail-soft contract as
+  // recordContextInjection/getContextInjections: a delivery ledger row is useful-but-not-critical
+  // observability, so a DB fault here logs and degrades gracefully rather than breaking a caller
+  // on the voice hot path).
+
+  private static readonly CONTEXT_DELIVERY_DEFAULTS: ReadonlyArray<readonly [keyof ContextDelivery, unknown]> = [
+    ["project_id", null], ["voice_session_id", null], ["snapshot_hash", null], ["brief_hash", null],
+    ["included_sources_json", "[]"], ["dropped_sources_json", "[]"], ["acknowledged_at", null],
+  ];
+
+  /** Insert one context-delivery row. `delivery_id` is minted (mirrors `ctxevt-` minting) when
+   *  absent. Fail-soft: swallows + console.error on any DB error (mirrors recordContextInjection);
+   *  the constructed row is still returned so a caller has a stable delivery_id either way. */
+  insertContextDelivery(
+    input: Partial<ContextDelivery> & Pick<ContextDelivery, "context_version" | "trigger">,
+  ): ContextDelivery {
+    const now = Date.now();
+    const rec = {
+      delivery_id: input.delivery_id ?? mintContextDeliveryId(now),
+      context_version: input.context_version,
+      trigger: input.trigger,
+      ts: input.ts ?? now,
+    } as Record<string, unknown>;
+    for (const [col, dflt] of JanusStore.CONTEXT_DELIVERY_DEFAULTS) {
+      rec[col] = (input as Record<string, unknown>)[col] ?? dflt;
+    }
+    const row = rec as unknown as ContextDelivery;
+    try {
+      this.db.prepare(
+        `INSERT INTO context_deliveries(delivery_id,project_id,voice_session_id,context_version,trigger,
+           snapshot_hash,brief_hash,included_sources_json,dropped_sources_json,acknowledged_at,ts)
+         VALUES(@delivery_id,@project_id,@voice_session_id,@context_version,@trigger,
+           @snapshot_hash,@brief_hash,@included_sources_json,@dropped_sources_json,@acknowledged_at,@ts)`
+      ).run(row);
+    } catch (e) {
+      console.error("[store] insertContextDelivery failed:", e);
+    }
+    return row;
+  }
+
+  /** Stamp `acknowledged_at` exactly once. True iff this call did the stamping (idempotent: a
+   *  second ack on an already-acknowledged row is a no-op, `false`). Fail-soft on a DB error. */
+  acknowledgeContextDelivery(deliveryId: string, at: number = Date.now()): boolean {
+    try {
+      const res = this.db.prepare(
+        "UPDATE context_deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL"
+      ).run(at, deliveryId);
+      return res.changes === 1;
+    } catch (e) {
+      console.error("[store] acknowledgeContextDelivery failed:", e);
+      return false;
+    }
+  }
+
+  /** Every delivery for one voice session, oldest first (idx_context_deliveries_session_ts).
+   *  Fail-soft: an unexpected DB error yields an empty array (mirrors getContextInjections). */
+  listContextDeliveries(sessionId: string): ContextDelivery[] {
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM context_deliveries WHERE voice_session_id=? ORDER BY ts ASC"
+      ).all(sessionId) as ContextDeliveryRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listContextDeliveries failed:", e);
       return [];
     }
   }

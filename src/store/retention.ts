@@ -12,6 +12,11 @@ export interface PruneOpts {
   cortexDecisionTtlDays?: number;
   /** gemini_turn_usage TTL in days (B-3 spine). Default 30. */
   geminiTurnUsageTtlDays?: number;
+  /** exchange_events TTL in days (AgentExchange spine, schema v12). Default 30 — same append-only,
+   *  no-replay-requirement rationale as action_log/cortex_decision (ACTION_LOG_TTL_DAYS). The
+   *  `agent_exchanges` head rows and `context_deliveries` are NOT pruned here (out of scope for
+   *  this pass — only the append-only event timeline gets bounded retention). */
+  exchangeEventsTtlDays?: number;
 }
 
 /**
@@ -63,6 +68,12 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
       db.prepare("DELETE FROM cortex_decision WHERE ts < ?").run(opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
       db.prepare("DELETE FROM gemini_turn_usage WHERE ts < ?").run(opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
     } catch { /* pre-v9 DB: tables absent, skip */ }
+    // AgentExchange spine (schema v12): exchange_events is append-only like action_log/
+    // cortex_decision, so it gets the same bounded TTL. Guarded for the same reason as the B-3
+    // pair above — a pre-v12 DB (tables absent) must not fail the whole boot-prune transaction.
+    try {
+      db.prepare("DELETE FROM exchange_events WHERE ts < ?").run(opts.now - (opts.exchangeEventsTtlDays ?? ACTION_LOG_TTL_DAYS) * day);
+    } catch { /* pre-v12 DB: table absent, skip */ }
   });
   tx();
   // Orphaned scrollback sweep: delete .log files not referenced by any live or archived pane.
@@ -102,6 +113,8 @@ export interface SweepOpts {
   cortexDecisionTtlDays?: number;
   /** gemini_turn_usage TTL in days (B-3 spine). Default 30. */
   geminiTurnUsageTtlDays?: number;
+  /** exchange_events TTL in days (AgentExchange spine, schema v12). Default 30. */
+  exchangeEventsTtlDays?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
 }
@@ -121,6 +134,7 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
   const alCutoff = opts.now - (opts.actionLogTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
   const cdCutoff = opts.now - (opts.cortexDecisionTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
   const gtuCutoff = opts.now - (opts.geminiTurnUsageTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
+  const eeCutoff = opts.now - (opts.exchangeEventsTtlDays ?? ACTION_LOG_TTL_DAYS) * day;
   const pendingCutoff = opts.now - PENDING_PRUNE_GRACE_MS;
 
   const deleted: Record<string, number> = {};
@@ -164,6 +178,13 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM gemini_turn_usage WHERE id IN (SELECT id FROM gemini_turn_usage WHERE ts < ? ORDER BY id LIMIT ?)",
       [gtuCutoff]);
   } catch { /* pre-v9 DB: tables absent, skip */ }
+  // AgentExchange spine (schema v12): same batched-append-only pattern, own try/catch so a
+  // pre-v12 DB (table absent) doesn't fail the whole sweep tick.
+  try {
+    step("exchange_events",
+      "DELETE FROM exchange_events WHERE event_id IN (SELECT event_id FROM exchange_events WHERE ts < ? ORDER BY event_id LIMIT ?)",
+      [eeCutoff]);
+  } catch { /* pre-v12 DB: table absent, skip */ }
 
   return { deleted, more };
 }
