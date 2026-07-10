@@ -259,6 +259,13 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   retry_exchange: new Set<Surface>(["rest"]),
   cancel_exchange: new Set<Surface>(["rest"]),
   open_exchange_pane: new Set<Surface>(["rest"]),
+
+  // ── Phase 5, Step 5.2 exchange replay/metrics: NEW rest-only observability defs (no voice twin —
+  // see src/actions/defs/observability.ts's own scope note). Both outputs (a full multi-field
+  // timeline, a many-field metrics report) are read/inspected via REST/CLI, not spoken; a voice
+  // twin is not planned. ──
+  replay_exchange: new Set<Surface>(["rest"]),
+  get_exchange_metrics: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

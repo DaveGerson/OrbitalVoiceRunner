@@ -332,6 +332,22 @@ export class JanusStore {
       .map(r => this.hydrateApproval(r));
   }
 
+  /**
+   * Phase 5, Step 5.2 (exchange replay): every `pending_approvals` row stamped with this
+   * `exchange_id` (schema v12's nullable correlation column), regardless of claimed state —
+   * a replay's whole point is showing the operator the approval record that GOVERNED the
+   * exchange, even one already claimed/resolved. A row is only ever durably ABSENT here once
+   * `deletePendingApproval` actually runs (normal resolve, or the 4E.3c claimed=1 retention
+   * sweep) — replay degrades to "no surviving approval record" in that case, never fabricated.
+   * Ordered by timestamp ASC (oldest first, mirrors getPendingApprovals). Bounded: at most a
+   * handful of approval requests ever correlate to one exchange in practice.
+   */
+  listPendingApprovalsByExchange(exchangeId: string): StoredPendingApproval[] {
+    return (this.db.prepare(
+      "SELECT * FROM pending_approvals WHERE exchange_id=? ORDER BY timestamp ASC"
+    ).all(exchangeId) as PendingApprovalRow[]).map(r => this.hydrateApproval(r));
+  }
+
   // ── durable deferred actions (bead wsm-e2e-pinned-kzt, schema v5) ─────────────────────────────
   // Mirrors the pending_approvals seam: insert the INTENT, atomic-claim the exactly-once gate, delete
   // on resolve, hydrate un-claimed survivors on boot. PendingActionStore rebuilds run() via
@@ -1640,6 +1656,46 @@ export class JanusStore {
     return (this.db.prepare(
       `SELECT * FROM exchange_events WHERE event_type IN (${placeholders}) AND ts >= ? ORDER BY ts DESC, event_id DESC LIMIT ?`
     ).all(...eventTypes, sinceTs, limit) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 5, Step 5.2 (exchange metrics report): EVERY exchange row created since `sinceMs` —
+   * the report-window read `buildExchangeMetricsReport` (src/exchanges/metrics.ts) needs, as
+   * opposed to `listExchangesByState`/`listExchangesByStates` (state-scoped) or
+   * `listExchangesByPane` (pane-scoped). Oldest first (mirrors `listExchangesByPane`'s
+   * ordering); mirrors `getContextDeliveries`'s window/limit/fail-soft shape (Phase 2 Step 2.2)
+   * so the two report modules share one calling convention.
+   */
+  listExchangesSince(sinceMs: number, opts: { limit?: number } = {}): AgentExchange[] {
+    const limit = opts.limit ?? 1_000_000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM agent_exchanges WHERE created_at >= ? ORDER BY created_at ASC LIMIT ?"
+      ).all(sinceMs, limit) as AgentExchangeRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listExchangesSince failed:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Phase 5, Step 5.2: EVERY `exchange_events` row (any event_type) since `sinceMs`, ordered
+   * `ts ASC, event_id ASC` — a single flat, globally-ordered stream a report module groups by
+   * `exchange_id` itself (grouping a stream already sorted this way preserves each group's own
+   * chronological order, so no per-exchange re-sort is needed downstream). Distinct from
+   * `listRecentExchangeEventsByTypes` (type-filtered, newest-first, small default limit — a
+   * catch-up/SITREP read) and `listExchangeEvents` (single exchange only).
+   */
+  listExchangeEventsSince(sinceMs: number, opts: { limit?: number } = {}): ExchangeEvent[] {
+    const limit = opts.limit ?? 1_000_000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM exchange_events WHERE ts >= ? ORDER BY ts ASC, event_id ASC LIMIT ?"
+      ).all(sinceMs, limit) as ExchangeEventRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listExchangeEventsSince failed:", e);
+      return [];
+    }
   }
 
   // ── context_deliveries (schema v12) ──────────────────────────────────────────────────────────

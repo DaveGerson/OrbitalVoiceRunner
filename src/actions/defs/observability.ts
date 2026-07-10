@@ -9,6 +9,8 @@
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import type { ShadowStats } from "../../approvalShadow";
+import { buildReplayTimeline } from "../../exchanges/replay";
+import { buildExchangeMetricsReport } from "../../exchanges/metrics";
 
 /**
  * Inc 2 task 2.2 observability: derive the additive `shadow` health block from the optional ctx getter.
@@ -120,5 +122,66 @@ export const getHealth: ActionDef<typeof HealthParams> = {
   },
 };
 
-/** The OBSERVABILITY group registry slice (Wave D). */
-export const OBSERVABILITY_ACTIONS: ActionDef[] = [getActionLog, getHealth];
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5, Step 5.2 — exchange REPLAY + METRICS (communication-quality observability). Both are
+// pure, deterministic reads over the AgentExchange spine's durable rows/events
+// (src/exchanges/replay.ts / src/exchanges/metrics.ts do ALL the actual joining/math); these two
+// defs are thin REST wrappers, mirroring get_action_log/get_health's own posture (UNGATED reads,
+// readOnly so runAction re-redacts string leaves on egress — belt-and-suspenders on top of both
+// modules' own defensive re-redaction). REST-ONLY (not voice): the task brief scoped this pass to
+// "REST + CLI surfaces" for an audit/observability drill-down, and both outputs (a full timeline,
+// a many-field metrics report) are read/inspected, not spoken — matching get_project_export's own
+// rest-only precedent (see tests/test_live_harness.ts's golden voice-tool-count comment, which this
+// module deliberately does NOT bump).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ReplayExchangeParams = z.object({ exchange_id: z.string() });
+
+export const replayExchange: ActionDef<typeof ReplayExchangeParams> = {
+  name: "replay_exchange",
+  description:
+    "Replay one exchange's full redacted communication timeline: state, ordered events, target " +
+    "resolutions, draft revisions, questions, terminal transitions, result summaries, approval " +
+    "records, context deliveries, and a hash of the delivered instruction (never the raw text). " +
+    "Degrades gracefully (a 'degraded' flag + note) when exchange_events were pruned by retention.",
+  params: ReplayExchangeParams,
+  capability: "read_notes",
+  readOnly: true,
+  surfaces: new Set(["rest"]),
+  rest: { method: "get", path: "/api/exchanges/:exchange_id/replay" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: { found: false, note: "no durable store wired" } };
+    return { kind: "ok", output: buildReplayTimeline(ctx.store, args.exchange_id) };
+  },
+};
+
+// z.coerce.number so a REST query string ("?since_ms=..&limit=..") coerces to a number; voice
+// passes real numbers. Mirrors ActionLogParams's own coercion idiom above.
+const ExchangeMetricsParams = z.object({
+  since_ms: z.coerce.number().optional(),
+  limit: z.coerce.number().optional(),
+});
+
+export const getExchangeMetrics: ActionDef<typeof ExchangeMetricsParams> = {
+  name: "get_exchange_metrics",
+  description:
+    "Deterministic communication-quality metrics over the AgentExchange spine for a window " +
+    "(since_ms epoch ms, default 0 = all time; optional row limit): wrong-target/duplicate " +
+    "deliveries, clarification causes, draft-edit counts, speech-to-draft and delivery latency " +
+    "percentiles (p50/p95), context-delivery cost, and recovery-state counts.",
+  params: ExchangeMetricsParams,
+  capability: "read_notes",
+  readOnly: true,
+  surfaces: new Set(["rest"]),
+  rest: { method: "get", path: "/api/exchange-metrics" },
+  handler: (args, ctx): ActionResult => {
+    if (!ctx.store) return { kind: "ok", output: { note: "no durable store wired" } };
+    return {
+      kind: "ok",
+      output: buildExchangeMetricsReport(ctx.store, { sinceMs: args.since_ms, limit: args.limit }),
+    };
+  },
+};
+
+/** The OBSERVABILITY group registry slice (Wave D + Phase 5.2). */
+export const OBSERVABILITY_ACTIONS: ActionDef[] = [getActionLog, getHealth, replayExchange, getExchangeMetrics];

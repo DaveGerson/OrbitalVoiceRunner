@@ -56,6 +56,7 @@ import type { JanusStore } from "../store/sqliteStore";
 import type { ExchangeService } from "./service";
 import type { AgentExchange, ExchangeEvent } from "./types";
 import { TERMINAL_STATES } from "./lifecycle";
+import { fetchExchangeCore } from "./replay";
 
 // ── resume-inspect ──────────────────────────────────────────────────────────────────────────────
 
@@ -67,17 +68,20 @@ export interface ResumeInspectView {
 
 /** Surface an exchange's current durable state + its recent event timeline — the read-only half
  *  of recovery. Store-level (never the in-memory machine): the whole point is to work for an
- *  exchange this process never created. `null` when the id does not exist. */
+ *  exchange this process never created. `null` when the id does not exist.
+ *  Phase 5, Step 5.2: shares its exchange-row + event-timeline read with the fuller replay joiner
+ *  (`fetchExchangeCore`, src/exchanges/replay.ts) rather than re-implementing the same two store
+ *  calls — this stays the lightweight, bounded "recent events" view; replay.ts's
+ *  `buildReplayTimeline` is the full, multi-source, redacted timeline built from the same pair. */
 export function resumeInspectExchange(
   store: JanusStore,
   exchangeId: string,
   opts?: { limit?: number },
 ): ResumeInspectView | null {
-  const exchange = store.getExchange(exchangeId);
-  if (!exchange) return null;
+  const core = fetchExchangeCore(store, exchangeId);
+  if (!core) return null;
   const limit = opts?.limit ?? 10;
-  const events = store.listExchangeEvents(exchangeId);
-  return { exchange, recentEvents: events.slice(-limit).reverse() };
+  return { exchange: core.exchange, recentEvents: core.events.slice(-limit).reverse() };
 }
 
 // ── retry eligibility (pure, independently testable) ────────────────────────────────────────────

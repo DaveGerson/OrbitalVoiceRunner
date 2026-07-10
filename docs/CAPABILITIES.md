@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**114** actions across **26** gated capabilities, plus the always-allowed group.
+**116** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -220,6 +220,7 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | `catch_me_up` | voice | yes | Catch the operator up on what happened over a recent time window WITHOUT reconnecting |
 | `get_action_log` | voice / rest | yes | Read the unified action log |
 | `get_attention_digest` | voice | yes | Speak a structured summary of items needing the operator's attention |
+| `get_exchange_metrics` | rest | yes | Deterministic communication-quality metrics over the AgentExchange spine for a window (since_ms epoch ms, default 0 = all time; optional row limit) |
 | `get_health` | voice / rest | yes | Report a one-glance health snapshot |
 | `get_pane_gates` | voice / rest | yes | Read the resolved capability-gate matrix for a pane (or global if pane_id omitted) |
 | `get_project_export` | rest | no | Return the same deterministic, secret-redacted Markdown export as export_project, as a markdown download (text/markdown; Content-Disposition |
@@ -231,6 +232,7 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | `list_pending_approvals` | voice | yes | List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count) |
 | `list_prompt_templates` | voice / rest | yes | List the saved prompt templates (name, description, and the {{slot}} parameters each one needs) |
 | `read_handoff` | voice / rest | yes | Read a single handoff (UNGATED, redacted output) |
+| `replay_exchange` | rest | yes | Replay one exchange's full redacted communication timeline |
 | `search_notes` | voice | yes | Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries') |
 
 ## Read a pane's output
