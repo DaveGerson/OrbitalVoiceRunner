@@ -22,6 +22,56 @@ export function shouldSendDraftOverWs(
   return !!ws && ws.readyState === openState;
 }
 
+// ── Phase 3, Step 3.3: instruction-envelope exchange draft — pure derivations ───────────────────
+//
+// The Workbench/Kitchen UI surfaces a pane's open InstructionEnvelope draft (src/types.ts's
+// ExchangeDraftView, mirrored from src/exchanges/draftRegistry.ts's viewOpenDraft). These two pure
+// functions are the ONLY non-trivial decisions that view needs, extracted here (rather than inlined
+// in the component) so they're node:test-pinned like the rest of this module — see
+// tests/test_composer_logic.ts.
+
+/**
+ * "none"  — this draft has never been sent (no version recorded as delivered).
+ * "sent"  — the CURRENT draft_version is the one most recently delivered — nothing has changed
+ *           since; what's on screen is what the pane received.
+ * "stale" — a delivery happened, but the draft has since been revised (draft_version has moved past
+ *           the last delivered version) — what's on screen is NOT what the pane received.
+ */
+export type ExchangeApprovalState = "none" | "sent" | "stale";
+
+/**
+ * Derives the approval/delivery state from `draftVersion` + the exchange machinery's own
+ * `sentVersions` (bumped today only by the voice `send_instruction` verb — spec
+ * docs/superpowers/specs/2026-07-09-instruction-routing.md §5.3). The Workbench's REST send lane
+ * (`POST /api/panes/:projectId/:paneId/draft/send`) is documented in that spec as eventually
+ * stamping the same exchange, but does not yet (a real, pre-existing backend gap, not something
+ * this UI layer can close without a new mutating route) — so a caller MAY pass
+ * `optimisticDeliveredVersion` (a client-local "I clicked Send and the server accepted it" marker,
+ * the same optimistic-then-reconciled idiom useOrbitalData already uses for e.g. attention dismiss)
+ * to reflect that lane honestly without inventing server-side bookkeeping. Pure: no clocks, no I/O.
+ */
+export function deriveExchangeApprovalState(
+  draftVersion: number,
+  sentVersions: readonly number[],
+  optimisticDeliveredVersion?: number | null,
+): ExchangeApprovalState {
+  const lastDelivered = Math.max(-1, ...sentVersions, optimisticDeliveredVersion ?? -1);
+  if (lastDelivered < 0) return "none";
+  return lastDelivered >= draftVersion ? "sent" : "stale";
+}
+
+/** A one-line, screen-reader-friendly summary of an ExchangeReadiness result (src/types.ts), for
+ *  the Workbench panel's aria-live status text and title attributes. */
+export function exchangeReadinessSummary(
+  readiness: { ready: true } | { ready: false; missing: "target" | "objective"; clarification: string },
+): string {
+  // NOTE: `readiness.ready === false` (not `!readiness.ready`) — mirrors src/actions/defs/
+  // voice_ux.ts's sendInstruction note on the exact same pattern: TS's narrowing on a negated
+  // boolean-discriminant does not reliably exclude the `{ ready: true }` union member.
+  if (readiness.ready === false) return `Not ready — ${readiness.clarification}`;
+  return "Ready to send";
+}
+
 /**
  * Whether the right-rail "Sync Spec" header should show its draft-pending pulse dot
  * (sync-spec-draft-badge): true iff the active-pane buffer holds non-whitespace text OR any pane

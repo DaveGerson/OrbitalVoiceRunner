@@ -18,7 +18,7 @@
 //      never per frame). The target resolver only RECEIVES this as input — this module is where
 //      it is maintained.
 
-import type { EnvelopeDraft } from "./instructionEnvelope";
+import { assessReadiness, type EnvelopeDraft, type ReadinessResult } from "./instructionEnvelope";
 
 function keyFor(projectId: string, paneId: string): string {
   return `${projectId}::${paneId}`;
@@ -38,6 +38,47 @@ export function setOpenDraft(projectId: string, paneId: string, draft: EnvelopeD
 
 export function clearOpenDraft(projectId: string, paneId: string): void {
   openDrafts.delete(keyFor(projectId, paneId));
+}
+
+// ── client-facing getter (Phase 3, Step 3.3 — instruction-routing spec §5, UI surfacing) ──────────
+//
+// A pure, read-only projection of an EnvelopeDraft onto a flat, JSON-serializable shape for the
+// draft_updated broadcast frame and the GET /api/panes/:projectId/:paneId/draft response
+// (server.ts). Mirrors src/types.ts's client-side ExchangeDraftView structurally (kept as two
+// independent declarations, not a shared import, so the client bundle never pulls in this module's
+// zod-backed instructionEnvelope dependency — the src/exchanges/** <-> src/orbital/** boundary the
+// program's Python/TS-seam posture already draws elsewhere in this repo). No I/O, never throws.
+export interface OpenDraftView {
+  exchangeId: string;
+  target: { projectId: string; paneId: string } | null;
+  objective: string;
+  relevantContext: string[];
+  constraints: string[];
+  requestedOutput: string | null;
+  completionSignal: string | null;
+  draftVersion: number;
+  sentVersions: number[];
+  readiness: ReadinessResult;
+}
+
+/** The open draft for this pane, projected for a client, or null when there is none. Callers gate
+ *  this on `instructionEnvelopeActive()` themselves (server.ts) so the field is omitted/`null`
+ *  byte-for-byte when the flag is off — zero payload shape change for existing clients. */
+export function viewOpenDraft(projectId: string, paneId: string): OpenDraftView | null {
+  const draft = getOpenDraft(projectId, paneId);
+  if (!draft) return null;
+  return {
+    exchangeId: draft.exchangeId,
+    target: draft.target,
+    objective: draft.envelope.objective,
+    relevantContext: draft.envelope.relevant_context,
+    constraints: draft.envelope.constraints,
+    requestedOutput: draft.envelope.requested_output,
+    completionSignal: draft.envelope.completion_signal,
+    draftVersion: draft.draftVersion,
+    sentVersions: [...draft.sentVersions],
+    readiness: assessReadiness(draft),
+  };
 }
 
 /** Find the (projectId, paneId, draft) triple currently holding this exchangeId as its open draft,

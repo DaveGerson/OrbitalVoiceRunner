@@ -27,12 +27,13 @@ import type {
   PaneLayout,
   AttentionItem,
   ActionActivityFrame,
+  ExchangeDraftView,
 } from "../types";
 import type { StoredNote, StoredHandoff } from "../store/types";
 import { findPostureProfileByName, normalizeGateMap } from "../settingsGatesRoundTrip";
 import { extractSlots } from "../templates";
 import {
-  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
+  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, exchangeFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
@@ -220,8 +221,10 @@ export interface OrbitalData {
   toast: { msg: string; kind: "fire" | "warn"; action?: ToastAction } | null;
   /** 2K.1: the freezer — archived (recoverable) panes from GET /api/archive. */
   archived: ArchivedPane[];
-  /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror. */
-  paneDrafts: Record<string, { text: string; at: number }>;
+  /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror.
+   *  Phase 3, Step 3.3 (additive): `exchange` carries the pane's open instruction-envelope draft
+   *  when JANUS_INSTRUCTION_ENVELOPE is shadow/primary and one exists; null/absent otherwise. */
+  paneDrafts: Record<string, { text: string; at: number; exchange?: ExchangeDraftView | null }>;
   /** 4U.2: latest server-pushed history per pane (history_updated frames; entries null = refetch). */
   paneHistories: Record<string, { entries: PaneHistoryEntry[] | null; at: number }>;
   /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
@@ -384,7 +387,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn"; action?: ToastAction } | null>(null);
   // 2K.1: the freezer (archived, recoverable panes). 2K.3: per-pane server-pushed draft mirror.
   const [archived, setArchived] = useState<ArchivedPane[]>([]);
-  const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number }>>({});
+  const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number; exchange?: ExchangeDraftView | null }>>({});
   // 4U.2: per-pane server-pushed history mirror (history_updated frames carry the full array;
   // a frame without one stores entries:null so the burner knows to refetch).
   const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
@@ -751,7 +754,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // latest text per pane; the Order Pad applies it ONLY while the textarea isn't focused
       // (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
       draft_updated: () => {
-        if (typeof msg.paneId === "string") setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text: draftTextFromFrame(msg), at: Date.now() } }));
+        if (typeof msg.paneId === "string") {
+          // Phase 3, Step 3.3 (additive): mirror the frame's `exchange` field alongside the text —
+          // exchangeFromFrame degrades to null on a malformed/absent field (old server, flag off),
+          // so the text mirror above is completely unaffected either way.
+          setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text: draftTextFromFrame(msg), at: Date.now(), exchange: exchangeFromFrame(msg) } }));
+        }
       },
       // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full array —
       // mirror it per-pane so an open burner repaints; a payload-less frame stores entries:null, which

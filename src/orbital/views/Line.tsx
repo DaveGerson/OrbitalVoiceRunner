@@ -9,6 +9,13 @@ import { TILTS } from "../theme";
 import type { Station, StationProject } from "../station";
 import type { Tweaks } from "../useTweaks";
 import type { StoredHandoff } from "../../store/types";
+import type { ExchangeDraftView } from "../../types";
+
+// Phase 3, Step 3.3 (additive): a pane's open instruction-envelope draft, by pane id — threaded
+// Board → sections → StationCard exactly like HandoffWiring's byPane map above. Omitted/undefined
+// entries render no card chip (StationCard.ExchangeStateChip already no-ops on a null/undefined
+// exchange), so this is a zero-visual-delta addition for any caller that doesn't pass it.
+export type ExchangeByPane = Record<string, ExchangeDraftView | null | undefined>;
 
 // j4e1: the handoff line-drawer wiring, threaded Board → sections → StationCard. `byPane` maps a
 // station id (to_pane) to the handoffs bound to it; the callbacks fire the canonical REST twins.
@@ -47,29 +54,31 @@ function Empty({ msg }: { msg: string }) {
   return <div style={{ padding: 18, textAlign: "center", border: "2px dashed #c9a97a", borderRadius: 10, fontFamily: "Caveat, cursive", fontSize: 17, color: "#8a6a4f" }}>{msg}</div>;
 }
 
-function PaneList({ items, dark, compact, layout, onOpen, showCue, activeId, handoffs }: {
+function PaneList({ items, dark, compact, layout, onOpen, showCue, activeId, handoffs, exchangeByPane }: {
   items: Station[]; dark: boolean; compact: boolean; layout: Tweaks["layout"];
   onOpen: (st: Station) => void; showCue: boolean; activeId: string | null; handoffs?: HandoffWiring;
+  exchangeByPane?: ExchangeByPane;
 }) {
   if (items.length === 0) return <Empty msg="nothin' cookin' here 😴" />;
   if (layout === "list") {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {items.map((st) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={0} onOpen={() => onOpen(st)} layout="list" showCue={showCue} active={st.id === activeId} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
+        {items.map((st) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={0} onOpen={() => onOpen(st)} layout="list" showCue={showCue} active={st.id === activeId} exchange={exchangeByPane?.[st.id]} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
       </div>
     );
   }
   return (
     <div style={{ display: "grid", gridTemplateColumns: compact ? "repeat(auto-fill, minmax(248px, 1fr))" : "repeat(auto-fill, minmax(290px, 1fr))", gap: compact ? 13 : 18 }}>
-      {items.map((st, i) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={TILTS[i % TILTS.length]} onOpen={() => onOpen(st)} layout="grid" showCue={showCue} active={st.id === activeId} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
+      {items.map((st, i) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={TILTS[i % TILTS.length]} onOpen={() => onOpen(st)} layout="grid" showCue={showCue} active={st.id === activeId} exchange={exchangeByPane?.[st.id]} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
     </div>
   );
 }
 
-function ProjectSection({ proj, items, dark, compact, layout, onOpen, showCue, activeId, onNewPane, handoffs }: {
+function ProjectSection({ proj, items, dark, compact, layout, onOpen, showCue, activeId, onNewPane, handoffs, exchangeByPane }: {
   proj: StationProject; items: Station[]; dark: boolean; compact: boolean; layout: Tweaks["layout"];
   onOpen: (st: Station) => void; showCue: boolean; activeId: string | null; onNewPane?: (projectId: string) => void;
   handoffs?: HandoffWiring;
+  exchangeByPane?: ExchangeByPane;
 }) {
   const running = items.filter((s) => s.status === "Running").length;
   return (
@@ -90,7 +99,7 @@ function ProjectSection({ proj, items, dark, compact, layout, onOpen, showCue, a
           fontFamily: "DM Sans", fontWeight: 800, fontSize: 12, boxShadow: "2px 2px 0 0 " + INK,
         }}><Icon name="plus" size={13} /> Pane</button>
       </div>
-      <PaneList items={items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} handoffs={handoffs} />
+      <PaneList items={items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} handoffs={handoffs} exchangeByPane={exchangeByPane} />
     </section>
   );
 }
@@ -113,13 +122,15 @@ function ClearExitedChip({ count, onClear }: { count: number; onClear?: () => vo
   );
 }
 
-export function Board({ stations, projects, dark, density, layout, onOpen, showCue, activeId, selectedProject, onNewPane, onClearExited, handoffs }: {
+export function Board({ stations, projects, dark, density, layout, onOpen, showCue, activeId, selectedProject, onNewPane, onClearExited, handoffs, exchangeByPane }: {
   stations: Station[]; projects: StationProject[]; dark: boolean; density: Tweaks["density"]; layout: Tweaks["layout"];
   onOpen: (st: Station) => void; showCue: boolean; activeId: string | null; selectedProject: string; onNewPane?: (projectId: string) => void;
   /** 2K.1: archive all Exited panes (POST /api/terminals/clear-exited). */
   onClearExited?: () => void;
   /** j4e1: the per-station handoff line-drawer wiring (handoffs by to_pane + deliver/revise/reject). */
   handoffs?: HandoffWiring;
+  /** Phase 3, Step 3.3 (additive): open instruction-envelope drafts by pane id — compact card chip. */
+  exchangeByPane?: ExchangeByPane;
 }) {
   const compact = density === "dense";
   const scope = selectedProject === "all" ? stations : stations.filter((s) => s.project === selectedProject);
@@ -145,7 +156,7 @@ export function Board({ stations, projects, dark, density, layout, onOpen, showC
                 <span style={{ width: 24, height: 24, borderRadius: "50%", background: INK, color: "#fff4de", display: "grid", placeItems: "center", fontFamily: "Fraunces", fontWeight: 900, fontSize: 12 }}>{items.length}</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                {items.map((st, i) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={TILTS[i % TILTS.length]} onOpen={() => onOpen(st)} layout="grid" showCue={showCue} active={st.id === activeId} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
+                {items.map((st, i) => <Fragment key={st.id}><StationCard st={st} accentHex={st.projectColor} dark={dark} compact={compact} tilt={TILTS[i % TILTS.length]} onOpen={() => onOpen(st)} layout="grid" showCue={showCue} active={st.id === activeId} exchange={exchangeByPane?.[st.id]} {...handoffCardProps(handoffs, st.id)} /></Fragment>)}
                 {items.length === 0 && <Empty msg="nothin' here 😴" />}
               </div>
             </section>
@@ -165,7 +176,7 @@ export function Board({ stations, projects, dark, density, layout, onOpen, showC
         </div>
       )}
       {groups.length === 0 && <Empty msg="the line's quiet — fire up a pane to start cookin' 🍳" />}
-      {groups.map((g) => <Fragment key={g.p.id}><ProjectSection proj={g.p} items={g.items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} onNewPane={onNewPane} handoffs={handoffs} /></Fragment>)}
+      {groups.map((g) => <Fragment key={g.p.id}><ProjectSection proj={g.p} items={g.items} dark={dark} compact={compact} layout={layout} onOpen={onOpen} showCue={showCue} activeId={activeId} onNewPane={onNewPane} handoffs={handoffs} exchangeByPane={exchangeByPane} /></Fragment>)}
     </div>
   );
 }

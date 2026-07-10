@@ -221,6 +221,13 @@ export default function OrbitalApp() {
     onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onStage: data.stageHandoff,
     onReject: data.rejectHandoff, onFetchPrompt: data.fetchHandoffPrompt,
   }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.stageHandoff, data.rejectHandoff, data.fetchHandoffPrompt]);
+  // Phase 3, Step 3.3 (additive): the open instruction-envelope draft per pane, for the board's
+  // compact card chip (StationCard.ExchangeStateChip). Sourced from the SAME paneDrafts mirror the
+  // burner's Order Pad already reads (draft_updated frames' additive `exchange` field).
+  const exchangeByPane = useMemo(
+    () => Object.fromEntries(Object.entries(data.paneDrafts).map(([paneId, d]) => [paneId, d.exchange ?? null])),
+    [data.paneDrafts],
+  );
   const running = stations.filter((s) => s.status === "Running").length;
   // Velocity-design (D7): the conversational pill's state, derived from the voice-channel signals the
   // data layer already computes + tool-call activity off the transcript (activeSources). Pure machine,
@@ -308,7 +315,7 @@ export default function OrbitalApp() {
             onDenyAttention={(item) => data.denyAttention(item)}
             onRestartAttention={(id) => data.restartPane(id)}
             onDismissAttention={(id) => data.dismissAttention(id)} />
-          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />
+          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} exchangeByPane={exchangeByPane} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
         <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column" }}>

@@ -21,9 +21,11 @@ import { INK, RUNTIMES } from "./theme";
 import { Button, Chip, Icon, PostureChip, StatusBadge, VoiceCue } from "./primitives";
 import { TICKET_KINDS } from "./theme";
 import { useDialog } from "./useFocusTrap";
+import { InstructionWorkbench } from "./InstructionWorkbench";
 import type { Station } from "./station";
 import type { StoredNote } from "../store/types";
 import type { PaneHistoryEntry } from "./useOrbitalData";
+import type { ExchangeDraftView } from "../types";
 // Pure helpers live in a CSS-free sibling module so unit tests can import them
 // without triggering the xterm/css load that kills the Node test runner.
 export {
@@ -86,30 +88,45 @@ function ControlKeyBar({ paneId, dark, onKey }: { paneId: string; dark: boolean;
 // Per-pane WIP draft — the Order Pad. Fetches the saved draft on open (skipped in mock; the harness
 // has no server), persists edits over the observe WS (`draft_edit`) when connected or PUT otherwise,
 // and Send fires the real …/draft/send POST. Returns the live text + handlers.
-function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject<boolean>, wsRef: MutableRefObject<WebSocket | null>, incoming?: { text: string; at: number }) {
+function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject<boolean>, wsRef: MutableRefObject<WebSocket | null>, incoming?: { text: string; at: number; exchange?: ExchangeDraftView | null }) {
   const [text, setText] = useState("");
+  // Phase 3, Step 3.3 (additive): the pane's open instruction-envelope exchange draft, mirrored
+  // from the SAME GET/draft_updated payloads the plain-text `text` above already reads (server.ts's
+  // additive `exchange` field). `dismissed`/`localAck` are small client-local view overlays for the
+  // two REST-lane gaps documented in InstructionWorkbench.tsx's header comment (cancel doesn't clear
+  // the server-side registry yet; the Workbench send lane doesn't stamp sentVersions yet) — both are
+  // keyed by exchangeId/version so a genuinely new draft always shows fresh, un-overlaid state.
+  const [exchange, setExchange] = useState<ExchangeDraftView | null>(null);
+  const [dismissedExchangeId, setDismissedExchangeId] = useState<string | null>(null);
+  const [localAck, setLocalAck] = useState<{ exchangeId: string; version: number } | null>(null);
   // 2K.3: the focus-lock (classic App.tsx:1164-1176) — a server-pushed draft must never clobber
   // the operator mid-keystroke. Tracked by the textarea's onFocus/onBlur below.
   const focusedRef = useRef(false);
   useEffect(() => {
-    if (!paneId || isMockRef.current) { setText(""); return; }
+    if (!paneId || isMockRef.current) { setText(""); setExchange(null); return; }
     let cancelled = false;
     apiFetch(`/api/panes/${projectId}/${paneId}/draft`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (!cancelled && d) setText(d.draft?.text ?? ""); })
+      .then((d) => {
+        if (cancelled || !d) return;
+        setText(d.draft?.text ?? "");
+        setExchange((d.exchange as ExchangeDraftView | undefined) ?? null);
+      })
       .catch(() => { /* pane has no draft yet */ });
     return () => { cancelled = true; };
   }, [projectId, paneId, isMockRef]);
 
   // 2K.3: mirror incoming draft_updated frames (Janus dictation, another view's edit) into the
-  // pad — ONLY while the textarea isn't focused (the classic guard). `at` keys re-application.
+  // pad — the TEXT mirror stays gated on the focus-lock (ONLY while the textarea isn't focused); the
+  // exchange struct is metadata the operator never edits by keystroke here, so it always mirrors.
   const incomingAt = incoming?.at;
   const incomingText = incoming?.text;
+  const incomingExchange = incoming?.exchange;
   useEffect(() => {
-    if (incomingAt === undefined || typeof incomingText !== "string") return;
-    if (focusedRef.current) return; // operator is typing — their keystrokes win
-    setText(incomingText);
-  }, [incomingAt, incomingText]);
+    if (incomingAt === undefined) return;
+    if (typeof incomingText === "string" && !focusedRef.current) setText(incomingText);
+    setExchange(incomingExchange ?? null);
+  }, [incomingAt, incomingText, incomingExchange]);
 
   const onChange = (v: string) => {
     setText(v);
@@ -136,7 +153,23 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
     } catch { /* pane may have exited */ }
     return false;
   };
-  return { text, onChange, send, scrap: () => onChange(""), focusedRef };
+  // The Workbench "Send" button calls the SAME `send()` above (no parallel effect path); this just
+  // records the client-local delivered-version marker afterward — see the exchange state doc comment.
+  const ackSend = (): void => {
+    if (exchange) setLocalAck({ exchangeId: exchange.exchangeId, version: exchange.draftVersion });
+  };
+  const scrap = () => onChange("");
+  // The Workbench "Cancel" control: the SAME clear-the-draft PUT the existing "Scrap" button already
+  // fires, plus dismissing this exchangeId's panel client-side (the honest bridge for the REST lane
+  // not yet clearing the server-side draft registry — see InstructionWorkbench.tsx's header comment).
+  const cancelExchange = () => {
+    if (exchange) setDismissedExchangeId(exchange.exchangeId);
+    scrap();
+  };
+  const effectiveExchange = exchange && exchange.exchangeId !== dismissedExchangeId ? exchange : null;
+  const optimisticDeliveredVersion =
+    effectiveExchange && localAck && localAck.exchangeId === effectiveExchange.exchangeId ? localAck.version : null;
+  return { text, onChange, send, ackSend, scrap, cancelExchange, focusedRef, exchange: effectiveExchange, optimisticDeliveredVersion };
 }
 
 // 4U.2: the pane's recorded command history — the same raw feed the classic per-pane panel reads
@@ -207,8 +240,9 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   wsRef: MutableRefObject<WebSocket | null>;
   voiceCues: boolean;
   paneNotes: StoredNote[];
-  /** 2K.3: the latest server-pushed draft for this pane (applied only while the pad isn't focused). */
-  incomingDraft?: { text: string; at: number };
+  /** 2K.3: the latest server-pushed draft for this pane (applied only while the pad isn't focused).
+   *  Phase 3, Step 3.3 (additive): `exchange` carries the pane's open instruction-envelope draft. */
+  incomingDraft?: { text: string; at: number; exchange?: ExchangeDraftView | null };
   /** 4U.2: the latest server-pushed history for this pane (history_updated; entries null = refetch). */
   incomingHistory?: { entries: PaneHistoryEntry[] | null; at: number };
   onAddNote: (text: string) => void;
@@ -261,11 +295,16 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   const draft = useDraft(st.project || "default_project", st.id, isMockRef, wsRef, incomingDraft);
   // 2K.5: shared dialog semantics — initial focus, focus trap, Escape closes (top-most only).
   const dialogRef = useDialog<HTMLDivElement>(onClose);
+  // Phase 3, Step 3.3: the ONE Send effect (POST …/draft/send) both the Order Pad's own Send button
+  // AND the InstructionWorkbench's Send control call — no parallel effect path.
+  const draftTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const onSend = async () => {
     const ok = await draft.send();
+    if (ok) draft.ackSend();
     showToast(ok ? "Sent to the line 🔥" : "Nothing to send", ok ? "fire" : "warn");
   };
+  const onRevise = () => { setTab("pad"); draftTextareaRef.current?.focus(); };
 
   // Guard against the Enter→blur double-fire (Enter commits, then the input unmounts and its
   // blur would commit again) — one commit per edit session.
@@ -330,9 +369,14 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   );
 
   // Inline render-helper: the Order Pad tab content.
+  // Phase 3, Step 3.3: the InstructionWorkbench panel renders ONLY when this pane has an open
+  // instruction-envelope draft (draft.exchange non-null) — otherwise this tab is byte-identical to
+  // before this step (the zero-visual-delta regression the component test pins).
   const renderPadTab = () => (
-    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, background: dark ? "#2f1d12" : "#fff9ec" }}>
-      <textarea data-testid="burner-draft" value={draft.text} onChange={(e) => draft.onChange(e.target.value)}
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", padding: 14, overflowY: "auto", background: dark ? "#2f1d12" : "#fff9ec" }}>
+      <InstructionWorkbench exchange={draft.exchange} dark={dark} optimisticDeliveredVersion={draft.optimisticDeliveredVersion}
+        onRevise={onRevise} onCancel={draft.cancelExchange} onSend={onSend} />
+      <textarea data-testid="burner-draft" ref={draftTextareaRef} value={draft.text} onChange={(e) => draft.onChange(e.target.value)}
         onFocus={() => { draft.focusedRef.current = true; }}
         onBlur={() => { draft.focusedRef.current = false; }}
         placeholder={`Write the next order for ${st.name}, or dictate it to the Chef…`}

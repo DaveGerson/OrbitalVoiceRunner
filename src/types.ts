@@ -273,6 +273,35 @@ export interface PaneDraft {
   updatedBy?: "janus" | "operator";
 }
 
+// Phase 3, Step 3.3 — the client-side projection of a pane's open InstructionEnvelope draft
+// (docs/superpowers/specs/2026-07-09-instruction-routing.md §5). Additive, optional everywhere it
+// is threaded: server truth only, mirrored one-way from the `exchange` field on the draft_updated
+// WS frame and the GET /api/panes/:projectId/:paneId/draft response — src/exchanges/draftRegistry.ts's
+// `viewOpenDraft` is the server-side serializer this shape mirrors structurally (kept as an
+// independent declaration so the client bundle never imports the zod-backed exchanges module).
+// `null`/absent whenever JANUS_INSTRUCTION_ENVELOPE is "off" (default) or the pane has no open
+// draft — every existing PaneDraft-only surface is unaffected either way.
+export type ExchangeReadiness =
+  | { ready: true }
+  | { ready: false; missing: "target" | "objective"; clarification: string };
+
+export interface ExchangeDraftView {
+  exchangeId: string;
+  target: { projectId: string; paneId: string } | null;
+  objective: string;
+  relevantContext: string[];
+  constraints: string[];
+  requestedOutput: string | null;
+  completionSignal: string | null;
+  /** Bumps on every revise (voice field edit or typed hand-edit convergence) — spec §5. */
+  draftVersion: number;
+  /** Versions the exchange machinery has recorded as sent (voice `send_instruction` only today —
+   *  the Workbench's own REST send lane does not yet stamp this array, a known backend gap; see
+   *  ExchangeApprovalState below for how the client covers the REST lane honestly). */
+  sentVersions: number[];
+  readiness: ExchangeReadiness;
+}
+
 export interface PaneMeta {
   pane_id: string;
   name: string;

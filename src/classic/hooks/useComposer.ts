@@ -32,6 +32,7 @@ import type * as React from "react";
 import { useState, type Dispatch, type SetStateAction } from "react";
 import { apiFetch } from "../../utils/api";
 import { shouldSendDraftOverWs } from "../helpers/composerLogic";
+import type { ExchangeDraftView } from "../../types";
 
 /** One WIP-draft register row, as returned by GET /api/projects/:id/drafts. */
 export type WipDraft = { paneId: string; draft: { text: string; updatedAt: string; updatedBy?: string } };
@@ -64,6 +65,14 @@ export interface Composer {
   setWipDrafts: Dispatch<SetStateAction<WipDraft[]>>;
   contextInput: string;
   setContextInput: Dispatch<SetStateAction<string>>;
+  /** Phase 3, Step 3.3 (additive, PRESERVES all WIP-draft behavior above unchanged): the open
+   *  instruction-envelope exchange draft for the active pane, mirrored from the SAME GET response
+   *  fetchActiveDraft already reads (its additive `exchange` field — server.ts, gated on
+   *  JANUS_INSTRUCTION_ENVELOPE). null when the flag is off, the pane has no open draft, or no
+   *  pane is open. Refreshed only on fetchActiveDraft — this hook does not itself own a live WS
+   *  subscription (see useComposer.ts's header comment); a caller wanting live pushes threads its
+   *  own draft_updated handling the same way it already threads promptBuffer today. */
+  exchangeDraft: ExchangeDraftView | null;
   fetchActiveDraft: (projId?: string, paneId?: string | null) => Promise<void>;
   fetchWipDrafts: (projId?: string) => Promise<void>;
   handlePromptBufferChange: (val: string) => void;
@@ -82,15 +91,21 @@ export function useComposer(params: ComposerParams): Composer {
   // visible (and never lost) when the operator switches to another.
   const [wipDrafts, setWipDrafts] = useState<WipDraft[]>([]);
   const [contextInput, setContextInput] = useState("");
+  // Phase 3, Step 3.3 (additive): see the Composer.exchangeDraft doc comment above.
+  const [exchangeDraft, setExchangeDraft] = useState<ExchangeDraftView | null>(null);
 
   // Step 6 (the Workbench): the buffer is the ACTIVE pane's persistent WIP draft.
   const fetchActiveDraft = async (projId = activeProjectId, paneId = activeTerminalId) => {
-    if (!paneId) { setPromptBuffer(""); return; }
+    if (!paneId) { setPromptBuffer(""); setExchangeDraft(null); return; }
     try {
       const res = await apiFetch(`/api/panes/${projId}/${paneId}/draft`);
       if (res.ok) {
         const data = await res.json();
         setPromptBuffer(data.draft?.text ?? "");
+        // Additive field (server.ts) — absent/undefined on any server that predates this step, and
+        // always null while JANUS_INSTRUCTION_ENVELOPE is "off" (default). Either way: no behavior
+        // change to promptBuffer above.
+        setExchangeDraft((data.exchange as ExchangeDraftView | undefined) ?? null);
       }
     } catch (e) {
       console.warn("REST draft fetch failed");
@@ -165,6 +180,7 @@ export function useComposer(params: ComposerParams): Composer {
     setWipDrafts,
     contextInput,
     setContextInput,
+    exchangeDraft,
     fetchActiveDraft,
     fetchWipDrafts,
     handlePromptBufferChange,

@@ -37,8 +37,8 @@ import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
 import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
-import { reviseDraft, instructionEnvelopeIsPrimary } from "./src/exchanges/instructionEnvelope";
-import { getOpenDraft, setOpenDraft, setProseOverride } from "./src/exchanges/draftRegistry";
+import { reviseDraft, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { getOpenDraft, setOpenDraft, setProseOverride, viewOpenDraft } from "./src/exchanges/draftRegistry";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -1077,7 +1077,10 @@ function registerDraftAndSettingsRoutes(
   app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
     const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
       ?? { text: "", updatedAt: new Date().toISOString() };
-    res.json({ draft });
+    // Phase 3, Step 3.3: same additive `exchange` projection as broadcastDraft — a null/absent
+    // field under `off` (default) is a no-op for every existing caller of this route.
+    const exchange = instructionEnvelopeActive() ? viewOpenDraft(req.params.projectId, req.params.paneId) : null;
+    res.json({ draft, exchange });
   });
 
   app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
@@ -1420,7 +1423,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   }
   function broadcastDraft(projectId: string, paneId: string) {
     const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
-    broadcast({ type: "draft_updated", projectId, paneId, draft });
+    // Phase 3, Step 3.3 (instruction-routing spec §5): additive field only — a client that doesn't
+    // know about `exchange` ignores it; the draft text/shape are byte-identical either way. Omitted
+    // to plain `null` unless the flag is shadow/primary, so the OFF-default path never changes.
+    const exchange = instructionEnvelopeActive() ? viewOpenDraft(projectId, paneId) : null;
+    broadcast({ type: "draft_updated", projectId, paneId, draft, exchange });
   }
   function appendActiveDraft(line: string, updatedBy: "janus" | "operator") {
     const t = activeDraftTarget();
