@@ -18,7 +18,7 @@
 // delivers work to the wrong agent, so fuzzy/multiple/cross-project references always confirm,
 // regardless of the operator's focus-bind preference.
 
-import { literalResolve } from "./focusResolver";
+import { literalResolve, formatNameList, candidateName, closeAlternatives } from "./focusResolver";
 import type { FocusCandidate, FocusResolution } from "./policyClient";
 
 export interface TargetResolverInput {
@@ -111,19 +111,8 @@ function isAnaphora(reference: string): boolean {
   return ANAPHORA_RE.test(reference.trim());
 }
 
-// ── prose helpers (mirrors focusResolver's clarify/formatNameList idiom) ───────────────────────
-
-function formatNameList(names: string[]): string {
-  const quoted = names.map((n) => `'${n}'`);
-  if (quoted.length === 0) return "";
-  if (quoted.length === 1) return quoted[0];
-  if (quoted.length === 2) return `${quoted[0]} or ${quoted[1]}`;
-  return `${quoted.slice(0, -1).join(", ")}, or ${quoted[quoted.length - 1]}`;
-}
-
-function candidateName(candidates: FocusCandidate[], paneId: string): string {
-  return candidates.find((c) => c.paneId === paneId)?.paneName ?? paneId;
-}
+// ── prose helpers — formatNameList/candidateName are shared with focusResolver.ts (imported above)
+//    rather than mirrored by hand. ────────────────────────────────────────────────────────────────
 
 function candidateProjectId(candidates: FocusCandidate[], paneId: string, fallback: string): string {
   return candidates.find((c) => c.paneId === paneId)?.projectId ?? fallback;
@@ -199,10 +188,11 @@ async function safeRank(
   }
 }
 
-/** Classify a ranker resolution using the SAME 0.15-margin rule focusResolver's
- *  classifyResolution applies (mirrored, not imported, since the resolver here returns a decision
- *  rather than an ActionResult): confidence >= 1 is exact; any alternative within 0.15 of the top
- *  confidence makes the pick ambiguous; otherwise it's a fuzzy single match. */
+/** Classify a ranker resolution using the SAME close-margin rule focusResolver's
+ *  classifyResolution applies (closeAlternatives, imported above — the resolver here returns a
+ *  decision rather than an ActionResult, so the classification shape differs, but the margin filter
+ *  itself is shared, not mirrored by hand): confidence >= 1 is exact; any alternative within
+ *  CLOSE_MARGIN of the top confidence makes the pick ambiguous; otherwise it's a fuzzy single match. */
 function resolveViaRanker(
   resolution: FocusResolution,
   candidates: FocusCandidate[],
@@ -214,9 +204,7 @@ function resolveViaRanker(
   if (!candidates.some((c) => c.paneId === resolution.paneId)) {
     return clarifyNoMatch(candidates);
   }
-  const close = resolution.alternatives.filter(
-    (a) => a.paneId !== resolution.paneId && resolution.confidence - a.score <= 0.15,
-  );
+  const close = closeAlternatives(resolution);
   if (close.length > 0) {
     return confirmMultiple([resolution.paneId as string, ...close.map((a) => a.paneId)], candidates);
   }

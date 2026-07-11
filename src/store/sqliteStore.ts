@@ -11,6 +11,7 @@ import type {
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
 import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState, ExchangeEventType } from "../exchanges/types";
 import { mintExchangeId, mintContextDeliveryId } from "../exchanges/types";
+import { TERMINAL_STATES } from "../exchanges/lifecycle";
 
 /**
  * One persisted row of the unified ACTION LOG (schema v6, PLM2). Mirrors F1's ActionAuditRow call
@@ -1540,6 +1541,38 @@ export class JanusStore {
     ).all(state) as AgentExchangeRow[]).map(r => ({ ...r }));
   }
 
+  /**
+   * Boot-recovery efficiency: full rows for exchanges in ANY of `states`, oldest first — one query
+   * in place of one `listExchangesByState` call per state (src/exchanges/recovery.ts's
+   * `recoverExchangesOnBoot` used to do exactly that, once per one of the 12 ExchangeState values).
+   * Deliberately UNBOUNDED and ASC-ordered, mirroring `listExchangesByState`'s own contract exactly
+   * — NOT `listExchangesByStates`'s bounded, DESC "recent activity" shape (a different read for a
+   * different caller: SITREP/catch-up, where newest-first + a cap is the right answer). Boot
+   * recovery must never silently drop a row to a LIMIT.
+   */
+  listExchangesByStatesForRecovery(states: ExchangeState[]): AgentExchange[] {
+    if (states.length === 0) return [];
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE state IN (${placeholders}) ORDER BY created_at ASC`
+    ).all(...states) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Boot-recovery efficiency: JUST the `exchange_id` column for exchanges in ANY of `states` — the
+   * "kept, untouched, nothing else needed" half of `recoverExchangesOnBoot` (draft/
+   * awaiting_clarification/agent_complete/agent_failed/interrupted/cancelled), which only ever
+   * pushes the id into its report and reads no other column. Unbounded, same reasoning as
+   * `listExchangesByStatesForRecovery`.
+   */
+  listExchangeIdsByStates(states: ExchangeState[]): string[] {
+    if (states.length === 0) return [];
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT exchange_id FROM agent_exchanges WHERE state IN (${placeholders})`
+    ).all(...states) as Array<{ exchange_id: string }>).map(r => r.exchange_id);
+  }
+
   /** Every exchange ever created for `paneId`, oldest first (idx_agent_exchanges_pane_state). */
   listExchangesByPane(paneId: string): AgentExchange[] {
     return (this.db.prepare(
@@ -1558,6 +1591,26 @@ export class JanusStore {
     const r = this.db.prepare(
       "SELECT * FROM agent_exchanges WHERE pane_id=? ORDER BY updated_at DESC LIMIT 1"
     ).get(paneId) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /**
+   * Phase 2 Step 2.1 (WorldModel board-tier efficiency): the single newest NON-TERMINAL exchange
+   * for `paneId` — src/memory/worldModel.ts's "current in-flight exchange" read, previously done by
+   * pulling the pane's ENTIRE history via `listExchangesByPane` and filtering/sorting in JS. Matches
+   * that JS selection EXACTLY: newest by `created_at` DESC, tie-broken by `exchange_id` DESC (both
+   * columns are plain ASCII, so SQLite's default BINARY collation orders identically to the JS
+   * string comparison it replaces) — deliberately NOT `updated_at` (that's `getLatestExchangeForPane`
+   * above, a different ordering for a different caller). `null` when the pane has no open exchange.
+   * Terminal states come from `TERMINAL_STATES` (src/exchanges/lifecycle.ts) — the single authority
+   * worldModel.ts's own TERMINAL_EXCHANGE_STATES now also imports.
+   */
+  getLatestOpenExchangeForPane(paneId: string): AgentExchange | null {
+    const terminal = [...TERMINAL_STATES];
+    const placeholders = terminal.map(() => "?").join(",");
+    const r = this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE pane_id=? AND state NOT IN (${placeholders}) ORDER BY created_at DESC, exchange_id DESC LIMIT 1`
+    ).get(paneId, ...terminal) as AgentExchangeRow | undefined;
     return r ? { ...r } : null;
   }
 
@@ -1623,6 +1676,23 @@ export class JanusStore {
     return (this.db.prepare(
       "SELECT * FROM exchange_events WHERE exchange_id=? ORDER BY ts ASC, event_id ASC"
     ).all(exchangeId) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 2 Step 2.1 (WorldModel event-focus efficiency): one exchange's timeline, filtered to
+   * `eventTypes` — a type-filtered VARIANT of `listExchangeEvents` (same table, same ordering: `ts
+   * ASC, event_id ASC`), not a different selection. src/memory/worldModel.ts's
+   * `candidateForExchangeEvent` only ever turns `needs_input_detected` + a small
+   * RELEVANT_EXCHANGE_EVENTS set into a RecentCandidate and silently drops everything else — this
+   * lets that caller ask for exactly that subset up front instead of pulling an exchange's full
+   * (often much longer) event timeline just to discard most of it in JS.
+   */
+  listExchangeEventsByTypes(exchangeId: string, eventTypes: ExchangeEventType[]): ExchangeEvent[] {
+    if (eventTypes.length === 0) return [];
+    const placeholders = eventTypes.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM exchange_events WHERE exchange_id=? AND event_type IN (${placeholders}) ORDER BY ts ASC, event_id ASC`
+    ).all(exchangeId, ...eventTypes) as ExchangeEventRow[]).map(r => ({ ...r }));
   }
 
   /**

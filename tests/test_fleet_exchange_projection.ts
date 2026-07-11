@@ -140,6 +140,20 @@ describe("buildFleetExchangeSummary", () => {
     assert.equal(s.exchangeId, "exch_abc");
     assert.equal(s.updatedAt, 12345);
   });
+
+  // Phase 5.5 (release review): offers key off the REAL lifecycle/recovery rules, not the display
+  // `kind` — retry is `interrupted`-only (classifyRetryEligibility's new_exchange leg); cancel is
+  // every non-terminal state (lifecycle CANCELLABLE_STATES).
+  it("offers.retry is true ONLY for interrupted; offers.cancel is true for every non-terminal state", () => {
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "interrupted" }), identity).offers, { retry: true, cancel: true });
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "agent_failed" }), identity).offers, { retry: false, cancel: false }, "terminal — the service refuses a retry unconditionally, and there's nothing left to cancel");
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "agent_complete" }), identity).offers, { retry: false, cancel: false });
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "cancelled" }), identity).offers, { retry: false, cancel: false });
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "running" }), identity).offers, { retry: false, cancel: true }, "not provably failed yet — no retry, but still cancellable");
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "needs_input" }), identity).offers, { retry: false, cancel: true });
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "staged" }), identity).offers, { retry: false, cancel: true });
+    assert.deepEqual(buildFleetExchangeSummary(ex({ state: "draft" }), identity).offers, { retry: false, cancel: true }, "the RAW rule says a draft is cancellable — the display-level 'decision kind' guard (fleetExchangeOrdering.ts) is what actually suppresses this on the card");
+  });
 });
 
 describe("projectFleetExchangeSummaries", () => {

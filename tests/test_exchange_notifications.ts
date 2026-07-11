@@ -20,7 +20,6 @@ import {
   renderExchangeBoard,
   terseExchangeOutcomeLine,
   syncExchangeAttentionItems,
-  resetCompletionAttentionMintMemoryForTests,
   COMPLETION_WINDOW_MS,
   type ExchangeBoardItem,
 } from "../src/voice/sitrep";
@@ -286,7 +285,7 @@ describe("syncExchangeAttentionItems", () => {
   // anchor — a dismissed/TTL-pruned "finished" item is never re-minted for the same settled result,
   // while a genuinely NEW completion (fresh updated_at) still mints fresh.
   it("a COMPLETION whose item was dismissed or pruned is NOT re-minted for the same updated_at anchor", () => {
-    resetCompletionAttentionMintMemoryForTests();
+    resetExchangeNarrationGateForTests();
     const queue: any[] = [];
     const ctx = makeCtx({ attentionQueue: queue });
     const item: ExchangeBoardItem = { tier: 3, kind: "complete", exchangeId: "ex-done", paneId: "p1", projectId: "proj-1", text: "Pane 'p1' finished: ok", updatedAt: 42_000 };
@@ -298,7 +297,7 @@ describe("syncExchangeAttentionItems", () => {
     // A NEW completion on the same exchange (fresh transition => fresh updated_at) mints again.
     syncExchangeAttentionItems(ctx, [{ ...item, updatedAt: 99_000 }], 70_000);
     assert.strictEqual(queue.length, 1, "a fresh anchor is a fresh mint");
-    resetCompletionAttentionMintMemoryForTests();
+    resetExchangeNarrationGateForTests();
   });
 });
 

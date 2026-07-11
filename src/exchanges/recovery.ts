@@ -166,12 +166,27 @@ function recoverOne(
   report.kept.push(row.exchange_id); // draft/awaiting_clarification/terminal/interrupted — untouched
 }
 
+/** The states whose disposition needs an actual per-row decision at boot: the 5 in-flight states
+ *  `recoveryDisposition` classifies "interrupt", plus `awaiting_approval` (a "keep"-by-default
+ *  state that STILL needs its own row — and a `hasPendingApproval` check — to decide keep vs
+ *  revert). Every OTHER state (draft/awaiting_clarification/agent_complete/agent_failed/
+ *  interrupted/cancelled) is untouched no matter what: `recoverOne`'s fallback branch just pushes
+ *  the exchange_id into `report.kept`, so those rows need nothing but their own id. */
+const ACTIONABLE_RECOVERY_STATES: readonly ExchangeState[] = [
+  "staged", "delivered", "running", "needs_input", "terminal_idle", "awaiting_approval",
+];
+const PASSTHROUGH_RECOVERY_STATES: readonly ExchangeState[] =
+  EXCHANGE_STATES.filter((s) => !ACTIONABLE_RECOVERY_STATES.includes(s));
+
 /**
- * Walk every durable exchange row a real boot would find (one `listExchangesByState` per state —
- * a one-shot boot cost, not a hot path) and apply the disposition rule (spec §4). Never scans
- * `exchange_events`/history to guess anything — purely a per-row state classification + a guarded
- * CAS, exactly mirroring `ExchangeMachine.recoverOnBoot`'s in-memory contract but against the
- * durable store a fresh process actually starts with.
+ * Walk every durable exchange row a real boot would find and apply the disposition rule (spec §4).
+ * Two queries total (one full-row fetch for the states that need a real per-row decision, one
+ * id-only fetch for the states that are always kept verbatim) rather than one `listExchangesByState`
+ * call per EACH of the 12 ExchangeState values, most of which (draft/awaiting_clarification/
+ * agent_complete/agent_failed/interrupted/cancelled) never do anything but count their own id.
+ * Never scans `exchange_events`/history to guess anything — purely a per-row state classification +
+ * a guarded CAS, exactly mirroring `ExchangeMachine.recoverOnBoot`'s in-memory contract but against
+ * the durable store a fresh process actually starts with.
  */
 export function recoverExchangesOnBoot(
   store: JanusStore,
@@ -179,10 +194,18 @@ export function recoverExchangesOnBoot(
 ): ExchangeRecoveryReport {
   const now = opts?.now ?? (() => Date.now());
   const report = freshReport();
-  for (const state of EXCHANGE_STATES) {
-    for (const row of store.listExchangesByState(state)) {
-      recoverOne(store, row, state, now, report);
-    }
+  // ORDER MATTERS: snapshot the passthrough ids FIRST, before any actionable-row CAS below can
+  // mutate a row INTO a passthrough state (awaiting_approval -> draft on revert) — mirrors the
+  // prior per-state-loop's own ordering (EXCHANGE_STATES lists "draft" before "awaiting_approval",
+  // so the old per-state `draft` query always ran before anything could revert INTO it). Querying
+  // passthrough ids AFTER the actionable pass would double-count a just-reverted row in both
+  // `reverted` and `kept`.
+  const keptIds = store.listExchangeIdsByStates([...PASSTHROUGH_RECOVERY_STATES]);
+  for (const row of store.listExchangesByStatesForRecovery([...ACTIONABLE_RECOVERY_STATES])) {
+    recoverOne(store, row, row.state, now, report);
+  }
+  for (const exchangeId of keptIds) {
+    report.kept.push(exchangeId);
   }
   return report;
 }

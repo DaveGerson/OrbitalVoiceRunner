@@ -101,6 +101,10 @@ export interface AnnouncementItem {
   summary?: string;
   /** Monotonic time the item was enqueued (filled in by the bus from its clock). */
   at?: number;
+  /** AgentExchange spine correlation (task C, spec §5 "attention rows") — present when this
+   *  announcement is exchange-correlated (e.g. an approval_expired resolve for an exchange-bound
+   *  approval), so downstream attention-row consumers can key off it. */
+  exchangeId?: string;
 }
 
 export interface Clock {

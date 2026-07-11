@@ -43,7 +43,7 @@ import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { mintExchangeForSend } from "../exchanges/deliveryHooks";
 import type { ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
-import { terseExchangeOutcomeLine } from "./sitrep";
+import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
 import { convergeTypedDraftEdit } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
@@ -186,8 +186,7 @@ function exchangeNarrationClass(state: string): "exception" | "complete" | null 
 }
 
 function resolvePaneLabel(manager: OrchestratorManager, projectId: string | null, paneId: string): string {
-  const raw = projectId ? (manager.ledger.workspaces?.[projectId]?.panes?.[paneId]?.name || paneId) : paneId;
-  return redactSecrets(raw);
+  return paneDisplayLabel(manager.ledger, projectId, paneId, redactSecrets);
 }
 
 function resolveProjectLabel(manager: OrchestratorManager, projectId: string): string {
@@ -1473,11 +1472,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             clearStableResetTimer();
           }
         }
-        // AgentExchange spine (Phase 4, Step 4.3 — src/exchanges/recovery.ts
-        // `interruptionDispositionFor("gemini_session_reconnect")`): this whole handler is about
-        // the VOICE/NARRATION channel, never the PTY. No exchange is interrupted/quarantined here,
-        // by design — a delivery already landed (or didn't) independently of whether Gemini's
-        // socket is open, so a Live session drop creates no delivery uncertainty to recover from.
+        // AgentExchange spine: `interruptionDispositionFor("gemini_session_reconnect")` is a
+        // documented no-op (src/exchanges/recovery.ts) — see that table for why a Live session
+        // drop is never a delivery-uncertainty/quarantine event.
         //
         // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
         // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
@@ -2536,16 +2533,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     });
 
     clientWs.on("close", () => {
-      // AgentExchange spine (Phase 4, Step 4.3 — src/exchanges/recovery.ts
-      // `interruptionDispositionFor("browser_ws_reconnect")`): this is the OPERATOR'S BROWSER
-      // socket, not the server process. Nothing here touches an AgentExchange, on purpose — the
-      // server (and every live PTY it holds) is completely unaffected by the operator's tab
-      // dropping/reloading, so no delivery became uncertain and nothing is quarantined. The
-      // in-memory envelope-draft registry (src/exchanges/draftRegistry.ts) is likewise untouched:
-      // it is keyed by (projectId, paneId), not by connection, so the NEXT connection (the
-      // reconnect) reads the exact same live state via GET /api/panes/:p/:id/draft — no
-      // rehydration needed for a same-process reconnect (only a process RESTART needs that; see
-      // draftRegistry.ts's `rehydrateDraftRegistryOnBoot`).
+      // AgentExchange spine: `interruptionDispositionFor("browser_ws_reconnect")` is a documented
+      // no-op (src/exchanges/recovery.ts) — see that table for why the operator's browser tab
+      // dropping/reloading never touches an AgentExchange or the draft registry.
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
       // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
       // destructive pendingActions record survives and stays resolvable via UI/typed SURE.

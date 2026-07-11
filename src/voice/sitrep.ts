@@ -16,8 +16,11 @@
 // render -> speak. It NEVER throws (wrapped; falls back to a safe static string on any failure).
 import type { ActionContext, ActionResult } from "../actions/types";
 import type { SitrepPayload, SitrepRanking } from "./policyClient";
-import { DEFAULT_VOICE_UX, type AttentionItem } from "../types";
+import { DEFAULT_VOICE_UX, type AttentionItem, type FleetExchangeTier, type FleetExchangeKind } from "../types";
 import type { AgentExchange, ExchangeEvent, ExchangeState } from "../exchanges/types";
+import { tierKindForState } from "../exchanges/priority";
+import { redactCapped } from "../exchanges/textUtil";
+import { getExchangeNarrationGate } from "../announcementBus";
 
 const EMPTY_SITREP_TEXT =
   "Nothing needs your attention: no pending approvals, no alerts, and no panes are busy.";
@@ -42,8 +45,14 @@ const EMPTY_SITREP_TEXT =
 // ahead of something that just changed.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-export type ExchangeBoardTier = 1 | 2 | 3 | 4 | 5 | 6;
-export type ExchangeBoardKind = "needs_input" | "approval" | "failed" | "complete" | "running" | "decision";
+/** Aliases of the src/types.ts six-tier unions (FleetExchangeTier/FleetExchangeKind) — the exact
+ *  same tiering shared with src/exchanges/fleetProjection.ts's FleetExchangeSummary and
+ *  src/orbital/fleetExchangeOrdering.ts's FleetRow. `FleetExchangeKind` also carries `"staged"`
+ *  (tier 5, a durable-summary-only case this board never emits itself — approval items use kind
+ *  `"approval"` directly), so this is a strict widening, never a narrowing, of what this board's
+ *  own items are ever assigned. */
+export type ExchangeBoardTier = FleetExchangeTier;
+export type ExchangeBoardKind = FleetExchangeKind;
 
 export interface ExchangeBoardItem {
   tier: ExchangeBoardTier;
@@ -77,11 +86,30 @@ function capBoardText(s: string, max: number = BOARD_TEXT_CAP): string {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-/** Resolve a pane's display name off the ledger the same way composeSitrep does, falling back to
- *  the bare pane id — then redact (a ledger-recorded pane name is operator-authored free text). */
+/** A minimal ledger read surface — `OrchestratorManager["ledger"]` satisfies this directly. */
+interface LedgerLike {
+  workspaces?: Record<string, { panes?: Record<string, { name?: string }> }>;
+}
+
+/** Resolve a pane's display name off the ledger, falling back to the bare pane id, then redact (a
+ *  ledger-recorded pane name is operator-authored free text). Shared by every board/narration
+ *  surface that needs "what does this pane look like to the operator" — composeSitrep and the
+ *  exchange board here, and src/voice/index.ts's live-session narration seam (resolvePaneLabel). A
+ *  null `projectId` (no known owning project) degrades straight to the bare paneId, same as a
+ *  project id with no matching workspace entry. */
+export function paneDisplayLabel(
+  ledger: LedgerLike | undefined,
+  projectId: string | null,
+  paneId: string,
+  redact: (s: string) => string,
+): string {
+  const raw = projectId ? (ledger?.workspaces?.[projectId]?.panes?.[paneId]?.name || paneId) : paneId;
+  return redact(raw);
+}
+
+/** Thin exchange-board-specific wrapper — every caller here always has a non-null `projectId`. */
 function exchangePaneLabel(ctx: ActionContext, projectId: string, paneId: string): string {
-  const raw = ctx.manager.ledger?.workspaces?.[projectId]?.panes?.[paneId]?.name || paneId;
-  return ctx.redact(raw);
+  return paneDisplayLabel(ctx.manager.ledger, projectId, paneId, ctx.redact);
 }
 
 /**
@@ -94,18 +122,18 @@ function exchangePaneLabel(ctx: ActionContext, projectId: string, paneId: string
  * decides what (if anything) to fall back to.
  */
 function needsInputLine(paneLabel: string, terminalState: string | null, redact: (s: string) => string): string {
-  const q = terminalState ? capBoardText(redact(terminalState)) : null;
+  const q = redactCapped(terminalState, redact, BOARD_TEXT_CAP);
   return q ? `Pane '${paneLabel}' needs your input: "${q}"` : `Pane '${paneLabel}' needs your input.`;
 }
 
 function failedLine(paneLabel: string, terminalState: string | null, redact: (s: string) => string): string {
-  const d = terminalState ? capBoardText(redact(terminalState)) : null;
+  const d = redactCapped(terminalState, redact, BOARD_TEXT_CAP);
   return d ? `Pane '${paneLabel}' failed: ${d}` : `Pane '${paneLabel}' failed.`;
 }
 
 /** null = no meaningful result to say (a completion with nothing to report is not narrated). */
 function completeLine(paneLabel: string, resultSummary: string | null, redact: (s: string) => string): string | null {
-  const s = resultSummary ? capBoardText(redact(resultSummary)) : null;
+  const s = redactCapped(resultSummary, redact, BOARD_TEXT_CAP);
   return s ? `Pane '${paneLabel}' finished: ${s}` : null;
 }
 
@@ -134,40 +162,23 @@ export function terseExchangeOutcomeLine(
   return build ? build(paneLabel, terminalState, resultSummary, redact) : null;
 }
 
-function needsInputItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem {
+/** One parameterized builder for every store-derived board item (tiers 1a/2/3/4) — collapses what
+ *  used to be four near-identical needsInputItem/failedItem/completeItem/runningItem functions
+ *  (same shape, differing only in which literal tier/kind/state they hardcoded). Tier/kind now come
+ *  from the shared src/exchanges/priority.ts table keyed on the exchange's OWN `state` — exactly
+ *  the same values each hardcoded call site passed (every caller only ever hands this a `ex` whose
+ *  `state` is already within the state-group it queried for, e.g. needs_input-only, running/
+ *  delivered, etc.), so this is a mechanical, behavior-preserving fold. Keeps the tier-3 "no
+ *  meaningful result" null guard (a completion with nothing to report is not narrated) — the ONLY
+ *  builder that can return null. */
+function exchangeStoreBoardItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem | null {
   const pane = exchangePaneLabel(ctx, ex.project_id, ex.pane_id);
+  const text = terseExchangeOutcomeLine(pane, ex.state, ex.terminal_state, ex.result_summary, ctx.redact);
+  if (!text) return null;
+  const { tier, kind } = tierKindForState(ex.state);
   return {
-    tier: 1, kind: "needs_input", exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
-    text: terseExchangeOutcomeLine(pane, "needs_input", ex.terminal_state, ex.result_summary, ctx.redact)!,
-    updatedAt: ex.updated_at,
-  };
-}
-
-function failedItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem {
-  const pane = exchangePaneLabel(ctx, ex.project_id, ex.pane_id);
-  return {
-    tier: 2, kind: "failed", exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
-    text: terseExchangeOutcomeLine(pane, ex.state, ex.terminal_state, ex.result_summary, ctx.redact)!,
-    updatedAt: ex.updated_at,
-  };
-}
-
-function completeItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem | null {
-  const pane = exchangePaneLabel(ctx, ex.project_id, ex.pane_id);
-  const text = terseExchangeOutcomeLine(pane, "agent_complete", ex.terminal_state, ex.result_summary, ctx.redact);
-  if (!text) return null; // no meaningful result — a completion with nothing to report is not narrated
-  return {
-    tier: 3, kind: "complete", exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
+    tier, kind, exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
     text, updatedAt: ex.updated_at,
-  };
-}
-
-function runningItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem {
-  const pane = exchangePaneLabel(ctx, ex.project_id, ex.pane_id);
-  return {
-    tier: 4, kind: "running", exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
-    text: terseExchangeOutcomeLine(pane, "running", ex.terminal_state, ex.result_summary, ctx.redact)!,
-    updatedAt: ex.updated_at,
   };
 }
 
@@ -207,18 +218,27 @@ function safeList<T>(fn: () => T[]): T[] {
   try { return fn(); } catch (e) { console.error("[sitrep] exchange board query failed:", e); return []; }
 }
 
+/** Push `exchangeStoreBoardItem(ctx, ex)` for every `ex` in `exchanges`, skipping the ones that
+ *  build to `null` (the tier-3 "no meaningful result" guard). Split out of
+ *  gatherExchangeStoreItems purely so its own per-state loops stay a flat one-liner each
+ *  (complexity gate). */
+function pushExchangeStoreBoardItems(items: ExchangeBoardItem[], ctx: ActionContext, exchanges: AgentExchange[]): void {
+  for (const ex of exchanges) {
+    const it = exchangeStoreBoardItem(ctx, ex);
+    if (it) items.push(it);
+  }
+}
+
 /** Tiers 1a/2/3/4/6 — every item derived DIRECTLY from the durable exchange store. Split out of
  *  composeExchangeBoard purely to keep that function's own branch count low (complexity gate). */
 function gatherExchangeStoreItems(ctx: ActionContext, store: NonNullable<ActionContext["store"]>, now: number): ExchangeBoardItem[] {
   const items: ExchangeBoardItem[] = [];
-  for (const ex of safeList(() => store.listExchangesByStates(["needs_input"]))) items.push(needsInputItem(ctx, ex));
-  for (const ex of safeList(() => store.listExchangesByStates(["agent_failed", "interrupted"]))) items.push(failedItem(ctx, ex));
-  for (const ex of safeList(() => store.listExchangesByStates(["agent_complete"]))) {
-    if (ex.updated_at < now - COMPLETION_WINDOW_MS) continue; // B11: recent results only (see COMPLETION_WINDOW_MS)
-    const it = completeItem(ctx, ex);
-    if (it) items.push(it);
-  }
-  for (const ex of safeList(() => store.listExchangesByStates(["running", "delivered"]))) items.push(runningItem(ctx, ex));
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["needs_input"])));
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["agent_failed", "interrupted"])));
+  const recentComplete = safeList(() => store.listExchangesByStates(["agent_complete"]))
+    .filter((ex) => ex.updated_at >= now - COMPLETION_WINDOW_MS); // B11: recent results only (see COMPLETION_WINDOW_MS)
+  pushExchangeStoreBoardItems(items, ctx, recentComplete);
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["running", "delivered"])));
   for (const ev of safeList(() =>
     store.listRecentExchangeEventsByTypes(["approval_confirmed"], { sinceTs: now - DECISION_WINDOW_MS, limit: MAX_DECISION_ITEMS }),
   )) items.push(decisionItem(ctx, ev));
@@ -331,29 +351,22 @@ function newExchangeAttentionItem(
 }
 
 /** Phase 5.5 (the 4.5 review's B11 finding): COMPLETION attention items are minted exactly once
- *  per (exchange_id, updated_at) anchor for the process lifetime — the ExchangeNarrationGate's
- *  derived-anchor idea (src/announcementBus.ts) applied to the attention mint. Without it, a
- *  completion whose attention item was dismissed or TTL-pruned (pruneAttentionQueue) was re-minted
- *  by the very next board sync, nagging forever. Scoped to `complete` ONLY: needs_input/failed are
- *  the operator's OUTSTANDING backlog, and their dismiss-then-re-push behavior is pinned intended
+ *  per (exchange_id, updated_at) anchor for the process lifetime. This reuses the shared
+ *  ExchangeNarrationGate (src/announcementBus.ts) — the SAME exactly-once derived-anchor primitive
+ *  the live voice-session narration seam uses — instead of a second, hand-rolled Set with identical
+ *  semantics; event type "attention_complete" keeps this mint's keyspace disjoint from the live
+ *  narration seam's own event types on the shared gate. Without it, a completion whose attention
+ *  item was dismissed or TTL-pruned (pruneAttentionQueue) was re-minted by the very next board
+ *  sync, nagging forever. Scoped to `complete` ONLY: needs_input/failed are the operator's
+ *  OUTSTANDING backlog, and their dismiss-then-re-push behavior is pinned intended
  *  (tests/test_exchange_notifications.ts "a DISMISSED prior item does not block a fresh push") —
  *  an unanswered question should keep resurfacing; a finished result should not. A NEW completion
- *  on the same exchange (a fresh transition ⇒ fresh updated_at) is a fresh anchor, minted again. */
-const mintedCompletionAnchors = new Set<string>();
-
-/** Test-only reset — mirrors resetExchangeNarrationGateForTests (src/announcementBus.ts). */
-export function resetCompletionAttentionMintMemoryForTests(): void {
-  mintedCompletionAnchors.clear();
-}
-
-/** True when this completion board item's (exchange, updated_at) anchor was already minted once —
- *  and remembers it, so every later sync of the SAME settled completion is a no-op. */
+ *  on the same exchange (a fresh transition ⇒ fresh updated_at) is a fresh anchor, minted again.
+ *  Test-only reset: resetExchangeNarrationGateForTests (src/announcementBus.ts) — no separate reset
+ *  seam here anymore. */
 function completionAlreadyMinted(item: ExchangeBoardItem): boolean {
-  if (item.kind !== "complete") return false;
-  const key = `${item.exchangeId} ${item.updatedAt}`;
-  if (mintedCompletionAnchors.has(key)) return true;
-  mintedCompletionAnchors.add(key);
-  return false;
+  if (item.kind !== "complete" || !item.exchangeId) return false;
+  return !getExchangeNarrationGate().shouldNarrate(item.exchangeId, "attention_complete", item.updatedAt);
 }
 
 export function syncExchangeAttentionItems(ctx: ActionContext, board: ExchangeBoardItem[], now: number): void {
@@ -377,11 +390,10 @@ export function syncExchangeAttentionItems(ctx: ActionContext, board: ExchangeBo
 export function composeSitrep(ctx: ActionContext, now: number): SitrepPayload {
   const panes = Object.entries(ctx.manager.terminals).map(([paneId, term]) => {
     const projectId = term.projectId || "default_project";
-    const rawName = ctx.manager.ledger.workspaces[projectId]?.panes?.[paneId]?.name || paneId;
     return {
       paneId,
       projectId,
-      name: ctx.redact(rawName),
+      name: paneDisplayLabel(ctx.manager.ledger, projectId, paneId, ctx.redact),
       state: term.status,
       isBusy: term.status === "Running",
       elapsedMs: Math.max(0, now - term.lastStatusChangeAt),

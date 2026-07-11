@@ -22,11 +22,13 @@
 // so this module is a pure ENHANCEMENT layer, never a second source of truth that could disagree
 // with the board.
 import type { Station } from "./station";
-import type { ExchangeDraftView, FleetExchangeSummary, PendingCommand } from "../types";
+import type { ExchangeDraftView, FleetExchangeKind, FleetExchangeSummary, FleetExchangeTier, PendingCommand } from "../types";
 
-export type FleetRowTier = 1 | 2 | 3 | 4 | 5 | 6;
-export type FleetRowKind =
-  | "needs_input" | "approval" | "failed" | "complete" | "running" | "staged" | "decision";
+/** Aliases of the src/types.ts six-tier unions — FleetRow's tiering is the exact same six-tier
+ *  priority as FleetExchangeSummary (this file already imports it), so these are no longer a
+ *  hand-duplicated second copy of the same literal unions. */
+export type FleetRowTier = FleetExchangeTier;
+export type FleetRowKind = FleetExchangeKind;
 
 export interface FleetRow {
   station: Station;
@@ -53,29 +55,50 @@ export interface FleetRow {
   exchangeState: string | null;
   /** Epoch ms this row's underlying signal last changed, or null when unknown (no durable summary). */
   updatedAt: number | null;
+  /** Phase 5.5 (fleet-offers server-side dedupe): the durable summary's own precomputed offers
+   *  (FleetExchangeSummary.offers — src/exchanges/fleetProjection.ts's `computeFleetOffers`, the
+   *  REAL lifecycle/recovery rules), carried through verbatim when this row was built from one.
+   *  `undefined` for an approval-precedence row or the Station-status-ladder fallback (no durable
+   *  summary to compute from) — fleetRetryOffered/fleetCancelOffered fall back to their OWN local
+   *  rule in that case (e.g. a draft-view row with no durable summary yet). */
+  offers?: { retry: boolean; cancel: boolean };
 }
 
 // ── quick-action offers (Phase 5.5 — keyed to the lifecycle's legal-transition table) ───────────
 
 /** The three terminal states (mirrors src/exchanges/lifecycle.ts TERMINAL_STATES — duplicated as
  *  literals here because src/orbital/** deliberately never imports from src/exchanges/**, the same
- *  client/server boundary OpenDraftView/ExchangeDraftView already keep). */
+ *  client/server boundary OpenDraftView/ExchangeDraftView already keep). Only still consulted as
+ *  the FALLBACK rule below, for rows with no durable summary (`row.offers` absent) — every row that
+ *  DOES have one now carries the server's own real-rule computation instead. */
 const TERMINAL_EXCHANGE_STATES: ReadonlySet<string> = new Set(["agent_complete", "agent_failed", "cancelled"]);
 
 /** Offer Retry ONLY for a state the recovery action will actually accept from a fleet card:
  *  `interrupted` (→ a new follow-up draft, recoveryActions.ts's new_exchange leg). A terminal
  *  `agent_failed` row is never retryable (the service refuses it unconditionally); a
  *  `draft`-after-delivery_failed same-exchange retry needs the event timeline to prove the failure,
- *  which this projection deliberately does not carry — that leg stays reachable via REST/inspect. */
-export function fleetRetryOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState">): boolean {
+ *  which this projection deliberately does not carry — that leg stays reachable via REST/inspect.
+ *  Prefers `row.offers.retry` (the server's own real-rule computation) when present; the local
+ *  `exchangeState === "interrupted"` check is IDENTICAL in every case, so this is purely "skip
+ *  re-deriving what the summary already computed", never a different answer. Falls back to the
+ *  local rule only for a row with no durable summary (a draft-view-only row, always `retry: false`
+ *  either way — a draft is sent normally, never retried). */
+export function fleetRetryOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState" | "offers">): boolean {
+  if (row.offers) return row.offers.retry;
   return row.exchangeId != null && row.exchangeState === "interrupted";
 }
 
 /** Offer Hold/cancel only when the exchange is actually cancellable: every state except the three
  *  terminal ones (lifecycle CANCELLABLE_STATES). A null exchangeState (an open draft view with no
- *  durable summary) stays offered — an open draft is always cancellable. */
-export function fleetCancelOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState" | "kind">): boolean {
+ *  durable summary) stays offered — an open draft is always cancellable. `kind === "decision"` is
+ *  checked FIRST and unconditionally (never actionable, regardless of any offers computation) —
+ *  this is the ONE case where a durable-summary row (e.g. a `draft`-state summary, which is
+ *  non-terminal and so WOULD be cancellable by the server's own real-rule computation) must still
+ *  defer to this display-level guard, preserving the existing "decision kind is never actionable"
+ *  contract byte-for-byte. Every other kind prefers `row.offers.cancel` when present. */
+export function fleetCancelOffered(row: Pick<FleetRow, "exchangeId" | "exchangeState" | "kind" | "offers">): boolean {
   if (!row.exchangeId || row.kind === "decision") return false;
+  if (row.offers) return row.offers.cancel;
   return row.exchangeState == null || !TERMINAL_EXCHANGE_STATES.has(row.exchangeState);
 }
 
@@ -192,6 +215,7 @@ function summaryRow(station: Station, summary: FleetExchangeSummary, draft: Exch
     exchangeId: summary.exchangeId,
     exchangeState: summary.state,
     updatedAt: summary.updatedAt,
+    offers: summary.offers,
   };
 }
 

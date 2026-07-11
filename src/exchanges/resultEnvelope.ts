@@ -214,37 +214,33 @@ interface BraceScanState {
   escape: boolean;
 }
 
-/** The IN-STRING half of the character step (escape handling, closing quote) — split out of
- *  `stepBraceScan` so neither function's own branch count trips the complexity gate. */
-function stepInStringScan(state: BraceScanState, ch: string): BraceScanState & { closed: boolean } {
-  if (state.escape) return { ...state, escape: false, closed: false };
-  if (ch === "\\") return { ...state, escape: true, closed: false };
-  if (ch === '"') return { ...state, inString: false, closed: false };
-  return { ...state, closed: false };
+/** Mutates `state` IN PLACE for one character while inside a string (escape handling, closing
+ *  quote) — split out of `scanBalancedObject` purely to keep its own cognitive complexity under
+ *  the gate. ONE `state` object is allocated for the whole scan (in `scanBalancedObject`) and
+ *  mutated here every call — NOT a fresh `{...state}` copy per character (the prior
+ *  stepBraceScan/stepInStringScan split's approach), which was real per-char allocation pressure
+ *  on a linear scan that runs over every pane-output flush. */
+function applyInStringChar(state: BraceScanState, ch: string): void {
+  if (state.escape) state.escape = false;
+  else if (ch === "\\") state.escape = true;
+  else if (ch === '"') state.inString = false;
 }
 
-/** One character step of the brace/string/escape scan. `closed: true` means this character was
- *  the matching close-brace for the object that started the scan (depth returned to 0 from a
- *  real opening "{"). */
-function stepBraceScan(state: BraceScanState, ch: string): BraceScanState & { closed: boolean } {
-  if (state.inString) return stepInStringScan(state, ch);
-  if (ch === '"') return { ...state, inString: true, closed: false };
-  if (ch === "{") return { ...state, depth: state.depth + 1, closed: false };
-  if (ch === "}") {
-    const depth = state.depth - 1;
-    return { ...state, depth, closed: depth === 0 };
-  }
-  return { ...state, closed: false };
-}
-
-/** From an opening `{` at `start`, walk forward tracking brace depth and string/escape state;
- *  returns the index just past the matching `}`, or -1 if the object never closes within `text`. */
+/**
+ * From an opening `{` at `start`, walk forward tracking brace depth and string/escape state.
+ * Returns the index just past the matching `}`, or -1 if the object never closes within `text`.
+ */
 function scanBalancedObject(text: string, start: number): number {
-  let state: BraceScanState = { depth: 0, inString: false, escape: false };
+  const state: BraceScanState = { depth: 0, inString: false, escape: false };
   for (let j = start; j < text.length; j++) {
-    const next = stepBraceScan(state, text[j]);
-    if (next.closed) return j + 1;
-    state = next;
+    const ch = text[j];
+    if (state.inString) { applyInStringChar(state, ch); continue; }
+    if (ch === '"') { state.inString = true; continue; }
+    if (ch === "{") { state.depth++; continue; }
+    if (ch === "}") {
+      state.depth--;
+      if (state.depth === 0) return j + 1;
+    }
   }
   return -1;
 }
@@ -254,6 +250,9 @@ function scanBalancedObject(text: string, start: number): number {
  *  fail-safe detection contract; callers never distinguish "malformed" from "not present". */
 function tryParseCandidate(candidate: string, redact: (s: string) => string): ParsedResultEnvelope | null {
   if (candidate.length > MAX_CANDIDATE_CHARS) return null;
+  // Cheap prefilter: a valid envelope's schema REQUIRES exchange_id, so a candidate substring that
+  // doesn't even mention the key can never validate — skip the JSON.parse + schema round-trip.
+  if (!candidate.includes('"exchange_id"')) return null;
   let json: unknown;
   try {
     json = JSON.parse(candidate);
@@ -340,7 +339,14 @@ export function scanForResultEnvelope(text: string, opts: ScanOptions = {}): Sca
   if (!resultEnvelopeActive(mode) || !text) {
     return { found: false, candidatesSeen: 0, candidatesValid: 0 };
   }
-  const candidates = findJsonObjectCandidates(tailWindow(text, maxScanChars), maxCandidates);
+  const window = tailWindow(text, maxScanChars);
+  // Cheap whole-window prefilter: every valid envelope's schema REQUIRES exchange_id, so a window
+  // that never mentions the key can never contain one — skip the brace-matching scan entirely for
+  // the (overwhelmingly common) case of ordinary pane output with no envelope in it at all.
+  if (!window.includes('"exchange_id"')) {
+    return { found: false, candidatesSeen: 0, candidatesValid: 0 };
+  }
+  const candidates = findJsonObjectCandidates(window, maxCandidates);
   const { best, validCount } = pickLastValidCandidate(candidates, redact);
   return { found: best !== undefined, envelope: best, candidatesSeen: candidates.length, candidatesValid: validCount };
 }

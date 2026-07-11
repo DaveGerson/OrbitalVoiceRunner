@@ -337,6 +337,14 @@ export interface FleetExchangeSummary {
   resultSummary: string | null;
   /** Epoch ms this exchange row last changed (updated_at) — the card's age anchor. */
   updatedAt: number;
+  /** Phase 5.5 (release review): server-computed quick-action offers, keyed off the REAL
+   *  lifecycle/recovery rules (src/exchanges/recoveryActions.ts's classifyRetryEligibility +
+   *  src/exchanges/lifecycle.ts's CANCELLABLE_STATES) rather than the display `kind` — `kind`
+   *  collapses `agent_failed` (terminal, never retryable) and `interrupted` (retryable) into one
+   *  "failed" chip. Optional so an older wire payload without this field still degrades cleanly —
+   *  src/orbital/fleetExchangeOrdering.ts's fleetRetryOffered/fleetCancelOffered fall back to their
+   *  own local rule when it's absent. */
+  offers?: { retry: boolean; cancel: boolean };
 }
 
 export interface PaneMeta {

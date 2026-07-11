@@ -302,4 +302,28 @@ describe("fleetRetryOffered / fleetCancelOffered — lifecycle-consistent quick 
     const fallback = buildFleetRow(stn("p2", "Exited"), {});
     assert.equal(fallback.exchangeState, null);
   });
+
+  // Phase 5.5 (fleet-offers server-side dedupe): when the durable summary carries its own
+  // precomputed `offers` (fleetProjection.ts's computeFleetOffers), fleetRetryOffered/
+  // fleetCancelOffered consume it directly instead of re-deriving from exchangeState/kind.
+  it("prefers the durable summary's own offers over re-deriving from exchangeState", () => {
+    const row = buildFleetRow(stn("p1", "Running"), {
+      summaryByPane: { p1: summary({ state: "running", tier: 4, kind: "running", offers: { retry: true, cancel: false } }) },
+    });
+    assert.equal(row.offers?.retry, true, "buildFleetRow carries summary.offers through verbatim");
+    assert.equal(row.offers?.cancel, false);
+    assert.equal(fleetRetryOffered(row), true, "consumes offers.retry directly, even though exchangeState alone would say false");
+    assert.equal(fleetCancelOffered(row), false, "consumes offers.cancel directly, even though exchangeState alone would say true");
+  });
+
+  it("the 'decision kind is never actionable' guard still wins even when offers.cancel is true", () => {
+    // A non-terminal `draft`-state summary IS cancellable by the raw lifecycle rule, so
+    // computeFleetOffers sets cancel:true — but the fleet card's own display-level guard must still
+    // suppress it for a "decision" kind row (matches buildFleetExchangeSummary's real output shape
+    // for a draft-state exchange: kind is always "decision").
+    const row = buildFleetRow(stn("p1", "Idle"), {
+      summaryByPane: { p1: summary({ state: "draft", tier: 6, kind: "decision", offers: { retry: false, cancel: true } }) },
+    });
+    assert.equal(fleetCancelOffered(row), false, "decision kind is never actionable, regardless of offers.cancel");
+  });
 });

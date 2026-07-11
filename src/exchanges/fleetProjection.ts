@@ -14,8 +14,12 @@
 // Every text field is REDACTED (the caller-injected `redact`) and length-capped before it leaves
 // this module — the wire never carries raw operator/agent text, matching the exchange spine's own
 // storage-layer convention ("operator_utterance: redacted at the boundary by the caller").
-import type { AgentExchange, ExchangeState } from "./types";
-import type { FleetExchangeKind, FleetExchangeSummary, FleetExchangeTier } from "../types";
+import type { AgentExchange } from "./types";
+import type { FleetExchangeSummary } from "../types";
+import { tierKindForState } from "./priority";
+import { redactCapped } from "./textUtil";
+import { CANCELLABLE_STATES } from "./lifecycle";
+import { classifyRetryEligibility } from "./recoveryActions";
 
 /** Structural read surface this module needs — mirrors ContextVersionSource / PoolKVSource's
  *  convention (small interface, not a full JanusStore import) so a hand-built test double can
@@ -26,46 +30,38 @@ export interface FleetExchangeSource {
 
 const SUMMARY_TEXT_CAP = 160;
 
-/** state -> (tier, kind). Any state not listed here (a future addition to the lifecycle union)
- *  falls back to tier 6 / "decision" — the LEAST urgent bucket, never silently promoted to an
- *  exception the operator hasn't actually earned a look at. */
-const TIER_KIND_BY_STATE: Partial<Record<ExchangeState, { tier: FleetExchangeTier; kind: FleetExchangeKind }>> = {
-  needs_input: { tier: 1, kind: "needs_input" },
-  awaiting_clarification: { tier: 1, kind: "needs_input" },
-  awaiting_approval: { tier: 1, kind: "approval" },
-  agent_failed: { tier: 2, kind: "failed" },
-  interrupted: { tier: 2, kind: "failed" },
-  agent_complete: { tier: 3, kind: "complete" },
-  running: { tier: 4, kind: "running" },
-  delivered: { tier: 4, kind: "running" },
-  terminal_idle: { tier: 4, kind: "running" },
-  staged: { tier: 5, kind: "staged" },
-  draft: { tier: 6, kind: "decision" },
-  cancelled: { tier: 6, kind: "decision" },
-};
-
-const FALLBACK_TIER_KIND = { tier: 6 as FleetExchangeTier, kind: "decision" as FleetExchangeKind };
-
-/** Redact + cap one text field. `null`/empty stays `null` (an absent field is never fabricated
- *  into an empty string the card would render as a blank line). */
-function summaryText(raw: string | null | undefined, redact: (s: string) => string): string | null {
-  if (!raw) return null;
-  const r = redact(raw);
-  return r.length > SUMMARY_TEXT_CAP ? r.slice(0, SUMMARY_TEXT_CAP) : r;
+/**
+ * Phase 5.5 (release review): the fleet card's quick-action offers, computed from the REAL
+ * lifecycle/recovery rules rather than the display `kind` (which collapses terminal `agent_failed`
+ * and recoverable `interrupted` into one "failed" chip). `classifyRetryEligibility` is called with
+ * an EMPTY events array — safe here because its only events-dependent branch is the `draft` state
+ * (classifyDraftRetryEligibility, which needs the event timeline to prove a prior delivery
+ * actually failed); every other state (including the one this fleet card ever offers a retry for,
+ * `interrupted`) resolves before it would ever look at `events`. That "draft-after-delivery_failed
+ * same-exchange retry" leg deliberately stays off the fleet card (recoveryActions.ts's own module
+ * doc) — it needs the timeline this per-pane summary projection doesn't carry, and stays reachable
+ * via REST/inspect instead.
+ */
+function computeFleetOffers(ex: AgentExchange): { retry: boolean; cancel: boolean } {
+  return {
+    retry: classifyRetryEligibility(ex, []).kind === "new_exchange",
+    cancel: CANCELLABLE_STATES.has(ex.state),
+  };
 }
 
 /** Project one durable exchange row into the bounded, redacted client view. */
 export function buildFleetExchangeSummary(ex: AgentExchange, redact: (s: string) => string): FleetExchangeSummary {
-  const { tier, kind } = TIER_KIND_BY_STATE[ex.state] ?? FALLBACK_TIER_KIND;
+  const { tier, kind } = tierKindForState(ex.state);
   return {
     exchangeId: ex.exchange_id,
     state: ex.state,
     tier,
     kind,
-    instructionSummary: summaryText(ex.distilled_instruction || ex.operator_utterance, redact),
-    waitingReason: summaryText(ex.terminal_state, redact),
-    resultSummary: summaryText(ex.result_summary, redact),
+    instructionSummary: redactCapped(ex.distilled_instruction || ex.operator_utterance, redact, SUMMARY_TEXT_CAP),
+    waitingReason: redactCapped(ex.terminal_state, redact, SUMMARY_TEXT_CAP),
+    resultSummary: redactCapped(ex.result_summary, redact, SUMMARY_TEXT_CAP),
     updatedAt: ex.updated_at,
+    offers: computeFleetOffers(ex),
   };
 }
 

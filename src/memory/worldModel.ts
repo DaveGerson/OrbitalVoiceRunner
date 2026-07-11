@@ -11,6 +11,7 @@
 // see tests/test_memory_worldmodel.ts's fakeDeps(), which deliberately never grows these methods.
 import type { BreadcrumbRing } from "./breadcrumbs";
 import type { MemoryTiers, ProjectTier, PaneTier, BoardEntry, JanusFrame, EventFocusTier } from "./types";
+import { TERMINAL_STATES } from "../exchanges/lifecycle";
 
 /** A minimal note shape (StoredNote, src/store/types.ts) — duplicated narrowly here so this
  *  module has zero import coupling to src/store/*, matching the existing WorldModelDeps style. */
@@ -51,6 +52,14 @@ export interface WorldModelDeps {
     listExchangesByPane?: (paneId: string) => ExchangeLike[];
     /** One exchange's ordered event timeline. Mirrors JanusStore.listExchangeEvents. */
     listExchangeEvents?: (exchangeId: string) => ExchangeEventLike[];
+    /** The newest NON-TERMINAL exchange for a pane, bounded server-side. Mirrors
+     *  JanusStore.getLatestOpenExchangeForPane. OPTIONAL: absent (e.g. fakeDeps() test doubles)
+     *  degrades to the listExchangesByPane + JS-filter path below, unchanged. */
+    getLatestOpenExchangeForPane?: (paneId: string) => ExchangeLike | null;
+    /** One exchange's event timeline, filtered to `eventTypes`. Mirrors
+     *  JanusStore.listExchangeEventsByTypes. OPTIONAL: absent degrades to listExchangeEvents's full
+     *  timeline (still correctly filtered in JS below), unchanged. */
+    listExchangeEventsByTypes?: (exchangeId: string, eventTypes: string[]) => ExchangeEventLike[];
   };
   redact: (s: string) => string;
   breadcrumbs: BreadcrumbRing;
@@ -73,8 +82,20 @@ const RELEVANT_EXCHANGE_EVENTS = new Set([
   "agent_completion_reported", "agent_failure_reported", "delivery_succeeded", "exchange_cancelled",
 ]);
 
-/** Terminal AgentExchange states (spec §1.1) — excluded from "current in-flight exchange". */
-const TERMINAL_EXCHANGE_STATES = new Set(["agent_complete", "agent_failed", "cancelled"]);
+/** Every exchange_events type `candidateForExchangeEvent` ever turns into a RecentCandidate
+ *  (needs_input_detected + RELEVANT_EXCHANGE_EVENTS) — the type filter passed to
+ *  `listExchangeEventsByTypes` so the query returns exactly this subset instead of the exchange's
+ *  full timeline. */
+const RELEVANT_EXCHANGE_EVENT_TYPES = ["needs_input_detected", ...RELEVANT_EXCHANGE_EVENTS];
+
+/** Terminal AgentExchange states (spec §1.1) — excluded from "current in-flight exchange". Single
+ *  authority: src/exchanges/lifecycle.ts's TERMINAL_STATES (this module is server-side-only, so
+ *  importing it carries no client-bundle concern — unlike src/orbital/fleetExchangeOrdering.ts's
+ *  OWN local copy, which stays duplicated on purpose for exactly that reason). Widened to
+ *  `ReadonlySet<string>` here because `ExchangeLike.state` is deliberately `string`, not the
+ *  literal `ExchangeState` union (this module's own no-coupling convention, see ExchangeLike doc
+ *  above). */
+const TERMINAL_EXCHANGE_STATES: ReadonlySet<string> = TERMINAL_STATES;
 
 /** Human-readable waiting reason per in-flight exchange state, or absent (null) when the state
  *  doesn't imply the operator/agent is waiting on anything in particular. */
@@ -131,7 +152,14 @@ export class WorldModel {
 
   // ── AgentExchange state (board enrichment + event focus) ─────────────────────────────────────
 
+  /** Prefers the bounded store query (one row over the wire) when available; degrades to the full
+   *  per-pane history + JS filter/sort for a store double that doesn't implement it (e.g.
+   *  fakeDeps() in tests/test_memory_worldmodel.ts) — same selection either way (see
+   *  getLatestOpenExchangeForPane's doc for the exact tie-break match). */
   private currentExchangeForPane(paneId: string): ExchangeLike | null {
+    if (this.deps.store.getLatestOpenExchangeForPane) {
+      return this.deps.store.getLatestOpenExchangeForPane(paneId);
+    }
     const open = (this.deps.store.listExchangesByPane?.(paneId) ?? [])
       .filter(x => !TERMINAL_EXCHANGE_STATES.has(x.state));
     if (!open.length) return null;
@@ -182,7 +210,12 @@ export class WorldModel {
     ).slice(0, EXCHANGES_PER_PANE_SCAN);
     const out: RecentCandidate[] = [];
     for (const ex of exchanges) {
-      const events = this.deps.store.listExchangeEvents?.(ex.exchange_id) ?? [];
+      // Prefer the type-filtered read (only the event types candidateForExchangeEvent can ever use)
+      // over the full per-exchange timeline; degrades to listExchangeEvents (still correctly
+      // filtered below) for a store double that doesn't implement the narrower query.
+      const events = this.deps.store.listExchangeEventsByTypes
+        ? this.deps.store.listExchangeEventsByTypes(ex.exchange_id, RELEVANT_EXCHANGE_EVENT_TYPES)
+        : (this.deps.store.listExchangeEvents?.(ex.exchange_id) ?? []);
       for (const ev of events) {
         const cand = this.candidateForExchangeEvent(ex, ev);
         if (cand) out.push(cand);
