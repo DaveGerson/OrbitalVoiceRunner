@@ -53,11 +53,13 @@ function resolveSinceMsCutoff(sinceMsWindow: number, now: number): number {
 export function runMetricsReportCli<TArgs extends BaseCliArgs>(opts: RunMetricsReportCliOptions<TArgs>): void {
   const { label, extraFlags, extraValidate, buildReport } = opts;
   const flagSetters: Record<string, FlagSetter<TArgs>> = {
+    ...(extraFlags ?? {}),
+    // The shared four are spread LAST so a script's extraFlags genuinely cannot shadow them
+    // (matches the extraFlags doc contract above).
     "--db": (args, v) => { args.db = v; },
     "--since-ms": (args, v) => { args.sinceMs = Number(v); },
     "--limit": (args, v) => { args.limit = Number(v); },
     "--out": (args, v) => { args.out = v; },
-    ...(extraFlags ?? {}),
   };
 
   /** The shared --since-ms/--limit numeric checks — split out of `parseArgs` purely to keep that

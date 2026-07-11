@@ -159,6 +159,26 @@ describe("AgentExchange spine: boot recovery — restart AFTER delivered / obser
     });
   }
 
+  // Regression (WP2 two-query rewrite, adversarial review): a row quarantined THIS boot pass
+  // (e.g. running -> interrupted) must be counted EXACTLY ONCE — in `interrupted`, never also in
+  // `kept`. The passthrough-id snapshot is taken BEFORE the actionable CAS pass precisely so a
+  // just-quarantined row can't be re-seen in its new passthrough state. (The old per-state loop
+  // queried "interrupted" AFTER the in-flight states and so double-counted these rows into `kept`,
+  // inflating the boot digest — the rewrite fixed that; this pins the fix.)
+  it("a row quarantined this pass appears ONLY in `interrupted` — never double-counted into `kept`", () => {
+    const s = freshStore();
+    const quarantined = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "running", delivery_attempt: 1, delivered_at: 1000 });
+    const preExisting = s.insertExchange({ project_id: "p1", pane_id: "pane-2", state: "interrupted" });
+
+    const report = recoverExchangesOnBoot(s);
+
+    assert.ok(report.interrupted.includes(quarantined.exchange_id));
+    assert.ok(!report.kept.includes(quarantined.exchange_id), "quarantined row must not also be counted as kept");
+    assert.ok(report.kept.includes(preExisting.exchange_id), "a PRE-EXISTING interrupted row is still kept");
+    assert.ok(!report.interrupted.includes(preExisting.exchange_id));
+    s.close();
+  });
+
   it("already-settled exchanges (agent_complete/agent_failed/cancelled/interrupted) are kept, untouched, no event", () => {
     const s = freshStore();
     const ids = (["agent_complete", "agent_failed", "cancelled", "interrupted"] as ExchangeState[]).map(

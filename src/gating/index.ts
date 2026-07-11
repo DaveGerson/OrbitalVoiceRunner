@@ -1071,6 +1071,11 @@ export function createGating(deps: GatingDeps): Gating {
         }
       } catch (e) {
         console.error("[exchange-spine] beginExchangeDeliveryOnApprove (confirmApproval) failed:", e);
+        // Pre-consolidation semantics (the single try/catch this prelude and the stage/begin pair
+        // used to share): a confirmApproval-leg throw aborts the WHOLE hook — delivery is never
+        // staged on a spine whose approval-confirm just failed. The real pane write is unaffected
+        // either way (spec §9.6).
+        return;
       }
     }
     beginExchangeDelivery(record.exchangeId, "beginExchangeDeliveryOnApprove");

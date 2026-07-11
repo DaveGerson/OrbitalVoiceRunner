@@ -16,6 +16,10 @@
 // `instructionEnvelopeIsPrimary()` check) — this only folds the shared core.
 
 import { getExchangeService, exchangeSpineActive } from "./spine";
+// No new flag-freeze hazard: draftRegistry (imported below) already transitively imports
+// instructionEnvelope.ts, so its INSTRUCTION_ENVELOPE_MODE constant is frozen at the same point
+// with or without this direct import.
+import { instructionEnvelopeActive } from "./instructionEnvelope";
 import { getOpenDraft, serializeDraftEnvelope } from "./draftRegistry";
 
 /** Phase 1, Step 1.4 / Phase 3 Step 3.5: durable pre-write intent — legal only from `staged`,
@@ -68,17 +72,21 @@ export interface MintExchangeForSendInput {
 }
 
 /**
- * Shared "mint an exchange for a fresh send" core: `createExchange` plus — when this pane has an
- * OPEN envelope draft (src/exchanges/draftRegistry.ts) — serializing it into
- * `instructionEnvelopeJson` (the durable source `rehydrateDraftRegistryOnBoot` reads back after a
- * restart). A pane with no open draft (the plain, non-envelope dispatch case, or the envelope flag
- * fully off — nothing is ever registered in that case) simply gets `undefined`, unchanged from the
- * schema default. No-op (returns `undefined`) unless the flag is active; never throws.
+ * Shared "mint an exchange for a fresh send" core: `createExchange` plus — when the
+ * instruction-envelope flag is active AND this pane has an OPEN envelope draft
+ * (src/exchanges/draftRegistry.ts) — serializing it into `instructionEnvelopeJson` (the durable
+ * source `rehydrateDraftRegistryOnBoot` reads back after a restart). The `instructionEnvelopeActive()`
+ * gate is load-bearing, not redundant: the compose_draft voice actions (src/actions/defs/
+ * voice_ux.ts) can register an open draft regardless of the envelope flag, so "flag off ⇒ registry
+ * empty" does NOT hold — with the flag off the column must stay at its schema default (exactly what
+ * the pre-consolidation voice lane's `draftEnvelopeJsonForDispatch` guaranteed). A pane with no
+ * open draft (the plain, non-envelope dispatch case) likewise gets `undefined`. No-op (returns
+ * `undefined`) unless the spine flag is active; never throws.
  */
 export function mintExchangeForSend(input: MintExchangeForSendInput): string | undefined {
   if (!exchangeSpineActive()) return undefined;
   try {
-    const openDraft = getOpenDraft(input.projectId, input.paneId);
+    const openDraft = instructionEnvelopeActive() ? getOpenDraft(input.projectId, input.paneId) : undefined;
     return getExchangeService().createExchange({
       projectId: input.projectId,
       paneId: input.paneId,

@@ -239,7 +239,7 @@ export class AnnouncementBus {
     if (this.isPaneMuted(item.terminalId)) return false;
 
     if (!isHighSeverity(item.kind)) {
-      const key = `${item.terminalId} ${item.kind}`;
+      const key = `${item.terminalId}\0${item.kind}`;
       const last = this.lastAnnouncedAt[key];
       if (last !== undefined && now - last < this.perPaneDebounceMs) {
         // 4D.2: DEFER, never drop — latest-wins into the pending slot; one timer per slot fires
@@ -380,7 +380,7 @@ export class ExchangeNarrationGate {
   private readonly seen = new Set<string>();
 
   private key(exchangeId: string, eventType: string, anchor: number | string): string {
-    return `${exchangeId} ${eventType} ${anchor}`;
+    return `${exchangeId}\0${eventType}\0${anchor}`;
   }
 
   /** True the FIRST time this (exchangeId, eventType, anchor) combo is seen — and remembers it, so
