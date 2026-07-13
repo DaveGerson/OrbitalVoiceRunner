@@ -7,7 +7,9 @@ import { AutonomyBadge, ChefAvatar, Chip, Pips, PostureChip, StatusBadge, VoiceC
 import { CHEFS } from "./theme";
 import type { Station } from "./station";
 import type { StoredHandoff } from "../store/types";
+import type { ExchangeDraftView } from "../types";
 import { StationHandoffDrawer } from "./StationHandoffDrawer";
+import { ExchangeStateChip } from "./InstructionWorkbench";
 import {
   deriveCardColors,
   deriveCardTag,
@@ -23,7 +25,7 @@ import {
 
 const PIP_COUNT = 8;
 
-export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onStageHandoff, onRejectHandoff, onFetchHandoffPrompt }: {
+export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, layout, showCue, active, handoffs, onDeliverHandoff, onReviseHandoff, onStageHandoff, onRejectHandoff, onFetchHandoffPrompt, exchange }: {
   st: Station; accentHex: string; dark: boolean; compact: boolean; tilt?: number;
   onOpen: () => void; layout: "grid" | "rail" | "list"; showCue: boolean; active: boolean;
   // j4e1 (additive): handoffs bound TO this station + the hero-action callbacks. Omitted → no drawer.
@@ -33,6 +35,9 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
   onStageHandoff?: (id: string) => void;
   onRejectHandoff?: (id: string) => void;
   onFetchHandoffPrompt?: (id: string) => Promise<string | null>;
+  /** Phase 3, Step 3.3 (additive): this station's open instruction-envelope draft, or null/absent —
+   *  renders a compact state chip in the header row when present, nothing otherwise. */
+  exchange?: ExchangeDraftView | null;
 }) {
   const [hover, setHover] = useState(false);
   const rt = RUNTIMES[st.toolPreset] || RUNTIMES.Custom;
@@ -55,6 +60,8 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
           </span>
         )}
         {!list && <div style={{ flex: 1 }} />}
+        {/* Phase 3, Step 3.3: the pane's open instruction-draft state, at a glance. */}
+        {!list && <ExchangeStateChip exchange={exchange} />}
         {/* 2K.2: the pane's autonomy at a glance — server truth (posture/permissions_mode), visual only */}
         {!list && <PostureChip posture={st.posture} mode={st.mode} />}
         {!list && <AutonomyBadge until={st.autonomy_until} />}
@@ -109,6 +116,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         display: "flex", alignItems: "center", gap: 8, marginTop: list ? 0 : 10, paddingTop: list ? 0 : 9, paddingLeft: 4,
         borderTop: list ? "none" : "1.5px dashed " + deriveFooterBorderColor(dark), flex: list ? 1 : "none",
       }}>
+        {list && <ExchangeStateChip exchange={exchange} />}
         {list && <PostureChip posture={st.posture} mode={st.mode} />}
         {list && <AutonomyBadge until={st.autonomy_until} />}
         {list && <StatusBadge status={st.status} />}

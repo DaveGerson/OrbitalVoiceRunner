@@ -18,9 +18,35 @@
 //
 // Runner: npx tsx --test --test-force-exit tests/test_verifymodeswitch_complexity_refactor.ts
 
-import { describe, it } from "node:test";
+import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { computeVerdictInfo } from "../scripts/verify-live-modeswitch-agy";
+import type { VerdictInfo } from "../scripts/verify-live-modeswitch-agy";
+
+let computeVerdictInfo: (
+  floorMarker: string | null,
+  axisDown: string[],
+  axisTab: string[],
+) => VerdictInfo;
+
+// DELTA(plan): Task 3's `npm test` gate surfaced that this "pure helper" suite was starting
+// the live agy verifier at import time. Pin the no-side-effect import contract so the battery
+// cannot hang behind an unrelated ConPTY child while z5c changes are being verified.
+before(async () => {
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: any[]) => { logs.push(args.map(String).join(" ")); };
+  try {
+    const mod = await import("../scripts/verify-live-modeswitch-agy");
+    computeVerdictInfo = mod.computeVerdictInfo;
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual(
+    logs.filter((line) => line.includes("[p5-agy]")),
+    [],
+    "importing the pure helper module must not start the live agy verifier",
+  );
+});
 
 // ---------------------------------------------------------------------------
 // 1. inconclusive = true: no non-null markers at all

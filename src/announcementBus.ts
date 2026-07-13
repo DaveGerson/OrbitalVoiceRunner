@@ -101,6 +101,10 @@ export interface AnnouncementItem {
   summary?: string;
   /** Monotonic time the item was enqueued (filled in by the bus from its clock). */
   at?: number;
+  /** AgentExchange spine correlation (task C, spec §5 "attention rows") — present when this
+   *  announcement is exchange-correlated (e.g. an approval_expired resolve for an exchange-bound
+   *  approval), so downstream attention-row consumers can key off it. */
+  exchangeId?: string;
 }
 
 export interface Clock {
@@ -133,6 +137,16 @@ export interface AnnouncementBusOptions {
   /** Returns the current operator-editable templates (read fresh each flush so a
    *  Settings edit takes effect without a restart). */
   getTemplates?: () => AnnouncementTemplates;
+  /**
+   * Phase 5, Step 5.1 (Fleet View "communication-by-exception"): per-project mute. Checked FIRST
+   * on every `enqueue()`, read fresh each call (mirrors `getTemplates`) so an operator's mute
+   * toggle (PUT /api/settings) takes effect immediately, no restart/reconnect needed. Returns
+   * `true` to DROP the item entirely — no earcon, no notification, no debounce/coalesce
+   * bookkeeping touched (a muted project must not even warm the per-pane debounce window, so
+   * un-muting later doesn't inherit a stale cold/hot state from while it was muted). Absent ⇒
+   * nothing is ever muted (today's behavior, byte-identical).
+   */
+  isPaneMuted?: (terminalId: string) => boolean;
 }
 
 function applyTemplate(tpl: string, pane: string, summary: string): string {
@@ -155,6 +169,7 @@ export class AnnouncementBus {
   private rateLimitBurst: number;
   private itemTtlMs: number;
   private getTemplates: () => AnnouncementTemplates;
+  private isPaneMuted: (terminalId: string) => boolean;
 
   private buffer: AnnouncementItem[] = [];
   private flushTimer: any = null;
@@ -178,6 +193,7 @@ export class AnnouncementBus {
     this.rateLimitBurst = opts.rateLimitBurst ?? 2;
     this.itemTtlMs = opts.itemTtlMs ?? ATTENTION_TTL_MS;
     this.getTemplates = opts.getTemplates || (() => DEFAULT_ANNOUNCEMENT_TEMPLATES);
+    this.isPaneMuted = opts.isPaneMuted || (() => false);
   }
 
   /**
@@ -202,15 +218,28 @@ export class AnnouncementBus {
    *   - normal severity, hot (pane,kind) window: COALESCES-TO-LATEST into a pending slot and is
    *     delivered (earcon + notification) when the window expires; the flush re-stamps the window,
    *     so sustained flapping keeps collapsing to one announcement per window. */
-  enqueue(item: AnnouncementItem): boolean {
-    const now = this.clock.now();
-    // 4D.1: every genuine edge reaches the listeners, even when the announcement defers.
+  /** 4D.1: notify every onEnqueue listener (the durable activity recorder), containing a throw so
+   *  one bad listener can never break enqueue's own control flow. Split out of enqueue() purely to
+   *  keep that method's own branch count flat (complexity gate). */
+  private notifyEnqueueListeners(item: AnnouncementItem): void {
     for (const listener of this.enqueueListeners) {
       try { listener(item); } catch (e) { console.error("AnnouncementBus onEnqueue listener failed:", e); }
     }
+  }
+
+  enqueue(item: AnnouncementItem): boolean {
+    const now = this.clock.now();
+    // 4D.1: every genuine edge reaches the listeners, even when the announcement defers.
+    this.notifyEnqueueListeners(item);
+
+    // Phase 5, Step 5.1: a muted project's announcements are DROPPED here — before the debounce
+    // window, the earcon, and the notification stack all touch it. Unlike the debounce path this
+    // is a genuine drop, not a defer: there is no pending slot to flush once the operator un-mutes
+    // (that would surprise them with a stale earcon for something that happened while muted).
+    if (this.isPaneMuted(item.terminalId)) return false;
 
     if (!isHighSeverity(item.kind)) {
-      const key = `${item.terminalId} ${item.kind}`;
+      const key = `${item.terminalId}\0${item.kind}`;
       const last = this.lastAnnouncedAt[key];
       if (last !== undefined && now - last < this.perPaneDebounceMs) {
         // 4D.2: DEFER, never drop — latest-wins into the pending slot; one timer per slot fires
@@ -330,4 +359,59 @@ export class AnnouncementBus {
     this.pendingCoalesced.clear();
     this.buffer = [];
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — EXACTLY-ONCE narration gate for exchange-correlated spoken/caption
+// announcements (src/voice/index.ts's live-session pushSignal enrichment). Keyed by
+// (exchange_id, event_type, narration-id). The narration-id is DERIVED, never separately stored:
+// callers pass the exchange's own durable `updated_at` (or an `exchange_events.event_id`) as the
+// anchor. `persistTransition` (src/exchanges/service.ts) only ever advances `updated_at` on a
+// genuine, CAS-won transition — a repeated pane edge that does NOT change exchange state is a
+// structural no-op there and therefore never produces a fresh anchor here either, so "have I
+// narrated this (exchange, eventType, anchor) triple" is a sufficient exactly-once test without a
+// second durable table. Process-lifetime, in-memory: a live client reconnect (WS drop/resume)
+// does NOT restart this process, so the gate's memory survives it (no re-announce on reconnect);
+// a genuine process restart already quarantines every in-flight exchange to `interrupted`
+// (recoverOnBoot) — a NEW, distinct transition worth narrating once — so losing the cache on an
+// actual restart is correct, not a gap.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+export class ExchangeNarrationGate {
+  private readonly seen = new Set<string>();
+
+  private key(exchangeId: string, eventType: string, anchor: number | string): string {
+    return `${exchangeId}\0${eventType}\0${anchor}`;
+  }
+
+  /** True the FIRST time this (exchangeId, eventType, anchor) combo is seen — and remembers it, so
+   *  every subsequent call with the SAME triple returns false. A DIFFERENT anchor (a genuine new
+   *  transition) is always a fresh true, even for the same exchange+eventType. */
+  shouldNarrate(exchangeId: string, eventType: string, anchor: number | string): boolean {
+    const k = this.key(exchangeId, eventType, anchor);
+    if (this.seen.has(k)) return false;
+    this.seen.add(k);
+    return true;
+  }
+
+  /** Test/debug hook — clears all narration memory (mirrors what a real process restart implies:
+   *  every in-flight exchange has already moved to `interrupted`, a fresh anchor). */
+  reset(): void {
+    this.seen.clear();
+  }
+}
+
+/** Process-lifetime singleton (mirrors src/exchanges/spine.ts's getExchangeService() idiom) — the
+ *  live voice session's pushSignal enrichment and any other narration surface share ONE gate so a
+ *  transition narrated via one path is never repeated via another. */
+let sharedExchangeNarrationGate: ExchangeNarrationGate | undefined;
+
+export function getExchangeNarrationGate(): ExchangeNarrationGate {
+  if (!sharedExchangeNarrationGate) sharedExchangeNarrationGate = new ExchangeNarrationGate();
+  return sharedExchangeNarrationGate;
+}
+
+/** Test-only reset (mirrors resetExchangeServiceForTests) — each test file that exercises the
+ *  gate should reset it in `before()`/`beforeEach()` so cases don't leak state across each other. */
+export function resetExchangeNarrationGateForTests(): void {
+  sharedExchangeNarrationGate = undefined;
 }

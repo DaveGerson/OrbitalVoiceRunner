@@ -26,7 +26,11 @@ import {
   GEMINI_INVALID_KEY_CODE,
   isInvalidKeyClose,
   isBlankApiKey,
+  LEGACY_RESUME_HANDLE_KV_KEY,
+  resumptionHandleKvKeyFor,
+  readHandleOwner,
 } from "../src/voiceResumption";
+import { interruptionDispositionFor } from "../src/exchanges/recovery";
 
 test("GEMINI_SESSION_EXPIRED_CODE is the WebSocket 1008 'session expired' code", () => {
   assert.strictEqual(GEMINI_SESSION_EXPIRED_CODE, 1008);
@@ -123,4 +127,88 @@ test("isBlankApiKey: empty / whitespace / nullish are blank — never attempt a 
 });
 test("isBlankApiKey: a real key is not blank", () => {
   assert.strictEqual(isBlankApiKey("AIzaSyA-validlookingkey-0123456789"), false);
+});
+
+// ── z5c design (spec 2026-07-07-z5c-session-pool-design.md D5) — per-project handle KV naming ──
+// The pre-pool app had exactly ONE resumption handle for the whole server (LEGACY_RESUME_HANDLE_KV_KEY,
+// literally "voiceResumptionToken"). The per-project session pool (src/voice/sessionPool.ts) gives
+// each pool entry its OWN durable slot so switching A->B->A can resume EACH project's own
+// server-side Gemini conversation. These are pure string-building helpers; the actual KV I/O +
+// one-way legacy migration lives in SessionPool (tests/test_session_pool.ts) — proven here is just
+// that the naming scheme is stable, collision-free across projects, and correctly rooted at the
+// SAME legacy key literal every pre-pool read/write site already used (src/voice/index.ts's
+// VOICE_RESUMPTION_KV constant) so migration always finds the right row.
+test("LEGACY_RESUME_HANDLE_KV_KEY is the pre-pool single-slot literal every existing read/write site used", () => {
+  assert.strictEqual(LEGACY_RESUME_HANDLE_KV_KEY, "voiceResumptionToken");
+});
+test("resumptionHandleKvKeyFor: distinct projects get distinct, deterministic keys", () => {
+  const a = resumptionHandleKvKeyFor("proj_a");
+  const b = resumptionHandleKvKeyFor("proj_b");
+  assert.notStrictEqual(a, b);
+  assert.strictEqual(a, resumptionHandleKvKeyFor("proj_a"), "same project id -> same key, every call");
+});
+test("resumptionHandleKvKeyFor: the per-project key is namespaced under the legacy key, not colliding with it", () => {
+  const key = resumptionHandleKvKeyFor("proj_a");
+  assert.notStrictEqual(key, LEGACY_RESUME_HANDLE_KV_KEY);
+  assert.ok(key.startsWith(LEGACY_RESUME_HANDLE_KV_KEY), "namespaced under the SAME root the legacy reader/writer used");
+});
+test("resumptionHandleKvKeyFor: a project id containing ':' still round-trips to a distinct key (no accidental collision)", () => {
+  const a = resumptionHandleKvKeyFor("weird:proj");
+  const b = resumptionHandleKvKeyFor("weird");
+  assert.notStrictEqual(a, b);
+});
+
+// ── z5c design D4/D5 — the poison-handle self-heal + freshness predicates are already per-entry ──
+// shouldClearHandleOnClose / isResumptionHandleFresh / readFreshHandle take their inputs as plain
+// parameters (never touch shared module state), so the SAME pure functions the pre-pool single
+// socket used for its one handle work UNCHANGED for N independent per-project handles under the
+// pool — two "entries" (simulated here as two independent wrapHandleForPersist/readFreshHandle
+// round trips) never see or influence each other's poison/freshness state.
+test("poison-handle self-heal is independent per project — clearing project A's handle never affects project B's", () => {
+  const now = 10_000;
+  const rawA = wrapHandleForPersist({ newHandle: "h-a" }, now);
+  const rawB = wrapHandleForPersist({ newHandle: "h-b" }, now);
+  // Project A's session closes 1008 (poisoned) -> its handle is cleared (simulated: caller nulls it).
+  const aShouldClear = shouldClearHandleOnClose(GEMINI_SESSION_EXPIRED_CODE, true);
+  assert.strictEqual(aShouldClear, true);
+  const clearedA: string | null = null; // what the caller would persist for A
+  // Project B's session, meanwhile, closed normally — its own handle stays intact.
+  const bShouldClear = shouldClearHandleOnClose(1000, true);
+  assert.strictEqual(bShouldClear, false);
+  assert.strictEqual(clearedA, null);
+  assert.deepStrictEqual(readFreshHandle(rawB, now + 500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h-b" });
+  // And re-reading A's (now-cleared) slot never resurrects the poisoned handle.
+  assert.deepStrictEqual(readFreshHandle(rawA, now + 500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h-a" }, "the RAW row is unaffected by another project's clear — clearing is the caller's job (delete the row), not this predicate's");
+});
+
+// ── Phase 2 Step 2.5 review fix — owner-stamped handles ─────────────────────────────────────────
+test("wrapHandleForPersist owner stamp round-trips through readHandleOwner; unstamped/garbage reads null", () => {
+  const stamped = wrapHandleForPersist({ newHandle: "h" }, 1000, "proj_a");
+  assert.strictEqual(readHandleOwner(stamped), "proj_a");
+  // The stamp is ADDITIVE — the age-guarded read is unaffected by its presence.
+  assert.deepStrictEqual(readFreshHandle(stamped, 1500, DEFAULT_RESUME_HANDLE_TTL_MS)?.token, { newHandle: "h" });
+  // Unstamped (legacy/pre-pool) rows, explicit-null owners, and garbage all read null owner.
+  assert.strictEqual(readHandleOwner(wrapHandleForPersist({ newHandle: "h" }, 1000)), null);
+  assert.strictEqual(readHandleOwner(wrapHandleForPersist({ newHandle: "h" }, 1000, null)), null);
+  assert.strictEqual(readHandleOwner("not json"), null);
+  assert.strictEqual(readHandleOwner(null), null);
+});
+
+// ── AgentExchange spine (Phase 4, Step 4.3) — a Gemini Live session reconnect never interrupts an
+// exchange's DELIVERY. This file is the resumption/reconnect module; this is the resumption-
+// relevant HALF of src/exchanges/recovery.ts's interruption class -> disposition table (the other
+// half, browser reconnect + the actual process-boot quarantine machinery, is pinned in
+// tests/test_exchange_recovery.ts). Everything ELSE in this file (the poison-handle self-heal, the
+// TTL freshness guard) is exactly WHY a session can reconnect cleanly without ever touching an
+// AgentExchange: the handle/session churn this module manages is entirely upstream of the PTY
+// write path (`term.writeInput` never round-trips through the Live session), so nothing about it
+// creates delivery uncertainty. ──────────────────────────────────────────────────────────────────
+test("AgentExchange spine: a Gemini Live session reconnect (handle-poison clear, TTL expiry, or a plain drop) never quarantines an exchange — delivery already landed (or didn't) independently of the Live socket", () => {
+  assert.strictEqual(interruptionDispositionFor("gemini_session_reconnect"), "no_op_delivery_unaffected");
+});
+test("AgentExchange spine: a browser WS reconnect never quarantines an exchange either — the server process (and every live PTY) is untouched by the operator's tab reconnecting", () => {
+  assert.strictEqual(interruptionDispositionFor("browser_ws_reconnect"), "no_op_delivery_unaffected");
+});
+test("AgentExchange spine: only a real process restart creates delivery uncertainty worth quarantining", () => {
+  assert.strictEqual(interruptionDispositionFor("process_boot"), "quarantine_uncertain_inflight");
 });

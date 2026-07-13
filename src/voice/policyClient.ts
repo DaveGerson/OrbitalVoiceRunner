@@ -89,6 +89,46 @@ export interface MacroPhraseEntry {
   phrase: string;
 }
 
+// ── z5c design (spec 2026-07-07-z5c-session-pool-design.md D3): pool.plan ──────────────────────
+// Python DECIDES per-project session-pool membership (hot/warm/handle); TS keeps all socket I/O.
+// Same wire shape + versioning + 300ms race + null-on-ANY-miss fallback contract as every other op
+// in this file — see PythonPolicyClient's class doc above. The TS-side FAIL-CLOSED FLOOR (D6) lives
+// in src/voice/sessionPool.ts (SessionPool.floorPlan), NOT here — this facade only ever returns the
+// daemon's real answer or null; it never invents a floor plan itself (single-responsibility, mirrors
+// resolveFocus/rankSitrep leaving their TS fallback to the caller).
+
+/** One (project_id -> pool entry) snapshot row fed to pool.plan (spec D3's `entries[projectId]`). */
+export interface PoolPlanEntrySnapshot {
+  state: "hot-foreground" | "hot-warm" | "handle" | "cold";
+  handleAgeMs: number | null;
+  handleTtlMs: number | null;
+  lastEventAtMs: number | null;
+  lastSwitchAtMs: number | null;
+}
+
+/** The TS-composed health snapshot pool.plan reasons over (spec D3's request `snapshot` field). */
+export interface PoolPlanSnapshot {
+  projects: string[];
+  foregroundProjectId: string | null;
+  hotSlotBudget: number;
+  entries: Record<string, PoolPlanEntrySnapshot>;
+}
+
+export type PoolPlanActionType = "promote" | "demote" | "resume" | "fresh" | "evict";
+
+export interface PoolPlanAction {
+  type: PoolPlanActionType;
+  projectId: string;
+  reason: string;
+}
+
+/** The daemon's deterministic slot assignment for THIS snapshot (spec D3's response `plan`). */
+export interface PoolPlan {
+  foregroundProjectId: string | null;
+  hotSlots: string[];
+  actions: PoolPlanAction[];
+}
+
 /** The macro.match result: the matched macro id, or null when the daemon RAN but found no match. */
 export interface MacroMatch {
   id: string | null;
@@ -114,6 +154,12 @@ export interface PythonPolicyClient {
    *  (the wire enum is pinned to the four-value subset). Same fallback contract as resolveFocus.
    *  OPTIONAL on the interface (like matchMacro) so pre-hwu.3 test doubles stay valid. */
   classifyNote?(text: string): Promise<ClassifiableNoteType | null>;
+  /** z5c design D3: ask the daemon which projects should be hot/warm/handle right now. Resolves
+   *  null on ANY miss (down/timeout/schema/ok:false) — the caller (SessionPool.planPool) MUST
+   *  fall back to the D6 fail-closed floor (foreground-only, no hot-warm slots) on null, exactly
+   *  like every other op's fallback contract on this facade. NEVER rejects. OPTIONAL on the
+   *  interface (like matchMacro/classifyNote) so pre-z5c test doubles stay valid. */
+  planPool?(snapshot: PoolPlanSnapshot): Promise<PoolPlan | null>;
   /** True only when the shared daemon has pinged and the breaker is closed. */
   available(): boolean;
   /** Tear down the shared core (idempotent — call once for all facades over that core). */
@@ -202,6 +248,34 @@ const NoteClassifyResponseSchema = z.discriminatedUnion("ok", [
   }),
 ]);
 
+const PoolPlanActionSchema = z.object({
+  type: z.enum(["promote", "demote", "resume", "fresh", "evict"]),
+  projectId: z.string(),
+  reason: z.string(),
+});
+
+const PoolPlanSchema = z.object({
+  foregroundProjectId: z.string().nullable(),
+  hotSlots: z.array(z.string()),
+  actions: z.array(PoolPlanActionSchema),
+});
+
+const PoolPlanResponseSchema = z.discriminatedUnion("ok", [
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(true),
+    plan: PoolPlanSchema,
+    trace: z.unknown().optional(),
+  }),
+  z.object({
+    id: z.string(),
+    v: z.literal(WIRE_VERSION),
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string() }),
+  }),
+]);
+
 /** Race one core.request against `timeoutMs`; resolves null on timeout (the timer never rejects, so
  *  a slow daemon just loses the race — no unhandled rejection, no throw). */
 async function raceRequest(
@@ -270,6 +344,19 @@ export function createPythonPolicyClient(
       if (!parsed.success || !parsed.data.ok) return null;
       // The enum-validated `type` is one of the four allowed values; return it verbatim.
       return parsed.data.type;
+    },
+    async planPool(snapshot) {
+      const obj = await raceRequest(core, "pool.plan", { snapshot }, timeoutMs);
+      if (!obj) return null;
+      const parsed = PoolPlanResponseSchema.safeParse(obj);
+      if (!parsed.success || !parsed.data.ok) return null;
+      const p = parsed.data.plan;
+      // Rebuilt field-by-field (independent of any zod-inference quirk), mirroring resolveFocus.
+      return {
+        foregroundProjectId: p.foregroundProjectId,
+        hotSlots: [...p.hotSlots],
+        actions: p.actions.map((a) => ({ type: a.type, projectId: a.projectId, reason: a.reason })),
+      };
     },
     dispose() { core.dispose(); },
   };

@@ -97,23 +97,44 @@ function resolveDispatchText(
 }
 
 /**
- * Stamp ONE per-pane dispatch outcome onto the join group and classify it as staged or refused.
- * Behavior-preserving extraction of the per-pane outcome branch inside the fan-out loop.
+ * The exchange bound to this member's synthetic pendingId, if any (AgentExchange spine, step 1.4,
+ * spec §5). `ctx.dispatchProposal` (the injected pane-write choke-point) mints + binds the
+ * exchange internally when JANUS_EXCHANGE_SPINE is shadow/primary — this reads that binding back
+ * via the SAME pending-approval record the write staged, so the join tracker can attach it to the
+ * matching member (recordOutcomeAt). Best-effort: `ctx.pendingApprovals` is optional on hand-built
+ * test contexts, and the flag-off / defensive 'executed' path never bound anything — both degrade
+ * to `undefined`, which keeps the member legacy/pane-scoped (see joinTracker.ts).
  */
-function recordDispatchOutcome(groupId: string, paneId: string, outcome: DispatchOutcome): { staged: boolean; refused?: string } {
+function exchangeIdForPending(ctx: ActionContext, pendingId: string): string | undefined {
+  return ctx.pendingApprovals?.get(pendingId)?.exchangeId;
+}
+
+/**
+ * Stamp ONE per-pane dispatch outcome onto the join group (by member INDEX, step 1.4 — see
+ * recordOutcomeAt) and classify it as staged or refused. Behavior-preserving extraction of the
+ * per-pane outcome branch inside the fan-out loop, plus the exchange-id thread-through.
+ */
+function recordDispatchOutcome(
+  ctx: ActionContext,
+  groupId: string,
+  index: number,
+  paneId: string,
+  pendingId: string,
+  outcome: DispatchOutcome
+): { staged: boolean; refused?: string } {
   if (outcome.kind === "pending") {
-    dispatchJoinTracker.recordOutcome(groupId, paneId, "staged");
+    dispatchJoinTracker.recordOutcomeAt(groupId, index, "staged", undefined, exchangeIdForPending(ctx, pendingId));
     return { staged: true };
   }
   if (outcome.kind === "executed") {
     // Defensive: forceStage should make this unreachable, but record it honestly if the engine
     // ever executes (e.g. a future caller drops the flag).
-    dispatchJoinTracker.recordOutcome(groupId, paneId, "running");
+    dispatchJoinTracker.recordOutcomeAt(groupId, index, "running", undefined, exchangeIdForPending(ctx, pendingId));
     return { staged: true };
   }
-  dispatchJoinTracker.recordOutcome(
+  dispatchJoinTracker.recordOutcomeAt(
     groupId,
-    paneId,
+    index,
     outcome.kind === "blocked" ? "blocked" : "error",
     outcome.text
   );
@@ -163,13 +184,15 @@ export function stageDispatchGroup(
   const base = ctx.callId ?? group.id;
   const staged: string[] = [];
   const refused: string[] = [];
-  for (const t of targets) {
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    // Synthetic per-step pending id (the execute_plan precedent) so N stagings never collide on one
+    // functionCall id — `key` is unique per target (paneId for a fan-out, step-index+pane for a macro).
+    const pendingId = `${base}__${group.id}__${t.key}`;
     const outcome = ctx.dispatchProposal({
       sess: ctx.session,
       callId: base,
-      // Synthetic per-step pending id (the execute_plan precedent) so N stagings never collide on one
-      // functionCall id — `key` is unique per target (paneId for a fan-out, step-index+pane for a macro).
-      pendingId: `${base}__${group.id}__${t.key}`,
+      pendingId,
       targetId: t.paneId,
       instruction: t.instruction,
       trigger,
@@ -177,7 +200,8 @@ export function stageDispatchGroup(
       // The fan-out invariant: never auto-execute; every write parks as an approval. See paneWrite.ts.
       forceStage: true,
     });
-    const recorded = recordDispatchOutcome(group.id, t.paneId, outcome);
+    // `i` (not paneId alone) addresses the member — see recordDispatchOutcome/recordOutcomeAt.
+    const recorded = recordDispatchOutcome(ctx, group.id, i, t.paneId, pendingId, outcome);
     if (recorded.staged) staged.push(t.paneId);
     else refused.push(recorded.refused!);
   }

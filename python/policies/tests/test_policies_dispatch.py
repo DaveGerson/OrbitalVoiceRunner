@@ -3,7 +3,9 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import dispatch  # noqa: E402
+from _policies_dispatch_loader import load_dispatch  # noqa: E402
+
+dispatch = load_dispatch()
 
 
 class DispatchTest(unittest.TestCase):

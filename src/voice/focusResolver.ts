@@ -173,29 +173,42 @@ type Classification =
   | { kind: "fuzzy" }
   | { kind: "exact" };
 
+/** The ambiguity margin (spec): an alternative within this much confidence of the top pick makes
+ *  the resolution "multiple" rather than a clean single match. Shared with
+ *  src/voice/targetResolver.ts's resolveViaRanker, which classifies the SAME FocusResolution shape
+ *  via the ranker leg — both used to hand-maintain their own copy of this filter. */
+export const CLOSE_MARGIN = 0.15;
+
+/** Alternatives within CLOSE_MARGIN of `resolution`'s own top confidence, excluding its own
+ *  paneId. Exported so targetResolver.ts's ranker-resolution classification can share this exact
+ *  filter instead of mirroring it by hand. */
+export function closeAlternatives(resolution: FocusResolution): FocusResolution["alternatives"] {
+  return resolution.alternatives.filter(
+    (a) => a.paneId !== resolution.paneId && resolution.confidence - a.score <= CLOSE_MARGIN,
+  );
+}
+
 /**
  * Classify a FocusResolution into the four spec buckets. confidence===1 is treated as an
  * unconditional exact/unique match (silent-bind eligible) regardless of any alternatives the
- * (possibly fuzzy) policy scorer also reported. Otherwise: any alternative within the 0.15 margin
+ * (possibly fuzzy) policy scorer also reported. Otherwise: any alternative within the CLOSE_MARGIN
  * of the top confidence makes the pick ambiguous ("multiple"); zero close alternatives is "fuzzy".
  */
 function classifyResolution(resolution: FocusResolution): Classification {
   if (!resolution.paneId || resolution.confidence <= 0) return { kind: "none" };
   if (resolution.confidence >= 1) return { kind: "exact" };
-  const close = resolution.alternatives.filter(
-    (a) => a.paneId !== resolution.paneId && resolution.confidence - a.score <= 0.15,
-  );
+  const close = closeAlternatives(resolution);
   if (close.length > 0) {
     return { kind: "multiple", ids: [resolution.paneId, ...close.map((a) => a.paneId)] };
   }
   return { kind: "fuzzy" };
 }
 
-function candidateName(candidates: FocusCandidate[], paneId: string): string {
+export function candidateName(candidates: FocusCandidate[], paneId: string): string {
   return candidates.find((c) => c.paneId === paneId)?.paneName ?? paneId;
 }
 
-function formatNameList(names: string[]): string {
+export function formatNameList(names: string[]): string {
   const quoted = names.map((n) => `'${n}'`);
   if (quoted.length === 0) return "";
   if (quoted.length === 1) return quoted[0];

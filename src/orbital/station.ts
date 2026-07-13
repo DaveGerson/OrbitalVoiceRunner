@@ -84,6 +84,14 @@ function findWorkspace(ledger: Record<string, Workspace>, paneId: string): Works
   return undefined;
 }
 
+/** Phase 5, Step 5.1 (Fleet View): resolve a pane's owning project id, or `""` when unassigned/
+ *  unknown — the client-side twin of server.ts's `manager.terminals[id].projectId` lookup, reused
+ *  wherever a client-side surface (the per-project mute check, fleet ordering) needs "which
+ *  project does this pane belong to" without re-deriving `findWorkspace`'s scan inline. */
+export function projectIdForPane(ledger: Record<string, Workspace>, paneId: string): string {
+  return findWorkspace(ledger, paneId)?.id ?? "";
+}
+
 /** Resolve the workspace/pane context for a terminal id (membership + skin + project id). */
 function resolvePaneContext(ledger: Record<string, Workspace>, t: Terminal) {
   const ws = findWorkspace(ledger, t.id);

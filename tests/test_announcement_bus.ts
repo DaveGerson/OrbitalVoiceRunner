@@ -629,6 +629,80 @@ describe("4D.2 AnnouncementBus — debounce defers, never drops", () => {
   });
 });
 
+// Phase 5, Step 5.1 (Fleet View "communication-by-exception") — per-project mute. `isPaneMuted`
+// is injected (mirrors `getTemplates`); the bus checks it FIRST on every enqueue, before the
+// debounce/coalesce bookkeeping and before the earcon fires.
+describe("AnnouncementBus — per-project mute (isPaneMuted)", () => {
+  it("a muted pane's announcement is dropped entirely: no earcon, no notification", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, { isPaneMuted: (id: string) => id === "muted_pane" });
+    const ok = bus.enqueue({ kind: "completion", terminalId: "muted_pane", summary: "done" });
+    assert.strictEqual(ok, false, "enqueue reports the item was not delivered");
+    clock.advance(5000);
+    assert.strictEqual(earcons(sink).length, 0);
+    assert.strictEqual(notifs(sink).length, 0);
+    bus.stop();
+  });
+
+  it("an unmuted pane on the SAME bus still announces normally", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, { isPaneMuted: (id: string) => id === "muted_pane" });
+    bus.enqueue({ kind: "completion", terminalId: "other_pane", summary: "done" });
+    clock.advance(1500);
+    assert.strictEqual(notifs(sink).length, 1);
+    bus.stop();
+  });
+
+  it("even a HIGH-severity kind (error/exited) is muted — mute is checked before the severity branch", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, { isPaneMuted: () => true });
+    const ok = bus.enqueue({ kind: "error", terminalId: "any_pane", summary: "boom" });
+    assert.strictEqual(ok, false);
+    assert.strictEqual(earcons(sink).length, 0);
+    bus.stop();
+  });
+
+  it("still reaches onEnqueue listeners (the durable activity recorder) even while muted", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, { isPaneMuted: () => true });
+    const seen: string[] = [];
+    bus.onEnqueue((item) => seen.push(item.terminalId));
+    bus.enqueue({ kind: "completion", terminalId: "muted_pane", summary: "done" });
+    assert.deepStrictEqual(seen, ["muted_pane"]);
+    bus.stop();
+  });
+
+  it("mute is read FRESH each call — un-muting takes effect on the very next announcement", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    let muted = true;
+    const bus = makeBus(sink, clock, { isPaneMuted: () => muted });
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "first" });
+    clock.advance(5000);
+    assert.strictEqual(notifs(sink).length, 0, "muted: nothing delivered");
+    muted = false;
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "second" });
+    clock.advance(5000);
+    assert.strictEqual(notifs(sink).length, 1, "un-muted: delivered, and not a stale replay of the first");
+    assert.match(notifs(sink)[0].message, /second/);
+    bus.stop();
+  });
+
+  it("absent isPaneMuted (default) never mutes anything — byte-identical to before this option existed", () => {
+    const sink: any[] = [];
+    const clock = new FakeClock();
+    const bus = makeBus(sink, clock, {});
+    bus.enqueue({ kind: "completion", terminalId: "p", summary: "done" });
+    clock.advance(1500);
+    assert.strictEqual(notifs(sink).length, 1);
+    bus.stop();
+  });
+});
+
 describe("notificationStack — coalesce-to-latest", () => {
   const n = (id: string, message: string, severity: "high" | "normal" = "normal"): ProactiveNotification => ({
     id, kind: "completion", terminalId: id.split("_")[1] || "t", severity, message, timestamp: new Date().toISOString(),

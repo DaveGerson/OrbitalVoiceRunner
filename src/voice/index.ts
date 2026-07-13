@@ -37,8 +37,14 @@ import { buildVoiceTools } from "./liveConfig";
 import { shouldRouteUtterance, resolvePendingActionByVoice, resolveHeldCommandByVoice } from "../voiceApprovalRouting";
 import { isPaneActiveForWrite } from "../activePane";
 import { isOriginAllowed, parseAllowedOrigins } from "../security/perimeter";
-import { decideProposal, inferKind, type ApprovalKind } from "../pendingApprovals";
+import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } from "../pendingApprovals";
 import { applyDispatchDecision } from "../dispatch/paneWrite";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { mintExchangeForSend } from "../exchanges/deliveryHooks";
+import type { ExchangeSnapshot } from "../exchanges/lifecycle";
+import { getExchangeNarrationGate } from "../announcementBus";
+import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
+import { convergeTypedDraftEdit } from "../exchanges/draftRegistry";
 import {
   resolveResumeHandleTtlMs,
   shouldClearHandleOnClose,
@@ -73,7 +79,9 @@ import {
   type ContextInjectionTrigger,
   type ContextInjectionDisposition,
 } from "../memory/contextTelemetry";
+import { ContextVersionRegistry } from "../memory/contextVersions";
 import type { PythonPolicyClient } from "./policyClient";
+import { SessionPool, resolveHotSlotBudget, type PoolEntryState } from "./sessionPool";
 import { createSpokenConfirm } from "./spokenConfirm";
 import { DEFAULT_VOICE_UX } from "../types";
 import { matchMacroUtterance, fireMacro } from "../macros";
@@ -87,6 +95,186 @@ export function mintInjectId(): string {
   return `inj-${Date.now()}-${++injectSeq}`;
 }
 
+// Phase 2 Step 2.2 (real session identity): one voice_session_id per WEBSOCKET CONNECTION, minted
+// once when the connection's VoiceSessionState is constructed and held for the connection's whole
+// life (including across bounded auto-reconnects — a reconnect is the SAME operator session, not
+// a new one). This is deliberately NOT the z5c per-project session-pool identity (docs/superpowers/
+// specs/2026-07-07-z5c-session-pool-design.md D5's `ctx.sessionId` scoping is a later slice) — it
+// is the minimal "real, non-null, stable-per-connection identity" every telemetry/exchange row
+// that used to hardcode `session_id: null` needed so "no live telemetry row uses a null session
+// when a session exists" holds. Mirrors the mintInjectId idiom exactly.
+let voiceSessionSeq = 0;
+export function mintVoiceSessionId(): string {
+  return `vsess-${Date.now()}-${++voiceSessionSeq}`;
+}
+
+// ── z5c design (spec 2026-07-07-z5c-session-pool-design.md) small pure helpers ─────────────────
+// Pulled OUT of their call sites (inside attachVoiceSession's per-connection closures) so their
+// own branching does not load the caller's cyclomatic count — the complexity gate is a hard error
+// (CC<=10) and both connectLiveSession's connection handler and injectMemoryBrief are already
+// near the cap. Each is a standalone, easily-unit-testable pure function.
+
+/** D7: resolve `voiceUx.sessionPoolHotSlots` at connect time — read ONCE (not hot-reloaded
+ *  mid-session, same "Apply & Reconnect" idiom as every other voiceAi/voiceUx knob this file
+ *  reads at connect). */
+export function resolveConnectionHotSlotBudget(settings: { voiceUx?: { sessionPoolHotSlots?: number } }): number {
+  return resolveHotSlotBudget((settings.voiceUx ?? DEFAULT_VOICE_UX).sessionPoolHotSlots);
+}
+
+/** D4: the triggers that establish "what project is live right now" — the only ones
+ *  injectMemoryBrief should use to advance SessionPool's LRU/state bookkeeping. */
+export function isForegroundEstablishingTrigger(trigger: ContextInjectionTrigger): boolean {
+  return trigger === "session_start" || trigger === "reconnect" || trigger === "project_switch";
+}
+
+/** D4: keep the pool's LRU/state bookkeeping in sync with a foreground-establishing trigger.
+ *  `planSwitch` is computed here for observability/telemetry (a real decision trace exists on
+ *  every switch) even though EXECUTING that decision — actually resuming/connecting a per-project
+ *  socket — is Slice 3 scope; see the module doc + this task's reported deferrals. A no-op for
+ *  every other trigger, or when there is no active project to track. */
+export function syncSessionPoolOnTrigger(
+  pool: SessionPool,
+  projectId: string | null,
+  trigger: ContextInjectionTrigger,
+  now: number,
+): void {
+  if (!projectId || !isForegroundEstablishingTrigger(trigger)) return;
+  pool.planSwitch(projectId, now);
+  pool.noteSwitch(projectId, now);
+}
+
+/** D1/D4/D6: the pane's owning project when it is a project the POOL has POSITIVE evidence was
+ *  explicitly backgrounded (state "handle" — reached only via SessionPool.noteSwitch demoting a
+ *  PRIOR foreground when a real project_switch/session_start/reconnect trigger moved somewhere
+ *  else). Deliberately NOT "any project other than manager.ledger.activeProjectId": a project a
+ *  pane was simply created/worked in WITHOUT the operator ever running switch_context (a normal,
+ *  long-supported workflow — see tests/test_cortex_cutover_journeys.ts's command-outcome journey)
+ *  stays "cold" in the pool forever and must keep injecting exactly as it did pre-pool — there is
+ *  no meaningful "background" distinction for a project the pool has never actually seen switched
+ *  away from. Returns null (never "background") for the foreground project, an unresolvable pane,
+ *  or any project the pool hasn't tracked as a real switch-away — an unclassifiable or never-
+ *  switched pane always falls through to today's unconditional inject at the call site. */
+export function backgroundProjectForSignal(
+  pool: { isForegroundProject(projectId: string | null): boolean; stateFor(projectId: string): PoolEntryState },
+  paneProjectId: string | null,
+): string | null {
+  if (!paneProjectId || pool.isForegroundProject(paneProjectId)) return null;
+  return pool.stateFor(paneProjectId) === "handle" ? paneProjectId : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — exchange-aware pane-signal narration (pushSignal's enrichment, below in the
+// connection handler). Pulled out as small, parameterized pure(-ish) helpers so the connection
+// closure's own call site stays a flat two-line dispatch (complexity gate) — each helper here
+// takes `manager`/`sessionPool` as explicit params rather than capturing them, so they carry no
+// hidden closure state of their own.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+function isNarratableSignalKind(kind: string): boolean {
+  return kind === "idle" || kind === "prompt" || kind === "error" || kind === "exited";
+}
+
+/** "exception" states cross a background-project boundary and narrate immediately (foreground
+ *  session hears about background exceptions); "complete" is a meaningful outcome but is
+ *  SUPPRESSED for a backgrounded project (that project's own session picks it up on resume/
+ *  catch-up); every other state has nothing terse to say here — the plain pane-signal text
+ *  already covers it. */
+function exchangeNarrationClass(state: string): "exception" | "complete" | null {
+  if (state === "needs_input" || state === "agent_failed" || state === "interrupted") return "exception";
+  if (state === "agent_complete") return "complete";
+  return null;
+}
+
+function resolvePaneLabel(manager: OrchestratorManager, projectId: string | null, paneId: string): string {
+  return paneDisplayLabel(manager.ledger, projectId, paneId, redactSecrets);
+}
+
+function resolveProjectLabel(manager: OrchestratorManager, projectId: string): string {
+  return redactSecrets(manager.ledger.workspaces?.[projectId]?.name || projectId);
+}
+
+/** A plain terse line for a foreground/no-project event, or an "In project 'X', ..."
+ *  exception-level summary for a background event — narration TEXT only; focus is never touched
+ *  (no setActivePane anywhere in this path). */
+function composeNarrationText(manager: OrchestratorManager, backgroundProjectId: string | null, line: string): string {
+  if (!backgroundProjectId) return line;
+  const projectName = resolveProjectLabel(manager, backgroundProjectId);
+  return `In project '${projectName}', ${line.charAt(0).toLowerCase()}${line.slice(1)}`;
+}
+
+/** The three-way outcome of the exchange-aware narration decision (Phase 5.5 release-review fix —
+ *  this used to be a bare `string | null`, which conflated two different nulls):
+ *  - `narrate`  — speak/inject this enriched line;
+ *  - `fallback` — nothing exchange-specific to say; the caller uses formatPaneSignal(sig) as before;
+ *  - `suppress` — deliberately SILENT: a backgrounded project's non-exception outcome
+ *    (agent_complete) must reach the operator via that project's own resume/catch-up (the z5c
+ *    routing the 'inject' subscription already applies), NOT leak into the foreground session as a
+ *    plain "PANE STATUS UPDATE" context line — which is exactly what the old null-means-fallback
+ *    contract did despite this module's own doc claiming suppression. */
+export type ExchangeSignalNarration =
+  | { kind: "narrate"; text: string }
+  | { kind: "fallback" }
+  | { kind: "suppress" };
+
+/**
+ * The decision core behind pushSignal's exchange-aware enrichment: EXACTLY-ONCE narration (the
+ * ExchangeNarrationGate, keyed off the exchange's own durable `updatedAt`), background-project
+ * exception routing (an exception crosses over named explicitly; a plain completion waits for that
+ * project's own catch-up — now a REAL `suppress`, see ExchangeSignalNarration), and voice
+ * terseness (one clause, via terseExchangeOutcomeLine — shared with the on-demand board in
+ * src/voice/sitrep.ts so both surfaces read identically).
+ */
+function buildExchangeAwareSignalText(
+  manager: OrchestratorManager,
+  sessionPool: { isForegroundProject(projectId: string | null): boolean; stateFor(projectId: string): PoolEntryState },
+  sig: PaneSignal,
+  snap: ExchangeSnapshot,
+  exchangeId: string,
+): ExchangeSignalNarration {
+  const narrationClass = exchangeNarrationClass(snap.state);
+  if (!narrationClass) return { kind: "fallback" };
+
+  const paneProjectId = findPaneOwningProject(manager, sig.paneId)?.projectId ?? snap.projectId ?? null;
+  const backgroundProjectId = backgroundProjectForSignal(sessionPool, paneProjectId);
+  if (backgroundProjectId && narrationClass !== "exception") return { kind: "suppress" };
+
+  // Already narrated this exact transition (same durable anchor): stay silent rather than degrade
+  // to the plain fallback — the fallback would re-announce the same settled edge in weaker words.
+  if (!getExchangeNarrationGate().shouldNarrate(exchangeId, snap.state, snap.updatedAt)) return { kind: "suppress" };
+
+  const line = terseExchangeOutcomeLine(
+    resolvePaneLabel(manager, paneProjectId, sig.paneId), snap.state, snap.terminalState, snap.resultSummary, redactSecrets,
+  );
+  return line ? { kind: "narrate", text: composeNarrationText(manager, backgroundProjectId, line) } : { kind: "fallback" };
+}
+
+/** Phase 2 Step 2.5 review fix (the Step 2.4 documented switch_context mixed-brief bug): on a
+ *  `project_switch` trigger the operator's focused pane may still belong to the PRIOR project —
+ *  switch_context alone never moves `coreState.activePaneId` (only switch_active_pane does, see
+ *  src/actions/defs/orient.ts), so rendering the brief against that pane produced a genuinely
+ *  MIXED payload (PROJECT tier = the NEW project, ACTIVE PANE tier = the OLD project's pane)
+ *  stamped under the new project's delivery row. Resolution: for a project_switch whose focused
+ *  pane is NOT owned by the new foreground project, render the brief with NO active-pane tier —
+ *  the pane tier arrives on the operator's own next switch_active_pane, exactly the settled state
+ *  every existing call site pairs a switch_context with. Every other trigger, and a pane that DOES
+ *  belong to the new project, is byte-identical to before. A pane whose owner cannot be resolved
+ *  is dropped too (fail toward isolation — we cannot confirm affinity). Pure + exported for unit
+ *  coverage; extracted so injectMemoryBrief's own cyclomatic count is unchanged. */
+export function resolveBriefPane(
+  manager: Pick<OrchestratorManager, "terminals" | "ledger">,
+  trigger: ContextInjectionTrigger,
+  activePaneId: string | null,
+  foregroundProjectId: string | null,
+): string | null {
+  if (trigger !== "project_switch" || !activePaneId) return activePaneId;
+  const owner = findPaneOwningProject(manager, activePaneId)?.projectId ?? null;
+  return owner !== null && owner === foregroundProjectId ? activePaneId : null;
+}
+
+// Phase 2 Step 2.2: the six canonical context-tier keys (mirrors src/memory/assembler.ts's
+// CANONICAL_ORDER) — the universe deliverySourcesFromBrief below splits into included/dropped.
+const CONTEXT_SOURCE_KEYS = ["project", "pane", "eventFocus", "breadcrumbs", "board", "frame"];
+
 /**
  * B-3 measurement spine (Task 7): capture per-turn Gemini token cost at the turn-complete boundary.
  * Reads `message.usageMetadata` (top-level on @google/genai LiveServerMessage; fields
@@ -94,14 +282,23 @@ export function mintInjectId(): string {
  * gemini_turn_usage row joined to the nearest preceding injection (`lastInjectId`). Fail-soft: an
  * absent `usageMetadata`, a null store, or a writer throw is a no-op — the voice turn never blocks.
  * Exported as a pure unit so the capture is testable without booting a live session.
+ *
+ * `sessionId` (Phase 2 Step 2.2, default null so every pre-existing direct call in the test suite
+ * keeps its prior byte-identical behavior): the connection's real voice_session_id, threaded from
+ * `state.voiceSessionId` at the one live call site below.
  */
-export function captureTurnUsage(message: any, store: JanusStore | null, lastInjectId: string | null): void {
+export function captureTurnUsage(
+  message: any,
+  store: JanusStore | null,
+  lastInjectId: string | null,
+  sessionId: string | null = null,
+): void {
   const u = message?.usageMetadata;
   if (!store || !u) return;
   try {
     store.recordGeminiTurnUsage({
       ts: Date.now(),
-      sessionId: null,
+      sessionId,
       injectId: lastInjectId ?? null,
       promptTokens: u.promptTokenCount ?? null,
       responseTokens: u.responseTokenCount ?? null,
@@ -302,13 +499,22 @@ function applyDraftEditFrame(
   manager: OrchestratorManager,
   coreState: CoreState,
   broadcastDraft: (projectId: string, paneId: string) => void,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
 ): void {
   const projectId = msg.projectId || manager.ledger.activeProjectId || "default_project";
   const paneId = msg.paneId || coreState.activePaneId;
   if (paneId && manager.ledger.setDraft(projectId, paneId, msg.text, "operator")) {
+    // Converge BEFORE broadcasting so the draft_updated frame carries the post-edit exchange
+    // projection (bumped version / cancelled), not the pre-edit one.
+    convergeTypedDraftEdit(projectId, paneId, String(msg.text ?? ""), applyResolution);
     broadcastDraft(projectId, paneId);
   }
 }
+
+// `convergeTypedDraftEdit` (the instruction-envelope convergence bridge, spec docs/superpowers/
+// specs/2026-07-09-instruction-routing.md §5.2) is now the SINGLE shared implementation exported by
+// src/exchanges/draftRegistry.ts — this file's own byte-identical copy (and the REST twin that used
+// to live in server.ts) were folded into it; both call sites now just call the shared function.
 
 // DispatchOutcome (the result shape returned by `dispatchProposal`) is the single canonical type in
 // ../actions/types — imported above. The byte-identical local duplicate that used to live here was
@@ -328,7 +534,7 @@ export interface VoiceDeps {
   activeDraftTarget: () => { projectId: string; paneId: string } | null;
   sanitizeSettingsForClient: (settings: any) => any;
   coreState: CoreState;
-  paneSignalBus: { subscribe: (fn: (sig: any) => void) => () => void };
+  paneSignalBus: { subscribe: (fn: (sig: any) => void, cls?: "spoken" | "inject") => () => void };
   announcementBus: { enqueue: (item: any) => void };
   pruneAttention: () => void;
   interactionLog: {
@@ -337,8 +543,12 @@ export interface VoiceDeps {
   };
   recipes: any;
   /** record a command in the HistoryManager singleton (server.ts-internal; passed in, not imported) —
-   *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was. */
-  addCommand: (terminalId: string, command: string) => void;
+   *  used by the dispatchProposal auto-execute path exactly as the inline HistoryManager.addCommand was.
+   *  `exchangeId` is an ADDITIVE optional 3rd arg (AgentExchange spine, task C) — this file's own
+   *  wiring never has occasion to use it today (the DispatchDeps.addCommand paneWrite.ts calls into
+   *  is a strict 2-arg contract out of this step's scope), but widening the TYPE here costs nothing
+   *  and keeps this deps bag's addCommand shape consistent with GatingDeps' (src/gating/index.ts). */
+  addCommand: (terminalId: string, command: string, exchangeId?: string) => void;
   ai: GoogleGenAI;
   boundLiveConnector: (ai: GoogleGenAI, params: any, key?: string | null) => Promise<any>;
   boundSessionAiFactory: (key: string, fallback: GoogleGenAI) => GoogleGenAI;
@@ -416,6 +626,11 @@ interface VoiceSessionState {
   // connection. The Gemini turn-usage capture joins each turn's usageMetadata to the nearest
   // preceding injection by reading this (null until the first brief is injected).
   lastInjectId: string | null;
+  // Phase 2 Step 2.2 (real session identity): this connection's stable, non-null voice_session_id
+  // (mintVoiceSessionId, minted once at connect and held across bounded auto-reconnects — see the
+  // minter's own doc comment). Threaded onto context-injection telemetry rows, cortex decision
+  // rows, gemini_turn_usage rows, and AgentExchange.voice_session_id at creation.
+  voiceSessionId: string;
 }
 
 /**
@@ -485,6 +700,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     composeAwayDigest,
   } = gating;
 
+  // Phase 2 Step 2.2: ONE shared per-server context_version registry (mirrors the store itself —
+  // its internal state is keyed per (project_id, voice_session_id), so every connection's/pair's
+  // versions/acks stay independent even though they share one instance). `store` may be null in a
+  // hand-built test harness — the registry degrades to pure in-memory tracking, never throws.
+  const contextVersions = new ContextVersionRegistry(store);
+
   // PLM4 (1): RESUMPTION-TOKEN PERSISTENCE. The Gemini Live resume handle was in-memory only, so a
   // process restart lost it and the next connect could not resume the conversation. Persist the FULL
   // sessionResumptionUpdate to the durable KV whenever it changes, and rehydrate it at boot. Guarded
@@ -521,7 +742,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     if (!store) return;
     try {
       if (token == null) store.deleteKV(VOICE_RESUMPTION_KV);
-      else store.setKV(VOICE_RESUMPTION_KV, wrapHandleForPersist(token, Date.now()));
+      // Phase 2 Step 2.5 review fix: stamp the OWNING project on every rotation write — the
+      // handle resumes ONE project's server-side conversation, and the stamp is what lets
+      // SessionPool.migrateLegacyHandle refuse to mis-file it into a different project's
+      // per-project slot. Additive: readFreshHandle/rehydrate ignore unknown fields.
+      else store.setKV(VOICE_RESUMPTION_KV, wrapHandleForPersist(token, Date.now(), manager.ledger.activeProjectId ?? null));
     } catch (e) {
       console.error("[SESSION RESUMPTION] failed to persist token:", e);
     }
@@ -610,7 +835,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             coreState.activePaneId = typeof msg.paneId === "string" ? msg.paneId : null;
           } else if (msg.type === "draft_edit" && msg.text !== undefined) {
             // Per-pane WIP draft edit (ungated — composing is not a CLI write). Defaults to the active pane.
-            applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+            applyDraftEditFrame(msg, manager, coreState, broadcastDraft, applyResolution);
           } else if (msg.type === "pane_input") {
             // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
             // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.
@@ -680,7 +905,29 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       voiceLostSinceLastRestore: false,
       // B-3: no brief injected yet on this connection — the turn-usage join has no key until the first.
       lastInjectId: null,
+      // Phase 2 Step 2.2: one stable identity for this connection's whole life (including
+      // reconnects) — see mintVoiceSessionId's doc comment.
+      voiceSessionId: mintVoiceSessionId(),
     };
+
+    // z5c design (spec 2026-07-07-z5c-session-pool-design.md D2/D5): the per-project session pool's
+    // decision layer, scoped to THIS WS connection (dies with it, exactly like `state.session` — D5's
+    // "pool scope = the browser WS connection"). `memory.service.gates` is the SAME server-scoped
+    // InjectGateRegistry every connection shares (a browser refresh should not forget a project's
+    // "last injected hash"), so per-project gate state outlives any one connection even though the
+    // pool's own hot/warm/handle bookkeeping does not. hotSlotBudget is read ONCE at connect time
+    // (D7/D10 — not hot-reloaded mid-session, same "Apply & Reconnect" idiom as the rest of voiceAi).
+    const sessionPool = new SessionPool({
+      store,
+      gates: memory.service.gates,
+      contextVersions,
+      sessionId: state.voiceSessionId,
+      hotSlotBudget: resolveConnectionHotSlotBudget(manager.settings),
+    });
+    // D5: one-way migration of the legacy single-slot resumption handle into whatever project is
+    // ACTIVE right now (best guess for "the foreground project" before this connection has switched
+    // anywhere) — a total no-op once it has already run once, or if there is nothing to migrate.
+    sessionPool.migrateLegacyHandle(manager.ledger.activeProjectId);
 
     // Voice-UX wave 3: the spoken destructive-confirm protocol (src/voice/spokenConfirm.ts, f09-owned).
     // Constructed ONCE per WS connection (NOT per Gemini reconnect inside connectLiveSession) so its
@@ -752,7 +999,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         store.recordContextInjection({
           id: mintContextInjectionEventId(),
           ts: Date.now(),
-          session_id: null, // no per-connection session id concept exists yet — matches captureTurnUsage's own null.
+          // Phase 2 Step 2.2: this connection's real voice_session_id (was hardcoded null).
+          session_id: state.voiceSessionId,
           interaction_id: state.currentInteractionId,
           inject_id: injectId,
           trigger,
@@ -780,6 +1028,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     // primary is live means the choke point rendered today's default composition instead.
     const dispositionForBrief = (brief: SynthesizedBrief): ContextInjectionDisposition =>
       (isCortexPrimary() && brief.source !== "cortex-primary") ? "cortex-miss" : "injected";
+
+    // Phase 2 Step 2.2: split a rendered brief's tiers into "included" (present in perTierChars —
+    // assembleBrief/cortex curation only ever writes an entry for a tier it actually rendered) vs
+    // "dropped" (the canonical six-tier set minus included). Feeds the context_deliveries row's
+    // included_sources_json/dropped_sources_json (src/memory/contextVersions.ts's recordDelivery).
+    const deliverySourcesFromBrief = (b: SynthesizedBrief): { included: string[]; dropped: string[] } => {
+      const included = Object.keys(b.perTierChars);
+      const dropped = CONTEXT_SOURCE_KEYS.filter((k) => !included.includes(k));
+      return { included, dropped };
+    };
 
     // Wave 4 (D2): record + exit for an InjectGate skip — pulled out of injectMemoryBrief to keep
     // its cyclomatic count down (the complexity gate is a hard error).
@@ -839,8 +1097,27 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         injectId = mintInjectId();
         const now = Date.now();
         const wire = toCortexTrigger(trigger);
-        const snapshotHash = memory.service.snapshotHashFor(activeId, now);
-        const gateDecision = memory.service.gate.evaluate(snapshotHash, wire, now);
+        // z5c design (spec 2026-07-07-z5c-session-pool-design.md D5): the project this brief is
+        // ABOUT to shape — every actual send below still goes through the ONE physical socket
+        // (`sess`), so this is the pool's foreground project, not necessarily `activeId`'s owning
+        // project (that distinction matters for the inject-class ROUTING decision at the
+        // paneSignalBus subscription below, not here).
+        const poolProjectId = manager.ledger.activeProjectId;
+        syncSessionPoolOnTrigger(sessionPool, poolProjectId, trigger, now);
+        // Phase 2 Step 2.5 review fix: the pane the brief RENDERS — identical to activeId except
+        // on a project_switch whose focused pane still belongs to the PRIOR project (see
+        // resolveBriefPane's doc). The latest-wins guard below still compares the REAL activeId
+        // against the live focus (focus itself did not move).
+        const briefPaneId = resolveBriefPane(manager, trigger, activeId, poolProjectId);
+        // Phase 2 Step 2.2: affectedPaneId now threads into the gate's own hash (closing the Step
+        // 2.1 KNOWN GAP note on snapshotHashFor) so the gate can never make a skip/inject decision
+        // against a snapshot that doesn't yet reflect the SAME eventFocus block the cortex/renderer
+        // build moments later for this trigger.
+        const snapshotHash = memory.service.snapshotHashFor(briefPaneId, now, affectedPaneId);
+        // D5: per-project gate isolation — was the single shared `memory.service.gate` (key null)
+        // regardless of active project; now keyed by the pool's foreground project so a stale hash
+        // from project A can never skip a genuinely-changed brief for project B.
+        const gateDecision = sessionPool.gateFor(poolProjectId).evaluate(snapshotHash, wire, now);
         if (gateDecision.skip) {
           recordGateSkip(trigger, activeId, injectId, startedAt, gateDecision.skip, snapshotHash);
           return;
@@ -849,10 +1126,12 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // this trigger when NOT primary; a no-op when primary (that path decides via synthesizeAsync
         // below instead, avoiding a double daemon call). Synchronous void; never blocks or alters the
         // brief below. Spec: docs/superpowers/specs/2026-06-27-python-cortex-shadow-design.md
-        memory.service.observeCortexShadow(activeId, now, wire, injectId, affectedPaneId);
+        // Phase 2 Step 2.2: `state.voiceSessionId` is this connection's real session identity — the
+        // cortex_decision row this observation persists no longer hardcodes sessionId null.
+        memory.service.observeCortexShadow(briefPaneId, now, wire, injectId, affectedPaneId, state.voiceSessionId);
         // P0b/Wave 4 D5: race the cortex (when primary) / the Python synthesizer against the
         // in-process floor. synthesizeAsync owns the race + `source` authority and NEVER rejects.
-        brief = await memory.service.synthesizeAsync(activeId, now, injectId, wire, affectedPaneId);
+        brief = await memory.service.synthesizeAsync(briefPaneId, now, injectId, wire, affectedPaneId, state.voiceSessionId);
         // Latest-wins (invariant I3): compare the requested pane id against the current focus — if
         // the operator switched panes while we awaited, DROP this brief rather than inject stale
         // context for a backgrounded pane. Using activeId (not brief.activePaneId) means a pane
@@ -874,6 +1153,28 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           });
           return;
         }
+        // Phase 2 Step 2.2: record the delivery ATTEMPT — mints the next context_version for this
+        // (project, voice_session_id) pair and persists an UNACKNOWLEDGED context_deliveries row
+        // BEFORE the send. If sendClientContent below throws, control jumps straight to the outer
+        // catch and this row is never acknowledged (src/memory/contextVersions.ts's ack-on-success
+        // contract) — a skip/stale/empty brief never reaches this line at all.
+        const { included: includedSources, dropped: droppedSources } = deliverySourcesFromBrief(brief);
+        // Phase 2 Step 2.5 review fix: stamp the delivery row with poolProjectId — the project
+        // this brief was hashed/gated/assembled FOR (read once, pre-await) — NOT a fresh
+        // manager.ledger.activeProjectId re-read. The tiers snapshot is built synchronously under
+        // poolProjectId before the first await in synthesizeAsync, so a switch_context landing
+        // DURING the await used to mis-stamp the OLD project's brief under the NEW project's
+        // (project, session) version counter (the same class as the documented switch_context
+        // mis-stamp, reached from the other side).
+        const delivery = contextVersions.recordDelivery({
+          projectId: poolProjectId ?? null,
+          sessionId: state.voiceSessionId,
+          trigger,
+          includedSourceIds: includedSources,
+          droppedSourceIds: droppedSources,
+          snapshotHash,
+          briefHash: hashText(brief.text),
+        });
         // Redaction invariant: every string injected toward Gemini goes through the redaction pass
         // regardless of who composed it — identity on already-clean tier text, load-bearing when the
         // cortex-curated path renders text this choke point did not itself sanitize upstream.
@@ -881,12 +1182,18 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}` }] }],
           turnComplete: true,
         });
+        // Phase 2 Step 2.2: acknowledge ONLY now that the send returned without throwing — this is
+        // the ack-on-success seam. A reconnect race (an older delivery's ack landing after a newer
+        // one already advanced the pair's acknowledged version) can never move it backward — see
+        // ContextVersionRegistry.acknowledgeDelivery's monotonic guard.
+        contextVersions.acknowledgeDelivery(delivery.deliveryId);
         // Join key: only NOW (the brief actually entered Gemini) does this injection become the
         // "preceding injection" a subsequent turn's usageMetadata correlates to (finding-1 fix).
         state.lastInjectId = injectId;
         // Wave 4 (D2): the gate only advances state AFTER a confirmed send — a dropped/stale/empty
-        // brief above returned before this point and never counts as "injected".
-        memory.service.gate.noteInjected(snapshotHash, now);
+        // brief above returned before this point and never counts as "injected". D5: the SAME
+        // per-project gate `evaluate` read above, so the advance lands on the right project's state.
+        sessionPool.gateFor(poolProjectId).noteInjected(snapshotHash, now);
         recordInjectionEvent({
           trigger, activeId, injectId, startedAt,
           disposition: dispositionForBrief(brief), skippedReason: null, brief, error: null,
@@ -931,6 +1238,92 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // The shared single choke-point renders narration + broadcast through the mandatory claim
       // gate (exactly-once, dead-pane, redaction all inside). `vocal:true` tags the WS payloads.
       applyResolution(messageId, approve ? "approve" : "reject", { vocal: true });
+    }
+
+    // AgentExchange spine (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md, flag
+    // JANUS_EXCHANGE_SPINE, task C of step 1.3): mint an exchange for this dispatch BEFORE the
+    // gate/effect decision, so the exchange_id exists no matter which arm the decision resolves
+    // to (spec §5: "exchange_id mints BEFORE approval/delivery is possible"). `off` (the default)
+    // short-circuits to undefined so no exchange is ever created; every call below is best-effort
+    // and swallows its own errors — a spine fault must never affect the real dispatch outcome
+    // (spec §9.6).
+    //
+    // SCOPE NOTE: the strict two-phase "delivery_attempted event durably precedes the pane write"
+    // ordering (spec §2b) needs a hook INSIDE applyDispatchDecision's auto_execute arm
+    // (src/dispatch/paneWrite.ts), which is out of this step's allowed-paths scope. What follows
+    // is a best-effort approximation that derives the exchange's transitions from the returned
+    // DispatchOutcome AFTER the (synchronous, single-turn) call returns — correct for normal
+    // operation, but it does not close the crash-window between "attempt recorded" and "write
+    // fired" the way the strict ordering would. Flagged as a step 1.4 follow-up in the report.
+    // Phase 2 Step 2.5 review fix: resolve the pane's OWNING project through the canonical
+    // resolver before ever falling back to "whatever project happens to be active" — a ledger
+    // pane in a NON-active project (no live terminal) used to stamp the exchange row (and its
+    // context_version join) under the WRONG project. Split out of `stampExchangeForDispatch`
+    // purely to keep that function's own branch count under the complexity gate.
+    function projectIdForExchangeDispatch(targetId: string): string {
+      return (
+        manager.terminals[targetId]?.projectId ||
+        findPaneOwningProject(manager, targetId)?.projectId ||
+        manager.ledger.getActiveProject?.()?.id ||
+        "default_project"
+      );
+    }
+
+    /** Mint the exchange for this dispatch BEFORE the effect switch (spec §5) via the shared
+     *  `mintExchangeForSend` core (src/exchanges/deliveryHooks.ts) — the same core server.ts's
+     *  Workbench-send seam uses. That core already folds in "serialize this pane's OPEN envelope
+     *  draft, if any, into `instructionEnvelopeJson`" (Phase 4, Step 4.3 — the durable source a
+     *  restart's `rehydrateDraftRegistryOnBoot` reads back), so this wrapper only supplies the
+     *  fields specific to a voice dispatch: the resolved owning project (Phase 2 Step 2.5 review
+     *  fix — never "whatever project happens to be active"), and this connection's real
+     *  voice_session_id/interaction_id/context_version stamps (Phase 2 Step 2.2 — "the context
+     *  version that shaped this instruction"). */
+    function stampExchangeForDispatch(targetId: string, instruction: string, trigger: string): string | undefined {
+      if (!exchangeSpineActive()) return undefined;
+      try {
+        const projectId = projectIdForExchangeDispatch(targetId);
+        return mintExchangeForSend({
+          projectId,
+          paneId: targetId,
+          operatorUtterance: trigger,
+          distilledInstruction: instruction,
+          voiceSessionId: state.voiceSessionId,
+          interactionId: state.currentInteractionId,
+          contextVersion: contextVersions.currentAcknowledgedVersion(projectId, state.voiceSessionId),
+        });
+      } catch (e) {
+        console.error("[exchange-spine] createExchange failed:", e);
+        return undefined;
+      }
+    }
+
+    /** Progress (or cancel) the just-created draft exchange to match what `applyDispatchDecision`
+     *  actually did, entirely from its returned outcome (see SCOPE NOTE above). Never throws. */
+    function settleExchangeForDispatch(
+      exchangeId: string | undefined,
+      pendingId: string,
+      decision: ProposalDecision,
+      outcome: DispatchOutcome
+    ): void {
+      if (!exchangeId) return;
+      try {
+        const svc = getExchangeService();
+        if (outcome.kind === "executed") {
+          svc.stageForDelivery(exchangeId);
+          svc.recordDelivery(exchangeId);
+        } else if (outcome.kind === "pending" && decision.type === "pending_approval") {
+          svc.requestApproval(exchangeId, pendingId);
+          pendingApprovals.bindExchange(pendingId, exchangeId);
+        } else {
+          // Phase 5.4 (observability wiring): a clarify outcome means the operator was asked to
+          // disambiguate before anything could be delivered — record it as its own audit event
+          // (metrics.ts's clarificationCauses convention) before the cancel disposition below.
+          if (outcome.kind === "clarify") svc.recordClarificationRequested(exchangeId, "dispatch_clarify");
+          svc.cancel(exchangeId, `dispatch_outcome:${outcome.kind}`);
+        }
+      } catch (e) {
+        console.error("[exchange-spine] settle failed:", e);
+      }
     }
 
     // WS-E.1 + R1/R2/R4: the SINGLE gated dispatch path. Used by both `propose_command` and
@@ -978,7 +1371,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
       const decision = decideProposal({ kind, instruction, effectiveMode, runtimeType, paneExists, allowlist: shellAllowlist, capability, gate });
 
-      return applyDispatchDecision(
+      // AgentExchange spine (task C): mint BEFORE the effect switch (spec §5) — a no-op when the
+      // flag is off.
+      const exchangeId = stampExchangeForDispatch(targetId, instruction, opts.trigger);
+
+      const outcome = applyDispatchDecision(
         decision,
         {
           manager,
@@ -1012,6 +1409,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           origin: "voice",
         }
       );
+
+      settleExchangeForDispatch(exchangeId, pendingId, decision, outcome);
+      return outcome;
     }
 
     // PLM4 (2): the session-establish logic, extracted into a reusable closure callable on BOTH the
@@ -1072,6 +1472,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             clearStableResetTimer();
           }
         }
+        // AgentExchange spine: `interruptionDispositionFor("gemini_session_reconnect")` is a
+        // documented no-op (src/exchanges/recovery.ts) — see that table for why a Live session
+        // drop is never a delivery-uncertainty/quarantine event.
+        //
         // RESILIENCE (bead wsm-e2e-pinned-aiu): a handle-fed session that CLOSES with 1008 "session
         // expired" means the resume handle is poisoned. The pre-existing self-heal only ran in the
         // connect-THROW catch; a 1008 is an async close (no throw), so the poison was re-fed on every
@@ -1546,7 +1950,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               state.muteCurrentModelTurn = false;
               // B-3 measurement spine (Task 7): capture this turn's Gemini token cost (usageMetadata)
               // joined to the nearest preceding injection. Fail-soft no-op when usageMetadata is absent.
-              captureTurnUsage(message, store, state.lastInjectId);
+              captureTurnUsage(message, store, state.lastInjectId, state.voiceSessionId);
             }
           };
 
@@ -1657,8 +2061,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             } catch (toolErr) {
               console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
               try {
+                // Phase 5.4 security review: the exception message is MODEL-BOUND (sendToolResponse)
+                // and a throwing handler may embed argument text (a pasted key, an env assignment) in
+                // its Error message — scrub it like every other model-bound string. Idempotent on the
+                // overwhelmingly common secret-free case.
+                const errText = redactSecrets(toolErr instanceof Error ? toolErr.message : String(toolErr));
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${toolErr instanceof Error ? toolErr.message : String(toolErr)}` } }]
+                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${errText}` } }]
                 });
               } catch { /* session already torn down; nothing more we can do */ }
             }
@@ -1813,11 +2222,50 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // already shows the pane, so a 10s-late "it's up" is pure noise).
         const READY_DEFER_MAX_MS = 10_000;
 
-        // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds).
+        // Phase 4, Step 4.2 — exchange-aware enrichment of a pane signal's spoken/context text.
+        // Three-way decision (Phase 5.5 fix — see ExchangeSignalNarration's doc): `narrate` sends
+        // the enriched line; `fallback` (spine off, no active exchange bound to this pane, an
+        // exchange state with no terse line) sends the plain formatPaneSignal(sig) text exactly as
+        // before this step; `suppress` sends NOTHING — a backgrounded project's non-exception
+        // outcome (agent_complete) and an already-narrated transition (the exactly-once gate) are
+        // deliberately silent instead of degrading to a plain context line about another project's
+        // pane in the foreground session.
+        //
+        // VOICE TERSENESS: one clause (project + pane + outcome/question), never the full
+        // instruction/evidence — that detail lives in the action panel / replay.
+        //
+        // BACKGROUND PROJECT EVENTS: an exception (needs_input/agent_failed/interrupted) still
+        // reaches the foreground session even from a backgrounded project — but named explicitly
+        // ("In project 'X', ..."), and NEVER via setActivePane (focus is never stolen). A
+        // non-exception outcome (agent_complete) from a backgrounded project is suppressed here —
+        // that project's own session picks it up on resume/catch-up (get_status_summary /
+        // catch_me_up are exchange-aware and query the durable store directly), mirroring the z5c
+        // session-pool routing the 'inject' subscription below already applies to command-outcome
+        // memory briefs.
+        const exchangeAwareSignalDecision = (sig: PaneSignal): ExchangeSignalNarration => {
+          if (!exchangeSpineActive() || !isNarratableSignalKind(sig.kind)) return { kind: "fallback" };
+          try {
+            const svc = getExchangeService();
+            const exchangeId = svc.activeExchangeForPane(sig.paneId);
+            if (!exchangeId) return { kind: "fallback" };
+            const snap = svc.get(exchangeId);
+            if (!snap) return { kind: "fallback" };
+            return buildExchangeAwareSignalText(manager, sessionPool, sig, snap, exchangeId);
+          } catch (e) {
+            console.error("[voice] exchange-aware signal narration failed:", e);
+            return { kind: "fallback" };
+          }
+        };
+
+        // Raw send of a single signal to THIS session (unchanged behavior for non-`created` kinds
+        // and every pane with no exchange correlation).
         const pushSignal = (sig: PaneSignal) => {
           try {
+            const decision = exchangeAwareSignalDecision(sig);
+            if (decision.kind === "suppress") return; // deliberately silent — never a plain-text leak
+            const text = decision.kind === "narrate" ? decision.text : formatPaneSignal(sig);
             justConnected.sendClientContent({
-              turns: [{ role: "user", parts: [{ text: formatPaneSignal(sig) }] }],
+              turns: [{ role: "user", parts: [{ text }] }],
               turnComplete: false, // L1 fix: inject as passive context, not a forced spoken turn
             });
           } catch (e) {
@@ -1848,7 +2296,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
         };
 
-        state.unsubscribePaneSignals = paneSignalBus.subscribe((sig: PaneSignal) => {
+        const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
           // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
           // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
           // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
@@ -1865,18 +2313,40 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           }
           pushSignal(sig);
-          // Wave 4 (D1, cortex cutover design): the observe layer's EXISTING onIdle 'idle' pane
-          // signal (src/observe/index.ts) IS the command-completion edge — no new observe-layer
-          // wiring needed. Fire a fourth injectMemoryBrief trigger here, threading the pane the
-          // signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever pane is
-          // currently focused, so a command-outcome cortex profile can lead with it. Fire-and-forget
-          // (injectMemoryBrief owns its own try/catch and never rejects) + gated by the SAME
-          // InjectGate every other trigger goes through — a burst of idle edges across panes still
-          // collapses to at most one cortex round-trip per debounce floor.
-          if (sig.kind === "idle") {
-            void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
-          }
         });
+        // Wave 4 (D1, cortex cutover design) + z5c slice 1 (spec 2026-07-07 D1, closes bead
+        // wsm-e2e-pinned-1d6w): the observe layer's EXISTING onIdle 'idle' pane signal IS the
+        // command-completion edge. It now arrives on the bus's `inject` delivery class, which is
+        // NOT subject to the spoken-turn L1 cross-kind cooldown — a fast command completing
+        // within 5s of its own 'running' edge still injects. Anti-spam for this leg is the SAME
+        // InjectGate every other trigger goes through (hash + debounce floor) — a burst of idle
+        // edges across panes still collapses to at most one cortex round-trip per floor.
+        // Fire-and-forget (injectMemoryBrief owns its own try/catch and never rejects). It threads
+        // the pane the signal was ABOUT (sig.paneId) as `affectedPaneId`, independent of whatever
+        // pane is currently focused, so a command-outcome cortex profile can lead with it.
+        const unsubscribeInject = paneSignalBus.subscribe((sig: PaneSignal) => {
+          if (sig.kind !== "idle") return;
+          // z5c design (spec 2026-07-07-z5c-session-pool-design.md D1/D4/D6): route a command-outcome
+          // signal to the project it's ABOUT. A signal about the FOREGROUND project's own pane still
+          // injects exactly as before. A signal about a project the pool has POSITIVE evidence was
+          // explicitly backgrounded (a real switch away from it — see backgroundProjectForSignal's doc
+          // comment) is a background event with no live socket to reach in today's single-physical-
+          // socket world — D6 non-goal 6 ("no event queue for the handle tier") means it is dropped,
+          // not misrouted into the wrong project's conversation; that project's own `lastEventAtMs`
+          // bookkeeping still advances so a later promotion's pool.plan snapshot (and its catch-up
+          // brief, sourced from durable stores via planSwitch) has accurate freshness to reason over.
+          // A project the pool has never seen switched away from (the common case — most projects are
+          // simply worked in without ever calling switch_context) is NOT treated as background, so
+          // this is byte-identical to pre-pool behavior until the operator actually starts switching.
+          const paneProjectId = findPaneOwningProject(manager, sig.paneId)?.projectId ?? null;
+          const backgroundProjectId = backgroundProjectForSignal(sessionPool, paneProjectId);
+          if (backgroundProjectId) {
+            sessionPool.noteEvent(backgroundProjectId, Date.now());
+            return;
+          }
+          void injectMemoryBrief(state.session, coreState.activePaneId, "command_outcome", sig.paneId);
+        }, "inject");
+        state.unsubscribePaneSignals = () => { unsubscribeSpoken(); unsubscribeInject(); };
       };
       hoistAndSubscribe();
     } catch (err: any) {
@@ -2041,7 +2511,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           handleVoiceAudioFrame(msg);
         } else if (msg.type === "draft_edit" && msg.text !== undefined) {
           // Step 6: operator editing a pane's WIP draft (ungated). Defaults to the active pane.
-          applyDraftEditFrame(msg, manager, coreState, broadcastDraft);
+          applyDraftEditFrame(msg, manager, coreState, broadcastDraft, applyResolution);
         } else if (msg.type === "pane_input") {
           // Operator typing directly into a focused pane — ungated (above the gate) but scoped to the
           // active pane inside the helper (isPaneActiveForWrite), like the raw-input control-key route.
@@ -2063,6 +2533,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     });
 
     clientWs.on("close", () => {
+      // AgentExchange spine: `interruptionDispositionFor("browser_ws_reconnect")` is a documented
+      // no-op (src/exchanges/recovery.ts) — see that table for why the operator's browser tab
+      // dropping/reloading never touches an AgentExchange or the draft registry.
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
       // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
       // destructive pendingActions record survives and stays resolvable via UI/typed SURE.

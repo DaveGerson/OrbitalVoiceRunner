@@ -16,6 +16,7 @@ import { isEarconType, playEarcon, createYourTurnChimeDetector } from "../utils/
 import { notifyDesktop, requestNotifyPermission } from "../utils/notify";
 import { useE2EHarness, isE2EWireArmed, type TranscriptEntry } from "../e2e/harness";
 import { setProjectSkin } from "./theme";
+import { projectIdForPane } from "./station";
 import { deriveConversationalState, hasToolActivity } from "./useConversationalState";
 import type {
   Terminal,
@@ -27,12 +28,14 @@ import type {
   PaneLayout,
   AttentionItem,
   ActionActivityFrame,
+  ExchangeDraftView,
+  FleetExchangeSummary,
 } from "../types";
 import type { StoredNote, StoredHandoff } from "../store/types";
 import { findPostureProfileByName, normalizeGateMap } from "../settingsGatesRoundTrip";
 import { extractSlots } from "../templates";
 import {
-  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, shouldAdoptMute,
+  projectTemplatesFrame, historyEntriesFromFrame, attentionQueueFromFrame, draftTextFromFrame, exchangeFromFrame, shouldAdoptMute,
   buildPendingCommand, buildPendingAction, blockedToastText, attachGrounding,
   firstServerMessage, hasSettingsEcho, globalModeToast, resolvePaneCommand, paneSlug, layoutApplyToast, layoutSaveToast,
   templateClarifyText, templateApplyToast, layoutGatedText, playObserveEarcon, isPaneExitedFrame,
@@ -220,8 +223,10 @@ export interface OrbitalData {
   toast: { msg: string; kind: "fire" | "warn"; action?: ToastAction } | null;
   /** 2K.1: the freezer — archived (recoverable) panes from GET /api/archive. */
   archived: ArchivedPane[];
-  /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror. */
-  paneDrafts: Record<string, { text: string; at: number }>;
+  /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror.
+   *  Phase 3, Step 3.3 (additive): `exchange` carries the pane's open instruction-envelope draft
+   *  when JANUS_INSTRUCTION_ENVELOPE is shadow/primary and one exists; null/absent otherwise. */
+  paneDrafts: Record<string, { text: string; at: number; exchange?: ExchangeDraftView | null }>;
   /** 4U.2: latest server-pushed history per pane (history_updated frames; entries null = refetch). */
   paneHistories: Record<string, { entries: PaneHistoryEntry[] | null; at: number }>;
   /** 4U.3: the service log — recent action-log rows from GET /api/action-log (newest-first). */
@@ -230,6 +235,20 @@ export interface OrbitalData {
   /** bead apu: the latest one-glance health snapshot from GET /api/health (null until first fetch). */
   healthSnapshot: HealthSnapshot | null;
   refetchHealth: () => void;
+  /** Phase 5, Step 5.1: the durable per-pane exchange projection (GET /api/fleet/exchange-summary),
+   *  keyed by pane id — additive/optional, absent entries degrade gracefully (see fleetExchangeOrdering.ts). */
+  fleetExchangeSummaries: Record<string, FleetExchangeSummary>;
+  refetchFleetExchangeSummaries: () => void;
+  /** Retry a provably-failed/interrupted exchange — POST /api/exchanges/:id/retry (gated
+   *  write_to_pane; may 202-defer or 403). Surfaces the server's own honest outcome message
+   *  (it may refuse with uncertainty rather than claim success) via the toast. */
+  retryExchange: (exchangeId: string) => void;
+  /** Cancel/dismiss an exchange (including an interrupted one) — POST /api/exchanges/:id/cancel
+   *  (ungated de-escalation, like stop_pane / the brake trio). */
+  cancelExchangeAction: (exchangeId: string) => void;
+  /** Phase 5, Step 5.1: mute/un-mute a project's proactive announcements — the existing settings
+   *  PUT idiom (saveSettings), toggling settings.projects.mutedProjectIds. */
+  toggleProjectMute: (projectId: string) => void;
   /** Journey-expansion C: the cookbook — saved prompt templates (GET /api/templates + templates_updated). */
   templates: TemplateView[];
   /** Journey-expansion C: mise en place — saved pane layouts (GET /api/layouts + layouts_updated). */
@@ -384,7 +403,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [toast, setToast] = useState<{ msg: string; kind: "fire" | "warn"; action?: ToastAction } | null>(null);
   // 2K.1: the freezer (archived, recoverable panes). 2K.3: per-pane server-pushed draft mirror.
   const [archived, setArchived] = useState<ArchivedPane[]>([]);
-  const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number }>>({});
+  const [paneDrafts, setPaneDrafts] = useState<Record<string, { text: string; at: number; exchange?: ExchangeDraftView | null }>>({});
   // 4U.2: per-pane server-pushed history mirror (history_updated frames carry the full array;
   // a frame without one stores entries:null so the burner knows to refetch).
   const [paneHistories, setPaneHistories] = useState<Record<string, { entries: PaneHistoryEntry[] | null; at: number }>>({});
@@ -392,6 +411,11 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   const [serviceLog, setServiceLog] = useState<ServiceLogRow[]>([]);
   // bead apu: the one-glance health snapshot (GET /api/health), refreshed when the Pantry opens.
   const [healthSnapshot, setHealthSnapshot] = useState<HealthSnapshot | null>(null);
+  // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): the durable per-pane exchange
+  // projection (GET /api/fleet/exchange-summary), keyed by pane id. Additive/optional — absent
+  // entries (mock mode, or before the first fetch resolves) degrade the fleet board to the plain
+  // Station-status ordering it already has (see src/orbital/fleetExchangeOrdering.ts).
+  const [fleetExchangeSummaries, setFleetExchangeSummaries] = useState<Record<string, FleetExchangeSummary>>({});
   // Journey-expansion C: the cookbook (prompt templates) + mise en place (pane layouts).
   const [templates, setTemplates] = useState<TemplateView[]>([]);
   const [layouts, setLayouts] = useState<PaneLayout[]>([]);
@@ -424,6 +448,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
   // 3C.2: render-fresh mirror so the mock fetchPaneBackfill can read synchronously.
   const terminalsRef = useRef<Terminal[]>([]);
   terminalsRef.current = terminals;
+  // Phase 5, Step 5.1: render-fresh mirrors so handleObserveFrame's proactive_notification arm can
+  // resolve a pane's project (for the client-side mute check) WITHOUT taking ledger/settings as
+  // useCallback deps — same render-fresh-ref idiom as activeTerminalIdRef/terminalsRef (adding them
+  // as real deps would re-identity handleObserveFrame on every ledger/settings change, which sits
+  // in the WS-connect effect's dependency array and would reconnect the socket needlessly).
+  const ledgerRef = useRef<Record<string, Workspace>>({});
+  ledgerRef.current = ledger;
+  const settingsRef = useRef<SystemSettings | null>(null);
+  settingsRef.current = settings;
   // bead 8xn: render-fresh mirror of the inbox so the promotion effect (keyed on activeTerminalId +
   // a visibilitychange listener) reads the LATEST queue WITHOUT re-subscribing on every queue
   // mutation — same render-fresh-ref idiom as activeTerminalIdRef / terminalsRef.
@@ -645,6 +678,22 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     } catch { /* silent */ }
   }, []);
 
+  // Phase 5, Step 5.1 (Fleet View): the durable per-pane exchange projection — GET
+  // /api/fleet/exchange-summary (default resultToHttp? no — a plain inline route returning
+  // {summaries:{...}} verbatim, mirrors GET .../draft). Fetched on the same cadence as the board
+  // (refetchAll below + the 20s poll) since the fleet view is always-live, not an on-demand panel
+  // like the service log/health snapshot. Mock mode: no-op (the harness owns fleet-card state via
+  // the e2e-only `fleet_exchange_summary_updated` WS-frame seam in handleObserveFrame below).
+  const refetchFleetExchangeSummaries = useCallback(async () => {
+    if (isMockModeRef.current) return;
+    try {
+      const res = await apiFetch("/api/fleet/exchange-summary");
+      if (!res.ok) return;
+      const data = await res.json().catch(() => null);
+      if (data && data.summaries && typeof data.summaries === "object") setFleetExchangeSummaries(data.summaries);
+    } catch { /* silent */ }
+  }, []);
+
   // Boot/poll durability for deferred ACTIONS (the WS broadcast carries the rich rider; this minimal
   // shape — id/capability/summary — keeps chips after a reload, degrade-safe in the confirm dialog).
   const refetchActions = useCallback(async () => {
@@ -693,7 +742,8 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchTemplates();
     refetchLayouts();
     refetchHandoffs();
-  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchAttention, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts, refetchHandoffs]);
+    refetchFleetExchangeSummaries();
+  }, [refetchTerminals, refetchLedger, refetchSettings, refetchPending, refetchActions, refetchPlans, refetchAttention, refetchFrozen, refetchArchive, refetchTemplates, refetchLayouts, refetchHandoffs, refetchFleetExchangeSummaries]);
 
   // ── observe-lane frame handler ───────────────────────────────────────────
   // Extracted from the socket closure (3C.1/3C.2a) so (a) the always-on observe socket and the
@@ -751,7 +801,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // latest text per pane; the Order Pad applies it ONLY while the textarea isn't focused
       // (classic App.tsx:1164-1176's focus-lock, enforced in TerminalWindow).
       draft_updated: () => {
-        if (typeof msg.paneId === "string") setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text: draftTextFromFrame(msg), at: Date.now() } }));
+        if (typeof msg.paneId === "string") {
+          // Phase 3, Step 3.3 (additive): mirror the frame's `exchange` field alongside the text —
+          // exchangeFromFrame degrades to null on a malformed/absent field (old server, flag off),
+          // so the text mirror above is completely unaffected either way.
+          setPaneDrafts((prev) => ({ ...prev, [msg.paneId]: { text: draftTextFromFrame(msg), at: Date.now(), exchange: exchangeFromFrame(msg) } }));
+        }
       },
       // 4U.2: a pane's recorded command history changed (WS-D). The frame carries the full array —
       // mirror it per-pane so an open burner repaints; a payload-less frame stores entries:null, which
@@ -760,6 +815,15 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         if (typeof msg.terminalId === "string") setPaneHistories((prev) => ({ ...prev, [msg.terminalId]: { entries: historyEntriesFromFrame(msg), at: Date.now() } }));
       },
       ledger_updated: () => { refetchLedger(); },
+      // Phase 5, Step 5.1 (Fleet View): the e2e/test seam for the fleet-card exchange enhancement
+      // layer — mirrors draft_updated's shape. The REAL server never broadcasts this frame today
+      // (fleetExchangeSummaries is fetch-refreshed, see refetchFleetExchangeSummaries); it exists
+      // so Playwright's generic `injectWsFrame` hook (already wired to this same switch, no harness
+      // changes needed) can seed deterministic fleet-card data under ?mock=1, exactly like
+      // orbital_instruction.spec.ts seeds `draft_updated`.
+      fleet_exchange_summary_updated: () => {
+        if (msg.summaries && typeof msg.summaries === "object") setFleetExchangeSummaries(msg.summaries);
+      },
       // 4U.1: the server broadcasts the full plans board on every plan mutation — adopt it directly;
       // degrade to a refetch otherwise.
       plans_updated: () => { if (Array.isArray(msg.plans)) setPlans(msg.plans); else refetchPlans(); },
@@ -843,6 +907,14 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       // 1B.7: the orchestrator's proactive announcements reach the kitchen too. earcon: null — the bus
       // already fired its own proactive_earcon for this event.
       proactive_notification: () => {
+        // Phase 5, Step 5.1: client-side belt-and-suspenders mute check — the SAME
+        // settings.projects.mutedProjectIds the server's AnnouncementBus.isPaneMuted already
+        // checks, re-applied here so a notification that slips through from just-before a mute
+        // toggle (or a future second announcement path) never renders. Resolves the frame's
+        // terminalId to a project via the live ledger mirror (projectIdForPane).
+        const projectId = typeof msg.terminalId === "string" ? projectIdForPane(ledgerRef.current, msg.terminalId) : "";
+        const muted = !!projectId && (settingsRef.current?.projects.mutedProjectIds || []).includes(projectId);
+        if (muted) return;
         if (typeof msg.message === "string" && msg.message) {
           showToast(msg.message, msg.severity === "high" ? "warn" : "fire", null);
           desktopNote("👨‍🍳 From the kitchen", msg.message); // 2K.6
@@ -1992,6 +2064,58 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     }
   }, [showToast]);
 
+  // Phase 5, Step 5.1 (Fleet View "communication-by-exception") — quick-action recovery lane.
+  // Canonical REST twins only (src/actions/defs/lifecycle_rest.ts's retry_exchange/cancel_exchange,
+  // Phase 4.3) — no new effect path. Mock mode: there is no real exchange spine to confirm against,
+  // so retry HONESTLY says it can't confirm the outcome (never a false "done") — the same
+  // "refuse with uncertainty" posture retryExchange's real handler documents for an interrupted
+  // exchange's brand-new-follow-up leg.
+  const retryExchange = useCallback(async (exchangeId: string) => {
+    if (isMockModeRef.current) { showToast("Retry sent — I can't confirm it landed from here, Chef.", "warn"); return; }
+    try {
+      const res = await apiFetch(`/api/exchanges/${exchangeId}/retry`, { method: "POST" });
+      const body = await res.json().catch(() => null);
+      if (res.status === 403) { showToast("Retrying is turned off right now — check the safety gate.", "warn"); return; }
+      if (res.status === 202) { showToast("Retry is waiting on your ok — check the pass.", "fire"); return; }
+      if (!res.ok) throw new Error(`retry ${res.status}`);
+      showToast(typeof body?.output === "string" ? body.output : "Retried.", "fire");
+      refetchFleetExchangeSummaries();
+    } catch {
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
+  }, [showToast, refetchFleetExchangeSummaries]);
+
+  const cancelExchangeAction = useCallback(async (exchangeId: string) => {
+    if (isMockModeRef.current) { showToast("Held it back.", "warn"); return; }
+    try {
+      const res = await apiFetch(`/api/exchanges/${exchangeId}/cancel`, { method: "POST" });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(`cancel ${res.status}`);
+      // Phase 5.5 (release review): surface the SERVER's outcome text, not an unconditional
+      // "Held it back." — cancel_exchange returns 200 with an honest refusal message when the
+      // exchange settled first (a lost race / an already-terminal row), and the old fixed toast
+      // reported that refusal as success.
+      showToast(typeof body?.output === "string" ? body.output : "Held it back.", "warn");
+      refetchFleetExchangeSummaries();
+    } catch {
+      showToast("That didn't go through, Chef — try again.", "warn");
+    }
+  }, [showToast, refetchFleetExchangeSummaries]);
+
+  // Phase 5, Step 5.1: per-project announcement mute — the EXISTING settings PUT idiom
+  // (saveSettings sends the full SystemSettings object; manager.updateSettings shallow-merges
+  // `projects` — see terminal.ts), toggling one id in `projects.mutedProjectIds`. No new settings
+  // surface, no new REST route.
+  const toggleProjectMute = useCallback((projectId: string) => {
+    if (!settingsRef.current) return;
+    const current = settingsRef.current.projects.mutedProjectIds || [];
+    const next = current.includes(projectId) ? current.filter((id) => id !== projectId) : [...current, projectId];
+    const nextSettings: SystemSettings = { ...settingsRef.current, projects: { ...settingsRef.current.projects, mutedProjectIds: next } };
+    setSettings(nextSettings); // optimistic — settings_updated / refetchSettings reconciles either way
+    if (isMockModeRef.current) { showToast(next.includes(projectId) ? "Muted that kitchen's announcements." : "Un-muted — you'll hear it again.", "fire"); return; }
+    saveSettings(nextSettings);
+  }, [saveSettings, showToast]);
+
   // bead e7h: in-inbox Approve/Deny. When an attention item carries a held-request messageId
   // (attentionResolveTarget), resolve it through the SAME POST /api/commands/approve resolver voice
   // uses (approveCommand/rejectCommand) AND optimistically clear the alert from the inbox. When it
@@ -2094,6 +2218,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     streamGeneration, fetchPaneBackfill,
     archived, paneDrafts, paneHistories, serviceLog, refetchServiceLog,
     healthSnapshot, refetchHealth,
+    fleetExchangeSummaries, refetchFleetExchangeSummaries,
     templates, layouts, handoffs,
     lastAction,
     selectActivePane, setGlobalPermissionsMode, setGlobalMode, saveSettings, showToast,
@@ -2107,6 +2232,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     refetchNotes, addNote, saveRadioNote, editNote, deleteNote,
     goLive, stopLive, toggleMute, writeControlKey, resizeTerminal,
     approveCommand, rejectCommand, confirmAction, cancelAction,
+    retryExchange, cancelExchangeAction, toggleProjectMute,
     stopAllFreeze, stopAllKill, stopAllRelease,
     refetchTerminals, refetchLedger, refetchSettings, refetchAttention, dismissAttention, approveAttention, denyAttention, refetchAll,
     wsRef, isMockModeRef,

@@ -236,6 +236,36 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   // rest-only READ twin (the download route) — no voice twin BY DESIGN (voice never reads the body aloud).
   export_project: new Set<Surface>(["voice"]),
   get_project_export: new Set<Surface>(["rest"]),
+
+  // ── Phase 3 Step 3.3 instruction-envelope verbs (spec 2026-07-09-instruction-routing.md §5.3):
+  // voice-only by design. These compose/revise/route the CONVERSATIONAL instruction envelope for the
+  // operator's open pane — the typed/UI twin for the same intent is the EXISTING Workbench draft
+  // surface (WS draft_edit + PUT /api/panes/:p/:id/draft + POST /draft/send), which the convergence
+  // bridge (spec §5.2) keeps mutating the SAME per-pane exchange draft. A separate REST registry twin
+  // for each verb would be a redundant affordance (same reasoning as update_draft_prompt/focus_pane). ─
+  draft_instruction: new Set<Surface>(["voice"]),
+  revise_instruction: new Set<Surface>(["voice"]),
+  retarget_instruction: new Set<Surface>(["voice"]),
+  confirm_instruction: new Set<Surface>(["voice"]),
+  cancel_instruction: new Set<Surface>(["voice"]),
+  send_instruction: new Set<Surface>(["voice"]),
+
+  // ── Phase 4, Step 4.3 AgentExchange recovery actions: NEW rest-only defs (no voice twin — see
+  // src/actions/defs/lifecycle_rest.ts's own "SCOPE NOTE (voice)"). All four key off an opaque
+  // exchange_id (the id an attention item/notification already carries), which is not naturally
+  // something an operator would SPEAK; a voice-natural phrasing needs pane-scoped resolution
+  // instead of an id lookup — deferred as a distinct, larger design item, not silently dropped. ──
+  resume_inspect_exchange: new Set<Surface>(["rest"]),
+  retry_exchange: new Set<Surface>(["rest"]),
+  cancel_exchange: new Set<Surface>(["rest"]),
+  open_exchange_pane: new Set<Surface>(["rest"]),
+
+  // ── Phase 5, Step 5.2 exchange replay/metrics: NEW rest-only observability defs (no voice twin —
+  // see src/actions/defs/observability.ts's own scope note). Both outputs (a full multi-field
+  // timeline, a many-field metrics report) are read/inspected via REST/CLI, not spoken; a voice
+  // twin is not planned. ──
+  replay_exchange: new Set<Surface>(["rest"]),
+  get_exchange_metrics: new Set<Surface>(["rest"]),
 });
 
 /** surfaceCoverage(registry) — total over the registry: one row per action, presence per surface. */

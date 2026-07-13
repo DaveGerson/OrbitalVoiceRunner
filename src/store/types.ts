@@ -35,6 +35,10 @@ export interface StoredPendingApproval {
   id: string; session_id: string; workspace_id: string; pane_id: string;
   command: string; kind: ApprovalKind; rationale: string | null;
   claimed: boolean; timestamp: number; expires_at: number;
+  /** AgentExchange spine correlation (schema v12, nullable — the v2 handoff_id precedent).
+   *  Set ONLY when this approval was requested by the exchange service (spec §5); a legacy/
+   *  uncorrelated approval keeps this NULL forever. */
+  exchange_id?: string | null;
 }
 /**
  * Row shape for the pending_actions table (schema v5, bead wsm-e2e-pinned-kzt). A deferred Ask-tier
@@ -121,6 +125,7 @@ export interface PendingApprovalRow {
   id: string; session_id: string; workspace_id: string; pane_id: string;
   command: string; kind: string; rationale: string | null;
   claimed: SqlBool; timestamp: number; expires_at: number;
+  exchange_id?: string | null;
 }
 /** Raw `pending_actions` row (claimed as 0|1). */
 export interface PendingActionRow {
@@ -156,3 +161,12 @@ export interface GeminiTurnUsageRow {
 /** Raw `context_injections` row (schema v10, cortex context-injection telemetry). Column-for-column
  *  with `ContextInjectionEvent` (src/memory/contextTelemetry.ts) — this IS that shape as stored. */
 export type ContextInjectionRow = import("../memory/contextTelemetry").ContextInjectionEvent;
+
+/** Raw `agent_exchanges` row (schema v12, AgentExchange spine). Column-for-column with
+ *  `AgentExchange` (src/exchanges/types.ts) — this IS that shape as stored; no boolean columns to
+ *  coerce, so the row IS the stored shape (mirrors the ContextInjectionRow precedent above). */
+export type AgentExchangeRow = import("../exchanges/types").AgentExchange;
+/** Raw `exchange_events` row (schema v12). Column-for-column with `ExchangeEvent`. */
+export type ExchangeEventRow = import("../exchanges/types").ExchangeEvent;
+/** Raw `context_deliveries` row (schema v12). Column-for-column with `ContextDelivery`. */
+export type ContextDeliveryRow = import("../exchanges/types").ContextDelivery;

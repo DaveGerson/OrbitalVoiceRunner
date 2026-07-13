@@ -13,27 +13,37 @@ import type { MemoryTiers, MemoryConfig, SynthesizedBrief } from "./types";
  *  optional per-tier char caps (`decision.budget`). A tier key ABSENT from `order` is simply never
  *  rendered — that IS "drop"; there is no separate filter/null step. `frame` is structural and is
  *  ALWAYS rendered even if omitted from `order` (appended last). An unknown key in `order` (not one
- *  of the five canonical tier names) is silently ignored. */
+ *  of the six canonical tier names — project/pane/eventFocus/breadcrumbs/board/frame, Phase 2 Step
+ *  2.1 added eventFocus) is silently ignored. */
 export interface RenderPlan {
   order: string[];
   caps: Record<string, number>;
 }
 
-const CANONICAL_ORDER = ["project", "pane", "breadcrumbs", "board", "frame"];
+// Phase 2 Step 2.1: eventFocus inserted right after the active pane (foreground-adjacent — it
+// names a DIFFERENT pane, but it's the reason this brief was assembled at all) and before the
+// decaying breadcrumbs. Absent for every trigger that never supplies an affectedPaneId (the
+// pre-existing behavior), so this insertion is a no-op for all of today's call sites.
+const CANONICAL_ORDER = ["project", "pane", "eventFocus", "breadcrumbs", "board", "frame"];
 
 function cap(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, Math.max(0, max - 1)) + "…";
 }
 
-/** PROJECT (mid-ground) block, or null when absent. Identical text to the inline original. */
+/** PROJECT (mid-ground) block, or null when absent. `warnings`/`openTodos` (Phase 2 Step 2.1)
+ *  are optional — appended only when present/non-empty, so a tier literal that never sets them
+ *  renders byte-identically to before. */
 function projectBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.project) return null;
   const p = tiers.project;
+  const decisions = p.recentDecisions.length ? ` | decisions: ${p.recentDecisions.slice(0, 3).join("; ")}` : "";
+  const warnings = p.warnings?.length ? ` | warnings: ${p.warnings.slice(0, 3).join("; ")}` : "";
+  const todos = p.openTodos?.length ? ` | todos: ${p.openTodos.slice(0, 3).join("; ")}` : "";
   return cap(
     `PROJECT ${p.name}: ${p.summary}` +
     (p.keyTerms.length ? ` | terms: ${p.keyTerms.join(", ")}` : "") +
-    (p.recentDecisions.length ? ` | decisions: ${p.recentDecisions.slice(0, 3).join("; ")}` : ""),
+    decisions + warnings + todos,
     capChars);
 }
 
@@ -48,16 +58,30 @@ function paneBlock(tiers: MemoryTiers, capChars: number): string | null {
     capChars);
 }
 
+/** EVENT FOCUS (Phase 2 Step 2.1) — the background pane + delta that triggered this assembly
+ *  cycle, or null when no affected pane was supplied / it IS the active pane. */
+function eventFocusBlock(tiers: MemoryTiers, capChars: number): string | null {
+  const ef = tiers.eventFocus;
+  if (!ef) return null;
+  const state = ef.exchangeState ? ` (${ef.exchangeState}${ef.waitingReason ? `: ${ef.waitingReason}` : ""})` : "";
+  return cap(`EVENT FOCUS ${ef.name}${state}: ${ef.eventText}`, capChars);
+}
+
 /** BREADCRUMBS (decaying working memory) block, or null when empty. */
 function breadcrumbsBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.breadcrumbs.length) return null;
   return cap(`RECENTLY: ${tiers.breadcrumbs.map(b => b.text).join(" · ")}`, capChars);
 }
 
-/** BOARD (perception) block, or null when empty. */
+/** BOARD (perception) block, or null when empty. Per-entry exchange-state suffix (Phase 2 Step
+ *  2.1) is appended only when present, so an entry built without it renders exactly as before. */
 function boardBlock(tiers: MemoryTiers, capChars: number): string | null {
   if (!tiers.board.length) return null;
-  return cap(`BOARD: ${tiers.board.map(b => `${b.name}=${b.status}`).join(", ")}`, capChars);
+  const parts = tiers.board.map(b => {
+    const suffix = b.exchangeState ? `[${b.exchangeState}${b.waitingReason ? `:${b.waitingReason}` : ""}]` : "";
+    return `${b.name}=${b.status}${suffix}`;
+  });
+  return cap(`BOARD: ${parts.join(", ")}`, capChars);
 }
 
 /** JANUS FRAME (self-model) block — always present. */
@@ -70,6 +94,7 @@ function frameBlock(tiers: MemoryTiers, capChars: number): string {
 const RENDERERS: Record<string, (tiers: MemoryTiers, capChars: number) => string | null> = {
   project: projectBlock,
   pane: paneBlock,
+  eventFocus: eventFocusBlock,
   breadcrumbs: breadcrumbsBlock,
   board: boardBlock,
   frame: frameBlock,
@@ -89,6 +114,11 @@ export function assembleBrief(tiers: MemoryTiers, cfg: MemoryConfig, _now: numbe
     if (!render || seen.has(key)) return; // unknown/duplicate key — ignored
     seen.add(key);
     const capChars = caps[key] ?? Math.floor(B * (weights[key] ?? 0));
+    // Phase 2 Step 2.5 review fix: a tier with NO budget (weight/cap absent or 0 — e.g. a caller
+    // whose weights literal predates the eventFocus tier) is ABSENT, exactly as its type doc
+    // promises ("Missing ⇒ tier renders empty/absent") — cap(s, 0) used to render a lone "…"
+    // (a garbage 1-char block that still claimed a perTierChars entry).
+    if (capChars <= 0) return;
     const body = render(tiers, capChars);
     if (body === null) return;
     perTierChars[key] = body.length;

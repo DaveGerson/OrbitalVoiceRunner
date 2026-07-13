@@ -43,6 +43,16 @@ import {
   type ResolveReason,
 } from "../pendingApprovals";
 import { PendingActionStore } from "../pendingActions";
+import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
+import { beginExchangeDelivery, completeExchangeDelivery } from "../exchanges/deliveryHooks";
+import { instructionEnvelopeActive } from "../exchanges/instructionEnvelope";
+import {
+  findApprovalBindingByMessageId,
+  getOpenDraft,
+  clearApprovalBinding,
+  clearOpenDraft,
+  clearProseOverride,
+} from "../exchanges/draftRegistry";
 import { applyPaneMode, type PaneModeResult } from "../applyPaneMode";
 import { buildActionRun, checkActionVersion } from "../actionEffects";
 import { resolveActionPendingPosture, type GlobalMode } from "../actionPendingPayload";
@@ -99,7 +109,11 @@ export interface GatingDeps {
   announcementBus: AnnouncementBus;
   pushApprovalNarration: (session: any, text: string) => boolean | void;
   sanitizeSettingsForClient: (settings: any) => any;
-  addCommand: (terminalId: string, command: string) => void;
+  /** `exchangeId` is an ADDITIVE optional 3rd arg (AgentExchange spine, task C): the approved-write
+   *  path passes it through ONLY when this approval was exchange-correlated (flag on); server.ts's
+   *  HistoryManager.addCommand accepts (and ignores when absent) the same optional param, so a
+   *  legacy caller passing 2 args is byte-identical. */
+  addCommand: (terminalId: string, command: string, exchangeId?: string) => void;
 }
 
 /** The cohesive seam createGating returns. The pending stores + the constants are exposed so the
@@ -1035,10 +1049,59 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  /**
+   * AgentExchange spine (task C): the SAME two-phase ordering the spec wants for the auto_execute
+   * arm (spec §2b), for real this time — renderApproved is the single approved-write path, so a
+   * durable `delivery_attempted` (here: the in-memory `beginDeliveryAttempt`) genuinely precedes
+   * the pane write, and `completeDelivery` genuinely follows it. Best-effort; never throws; a
+   * no-op unless the resolved record carries an `exchangeId` (flag on AND this approval was
+   * exchange-correlated at proposal time, src/voice/index.ts's dispatchProposal). The
+   * stageForDelivery/beginDeliveryAttempt pair is the SHARED hook (src/exchanges/deliveryHooks.ts,
+   * also used by src/dispatch/paneWrite.ts's auto_execute arm and server.ts's Workbench send seam)
+   * — this function keeps ONLY the confirmApproval prelude that is unique to the approved-write
+   * path (the CAS binding must be confirmed before delivery can be staged for THIS path).
+   */
+  function beginExchangeDeliveryOnApprove(record: ResolvedRecord): void {
+    if (exchangeSpineActive() && record.exchangeId) {
+      try {
+        const svc = getExchangeService();
+        const snap = svc.get(record.exchangeId);
+        if (snap?.state === "awaiting_approval" && snap.approvalDraftVersion != null) {
+          svc.confirmApproval(record.exchangeId, record.messageId, snap.approvalDraftVersion);
+        }
+      } catch (e) {
+        console.error("[exchange-spine] beginExchangeDeliveryOnApprove (confirmApproval) failed:", e);
+        // Pre-consolidation semantics (the single try/catch this prelude and the stage/begin pair
+        // used to share): a confirmApproval-leg throw aborts the WHOLE hook — delivery is never
+        // staged on a spine whose approval-confirm just failed. The real pane write is unaffected
+        // either way (spec §9.6).
+        return;
+      }
+    }
+    beginExchangeDelivery(record.exchangeId, "beginExchangeDeliveryOnApprove");
+  }
+
+  function completeExchangeDeliveryOnApprove(record: ResolvedRecord): void {
+    completeExchangeDelivery(record.exchangeId, "completeExchangeDeliveryOnApprove");
+  }
+
+  /** Non-approve terminal resolutions (reject/expire/dead-pane) never deliver — cancel whatever
+   *  exchange this approval was bound to (best-effort; a no-op without a flag+binding). */
+  function cancelExchangeOnResolve(record: ResolvedRecord, reason: string): void {
+    if (!exchangeSpineActive() || !record.exchangeId) return;
+    try {
+      getExchangeService().cancel(record.exchangeId, reason);
+    } catch (e) {
+      console.error("[exchange-spine] cancelExchangeOnResolve failed:", e);
+    }
+  }
+
   function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
     // Claim already won inside resolveDecision — this is the single write path.
-    addCommand(record.terminalId, record.instruction);
+    beginExchangeDeliveryOnApprove(record);
+    addCommand(record.terminalId, record.instruction, record.exchangeId);
     manager.terminals[record.terminalId]!.writeInput(record.instruction);
+    completeExchangeDeliveryOnApprove(record);
     clearMatchingDraftOnApprove(record);
     if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
     // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
@@ -1048,19 +1111,72 @@ export function createGating(deps: GatingDeps): Gating {
   function renderDeadPane(record: ResolvedRecord, safeInstr: string, session: any): void {
     if (session) pushApprovalNarration(session, `That pane (${record.terminalId}) is gone — I could not dispatch the command.`);
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Target pane missing." });
+    cancelExchangeOnResolve(record, "dead_pane");
   }
 
   function renderRejected(record: ResolvedRecord, safeInstr: string, session: any, opts?: { vocal?: boolean }): void {
     if (session) pushApprovalNarration(session, `Rejecting the command on pane ${record.terminalId}: "${safeInstr}".`);
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: opts?.vocal ? "Execution cancelled by operator via voice." : "Execution cancelled by operator." });
+    cancelExchangeOnResolve(record, "rejected");
   }
 
   function renderExpired(record: ResolvedRecord, safeInstr: string, session: any): void {
     if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
     // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its severity,
     // which rendered "Pane 'x' exited." for a pane that merely lost an approval.
-    announcementBus.enqueue({ kind: "approval_expired", terminalId: record.terminalId, summary: "Approval expired." });
+    // AgentExchange spine (task C, spec §5 "attention rows"): carry exchange_id in the item's
+    // details when this approval was exchange-correlated. The durable `attention` table + its
+    // `attention.exchange_id` column (schema v12) and the live `manager.attentionQueue` push
+    // call sites live in src/terminal.ts / src/observe/index.ts, both out of this step's
+    // allowed-paths scope — this is the one attention-adjacent enqueue point reachable from here.
+    announcementBus.enqueue({
+      kind: "approval_expired",
+      terminalId: record.terminalId,
+      summary: "Approval expired.",
+      ...(record.exchangeId ? { exchangeId: record.exchangeId } : {}),
+    });
     broadcast({ type: WS_EVT.BLOCKED, terminalId: record.terminalId, cmd: safeInstr, reason: "Approval expired (timeout)." });
+    cancelExchangeOnResolve(record, "expired");
+  }
+
+  // ── Phase 3 step 3.5 (instruction-envelope draft-version CAS — BUG-B) ────────────────────────
+  // The envelope layer binds a pending approval to the EXACT draft version it was staged from
+  // (src/exchanges/draftRegistry.ts bindApprovalToDraft) and eagerly invalidates the approval on
+  // every version bump. This pair is the belt-and-suspenders at the resolve choke-point itself —
+  // the envelope twin of the exchange spine's confirmApproval(approvalId, draftVersion) CAS
+  // (src/exchanges/lifecycle.ts): even if some future path bumps the version WITHOUT invalidating,
+  // an approve whose bound version no longer matches the live draft resolves as a REJECT — a stale
+  // approval can never deliver old text. Both helpers are best-effort in-memory reads/writes and
+  // never throw into the resolution path.
+
+  /** Approve → reject downgrade when the approval's bound draft version is no longer the live one
+   *  (draft revised, retargeted, or cancelled since staging). No binding / no flag → mode as-is. */
+  function envelopeCasMode(messageId: string, mode: ResolveMode): ResolveMode {
+    if (mode !== "approve" || !instructionEnvelopeActive()) return mode;
+    const found = findApprovalBindingByMessageId(messageId);
+    if (!found) return mode;
+    const open = getOpenDraft(found.projectId, found.paneId);
+    return open && open.draftVersion === found.binding.draftVersion ? mode : "reject";
+  }
+
+  /** Consume the envelope binding once its approval reaches a terminal resolution. An APPROVED
+   *  delivery also closes the open draft (the confirmed version landed on the pane — the draft's
+   *  lifecycle is complete); reject/expire/dead-pane leave the draft open and revisable.
+   *  Best-effort (owns its try/catch) — envelope bookkeeping never breaks the resolution. */
+  function settleEnvelopeBindingOnResolve(messageId: string, reason: ResolveReason): void {
+    if (!instructionEnvelopeActive() || reason === "lost_race" || reason === "not_found") return;
+    try {
+      const found = findApprovalBindingByMessageId(messageId);
+      if (!found) return;
+      clearApprovalBinding(found.projectId, found.paneId);
+      if (reason === "approved") {
+        clearOpenDraft(found.projectId, found.paneId);
+        clearProseOverride(found.projectId, found.paneId);
+        broadcastDraft(found.projectId, found.paneId);
+      }
+    } catch (e) {
+      console.error("[instruction-envelope] binding settle on resolve failed:", e);
+    }
   }
 
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
@@ -1071,7 +1187,7 @@ export function createGating(deps: GatingDeps): Gating {
     const action = resolveDecision(
       pendingApprovals,
       messageId,
-      mode,
+      envelopeCasMode(messageId, mode),
       (terminalId) => !!manager.terminals[terminalId]
     );
     const { reason, record } = action;
@@ -1088,6 +1204,10 @@ export function createGating(deps: GatingDeps): Gating {
       case "expired":   renderExpired(record, safeInstr, session); break;
       case "lost_race": break;
     }
+    // Phase 3 step 3.5: consume the instruction-envelope draft binding in the SAME choke-point
+    // (approved → close the delivered draft; reject/expire/dead-pane → binding cleared, draft
+    // stays open + revisable). Best-effort inside the helper — never breaks the resolution.
+    settleEnvelopeBindingOnResolve(messageId, reason);
     // Step 9: flip any associated handoff row in the SAME choke-point (after the write/narration).
     if (isFlipReason(reason)) {
       flipHandoffOnResolve(messageId, reason, opts);

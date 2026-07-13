@@ -1,0 +1,162 @@
+// src/memory/contextVersions.ts — Phase 2, Step 2.2 (AgentExchange spine follow-through).
+//
+// A per-(project_id, voice_session_id) monotonically increasing `context_version` registry,
+// backed by the schema-v12 `context_deliveries` table (src/store/schema.ts, ContextDelivery type
+// in src/exchanges/types.ts). This is the durable record of "what context brief version actually
+// shaped the model's understanding for THIS project+session pair, and did it actually land."
+//
+// ACK-ON-SUCCESS CONTRACT (the whole point of this module): `recordDelivery` is called the moment
+// a brief is ABOUT to be sent (src/voice/index.ts's injectMemoryBrief, right before
+// `sess.sendClientContent`), minting a fresh version and an unacknowledged row. `acknowledgeDelivery`
+// is called ONLY after that send call returns without throwing. A gate skip, a stale/empty brief,
+// or a send failure/exception never reaches `recordDelivery` at all (they exit injectMemoryBrief
+// earlier) or reaches it but never reaches the matching `acknowledgeDelivery` (a throw from
+// sendClientContent) — either way `currentAcknowledgedVersion` never advances for that attempt. A
+// reconnect race (two deliveries in flight, acks arriving out of order) can never move the
+// acknowledged version BACKWARD either — see `acknowledgeDelivery`'s monotonic-guard comment.
+//
+// Pure module: no wall-clock reads of its own beyond what callers pass in, no daemon/process
+// dependency. `store` is optional (mirrors the fail-soft telemetry writers elsewhere in
+// src/memory/) — a null store still tracks in-memory version/ack state correctly (useful for unit
+// tests and for the rare hand-built harness with no JanusStore attached), it just has nothing
+// durable to seed from at construction and nothing durable to persist to.
+
+import type { ContextDelivery } from "../exchanges/types";
+import { mintContextDeliveryId } from "../exchanges/types";
+
+/** Structural read/write surface this registry needs from the store. `JanusStore` satisfies this
+ *  directly (src/store/sqliteStore.ts); tests may pass a lighter fake with the same shape. */
+export interface ContextVersionSource {
+  insertContextDelivery(
+    input: Partial<ContextDelivery> & Pick<ContextDelivery, "context_version" | "trigger">,
+  ): ContextDelivery;
+  acknowledgeContextDelivery(deliveryId: string, at?: number): boolean;
+  listContextDeliveries(sessionId: string): ContextDelivery[];
+}
+
+export interface RecordDeliveryInput {
+  projectId: string | null;
+  sessionId: string | null;
+  trigger: string;
+  includedSourceIds: string[];
+  droppedSourceIds: string[];
+  snapshotHash: string | null;
+  briefHash: string | null;
+  ts?: number;
+}
+
+export interface DeliveryRecord {
+  deliveryId: string;
+  contextVersion: string;
+}
+
+/** In-memory bookkeeping key for a (project_id, voice_session_id) pair. Both legs may be null
+ *  (no active project / no live voice session yet) — still tracked as their own distinct pair so
+ *  callers with no session get consistent (if trivial) versioning rather than sharing state with
+ *  every other null-session caller. */
+function pairKey(project: string | null, session: string | null): string {
+  return `${project ?? "\0"}::${session ?? "\0"}`;
+}
+
+export class ContextVersionRegistry {
+  /** pairKey -> highest MINTED version (monotonic counter). Lazily seeded from the durable store
+   *  on first use so a process restart doesn't restart numbering at 1 for a pair the store already
+   *  has delivery rows for. */
+  private readonly counters = new Map<string, number>();
+  private readonly seeded = new Set<string>();
+  /** pairKey -> highest ACKNOWLEDGED version. Only `acknowledgeDelivery` ever writes here. */
+  private readonly acknowledged = new Map<string, number>();
+  /** deliveryId -> the (project, session, version) it was minted for — acknowledgeDelivery's
+   *  lookup so callers only need to pass the delivery id back, not re-derive the pair. */
+  private readonly deliveryMeta = new Map<string, { project: string | null; session: string | null; version: number }>();
+
+  constructor(private readonly store: ContextVersionSource | null = null) {}
+
+  /** Seed this pair's counter from the durable store's existing rows (once per pair, lazily) so a
+   *  restart resumes numbering instead of colliding with already-delivered versions. Only
+   *  meaningful when both a store AND a real session id are available (the store's
+   *  `listContextDeliveries` read is keyed on session id alone); no store / no session ⇒ starts
+   *  at 0, matching a genuinely fresh pair. Fail-soft: a store read error never throws. */
+  private ensureSeeded(project: string | null, session: string | null): void {
+    const key = pairKey(project, session);
+    if (this.seeded.has(key)) return;
+    this.seeded.add(key);
+    if (!this.store || session == null) return;
+    try {
+      let max = 0;
+      for (const row of this.store.listContextDeliveries(session)) {
+        if (row.project_id !== project) continue;
+        const n = Number(row.context_version);
+        if (Number.isFinite(n) && n > max) max = n;
+      }
+      if (max > 0) this.counters.set(key, max);
+    } catch {
+      // A seeding-read fault just means we start counting from 0 for this process — never throws.
+    }
+  }
+
+  /** Mint (and advance) the next version for `(project, session)`. Monotonic per pair;
+   *  independent pairs never share a counter. */
+  nextVersionFor(project: string | null, session: string | null): string {
+    this.ensureSeeded(project, session);
+    const key = pairKey(project, session);
+    const next = (this.counters.get(key) ?? 0) + 1;
+    this.counters.set(key, next);
+    return String(next);
+  }
+
+  /** Record a context-brief delivery ATTEMPT: mints a fresh version, persists an UNACKNOWLEDGED
+   *  `context_deliveries` row (best-effort — a store fault still returns a usable in-memory
+   *  delivery id so the caller's ack-on-success flow keeps working), and remembers the id so a
+   *  later `acknowledgeDelivery(deliveryId)` call can resolve back to this pair/version. Call this
+   *  the moment a brief is ABOUT to be sent — never for a gate skip / stale / empty brief (those
+   *  never reach this call at all). */
+  recordDelivery(input: RecordDeliveryInput): DeliveryRecord {
+    const contextVersion = this.nextVersionFor(input.projectId, input.sessionId);
+    const row = this.store?.insertContextDelivery({
+      project_id: input.projectId,
+      voice_session_id: input.sessionId,
+      context_version: contextVersion,
+      trigger: input.trigger,
+      snapshot_hash: input.snapshotHash,
+      brief_hash: input.briefHash,
+      included_sources_json: JSON.stringify(input.includedSourceIds),
+      dropped_sources_json: JSON.stringify(input.droppedSourceIds),
+      ts: input.ts,
+    });
+    const deliveryId = row?.delivery_id ?? mintContextDeliveryId(input.ts);
+    this.deliveryMeta.set(deliveryId, {
+      project: input.projectId,
+      session: input.sessionId,
+      version: Number(contextVersion),
+    });
+    return { deliveryId, contextVersion };
+  }
+
+  /** Stamp a delivery as ACKNOWLEDGED — call ONLY after the brief actually reached Gemini
+   *  (sendClientContent returned without throwing). Returns false for an unknown delivery id (a
+   *  skip/stale/empty path never called recordDelivery, so it has nothing to ack) or a durable
+   *  ack that the store refuses (already acknowledged / DB fault).
+   *
+   *  RECONNECT-RACE GUARD: `currentAcknowledgedVersion` only ever moves FORWARD. Two deliveries
+   *  can be in flight concurrently (e.g. a reconnect racing a still-settling prior send); if the
+   *  OLDER delivery's ack arrives after a NEWER delivery already advanced the acknowledged version,
+   *  this must not regress it back down — the numeric comparison below is exactly that guard. */
+  acknowledgeDelivery(deliveryId: string, at?: number): boolean {
+    const meta = this.deliveryMeta.get(deliveryId);
+    if (!meta) return false;
+    const ok = this.store ? this.store.acknowledgeContextDelivery(deliveryId, at) : true;
+    if (!ok) return false;
+    const key = pairKey(meta.project, meta.session);
+    const current = this.acknowledged.get(key) ?? 0;
+    if (meta.version > current) this.acknowledged.set(key, meta.version);
+    return true;
+  }
+
+  /** The latest ACKNOWLEDGED version for `(project, session)`, or null if none has ever been
+   *  acknowledged (fresh pair, or every delivery so far was skipped/failed/never acked). */
+  currentAcknowledgedVersion(project: string | null, session: string | null): string | null {
+    const v = this.acknowledged.get(pairKey(project, session));
+    return v == null ? null : String(v);
+  }
+}

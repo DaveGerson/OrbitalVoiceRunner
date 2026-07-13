@@ -17,7 +17,14 @@ CORTEX_VERSION = "0.3.0"
 
 # Canonical tier PRESENCE-CHECK order (matches the synthesizer's tier set). This is NOT the
 # render order — each profile below defines its own per-trigger order (D3).
-_TIER_KEYS = ("project", "pane", "breadcrumbs", "board", "frame")
+#
+# Phase 2 Step 2.1 (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md): "eventFocus" added
+# — the background-pane "event focus" block (src/memory/worldModel.ts's getEventFocusTier), only
+# ever present when a command-outcome-style trigger names an affected pane. It is APPENDED, not
+# inserted, so every existing golden fixture / TIERS_FULL-style test dict that never sets it keeps
+# an unaffected `kept0` (the tier is simply never present -> filtered out of every presence check
+# below, byte-identical to pre-2.1 behavior).
+_TIER_KEYS = ("project", "pane", "breadcrumbs", "board", "frame", "eventFocus")
 
 # Wave 4 D3: the cortex owns the render budget outright (locked 2026-06-25) as a FIXED total,
 # not driven by the caller's cfg. Matches DEFAULT_MEMORY_CONFIG.totalBudgetChars in
@@ -40,25 +47,43 @@ HISTORY_K = 8                # mirrors HISTORY_K in src/memory/types.ts (informa
 # A trigger that is not exactly one of these four keys (including non-string/hostile input)
 # falls back to the "session-start" row (D3 unknown-trigger fallback) with a trace note — it is
 # intentionally never silently treated as some blended/intermediate policy.
+#
+# Phase 2 Step 2.1: "eventFocus" caps below are ADDITIVE extras on top of the five original
+# fractions (which are left completely UNCHANGED — pinned byte-for-byte by
+# test_cortex.py::test_*_budget_matches_fixed_fractions_of_4800 and friends). Rows therefore sum
+# to MORE than 1.0 when eventFocus is counted, but `_allocate_caps` only ever emits a budget entry
+# for tiers actually in `keep` — and eventFocus is only ever "present" (and thus only ever kept)
+# when a background-outcome trigger's tiers snapshot actually carries one
+# (src/memory/worldModel.ts's getEventFocusTier). Every existing fixture/golden vector never sets
+# it, so `keep`/`budget` for those stays byte-identical to pre-2.1 output.
 PROFILES = {
     "session-start": {
-        "order": ("project", "pane", "breadcrumbs", "board", "frame"),
-        "caps": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05},
+        "order": ("project", "pane", "eventFocus", "breadcrumbs", "board", "frame"),
+        "caps": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05,
+                  "eventFocus": 0.05},
         "dropFirst": (),
     },
     "catch-up": {
-        "order": ("project", "pane", "breadcrumbs", "board", "frame"),
-        "caps": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05},
+        "order": ("project", "pane", "eventFocus", "breadcrumbs", "board", "frame"),
+        "caps": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10, "frame": 0.05,
+                  "eventFocus": 0.05},
         "dropFirst": (),
     },
     "pane-switch": {
-        "order": ("pane", "project", "breadcrumbs", "board", "frame"),
-        "caps": {"pane": 0.40, "project": 0.25, "breadcrumbs": 0.15, "board": 0.15, "frame": 0.05},
-        "dropFirst": ("board", "breadcrumbs"),
+        "order": ("pane", "project", "breadcrumbs", "board", "eventFocus", "frame"),
+        "caps": {"pane": 0.40, "project": 0.25, "breadcrumbs": 0.15, "board": 0.15, "frame": 0.05,
+                  "eventFocus": 0.05},
+        # eventFocus drops first on a plain pane-switch (the operator explicitly chose a
+        # different pane; a stale background event is the least relevant thing here).
+        "dropFirst": ("eventFocus", "board", "breadcrumbs"),
     },
     "command-outcome": {
-        "order": ("breadcrumbs", "pane", "board", "project", "frame"),
-        "caps": {"breadcrumbs": 0.30, "pane": 0.35, "board": 0.10, "project": 0.20, "frame": 0.05},
+        # eventFocus LEADS: this is the profile a background-outcome trigger actually uses, and
+        # the whole reason the block exists is to name the specific pane/event that fired it.
+        "order": ("eventFocus", "breadcrumbs", "pane", "board", "project", "frame"),
+        "caps": {"breadcrumbs": 0.30, "pane": 0.35, "board": 0.10, "project": 0.20, "frame": 0.05,
+                  "eventFocus": 0.25},
+        # eventFocus is deliberately absent from dropFirst — never sacrificed first on overflow.
         "dropFirst": ("project", "board"),
     },
 }
@@ -375,6 +400,9 @@ def _reallocate(base, project, pane, crumbs, board):
 
 
 def _project_block(project, budget):
+    """Phase 2 Step 2.1: `warnings`/`openTodos` are appended ONLY when present/non-empty (mirrors
+    src/memory/assembler.ts's projectBlock) — absent on every pre-2.1 fixture, so this stays
+    byte-identical to the un-enriched output for those (test_cortex_parity's oracle)."""
     name = project.get("name", "")
     summary = _salient_summary(
         project.get("summary", ""), project.get("keyTerms"),
@@ -387,6 +415,12 @@ def _project_block(project, budget):
     decisions = project.get("recentDecisions") or []
     if decisions:
         body += " | decisions: " + "; ".join(decisions[:3])
+    warnings = project.get("warnings") or []
+    if warnings:
+        body += " | warnings: " + "; ".join(warnings[:3])
+    todos = project.get("openTodos") or []
+    if todos:
+        body += " | todos: " + "; ".join(todos[:3])
     return _cap(body, budget)
 
 
@@ -407,6 +441,27 @@ def _frame_block(frame, budget):
     if prefs:
         fbody += " | prefs: " + "; ".join(prefs)
     return _cap(fbody, budget)
+
+
+def _board_entry(e):
+    """One BOARD: entry, with the Phase 2 Step 2.1 exchange-state suffix appended only when
+    present (mirrors src/memory/assembler.ts's boardBlock)."""
+    suffix = ""
+    state = e.get("exchangeState")
+    if state:
+        reason = e.get("waitingReason")
+        suffix = "[%s%s]" % (state, (":" + reason) if reason else "")
+    return "%s=%s%s" % (e.get("name", ""), e.get("status", ""), suffix)
+
+
+def _event_focus_block(ef, budget):
+    """Phase 2 Step 2.1: the background-pane "event focus" block — mirrors
+    src/memory/assembler.ts's eventFocusBlock exactly (same label/format)."""
+    state = ef.get("exchangeState")
+    reason = ef.get("waitingReason")
+    suffix = " (%s%s)" % (state, (": " + reason) if reason else "") if state else ""
+    body = "EVENT FOCUS %s%s: %s" % (ef.get("name", ""), suffix, ef.get("eventText", ""))
+    return _cap(body, budget)
 
 
 def synthesize_shadow(tiers, cfg, now):
@@ -439,15 +494,25 @@ def synthesize_shadow(tiers, cfg, now):
         per["pane"] = len(body)
         blocks.append(body)
 
+    # Phase 2 Step 2.1: eventFocus is rendered OUTSIDE `_base_budgets`/`_reallocate` on purpose —
+    # those two stay untouched 5-tier arithmetic (test_cortex_parity's byte-for-byte oracle
+    # depends on it), so eventFocus's budget is a separate, additive fraction of `total` that
+    # never perturbs the existing project/pane/breadcrumbs/board/frame allocation. Absent on
+    # every pre-2.1 tiers dict, so this whole branch is a no-op for those.
+    event_focus = tiers.get("eventFocus")
+    if event_focus:
+        ef_frac = float(((cfg.get("weights") or {})).get("eventFocus", 0.0))
+        body = _event_focus_block(event_focus, int(total * ef_frac))
+        per["eventFocus"] = len(body)
+        blocks.append(body)
+
     if crumbs:
         body = _cap("RECENTLY: " + " · ".join(b.get("text", "") for b in crumbs), budgets["breadcrumbs"])
         per["breadcrumbs"] = len(body)
         blocks.append(body)
 
     if board:
-        body = _cap(
-            "BOARD: " + ", ".join("%s=%s" % (e.get("name", ""), e.get("status", "")) for e in board),
-            budgets["board"])
+        body = _cap("BOARD: " + ", ".join(_board_entry(e) for e in board), budgets["board"])
         per["board"] = len(body)
         blocks.append(body)
 

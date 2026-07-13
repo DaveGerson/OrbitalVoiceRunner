@@ -22,6 +22,7 @@ import type { CapabilityGate, GateValue } from "../src/types";
 import type { ContextInjectionTrigger } from "../src/memory/contextTelemetry";
 import { PendingApprovalStore } from "../src/pendingApprovals";
 import { PendingActionStore } from "../src/pendingActions";
+import { JanusStore } from "../src/store/sqliteStore";
 
 const FORBID_CATCHUP =
   "Error: the 'read_notes' capability is gated Off; reading activity history is forbidden by policy.";
@@ -244,5 +245,100 @@ describe("catch_me_up — composer not wired (graceful degrade)", () => {
     assert.strictEqual(res.kind, "ok");
     assert.strictEqual((res as { output: unknown }).output, "Nothing notable in the last 15 minutes.");
     assert.deepStrictEqual(spy.injectTriggers, ["catch_me_up"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — exchange-aware catch-up: the exchange board (needs_input/failed/complete/
+// running/decisions, src/voice/sitrep.ts composeExchangeBoard) is PREPENDED ahead of the legacy
+// away-digest, windowed to [since, now] so an unchanged exchange is never replayed on a repeated
+// call. Every test above stays green untouched (no ctx.store attached there -> an empty board,
+// exactly the pre-4.2 behavior).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+function freshStore(): JanusStore {
+  const s = new JanusStore(":memory:");
+  s.init();
+  return s;
+}
+
+/** A fuller ActionContext than `makeCtx` above (which stubs `manager` down to nothing) — the
+ *  exchange board reads `ctx.manager.ledger.workspaces`/`activeProjectId` and
+ *  `ctx.manager.attentionQueue`, none of which the pure hwu.2 handler tests above ever touch. */
+function makeExchangeCtx(opts: {
+  store: JanusStore | null;
+  composeReturn?: string | null;
+  digestSpy?: Array<{ since: number; now: number }>;
+}): ActionContext {
+  const digestSpy = opts.digestSpy ?? [];
+  return {
+    manager: {
+      terminals: {},
+      ledger: { workspaces: {}, activeProjectId: "proj-1" },
+      attentionQueue: [],
+      settings: {},
+    },
+    session: null,
+    callId: "call_test",
+    redact: (s: string) => s,
+    isFrozen: () => false,
+    effectiveCapabilityGateFor: () => "Auto" as GateValue,
+    pruneAttention: () => {},
+    pendingApprovals: new PendingApprovalStore(null),
+    pendingActions: new PendingActionStore(null),
+    store: opts.store,
+    injectMemoryBrief: () => {},
+    composeAwayDigest:
+      opts.composeReturn === undefined
+        ? undefined
+        : (since: number, now: number): string | null => {
+            digestSpy.push({ since, now });
+            return opts.composeReturn ?? null;
+          },
+  } as unknown as ActionContext;
+}
+
+describe("catch_me_up — exchange-aware board (Phase 4, Step 4.2)", () => {
+  it("a needs_input exchange within the window surfaces its redacted question, ahead of the legacy digest", async () => {
+    const store = freshStore();
+    const now = Date.now();
+    store.insertExchange({
+      project_id: "proj-1", pane_id: "p1", state: "needs_input",
+      terminal_state: "overwrite existing file? y/n", updated_at: now - 5_000,
+    });
+    const ctx = makeExchangeCtx({ store, composeReturn: "2 panes finished while you were away." });
+    const res = await catchMeUp.handler({ window_minutes: 30 }, ctx);
+    assert.strictEqual(res.kind, "ok");
+    const output = String((res as { output: unknown }).output);
+    assert.ok(output.startsWith(`Pane 'p1' needs your input: "overwrite existing file? y/n"`), output);
+    assert.ok(output.includes("2 panes finished while you were away."), output);
+    store.close();
+  });
+
+  it("an exchange OUTSIDE the requested window is not replayed (no unchanged-context replay)", async () => {
+    const store = freshStore();
+    const now = Date.now();
+    // 2 hours old — outside a 30-minute catch-up window.
+    store.insertExchange({
+      project_id: "proj-1", pane_id: "p1", state: "agent_failed",
+      terminal_state: "stale failure", updated_at: now - 2 * 60 * 60 * 1000,
+    });
+    const ctx = makeExchangeCtx({ store, composeReturn: null });
+    const res = await catchMeUp.handler({ window_minutes: 30 }, ctx);
+    assert.strictEqual((res as { output: unknown }).output, "Nothing notable in the last 30 minutes.");
+    store.close();
+  });
+
+  it("no exchange activity at all -> byte-identical to the pre-4.2 digest-only behavior", async () => {
+    const store = freshStore(); // real store, but zero exchange rows.
+    const ctx = makeExchangeCtx({ store, composeReturn: "1 pane exited." });
+    const res = await catchMeUp.handler({ window_minutes: 30 }, ctx);
+    assert.strictEqual((res as { output: unknown }).output, "1 pane exited.");
+    store.close();
+  });
+
+  it("no store attached (REST/test paths) -> the exchange board is silently empty, digest-only as before", async () => {
+    const ctx = makeExchangeCtx({ store: null, composeReturn: "1 pane exited." });
+    const res = await catchMeUp.handler({ window_minutes: 30 }, ctx);
+    assert.strictEqual((res as { output: unknown }).output, "1 pane exited.");
   });
 });

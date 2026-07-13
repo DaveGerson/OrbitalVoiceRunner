@@ -6,8 +6,12 @@ import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHand
 import type {
   PaneRow, ArchivedPaneRow, ProjectRow, NoteRow, PendingApprovalRow, PendingActionRow,
   AttentionRow, HandoffRow, ValueRow, CountRow, IdRow, SearchHitRow,
+  AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow,
 } from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
+import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState, ExchangeEventType } from "../exchanges/types";
+import { mintExchangeId, mintContextDeliveryId } from "../exchanges/types";
+import { TERMINAL_STATES } from "../exchanges/lifecycle";
 
 /**
  * One persisted row of the unified ACTION LOG (schema v6, PLM2). Mirrors F1's ActionAuditRow call
@@ -292,14 +296,14 @@ export class JanusStore {
    */
   insertPendingApproval(a: StoredPendingApproval): void {
     this.db.prepare(
-      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at)
-       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at)
+      `INSERT INTO pending_approvals(id,session_id,workspace_id,pane_id,command,kind,rationale,claimed,timestamp,expires_at,exchange_id)
+       VALUES(@id,@session_id,@workspace_id,@pane_id,@command,@kind,@rationale,@claimed,@timestamp,@expires_at,@exchange_id)
        ON CONFLICT(id) DO UPDATE SET
          session_id=excluded.session_id, workspace_id=excluded.workspace_id, pane_id=excluded.pane_id,
          command=excluded.command, kind=excluded.kind, rationale=excluded.rationale,
-         timestamp=excluded.timestamp, expires_at=excluded.expires_at,
+         timestamp=excluded.timestamp, expires_at=excluded.expires_at, exchange_id=excluded.exchange_id,
          claimed=CASE WHEN pending_approvals.claimed=1 THEN 1 ELSE excluded.claimed END`
-    ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null });
+    ).run({ ...a, claimed: a.claimed?1:0, rationale: a.rationale ?? null, exchange_id: a.exchange_id ?? null });
   }
   /** Atomic claim: flips 0->1 only if currently 0. True == this caller won. */
   claimApproval(id: string): boolean {
@@ -307,6 +311,14 @@ export class JanusStore {
   }
   deletePendingApproval(id: string): void {
     this.db.prepare("DELETE FROM pending_approvals WHERE id=?").run(id);
+  }
+  /** AgentExchange spine boot recovery (step 1.4, spec §4): does a durable pending_approval row
+   *  still exist for this id (claimed or not)? Used to decide whether an `awaiting_approval`
+   *  exchange can be safely KEPT (the approval survivor re-hydrates via the existing path) or must
+   *  revert to `draft` (the row was claimed+deleted or TTL-swept mid-crash — never assume the
+   *  missing approval was confirmed). */
+  hasPendingApproval(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM pending_approvals WHERE id=?").get(id);
   }
   getPendingApprovals(sessionId: string): StoredPendingApproval[] {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE session_id=? AND claimed=0 ORDER BY timestamp ASC").all(sessionId) as PendingApprovalRow[])
@@ -319,6 +331,22 @@ export class JanusStore {
   getExpiredApprovals(now = Date.now()): StoredPendingApproval[] {
     return (this.db.prepare("SELECT * FROM pending_approvals WHERE claimed=0 AND expires_at<? ORDER BY expires_at ASC, timestamp ASC, id ASC").all(now) as PendingApprovalRow[])
       .map(r => this.hydrateApproval(r));
+  }
+
+  /**
+   * Phase 5, Step 5.2 (exchange replay): every `pending_approvals` row stamped with this
+   * `exchange_id` (schema v12's nullable correlation column), regardless of claimed state —
+   * a replay's whole point is showing the operator the approval record that GOVERNED the
+   * exchange, even one already claimed/resolved. A row is only ever durably ABSENT here once
+   * `deletePendingApproval` actually runs (normal resolve, or the 4E.3c claimed=1 retention
+   * sweep) — replay degrades to "no surviving approval record" in that case, never fabricated.
+   * Ordered by timestamp ASC (oldest first, mirrors getPendingApprovals). Bounded: at most a
+   * handful of approval requests ever correlate to one exchange in practice.
+   */
+  listPendingApprovalsByExchange(exchangeId: string): StoredPendingApproval[] {
+    return (this.db.prepare(
+      "SELECT * FROM pending_approvals WHERE exchange_id=? ORDER BY timestamp ASC"
+    ).all(exchangeId) as PendingApprovalRow[]).map(r => this.hydrateApproval(r));
   }
 
   // ── durable deferred actions (bead wsm-e2e-pinned-kzt, schema v5) ─────────────────────────────
@@ -372,10 +400,14 @@ export class JanusStore {
     surface?: string | null;
     idempotency_key?: string | null;
     interaction_id?: string | null;
+    /** AgentExchange spine correlation (schema v12's action_log.exchange_id, ALTER-added but not
+     *  previously exposed here — storage-API gap closed for step 1.3 task C). Nullable; only an
+     *  exchange-correlated dispatch (flag on) ever sets it. */
+    exchange_id?: string | null;
   }): void {
     this.db.prepare(
-      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key,interaction_id)
-       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key,@interaction_id)`
+      `INSERT INTO action_log(ts,name,capability,result_kind,ms,args_redacted,surface,idempotency_key,interaction_id,exchange_id)
+       VALUES(@ts,@name,@capability,@result_kind,@ms,@args_redacted,@surface,@idempotency_key,@interaction_id,@exchange_id)`
     ).run({
       ts: Date.now(),
       name: row.name,
@@ -384,6 +416,7 @@ export class JanusStore {
       ms: row.ms,
       args_redacted: row.args_redacted ?? null,
       surface: row.surface ?? null,
+      exchange_id: row.exchange_id ?? null,
       idempotency_key: row.idempotency_key ?? null,
       interaction_id: row.interaction_id ?? null,
     });
@@ -1445,6 +1478,377 @@ export class JanusStore {
       ).all(since, limit) as import("./types").ContextInjectionRow[];
     } catch (e) {
       console.error("[store] getContextInjections failed:", e);
+      return [];
+    }
+  }
+
+  // ── AgentExchange spine (schema v12, Phase 1 step 1.2) ──────────────────────────────────────────
+  // STORAGE ONLY: pure CRUD + the exchange-level CAS (spec §2a). No transition-legality checking
+  // lives here — src/exchanges/lifecycle.ts (step 1.3) owns the state machine and decides what to
+  // write; this layer just persists it atomically and reports whether a CAS won. Core ledger data
+  // (like handoffs/pending_approvals), so these throw on a genuine DB error rather than fail-soft —
+  // callers need a real signal to distinguish "CAS lost" (changed:false) from "the store broke".
+
+  // Per-column defaults for insertExchange, table-driven (the paneMetaToStoredPane /
+  // PANE_META_DEFAULTS idiom) so the constructor stays well under the CC-10 gate instead of a
+  // 16-field chain of `??` (which alone would trip the complexity rule — each `??` is a branch).
+  private static readonly EXCHANGE_DEFAULTS: ReadonlyArray<readonly [keyof AgentExchange, unknown]> = [
+    ["voice_session_id", null], ["interaction_id", null], ["operator_utterance", ""],
+    ["distilled_instruction", ""], ["instruction_envelope_json", "{}"], ["draft_version", 1],
+    ["context_version", null], ["state", "draft"], ["approval_id", null],
+    ["approval_draft_version", null], ["delivery_attempt", 0], ["terminal_state", null],
+    ["result_summary", null], ["result_envelope_json", null], ["delivered_at", null], ["completed_at", null],
+  ];
+
+  /** Insert a new exchange row. `exchange_id` is minted (spec §2 ID minting) when absent. Every
+   *  other column has a documented default (schema v12) so a caller only needs to pass the fields
+   *  it actually knows at `exchange_created` time (project_id, pane_id, the utterance/instruction). */
+  insertExchange(input: Partial<AgentExchange> & Pick<AgentExchange, "project_id" | "pane_id">): AgentExchange {
+    const now = Date.now();
+    const rec = {
+      exchange_id: input.exchange_id ?? mintExchangeId(now),
+      project_id: input.project_id,
+      pane_id: input.pane_id,
+      created_at: input.created_at ?? now,
+      updated_at: input.updated_at ?? now,
+    } as Record<string, unknown>;
+    for (const [col, dflt] of JanusStore.EXCHANGE_DEFAULTS) {
+      rec[col] = (input as Record<string, unknown>)[col] ?? dflt;
+    }
+    const row = rec as unknown as AgentExchange;
+    this.db.prepare(
+      `INSERT INTO agent_exchanges(exchange_id,project_id,pane_id,voice_session_id,interaction_id,
+         operator_utterance,distilled_instruction,instruction_envelope_json,draft_version,
+         context_version,state,approval_id,approval_draft_version,delivery_attempt,terminal_state,
+         result_summary,result_envelope_json,created_at,updated_at,delivered_at,completed_at)
+       VALUES(@exchange_id,@project_id,@pane_id,@voice_session_id,@interaction_id,
+         @operator_utterance,@distilled_instruction,@instruction_envelope_json,@draft_version,
+         @context_version,@state,@approval_id,@approval_draft_version,@delivery_attempt,@terminal_state,
+         @result_summary,@result_envelope_json,@created_at,@updated_at,@delivered_at,@completed_at)`
+    ).run(row);
+    return row;
+  }
+
+  getExchange(exchangeId: string): AgentExchange | null {
+    const r = this.db.prepare("SELECT * FROM agent_exchanges WHERE exchange_id=?").get(exchangeId) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /** Exchanges currently in `state`, oldest first (idx_agent_exchanges_state). */
+  listExchangesByState(state: ExchangeState): AgentExchange[] {
+    return (this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE state=? ORDER BY created_at ASC"
+    ).all(state) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Boot-recovery efficiency: full rows for exchanges in ANY of `states`, oldest first — one query
+   * in place of one `listExchangesByState` call per state (src/exchanges/recovery.ts's
+   * `recoverExchangesOnBoot` used to do exactly that, once per one of the 12 ExchangeState values).
+   * Deliberately UNBOUNDED and ASC-ordered, mirroring `listExchangesByState`'s own contract exactly
+   * — NOT `listExchangesByStates`'s bounded, DESC "recent activity" shape (a different read for a
+   * different caller: SITREP/catch-up, where newest-first + a cap is the right answer). Boot
+   * recovery must never silently drop a row to a LIMIT.
+   */
+  listExchangesByStatesForRecovery(states: ExchangeState[]): AgentExchange[] {
+    if (states.length === 0) return [];
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE state IN (${placeholders}) ORDER BY created_at ASC`
+    ).all(...states) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Boot-recovery efficiency: JUST the `exchange_id` column for exchanges in ANY of `states` — the
+   * "kept, untouched, nothing else needed" half of `recoverExchangesOnBoot` (draft/
+   * awaiting_clarification/agent_complete/agent_failed/interrupted/cancelled), which only ever
+   * pushes the id into its report and reads no other column. Unbounded, same reasoning as
+   * `listExchangesByStatesForRecovery`.
+   */
+  listExchangeIdsByStates(states: ExchangeState[]): string[] {
+    if (states.length === 0) return [];
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT exchange_id FROM agent_exchanges WHERE state IN (${placeholders})`
+    ).all(...states) as Array<{ exchange_id: string }>).map(r => r.exchange_id);
+  }
+
+  /** Every exchange ever created for `paneId`, oldest first (idx_agent_exchanges_pane_state). */
+  listExchangesByPane(paneId: string): AgentExchange[] {
+    return (this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE pane_id=? ORDER BY created_at ASC"
+    ).all(paneId) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 5, Step 5.1 (Fleet View): the SINGLE most-recently-updated exchange for `paneId`, or
+   * null when the pane has no exchange history at all. Bounded (`LIMIT 1`, uses
+   * idx_agent_exchanges_pane_state) — the read the fleet-card projection needs ("what is this
+   * pane's current/most-recent exchange"), as opposed to `listExchangesByPane`'s full oldest-first
+   * history (a plan/replay read, unbounded per pane).
+   */
+  getLatestExchangeForPane(paneId: string): AgentExchange | null {
+    const r = this.db.prepare(
+      "SELECT * FROM agent_exchanges WHERE pane_id=? ORDER BY updated_at DESC LIMIT 1"
+    ).get(paneId) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /**
+   * Phase 2 Step 2.1 (WorldModel board-tier efficiency): the single newest NON-TERMINAL exchange
+   * for `paneId` — src/memory/worldModel.ts's "current in-flight exchange" read, previously done by
+   * pulling the pane's ENTIRE history via `listExchangesByPane` and filtering/sorting in JS. Matches
+   * that JS selection EXACTLY: newest by `created_at` DESC, tie-broken by `exchange_id` DESC (both
+   * columns are plain ASCII, so SQLite's default BINARY collation orders identically to the JS
+   * string comparison it replaces) — deliberately NOT `updated_at` (that's `getLatestExchangeForPane`
+   * above, a different ordering for a different caller). `null` when the pane has no open exchange.
+   * Terminal states come from `TERMINAL_STATES` (src/exchanges/lifecycle.ts) — the single authority
+   * worldModel.ts's own TERMINAL_EXCHANGE_STATES now also imports.
+   */
+  getLatestOpenExchangeForPane(paneId: string): AgentExchange | null {
+    const terminal = [...TERMINAL_STATES];
+    const placeholders = terminal.map(() => "?").join(",");
+    const r = this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE pane_id=? AND state NOT IN (${placeholders}) ORDER BY created_at DESC, exchange_id DESC LIMIT 1`
+    ).get(paneId, ...terminal) as AgentExchangeRow | undefined;
+    return r ? { ...r } : null;
+  }
+
+  /**
+   * CAS-guarded update — the SQL half of spec §2(a): `UPDATE … WHERE exchange_id=? AND state=?
+   * [AND approval_id=? AND approval_draft_version=?]`. Every legal transition in the lifecycle
+   * machine (step 1.3) is exactly one such guarded UPDATE, so repeated/racing application of the
+   * same event is a structural no-op. Returns `changed:false` on a lost/stale CAS — callers must
+   * treat that as "already applied / superseded", never retry it as a fresh write.
+   */
+  updateExchange(
+    exchangeId: string,
+    patch: Partial<Omit<AgentExchange, "exchange_id" | "project_id" | "pane_id" | "created_at">>,
+    cas: { state: ExchangeState; approvalId?: string | null; approvalDraftVersion?: number | null },
+  ): { changed: boolean; exchange: AgentExchange | null } {
+    const sets: string[] = [];
+    const params: Record<string, unknown> = { exchange_id: exchangeId, cas_state: cas.state };
+    for (const [col, value] of Object.entries(patch)) { sets.push(`${col}=@${col}`); params[col] = value; }
+    if (!("updated_at" in patch)) { sets.push("updated_at=@updated_at"); params.updated_at = Date.now(); }
+    let where = "exchange_id=@exchange_id AND state=@cas_state";
+    if (cas.approvalId !== undefined) { where += " AND approval_id=@cas_approval_id"; params.cas_approval_id = cas.approvalId; }
+    if (cas.approvalDraftVersion !== undefined) {
+      where += " AND approval_draft_version=@cas_approval_draft_version";
+      params.cas_approval_draft_version = cas.approvalDraftVersion;
+    }
+    const res = this.db.prepare(`UPDATE agent_exchanges SET ${sets.join(", ")} WHERE ${where}`).run(params);
+    return { changed: res.changes === 1, exchange: this.getExchange(exchangeId) };
+  }
+
+  /** Append one exchange_events row (AUTOINCREMENT event_id). Append-only audit spine — the
+   *  exchange row above is the mutable head. Never throws on a genuine insert error (core ledger
+   *  data), mirroring appendEventInTxn's contract for the parallel `events` table. */
+  appendExchangeEvent(event: {
+    exchange_id: string;
+    event_type: ExchangeEvent["event_type"];
+    project_id?: string | null;
+    pane_id?: string | null;
+    payload_redacted_json?: string;
+    source?: ExchangeEvent["source"];
+    interaction_id?: string | null;
+    ts?: number;
+  }): ExchangeEvent {
+    const rec = {
+      exchange_id: event.exchange_id,
+      project_id: event.project_id ?? null,
+      pane_id: event.pane_id ?? null,
+      event_type: event.event_type,
+      payload_redacted_json: event.payload_redacted_json ?? "{}",
+      source: event.source ?? "system",
+      interaction_id: event.interaction_id ?? null,
+      ts: event.ts ?? Date.now(),
+    };
+    const info = this.db.prepare(
+      `INSERT INTO exchange_events(exchange_id,project_id,pane_id,event_type,payload_redacted_json,source,interaction_id,ts)
+       VALUES(@exchange_id,@project_id,@pane_id,@event_type,@payload_redacted_json,@source,@interaction_id,@ts)`
+    ).run(rec);
+    return { event_id: Number(info.lastInsertRowid), ...rec };
+  }
+
+  /** Ordered timeline for one exchange (idx_exchange_events_exchange_ts): `ts ASC, event_id ASC` —
+   *  event_id is the AUTOINCREMENT PK, so same-millisecond bursts still get a deterministic order. */
+  listExchangeEvents(exchangeId: string): ExchangeEvent[] {
+    return (this.db.prepare(
+      "SELECT * FROM exchange_events WHERE exchange_id=? ORDER BY ts ASC, event_id ASC"
+    ).all(exchangeId) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 2 Step 2.1 (WorldModel event-focus efficiency): one exchange's timeline, filtered to
+   * `eventTypes` — a type-filtered VARIANT of `listExchangeEvents` (same table, same ordering: `ts
+   * ASC, event_id ASC`), not a different selection. src/memory/worldModel.ts's
+   * `candidateForExchangeEvent` only ever turns `needs_input_detected` + a small
+   * RELEVANT_EXCHANGE_EVENTS set into a RecentCandidate and silently drops everything else — this
+   * lets that caller ask for exactly that subset up front instead of pulling an exchange's full
+   * (often much longer) event timeline just to discard most of it in JS.
+   */
+  listExchangeEventsByTypes(exchangeId: string, eventTypes: ExchangeEventType[]): ExchangeEvent[] {
+    if (eventTypes.length === 0) return [];
+    const placeholders = eventTypes.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM exchange_events WHERE exchange_id=? AND event_type IN (${placeholders}) ORDER BY ts ASC, event_id ASC`
+    ).all(exchangeId, ...eventTypes) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 4, Step 4.2: exchanges currently in ANY of `states`, most-recently-updated FIRST — the
+   * cross-pane query catch-up/SITREP/attention prioritization needs ("what does the operator need
+   * to hear about right now", newest first), as opposed to `listExchangesByState` (single state,
+   * oldest-first, used by boot recovery). Uses idx_agent_exchanges_state per matched state.
+   */
+  listExchangesByStates(states: ExchangeState[], opts: { limit?: number } = {}): AgentExchange[] {
+    if (states.length === 0) return [];
+    const limit = opts.limit ?? 200;
+    const placeholders = states.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM agent_exchanges WHERE state IN (${placeholders}) ORDER BY updated_at DESC LIMIT ?`
+    ).all(...states, limit) as AgentExchangeRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 4, Step 4.2: recent `exchange_events` rows of the given `eventTypes`, newest first
+   * (idx_exchange_events_type_ts) — feeds the catch-up/SITREP "recent decisions" tier (e.g.
+   * `approval_confirmed`) without walking every exchange's own timeline individually.
+   */
+  listRecentExchangeEventsByTypes(
+    eventTypes: ExchangeEventType[],
+    opts: { sinceTs?: number; limit?: number } = {},
+  ): ExchangeEvent[] {
+    if (eventTypes.length === 0) return [];
+    const limit = opts.limit ?? 20;
+    const sinceTs = opts.sinceTs ?? 0;
+    const placeholders = eventTypes.map(() => "?").join(",");
+    return (this.db.prepare(
+      `SELECT * FROM exchange_events WHERE event_type IN (${placeholders}) AND ts >= ? ORDER BY ts DESC, event_id DESC LIMIT ?`
+    ).all(...eventTypes, sinceTs, limit) as ExchangeEventRow[]).map(r => ({ ...r }));
+  }
+
+  /**
+   * Phase 5, Step 5.2 (exchange metrics report): EVERY exchange row created since `sinceMs` —
+   * the report-window read `buildExchangeMetricsReport` (src/exchanges/metrics.ts) needs, as
+   * opposed to `listExchangesByState`/`listExchangesByStates` (state-scoped) or
+   * `listExchangesByPane` (pane-scoped). Oldest first (mirrors `listExchangesByPane`'s
+   * ordering); mirrors `getContextDeliveries`'s window/limit/fail-soft shape (Phase 2 Step 2.2)
+   * so the two report modules share one calling convention.
+   */
+  listExchangesSince(sinceMs: number, opts: { limit?: number } = {}): AgentExchange[] {
+    const limit = opts.limit ?? 1_000_000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM agent_exchanges WHERE created_at >= ? ORDER BY created_at ASC LIMIT ?"
+      ).all(sinceMs, limit) as AgentExchangeRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listExchangesSince failed:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Phase 5, Step 5.2: EVERY `exchange_events` row (any event_type) since `sinceMs`, ordered
+   * `ts ASC, event_id ASC` — a single flat, globally-ordered stream a report module groups by
+   * `exchange_id` itself (grouping a stream already sorted this way preserves each group's own
+   * chronological order, so no per-exchange re-sort is needed downstream). Distinct from
+   * `listRecentExchangeEventsByTypes` (type-filtered, newest-first, small default limit — a
+   * catch-up/SITREP read) and `listExchangeEvents` (single exchange only).
+   */
+  listExchangeEventsSince(sinceMs: number, opts: { limit?: number } = {}): ExchangeEvent[] {
+    const limit = opts.limit ?? 1_000_000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM exchange_events WHERE ts >= ? ORDER BY ts ASC, event_id ASC LIMIT ?"
+      ).all(sinceMs, limit) as ExchangeEventRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listExchangeEventsSince failed:", e);
+      return [];
+    }
+  }
+
+  // ── context_deliveries (schema v12) ──────────────────────────────────────────────────────────
+  // Sibling of the v10 context_injections telemetry spine (same fail-soft contract as
+  // recordContextInjection/getContextInjections: a delivery ledger row is useful-but-not-critical
+  // observability, so a DB fault here logs and degrades gracefully rather than breaking a caller
+  // on the voice hot path).
+
+  private static readonly CONTEXT_DELIVERY_DEFAULTS: ReadonlyArray<readonly [keyof ContextDelivery, unknown]> = [
+    ["project_id", null], ["voice_session_id", null], ["snapshot_hash", null], ["brief_hash", null],
+    ["included_sources_json", "[]"], ["dropped_sources_json", "[]"], ["acknowledged_at", null],
+  ];
+
+  /** Insert one context-delivery row. `delivery_id` is minted (mirrors `ctxevt-` minting) when
+   *  absent. Fail-soft: swallows + console.error on any DB error (mirrors recordContextInjection);
+   *  the constructed row is still returned so a caller has a stable delivery_id either way. */
+  insertContextDelivery(
+    input: Partial<ContextDelivery> & Pick<ContextDelivery, "context_version" | "trigger">,
+  ): ContextDelivery {
+    const now = Date.now();
+    const rec = {
+      delivery_id: input.delivery_id ?? mintContextDeliveryId(now),
+      context_version: input.context_version,
+      trigger: input.trigger,
+      ts: input.ts ?? now,
+    } as Record<string, unknown>;
+    for (const [col, dflt] of JanusStore.CONTEXT_DELIVERY_DEFAULTS) {
+      rec[col] = (input as Record<string, unknown>)[col] ?? dflt;
+    }
+    const row = rec as unknown as ContextDelivery;
+    try {
+      this.db.prepare(
+        `INSERT INTO context_deliveries(delivery_id,project_id,voice_session_id,context_version,trigger,
+           snapshot_hash,brief_hash,included_sources_json,dropped_sources_json,acknowledged_at,ts)
+         VALUES(@delivery_id,@project_id,@voice_session_id,@context_version,@trigger,
+           @snapshot_hash,@brief_hash,@included_sources_json,@dropped_sources_json,@acknowledged_at,@ts)`
+      ).run(row);
+    } catch (e) {
+      console.error("[store] insertContextDelivery failed:", e);
+    }
+    return row;
+  }
+
+  /** Stamp `acknowledged_at` exactly once. True iff this call did the stamping (idempotent: a
+   *  second ack on an already-acknowledged row is a no-op, `false`). Fail-soft on a DB error. */
+  acknowledgeContextDelivery(deliveryId: string, at: number = Date.now()): boolean {
+    try {
+      const res = this.db.prepare(
+        "UPDATE context_deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL"
+      ).run(at, deliveryId);
+      return res.changes === 1;
+    } catch (e) {
+      console.error("[store] acknowledgeContextDelivery failed:", e);
+      return false;
+    }
+  }
+
+  /** Every delivery for one voice session, oldest first (idx_context_deliveries_session_ts).
+   *  Fail-soft: an unexpected DB error yields an empty array (mirrors getContextInjections). */
+  listContextDeliveries(sessionId: string): ContextDelivery[] {
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM context_deliveries WHERE voice_session_id=? ORDER BY ts ASC"
+      ).all(sessionId) as ContextDeliveryRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listContextDeliveries failed:", e);
+      return [];
+    }
+  }
+
+  /** All context-delivery rows since `since` (ts >=), most-recent-first, capped by `limit`
+   *  (default 1000) — powers report-style aggregation across EVERY voice session (unlike
+   *  `listContextDeliveries`, which is scoped to one session). Mirrors `getContextInjections`'
+   *  shape/fail-soft contract (src/memory/contextMetricsReport.ts, Phase 2 Step 2.2). */
+  getContextDeliveries(filter?: { since?: number; limit?: number }): ContextDelivery[] {
+    const since = filter?.since ?? 0;
+    const limit = filter?.limit ?? 1000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM context_deliveries WHERE ts >= ? ORDER BY ts DESC LIMIT ?"
+      ).all(since, limit) as ContextDeliveryRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] getContextDeliveries failed:", e);
       return [];
     }
   }

@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**104** actions across **26** gated capabilities, plus the always-allowed group.
+**116** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -18,6 +18,7 @@ These bypass the capability gate entirely — they work even while the system is
 | --- | --- | --- | --- |
 | `add_pane_context` | rest | no | Operator-UI |
 | `approve_pending_command` | rest | no | Approve or reject a pending spoken-command approval by messageId (approved=true approves, false rejects) |
+| `cancel_exchange` | rest | no | Cancel/dismiss an exchange (including an interrupted one — this is its only way out besides a retry follow-up) |
 | `cancel_pending_action` | rest | no | Cancel (discard, no side effect) a pending NON-PTY deferred action by id |
 | `clear_exited` | rest | no | Archive all exited panes in the active project (recoverable, not a hard delete) |
 | `confirm_pending_action` | rest | no | Confirm (run) a pending NON-PTY deferred action by id |
@@ -36,10 +37,12 @@ These bypass the capability gate entirely — they work even while the system is
 | `list_pending_actions` | rest | no | List the pending NON-PTY deferred actions (gated-Ask staging) with their age |
 | `list_pending_commands` | rest | no | List the pending spoken-command approvals (the HiTL queue the ApprovalDialog renders) |
 | `list_watch_rules` | rest | no | List all configured watch-automation rules |
+| `open_exchange_pane` | rest | no | Resolve the (project, pane) an exchange belongs to, so a client holding only an exchange_id can navigate to it |
 | `read_project_notes` | rest | no | Operator-UI |
 | `release_stop_all` | voice / rest / ws | no | Clear the freeze (always allowed) |
 | `remove_note` | rest | no | Operator-UI |
 | `resize_pane` | rest | no | Resize a terminal pane's PTY grid to match the operator's viewport |
+| `resume_inspect_exchange` | rest | no | Inspect an interrupted (or any) exchange's current state and recent event history — the recovery drill-down for an attention item |
 | `stop_all` | voice / rest / ws | no | EMERGENCY BRAKE Stage 1 (always allowed) |
 | `stop_pane` | rest | no | Gracefully stop a pane and archive it (recoverable) |
 | `update_project` | rest | no | Update a project's directory/summary/keyTerms/name (operator-UI, ungated) |
@@ -112,10 +115,15 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | Action | Surfaces | Read-only | Description |
 | --- | --- | --- | --- |
 | `apply_prompt_template` | voice / rest | no | Instantiate a saved prompt template (filling its {{slot}} values) into a pane's WIP draft for the operator to review and send |
+| `cancel_instruction` | voice | no | Cancel the instruction draft for the operator's open pane and clear its WIP draft text |
+| `confirm_instruction` | voice | no | Finalize a pending 'which pane did you mean' / 'did you mean X' / cross-project confirmation for the instruction draft (from retarget_instruction) by naming th… |
+| `draft_instruction` | voice | no | Compose (or revise) the structured instruction envelope for the pane the operator currently has open — objective plus, only when the operator said them, contex… |
 | `handoff_context_between_panes` | voice / rest | no | Gather context from a source CLI pane and package summaries/learnings to prime a model agent in another target pane |
 | `propose_handoff` | voice / rest | no | Draft a first-class handoff to a target pane (UNGATED — never touches the pane) |
 | `reject_handoff` | voice / rest | no | Reject/cancel a handoff (UNGATED pre-gate flip; if a delivery is pending at the gate, routes through the gate's reject path) |
+| `retarget_instruction` | voice | no | Move the instruction draft for the operator's open pane to a DIFFERENT pane the operator names ('send this to the codex pane instead') |
 | `revise_handoff` | voice / rest | no | Rewrite a handoff's composed prompt (UNGATED co-authoring; increments revision_count) |
+| `revise_instruction` | voice | no | Revise the instruction envelope currently drafted for the operator's open pane — change the objective and/or add/replace operator-stated context, constraints,… |
 | `stage_handoff` | voice / rest | no | Freeze a handoff draft and mark it 'staged' (UNGATED; validates the target pane is live) |
 | `update_draft_prompt` | voice | no | Compose or refine the WIP draft prompt for the pane the operator currently has open, so they can review/edit and send it |
 
@@ -212,6 +220,7 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | `catch_me_up` | voice | yes | Catch the operator up on what happened over a recent time window WITHOUT reconnecting |
 | `get_action_log` | voice / rest | yes | Read the unified action log |
 | `get_attention_digest` | voice | yes | Speak a structured summary of items needing the operator's attention |
+| `get_exchange_metrics` | rest | yes | Deterministic communication-quality metrics over the AgentExchange spine for a window (since_ms epoch ms, default 0 = all time; optional row limit) |
 | `get_health` | voice / rest | yes | Report a one-glance health snapshot |
 | `get_pane_gates` | voice / rest | yes | Read the resolved capability-gate matrix for a pane (or global if pane_id omitted) |
 | `get_project_export` | rest | no | Return the same deterministic, secret-redacted Markdown export as export_project, as a markdown download (text/markdown; Content-Disposition |
@@ -223,6 +232,7 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | `list_pending_approvals` | voice | yes | List the commands/instructions currently awaiting the operator's spoken approval (pane, kind, distilled instruction, rationale, count) |
 | `list_prompt_templates` | voice / rest | yes | List the saved prompt templates (name, description, and the {{slot}} parameters each one needs) |
 | `read_handoff` | voice / rest | yes | Read a single handoff (UNGATED, redacted output) |
+| `replay_exchange` | rest | yes | Replay one exchange's full redacted communication timeline |
 | `search_notes` | voice | yes | Full-text search the saved NOTES for a phrase ('find the note about auth', 'what did we say about retries') |
 
 ## Read a pane's output
@@ -361,3 +371,5 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | --- | --- | --- | --- |
 | `dispatch_to_panes` | voice / rest | no | Send one instruction (raw text or a prompt template with slot values) to SEVERAL panes at once |
 | `propose_command` | voice | no | Direct work to the pane the operator currently has OPEN (the active pane) |
+| `retry_exchange` | rest | no | Retry an exchange |
+| `send_instruction` | voice | no | Send the finished instruction draft for the operator's open pane to its agent |

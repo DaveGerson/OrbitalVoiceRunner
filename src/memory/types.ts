@@ -7,7 +7,13 @@ export interface ProjectTier {
   name: string;
   summary: string;
   keyTerms: string[];
-  recentDecisions: string[];   // redacted, newest-first
+  recentDecisions: string[];   // redacted, newest-first (typed notes, type=decision)
+  // Phase 2 Step 2.1 (AgentExchange spine context enrichment): OPTIONAL so pre-existing tier
+  // literals built by hand (assembler/synthesizer test fixtures) still typecheck unchanged.
+  // Populated from typed notes (Wave 6 NoteType: "warning" / "todo"), redacted, newest-first,
+  // bounded — see src/memory/worldModel.ts's PROJECT_LIST_MAX.
+  warnings?: string[];         // redacted, newest-first (typed notes, type=warning)
+  openTodos?: string[];        // redacted, newest-first (typed notes, type=todo, not yet promoted to a bead)
 }
 export interface PaneTier {
   paneId: string;
@@ -17,13 +23,40 @@ export interface PaneTier {
   lastCommand: string | null;  // redacted
   recent: string[];            // redacted recent pane lines/outcomes, newest-first
 }
-export interface BoardEntry { paneId: string; name: string; status: string; }
+export interface BoardEntry {
+  paneId: string; name: string; status: string;
+  // Phase 2 Step 2.1: OPTIONAL AgentExchange enrichment (current in-flight exchange state for
+  // this pane + a human-readable reason it's waiting, when applicable). Absent/undefined on any
+  // pre-existing BoardEntry literal built without exchange data — see src/memory/worldModel.ts.
+  exchangeState?: string | null;   // e.g. "running" | "needs_input" | "awaiting_approval" | null
+  waitingReason?: string | null;   // "needs input" | "awaiting approval" | "awaiting clarification" | null
+}
 export interface JanusFrame {
   role: string;
   gatePosture: string;         // global permissions mode summary
   prefs: string[];             // redacted global operator prefs, may be empty
 }
-export interface Breadcrumb { ts: number; paneId: string | null; text: string; } // text already redacted
+// text already redacted. `projectId` (Phase 2 Step 2.4/2.5 fix — cross-project breadcrumb leak):
+// the pane's OWNING project at drop time, stamped by the observe-layer call sites so the render
+// path can scope crumbs to the brief's project. OPTIONAL + nullable: a crumb with no project
+// affinity (system/global, unresolvable pane, or any pre-existing caller/test that never stamps
+// it) stays visible everywhere — byte-identical to the pre-scoping behavior for those callers.
+export interface Breadcrumb { ts: number; paneId: string | null; text: string; projectId?: string | null; }
+
+/**
+ * Phase 2 Step 2.1: the "affected pane" / event-focus block. Populated ONLY when a background
+ * (non-active-pane) outcome triggers context assembly (src/memory/worldModel.ts's
+ * `getEventFocusTier`, wired via `WorldModel.getTiers`'s optional `affectedPaneId` param) — so
+ * Cortex (and the TS floor renderer) can name the specific pane + event that caused this
+ * injection cycle, independent of whichever pane is currently in the operator's foreground.
+ */
+export interface EventFocusTier {
+  paneId: string;
+  name: string;
+  eventText: string;           // redacted — the most recent outcome/question/handoff/exchange delta
+  exchangeState: string | null;
+  waitingReason: string | null;
+}
 
 export interface MemoryTiers {
   project: ProjectTier | null;
@@ -31,10 +64,19 @@ export interface MemoryTiers {
   board: BoardEntry[];
   frame: JanusFrame;
   breadcrumbs: Breadcrumb[];   // newest-first, already age/cap filtered
+  // Phase 2 Step 2.1: OPTIONAL so every existing MemoryTiers literal (tests, the python parity
+  // fixtures) that never mentions it still typechecks/behaves byte-identically. null/undefined
+  // both mean "no background-pane event to focus on this cycle".
+  eventFocus?: EventFocusTier | null;
 }
 
 export interface BudgetWeights {
   project: number; pane: number; breadcrumbs: number; board: number; frame: number;
+  // Phase 2 Step 2.1: OPTIONAL extra share for the eventFocus tier (additive, on top of the
+  // five existing fractions — NOT rebalanced out of them, so every pre-existing weights literal
+  // (server.ts, docs, other tests) that omits it keeps its EXACT prior byte output). Missing ⇒
+  // assembler.ts's collect() treats it as 0 (tier renders empty/absent).
+  eventFocus?: number;
 }
 export interface MemoryConfig {
   totalBudgetChars: number;    // default 4800 (~1200 tokens)
@@ -51,7 +93,12 @@ export interface SynthesizedBrief {
 
 export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
   totalBudgetChars: 4800,
-  weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+  // eventFocus (Phase 2 Step 2.1) is an ADDITIVE extra share, not a rebalance of the five
+  // pre-existing fractions — those five stay byte-identical to every historical value pinned by
+  // test_memory_assembler.ts / test_assembler_complexity_refactor.ts (e.g. the hardcoded `* 0.40`
+  // project-cap assertion). eventFocus itself renders only when the tier is actually present
+  // (the rare background-outcome-trigger case), so this budget is otherwise inert.
+  weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05, eventFocus: 0.15 },
   breadcrumbMax: 12,
   breadcrumbMaxAgeMs: 15 * 60 * 1000,
 };

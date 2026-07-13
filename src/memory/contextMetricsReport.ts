@@ -14,11 +14,16 @@
 // table) are emitted as `null` with an explanatory `notes[]` entry — never faked.
 
 import type { ContextInjectionDisposition, ContextInjectionEvent } from "./contextTelemetry";
+import type { ContextDelivery } from "../exchanges/types";
 
 /** Structural read surface this report needs. `JanusStore.getContextInjections` satisfies this
- *  directly; tests may pass a lighter fake with the same method. */
+ *  directly; tests may pass a lighter fake with the same method. `getContextDeliveries` (Phase 2
+ *  Step 2.2) is OPTIONAL so a pre-existing fake store that only ever implemented
+ *  `getContextInjections` still satisfies this interface unchanged — its absence degrades the new
+ *  delivery/acknowledgment/version-advance stats to their empty-set values (never a throw). */
 export interface ContextMetricsSource {
   getContextInjections(filter?: { since?: number; sessionId?: string; limit?: number }): ContextInjectionEvent[];
+  getContextDeliveries?(filter?: { since?: number; limit?: number }): ContextDelivery[];
 }
 
 /** Configurable price table (spec §6.4) — do not hard-code provider assumptions in logic. Defaults
@@ -77,6 +82,22 @@ export interface ContextMetricsReport {
    *  off-schema/daemon dead). Null when the injected set is empty. Post-land health check target
    *  (spec D5): <1% on a warm daemon. */
   cortexFallbackRate: number | null;
+  /** Phase 2 Step 2.2: total `context_deliveries` rows in the window (one per actual
+   *  sendClientContent delivery ATTEMPT — a gate skip/stale/empty brief never reaches this table
+   *  at all, so this is strictly a subset of contextInjectionCount's universe, not equal to it). */
+  contextDeliveryCount: number;
+  /** Phase 2 Step 2.2: of those, how many were ACKNOWLEDGED (send succeeded) vs left hanging (send
+   *  threw, or the process died between record and ack — the "uncertain delivery" signature). */
+  contextDeliveryAcknowledgedCount: number;
+  contextDeliveryUnacknowledgedCount: number;
+  /** Phase 2 Step 2.2: per-(project,session) version-advance stats over the window — how far the
+   *  context_version counter climbed for each pair that had at least one delivery. Null when the
+   *  window has zero delivery rows (same "undefined, not zero" convention as focusCorrectnessRate). */
+  contextVersionAdvanceStats: {
+    pairs: number;
+    maxVersionSeen: number;
+    averageVersionsPerPair: number;
+  } | null;
   notes: string[];
 }
 
@@ -161,6 +182,38 @@ function countDistinctSessions(rows: ContextInjectionEvent[]): number {
   return s.size;
 }
 
+/** Phase 2 Step 2.2: acknowledged vs unacknowledged counts over the delivery rows in the window.
+ *  A row's `acknowledged_at` is non-null iff `ContextVersionRegistry.acknowledgeDelivery` actually
+ *  ran for it (i.e. sendClientContent succeeded) — see src/memory/contextVersions.ts. */
+function computeDeliveryAckCounts(deliveries: ContextDelivery[]): { acknowledged: number; unacknowledged: number } {
+  let acknowledged = 0;
+  for (const d of deliveries) if (d.acknowledged_at != null) acknowledged++;
+  return { acknowledged, unacknowledged: deliveries.length - acknowledged };
+}
+
+/** Phase 2 Step 2.2: per-(project_id, voice_session_id) highest context_version reached in the
+ *  window, aggregated into pair count / max / average. Non-numeric context_version strings are
+ *  ignored (defensive — the registry always mints stringified integers, but this report must never
+ *  throw on a malformed row). Null when there are no deliveries at all (undefined, not zero). */
+function computeVersionAdvanceStats(deliveries: ContextDelivery[]): ContextMetricsReport["contextVersionAdvanceStats"] {
+  if (deliveries.length === 0) return null;
+  const maxByPair = new Map<string, number>();
+  for (const d of deliveries) {
+    const n = Number(d.context_version);
+    if (!Number.isFinite(n)) continue;
+    const key = `${d.project_id ?? ""}::${d.voice_session_id ?? ""}`;
+    const cur = maxByPair.get(key) ?? 0;
+    if (n > cur) maxByPair.set(key, n);
+  }
+  if (maxByPair.size === 0) return null;
+  const values = [...maxByPair.values()];
+  return {
+    pairs: maxByPair.size,
+    maxVersionSeen: Math.max(...values),
+    averageVersionsPerPair: values.reduce((a, b) => a + b, 0) / values.length,
+  };
+}
+
 export const NOT_DERIVABLE_NOTE =
   "durableDuplicatePaneCount, wrongPaneRefusals, and approvalExactlyOnceSuccessRate are null: " +
   "this report's read surface is context_injections only, and none of the three is recorded there. " +
@@ -174,9 +227,12 @@ export const DEDUPE_NOTE =
   "Dedupe is metric-only in this PR; repeated brief hashes are expected baseline observations, not a bug.";
 
 export const SESSION_ID_NOTE =
-  "sessions reflects only rows with a non-null session_id. The live injectMemoryBrief choke point " +
-  "does not yet stamp a per-connection session id (matches captureTurnUsage's own null), so this is " +
-  "commonly 0 today even with many injections.";
+  "sessions reflects only rows with a non-null session_id. Phase 2 Step 2.2: the live " +
+  "injectMemoryBrief choke point now stamps each connection's real voice_session_id (mintVoiceSessionId, " +
+  "src/voice/index.ts) on every context_injections/cortex_decision/gemini_turn_usage row it writes, so " +
+  "this is non-zero whenever at least one live voice connection has produced rows in the window. A row " +
+  "with session_id=null means it was written by a path with no live connection in scope (a REST-only " +
+  "caller, or a hand-seeded test fixture), not a gap in the choke point's own instrumentation.";
 
 /** Build the spec-§11-shaped metrics report from `context_injections` rows in `[sinceMs, +inf)`.
  *  Deterministic: given the same rows, always returns the same JSON (no Date.now(), no randomness). */
@@ -198,6 +254,17 @@ export function buildContextMetricsReport(
   const skippedByDisposition = countSkippedByDisposition(rows);
   const skippedCount = Object.values(skippedByDisposition).reduce((a, b) => a + b, 0);
 
+  // Phase 2 Step 2.2: the context_deliveries read surface is optional (see ContextMetricsSource's
+  // doc comment) — an absent method or a store read fault degrades to "no deliveries observed",
+  // never a throw.
+  let deliveries: ContextDelivery[] = [];
+  try {
+    deliveries = store.getContextDeliveries?.({ since: sinceMs, limit }) ?? [];
+  } catch {
+    deliveries = [];
+  }
+  const deliveryAckCounts = computeDeliveryAckCounts(deliveries);
+
   return {
     sinceMs,
     rowCount: rows.length,
@@ -215,6 +282,10 @@ export function buildContextMetricsReport(
     approvalExactlyOnceSuccessRate: null,
     cortexPrimaryRate: computeCortexPrimaryRate(injectedSet),
     cortexFallbackRate: computeCortexFallbackRate(injectedSet),
+    contextDeliveryCount: deliveries.length,
+    contextDeliveryAcknowledgedCount: deliveryAckCounts.acknowledged,
+    contextDeliveryUnacknowledgedCount: deliveryAckCounts.unacknowledged,
+    contextVersionAdvanceStats: computeVersionAdvanceStats(deliveries),
     notes: [DEDUPE_NOTE, SESSION_ID_NOTE, NOT_DERIVABLE_NOTE],
   };
 }

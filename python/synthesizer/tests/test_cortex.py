@@ -5,7 +5,9 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import cortex  # noqa: E402
-import dispatch  # noqa: E402
+from _synth_dispatch_loader import load_dispatch  # noqa: E402
+
+dispatch = load_dispatch()
 
 # Resolve the fixture path relative to this file (works from any cwd).
 # Layout: python/synthesizer/tests/test_cortex.py  →  ../../.. = repo root
@@ -142,8 +144,9 @@ class ProfileTest(unittest.TestCase):
         tiers["board"] = _big_board(200)
         ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "pane-switch"}
         out = cortex.decide(tiers, ctx, 0)
-        # Sanity: this snapshot really does overflow the budget.
-        raw_total = sum(cortex._size_probe(tiers[t]) for t in cortex._TIER_KEYS)
+        # Sanity: this snapshot really does overflow the budget. `.get` (not `tiers[t]`) because
+        # Phase 2 Step 2.1 added "eventFocus" to _TIER_KEYS and this fixture never sets it.
+        raw_total = sum(cortex._size_probe(tiers.get(t)) for t in cortex._TIER_KEYS)
         self.assertGreater(raw_total, cortex._TOTAL_BUDGET_CHARS)
         self.assertIn("board", out["decision"]["drop"])
         self.assertIn("breadcrumbs", out["decision"]["drop"])
@@ -182,6 +185,112 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(out["decision"]["drop"], [])
         self.assertEqual(out["decision"]["keep"],
                           ["project", "pane", "breadcrumbs", "board", "frame"])
+
+
+class EventFocusTierTest(unittest.TestCase):
+    """Phase 2 Step 2.1: the background-pane "event focus" tier — selection under the existing
+    D3 profile/budget system. TIERS_FULL_WITH_EVENT_FOCUS never appears in any pre-2.1 fixture,
+    so these are all NEW scenarios; the pre-existing exact-budget assertions above are untouched
+    (eventFocus stays absent from `keep`/`budget` whenever a tiers dict never sets it)."""
+
+    EVENT_FOCUS = {
+        "paneId": "p2", "name": "worker", "eventText": "build finished",
+        "exchangeState": "needs_input", "waitingReason": "needs input",
+    }
+
+    def _tiers_with_event_focus(self):
+        return dict(TIERS_FULL, eventFocus=self.EVENT_FOCUS)
+
+    def test_command_outcome_leads_with_event_focus_when_present(self):
+        ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "command-outcome", "affectedPaneId": "p2"}
+        out = cortex.decide(self._tiers_with_event_focus(), ctx, 0)
+        self.assertEqual(out["decision"]["keep"][0], "eventFocus")
+        self.assertEqual(out["decision"]["keep"],
+                          ["eventFocus", "breadcrumbs", "pane", "board", "project", "frame"])
+        # eventFocus's own cap (0.25) is additive -- the other five tiers' caps are UNCHANGED
+        # from the no-eventFocus scenario (test_command_outcome_leads_with_breadcrumbs).
+        self.assertEqual(out["decision"]["budget"]["eventFocus"], int(cortex._TOTAL_BUDGET_CHARS * 0.25))
+        self.assertEqual(out["decision"]["budget"]["breadcrumbs"], 1440)
+        self.assertEqual(out["decision"]["budget"]["pane"], 1680)
+        self.assertEqual(out["decision"]["budget"]["board"], 480)
+        self.assertEqual(out["decision"]["budget"]["project"], 960)
+        self.assertEqual(out["decision"]["budget"]["frame"], 240)
+
+    def test_event_focus_absent_from_keep_when_tier_absent(self):
+        # TIERS_FULL (no eventFocus key) under command-outcome: keep/budget stay byte-identical
+        # to the pre-2.1 fixed values (test_command_outcome_leads_with_breadcrumbs).
+        ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "command-outcome"}
+        out = cortex.decide(TIERS_FULL, ctx, 0)
+        self.assertNotIn("eventFocus", out["decision"]["keep"])
+        self.assertNotIn("eventFocus", out["decision"]["budget"])
+
+    def test_session_start_keeps_event_focus_last_before_frame(self):
+        ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "session-start"}
+        out = cortex.decide(self._tiers_with_event_focus(), ctx, 0)
+        self.assertEqual(out["decision"]["keep"],
+                          ["project", "pane", "eventFocus", "breadcrumbs", "board", "frame"])
+
+    def test_pane_switch_drops_event_focus_first_on_overflow(self):
+        tiers = self._tiers_with_event_focus()
+        tiers["breadcrumbs"] = _big_breadcrumbs(200)
+        tiers["board"] = _big_board(200)
+        ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "pane-switch"}
+        out = cortex.decide(tiers, ctx, 0)
+        self.assertIn("eventFocus", out["decision"]["drop"])
+        # eventFocus is dropped BEFORE board/breadcrumbs in pane-switch's dropFirst order.
+        drop = out["decision"]["drop"]
+        self.assertEqual(drop.index("eventFocus"), 0)
+
+    def test_command_outcome_never_drops_event_focus_first(self):
+        # eventFocus is deliberately absent from command-outcome's dropFirst list.
+        tiers = self._tiers_with_event_focus()
+        tiers["project"] = dict(TIERS_FULL["project"], summary="x" * 3000)
+        tiers["board"] = _big_board(200)
+        ctx = {"activePaneId": "p1", "sessionId": None, "trigger": "command-outcome"}
+        out = cortex.decide(tiers, ctx, 0)
+        self.assertIn("eventFocus", out["decision"]["keep"])
+        self.assertNotIn("eventFocus", out["decision"]["drop"])
+
+    def test_shadow_render_includes_event_focus_block_when_present(self):
+        import synth  # the live oracle (does NOT know about eventFocus)  # noqa: E402
+        tiers = self._tiers_with_event_focus()
+        cfg = {"totalBudgetChars": 4800,
+               "weights": {"project": 0.40, "pane": 0.30, "breadcrumbs": 0.15, "board": 0.10,
+                            "frame": 0.05, "eventFocus": 0.15}}
+        out = cortex.synthesize_shadow(tiers, cfg, 0)
+        self.assertIn("EVENT FOCUS worker (needs_input: needs input): build finished", out["text"])
+        self.assertIn("eventFocus", out["perTierChars"])
+        # synth.py (untouched, no eventFocus knowledge) renders the SAME 5 tiers exactly as
+        # before -- the shadow port's extra block is purely additive.
+        oracle = synth.synthesize(dict(tiers, eventFocus=None), {k: v for k, v in cfg.items()}, 0)
+        for key in ("project", "pane", "breadcrumbs", "board", "frame"):
+            self.assertEqual(out["perTierChars"][key], oracle["perTierChars"][key])
+
+    def test_shadow_render_omits_event_focus_block_when_absent(self):
+        out = cortex.synthesize_shadow(TIERS_FULL, {}, 0)
+        self.assertNotIn("EVENT FOCUS", out["text"])
+        self.assertNotIn("eventFocus", out["perTierChars"])
+
+    def test_project_warnings_and_todos_render_when_present(self):
+        project = dict(TIERS_FULL["project"], warnings=["disk low"], openTodos=["fix flaky test"])
+        tiers = dict(TIERS_FULL, project=project)
+        out = cortex.synthesize_shadow(tiers, {}, 0)
+        self.assertIn("warnings: disk low", out["text"])
+        self.assertIn("todos: fix flaky test", out["text"])
+
+    def test_board_exchange_state_suffix_renders_when_present(self):
+        # Both entries use status "Running" -- _rank_board filters Idle/Exited entries out
+        # entirely (unrelated to the Phase 2.1 exchangeState/waitingReason enrichment under test).
+        board = [{"paneId": "p1", "name": "main", "status": "Running",
+                   "exchangeState": "running", "waitingReason": None},
+                  {"paneId": "p2", "name": "worker", "status": "Running",
+                   "exchangeState": "needs_input", "waitingReason": "needs input"}]
+        tiers = dict(TIERS_FULL, board=board,
+                     pane={"paneId": "p1", "name": "main", "runtimeType": "claude",
+                           "status": "Running", "lastCommand": None, "recent": []})
+        out = cortex.synthesize_shadow(tiers, {}, 0)
+        self.assertIn("main=Running[running]", out["text"])
+        self.assertIn("worker=Running[needs_input:needs input]", out["text"])
 
 
 class ExitedPaneTest(unittest.TestCase):

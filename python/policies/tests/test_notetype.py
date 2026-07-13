@@ -4,7 +4,9 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import notetype  # noqa: E402
-import dispatch  # noqa: E402
+from _policies_dispatch_loader import load_dispatch  # noqa: E402
+
+dispatch = load_dispatch()
 
 # The exact closed set the classifier may emit (a SUBSET of NoteType in src/store/types.ts — it must
 # NEVER emit "handoff", which would corrupt the typed-note taxonomy hwu.4/hwu.5 build on).

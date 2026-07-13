@@ -5,7 +5,7 @@
 // hook then applies. Cyclomatic-complexity burndown only; no logic was changed.
 import { extractSlots } from "../templates";
 import type { EarconType } from "../utils/earcon";
-import type { PendingCommand, PendingActionView, AttentionItem } from "../types";
+import type { PendingCommand, PendingActionView, AttentionItem, ExchangeDraftView } from "../types";
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 import type { HandoffState, StoredHandoff } from "../store/types";
 
@@ -99,6 +99,18 @@ export function attentionQueueFromFrame(msg: { queue?: unknown }): AttentionItem
 /** draft_updated: the WIP draft text for a pane (always a string; missing/non-string → ""). */
 export function draftTextFromFrame(msg: { draft?: { text?: unknown } }): string {
   return typeof msg.draft?.text === "string" ? msg.draft.text : "";
+}
+
+/** draft_updated (Phase 3, Step 3.3, additive): the pane's open instruction-envelope exchange draft,
+ *  or null when there is none / the flag is off / the frame predates this field. A minimal shape
+ *  guard (exchangeId + draftVersion present) rather than a full validator — this is a same-origin
+ *  server broadcast, not untrusted input, mirroring draftTextFromFrame's own posture next to it. */
+export function exchangeFromFrame(msg: { exchange?: unknown }): ExchangeDraftView | null {
+  const e = msg.exchange;
+  if (!e || typeof e !== "object") return null;
+  const o = e as Record<string, unknown>;
+  if (typeof o.exchangeId !== "string" || typeof o.draftVersion !== "number") return null;
+  return e as ExchangeDraftView;
 }
 
 /** handoffs_updated (j4e1): the full handoffs board the server broadcasts on every lifecycle mutation.

@@ -1,169 +1,179 @@
-# Orbital Harness — Janus Terminal Orchestrator
+# Orbital Harness — Janus Voice Communication Cockpit
 
-A web-based, voice-controlled orchestrator for multiple local terminal sessions.
-You speak to **Project Janus** (a Gemini Live voice agent); it observes your
-terminal panes, organizes them in a persistent ledger, and acts on shell
-commands according to a configurable permissions policy — from full manual
-approval to full autonomy.
+A web-based, voice-controlled **communication cockpit** for a fleet of local
+terminal coding agents (Claude Code, Codex, Antigravity, or any CLI). You speak
+to **Project Janus** (a Gemini Live voice agent); it observes your terminal
+panes, drafts and routes instructions to them, correlates what comes back, and
+reports outcomes — all under a configurable capability-gate safety matrix.
+
+**The boundary, in one sentence:** *Orbital listens, understands, drafts,
+routes, correlates, and reports; the terminal agents do the engineering.*
+Orbital never plans implementations, never fabricates instruction content the
+operator didn't say, never verifies an agent's engineering (it records the
+agent's own report), and never re-sends work on its own initiative.
 
 ## How it works
 
 ```
- Browser (mic)                  Node server (server.ts)              Gemini Live
- ─────────────                  ───────────────────────              ───────────
- PCM 16kHz  ──audio frames──▶   WebSocket /live  ──realtime audio──▶  model
- audio out  ◀──audio frames──   WebSocket /live  ◀──audio + tools───  (tool calls)
- live UI    ◀──stdout chunks──         │
-                                       │ spawns / reads / writes
-                                       ▼
-                                UniversalTerminal(s)
-                                (child_process panes)
-                                       │
-                                       ▼
-                                Ledger (.janus_ledger.json)
-                                Settings (.janus_settings.json)
+ Browser (mic + cockpit UI)      Node server (server.ts)               Gemini Live
+ ──────────────────────────      ───────────────────────               ───────────
+ PCM 16kHz  ──audio frames──▶    WebSocket /live  ──realtime audio──▶   model
+ audio out  ◀──audio frames──    WebSocket /live  ◀──audio + tools───   (tool calls)
+ live UI    ◀──stdout chunks──          │
+                                        │ spawns / observes / gated writes
+                                        ▼
+                                 UniversalTerminal panes (real PTY, node-pty/ConPTY)
+                                        │
+                                        ▼
+                                 SQLite ledger (.janus.db — JanusStore, schema v12)
+                                 projects · panes · approvals · agent_exchanges ·
+                                 exchange_events · context_deliveries · telemetry
 ```
 
-1. The browser captures mic audio, encodes it as 16 kHz PCM, and streams it over
-   the `/live` WebSocket to the server, which forwards it to a Gemini Live session.
-2. Gemini replies with synthesized audio (default voice `Zephyr`) and may emit
-   tool calls. Pane stdout is also pushed to the UI live as `stdout_chunk` events.
-3. Read/observe tools (`list_panes`, `get_pane_summary`, `switch_context`) and
-   organization tools (`add_project_note`, `add_pane_note`, `rename_project`,
-   `rename_pane`) are answered from the orchestrator/ledger state.
-4. `propose_command` is gated by the **effective permissions mode** (see below):
-   - **Full Auto** — executed immediately; the UI is notified.
-   - **Read-Only** — blocked; the model is told writes are disabled.
-   - **Human-in-the-Loop** — held as a pending approval; the frontend shows an
-     **Approval Dialog**, and only operator confirmation writes the command to
-     the pane's stdin. The outcome is returned to the model.
+1. The browser streams mic audio over `/live`; the server forwards it to a
+   Gemini Live session. Panes boot **inert** — nothing spawns until you (or a
+   gated action) starts one.
+2. The model's tool calls ride a unified action registry (voice + REST twins).
+   Every pane-mutating action routes through the **capability-gate matrix**
+   (per-capability Auto/Ask/Off, global + per-pane) — the single permission
+   choke-point.
+3. A Python "cortex" daemon (stdio-JSON) owns deterministic decision logic
+   (context curation, focus/target ranking, SITREP ranking, session-pool
+   planning) with a fail-closed TypeScript floor: a dead daemon can only ever
+   narrow behavior, never widen it.
+
+## The exchange lifecycle (schema v12)
+
+Every operator instruction is tracked as a durable **AgentExchange** — a
+communication record, not a work engine — through a 12-state lifecycle:
+
+```
+draft → awaiting_clarification → awaiting_approval → staged → delivered
+      → running → needs_input → terminal_idle → agent_complete
+                                              → agent_failed
+      (any cancellable state → cancelled; any in-flight state → interrupted)
+```
+
+Key guarantees (spec: `docs/superpowers/specs/2026-07-09-agent-exchange-spine.md`):
+
+- **Exactly-once delivery**: approval confirmation and every state transition
+  are CAS-guarded; a double-click, replayed voice call, or duplicated approval
+  can never double-type into a live agent.
+- **Draft-version binding**: editing a draft invalidates any outstanding
+  approval — what the operator heard read back is byte-for-byte what can land.
+- **Never invent history**: on restart, in-flight exchanges are quarantined to
+  `interrupted` (surfaced for the operator to dismiss or follow up) — never
+  auto-resumed, never re-sent, never settled from stale scrollback.
+- **Reports, not verification**: `agent_complete` records the agent's own
+  report (result envelope or conservative prose heuristic). Orbital never runs
+  tests/builds to "verify" an exchange.
+- **Redaction at rest**: instructions are delivered raw but persisted redacted;
+  every free-text column is scrubbed at the write boundary.
+
+Instruction drafting rides the **InstructionEnvelope**
+(`objective / relevant_context / constraints / requested_output /
+completion_signal` — operator-stated content only; spec:
+`docs/superpowers/specs/2026-07-09-instruction-routing.md`), converged with the
+Workbench draft so voice and typed edits mutate the same versioned draft.
+
+## Fleet cockpit
+
+- **Fleet exception view** — "communication by exception": a per-pane card lane
+  showing only what needs you (questions, held approvals, failures/interrupts),
+  with lifecycle-consistent quick actions (Answer / Approve / Deny / Retry for
+  interrupted exchanges / Hold-cancel / Open pane) and per-project announcement
+  mute.
+- **Exchange replay** — one exchange's full redacted communication timeline
+  (events, approvals, context versions, terminal transitions; instruction
+  content only ever as a hash): `GET /api/exchanges/:exchange_id/replay`.
+- **Communication-quality metrics** — wrong-target tripwire, duplicate
+  deliveries, clarification causes, speech-to-draft / delivery latency, context
+  cost: `GET /api/exchange-metrics` or `npx tsx scripts/exchange-metrics-report.ts`.
+- **Exchange-aware notifications** — exactly-once narration of questions/
+  failures (background projects cross over named explicitly, never stealing
+  focus), spoken SITREP board, catch-up digests anchored to your away window.
+
+Operations, feature flags, rollout order, and troubleshooting:
+**`docs/runbooks/communication-cockpit-operations.md`**.
 
 ## Permissions model
 
 Every pane has a `permissionsMode`; a `globalPermissionsMode` can override it.
 The effective mode is: use the global mode unless it is `Inherit`, in which case
-the pane's own mode applies (defaulting to `Human-in-the-Loop`).
+the pane's own mode applies (defaulting to `Human-in-the-Loop`). On top of the
+mode, each capability (write_to_pane, send_keys, create_pane, …) carries its own
+Auto/Ask/Off gate, AND-composed with the mode.
 
-> **Note:** because the global mode takes precedence, changing a *pane's* mode
-> while `globalPermissionsMode` is anything other than `Inherit` has **no effect
-> on gating** until the global mode is set back to `Inherit`.
-
-| Mode               | Effect on `propose_command`                          |
+| Mode               | Effect on proposed writes                             |
 | ------------------ | ---------------------------------------------------- |
-| `Full Auto`        | Voice/AI Submits Commands Automatically. The agent writes commands directly to the pane without confirmation. |
-| `Human-in-the-Loop`| Requires explicit operator approval in the UI for individual commands. |
-| `Read-Only`        | Terminal output only, no submissions. The pane accepts no writes from the agent. |
-| `Inherit` (global) | Falls back to the pane's own mode.                   |
+| `Full Auto`        | Commands write to the pane without confirmation.      |
+| `Human-in-the-Loop`| Each write is held as a pending approval in the UI.   |
+| `Read-Only`        | Output only; the pane accepts no agent writes.        |
+| `Inherit` (global) | Falls back to the pane's own mode.                    |
 
 Tool presets (`Claude Code`, `Codex`, `Antigravity`, `Custom`) seed a pane's
-startup command and, for non-custom presets, manage the
-`--dangerously-skip-permissions` flag based on the mode.
+startup command and, for non-custom presets, manage permission flags based on
+the mode.
 
-## Project structure
+## Project structure (orientation)
 
 ```
-server.ts                     Express + WebSocket server; Gemini Live bridge; REST API
-SETTINGS_SPEC.md              Specification for the configuration/settings system
-index.html                    Vite entry point
-vite.config.ts                Vite + React + Tailwind config
-src/
-  main.tsx                    React root
-  App.tsx                     Main UI: pane list, terminal view, voice + permission controls
-  types.ts                    Shared types (Terminal, PaneMeta, Workspace, CliPreset, SystemSettings)
-  index.css                   Tailwind entry
-  terminal.ts                 UniversalTerminal, OrchestratorManager, settings/preset handling
-  ledger.ts                   Ledger: persisted projects/workspaces, panes, notes, briefings
-  utils/audio.ts              PCM <-> base64 encode/decode and chunked playback
-  components/
-    ApprovalDialog.tsx        Human-in-the-loop command confirmation
-    CreateTerminalDialog.tsx  Manual pane creation (tool preset + permissions)
-    SettingsDialog.tsx        Settings editor (form + raw JSON, import/export)
-tests/
-  test_server.ts             Tests for terminal.ts / OrchestratorManager
-  test_ledger.ts             Tests for the persisted project ledger
+server.ts                  Express + WS hub; Gemini Live bridge; REST API (~3,200 lines — grep first)
+src/terminal.ts            UniversalTerminal + OrchestratorManager (pane lifecycle over real PTY)
+src/store/                 SQLite ledger (JanusStore, schema v12), migrations, retention
+src/exchanges/             AgentExchange spine: lifecycle, correlator service, recovery,
+                           instruction envelope, draft registry, result envelope,
+                           fleet projection, metrics, replay
+src/voice/                 Gemini Live session, target resolver, SITREP, session pool, spoken confirm
+src/observe/               Pane-output observation: transitions, completion heuristics, attention
+src/gating/, src/dispatch/ Capability-gate choke-point + the single gated write path
+src/actions/               Unified action registry (voice + REST surfaces)
+src/orbital/, src/classic/ React frontends (cockpit / classic)
+python/                    The decision layer: cortex synthesizer + policies daemons (stdio-JSON)
+docs/                      Specs, runbooks, reviews, roadmap
 ```
 
-State is persisted next to the server as `.janus_ledger.json` (workspaces/panes)
-and `.janus_settings.json` (system settings); both are local runtime files.
+Persistent state lives next to the server: `.janus.db` (SQLite — the ONLY
+ledger backend), `.janus_settings.json`, `.janus_history.json` (redacted pane
+command history), `.janus_interaction_log.jsonl`. A one-way JSON→SQLite boot
+migration upgrades pre-SQLite installs.
 
 ## Prerequisites
 
 - Node.js 18+ (developed against Node 22)
+- Python 3 (for the cortex/policies daemons; the TS floor covers a missing Python)
 - A Google Gemini API key with access to the Live API
 
-## Setup
-
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. Create a `.env` file (see `.env.example`) and set your key:
-   ```bash
-   GEMINI_API_KEY="your-key-here"
-   ```
-   The key can alternatively be set at runtime via the Settings dialog.
-
-## Running
+## Setup & running
 
 ```bash
-npm run dev         # Start the server with Vite middleware at http://localhost:3000
-npm run build       # Build the client (vite) and bundle the server to dist/server.cjs
-npm start           # Run the production build (serves the bundled SPA from dist/)
-npm test            # Run the TypeScript test suites with tsx
-npm run lint        # Type-check with tsc --noEmit
-npm run complexity  # Lint gates: complexity<=10 + cognitive<=15 + react-hooks/rules-of-hooks (all error)
-npm run clean       # Remove build artifacts
+npm install
+cp .env.example .env   # set GEMINI_API_KEY
+npm run dev            # server + Vite middleware at http://localhost:3000
 ```
 
-Open http://localhost:3000, click **Connect**, and grant microphone access. A
-default `primary-cli` pane is created on startup; add more with **Create Node**.
+```bash
+npm run build          # vite + esbuild → dist/server.cjs
+npm start              # run the production build
+npm test               # unit suite (tsx --test --test-force-exit)
+npm run test:component # vitest component tests
+npm run test:e2e       # Playwright (?mock=1 harness, auto-starts Vite)
+npm run test:py        # python pytest suites
+npm run typecheck      # tsc --noEmit
+npm run complexity     # eslint gates: CC<=10 + cognitive<=15 (errors, zero suppressions)
+npm run catalog        # regenerate the capability catalog (drift-gated by tests)
+```
 
-## HTTP & WebSocket API
+Open http://localhost:3000, click **Connect**, and grant microphone access.
+Panes boot inert — create one via the UI or `/restart`.
 
-| Method | Path                                                  | Purpose                                       |
-| ------ | ----------------------------------------------------- | --------------------------------------------- |
-| GET    | `/api/terminals`                                      | List panes with state, preset, and permissions.|
-| POST   | `/api/terminals`                                      | Create a pane (`terminalId, cwd, command, ...`).|
-| POST   | `/api/terminals/:id/restart`                          | Restart (or restore) a pane.                  |
-| GET    | `/api/ledger`                                         | Full workspace/pane ledger.                   |
-| POST   | `/api/projects`                                       | Create a project workspace.                   |
-| PUT    | `/api/projects/:id/rename`                            | Rename a project.                             |
-| POST   | `/api/projects/:id/switch`                            | Switch the active project context.            |
-| DELETE | `/api/projects/:id`                                   | Delete a project workspace.                   |
-| POST   | `/api/projects/:id/notes`                             | Add a project note.                           |
-| PUT    | `/api/projects/:pid/panes/:paneId/rename`             | Rename a pane.                                |
-| POST   | `/api/projects/:pid/panes/:paneId/notes`              | Add a pane note.                              |
-| PUT    | `/api/projects/:pid/panes/:paneId/permissions`        | Change a pane's permissions mode.             |
-| DELETE | `/api/projects/:pid/panes/:paneId`                    | Stop and remove a pane.                       |
-| GET    | `/api/settings`                                       | Read settings (API key masked).               |
-| PUT    | `/api/settings`                                       | Update settings; broadcasts to clients.       |
-| GET    | `/api/commands/pending`                               | List pending approvals.                       |
-| POST   | `/api/commands/approve`                               | Approve/reject a proposed command.            |
-| WS     | `/live`                                                | Bidirectional audio + control/stdout messages.|
+## Security posture
 
-WebSocket server→client message types include `audio`, `interrupted`,
-`approval_pending`, `terminals_updated`, `ledger_updated`, `settings_updated`,
-`command_auto_executed`, `command_blocked`, `stdout_chunk`, and `error`.
-
-See `SETTINGS_SPEC.md` for the full configuration schema and settings design.
-
-## Agent tools
-
-| Tool               | Effect                                                                       |
-| ------------------ | ---------------------------------------------------------------------------- |
-| `list_panes`       | Cheap orientation: all projects and panes with state, `is_busy`, `alive`.    |
-| `get_pane_summary` | Markdown snapshot of one pane's recent output.                               |
-| `switch_context`   | Make a project the active focus and return its briefing.                     |
-| `propose_command`  | Propose a command for a pane; gated by the effective permissions mode.       |
-| `add_project_note` | Append a durable note to a project.                                          |
-| `add_pane_note`    | Append a durable note to a specific pane.                                    |
-| `rename_project`   | Rename a project.                                                            |
-| `rename_pane`      | Rename a pane.                                                               |
-
-## Security note
-
-The server runs commands on the host machine and the REST API has no
-authentication. Run it only on trusted, local networks. Agent-proposed commands
-are gated by the permissions model above, but `POST /api/terminals` and
-`Full Auto` panes can execute processes without a manual approval step — keep the
-server bound to a trusted environment, and avoid `Full Auto` for untrusted input.
+- The REST API sits behind a per-boot token (`x-api-token` header / an
+  `httpOnly SameSite=strict` cookie seeded on loopback or via an explicit
+  `?auth_token=` bootstrap); an Origin fence guards the WS. Still: the server
+  runs commands on the host — run it only in trusted environments and avoid
+  `Full Auto` for untrusted input.
+- Secrets are redacted before persistence and before any model-bound string.
+- The latest security review of the communication pipeline:
+  `docs/review/2026-07-10-communication-security-review-5.4.md`.

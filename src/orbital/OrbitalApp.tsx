@@ -12,6 +12,7 @@ import { useConversationalState, chipColorForKind, type ConversationalState } fr
 import { groupHandoffsByPane } from "./useOrbitalDataHelpers";
 import { deriveProjects, deriveStations } from "./station";
 import { Board, ProjectsSidebar } from "./views/Line";
+import { FleetExchangeView } from "./FleetExchangeView";
 import { ServiceMode } from "./ServiceMode";
 import { EmergencyStop } from "./EmergencyStop";
 import { KitchenRadio } from "./KitchenRadio";
@@ -221,6 +222,13 @@ export default function OrbitalApp() {
     onDeliver: data.deliverHandoff, onRevise: data.reviseHandoff, onStage: data.stageHandoff,
     onReject: data.rejectHandoff, onFetchPrompt: data.fetchHandoffPrompt,
   }), [data.handoffs, data.deliverHandoff, data.reviseHandoff, data.stageHandoff, data.rejectHandoff, data.fetchHandoffPrompt]);
+  // Phase 3, Step 3.3 (additive): the open instruction-envelope draft per pane, for the board's
+  // compact card chip (StationCard.ExchangeStateChip). Sourced from the SAME paneDrafts mirror the
+  // burner's Order Pad already reads (draft_updated frames' additive `exchange` field).
+  const exchangeByPane = useMemo(
+    () => Object.fromEntries(Object.entries(data.paneDrafts).map(([paneId, d]) => [paneId, d.exchange ?? null])),
+    [data.paneDrafts],
+  );
   const running = stations.filter((s) => s.status === "Running").length;
   // Velocity-design (D7): the conversational pill's state, derived from the voice-channel signals the
   // data layer already computes + tool-call activity off the transcript (activeSources). Pure machine,
@@ -291,6 +299,38 @@ export default function OrbitalApp() {
       <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
         <ProjectsSidebar stations={stations} projects={projects} selected={selectedProject} setSelected={setSelectedProject} dark={t.dark} onNewProject={() => setNewProjOpen(true)} />
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0, minWidth: 0, backgroundImage: dotBg, backgroundSize: "18px 18px" }}>
+          {/* Phase 5, Step 5.1: the Fleet View's "communication-by-exception" lane — only in the
+              All-Projects scope (selectedProject === "all"), and renders NOTHING when the fleet has
+              no exception (zero visual delta otherwise — see FleetExchangeView's own doc). */}
+          {selectedProject === "all" && (
+            <FleetExchangeView
+              stations={stations}
+              pendingCommands={data.pendingCommands}
+              attentionQueue={data.attentionQueue}
+              exchangeByPane={exchangeByPane}
+              exchangeSummaries={data.fleetExchangeSummaries}
+              mutedProjectIds={data.settings?.projects.mutedProjectIds}
+              dark={t.dark}
+              onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }}
+              /* A fleet card's held approval comes from one of TWO existing sources (fleetExchangeOrdering
+                 .ts's precedence ladder): the active pane's pendingCommands (resolve via approveCommand/
+                 rejectCommand directly) or a background pane's attention-inbox item (bead 8xn — resolve via
+                 approveAttention/denyAttention, which ALSO optimistically clears the inbox row/badge, not
+                 just pendingCommands). Both are the SAME canonical POST /api/commands/approve resolver
+                 underneath; this is only choosing which existing wrapper clears the right client-side queue. */
+              onApprove={(messageId) => {
+                const item = data.attentionQueue.find((a) => a.messageId === messageId);
+                if (item) data.approveAttention(item); else data.approveCommand(messageId);
+              }}
+              onDeny={(messageId) => {
+                const item = data.attentionQueue.find((a) => a.messageId === messageId);
+                if (item) data.denyAttention(item); else data.rejectCommand(messageId);
+              }}
+              onRetry={data.retryExchange}
+              onCancelExchange={data.cancelExchangeAction}
+              onToggleMute={data.toggleProjectMute}
+            />
+          )}
           <ThePass notes={data.notes} plans={data.plans} templates={data.templates} layouts={data.layouts} attention={data.attentionQueue}
             stations={stations} activePaneId={data.activeTerminalId}
             jotProjectId={passProjectId} jotProjectName={passProjectName} dark={t.dark} voiceCues={t.voiceCues}
@@ -308,7 +348,7 @@ export default function OrbitalApp() {
             onDenyAttention={(item) => data.denyAttention(item)}
             onRestartAttention={(id) => data.restartPane(id)}
             onDismissAttention={(id) => data.dismissAttention(id)} />
-          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} />
+          <Board stations={stations} projects={projects} dark={t.dark} density={t.density} layout={t.layout} onOpen={(st) => { data.selectActivePane(st.id); setBurnerId(st.id); }} showCue={t.voiceCues} activeId={data.activeTerminalId} selectedProject={selectedProject} onNewPane={(pid) => setNewPaneProj(pid)} onClearExited={data.clearExited} handoffs={handoffWiring} exchangeByPane={exchangeByPane} />
         </div>
         {/* action-right: the Kitchen Radio (voice channel). "If you can click it, you can say it." */}
         <aside style={{ width: 392, flexShrink: 0, borderLeft: "3px solid " + INK, height: "100%", overflow: "hidden", minHeight: 0, display: "flex", flexDirection: "column" }}>

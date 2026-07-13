@@ -108,9 +108,47 @@ export function shouldClearHandleOnClose(
   return usedHandle && closeCode === GEMINI_SESSION_EXPIRED_CODE;
 }
 
-/** Serialize a resume token for the durable KV, stamping the persist time for the age guard. */
-export function wrapHandleForPersist(token: unknown, now: number): string {
-  return JSON.stringify({ token, persistedAt: now });
+/** Serialize a resume token for the durable KV, stamping the persist time for the age guard.
+ *  `ownerProjectId` (Phase 2 Step 2.5 review fix, optional so every existing caller/row shape is
+ *  unchanged): the project whose CONVERSATION this handle belongs to at persist time. The legacy
+ *  single slot is rewritten on every rotation, so without this stamp a later connection's
+ *  one-way migration (src/voice/sessionPool.ts migrateLegacyHandle) could copy project A's
+ *  conversation handle into project B's per-project slot — a cross-project handle mis-file. */
+export function wrapHandleForPersist(token: unknown, now: number, ownerProjectId?: string | null): string {
+  return JSON.stringify({ token, persistedAt: now, ...(ownerProjectId ? { ownerProjectId } : {}) });
+}
+
+/** Read the owner stamp back from a persisted handle, or null for a legacy/unstamped/garbage
+ *  value (an unstamped handle has UNKNOWN ownership — the caller decides how conservative to be). */
+export function readHandleOwner(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.ownerProjectId === "string" ? parsed.ownerProjectId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * z5c design (spec 2026-07-07-z5c-session-pool-design.md D5): the legacy KV key a single global
+ * resumption handle lived under before the per-project session pool. Kept as a named constant
+ * (not just a literal) so the one-way migration into a per-project slot (src/voice/sessionPool.ts)
+ * and the original single-session read/write site (src/voice/index.ts) both name the SAME key —
+ * a typo'd duplicate literal would silently split the value into two dead KV rows.
+ */
+export const LEGACY_RESUME_HANDLE_KV_KEY = "voiceResumptionToken";
+
+/**
+ * z5c design D5: per-project resumption handles. Each pool entry gets its OWN durable KV slot
+ * (was one global slot for the whole app) so switching A->B->A can resume EACH project's own
+ * server-side Gemini conversation instead of all projects racing to overwrite one shared handle.
+ * Pure string-building only — the actual get/set/delete + migration lives in
+ * src/voice/sessionPool.ts (this module stays scoped to "resilience for the resumption handle",
+ * not KV I/O).
+ */
+export function resumptionHandleKvKeyFor(projectId: string): string {
+  return `${LEGACY_RESUME_HANDLE_KV_KEY}:project:${projectId}`;
 }
 
 /**

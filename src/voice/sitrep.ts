@@ -16,10 +16,371 @@
 // render -> speak. It NEVER throws (wrapped; falls back to a safe static string on any failure).
 import type { ActionContext, ActionResult } from "../actions/types";
 import type { SitrepPayload, SitrepRanking } from "./policyClient";
-import { DEFAULT_VOICE_UX } from "../types";
+import { DEFAULT_VOICE_UX, type AttentionItem, type FleetExchangeTier, type FleetExchangeKind } from "../types";
+import type { AgentExchange, ExchangeEvent, ExchangeState } from "../exchanges/types";
+import { tierKindForState } from "../exchanges/priority";
+import { redactCapped } from "../exchanges/textUtil";
+import { getExchangeNarrationGate } from "../announcementBus";
 
 const EMPTY_SITREP_TEXT =
   "Nothing needs your attention: no pending approvals, no alerts, and no panes are busy.";
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Phase 4, Step 4.2 — the exchange-aware "board": a prioritized, cross-pane view built directly
+// off the durable AgentExchange spine (src/exchanges/**) plus the existing pending-approval
+// surfaces, ADDITIVE to everything above. This is a SEPARATE composition from
+// composeSitrep/fallbackRanking/renderSitrep (which stay byte-identical — every existing golden in
+// tests/test_status_summary.ts keeps passing unmodified) so that a world with NO exchange activity
+// (the exchange spine off, or `ctx.store` absent — every hand-built test ActionContext today)
+// degrades to EXACTLY the legacy rendering, and a world WITH real exchange activity gets the
+// spec's 6-tier priority order:
+//   (1) agents waiting for operator input — needs_input exchanges + held pane-write approvals
+//   (2) failed/exited exchanges — agent_failed + interrupted
+//   (3) delivered exchanges with a meaningful result — agent_complete (non-empty result_summary)
+//   (4) currently running exchanges — running/delivered
+//   (5) unresolved approvals not already covered by (1) — staged (non-PTY) deferred actions
+//   (6) relevant recent decisions — recently confirmed approvals (approval_confirmed events)
+// Within a tier, items sort newest-first (freshest signal leads), matching "avoid replaying
+// unchanged context" — an exchange that hasn't moved since the last read never reorders itself
+// ahead of something that just changed.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** Aliases of the src/types.ts six-tier unions (FleetExchangeTier/FleetExchangeKind) — the exact
+ *  same tiering shared with src/exchanges/fleetProjection.ts's FleetExchangeSummary and
+ *  src/orbital/fleetExchangeOrdering.ts's FleetRow. `FleetExchangeKind` also carries `"staged"`
+ *  (tier 5, a durable-summary-only case this board never emits itself — approval items use kind
+ *  `"approval"` directly), so this is a strict widening, never a narrowing, of what this board's
+ *  own items are ever assigned. */
+export type ExchangeBoardTier = FleetExchangeTier;
+export type ExchangeBoardKind = FleetExchangeKind;
+
+export interface ExchangeBoardItem {
+  tier: ExchangeBoardTier;
+  kind: ExchangeBoardKind;
+  /** null for approval items that carry no exchange correlation (a staged non-PTY action). */
+  exchangeId: string | null;
+  paneId: string | null;
+  projectId: string | null;
+  /** Already-redacted, capped, TERSE spoken clause (project + pane + one-clause outcome/question) —
+   *  the voice-terseness contract: this is the ONE line a spoken summary reads for this item; full
+   *  detail (evidence, full instruction text) stays in the action panel / replay, never spoken. */
+  text: string;
+  /** Sort anchor within a tier — larger = more recent. Exchange rows use their durable
+   *  `updated_at`; approvals (no such column) use their own creation `timestamp`, or `0` when
+   *  neither is available (stable, but always last within its tier on ties). */
+  updatedAt: number;
+}
+
+const BOARD_TEXT_CAP = 160;
+const DECISION_WINDOW_MS = 30 * 60 * 1000; // 30 minutes — "relevant RECENT decisions" only
+const MAX_DECISION_ITEMS = 3;
+/** Phase 5.5 (the 4.5 review's B11 finding): tier-3 completions are WINDOWED, mirroring tier 6's
+ *  DECISION_WINDOW_MS rationale — "delivered exchanges with a meaningful result" means RECENT
+ *  results. Unwindowed, every terminal `agent_complete` row (retained up to the 30-DAY store TTL,
+ *  src/store/retention.ts) re-surfaced on every single SITREP until pruned. A completion older
+ *  than this window falls off the spoken board; its durable record stays reachable via replay /
+ *  the attention queue / catch_me_up's own away-window filter (src/actions/defs/catchup.ts). */
+export const COMPLETION_WINDOW_MS = 30 * 60 * 1000;
+
+function capBoardText(s: string, max: number = BOARD_TEXT_CAP): string {
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/** A minimal ledger read surface — `OrchestratorManager["ledger"]` satisfies this directly. */
+interface LedgerLike {
+  workspaces?: Record<string, { panes?: Record<string, { name?: string }> }>;
+}
+
+/** Resolve a pane's display name off the ledger, falling back to the bare pane id, then redact (a
+ *  ledger-recorded pane name is operator-authored free text). Shared by every board/narration
+ *  surface that needs "what does this pane look like to the operator" — composeSitrep and the
+ *  exchange board here, and src/voice/index.ts's live-session narration seam (resolvePaneLabel). A
+ *  null `projectId` (no known owning project) degrades straight to the bare paneId, same as a
+ *  project id with no matching workspace entry. */
+export function paneDisplayLabel(
+  ledger: LedgerLike | undefined,
+  projectId: string | null,
+  paneId: string,
+  redact: (s: string) => string,
+): string {
+  const raw = projectId ? (ledger?.workspaces?.[projectId]?.panes?.[paneId]?.name || paneId) : paneId;
+  return redact(raw);
+}
+
+/** Thin exchange-board-specific wrapper — every caller here always has a non-null `projectId`. */
+function exchangePaneLabel(ctx: ActionContext, projectId: string, paneId: string): string {
+  return paneDisplayLabel(ctx.manager.ledger, projectId, paneId, ctx.redact);
+}
+
+/**
+ * Phase 4, Step 4.2 — the terse spoken/caption clause for one exchange's CURRENT terminal-ish
+ * state. Shared by the on-demand board composer here AND the live voice-session narration seam
+ * (src/voice/index.ts's pushSignal enrichment) so both surfaces read the SAME wording for the
+ * SAME state — the `redact` function is injected because the live-session seam doesn't carry an
+ * ActionContext (it uses `redactSecrets` directly; the board composer uses `ctx.redact`).
+ * `state` values with nothing terse to say (draft/staged/delivered/etc.) return null — the caller
+ * decides what (if anything) to fall back to.
+ */
+function needsInputLine(paneLabel: string, terminalState: string | null, redact: (s: string) => string): string {
+  const q = redactCapped(terminalState, redact, BOARD_TEXT_CAP);
+  return q ? `Pane '${paneLabel}' needs your input: "${q}"` : `Pane '${paneLabel}' needs your input.`;
+}
+
+function failedLine(paneLabel: string, terminalState: string | null, redact: (s: string) => string): string {
+  const d = redactCapped(terminalState, redact, BOARD_TEXT_CAP);
+  return d ? `Pane '${paneLabel}' failed: ${d}` : `Pane '${paneLabel}' failed.`;
+}
+
+/** null = no meaningful result to say (a completion with nothing to report is not narrated). */
+function completeLine(paneLabel: string, resultSummary: string | null, redact: (s: string) => string): string | null {
+  const s = redactCapped(resultSummary, redact, BOARD_TEXT_CAP);
+  return s ? `Pane '${paneLabel}' finished: ${s}` : null;
+}
+
+/** state -> the terse-line builder for it, or null for states with nothing terse to say. Table-
+ *  driven so the top-level `terseExchangeOutcomeLine` stays a flat one-line dispatch (complexity
+ *  gate) instead of a long switch. */
+const TERSE_LINE_BUILDERS: Partial<
+  Record<ExchangeState, (paneLabel: string, terminalState: string | null, resultSummary: string | null, redact: (s: string) => string) => string | null>
+> = {
+  needs_input: (p, t, _r, redact) => needsInputLine(p, t, redact),
+  agent_failed: (p, t, _r, redact) => failedLine(p, t, redact),
+  interrupted: (p) => `Pane '${p}' was interrupted.`,
+  agent_complete: (p, _t, r, redact) => completeLine(p, r, redact),
+  running: (p) => `Pane '${p}' is still working.`,
+  delivered: (p) => `Pane '${p}' is still working.`,
+};
+
+export function terseExchangeOutcomeLine(
+  paneLabel: string,
+  state: ExchangeState | string,
+  terminalState: string | null,
+  resultSummary: string | null,
+  redact: (s: string) => string,
+): string | null {
+  const build = TERSE_LINE_BUILDERS[state as ExchangeState];
+  return build ? build(paneLabel, terminalState, resultSummary, redact) : null;
+}
+
+/** One parameterized builder for every store-derived board item (tiers 1a/2/3/4) — collapses what
+ *  used to be four near-identical needsInputItem/failedItem/completeItem/runningItem functions
+ *  (same shape, differing only in which literal tier/kind/state they hardcoded). Tier/kind now come
+ *  from the shared src/exchanges/priority.ts table keyed on the exchange's OWN `state` — exactly
+ *  the same values each hardcoded call site passed (every caller only ever hands this a `ex` whose
+ *  `state` is already within the state-group it queried for, e.g. needs_input-only, running/
+ *  delivered, etc.), so this is a mechanical, behavior-preserving fold. Keeps the tier-3 "no
+ *  meaningful result" null guard (a completion with nothing to report is not narrated) — the ONLY
+ *  builder that can return null. */
+function exchangeStoreBoardItem(ctx: ActionContext, ex: AgentExchange): ExchangeBoardItem | null {
+  const pane = exchangePaneLabel(ctx, ex.project_id, ex.pane_id);
+  const text = terseExchangeOutcomeLine(pane, ex.state, ex.terminal_state, ex.result_summary, ctx.redact);
+  if (!text) return null;
+  const { tier, kind } = tierKindForState(ex.state);
+  return {
+    tier, kind, exchangeId: ex.exchange_id, paneId: ex.pane_id, projectId: ex.project_id,
+    text, updatedAt: ex.updated_at,
+  };
+}
+
+interface HeldApproval { messageId: string; instruction: string; terminalId: string; timestamp?: number; exchangeId?: string }
+
+function heldApprovalItem(ctx: ActionContext, a: HeldApproval): ExchangeBoardItem {
+  const summary = capBoardText(ctx.redact(a.instruction));
+  return {
+    tier: 1, kind: "approval", exchangeId: a.exchangeId ?? null, paneId: a.terminalId ?? null, projectId: null,
+    text: `Pane '${a.terminalId}' is awaiting your approval: "${summary}"`,
+    updatedAt: a.timestamp ?? 0,
+  };
+}
+
+interface StagedApproval { id: string; summary: string }
+
+function stagedApprovalItem(ctx: ActionContext, a: StagedApproval): ExchangeBoardItem {
+  return {
+    tier: 5, kind: "approval", exchangeId: null, paneId: null, projectId: null,
+    text: `A staged action is awaiting your approval: "${capBoardText(ctx.redact(a.summary))}"`,
+    updatedAt: 0,
+  };
+}
+
+function decisionItem(ctx: ActionContext, ev: ExchangeEvent): ExchangeBoardItem {
+  const pane = ev.pane_id && ev.project_id ? exchangePaneLabel(ctx, ev.project_id, ev.pane_id) : (ev.pane_id ?? "a pane");
+  return {
+    tier: 6, kind: "decision", exchangeId: ev.exchange_id, paneId: ev.pane_id, projectId: ev.project_id,
+    text: `Pane '${pane}': your instruction was approved.`,
+    updatedAt: ev.ts,
+  };
+}
+
+/** Never-throw wrapper around one store query — a single bad query must not blank the whole board
+ *  (mirrors the QW5 never-throw idiom used throughout src/observe/index.ts). */
+function safeList<T>(fn: () => T[]): T[] {
+  try { return fn(); } catch (e) { console.error("[sitrep] exchange board query failed:", e); return []; }
+}
+
+/** Push `exchangeStoreBoardItem(ctx, ex)` for every `ex` in `exchanges`, skipping the ones that
+ *  build to `null` (the tier-3 "no meaningful result" guard). Split out of
+ *  gatherExchangeStoreItems purely so its own per-state loops stay a flat one-liner each
+ *  (complexity gate). */
+function pushExchangeStoreBoardItems(items: ExchangeBoardItem[], ctx: ActionContext, exchanges: AgentExchange[]): void {
+  for (const ex of exchanges) {
+    const it = exchangeStoreBoardItem(ctx, ex);
+    if (it) items.push(it);
+  }
+}
+
+/** Tiers 1a/2/3/4/6 — every item derived DIRECTLY from the durable exchange store. Split out of
+ *  composeExchangeBoard purely to keep that function's own branch count low (complexity gate). */
+function gatherExchangeStoreItems(ctx: ActionContext, store: NonNullable<ActionContext["store"]>, now: number): ExchangeBoardItem[] {
+  const items: ExchangeBoardItem[] = [];
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["needs_input"])));
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["agent_failed", "interrupted"])));
+  const recentComplete = safeList(() => store.listExchangesByStates(["agent_complete"]))
+    .filter((ex) => ex.updated_at >= now - COMPLETION_WINDOW_MS); // B11: recent results only (see COMPLETION_WINDOW_MS)
+  pushExchangeStoreBoardItems(items, ctx, recentComplete);
+  pushExchangeStoreBoardItems(items, ctx, safeList(() => store.listExchangesByStates(["running", "delivered"])));
+  for (const ev of safeList(() =>
+    store.listRecentExchangeEventsByTypes(["approval_confirmed"], { sinceTs: now - DECISION_WINDOW_MS, limit: MAX_DECISION_ITEMS }),
+  )) items.push(decisionItem(ctx, ev));
+  return items;
+}
+
+/** Tiers 1b (held pane-write approvals) + 5 (staged non-PTY approvals) — folded in ONLY once the
+ *  caller has already established real exchange activity exists (composeExchangeBoard's own
+ *  early-return). Never-throw: a pending-store fault must not blank the exchange-derived items
+ *  already gathered. */
+function gatherApprovalItems(ctx: ActionContext): ExchangeBoardItem[] {
+  const items: ExchangeBoardItem[] = [];
+  try {
+    for (const a of ctx.pendingApprovals?.forSession(ctx.session) ?? []) items.push(heldApprovalItem(ctx, a as unknown as HeldApproval));
+  } catch (e) { console.error("[sitrep] exchange board held-approvals gather failed:", e); }
+  try {
+    for (const a of ctx.pendingActions?.all() ?? []) items.push(stagedApprovalItem(ctx, a as unknown as StagedApproval));
+  } catch (e) { console.error("[sitrep] exchange board staged-approvals gather failed:", e); }
+  return items;
+}
+
+/**
+ * Phase 4, Step 4.2 — gather the exchange-aware board (§ priority tiers, see module doc above).
+ * Returns `[]` whenever there is no real exchange activity at all (no store attached, or the store
+ * has no needs_input/failed/complete/running/decision rows) — callers MUST treat an empty board as
+ * "fall back to the legacy composeSitrep/renderSitrep pipeline", never as "nothing to say".
+ * Approvals (tiers 1's held-approval half and tier 5) are folded in ONLY once real exchange
+ * activity already justifies taking this path — an approvals-only world (no exchange rows at all)
+ * keeps using the legacy pipeline verbatim, so every existing composeSitrep/runStatusSummary golden
+ * stays byte-identical.
+ */
+export function composeExchangeBoard(ctx: ActionContext, now: number): ExchangeBoardItem[] {
+  const store = ctx.store;
+  const items = store ? gatherExchangeStoreItems(ctx, store, now) : [];
+  if (items.length === 0) return []; // no real exchange activity — legacy pipeline handles this response.
+
+  items.push(...gatherApprovalItems(ctx));
+
+  try {
+    syncExchangeAttentionItems(ctx, items, now);
+  } catch (e) { console.error("[sitrep] exchange attention sync failed:", e); }
+
+  return items;
+}
+
+/** Deterministic within-tier order: tier ascending, then most-recently-updated first, then a
+ *  stable id tie-break so repeated calls over an UNCHANGED board always render identically. */
+export function rankExchangeBoard(items: ExchangeBoardItem[]): ExchangeBoardItem[] {
+  return [...items].sort(
+    (a, b) =>
+      a.tier - b.tier ||
+      b.updatedAt - a.updatedAt ||
+      (a.exchangeId ?? a.paneId ?? "").localeCompare(b.exchangeId ?? b.paneId ?? ""),
+  );
+}
+
+/** Pure text rendering — VOICE TERSENESS: one clause per item, joined with a single space (mirrors
+ *  the existing renderBrief/renderWalk idiom's word-salad-but-scannable style). Detail beyond one
+ *  clause per item belongs to the action panel / replay, not the spoken line. */
+export function renderExchangeBoard(items: ExchangeBoardItem[]): string {
+  return items.map((i) => i.text).join(" ");
+}
+
+/** The exchange-kind -> AttentionItem.type projection for the durable-attention sync below. `null`
+ *  means "this tier is not attention-queue-worthy" (approvals/running/decisions already have their
+ *  own established surfaces — pendingApprovals/pendingActions and the spoken board itself). */
+function attentionTypeForBoardItem(item: ExchangeBoardItem): AttentionItem["type"] | null {
+  switch (item.kind) {
+    case "needs_input": return "needs_input";
+    case "failed": return "error";
+    case "complete": return "idle";
+    default: return null;
+  }
+}
+
+/**
+ * Phase 4, Step 4.2 — reconcile exchange-derived board items into the durable attention queue
+ * (`ctx.manager.attentionQueue`), each carrying `details.exchange_id` (spec: "each carrying
+ * exchange_id in details"). This is a PULL-based sync (called from every board composition) rather
+ * than a push at the moment the underlying pane transition happens — the true event-occurrence
+ * hook (src/observe/index.ts) is out of this step's allowed-paths scope, so a fresh item surfaces
+ * the first time any exchange-aware voice action (get_status_summary / catch_me_up) runs after the
+ * transition, which is a small, acceptable latency trade for staying inside the allowed surface.
+ * Dedupes on (exchange_id, type): a non-dismissed item for the SAME exchange+kind is never
+ * duplicated, so repeated syncs across many calls are idempotent.
+ */
+/** True when `board`'s exchange-derived item already has a live (non-dismissed) attention entry of
+ *  the same type in `queue` — split out purely to keep the loop body in
+ *  `syncExchangeAttentionItems` a flat one-branch-per-line shape (complexity gate). */
+function attentionAlreadyCovers(queue: AttentionItem[], exchangeId: string, type: AttentionItem["type"]): boolean {
+  return queue.some((q) => !q.dismissed && q.details?.exchange_id === exchangeId && q.type === type);
+}
+
+function newExchangeAttentionItem(
+  ctx: ActionContext,
+  item: ExchangeBoardItem,
+  type: AttentionItem["type"],
+  now: number,
+): AttentionItem {
+  return {
+    id: "att_ex_" + Math.random().toString(36).substring(2, 11),
+    type,
+    terminalId: item.paneId ?? "",
+    projectId: item.projectId ?? ctx.manager.ledger?.activeProjectId ?? "default_project",
+    message: item.text,
+    timestamp: new Date(now).toISOString(),
+    dismissed: false,
+    details: { exchange_id: item.exchangeId, kind: item.kind },
+  };
+}
+
+/** Phase 5.5 (the 4.5 review's B11 finding): COMPLETION attention items are minted exactly once
+ *  per (exchange_id, updated_at) anchor for the process lifetime. This reuses the shared
+ *  ExchangeNarrationGate (src/announcementBus.ts) — the SAME exactly-once derived-anchor primitive
+ *  the live voice-session narration seam uses — instead of a second, hand-rolled Set with identical
+ *  semantics; event type "attention_complete" keeps this mint's keyspace disjoint from the live
+ *  narration seam's own event types on the shared gate. Without it, a completion whose attention
+ *  item was dismissed or TTL-pruned (pruneAttentionQueue) was re-minted by the very next board
+ *  sync, nagging forever. Scoped to `complete` ONLY: needs_input/failed are the operator's
+ *  OUTSTANDING backlog, and their dismiss-then-re-push behavior is pinned intended
+ *  (tests/test_exchange_notifications.ts "a DISMISSED prior item does not block a fresh push") —
+ *  an unanswered question should keep resurfacing; a finished result should not. A NEW completion
+ *  on the same exchange (a fresh transition ⇒ fresh updated_at) is a fresh anchor, minted again.
+ *  Test-only reset: resetExchangeNarrationGateForTests (src/announcementBus.ts) — no separate reset
+ *  seam here anymore. */
+function completionAlreadyMinted(item: ExchangeBoardItem): boolean {
+  if (item.kind !== "complete" || !item.exchangeId) return false;
+  return !getExchangeNarrationGate().shouldNarrate(item.exchangeId, "attention_complete", item.updatedAt);
+}
+
+export function syncExchangeAttentionItems(ctx: ActionContext, board: ExchangeBoardItem[], now: number): void {
+  const queue = ctx.manager.attentionQueue;
+  if (!queue) return;
+  for (const item of board) {
+    const type = item.exchangeId ? attentionTypeForBoardItem(item) : null;
+    if (!type || !item.exchangeId) continue;
+    if (completionAlreadyMinted(item)) continue;
+    if (attentionAlreadyCovers(queue, item.exchangeId, type)) continue;
+    queue.push(newExchangeAttentionItem(ctx, item, type, now));
+  }
+  ctx.pruneAttention?.();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // composeSitrep — pure gather (D3). NO prose. Every string field is ALREADY redacted via ctx.redact
@@ -29,11 +390,10 @@ const EMPTY_SITREP_TEXT =
 export function composeSitrep(ctx: ActionContext, now: number): SitrepPayload {
   const panes = Object.entries(ctx.manager.terminals).map(([paneId, term]) => {
     const projectId = term.projectId || "default_project";
-    const rawName = ctx.manager.ledger.workspaces[projectId]?.panes?.[paneId]?.name || paneId;
     return {
       paneId,
       projectId,
-      name: ctx.redact(rawName),
+      name: paneDisplayLabel(ctx.manager.ledger, projectId, paneId, ctx.redact),
       state: term.status,
       isBusy: term.status === "Running",
       elapsedMs: Math.max(0, now - term.lastStatusChangeAt),
@@ -318,9 +678,40 @@ function rankingCoversPendingWork(payload: SitrepPayload, ranking: SitrepRanking
 // ─────────────────────────────────────────────────────────────────────────────
 // runStatusSummary — the impure entry point the get_status_summary tool def delegates to.
 // ─────────────────────────────────────────────────────────────────────────────
+/** Count of currently-idle panes, straight from `ctx.manager.terminals` — the SAME `isBusy` rule
+ *  `composeSitrep` uses (`term.status === "Running"`), without paying for that function's full
+ *  legacy gather (panes/approvals/attention/plans) just to read one field of it. Appended as a
+ *  one-line tail after an exchange-aware board so "what's free right now" is never silently
+ *  dropped just because real exchange activity exists elsewhere. Deliberately NOT routed through
+ *  renderSitrep (whose isEmptyWorld() treats an idle-only ranking as "nothing to report" — correct
+ *  for the LEGACY empty-world sentence, wrong here where the board has already established there
+ *  IS something to report). */
+function idleTailFromTerminals(ctx: ActionContext): string {
+  const idleCount = Object.values(ctx.manager.terminals).filter((t) => t.status !== "Running").length;
+  return idleCount === 0 ? "" : `${idleCount} pane${idleCount === 1 ? "" : "s"} idle.`;
+}
+
 export async function runStatusSummary(ctx: ActionContext): Promise<ActionResult> {
   try {
-    const payload = composeSitrep(ctx, Date.now());
+    const now = Date.now();
+    // Phase 4, Step 4.2: prefer the exchange-aware board whenever there is real exchange activity
+    // (see composeExchangeBoard's doc — an empty board means "no exchange activity at all", and the
+    // legacy pipeline below runs byte-identical to before this step, preserving every existing
+    // golden). Never throws (composeExchangeBoard/rankExchangeBoard are pure/guarded internally).
+    const board = rankExchangeBoard(composeExchangeBoard(ctx, now));
+    if (board.length > 0) {
+      // This path used to call composeSitrep(ctx, now) purely to read its idle-pane count back out
+      // — composeSitrep's BUG-035-style attention-queue hygiene (pruneAttention() BEFORE reading
+      // the queue) was a side effect of that call, not something idleTailFromTerminals needs, so it
+      // is preserved explicitly here rather than silently dropped now that composeSitrep itself is
+      // no longer on this path.
+      ctx.pruneAttention();
+      const tail = idleTailFromTerminals(ctx);
+      const text = tail ? `${renderExchangeBoard(board)} ${tail}` : renderExchangeBoard(board);
+      return { kind: "ok", output: text };
+    }
+
+    const payload = composeSitrep(ctx, now);
     const remoteRanking = (await ctx.policies?.rankSitrep(payload)) ?? null;
     const ranking =
       remoteRanking && rankingCoversPendingWork(payload, remoteRanking)

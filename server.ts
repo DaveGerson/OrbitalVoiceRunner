@@ -36,6 +36,11 @@ import { isBlankApiKey, shouldNudgeReconnectOnSettingsKey } from "./src/voiceRes
 import { isPaneActiveForWrite } from "./src/activePane";
 import { planRecipeApply } from "./src/recipeApply";
 import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migrate";
+import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
+import { mintExchangeForSend, beginExchangeDelivery, completeExchangeDelivery, failExchangeDelivery } from "./src/exchanges/deliveryHooks";
+import { renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, convergeTypedDraftEdit } from "./src/exchanges/draftRegistry";
+import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
@@ -149,7 +154,7 @@ function validateCapabilityGatesField(adv: Record<string, unknown>): string | nu
 // validateCapabilityGatesField), never a 400 — a newer client's extra knob must not brick the PUT.
 const SettingsSitrepShapeSchema = z.enum(["brief", "walk", "full"]);
 const SettingsFocusBindPolicySchema = z.enum(["confirm", "echo", "tiered"]);
-const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs"]);
+const VOICE_UX_KNOWN_KEYS: ReadonlySet<string> = new Set(["sitrepShape", "focusBindPolicy", "confirmTimeoutMs", "contextInjectDebounceMs", "sessionPoolHotSlots"]);
 
 /** Strip unknown voiceUx keys IN PLACE (forward compat, mirrors validateCapabilityGatesField's
  *  unknown-key strip). Pure side effect, no validation — kept separate to hold each function's own
@@ -199,6 +204,19 @@ function validateVoiceUxDebounceMs(voiceUx: Record<string, unknown>): string | n
   return null;
 }
 
+/** Validate voiceUx.sessionPoolHotSlots (when present): must be a finite integer in [0, 3].
+ *  z5c design D7 (docs/superpowers/specs/2026-07-07-z5c-session-pool-design.md): the hot-warm
+ *  background-session budget — 0 (handle-tier only) through 3 (the quota-guard ceiling against
+ *  Gemini Live concurrent-session limits). Same shape as the other voiceUx validators above. */
+function validateVoiceUxHotSlots(voiceUx: Record<string, unknown>): string | null {
+  if (voiceUx.sessionPoolHotSlots === undefined) return null;
+  const v = voiceUx.sessionPoolHotSlots;
+  if (typeof v !== "number" || !Number.isFinite(v) || !Number.isInteger(v) || v < 0 || v > 3) {
+    return "Invalid settings field 'voiceUx.sessionPoolHotSlots': must be an integer between 0 and 3.";
+  }
+  return null;
+}
+
 /** Validate (and forward-compat-strip) settings.voiceUx (when present). Returns an error message
  *  string for an invalid value on a KNOWN field, else null. Pure over everything except the
  *  unknown-key strip (mirrors validateCapabilityGatesField). */
@@ -209,7 +227,10 @@ function validateVoiceUxField(body: Record<string, unknown>): string | null {
     return "Invalid settings field 'voiceUx': expected an object.";
   }
   stripUnknownVoiceUxKeys(voiceUx);
-  return validateVoiceUxEnumFields(voiceUx) ?? validateVoiceUxConfirmTimeout(voiceUx) ?? validateVoiceUxDebounceMs(voiceUx);
+  return validateVoiceUxEnumFields(voiceUx)
+    ?? validateVoiceUxConfirmTimeout(voiceUx)
+    ?? validateVoiceUxDebounceMs(voiceUx)
+    ?? validateVoiceUxHotSlots(voiceUx);
 }
 
 export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
@@ -359,6 +380,15 @@ export interface HistoryEntry {
   timestamp: string;
   output: string;
   finalResponse?: string;
+  /**
+   * AgentExchange spine correlation (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md
+   * §5/§6 discovery 2: command history is file-backed, so this is an additive optional JSON
+   * field, not a SQLite column). Stamped ONLY by an exchange-driven write (the flag
+   * JANUS_EXCHANGE_SPINE gated dispatch/approval paths); the raw WS input path and every
+   * legacy/manual command NEVER set it — never adopted heuristically, even for byte-identical
+   * text (spec §5 correlation-map row, "command-history entry").
+   */
+  exchangeId?: string;
 }
 
 // 4E.1: HistoryManager used to fs.readFileSync + JSON.parse the WHOLE multi-pane
@@ -466,12 +496,13 @@ export class HistoryManager {
     this.scheduleFlush(filePath);
   }
 
-  public addCommand(terminalId: string, command: string) {
+  public addCommand(terminalId: string, command: string, exchangeId?: string) {
     const history = this.loadHistory(terminalId);
     const newEntry: HistoryEntry = {
       command,
       timestamp: new Date().toISOString(),
-      output: ""
+      output: "",
+      ...(exchangeId ? { exchangeId } : {}),
     };
     history.push(newEntry);
     this.saveHistory(terminalId, history);
@@ -638,6 +669,31 @@ let store: JanusStore | null = null;
     // to start rather than run in an undefined, silently-broken state.
     console.error("[STORE] JanusStore unavailable even after the quarantine retry — SQLite is the only ledger backend, so the server cannot boot. Check disk space/permissions for JANUS_DB (or the CWD default .janus.db); the preceding [STORE] log lines carry the underlying error.");
     throw new Error("[STORE] JanusStore failed to initialize and there is no fallback ledger backend (dbt3 retired JANUS_LEDGER_BACKEND=legacy). Refusing to boot.");
+  }
+}
+
+// AgentExchange spine (Phase 1, Step 1.5b): wire the durable persistence bridge + run boot
+// recovery — MUST happen after the store above is live and BEFORE the manager/panes exist (this
+// is still synchronous module-scope boot; panes boot INERT — CLAUDE.md — so nothing can race this
+// with a real exchange write). `off` mode (the production default) is a complete no-op: the store
+// is never wired, recovery never walks agent_exchanges. Never fatal — a recovery failure is
+// logged loudly and boot continues (initExchangeSpineOnBoot's own try/catch); only the store-init
+// failure above is fatal.
+{
+  const exchangeRecovery = initExchangeSpineOnBoot(store);
+  if (exchangeRecovery) {
+    console.log(
+      `[exchange-spine] boot recovery: kept=${exchangeRecovery.kept.length} interrupted=${exchangeRecovery.interrupted.length} reverted=${exchangeRecovery.reverted.length}`
+    );
+    // Phase 4, Step 4.3: draft-registry rehydration (only present when JANUS_INSTRUCTION_ENVELOPE
+    // is active) — the count of open Workbench/voice drafts + outstanding-approval bindings this
+    // boot rebuilt from durable agent_exchanges rows, so a restart's effect on in-flight
+    // communication is visible in the same boot log line boot recovery already uses.
+    if (exchangeRecovery.draftRegistry) {
+      console.log(
+        `[exchange-spine] draft-registry rehydration: drafts=${exchangeRecovery.draftRegistry.rehydratedDrafts.length} approvalBindings=${exchangeRecovery.draftRegistry.rehydratedApprovalBindings.length}`
+      );
+    }
   }
 }
 
@@ -999,21 +1055,106 @@ function registerRawInputRoute(
 // `requestVoiceReconnect` are in module scope; only the connection-bound `broadcast` +
 // `broadcastDraft` (and the module `requestVoiceReconnect`, passed for locality) are injected. Every
 // route path, verb, branch, status code, and broadcast is byte-identical to the inline block.
+// `convergeTypedDraftEdit` (spec docs/superpowers/specs/2026-07-09-instruction-routing.md §5.2) is
+// the single shared implementation exported by src/exchanges/draftRegistry.ts — this REST route's
+// own byte-identical copy (and the WS `draft_edit` twin that used to live in src/voice/index.ts)
+// were folded into it.
+
+/**
+ * Step 3.5: settle the open envelope draft when the OPERATOR sends via the Workbench lane
+ * (spec §5.3 — under `primary` the operator-direct send stamps the same exchange as delivered).
+ * Any approval a prior voice send staged for this draft is invalidated FIRST — the operator's
+ * direct send supersedes it, and letting it resolve later would double-type the pane. Best-effort.
+ */
+function settleEnvelopeDraftOnOperatorSend(
+  projectId: string,
+  paneId: string,
+  applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown,
+): void {
+  if (!instructionEnvelopeIsPrimary()) return;
+  try {
+    invalidateOutstandingApproval(projectId, paneId, applyResolution);
+    clearOpenDraft(projectId, paneId);
+    clearProseOverride(projectId, paneId);
+  } catch (e) {
+    console.error("[instruction-envelope] operator-send settle failed:", e);
+  }
+}
+
+/** Step 3.5 (BUG-D, spec §6.2): the Workbench send refuses an over-limit draft — never silent
+ *  truncation. Returns the overflow character count (0 = within the pane preset's ceiling).
+ *  `primary` only: the legacy lanes are byte-identical with the flag off. */
+function operatorSendOverflow(paneId: string, text: string): number {
+  if (!instructionEnvelopeIsPrimary()) return 0;
+  const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
+  const profile = RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom;
+  return renderedOverflow(text, profile);
+}
+
+/**
+ * Phase 4, Step 4.3 (REST-lane gap closure): the Workbench POST draft/send route writes directly
+ * (`term.writeInput`) — it never goes through dispatchProposal/applyDispatchDecision, so unlike
+ * every voice-side send it never got an AgentExchange, and therefore never got return-channel
+ * correlation (a subsequent pane idle/needs_input/failure signal had nothing to settle). This
+ * mints one, mirroring src/voice/index.ts's `stampExchangeForDispatch` (the only other envelope-
+ * draft exchange mint site) byte-for-byte in spirit: same createExchange call, same
+ * instruction_envelope_json stamp from the pane's open draft when one exists. Best-effort; a
+ * no-op (returns undefined) unless BOTH flags are active — `JANUS_EXCHANGE_SPINE` off means there
+ * is no spine to correlate against, and `JANUS_INSTRUCTION_ENVELOPE` not primary means this route
+ * is sending the LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before
+ * this existed in that case).
+ */
+function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: string): string | undefined {
+  if (!instructionEnvelopeIsPrimary()) return undefined;
+  return mintExchangeForSend({
+    projectId,
+    paneId,
+    operatorUtterance: "Workbench direct send",
+    distilledInstruction: text,
+  });
+}
+
+/** The two-phase durable-intent ordering (spec §2b) around the Workbench's direct pane write —
+ *  mirrors `renderApproved` (src/gating/index.ts) / `applyAutoExecute` (src/dispatch/paneWrite.ts)
+ *  exactly: `delivery_attempted` genuinely precedes the write, `delivery_succeeded` genuinely
+ *  follows it, and a write that throws certainly-fails the exchange back to `draft` instead of
+ *  leaving it stranded `staged` (which boot recovery would otherwise have to quarantine as merely
+ *  UNCERTAIN). Thin wrappers over the shared hooks (src/exchanges/deliveryHooks.ts, also used by
+ *  src/gating/index.ts's approved-write path and src/dispatch/paneWrite.ts's auto_execute arm) —
+ *  every one is a no-op without an exchangeId (the flag-off case above). */
+function beginExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
+  beginExchangeDelivery(exchangeId, "Workbench send: beginDeliveryAttempt");
+}
+
+function completeExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined): void {
+  completeExchangeDelivery(exchangeId, "Workbench send: completeDelivery");
+}
+
+function failExchangeDeliveryForWorkbenchSend(exchangeId: string | undefined, reason: string): void {
+  failExchangeDelivery(exchangeId, reason, "Workbench send: failDelivery");
+}
+
 function registerDraftAndSettingsRoutes(
   app: express.Express,
   deps: {
     broadcast: (msg: any) => void;
     broadcastDraft: (projectId: string, paneId: string) => void;
     requestVoiceReconnect: () => void;
+    /** Step 3.5: the gating resolve choke-point — the typed-edit convergence + operator-direct
+     *  send use it to invalidate a pending approval staged from a now-stale draft version. */
+    applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown;
   }
 ): void {
-  const { broadcast, broadcastDraft, requestVoiceReconnect } = deps;
+  const { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution } = deps;
 
   // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
   app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
     const draft = manager.ledger.getDraft(req.params.projectId, req.params.paneId)
       ?? { text: "", updatedAt: new Date().toISOString() };
-    res.json({ draft });
+    // Phase 3, Step 3.3: same additive `exchange` projection as broadcastDraft — a null/absent
+    // field under `off` (default) is a no-op for every existing caller of this route.
+    const exchange = instructionEnvelopeActive() ? viewOpenDraft(req.params.projectId, req.params.paneId) : null;
+    res.json({ draft, exchange });
   });
 
   app.put("/api/panes/:projectId/:paneId/draft", (req, res) => {
@@ -1021,6 +1162,7 @@ function registerDraftAndSettingsRoutes(
     if (text === undefined) { res.status(400).json({ error: "Missing text field" }); return; }
     const ok = manager.ledger.setDraft(req.params.projectId, req.params.paneId, text, "operator");
     if (!ok) { res.status(404).json({ error: "Pane not found" }); return; }
+    convergeTypedDraftEdit(req.params.projectId, req.params.paneId, String(text), applyResolution);
     broadcastDraft(req.params.projectId, req.params.paneId);
     res.json({ success: true });
   });
@@ -1029,6 +1171,18 @@ function registerDraftAndSettingsRoutes(
   // so work composed for one pane is never lost when the operator switches to another.
   app.get("/api/projects/:projectId/drafts", (req, res) => {
     res.json({ drafts: manager.ledger.listDrafts(req.params.projectId) });
+  });
+
+  // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): a small, bounded, read-only
+  // projection of every LIVE pane's most-recent AgentExchange (src/exchanges/fleetProjection.ts) —
+  // mirrors GET .../draft's viewOpenDraft pattern, but covers a pane whose exchange has already
+  // moved PAST the open-draft stage (running/agent_complete/agent_failed/interrupted), which the
+  // draft registry alone cannot. No store ⇒ an empty map (never an error — the fleet board just
+  // shows no exchange enhancement for that pane, falling back to its plain Station fields).
+  app.get("/api/fleet/exchange-summary", (_req, res) => {
+    if (!store) { res.json({ summaries: {} }); return; }
+    const paneIds = Object.keys(manager.terminals);
+    res.json({ summaries: projectFleetExchangeSummaries(store, paneIds, redactSecrets) });
   });
 
   // Send the draft to its pane. This is an OPERATOR-DIRECT write (the operator is above the gate,
@@ -1040,9 +1194,30 @@ function registerDraftAndSettingsRoutes(
     if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
     const term = manager.terminals[paneId];
     if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
-    HistoryManager.getInstance().addCommand(paneId, text);
-    term.writeInput(text);
+    // Step 3.5 (BUG-D, spec §6.2): refuse an over-limit send — never silent truncation. Primary only.
+    const overflow = operatorSendOverflow(paneId, text);
+    if (overflow > 0) {
+      res.status(400).json({ error: `Draft is ${overflow} characters over this pane's size limit — shorten it before sending.` });
+      return;
+    }
+    // Phase 4, Step 4.3: mint + stamp the two-phase delivery markers around this direct write —
+    // closes the REST-lane gap (this route bypassed dispatchProposal entirely, so it never got
+    // return-channel correlation like the voice-side send does). Best-effort no-op unless both
+    // flags are active.
+    const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
+    beginExchangeDeliveryForWorkbenchSend(exchangeId);
+    HistoryManager.getInstance().addCommand(paneId, text, exchangeId);
+    try {
+      term.writeInput(text);
+    } catch (e) {
+      failExchangeDeliveryForWorkbenchSend(exchangeId, "workbench_write_threw");
+      throw e;
+    }
+    completeExchangeDeliveryForWorkbenchSend(exchangeId);
     broadcast({ type: "command_auto_executed", terminalId: paneId, cmd: redactSecrets(text) });
+    // Step 3.5 (spec §5.3): the operator-direct send DELIVERED the draft — close the open envelope
+    // exchange and withdraw any voice-staged approval for it (it would otherwise double-deliver).
+    settleEnvelopeDraftOnOperatorSend(projectId, paneId, applyResolution);
     manager.ledger.setDraft(projectId, paneId, "", "operator");
     broadcastDraft(projectId, paneId);
     res.json({ success: true });
@@ -1255,7 +1430,7 @@ function createMemorySubsystem(
     { manager: memoryManager, store: memoryStore, redact: redactSecrets },
     {
       totalBudgetChars: manager.settings.advanced?.memoryBudgetChars ?? 4800,
-      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05 },
+      weights: { project: 0.40, pane: 0.30, breadcrumbs: 0.15, board: 0.10, frame: 0.05, eventFocus: 0.15 },
       breadcrumbMax: manager.settings.advanced?.breadcrumbMax ?? 12,
       breadcrumbMaxAgeMs: manager.settings.advanced?.breadcrumbMaxAgeMs ?? 900_000,
     },
@@ -1355,7 +1530,11 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   }
   function broadcastDraft(projectId: string, paneId: string) {
     const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
-    broadcast({ type: "draft_updated", projectId, paneId, draft });
+    // Phase 3, Step 3.3 (instruction-routing spec §5): additive field only — a client that doesn't
+    // know about `exchange` ignores it; the draft text/shape are byte-identical either way. Omitted
+    // to plain `null` unless the flag is shadow/primary, so the OFF-default path never changes.
+    const exchange = instructionEnvelopeActive() ? viewOpenDraft(projectId, paneId) : null;
+    broadcast({ type: "draft_updated", projectId, paneId, draft, exchange });
   }
   function appendActiveDraft(line: string, updatedBy: "janus" | "operator") {
     const t = activeDraftTarget();
@@ -1371,6 +1550,16 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const announcementBus = new AnnouncementBus({
     broadcast,
     getTemplates: () => manager.settings.announcements || DEFAULT_ANNOUNCEMENT_TEMPLATES,
+    // Phase 5, Step 5.1 (Fleet View "communication-by-exception"): per-project mute — resolve the
+    // announcing pane's project the same way the rest of the server does (Terminal.projectId) and
+    // check it against the operator-editable settings.projects.mutedProjectIds. Absent/empty list
+    // ⇒ never muted (today's behavior). Read fresh every call, so a live PUT /api/settings mute
+    // toggle takes effect on the very next announcement.
+    isPaneMuted: (terminalId) => {
+      const projectId = manager.terminals[terminalId]?.projectId;
+      if (!projectId) return false;
+      return (manager.settings.projects.mutedProjectIds || []).includes(projectId);
+    },
   });
 
   // BUG-035: keep the attentionQueue bounded + TTL-evicted wherever it is mutated.
@@ -1474,7 +1663,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     announcementBus,
     pushApprovalNarration,
     sanitizeSettingsForClient,
-    addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
+    addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
   });
   // Destructure the gating seam so the existing inline call sites across the REST + WS surfaces keep
   // referencing these by name. ONE shared object by reference — the pending stores + the posture
@@ -1778,7 +1967,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // VERBATIM extraction (CC paydown): the four per-pane WIP draft routes (GET/PUT pane draft, GET
   // project drafts, POST draft/send) then the two settings routes (GET/PUT) — registered together,
   // IN THE SAME ORDER, by this helper at the SAME point in the boot sequence.
-  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect });
+  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution });
 
   // dec-4 (DBT5): the WS-E pending-approval store + the deferred-action store + their durable boot
   // hydration, effectiveModeFor / effectiveCapabilityGateFor / gateCapability / gateOrDefer, the
@@ -1838,7 +2027,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pruneAttention,
     interactionLog,
     recipes,
-    addCommand: (terminalId, command) => HistoryManager.getInstance().addCommand(terminalId, command),
+    addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
     ai,
     boundLiveConnector,
     boundSessionAiFactory,

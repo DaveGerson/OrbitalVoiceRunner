@@ -273,6 +273,80 @@ export interface PaneDraft {
   updatedBy?: "janus" | "operator";
 }
 
+// Phase 3, Step 3.3 — the client-side projection of a pane's open InstructionEnvelope draft
+// (docs/superpowers/specs/2026-07-09-instruction-routing.md §5). Additive, optional everywhere it
+// is threaded: server truth only, mirrored one-way from the `exchange` field on the draft_updated
+// WS frame and the GET /api/panes/:projectId/:paneId/draft response — src/exchanges/draftRegistry.ts's
+// `viewOpenDraft` is the server-side serializer this shape mirrors structurally (kept as an
+// independent declaration so the client bundle never imports the zod-backed exchanges module).
+// `null`/absent whenever JANUS_INSTRUCTION_ENVELOPE is "off" (default) or the pane has no open
+// draft — every existing PaneDraft-only surface is unaffected either way.
+export type ExchangeReadiness =
+  | { ready: true }
+  | { ready: false; missing: "target" | "objective"; clarification: string };
+
+export interface ExchangeDraftView {
+  exchangeId: string;
+  target: { projectId: string; paneId: string } | null;
+  objective: string;
+  relevantContext: string[];
+  constraints: string[];
+  requestedOutput: string | null;
+  completionSignal: string | null;
+  /** Bumps on every revise (voice field edit or typed hand-edit convergence) — spec §5. */
+  draftVersion: number;
+  /** Versions the exchange machinery has recorded as sent — stamped by the voice
+   *  `send_instruction` verb; the Workbench REST send lane (step 3.5) now CLOSES the exchange
+   *  server-side on delivery, so a surviving view with sentVersions implies a pending/blocked
+   *  send, never a completed REST one. */
+  sentVersions: number[];
+  /** The draft version currently parked as a PENDING operator approval, or null/absent when none
+   *  is outstanding (step 3.5) — distinguishes "awaiting approval" from "delivered" honestly. */
+  pendingApprovalVersion?: number | null;
+  readiness: ExchangeReadiness;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5, Step 5.1 — Fleet View "communication-by-exception": a small, read-only,
+// per-pane projection off the durable AgentExchange spine (src/exchanges/fleetProjection.ts),
+// mirroring ExchangeDraftView's client-facing-projection idiom (viewOpenDraft) but for a
+// pane's MOST RECENT exchange regardless of whether its draft is still "open" — so a pane
+// whose exchange has already moved to running/agent_complete/agent_failed/interrupted still
+// carries a summary. GET /api/fleet/exchange-summary; additive, bounded (one row per pane),
+// absent/undefined for a pane with no exchange history at all (zero visual delta).
+// ─────────────────────────────────────────────────────────────────────────────
+export type FleetExchangeTier = 1 | 2 | 3 | 4 | 5 | 6;
+export type FleetExchangeKind =
+  | "needs_input" | "approval" | "failed" | "complete" | "running" | "staged" | "decision";
+
+export interface FleetExchangeSummary {
+  exchangeId: string;
+  /** The exchange's raw lifecycle state (ExchangeState) — carried as a string at this client
+   *  boundary (mirrors PersistedDraftEnvelope's cross-boundary convention) so this type has no
+   *  dependency on src/exchanges/types.ts's server-only union. */
+  state: string;
+  /** Six-tier priority (spec docs/superpowers/specs/2026-06-25-fleet-view-design.md + the 4.2
+   *  composeExchangeBoard tiers) — 1 = most urgent (needs input / approval). */
+  tier: FleetExchangeTier;
+  kind: FleetExchangeKind;
+  /** Already-redacted, capped instruction summary (distilled_instruction), or null. */
+  instructionSummary: string | null;
+  /** Already-redacted, capped terminal_state text — the reason the pane is waiting, or null. */
+  waitingReason: string | null;
+  /** Already-redacted, capped result_summary — the last meaningful agent report, or null. */
+  resultSummary: string | null;
+  /** Epoch ms this exchange row last changed (updated_at) — the card's age anchor. */
+  updatedAt: number;
+  /** Phase 5.5 (release review): server-computed quick-action offers, keyed off the REAL
+   *  lifecycle/recovery rules (src/exchanges/recoveryActions.ts's classifyRetryEligibility +
+   *  src/exchanges/lifecycle.ts's CANCELLABLE_STATES) rather than the display `kind` — `kind`
+   *  collapses `agent_failed` (terminal, never retryable) and `interrupted` (retryable) into one
+   *  "failed" chip. Optional so an older wire payload without this field still degrades cleanly —
+   *  src/orbital/fleetExchangeOrdering.ts's fleetRetryOffered/fleetCancelOffered fall back to their
+   *  own local rule when it's absent. */
+  offers?: { retry: boolean; cancel: boolean };
+}
+
 export interface PaneMeta {
   pane_id: string;
   name: string;
@@ -344,6 +418,16 @@ export interface VoiceUxSettings {
   // event is allowed to inject again (session-start always bypasses). Reuses this block's
   // existing strip/validate idiom (VOICE_UX_KNOWN_KEYS + a dedicated validator in server.ts).
   contextInjectDebounceMs: number;
+  // z5c design D7 (docs/superpowers/specs/2026-07-07-z5c-session-pool-design.md): the number
+  // of ADDITIONAL hot-warm background sessions (beyond the one foreground session) the
+  // per-project session pool holds open. 0 = handle-tier only (no background sockets), default
+  // 1, capped at 3 (a quota guard against Gemini Live's concurrent-session limits). Read ONCE
+  // at connect time (src/voice/sessionPool.ts's resolveHotSlotBudget) — per D10 this is
+  // deliberately NOT hot-reloaded mid-session; a PUT here applies on the NEXT voice session,
+  // same "Apply & Reconnect" idiom as voiceAi.systemPrompt/voiceAi.voice. Optional so a
+  // persisted settings file from before this field existed keeps loading (shallow-merged with
+  // DEFAULT_VOICE_UX, same as every other field in this block).
+  sessionPoolHotSlots?: number;
 }
 
 export const DEFAULT_VOICE_UX: VoiceUxSettings = {
@@ -351,6 +435,11 @@ export const DEFAULT_VOICE_UX: VoiceUxSettings = {
   focusBindPolicy: "confirm",
   confirmTimeoutMs: 10_000,
   contextInjectDebounceMs: 3000,
+  // z5c D7: sessionPoolHotSlots is deliberately ABSENT here (left undefined), not defaulted to 1 —
+  // src/voice/sessionPool.ts's resolveHotSlotBudget() already treats "absent" as "default to 1", so
+  // this constant's SHAPE stays byte-identical to every pre-z5c snapshot/round-trip test that
+  // asserts DEFAULT_VOICE_UX's exact key set (tests/test_voice_ux_settings.ts, out of this task's
+  // edit scope). Setting a literal value here would add a key those tests don't expect.
 };
 
 export interface SystemSettings {
@@ -389,6 +478,13 @@ export interface SystemSettings {
   projects: {
     activeContext: string;
     localWorkspacePath: string;
+    // Phase 5, Step 5.1 (Fleet View communication-by-exception): project ids whose PROACTIVE
+    // announcements (AnnouncementBus earcon + on-screen notification) are muted. Absent/empty ⇒
+    // every project announces (today's behavior, byte-identical). Persists through the existing
+    // PUT /api/settings idiom — no new settings surface. Does NOT affect the durable attention
+    // queue / SITREP / exchange board — those stay visible on the fleet board itself; muting only
+    // silences the proactive earcon+toast+desktop-notification triad for that project.
+    mutedProjectIds?: string[];
   };
   presets: CliPreset[];
   // WS-D: operator-editable proactive-announcement message templates. `{pane}` and
@@ -446,7 +542,10 @@ export interface AttentionItem {
   id: string;
   // "idle" = informational completion (dispatch-group join, src/observe/index.ts) — consumers only
   // interpolate `type` into text, so the widening is display-safe.
-  type: "approval" | "exited" | "error" | "build-failed" | "confirmation" | "idle";
+  // "needs_input" (Phase 4, Step 4.2): an exchange-correlated agent question surfaced by the
+  // exchange-aware attention sync (src/voice/sitrep.ts syncExchangeAttentionItems) — distinct from
+  // "confirmation" (a co-pilot suggestion) because it names a REAL unanswered agent question.
+  type: "approval" | "exited" | "error" | "build-failed" | "confirmation" | "idle" | "needs_input";
   terminalId: string;
   projectId: string;
   message: string;
