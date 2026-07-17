@@ -14,8 +14,10 @@ import assert from "node:assert";
 import {
   MOCK_GLOBAL_TIMEOUT_MS,
   LIVE_GLOBAL_TIMEOUT_MS,
+  SCRIPTED_GLOBAL_TIMEOUT_MS,
   OUTER_MOCK_WALL_MS,
   OUTER_LIVE_WALL_MS,
+  OUTER_SCRIPTED_WALL_MS,
   WATCHDOG_BUFFER_MS,
 } from "../scripts/e2eBudgets.mjs";
 
@@ -37,6 +39,14 @@ test("live lane global timeout sits comfortably under the outer live wall", () =
   );
 });
 
+test("scripted lane global timeout sits comfortably under the outer scripted wall", () => {
+  // BEAD wsm-e2e-pinned-s1ap: the scripted lane boots the same real server+vite webServer as live.
+  assert.ok(
+    SCRIPTED_GLOBAL_TIMEOUT_MS + MARGIN_MS <= OUTER_SCRIPTED_WALL_MS,
+    `scripted global timeout (${SCRIPTED_GLOBAL_TIMEOUT_MS}) + margin must be <= outer wall (${OUTER_SCRIPTED_WALL_MS})`,
+  );
+});
+
 test("wrapper watchdog (globalTimeout + buffer) still fires before the outer wall", () => {
   // The defense-in-depth watchdog fires LATER than Playwright's globalTimeout but must still beat
   // the external wall, otherwise the orphan path the bead reports can recur.
@@ -48,14 +58,23 @@ test("wrapper watchdog (globalTimeout + buffer) still fires before the outer wal
     LIVE_GLOBAL_TIMEOUT_MS + WATCHDOG_BUFFER_MS < OUTER_LIVE_WALL_MS,
     "live watchdog must fire before the outer live wall",
   );
+  assert.ok(
+    SCRIPTED_GLOBAL_TIMEOUT_MS + WATCHDOG_BUFFER_MS < OUTER_SCRIPTED_WALL_MS,
+    "scripted watchdog must fire before the outer scripted wall",
+  );
 });
 
 test("budgets are positive, ordered numbers", () => {
-  for (const v of [MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS, OUTER_MOCK_WALL_MS, OUTER_LIVE_WALL_MS, WATCHDOG_BUFFER_MS]) {
+  for (const v of [
+    MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS, SCRIPTED_GLOBAL_TIMEOUT_MS,
+    OUTER_MOCK_WALL_MS, OUTER_LIVE_WALL_MS, OUTER_SCRIPTED_WALL_MS, WATCHDOG_BUFFER_MS,
+  ]) {
     assert.equal(typeof v, "number");
     assert.ok(v > 0, "every budget must be a positive number of ms");
   }
-  // Live gets a longer leash than mock (real PTY spawns), and each wall exceeds its own cap.
+  // Live/scripted get a longer leash than mock (real server boot), and each wall exceeds its cap.
   assert.ok(LIVE_GLOBAL_TIMEOUT_MS > MOCK_GLOBAL_TIMEOUT_MS);
+  assert.ok(SCRIPTED_GLOBAL_TIMEOUT_MS > MOCK_GLOBAL_TIMEOUT_MS);
   assert.ok(OUTER_LIVE_WALL_MS > OUTER_MOCK_WALL_MS);
+  assert.ok(OUTER_SCRIPTED_WALL_MS > OUTER_MOCK_WALL_MS);
 });

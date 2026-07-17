@@ -30,6 +30,12 @@ export const INLINE_EXCEPTIONS: readonly InlineException[] = [
   // ── infra (non-action) ──
   { method: "use", path: "/api", category: "infra", reason: "shared director-token auth middleware mount" },
   { method: "get", path: "*", category: "infra", reason: "SPA catch-all — serves index.html for client routes" },
+  // wsm-e2e-pinned-s1ap: the scripted-live e2e control channel. NOT actions and NEVER voice-commandable —
+  // these two routes exist ONLY when the JANUS_MOCK_LIVE=1 non-production gate is active (they are not
+  // registered at all otherwise) and are loopback-fenced per request. A registry def is exactly what they
+  // must never become: the registry is the operator-facing catalog, and this is test scaffolding.
+  { method: "post", path: "/__scripted_live__/emit", category: "infra", reason: "scripted-live e2e lane: inject a raw Gemini envelope; gate-registered + loopback-only (src/voice/scriptedLiveConnector.ts)" },
+  { method: "post", path: "/__scripted_live__/close", category: "infra", reason: "scripted-live e2e lane: simulate the Gemini socket dropping; gate-registered + loopback-only" },
   // ── exception: drafts (operator hand-rail; ungated plumbing per P2; voice uses propose_command) ──
   { method: "get", path: "/api/panes/:projectId/:paneId/draft", category: "exception", reason: "draft buffer read on pane-switch; operator hand-rail" },
   { method: "put", path: "/api/panes/:projectId/:paneId/draft", category: "exception", reason: "draft buffer persist (WS draft_edit primary; REST fallback)" },
