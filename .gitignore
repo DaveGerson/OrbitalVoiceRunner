@@ -17,6 +17,11 @@ logs/
 .janus_interaction_log*.jsonl
 .janus.db*
 .janus*.bak
+
+# wsm-e2e-pinned-arkr: raw Gemini Live capture traces (JANUS_CAPTURE_LIVE_TRACES=1). UNREDACTED —
+# operator/model speech + tool args verbatim. Never commit directly; run scripts/redact-trace.mjs
+# and commit only the reviewed *.redacted.jsonl sibling (see docs/process/LIVE_TRACE_CAPTURE.md).
+.janus_traces/
 _ptyprobe_test*.cjs
 dist-tmp/
 

@@ -44,6 +44,7 @@ import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
+import { assertValidFrameIfEnabled } from "./src/frames/catalog";
 import { z } from "zod";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { CAPABILITY_DEFS } from "./src/actions/capabilities";
@@ -1506,6 +1507,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const coreState = createCoreState(store);
 
   function broadcast(msg: any) {
+    // bead wsm-e2e-pinned-ys8d: the observe/board choke point. `broadcast` is passed by reference
+    // (never reimplemented) through every ctx.broadcast/deps.broadcast/this.broadcast call site in
+    // src/gating, src/actions/defs/*, src/dispatch, src/announcementBus.ts, src/applyPaneMode.ts,
+    // src/actionEffects.ts, src/voice/*, etc. — hardening this ONE body validates every one of them.
+    // Zero-cost outside test mode (a single cached boolean check; see src/frames/catalog.ts).
+    assertValidFrameIfEnabled(msg);
     const data = JSON.stringify(msg);
     for (const client of coreState.clients) {
       if (client.readyState === 1) { // OPEN

@@ -33,8 +33,12 @@ export interface EventEffect {
  * `watch_rule_suggested`: a matched watch rule is a co-pilot SUGGESTION, never an autonomous
  * write. The suggestion is queued via a paired `attention_updated` event (which feeds
  * setAttentionQueue), so here we only sound the chime.
+ *
+ * Exported (bead wsm-e2e-pinned-ys8d) so tests/test_frame_contracts.ts can include the classic UI's
+ * eventBus-fallback-reachable types (dispatchWsMessage routes anything NOT in WS_HANDLERS here) when
+ * computing what the classic UI actually consumes — this module is already node-test-safe.
  */
-const STATIC_EFFECTS: Record<string, EventEffect> = {
+export const STATIC_EFFECTS: Record<string, EventEffect> = {
   plans_updated: { setter: "setPlans", earcon: null },
   plan_step_completed: { setter: "fetchPlans", earcon: "execute" },
   plan_completed: { setter: "fetchPlans", earcon: "success" },

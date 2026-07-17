@@ -54,6 +54,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts, appendThinkingFragment } from "../liveTranscripts";
+import { createLiveTraceWriter, wrapOnMessageWithCapture } from "./liveTraceCapture";
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
 import { applyPaneInputFrame } from "./paneInputFrame";
@@ -63,6 +64,7 @@ import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/ty
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
 import { redactDeep } from "../interactionLog";
 import { recentTurns } from "./recentTurns";
+import { sendFrame } from "../frames/catalog";
 import type { JanusStore } from "../store/sqliteStore";
 import type { CoreState } from "../core/coreState";
 import type { Gating } from "../gating";
@@ -808,7 +810,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const tokenFromCookie = getCookie(req.headers.cookie, "auth_token");
     if (tokenFromCookie !== API_AUTH_TOKEN) {
       console.warn("[SECURITY] Blocked unauthorized WebSocket connection attempt.");
-      clientWs.send(JSON.stringify({ type: "error", message: "Unauthorized WebSocket access. Please reload the interface." }));
+      sendFrame(clientWs, { type: "error", message: "Unauthorized WebSocket access. Please reload the interface." });
       clientWs.close(4001, "Unauthorized");
       return true;
     }
@@ -936,6 +938,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // reconnects) — see mintVoiceSessionId's doc comment.
       voiceSessionId: mintVoiceSessionId(),
     };
+
+    // BEAD wsm-e2e-pinned-arkr: raw Gemini Live capture tap — env-gated (JANUS_CAPTURE_LIVE_TRACES=1),
+    // resolved ONCE here (per connection, not per message, not per reconnect) so the steady-state
+    // hot-path cost when disabled is a single already-paid env lookup. Bound to THIS connection's
+    // stable voiceSessionId, so every (re)connect on this WS appends to the SAME trace file. See
+    // src/voice/liveTraceCapture.ts for the fail-soft write path and the wrapper composed below.
+    const liveTraceWriter = createLiveTraceWriter(state.voiceSessionId);
 
     // z5c design (spec 2026-07-07-z5c-session-pool-design.md D2/D5): the per-project session pool's
     // decision layer, scoped to THIS WS connection (dies with it, exactly like `state.session` — D5's
@@ -1431,7 +1440,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // Step 5 (single active pane): Janus may only propose to the pane the operator has open, so
           // the operator can SEE and improve the command before it lands (HiTL). Enforced on voice.
           sess,
-          notifyPending: (frame) => clientWs.send(JSON.stringify(frame)),
+          notifyPending: (frame) => sendFrame(clientWs, frame),
           enforceActivePaneGuard: true,
           origin: "voice",
         }
@@ -1856,11 +1865,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               });
             }
 
-            clientWs.send(JSON.stringify({
+            sendFrame(clientWs, {
               type: "transcript_text",
               sender: "User",
               text: userUtterance
-            }));
+            });
 
             const cleanUtter = userUtterance.trim();
             if (!shouldRouteUtterance(cleanUtter)) return;
@@ -1923,11 +1932,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // closed/closing — a throw here must NOT skip the draft append below (that append is
             // SQLite-backed and survives a dead socket; only this frame send needs a live one).
             try {
-              clientWs.send(JSON.stringify({
+              sendFrame(clientWs, {
                 type: "transcript_text",
                 sender: "Janus",
                 text: modelUtterance
-              }));
+              });
             } catch (err) {
               console.error("[VOICE] failed to send transcript_text frame (client socket likely closed):", err);
             }
@@ -1962,11 +1971,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               kind: "system",
               data: { tag: "grounding", queries: grounding.queries, sources: grounding.sources },
             });
-            clientWs.send(JSON.stringify({
+            sendFrame(clientWs, {
               type: "grounding",
               queries: grounding.queries,
               sources: grounding.sources,
-            }));
+            });
           };
 
           // Pass model audio back to the client — the SINGLE spoken-output choke point (responseModalities
@@ -1979,7 +1988,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             for (const part of parts) {
               const audio = part?.inlineData?.data;
               if (audio) {
-                clientWs.send(JSON.stringify({ type: "audio", audio }));
+                sendFrame(clientWs, { type: "audio", audio });
               }
             }
           };
@@ -1992,7 +2001,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
               // wsm-e2e-pinned-zmu5: barge-in seizes the turn — flush the partial thought FIRST so the
               // spoken words captured so far are never silently dropped.
               flushModelThinking();
-              clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
+              sendFrame(clientWs, { type: "interrupted", interrupted: true });
               // B1 (turn-aware ack): a barge-in means the operator seized the turn. Latch it (so an async-
               // spawn ack SUPPRESSES rather than speaks over them) and stamp recency. Cleared when the model
               // next takes the turn (setModelTurn) or on the next operator transcript.
@@ -2147,7 +2156,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       const justConnected = await boundLiveConnector(sessionAi, {
         model: liveModel,
         callbacks: {
-          onmessage: async (message: LiveServerMessage) => {
+          // BEAD wsm-e2e-pinned-arkr: the capture tap wraps the REAL onmessage at the live-connector
+          // boundary — every raw inbound message is appended to the trace file (when enabled) BEFORE
+          // it reaches normal processing. `liveTraceWriter` is the no-op no-cost writer when capture
+          // is disabled (the default), so this wrapping is transparent in the steady state.
+          onmessage: wrapOnMessageWithCapture(async (message: LiveServerMessage) => {
             const session = state.session;
             // Thin dispatcher (Phase 7 CC refactor): each concern is handled by a nested helper above,
             // invoked in the SAME order the inline body ran them. The helpers own their own guards, so
@@ -2183,7 +2196,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // `session` is the live handle that delivered this message, so it is non-null here; the
             // guard narrows `Session | null` -> `Session` for the typed dispatch seam (bead ec8).
             if (session) await handleToolCalls(message, session);
-          },
+          }, liveTraceWriter),
         // QW3 (bead qw3): the Gemini Live socket can die WITHOUT the client WS closing — a network
         // reset, a server-side close, an SDK error. With only `onmessage`, nothing fired:
         // coreState.activeLiveSession kept a dead handle and the frontend was never told. These siblings mirror
@@ -2444,10 +2457,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // fires (the connect is async; the operator's WS can close mid-connect), and an unguarded
         // .send() on a closed socket throws, which would escape this catch handler entirely.
         try {
-          clientWs.send(JSON.stringify({
+          sendFrame(clientWs, {
             type: "error",
             message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings."
-          }));
+          });
         } catch { /* client gone */ }
       }
     }
@@ -2502,10 +2515,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       } catch (err: any) {
         console.error("Failed to establish Gemini Live session (initial setup):", err);
         try {
-          clientWs.send(JSON.stringify({
+          sendFrame(clientWs, {
             type: "error",
             message: "Gemini Live Voice Connection Failed. Please verify your Gemini API Key in Settings.",
-          }));
+          });
         } catch { /* client gone */ }
       }
     };
@@ -2557,14 +2570,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     const handleStopAllFrame = async (msg: any): Promise<void> => {
       if (msg.kill === true) {
         if (!coreState.frozen) {
-          clientWs.send(JSON.stringify({ type: "stop_all_done", error: "not_frozen" }));
+          sendFrame(clientWs, { type: "stop_all_done", error: "not_frozen" });
         } else {
           const killed = await stopAll(true);
-          clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 2, killed, failed: coreState.lastStopAllFailed }));
+          sendFrame(clientWs, { type: "stop_all_done", stage: 2, killed, failed: coreState.lastStopAllFailed });
         }
       } else {
         const running = await stopAll(false);
-        clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 1, frozen: true, running }));
+        sendFrame(clientWs, { type: "stop_all_done", stage: 1, frozen: true, running });
       }
     };
 
@@ -2589,7 +2602,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         } else if (msg.type === "release_stop_all") {
           // Clear the freeze from the UI (bead 8sq). Always allowed.
           releaseStopAll();
-          clientWs.send(JSON.stringify({ type: "stop_all_done", stage: 0, frozen: false }));
+          sendFrame(clientWs, { type: "stop_all_done", stage: 0, frozen: false });
         }
       } catch (err) {
         console.warn("Received malformed or non-JSON WebSocket frame, skipping:", err);

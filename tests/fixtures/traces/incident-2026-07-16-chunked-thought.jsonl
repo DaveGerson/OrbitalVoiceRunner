@@ -1,0 +1,11 @@
+{"ts":1752701460000,"seq":0,"message":{"serverContent":{"outputTranscription":{"text":"My apologies"}}}}
+{"ts":1752701460110,"seq":1,"message":{"serverContent":{"outputTranscription":{"text":" again."}}}}
+{"ts":1752701460205,"seq":2,"message":{"serverContent":{"outputTranscription":{"text":" The draft"}}}}
+{"ts":1752701460335,"seq":3,"message":{"serverContent":{"outputTranscription":{"text":" is ready"}}}}
+{"ts":1752701460475,"seq":4,"message":{"serverContent":{"outputTranscription":{"text":" for test-2"}}}}
+{"ts":1752701460575,"seq":5,"message":{"serverContent":{"outputTranscription":{"text":" now."}}}}
+{"ts":1752701460670,"seq":6,"message":{"serverContent":{"outputTranscription":{"text":" Say"}}}}
+{"ts":1752701460730,"seq":7,"message":{"serverContent":{"outputTranscription":{"text":" 'send"}}}}
+{"ts":1752701460800,"seq":8,"message":{"serverContent":{"outputTranscription":{"text":" it' to"}}}}
+{"ts":1752701460890,"seq":9,"message":{"serverContent":{"outputTranscription":{"text":" submit."}}}}
+{"ts":1752701461310,"seq":10,"message":{"serverContent":{"turnComplete":true}}}

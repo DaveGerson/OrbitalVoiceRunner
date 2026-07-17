@@ -9,6 +9,29 @@ import type { PendingCommand, PendingActionView, AttentionItem, ExchangeDraftVie
 import type { TemplateView, PaneHistoryEntry } from "./useOrbitalData";
 import type { HandoffState, StoredHandoff } from "../store/types";
 
+// bead wsm-e2e-pinned-ys8d: the frame-contract catalog test (tests/test_frame_contracts.ts) needs
+// the REAL key sets of useOrbitalData.ts's handleObserveFrame/handleVoiceFrame dispatch tables, but
+// that file imports React + browser-only utils (utils/audio, utils/notify) that a plain node:test
+// import must not drag in — mirroring exactly why this sibling module exists (see the file header).
+// These are plain literal arrays (the dispatch-table KEYS don't depend on any hook state, so they
+// can be hoisted safely) — keep them in LOCKSTEP with the `handlers` object literals in
+// useOrbitalData.ts's handleObserveFrame/handleVoiceFrame. A key added/removed there without a
+// matching edit here is exactly the drift class the catalog test exists to catch.
+export const OBSERVE_FRAME_TYPES = [
+  "stdout_chunk", "terminals_updated", "pane_status", "pane_quiescing", "pane_transition",
+  "draft_updated", "history_updated", "ledger_updated", "fleet_exchange_summary_updated",
+  "plans_updated", "attention_updated", "templates_updated", "layouts_updated", "handoffs_updated",
+  "settings_updated", "switch_active_pane", "frozen", "stop_all", "approval_pending",
+  "approval_resolved", "action_pending", "action_resolved", "command_auto_executed",
+  "command_blocked", "proactive_notification", "proactive_earcon", "error", "daemon_state",
+  "action_activity",
+] as const;
+
+export const VOICE_FRAME_TYPES = [
+  "audio", "interrupted", "transcript_text", "grounding", "voice_channel_lost",
+  "voice_channel_restored", "error",
+] as const;
+
 // ── handleObserveFrame helpers ───────────────────────────────────────────
 
 // Frame-type → hands-free earcon (UX_BRIEF §4: eyes-off, a state change with no sound is a bug).
