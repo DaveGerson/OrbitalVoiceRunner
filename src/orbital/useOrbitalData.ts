@@ -945,6 +945,76 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
     if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
   }, [queueStdoutChunk, refetchTerminals, refetchArchive, refetchLedger, refetchPlans, refetchAttention, refetchTemplates, refetchLayouts, refetchHandoffs, refetchFrozen, refetchPending, earcon, desktopNote, showToast]);
 
+  // ── voice-lane frame handler ─────────────────────────────────────────────
+  // bead wsm-e2e-pinned-rqae: extracted from the voice socket's onmessage closure so (a) the real
+  // /live voice socket and (b) the e2e harness (injectVoiceFrame) drive the SAME switch — mirroring
+  // why handleObserveFrame above was pulled out of the observe socket's closure. The old inline code
+  // split into handleVoiceMedia/handleVoiceChannel purely to duck the complexity gate (two switches,
+  // the second only reached when the first's default fired); a per-type dispatch table sidesteps that
+  // gate for free (same trick handleObserveFrame already uses), so the two switches collapse back into
+  // ONE table with no behavior change — any type not listed here is a no-op in both the old code (two
+  // stacked switch defaults) and this one (the hasOwn miss). The OBSERVABLE order of setState / audio /
+  // earcon / toast calls inside each handler is byte-identical to the original switch arms.
+  const handleVoiceFrame = useCallback((msg: any) => {
+    const handlers: Record<string, () => void> = {
+      // ── voice-only frames (Kitchen Radio) ──
+      audio: () => {
+        // playbackCtxRef mirrors the connect()-local playbackCtx (assigned before onmessage can ever
+        // fire on the real socket, so this is never null on the live path); the null guard only
+        // matters for the mock harness, which never opens a real socket to populate the ref.
+        if (typeof msg.audio === "string" && playbackCtxRef.current) playAudioChunk(playbackCtxRef.current, msg.audio);
+      },
+      interrupted: () => {
+        // bead 8fz.4: a barge-in — the operator already took the turn back, so the settle into
+        // "listening" this produces must stay silent (no your-turn chime for it).
+        yourTurnDetectorRef.current?.markInterrupted();
+        resetAudioPlayback();
+      },
+      transcript_text: () => {
+        if ((msg.sender === "User" || msg.sender === "Janus") && typeof msg.text === "string") {
+          setTranscript((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50));
+        }
+      },
+      grounding: () => {
+        // Attach grounded sources/queries to the most recent Janus turn (no-op if none yet).
+        setTranscript((prev) => attachGrounding(prev, msg.sources, msg.queries));
+      },
+      voice_channel_lost: () => {
+        // The Gemini channel died while our browser WS stayed open. Eyes-off must HEAR it, and a
+        // PERMANENT loss must stop the rail lying "● LIVE" (UX_BRIEF §4: no quiet state changes).
+        earcon("alert");
+        if (msg.permanent === true) {
+          setToast({ msg: "Radio's down — tune back in, Chef", kind: "warn" });
+          setTimeout(() => setToast(null), 4000);
+          desiredVoiceRef.current = false;
+          setVoiceLive(false);
+          setVoiceReconnecting(false);
+        } else {
+          setVoiceReconnecting(true); // server is still retrying a transient drop
+        }
+      },
+      voice_channel_restored: () => {
+        // 2K.6: the Gemini channel came back after a transient drop. The all-clear must be as loud as
+        // the loss was: success earcon + toast + a durable transcript line (showToast carries all
+        // three) and the reconnecting tell stands down.
+        setVoiceReconnecting(false);
+        // bead 8fz.4: a DEDICATED reconnect tone (3-note rising figure, src/utils/earcon.ts) instead
+        // of borrowing the generic success chime — eyes-off operators learn the difference by ear.
+        const t = voiceChannelRestoredToast();
+        showToast(t.msg, t.kind, t.earcon);
+      },
+      error: () => {
+        setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
+        setTimeout(() => setToast(null), 4000);
+        resetAudioPlayback();
+      },
+    };
+    // Broadcast/board frames also reach this socket — any type not in the table above is the observe
+    // lane's to own (no double refetch, no double xterm write), exactly like the original default arm.
+    const type = msg?.type;
+    if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
+  }, [earcon, showToast]);
+
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
     isMockModeRef,
@@ -981,6 +1051,9 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       setStreamConnected(true);
       setStreamGeneration((g) => g + 1);
     },
+    // bead wsm-e2e-pinned-rqae e2e seam: feed a frame through the REAL voice-lane switch (no real
+    // /live voice socket under ?mock=1) — mirrors onWsFrame's relationship to handleObserveFrame.
+    onVoiceFrame: (frame) => handleVoiceFrame(frame),
   });
 
   // Under the ?mock=1 harness there is no real server, so seed settings once so Back of House renders.
@@ -1236,73 +1309,12 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         startMic(ws, captureCtx);
       };
       ws.onmessage = (event) => {
+        // bead wsm-e2e-pinned-rqae: the inline switch used to live here — it now lives in
+        // handleVoiceFrame above (a useCallback, mirroring handleObserveFrame), so the e2e harness
+        // can drive the same per-type dispatch the real socket does.
         let msg: any;
         try { msg = JSON.parse(event.data); } catch { return; }
-        // Split into the audio/transcript half and the channel-state half so neither arrow trips the
-        // complexity gate; the per-case setState/audio ordering is unchanged from the flat switch.
-        const handleVoiceMedia = (): boolean => {
-          switch (msg.type) {
-            // ── voice-only frames (Kitchen Radio) ──
-            case "audio":
-              if (typeof msg.audio === "string") playAudioChunk(playbackCtx, msg.audio);
-              return true;
-            case "interrupted":
-              // bead 8fz.4: a barge-in — the operator already took the turn back, so the settle
-              // into "listening" this produces must stay silent (no your-turn chime for it).
-              yourTurnDetectorRef.current?.markInterrupted();
-              resetAudioPlayback();
-              return true;
-            case "transcript_text":
-              if ((msg.sender === "User" || msg.sender === "Janus") && typeof msg.text === "string") {
-                setTranscript((prev) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50));
-              }
-              return true;
-            case "grounding":
-              // Attach grounded sources/queries to the most recent Janus turn (no-op if none yet).
-              setTranscript((prev) => attachGrounding(prev, msg.sources, msg.queries));
-              return true;
-            default:
-              return false;
-          }
-        };
-        const handleVoiceChannel = (): void => {
-          switch (msg.type) {
-            case "voice_channel_lost":
-              // The Gemini channel died while our browser WS stayed open. Eyes-off must HEAR it, and a
-              // PERMANENT loss must stop the rail lying "● LIVE" (UX_BRIEF §4: no quiet state changes).
-              earcon("alert");
-              if (msg.permanent === true) {
-                setToast({ msg: "Radio's down — tune back in, Chef", kind: "warn" });
-                setTimeout(() => setToast(null), 4000);
-                desiredVoiceRef.current = false;
-                setVoiceLive(false);
-                setVoiceReconnecting(false);
-              } else {
-                setVoiceReconnecting(true); // server is still retrying a transient drop
-              }
-              break;
-            case "voice_channel_restored":
-              // 2K.6: the Gemini channel came back after a transient drop. The all-clear must be as
-              // loud as the loss was: success earcon + toast + a durable transcript line (showToast
-              // carries all three) and the reconnecting tell stands down.
-              setVoiceReconnecting(false);
-              // bead 8fz.4: a DEDICATED reconnect tone (3-note rising figure, src/utils/earcon.ts)
-              // instead of borrowing the generic success chime — the return of a lost channel is a
-              // distinct event from a plain "order up" success, and eyes-off operators learn the
-              // difference by ear.
-              { const t = voiceChannelRestoredToast(); showToast(t.msg, t.kind, t.earcon); }
-              break;
-            case "error":
-              setToast({ msg: typeof msg.message === "string" ? msg.message : "Radio hiccup — try again", kind: "warn" });
-              setTimeout(() => setToast(null), 4000);
-              resetAudioPlayback();
-              break;
-            default:
-              // Broadcast/board frames also reach this socket — the observe lane owns them.
-              break;
-          }
-        };
-        if (!handleVoiceMedia()) handleVoiceChannel();
+        handleVoiceFrame(msg);
       };
       ws.onerror = () => { try { ws.close(); } catch { /* already closing */ } };
       ws.onclose = (ev) => {
@@ -1331,7 +1343,7 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
       if (ws) { try { ws.close(); } catch { /* noop */ } voiceWsRef.current = null; }
       teardownAudio();
     };
-  }, [voiceLive, teardownAudio, earcon, showToast, handleUnauthorizedClose, clearUnauthorizedFlag]);
+  }, [voiceLive, teardownAudio, showToast, handleUnauthorizedClose, clearUnauthorizedFlag, handleVoiceFrame]);
 
   // The UI is the source of truth for the single active pane. Echo it whenever it changes and a
   // socket is open — BOTH lanes accept set_active_pane (3C.2a), so the voice session and the

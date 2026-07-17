@@ -33,6 +33,8 @@ declare global {
       injectWsFrame: (frame: unknown) => void;
       /** 3C.2: model an observe-socket drop/reopen → TerminalView resync-with-marker (kitchen only). */
       simulateStreamReconnect: () => void;
+      /** bead wsm-e2e-pinned-rqae: feed a frame through the REAL voice-lane WS switch (kitchen only). */
+      injectVoiceFrame: (frame: unknown) => void;
     };
   }
 }
@@ -260,6 +262,16 @@ export async function injectApprovalResolvedFrame(
     ([m, o]) => window.__ORBITAL_E2E__?.injectWsFrame({ type: "approval_resolved", messageId: m, outcome: o }),
     [messageId, outcome] as const,
   );
+}
+
+/**
+ * bead wsm-e2e-pinned-rqae: drive a frame through the REAL voice-lane WS switch (injectVoiceFrame →
+ * handleVoiceFrame), the voice-socket analog of injectWsFrame/handleObserveFrame — for exercising
+ * transcript_text / interrupted / voice_channel_lost / voice_channel_restored under ?mock=1 (the
+ * harness has no real /live voice socket).
+ */
+export async function injectVoiceFrame(page: Page, frame: Record<string, unknown>): Promise<void> {
+  await page.evaluate((f) => window.__ORBITAL_E2E__?.injectVoiceFrame(f), frame);
 }
 
 export const test = base;

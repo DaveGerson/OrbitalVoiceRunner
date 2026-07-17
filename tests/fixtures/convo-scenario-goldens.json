@@ -1,0 +1,27 @@
+{
+  "approval_vote_sequencing": {
+    "executed": {
+      "approved": true,
+      "cmd": "echo approval-vote-test",
+      "terminalId": "convo-approval-pane",
+      "type": "command_auto_executed",
+      "vocal": true
+    },
+    "pending": {
+      "messageId": "<ID>",
+      "terminalId": "convo-approval-pane",
+      "type": "approval_pending"
+    },
+    "resolved": {
+      "messageId": "<ID>",
+      "outcome": "approved",
+      "terminalId": "convo-approval-pane",
+      "type": "approval_resolved"
+    },
+    "resolvedCount": 1,
+    "voteFrame": {
+      "sender": "User",
+      "text": "approve"
+    }
+  }
+}
