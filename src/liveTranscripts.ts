@@ -44,6 +44,19 @@ function extractModelThinking(sc: any): string {
   return typeof outputTx === "string" ? outputTx : "";
 }
 
+/**
+ * wsm-e2e-pinned-zmu5: accumulate one outputTranscription fragment onto the per-turn modelThinking
+ * buffer. PLAIN concatenation — no inserted separator, ever. Forensics against the real incident log
+ * (ixn_mro7cpfy_9 / ixn_mro7dthy_c) showed every fragment after the first already carries its own
+ * leading whitespace (or none, where punctuation abuts, e.g. "apologies" + " again."), so raw `+`
+ * already reproduces the spoken sentence byte-for-byte; inserting a synthesized separator when a
+ * fragment has NO boundary whitespace on either side would be wrong here too — two single-character
+ * fragments like "o" + "k" must join to "ok", not "o k".
+ */
+export function appendThinkingFragment(buf: string, fragment: string): string {
+  return buf + fragment;
+}
+
 /** Read operator/model transcripts from a LiveServerMessage. Pure; never throws on malformed input. */
 export function extractTranscripts(message: any): LiveTranscripts {
   const sc = message?.serverContent;

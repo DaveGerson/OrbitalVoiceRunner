@@ -93,15 +93,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
 
-    term.open(containerRef.current);
-    fitAddon.fit();
-
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
     // Seed scrollback with the raw backfill (escape sequences intact) for an instant first paint.
     // When a fetchBackfill is wired (the kitchen burner), a quiet resync below replaces this with
     // SERVER truth right after mount — the React-state snapshot can be up to a poll-interval stale.
+    // Safe before open(): xterm's write buffer/parser live on the terminal core and don't need the
+    // DOM renderer that open() installs (CoreTerminal.write() has no dependency on it) — open()
+    // itself is deferred below, but seeding the buffer here still lands the very first paint.
     if (backfill) term.write(backfill);
     // The base the screen was last rebuilt from — lets the quiet resync skip a no-op rewrite.
     let lastBase = backfill ?? "";
@@ -112,8 +112,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     const resizeDisposable = term.onResize(({ cols, rows }) => {
       onResizeRef.current?.(cols, rows);
     });
-    // Report the initial fitted grid.
-    onResizeRef.current?.(term.cols, term.rows);
 
     // Operator typing edge: forward raw xterm onData bytes (escape sequences intact) so the
     // frontend can stream them to the backend PTY. No local echo / convertEol here — the PTY
@@ -162,6 +160,27 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
     // the prop snapshot above only covers up to the last poll/refetch.
     if (fetchBackfillRef.current) void resync({ marker: false });
 
+    // wsm-e2e-pinned-g2qe: term.open()/fitAddon.fit() deferred one animation frame, guarded by
+    // `disposed` + `isConnected`. React 18 StrictMode double-invokes this effect in dev (mount →
+    // cleanup → re-mount); xterm.js schedules an async Viewport refresh off open()/fit() that
+    // still fires after the terminal is torn down, reading a now-undefined internal field and
+    // surfacing as an uncaught "Cannot read properties of undefined (reading 'dimensions')"
+    // pageerror (xterm.js Viewport._innerRefresh / syncScrollArea). Cancelling the rAF in cleanup
+    // means the StrictMode-discarded first pass never calls open() at all, so it never schedules
+    // that callback in the first place — the real (second) pass opens cleanly one frame later.
+    let openRafId: number | null = requestAnimationFrame(() => {
+      openRafId = null;
+      if (disposed || !containerRef.current?.isConnected) return;
+      term.open(containerRef.current);
+      try {
+        fitAddon.fit();
+      } catch (err) {}
+      // Report the initial fitted grid now that open()/fit() have actually run (this used to run
+      // synchronously right after fit(); it now runs here so it still reports the FITTED cols/rows,
+      // not the pre-fit constructor defaults).
+      onResizeRef.current?.(term.cols, term.rows);
+    });
+
     // Handle container resize
     const resizeObserver = new ResizeObserver(() => {
       try {
@@ -207,6 +226,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ terminalId, backfill
 
     return () => {
       disposed = true;
+      if (openRafId !== null) cancelAnimationFrame(openRafId);
       resyncRef.current = null;
       unsubscribe();
       resizeDisposable.dispose();

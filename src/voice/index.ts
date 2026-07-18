@@ -53,7 +53,7 @@ import {
   isInvalidKeyClose,
   isBlankApiKey,
 } from "../voiceResumption";
-import { extractTranscripts } from "../liveTranscripts";
+import { extractTranscripts, appendThinkingFragment } from "../liveTranscripts";
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
 import { applyPaneInputFrame } from "./paneInputFrame";
@@ -596,6 +596,17 @@ interface VoiceSessionState {
   wsClosed: boolean;
   currentSessionUserUtterance: string;
   currentSessionModelUtterance: string;
+  // wsm-e2e-pinned-zmu5: Gemini Live streams serverContent.outputTranscription in word-at-a-time
+  // fragments (audio-only mode never populates modelTurn.parts, so onmessage sees N tiny messages
+  // per spoken thought, not one). This accumulates those fragments between turn boundaries; the
+  // SINGLE flush point (flushPendingThought, below) drains it once per turn so the pane composer,
+  // recentTurns, and the interaction log each see ONE coalesced thought instead of N sub-sentence
+  // fragments.
+  pendingModelThinking: string;
+  // wsm-e2e-pinned-zmu5: the per-connection flush closure, hoisted onto `state` (same pattern as
+  // `unsubscribePaneSignals` below) so the clientWs.on("close") teardown — a SIBLING scope to
+  // connectLiveSession, not nested inside it — can still drain a partial thought on socket close.
+  flushPendingThought: (() => void) | null;
   currentInteractionId: string | null;
   lastSpeaker: "operator" | "model" | null;
   // B1 (turn-aware ack): the async-spawn acks must NOT speak over the operator. Tracked from the
@@ -776,6 +787,18 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
   // (every non-browser client — scripts, the existing test suite) is unchanged/allowed, so this is
   // invisible to every existing test. The cookie/token check is byte-identical to the pre-existing
   // logic, just relocated.
+  // wsm-e2e-pinned-zmu5: best-effort teardown flush for a partial modelThinking buffer. Kept as a
+  // standalone module-scope helper (not inlined at either call site) so the try/catch lives HERE,
+  // not in doHandleSessionLost (already flagged near its complexity ceiling) or the clientWs.on
+  // ("close") teardown — both call sites gain a single function-call statement, zero new branches.
+  function safeFlushPendingThought(sessionState: VoiceSessionState): void {
+    try {
+      sessionState.flushPendingThought?.();
+    } catch (err) {
+      console.error("[VOICE] teardown flush of the pending model-thinking buffer failed:", err);
+    }
+  }
+
   function rejectUnauthorizedConnection(clientWs: WebSocket, req: IncomingMessage): boolean {
     if (!isOriginAllowed(req.headers.origin, req.headers.host, allowedOrigins)) {
       console.warn("[SECURITY] Blocked WebSocket connection with disallowed Origin:", req.headers.origin);
@@ -877,6 +900,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       wsClosed: false,
       currentSessionUserUtterance: "",
       currentSessionModelUtterance: "",
+      // wsm-e2e-pinned-zmu5: empty buffer for a fresh WS connection; also reset on every (re)connect
+      // in hoistAndSubscribe so a resumed session never inherits a stale partial thought.
+      pendingModelThinking: "",
+      flushPendingThought: null,
       // Correlated interaction log: one interaction_id per operator TURN. `lastSpeaker` flips the turn —
       // when the operator speaks after the model, mint a fresh id; the model's response + tool calls +
       // result + pty all share it. turnId() lazily mints for model-first events (e.g. a greeting).
@@ -1452,6 +1479,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // same stale drop stays idempotent.
         if (myGeneration !== state.connectGeneration) { sessionDead = true; return; }
         sessionDead = true;
+        // wsm-e2e-pinned-zmu5: the Gemini Live socket just dropped mid-utterance — clientWs is very
+        // likely still alive here, so flush the partial thought before it's lost. Best-effort (see
+        // safeFlushPendingThought): a throw here must not abort the rest of this teardown.
+        safeFlushPendingThought(state);
         if (state.session) {
           const detached = pendingApprovals.detachSession(state.session);
           // 4D.1: open the "while you were away" window — the next reconnect digests the durable
@@ -1888,17 +1919,38 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // line) so save_transcript_note can capture Janus's side too. Consumer redacts pre-persist.
             recentTurns.push("janus", modelUtterance);
             setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
-            clientWs.send(JSON.stringify({
-              type: "transcript_text",
-              sender: "Janus",
-              text: modelUtterance
-            }));
+            // wsm-e2e-pinned-zmu5: this fires from the teardown flush too, where clientWs may already be
+            // closed/closing — a throw here must NOT skip the draft append below (that append is
+            // SQLite-backed and survives a dead socket; only this frame send needs a live one).
+            try {
+              clientWs.send(JSON.stringify({
+                type: "transcript_text",
+                sender: "Janus",
+                text: modelUtterance
+              }));
+            } catch (err) {
+              console.error("[VOICE] failed to send transcript_text frame (client socket likely closed):", err);
+            }
             // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
             const cleanUtter = modelUtterance.trim();
             if (cleanUtter.length > 2) {
               appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
             }
           };
+
+          // wsm-e2e-pinned-zmu5: the SINGLE flush point for state.pendingModelThinking. Reused by every
+          // turn boundary below (interrupted / turnComplete / generationComplete) and, via
+          // state.flushPendingThought, by the two teardown paths outside this closure — reusing
+          // handleModelUtterance means "one gemini_text log / one recentTurns push / one transcript_text
+          // frame / one Agentic-Thought bullet (length>2 guard on the JOINED text)" fall out for free.
+          // trim() (not a bare truthiness check) so a lone-whitespace buffer flushes to nothing rather
+          // than a stray near-empty frame.
+          const flushModelThinking = (): void => {
+            const joined = state.pendingModelThinking;
+            state.pendingModelThinking = "";
+            if (joined.trim().length > 0) handleModelUtterance(joined);
+          };
+          state.flushPendingThought = flushModelThinking;
 
           // Surface Google-Search grounding (queries + sources) when this turn used it. Strict no-op when
           // grounding is OFF (the model never populates groundingMetadata -> extractGrounding returns empty).
@@ -1937,6 +1989,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // turn-complete handling.
           const relayInterruptAndTurnState = (message: any): void => {
             if (message.serverContent?.interrupted) {
+              // wsm-e2e-pinned-zmu5: barge-in seizes the turn — flush the partial thought FIRST so the
+              // spoken words captured so far are never silently dropped.
+              flushModelThinking();
               clientWs.send(JSON.stringify({ type: "interrupted", interrupted: true }));
               // B1 (turn-aware ack): a barge-in means the operator seized the turn. Latch it (so an async-
               // spawn ack SUPPRESSES rather than speaks over them) and stamp recency. Cleared when the model
@@ -1947,6 +2002,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // BEAD tkd: clear the speak-gate mute latch at the model turn boundary. (Also cleared at the
             // START of the next operator turn in onOperatorSpeech.)
             if (message.serverContent?.turnComplete || (message.serverContent as any)?.generationComplete) {
+              // wsm-e2e-pinned-zmu5: the common-case turn boundary — flush the coalesced thought once.
+              flushModelThinking();
               state.muteCurrentModelTurn = false;
               // B-3 measurement spine (Task 7): capture this turn's Gemini token cost (usageMetadata)
               // joined to the nearest preceding injection. Fail-soft no-op when usageMetadata is absent.
@@ -2109,9 +2166,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             if (modelThinking) {
               interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });
               setModelTurn(); // B1: model retook the turn -> clear any stale barge-in latch.
-              // B2: In audio-only mode, modelTurn.parts carries audio (not text), so modelUtterance
-              // is empty. Surface the outputTranscription as the visible transcript text.
-              if (!modelUtterance) handleModelUtterance(modelThinking);
+              // B2/wsm-e2e-pinned-zmu5: In audio-only mode, modelTurn.parts carries audio (not text), so
+              // modelUtterance is empty. outputTranscription streams in word-at-a-time fragments — buffer
+              // them here (accumulate, do NOT emit) and let the turn-boundary flush (flushModelThinking)
+              // surface ONE coalesced thought instead of one bullet/frame per fragment. This `if
+              // (!modelUtterance)` guard is unchanged from before the fix, so a turn that also populates
+              // modelUtterance still can't double-emit.
+              if (!modelUtterance) state.pendingModelThinking = appendThinkingFragment(state.pendingModelThinking, modelThinking);
             }
 
             if (userUtterance) handleOperatorUtterance(userUtterance, session);
@@ -2217,6 +2278,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // to the prior session's closure; a survivor "ready" is re-published by the bus, not replayed.
         state.deferredReady = [];
         if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
+        // wsm-e2e-pinned-zmu5: same reset rationale — a fresh/resumed session must not inherit a stale
+        // partial-thought buffer left over from a torn-down connection.
+        state.pendingModelThinking = "";
 
         // B1 (phase-2 defer): stale ceiling — a "ready" older than this is dropped on drain (the UI
         // already shows the pane, so a 10s-late "it's up" is pure noise).
@@ -2537,6 +2601,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // no-op (src/exchanges/recovery.ts) — see that table for why the operator's browser tab
       // dropping/reloading never touches an AgentExchange or the draft registry.
       state.wsClosed = true; // gate out the SDK's post-close resumption-token flush + the reconnect loop
+      // wsm-e2e-pinned-zmu5: the operator's browser tab/WS just closed — best-effort flush of any
+      // partial thought. The draft append (SQLite) can still land even though clientWs is now dead;
+      // only the transcript_text frame send inside it is guarded to fail silently (see handleModelUtterance).
+      safeFlushPendingThought(state);
       // Voice-UX wave 3: a session drop mid-window cancels the SPOKEN PROMPT only (D5) — the staged
       // destructive pendingActions record survives and stays resolvable via UI/typed SURE.
       spokenConfirm.dispose();
