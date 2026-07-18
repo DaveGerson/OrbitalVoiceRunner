@@ -137,6 +137,12 @@ export interface OrbitalE2EHooks {
    * reset-and-rewrite-from-snapshot resync (with the visible "reconnected" marker).
    */
   simulateStreamReconnect: () => void;
+  /**
+   * bead wsm-e2e-pinned-rqae: feed a frame through the SAME voice-lane WS switch the real /live
+   * voice socket drives (the harness is client-only — no real /live socket). Mirrors injectWsFrame's
+   * relationship to the observe lane. No-op for hosts that don't wire `onVoiceFrame` (classic).
+   */
+  injectVoiceFrame: (frame: unknown) => void;
 }
 
 export type PendingActionEntry = {
@@ -182,6 +188,8 @@ export interface E2EHarnessDeps {
   onWsFrame?: (frame: unknown) => void;
   /** 3C.2 (OPTIONAL — kitchen only): bump the stream generation (models an observe reconnect). */
   bumpStreamGeneration?: () => void;
+  /** bead wsm-e2e-pinned-rqae (OPTIONAL — kitchen only): the REAL voice-lane frame handler, for `injectVoiceFrame`. */
+  onVoiceFrame?: (frame: unknown) => void;
   /**
    * dbt4 (OPTIONAL): an App-owned `e2eActiveRef` to write into, so a sibling hook created BEFORE
    * the harness (useStdoutStream, which the harness depends on via queueStdoutChunk) can read the
@@ -501,6 +509,11 @@ export function useE2EHarness(deps: E2EHarnessDeps): { e2eActiveRef: MutableRefO
       // 3C.2: model an observe-socket drop/reopen → drives the TerminalView resync (kitchen only).
       simulateStreamReconnect: () => {
         deps.bumpStreamGeneration?.();
+      },
+
+      // bead wsm-e2e-pinned-rqae: route a frame through the REAL voice-lane switch (kitchen only).
+      injectVoiceFrame: (frame) => {
+        deps.onVoiceFrame?.(frame);
       },
     };
     (window as unknown as { __ORBITAL_E2E__?: OrbitalE2EHooks }).__ORBITAL_E2E__ = hooks;

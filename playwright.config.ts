@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 // BEAD wsm-e2e-pinned-rwnq: per-lane run-wide caps live in one data module so the safety margin
 // under the orchestrator's external wall is independently unit-testable (tests/test_e2e_budgets.ts).
-import { MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS } from "./scripts/e2eBudgets.mjs";
+import { MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS, SCRIPTED_GLOBAL_TIMEOUT_MS } from "./scripts/e2eBudgets.mjs";
 
 /**
- * E2E config — TWO lanes:
+ * E2E config — THREE lanes:
  *
  * • MOCK (default, `npm run test:e2e`): the React app is served standalone by Vite and driven
  *   entirely client-side via the ?mock=1 harness (see src/e2e/harness.ts) — no backend, no auth,
@@ -25,30 +25,51 @@ import { MOCK_GLOBAL_TIMEOUT_MS, LIVE_GLOBAL_TIMEOUT_MS } from "./scripts/e2eBud
  *   all files share the one real server: stop-all freezes every capability globally and the
  *   gate engine resolves per-pane overrides against the single ACTIVE project, so interleaved
  *   files would corrupt each other's state. Generous timeouts (real PTY spawns).
+ *
+ * • SCRIPTED (`npm run test:e2e:scripted`, BEAD wsm-e2e-pinned-s1ap, sets PW_SCRIPTED=1 via
+ *   scripts/run-scripted-live-e2e.mjs): the SAME REAL server as the live lane, on its OWN fresh
+ *   temp state set and its OWN port (never LIVE_PORT — a leaked live-lane server can never collide
+ *   with a scripted run or vice versa), but booted with JANUS_MOCK_LIVE=1 so server.ts installs the
+ *   in-process scripted Gemini Live connector (src/voice/scriptedLiveConnector.ts) instead of the
+ *   real one. A real browser opens the REAL /live voice socket (real WS auth cookie, real
+ *   tool-dispatch/approval code) and the test drives Gemini's side of the conversation via the
+ *   loopback-only control channel (POST /__scripted_live__/emit + /close) — the entire voice pipe
+ *   runs end-to-end with NO Gemini API key and NO microphone. Every scripted spec
+ *   (e2e/scripted_*.spec.ts) is EXCLUDED from both the mock and live lanes (testIgnore below), and
+ *   the mock/live specs are excluded from this lane (testMatch) — the three lanes never cross-run
+ *   each other's specs. Single worker, same rationale as LIVE (one shared real server + state).
  */
 const LIVE = process.env.PW_LIVE === "1";
+const SCRIPTED = !LIVE && process.env.PW_SCRIPTED === "1";
 const LIVE_PORT = Number(process.env.PW_LIVE_PORT || 3117);
-// Per-run temp state for the live server. Keyed by pid so a worker re-evaluating this config
+const SCRIPTED_PORT = Number(process.env.PW_SCRIPTED_PORT || 3118);
+// Per-run temp state for each real-server lane. Keyed by pid so a worker re-evaluating this config
 // computes the same path as the runner process that started the webServer's parent.
 const LIVE_STATE_DIR = path.join(os.tmpdir(), `orbital-live-e2e-${process.pid}`);
 if (LIVE) fs.mkdirSync(LIVE_STATE_DIR, { recursive: true });
+const SCRIPTED_STATE_DIR = path.join(os.tmpdir(), `orbital-scripted-e2e-${process.pid}`);
+if (SCRIPTED) fs.mkdirSync(SCRIPTED_STATE_DIR, { recursive: true });
 
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
   // BEAD wsm-e2e-pinned-rwnq: bound each lane's total wall-clock so Playwright aborts ITSELF (and
   // runs its normal webServer teardown) well before the orchestrator's external SIGKILL — which
-  // would otherwise orphan the vite/tsx child on ports 5173/3117. Do not raise without re-checking
-  // the margin guard in tests/test_e2e_budgets.ts.
-  globalTimeout: LIVE ? LIVE_GLOBAL_TIMEOUT_MS : MOCK_GLOBAL_TIMEOUT_MS,
-  // The live specs share ONE real server + state set (freeze flag, active project, the board),
-  // so the lane is single-worker: files run one at a time, in filename order.
-  workers: LIVE ? 1 : undefined,
+  // would otherwise orphan the vite/tsx child on ports 5173/3117/3118. Do not raise without
+  // re-checking the margin guard in tests/test_e2e_budgets.ts.
+  globalTimeout: LIVE ? LIVE_GLOBAL_TIMEOUT_MS : SCRIPTED ? SCRIPTED_GLOBAL_TIMEOUT_MS : MOCK_GLOBAL_TIMEOUT_MS,
+  // The live/scripted specs each share ONE real server + state set (freeze flag, active project,
+  // the board), so both lanes are single-worker: files run one at a time, in filename order.
+  workers: (LIVE || SCRIPTED) ? 1 : undefined,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? "github" : "list",
   use: {
-    baseURL: LIVE ? `http://127.0.0.1:${LIVE_PORT}` : "http://localhost:5173",
+    baseURL: LIVE
+      ? `http://127.0.0.1:${LIVE_PORT}`
+      : SCRIPTED
+      ? `http://127.0.0.1:${SCRIPTED_PORT}`
+      : "http://localhost:5173",
     trace: "on-first-retry",
   },
   projects: LIVE
@@ -60,10 +81,19 @@ export default defineConfig({
           use: { ...devices["Desktop Chrome"] },
         },
       ]
+    : SCRIPTED
+    ? [
+        {
+          name: "scripted",
+          testMatch: /scripted_.*\.spec\.ts/,
+          timeout: 180_000, // real server + real /live WS, same boot cost as the live lane
+          use: { ...devices["Desktop Chrome"] },
+        },
+      ]
     : [
-        // The default lane stays mock-only: the live specs are excluded here so `npm run test:e2e`
-        // never needs (or touches) a real server.
-        { name: "chromium", testIgnore: /live_.*\.spec\.ts/, use: { ...devices["Desktop Chrome"] } },
+        // The default lane stays mock-only: the live AND scripted specs are excluded here so
+        // `npm run test:e2e` never needs (or touches) a real server.
+        { name: "chromium", testIgnore: /(?:live|scripted)_.*\.spec\.ts/, use: { ...devices["Desktop Chrome"] } },
       ],
   webServer: LIVE
     ? {
@@ -81,6 +111,26 @@ export default defineConfig({
           JANUS_LEDGER_PATH: path.join(LIVE_STATE_DIR, "janus-ledger.json"),
           // Pinned token (the browser is keyed automatically via the auto-seeded auth cookie).
           API_AUTH_TOKEN: "orbital-live-e2e",
+        },
+      }
+    : SCRIPTED
+    ? {
+        command: "npx tsx server.ts",
+        url: `http://127.0.0.1:${SCRIPTED_PORT}/`,
+        reuseExistingServer: false, // the scripted lane owns a FRESH server + state, always
+        timeout: 120_000,
+        env: {
+          PORT: String(SCRIPTED_PORT),
+          // BEAD wsm-e2e-pinned-s1ap: the gate flag — server.ts installs the in-process scripted
+          // Gemini Live connector + the loopback-only control channel ONLY when this is exactly "1"
+          // AND NODE_ENV !== "production" (unset here, so the gate is open).
+          JANUS_MOCK_LIVE: "1",
+          // Fresh, isolated state — same rationale as the live lane's own temp dir, a SEPARATE one
+          // (never shared with LIVE_STATE_DIR) so a concurrent live + scripted run can never collide.
+          JANUS_DB: path.join(SCRIPTED_STATE_DIR, "janus-scripted.db"),
+          JANUS_SETTINGS_PATH: path.join(SCRIPTED_STATE_DIR, "janus-settings.json"),
+          JANUS_LEDGER_PATH: path.join(SCRIPTED_STATE_DIR, "janus-ledger.json"),
+          API_AUTH_TOKEN: "orbital-scripted-e2e",
         },
       }
     : {

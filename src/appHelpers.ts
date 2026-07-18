@@ -560,8 +560,10 @@ function handleEventBusFallback(msg: any, ctx: WsHandlerCtx): void {
   if (effect.earcon) ctx.playEarcon(effect.earcon);
 }
 
-/** type -> handler. Own-property lookup only (prototype-safe), mirroring eventBus.STATIC_EFFECTS. */
-const WS_HANDLERS: Record<string, WsHandler> = {
+/** type -> handler. Own-property lookup only (prototype-safe), mirroring eventBus.STATIC_EFFECTS.
+ *  Exported (bead wsm-e2e-pinned-ys8d) so tests/test_frame_contracts.ts can check its key set
+ *  against the WS frame catalog — this module is already node-test-safe (no React/Vite imports). */
+export const WS_HANDLERS: Record<string, WsHandler> = {
   audio: (msg, ctx) => { if (msg.audio) ctx.playAudioChunk(msg); },
   interrupted: (_msg, ctx) => ctx.resetAudioPlayback(),
   approval_pending: handleApprovalPending,

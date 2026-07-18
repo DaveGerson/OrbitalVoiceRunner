@@ -44,6 +44,7 @@ import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
 import { DEFAULT_VOICE_UX } from "./src/types";
 import { resolveProjectDir, isBadProjectDir } from "./src/projectDir";
+import { assertValidFrameIfEnabled } from "./src/frames/catalog";
 import { z } from "zod";
 import { REGISTRY, actionSchemaHash } from "./src/actions/registry";
 import { CAPABILITY_DEFS } from "./src/actions/capabilities";
@@ -60,6 +61,16 @@ import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow,
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
+// BEAD wsm-e2e-pinned-s1ap: the scripted Gemini Live connector + its control-channel business logic.
+// Gated at every layer on isScriptedLiveModeEnabled() — see the boot call site inside startServer()
+// and registerScriptedLiveControlRoutes below.
+import {
+  installScriptedLiveConnector,
+  isScriptedLiveModeEnabled,
+  isScriptedLiveRequestAllowed,
+  emitToScriptedSession,
+  closeScriptedSession,
+} from "./src/voice/scriptedLiveConnector";
 import { isLoopbackAddress, isOriginAllowed, parseAllowedOrigins, timingSafeEqualString } from "./src/security/perimeter";
 
 dotenv.config();
@@ -874,6 +885,59 @@ function registerAuthMiddleware(app: express.Express): void {
   app.use("/api", authMiddleware);
 }
 
+// BEAD wsm-e2e-pinned-s1ap: the scripted-live activation decision, hoisted out of startServer (CC
+// paydown) so its two branches (refusal-warning, install) load THIS function's cyclomatic count, not
+// startServer's. Returns whether the scripted connector is now active, so the caller can gate
+// registerScriptedLiveControlRoutes on the SAME boolean a few lines later without re-deriving it.
+function activateScriptedLiveIfRequested(setConnector: (fn: LiveConnector) => void): boolean {
+  const active = isScriptedLiveModeEnabled();
+  if (process.env.JANUS_MOCK_LIVE === "1" && !active) {
+    // The flag was requested but the gate refused it (NODE_ENV=production) — log LOUDLY so an
+    // operator who set the flag in the wrong environment sees exactly why voice still needs a real
+    // Gemini key, instead of silently getting the real connector with zero explanation.
+    console.warn(
+      "[SCRIPTED-LIVE] JANUS_MOCK_LIVE=1 was set but REFUSED: NODE_ENV=production forbids the " +
+        "scripted Gemini connector. The real connector remains active; no control endpoint exists."
+    );
+  }
+  if (active) {
+    installScriptedLiveConnector(setConnector);
+  }
+  return active;
+}
+
+// BEAD wsm-e2e-pinned-s1ap: the scripted-live control channel — POST /__scripted_live__/emit and
+// POST /__scripted_live__/close. Registered ONLY when isScriptedLiveModeEnabled() (checked
+// INDEPENDENTLY here, not merely trusted from the caller's own gate at the startServer() call site —
+// a future refactor that calls this from a second, ungated site still fails closed instead of
+// silently exposing the backdoor). Loopback-only PER REQUEST (a second, independent layer — this
+// protects against a non-default JANUS_BIND_HOST exposing the process to a non-loopback interface
+// even while the boot-time gate is on). When the gate is off, neither route is ever app.post()'d, so
+// a request to either path 404s exactly like any other unknown path — no distinguishing response
+// leaks that the feature exists at all.
+function registerScriptedLiveControlRoutes(app: express.Express): void {
+  if (!isScriptedLiveModeEnabled()) return;
+
+  const respond = (res: express.Response, result: { ok: boolean; status: number; error?: string }) => {
+    res.status(result.status).json(result.ok ? { ok: true } : { error: result.error });
+  };
+  const guardLoopback = (req: express.Request, res: express.Response): boolean => {
+    if (isScriptedLiveRequestAllowed(req.socket?.remoteAddress)) return true;
+    res.status(403).json({ error: "scripted-live control channel is loopback-only" });
+    return false;
+  };
+
+  app.post("/__scripted_live__/emit", (req, res) => {
+    if (!guardLoopback(req, res)) return;
+    respond(res, emitToScriptedSession(req.body?.message));
+  });
+
+  app.post("/__scripted_live__/close", (req, res) => {
+    if (!guardLoopback(req, res)) return;
+    respond(res, closeScriptedSession(req.body?.info));
+  });
+}
+
 // VERBATIM extraction from startServer (CC paydown). Pure boot-time clamp of the persisted memory
 // synth deadline: a 0/negative/NaN/non-number value would fire synthesizeAsync's race timer
 // immediately (?? does not catch 0), so floor it to the 150ms default. Behavior is byte-identical
@@ -1456,6 +1520,14 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const requestedPort = options.port ?? PORT;
   assertBindHostAuthorized(bindHost);
 
+  // BEAD wsm-e2e-pinned-s1ap: the scripted-live gate, read ONCE, synchronously, before ANYTHING else
+  // touches liveConnector — activateScriptedLiveIfRequested's setConnector call (when it fires) MUST
+  // land before the boundLiveConnector snapshot immediately below; there is no `await` between here
+  // and that snapshot, so this stays synchronous with it (same ordering constraint the snapshot's own
+  // comment already documents for installMockLive()). Hoisted into its own function (CC paydown): the
+  // flag-vs-refusal branching lives there, not inline in startServer's own cyclomatic count.
+  const scriptedLiveActive = activateScriptedLiveIfRequested(setLiveConnector);
+
   // Snapshot the live-session connector for THIS server instance. `liveConnector` is a module-level
   // seam (setLiveConnector); reading it late, at WS-connect time, let a sibling in-process server's
   // installMockLive() clobber the global between this server's boot and a client connecting — so a
@@ -1474,6 +1546,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // VERBATIM extraction (CC paydown): the auth/cookie middleware pair — the cookie-seed `app.use`
   // and the `/api` authMiddleware — are registered together, IN THE SAME ORDER, by this helper.
   registerAuthMiddleware(app);
+  // BEAD wsm-e2e-pinned-s1ap: registered ONLY inside the same scriptedLiveActive gate computed
+  // above — registerScriptedLiveControlRoutes ALSO re-derives the gate independently, so this call
+  // being conditioned here is belt-and-suspenders, not the only fence.
+  if (scriptedLiveActive) {
+    registerScriptedLiveControlRoutes(app);
+  }
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: "/live" });
@@ -1506,6 +1584,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   const coreState = createCoreState(store);
 
   function broadcast(msg: any) {
+    // bead wsm-e2e-pinned-ys8d: the observe/board choke point. `broadcast` is passed by reference
+    // (never reimplemented) through every ctx.broadcast/deps.broadcast/this.broadcast call site in
+    // src/gating, src/actions/defs/*, src/dispatch, src/announcementBus.ts, src/applyPaneMode.ts,
+    // src/actionEffects.ts, src/voice/*, etc. — hardening this ONE body validates every one of them.
+    // Zero-cost outside test mode (a single cached boolean check; see src/frames/catalog.ts).
+    assertValidFrameIfEnabled(msg);
     const data = JSON.stringify(msg);
     for (const client of coreState.clients) {
       if (client.readyState === 1) { // OPEN
