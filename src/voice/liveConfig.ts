@@ -4,7 +4,7 @@
  * WHY a separate module: the live `config.tools` array was an inline object literal buried inside
  * the `boundLiveConnector(sessionAi, {...})` connect call (src/voice/index.ts). That made the tools
  * shape untestable without a live connect. Carving it into a pure, total function lets us pin — as a
- * unit, no API key, no socket — the bead's load-bearing invariant: the existing 43-tool
+ * unit, no API key, no socket — the bead's load-bearing invariant: the existing full registry-derived
  * functionDeclarations path is BYTE-IDENTICAL when grounding is off, and gains a sibling googleSearch
  * Tool entry (never replacing functionDeclarations) when grounding is on.
  *
@@ -22,7 +22,7 @@
  * default web search.
  *
  * MODEL-LEVEL caveat (NOT enforced here): whether gemini-3.1-flash-live-preview ACCEPTS googleSearch
- * alongside a 43-tool functionDeclarations set in one Live session is a server-side rule the SDK types
+ * alongside a full registry-derived functionDeclarations set in one Live session is a server-side rule the SDK types
  * do not encode (historically the Live API rejected this combo for 2.0/2.5-era models; relaxed
  * unevenly in later previews). The off-by-default + gated design makes this safe regardless: the
  * off-path is untouched until an explicit enable, at which point model acceptance is observable before

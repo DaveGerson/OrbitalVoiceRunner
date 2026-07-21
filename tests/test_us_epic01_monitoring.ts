@@ -34,8 +34,33 @@ import { InteractionLogger } from "../src/interactionLog";
 import { BreadcrumbRing } from "../src/memory/breadcrumbs";
 import { JanusStore } from "../src/store/sqliteStore";
 import { closeFetchPool } from "./helpers/teardown";
-import { installMockLive, waitFor, type MockLiveHandle, type MockLiveSession } from "./helpers/mockLive";
+import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import type { RunningServer } from "../server";
+
+// ── WHY mockLive is imported LAZILY (bead wsm-e2e-pinned-bxpk — the file-level failure) ─────────
+// tests/helpers/mockLive.ts value-imports ../../server, so a STATIC value-import here evaluates
+// server.ts at module-LOAD time — before any hook has set JANUS_NO_AUTOSTART or chdir'd into a
+// tmpdir. Two concrete failures flow from that (both reproduced under 2x parallel runs):
+//   1. server.ts's module tail auto-starts a REAL server on :3000; when the port is taken (dev
+//      server, or any concurrent run of this file), the startServer().catch sets
+//      process.exitCode = 1 — so this FILE reds with every subtest passing ("EADDRINUSE
+//      127.0.0.1:3000" in stderr is the fingerprint).
+//   2. the process-wide JanusStore singleton roots at the REPO CHECKOUT's .janus.db instead of a
+//      test tmpdir (violating the header contract above); concurrent processes sharing that DB
+//      then flake subtests with SQLITE_BUSY_SNAPSHOT.
+// The guard below + deferring the import until AFTER each suite's tmpdir chdir (the same
+// import-type + dynamic-import idiom every other server suite uses) eliminates both.
+process.env.NODE_ENV = "test";
+process.env.JANUS_NO_AUTOSTART = "1";
+
+type MockLiveModule = typeof import("./helpers/mockLive");
+let installMockLive: MockLiveModule["installMockLive"];
+let waitFor: MockLiveModule["waitFor"];
+/** Load mockLive (→ server.ts) lazily. MUST be called after process.chdir into a test tmpdir so
+ *  the first server.ts evaluation roots its JanusStore singleton there, never at the repo root. */
+async function loadLiveHelpers(): Promise<void> {
+  ({ installMockLive, waitFor } = await import("./helpers/mockLive"));
+}
 
 const SHELL = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
 
@@ -120,6 +145,7 @@ describe("US-1.1 Background completion awareness (P0)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us11-"));
     process.chdir(tmpDir);
 
+    await loadLiveHelpers(); // evaluates server.ts — must run AFTER the chdir above (see header)
     const serverMod = await import("../server");
     startServer = serverMod.startServer;
     apiToken = serverMod.API_AUTH_TOKEN;
@@ -304,6 +330,8 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
     // The flat REST shape omits the field when falsy (|| undefined) and includes it when true.
     const projected = t.quiescing || undefined;
     assert.strictEqual(projected, true, "the board's `quiescing` overlay field is present while wrapping up");
+    // No teardown needed: the terminal is never start()ed — the constructor spawns no PTY and
+    // arms no timers, so there is nothing to stop (stop() would be an immediate no-op).
   });
 
   it("US-1.2: quiescing is reversible — a fresh output burst returns the pane to Running and the eventual idle fires exactly once", async () => {
@@ -312,6 +340,7 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
     const prevCwd = process.cwd();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us12-"));
     process.chdir(dir);
+    await loadLiveHelpers(); // waitFor comes from mockLive — load after the chdir (see header)
     const monitoringStore = new JanusStore(":memory:");
     monitoringStore.init();
     const mgr = new OrchestratorManager({ ledger: monitoringStore });
@@ -369,6 +398,7 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
       assert.strictEqual(idleCount, 1, "the eventual idle edge fires EXACTLY once across the burst→finish sequence");
     } finally {
       await Promise.all(Object.values(mgr.terminals).map((t: any) => t.stop?.()));
+      monitoringStore.close();
       process.chdir(prevCwd);
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
@@ -386,10 +416,13 @@ describe("US-1.3 Status from summary not scrollback (P0)", () => {
     const prevCwd = process.cwd();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us13-"));
     process.chdir(dir);
+    let summaryStore: JanusStore | undefined;
     try {
-      const summaryStore = new JanusStore(":memory:");
+      summaryStore = new JanusStore(":memory:");
       summaryStore.init();
       const mgr = new OrchestratorManager({ ledger: summaryStore });
+      // Spawn-free by design: the terminal is never start()ed (no PTY, no timers), so the pane
+      // needs no stop() teardown — the only disposable resource here is the store, closed below.
       const t: any = new UniversalTerminal("us13-A", ".", "npm run build", "Custom", "Read-Only");
       mgr.terminals["us13-A"] = t;
 
@@ -420,6 +453,7 @@ describe("US-1.3 Status from summary not scrollback (P0)", () => {
       const body = summary.slice(4, -4).split("\n");
       assert.ok(body.length <= 20, `summary tail is bounded to <=20 lines (got ${body.length})`);
     } finally {
+      summaryStore?.close();
       process.chdir(prevCwd);
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
@@ -432,6 +466,7 @@ describe("US-1.3 Status from summary not scrollback (P0)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us13v-"));
     process.chdir(dir);
 
+    await loadLiveHelpers(); // evaluates server.ts — must run AFTER the chdir above (see header)
     const serverMod = await import("../server");
     const startServer = serverMod.startServer;
     const token = serverMod.API_AUTH_TOKEN;
@@ -465,6 +500,9 @@ describe("US-1.3 Status from summary not scrollback (P0)", () => {
       assert.ok(!out.includes("AKIA1234567890ABCD99"), "the raw secret is scrubbed before reaching the model");
       assert.match(out, /REDACTED/i, "the snapshot carries the redaction marker");
     } finally {
+      if (running) {
+        await Promise.all(Object.values(running.manager.terminals).map((term: any) => term.stop?.()));
+      }
       if (ws && ws.readyState !== WebSocket.CLOSED) {
         await new Promise<void>((resolve) => { ws!.once("close", () => resolve()); try { ws!.terminate(); } catch { resolve(); } });
       }
@@ -506,6 +544,7 @@ describe("US-1.4 Chatty pane doesn't degrade the voice loop (P1)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us14-"));
     process.chdir(tmpDir);
 
+    await loadLiveHelpers(); // evaluates server.ts — must run AFTER the chdir above (see header)
     const serverMod = await import("../server");
     apiToken = serverMod.API_AUTH_TOKEN;
     installMockLive();
@@ -607,6 +646,7 @@ describe("US-1.5 Capturing launch intent (P1)", () => {
     prevCwd = process.cwd();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-us15-"));
     process.chdir(tmpDir);
+    await loadLiveHelpers(); // evaluates server.ts — must run AFTER the chdir above (see header)
     const serverMod = await import("../server");
     apiToken = serverMod.API_AUTH_TOKEN;
     mockHandle = installMockLive();
