@@ -29,7 +29,7 @@ export const OBSERVE_FRAME_TYPES = [
 
 export const VOICE_FRAME_TYPES = [
   "audio", "interrupted", "transcript_text", "grounding", "voice_channel_lost",
-  "voice_channel_restored", "error",
+  "voice_channel_restored", "error", "stop_all_done",
 ] as const;
 
 // ── handleObserveFrame helpers ───────────────────────────────────────────

@@ -430,7 +430,8 @@ const VoiceChannelRestoredFrame = z.object({
 /** src/voice/index.ts handleStopAllFrame / release_stop_all — the per-request ACK for the voice
  *  socket's own stop-all control frame (distinct from the broadcast `stop_all`/`frozen` frames every
  *  client receives). Four shapes: `{error:"not_frozen"}`, `{stage:2, killed, failed}`,
- *  `{stage:1, frozen:true, running}`, `{stage:0, frozen:false}`. UNCONSUMED — see below. */
+ *  `{stage:1, frozen:true, running}`, `{stage:0, frozen:false}`. Consumed by Kitchen's handleVoiceFrame
+ *  (refetches frozen state and terminals without playing earcon). */
 const StopAllDoneFrame = z.object({
   type: z.literal("stop_all_done"),
   stage: z.number().optional(),
@@ -516,7 +517,6 @@ export const UNCONSUMED_FRAME_TYPES: Record<string, string> = {
   dispatch_updated: "emitted by src/actions/defs/dispatch_group.ts + src/observe/index.ts's dispatch-join completion; no frontend surface (Kitchen or classic) has a dispatch-board UI that reads it.",
   macros_updated: "emitted by src/actions/defs/macros.ts on save/delete; neither Kitchen nor the classic UI has a macros surface that reads it.",
   pane_note: "emitted by src/actionEffects.ts's restart-resume permission-mode note; no frontend surface renders a pane note pushed over the WS frame (only the REST-created note surfaces render).",
-  stop_all_done: "voice-socket-only per-request ack (src/voice/index.ts handleStopAllFrame/release_stop_all); neither dispatch table has a handler for it — the UI infers stop-all completion from the broadcast `frozen`/`stop_all` frames instead.",
 };
 
 /** Enabled ONLY for real-server-booting tests (the ~54 suites that set `process.env.NODE_ENV =

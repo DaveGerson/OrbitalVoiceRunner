@@ -1008,12 +1008,18 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         setTimeout(() => setToast(null), 4000);
         resetAudioPlayback();
       },
+      // wsm-e2e-pinned-40tf: voice-socket per-request ACK for stop-all — refetch frozen/terminals
+      // immediately without waiting on the broadcast frame. No earcon (the broadcast `frozen` arm already alarms).
+      stop_all_done: () => {
+        refetchFrozen();
+        refetchTerminals();
+      },
     };
     // Broadcast/board frames also reach this socket — any type not in the table above is the observe
     // lane's to own (no double refetch, no double xterm write), exactly like the original default arm.
     const type = msg?.type;
     if (typeof type === "string" && Object.hasOwn(handlers, type)) handlers[type]();
-  }, [earcon, showToast]);
+  }, [earcon, showToast, refetchFrozen, refetchTerminals]);
 
   // E2E harness (?mock=1) — drives all the same setters as the classic app.
   useE2EHarness({
