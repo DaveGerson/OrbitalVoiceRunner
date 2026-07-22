@@ -56,7 +56,10 @@ interface ConductorState {
   maxTurnMs?: number;
   turnIndex: number;
   clockMs: number;
-  turnStartClockMs: number;
+  /** null until the first onClock — the clock BASIS is caller-defined (epoch wall-clock ms in
+   *  the real runner, small integers in tests), so a zero init would make the first
+   *  checkTimeout see elapsed ~= the entire epoch and insta-fail (keyed-run incident 2026-07-22). */
+  turnStartClockMs: number | null;
   gapStartClockMs: number | null;
   lastAudioClockMs: number | null;
   lastJanusTranscriptClockMs: number | null;
@@ -83,7 +86,7 @@ function advanceTurn(state: ConductorState): void {
 }
 
 function checkTimeout(state: ConductorState): Command | null {
-  if (state.maxTurnMs !== undefined) {
+  if (state.maxTurnMs !== undefined && state.turnStartClockMs !== null) {
     const elapsed = state.clockMs - state.turnStartClockMs;
     if (elapsed > state.maxTurnMs) {
       state.status = "FAILED";
@@ -222,7 +225,7 @@ export function createConductor(score: Score, cfg: ConductorConfig = {}): Conduc
     maxTurnMs: cfg.maxTurnMs,
     turnIndex: 0,
     clockMs: 0,
-    turnStartClockMs: 0,
+    turnStartClockMs: null,
     gapStartClockMs: null,
     lastAudioClockMs: null,
     lastJanusTranscriptClockMs: null,
@@ -269,6 +272,8 @@ export function createConductor(score: Score, cfg: ConductorConfig = {}): Conduc
 
     onClock(nowMs: number): void {
       state.clockMs = nowMs;
+      // First observed clock defines the basis for the first turn's timeout window.
+      if (state.turnStartClockMs === null) state.turnStartClockMs = nowMs;
     },
 
     step(): Command {

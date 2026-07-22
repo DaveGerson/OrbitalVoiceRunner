@@ -226,6 +226,20 @@ test("wire fidelity: unknown/lowercase senders are ignored, never counted as Jan
   assert.equal(out.janusTranscripts, 0);
 });
 
+test("epoch clock basis: Date.now()-scale clocks with maxTurnMs must not insta-fail the first turn", () => {
+  // Keyed-run incident 2026-07-22: turnStartClockMs initialized to 0 while the runner feeds
+  // epoch milliseconds — first checkTimeout saw elapsed ~= 1.78e12 and SCENARIO_FAILED before
+  // a single frame. The basis must be the FIRST OBSERVED clock, whatever its scale.
+  const conductor = createConductor(SCORES.spike, { quiescenceMs: 1200, maxTurnMs: 45_000 });
+  const epoch = 1_784_703_153_127;
+  conductor.onClock(epoch);
+  const cmd = conductor.step();
+  assert.equal(cmd.type, "START_UTTERANCE", `first step must start the utterance, got ${cmd.type}: ${cmd.reason ?? ""}`);
+  // And the timeout still works, measured from the first observed clock:
+  conductor.onClock(epoch + 46_000);
+  assert.equal(conductor.step().type, "SCENARIO_FAILED");
+});
+
 test("all four scores reduce to SCENARIO_DONE under well-formed frame sequences", () => {
   const names = Object.keys(SCORES) as Array<keyof typeof SCORES>;
   for (const name of names) {

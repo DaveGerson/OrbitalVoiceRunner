@@ -218,6 +218,10 @@ async function defaultRunScore(
   const ws = await connectWs(`ws://127.0.0.1:${running.port}/live`, { Cookie: `auth_token=${token}` });
   const conductor = createConductor(score, { quiescenceMs: 1200, maxTurnMs: 45_000 });
 
+  const firstFrame = new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 15_000); // proceed anyway if the server stays silent
+    ws.once("message", () => { clearTimeout(timer); resolve(); });
+  });
   ws.on("message", (data) => {
     try {
       conductor.onFrame(JSON.parse(data.toString()));
@@ -226,7 +230,27 @@ async function defaultRunScore(
     }
   });
 
+  // Re-assert focus over the REAL wire protocol, but only once the server is provably
+  // LISTENING (keyed-run incident #3, 2026-07-22): the voice connection handler binds its
+  // message listener only AFTER `await doInitialConnect()` (the 1-2s Gemini connect), so a
+  // set_active_pane sent right at open arrives listener-less and is silently dropped — while
+  // the pre-connect _testSetActivePane call races the PREVIOUS score's server-side close
+  // handler, which nulls activePaneId ("no UI connected -> no write permitted"). The first
+  // inbound frame proves doInitialConnect completed, so the listener is bound (250ms grace
+  // for the same-tick window); the frame is exactly what the browser client sends
+  // (src/voice/index.ts:2566) and propose_command's active-pane guard then passes.
+  await firstFrame;
+  await sleep(250);
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "set_active_pane", paneId }));
+  }
+
   await runConductorLoop(conductor, ws);
+  // Drain window: Gemini's inputTranscription of OUR utterance can arrive after the model
+  // turn already quiesced (turn-over fires on the model's side, not the ASR echo's). The
+  // outcome counters accumulate in onFrame independent of the state machine, so a short
+  // drain before closing lets stragglers land and keeps the spike assertion honest.
+  await sleep(4000);
   await closeWs(ws);
 
   return checkStructuralAssertions(scoreName, conductor.outcome());
