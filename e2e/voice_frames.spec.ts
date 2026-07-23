@@ -137,6 +137,10 @@ test.describe("voice lane WS frame injection (?mock=1 harness) — bead wsm-e2e-
 
   test("f. a draft_updated frame fills burner-draft, and a transcript_text(Janus) frame mints a bubble WITHOUT altering burner-draft", async ({ page }) => {
     await gotoKitchen(page);
+    // burner-draft (the Order Pad) only renders once a station is opened. Open the default-active
+    // seeded pane's station (mock_pane_1 = "React Frontend", the first card) — injectDraftUpdate below
+    // targets mock_pane_1, so its burner must be the open one.
+    await page.getByTestId("station-card").first().click();
     const draft = page.getByTestId("burner-draft");
     await expect(draft).toHaveValue("");
 
