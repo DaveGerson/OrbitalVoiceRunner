@@ -192,7 +192,7 @@ describe("voice thought-buffer flush (modelThinking fragments coalesce to ONE bu
     assert.strictEqual(frames.length, 1, `expected exactly ONE Janus transcript_text frame, got ${frames.length}: ${JSON.stringify(frames.map((f) => f.text))}`);
     assert.strictEqual(frames[0].text, joined, "the single flushed frame carries the correctly-joined whole thought");
 
-    assert.strictEqual(draftText(PROJECT, PANE), agenticBullet(joined), "exactly one Agentic Thought bullet, holding the joined text");
+    assert.strictEqual(draftText(PROJECT, PANE), undefined, "draft is untouched, no Agentic Thought bullet");
 
     assert.strictEqual(recentTurns.size(), 1, `expected exactly ONE recentTurns push for this turn, got ${recentTurns.size()}`);
     assert.strictEqual(recentTurns.latest("janus")?.text, joined, "the recentTurns entry holds the joined text, not just the last fragment");
@@ -223,7 +223,7 @@ describe("voice thought-buffer flush (modelThinking fragments coalesce to ONE bu
     const frames = janusFramesSince(seen);
     assert.strictEqual(frames.length, 1, `barge-in must flush the partial thought exactly once, got ${frames.length} frame(s): ${JSON.stringify(frames.map((f) => f.text))}`);
     assert.strictEqual(frames[0].text, joined, "the flushed partial thought is the correctly-joined fragments (spoken words not lost)");
-    assert.strictEqual(draftText(PROJECT, PANE), agenticBullet(joined), "the partial thought lands as ONE Agentic Thought bullet");
+    assert.strictEqual(draftText(PROJECT, PANE), undefined, "the partial thought appends NO draft bullet");
   });
 
   // ── (c) turnComplete with an empty buffer => no output, both virgin and immediately after a flush ──
@@ -250,7 +250,7 @@ describe("voice thought-buffer flush (modelThinking fragments coalesce to ONE bu
     const flushFrames = janusFramesSince(seen);
     assert.strictEqual(flushFrames.length, 1, `expected exactly ONE flush frame for the real thought, got ${flushFrames.length}`);
     assert.strictEqual(flushFrames[0].text, joined);
-    assert.strictEqual(draftText(PROJECT, PANE), agenticBullet(joined));
+    assert.strictEqual(draftText(PROJECT, PANE), undefined, "draft remains untouched");
 
     // Step 3: immediately after that flush, the buffer is empty again — a second boundary must add
     // NOTHING (no stray empty bullet, no stray empty/duplicate frame).
@@ -288,8 +288,8 @@ describe("voice thought-buffer flush (modelThinking fragments coalesce to ONE bu
 
     assert.strictEqual(
       draftText(PROJECT, PANE),
-      `${agenticBullet(joined1)}\n${agenticBullet(joined2)}`,
-      "two independent Agentic Thought bullets, one per turn, each holding exactly that turn's joined text"
+      undefined,
+      "draft remains untouched across two thought turns"
     );
 
     assert.strictEqual(recentTurns.size(), 2, `expected exactly TWO recentTurns pushes (one per turn), got ${recentTurns.size()}`);
@@ -336,6 +336,6 @@ describe("voice thought-buffer flush (modelThinking fragments coalesce to ONE bu
     const frames = janusFramesSince(seen);
     assert.strictEqual(frames.length, 1, `generationComplete must flush exactly once, got ${frames.length}: ${JSON.stringify(frames.map((f) => f.text))}`);
     assert.strictEqual(frames[0].text, joined);
-    assert.strictEqual(draftText(PROJECT, PANE), agenticBullet(joined));
+    assert.strictEqual(draftText(PROJECT, PANE), undefined, "draft remains untouched");
   });
 });

@@ -306,7 +306,13 @@ export function createGating(deps: GatingDeps): Gating {
       }
       const run = buildActionRun(
         { capability: row.capability, params },
-        { manager, broadcast, broadcastLedgerUpdate, sanitizeSettingsForClient },
+        {
+          manager,
+          broadcast,
+          broadcastLedgerUpdate,
+          sanitizeSettingsForClient,
+          setActivePane: (id) => { coreState.activePaneId = id; },
+        },
       );
       pendingActions.add({
         id: row.id, capability: row.capability, summary: row.summary, params,

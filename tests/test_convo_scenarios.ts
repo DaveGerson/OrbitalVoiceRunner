@@ -60,7 +60,7 @@ const scenarioCoalesce: ConvoScenario = {
   steps: [modelThinks(...FRAGMENTS_COALESCE), turnComplete()],
   expect: {
     frames: [{ sender: "Janus", text: JOINED_COALESCE }],
-    draftText: agenticThoughtBullet(JOINED_COALESCE),
+    draftText: null,
     recentTurns: { size: 1, latestJanus: JOINED_COALESCE },
     logKinds: { gemini_thinking: FRAGMENTS_COALESCE.length, gemini_text: 1 },
   },
@@ -76,15 +76,14 @@ const scenarioBargeIn: ConvoScenario = {
   steps: [modelThinks(...FRAGMENTS_BARGE_IN), interrupted()],
   expect: {
     frames: [{ sender: "Janus", text: JOINED_BARGE_IN }],
-    draftText: agenticThoughtBullet(JOINED_BARGE_IN),
+    draftText: null,
     recentTurns: { size: 1, latestJanus: JOINED_BARGE_IN },
   },
 };
 
 // ── Scenario 4 — multi-turn bleed: two independent model-thought turns with an operator dictation
 // IN BETWEEN. Each thought flush must stay uncontaminated by the other turn's fragments, the
-// dictation must land as exactly one User Dictation bullet, and draft ordering must match arrival
-// order (thought1, dictation, thought2) — no cross-turn bleed either direction. ───────────────────
+// dictation must land as transcript/log (NOT draft), and no cross-turn bleed either direction. ───
 const BLEED_TURN1 = ["First", " thought", " here."];
 const BLEED_JOINED1 = "First thought here.";
 const BLEED_DICTATION = "Please continue the deployment.";
@@ -104,18 +103,13 @@ const scenarioMultiTurnBleed: ConvoScenario = {
       { sender: "User", text: BLEED_DICTATION },
       { sender: "Janus", text: BLEED_JOINED2 },
     ],
-    draftText: [
-      agenticThoughtBullet(BLEED_JOINED1),
-      userDictationBullet(BLEED_DICTATION),
-      agenticThoughtBullet(BLEED_JOINED2),
-    ].join("\n"),
+    draftText: null,
     recentTurns: { size: 3, latestJanus: BLEED_JOINED2, latestUser: BLEED_DICTATION },
   },
 };
 
-// ── Scenario 5 — dictation/turn interplay: operator dictation THEN a model thought turn. One User
-// Dictation bullet followed by one Agentic Thought bullet, in that order; one transcript_text frame
-// per side. ─────────────────────────────────────────────────────────────────────────────────────
+// ── Scenario 5 — dictation/turn interplay: operator dictation THEN a model thought turn. No draft
+// bullets appended; one transcript_text frame per side. ─────────────────────────────────────────
 const INTERPLAY_DICTATION = "Kick off the build when ready.";
 const INTERPLAY_FRAGMENTS = ["Starting", " the build", " now."];
 const INTERPLAY_JOINED = "Starting the build now.";
@@ -131,12 +125,25 @@ const scenarioDictationThenThought: ConvoScenario = {
       { sender: "User", text: INTERPLAY_DICTATION },
       { sender: "Janus", text: INTERPLAY_JOINED },
     ],
-    draftText: [userDictationBullet(INTERPLAY_DICTATION), agenticThoughtBullet(INTERPLAY_JOINED)].join("\n"),
+    draftText: null,
     recentTurns: { size: 2, latestUser: INTERPLAY_DICTATION, latestJanus: INTERPLAY_JOINED },
   },
 };
 
-// Scenarios 1/2/4/5 run through the plain data-driven harness below. Scenario 3 (approval-vote
+// ── Scenario 6 — open pane by voice -> confirm -> update_draft_prompt lands on THAT pane WITHOUT _testSetActivePane ──
+const scenarioOpenPaneVoiceConfirm: ConvoScenario = {
+  name: "open pane by voice -> confirm -> update_draft_prompt lands on created pane",
+  steps: [
+    toolCall("create_pane", { pane_id: "voice-created-pane", command: "bash", project_id: "convo_s5_proj" }, { capture: "create" }),
+    operatorSay("confirm"),
+    toolCall("update_draft_prompt", { pane_id: "voice-created-pane", text: "Draft for new pane", mode: "replace" }),
+  ],
+  expect: {
+    draftText: "Draft for new pane",
+  },
+};
+
+// Scenarios 1/2/4/5/6 run through the plain data-driven harness below. Scenario 3 (approval-vote
 // sequencing) needs a gated pane wired up first (see "Scenario 3" section further down) — its
 // step timeline is still DATA, but it carries its own `it()` because of that extra rigging.
 const DATA_DRIVEN_SCENARIOS: ConvoScenario[] = [
@@ -144,6 +151,7 @@ const DATA_DRIVEN_SCENARIOS: ConvoScenario[] = [
   scenarioBargeIn,
   scenarioMultiTurnBleed,
   scenarioDictationThenThought,
+  scenarioOpenPaneVoiceConfirm,
 ];
 
 describe("conversation golden-scripts (DSL over the REG1 oracle)", () => {

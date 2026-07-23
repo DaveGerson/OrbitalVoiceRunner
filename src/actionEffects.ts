@@ -220,6 +220,27 @@ export interface ActionEffectDeps {
   broadcast: (msg: any) => void;
   broadcastLedgerUpdate: () => void;
   sanitizeSettingsForClient: (s: any) => any;
+  setActivePane?: (paneId: string | null) => void;
+}
+
+/** Activate a newly created pane — make it the operator's active WRITE target + broadcast the view
+ *  switch — but ONLY for an operator-initiated VOICE create. A REST/recipe/dispatch_group background
+ *  spawn must never steal the operator's focus, so a non-voice OR unknown origin does NOT activate
+ *  (fail-safe: undefined origin is treated as non-voice, never as voice). The broadcast mirrors
+ *  switch_active_pane's wire contract (panes_write.ts) so the browser remounts its xterm on the new
+ *  pane and subscribes the PTY stream; without it a voice-created pane leaves the browser on the OLD
+ *  pane and the new pane's stdout has no listener ("you can see them, but I can't"). */
+export function activateCreatedPane(
+  deps: { setActivePane?: (paneId: string | null) => void; broadcast: (msg: any) => void },
+  paneId: string | null | undefined,
+  origin?: string
+): void {
+  if (!paneId) return;
+  if (origin !== "voice") return; // fail-safe: only an explicit voice origin steals operator focus
+  if (deps.setActivePane) {
+    deps.setActivePane(paneId);
+  }
+  deps.broadcast({ type: "switch_active_pane", paneId });
 }
 
 /** A capability builder: turns a rehydrated intent + live deps into the deferred-effect thunk. */
@@ -274,6 +295,7 @@ function buildCreatePane(intent: ActionIntent, deps: ActionEffectDeps): () => st
     }
     deps.broadcastLedgerUpdate();
     deps.broadcast({ type: "terminals_updated" });
+    activateCreatedPane(deps, p.paneId, p.origin);
     // Reproduce the EXACT confirm string of the originating staging site (Risk 1 drift guard).
     // The side effects above are identical across origins; only the return string differs.
     return createPaneConfirm(p, projectId, result);

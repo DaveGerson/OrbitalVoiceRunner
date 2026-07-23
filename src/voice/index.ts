@@ -659,7 +659,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     broadcast,
     broadcastLedgerUpdate,
     broadcastDraft,
-    appendActiveDraft,
     activeDraftTarget,
     sanitizeSettingsForClient,
     coreState,
@@ -1873,17 +1872,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             const cleanUtter = userUtterance.trim();
             if (!shouldRouteUtterance(cleanUtter)) return;
-            // A4: route any utterance with non-whitespace content so bare votes ("no"/"ok", 2 chars) reach
-            // the parser. Empty/whitespace drops. Step 6: capture dictation into the ACTIVE pane's WIP
-            // draft (raw material the operator refines before sending). Only non-approval utterances
-            // reach the draft so bare approval votes do not land as dictation bullets (wsm-e2e-pinned-pvwg).
-            // No-op if no pane open. KNOWN DELTA (accepted): this guard is the TS parser; in FLIP mode
-            // (JANUS_APPROVAL_PYTHON_PRIMARY below) routing follows Python's verdict, so on a parser
-            // disagreement dictation capture and vote consumption can diverge for that one utterance.
-            // SHADOW (default) routes on the byte-identical TS result, so guard === router there.
-            if (parseApprovalIntent(cleanUtter).intent === "none") {
-              appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
-            }
+            // wsm-e2e-pinned-j07x (operator decision 2026-07-22): operator dictation NO LONGER writes the
+            // pane draft — the order pad shows ONLY the structured update_draft_prompt output. Dictation
+            // still reaches recentTurns + the transcript_text(User) frame above, so the radio/log are intact.
 
             // Voice-UX wave 3: the spoken destructive-confirm protocol gets FIRST look at every routed
             // utterance — a synchronous TS choke point ahead of the approval-intent routing below, so a
@@ -1947,11 +1938,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             } catch (err) {
               console.error("[VOICE] failed to send transcript_text frame (client socket likely closed):", err);
             }
-            // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
-            const cleanUtter = modelUtterance.trim();
-            if (cleanUtter.length > 2) {
-              appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
-            }
+            // wsm-e2e-pinned-j07x: agentic thoughts NO LONGER write the pane draft (order pad = structured
+            // prompt only). The thought still surfaces via the transcript_text(Janus) frame above + the log.
           };
 
           // wsm-e2e-pinned-zmu5: the SINGLE flush point for state.pendingModelThinking. Reused by every
