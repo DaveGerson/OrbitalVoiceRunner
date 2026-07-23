@@ -15,6 +15,10 @@ import { createPane } from "../src/actions/defs/panes_write";
 
 function runCtx(spy: { activated: string | null; broadcasts: any[] }): ActionContext {
   const ctx: Partial<ActionContext> = {
+    // These tests represent a VOICE create (the Issue-#2 RCA). create_pane now stamps origin from
+    // ctx.surface and activateCreatedPane only steals focus for origin==='voice' — so the ctx must
+    // declare its surface as "voice" (a REST/recipe create legitimately does NOT activate).
+    surface: "voice",
     manager: {
       settings: { presets: [], advanced: {} },
       ledger: {
