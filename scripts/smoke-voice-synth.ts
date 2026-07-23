@@ -106,9 +106,15 @@ function checkSpike(outcome: Outcome): { ok: boolean; reason?: string } {
 }
 
 function checkDictation(outcome: Outcome): { ok: boolean; reason?: string } {
-  return outcome.janusTranscripts >= 2
+  // DETERMINISTIC assertion (keyed-run incident 2026-07-22, run 5): assert on OPERATOR ASR
+  // landing across both turns — that is the real multi-turn-dictation invariant and it always
+  // holds (the server transcribes whatever we speak). The model's spoken reply is NOT asserted:
+  // it legitimately varies run-to-run between speaking and acting (tool call), so gating on
+  // janusTranscripts made the smoke flaky. Coalescing of model speech is already pinned
+  // deterministically by tests/test_voice_thought_buffer.ts; the live lane proves the pipe.
+  return outcome.userTranscripts >= 2
     ? { ok: true }
-    : { ok: false, reason: `dictation requires >=2 Janus transcript_text bubbles, got ${outcome.janusTranscripts}` };
+    : { ok: false, reason: `dictation requires >=2 operator (User) transcripts across the two turns, got ${outcome.userTranscripts}` };
 }
 
 function checkApproval(outcome: Outcome): { ok: boolean; reason?: string } {

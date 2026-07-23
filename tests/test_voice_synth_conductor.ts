@@ -240,6 +240,39 @@ test("epoch clock basis: Date.now()-scale clocks with maxTurnMs must not insta-f
   assert.equal(conductor.step().type, "SCENARIO_FAILED");
 });
 
+test("pure-tool turn completes: action_activity + quiescence advances even with NO Janus transcript", () => {
+  // Keyed-run incident 2026-07-22 (run 5): the model answered a dictation utterance by ACTING
+  // (list_panes/switch_context/propose_command) — a real voice turn with tool activity but zero
+  // spoken transcript. Turn-over must key off any model signal, not a Janus bubble, or it hangs.
+  const conductor = createConductor(SCORES.dictation, { quiescenceMs: 1200, maxTurnMs: 45_000 });
+  conductor.onClock(1000);
+  assert.equal(conductor.step().type, "START_UTTERANCE"); // turn 0 say
+  conductor.onFrame({ type: "transcript_text", sender: "User", text: "good morning" }); // operator ASR
+  conductor.onFrame({ type: "action_activity" }); // model does tool work — NO Janus transcript
+  conductor.onClock(1400);
+  assert.equal(conductor.step().type, "WAIT", "still within quiescence of the tool activity");
+  conductor.onClock(2700); // 1300ms since the last tool signal -> turn is over
+  const cmd = conductor.step();
+  assert.notEqual(cmd.type, "SCENARIO_FAILED", `pure-tool turn must not time out, got ${cmd.reason ?? cmd.type}`);
+  assert.equal(conductor.outcome().janusTranscripts, 0, "no spoken bubble was produced");
+});
+
+test("incidental approval_pending does NOT block a score with no 'approve' ahead", () => {
+  // Same incident: the stray propose->pending emitted approval_pending to the voice client. A
+  // non-approval score must ignore it and complete on quiescence, not wait forever for an approve.
+  const conductor = createConductor(SCORES.dictation, { quiescenceMs: 1200, maxTurnMs: 45_000 });
+  conductor.onClock(1000);
+  assert.equal(conductor.step().type, "START_UTTERANCE");
+  conductor.onFrame({ type: "transcript_text", sender: "User", text: "good morning" });
+  conductor.onFrame({ type: "action_activity" });
+  conductor.onFrame({ type: "approval_pending" }); // incidental — this score never says "approve"
+  conductor.onClock(2700);
+  assert.equal(conductor.step().type, "WAIT", "advances into GAP, not blocked on the stray pending");
+  conductor.onClock(3300); // gap(500) elapsed
+  const cmd = conductor.step();
+  assert.notEqual(cmd.type, "SCENARIO_FAILED", `stray pending must not hang the turn, got ${cmd.reason ?? cmd.type}`);
+});
+
 test("all four scores reduce to SCENARIO_DONE under well-formed frame sequences", () => {
   const names = Object.keys(SCORES) as Array<keyof typeof SCORES>;
   for (const name of names) {
