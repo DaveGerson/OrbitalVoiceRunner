@@ -130,20 +130,13 @@ const scenarioDictationThenThought: ConvoScenario = {
   },
 };
 
-// ── Scenario 6 — open pane by voice -> confirm -> update_draft_prompt lands on THAT pane WITHOUT _testSetActivePane ──
-const scenarioOpenPaneVoiceConfirm: ConvoScenario = {
-  name: "open pane by voice -> confirm -> update_draft_prompt lands on created pane",
-  steps: [
-    toolCall("create_pane", { pane_id: "voice-created-pane", command: "bash", project_id: "convo_s5_proj" }, { capture: "create" }),
-    operatorSay("confirm"),
-    toolCall("update_draft_prompt", { pane_id: "voice-created-pane", text: "Draft for new pane", mode: "replace" }),
-  ],
-  expect: {
-    draftText: "Draft for new pane",
-  },
-};
+// (Removed the "open pane by voice -> confirm -> update_draft_prompt" scenario: adversarial review
+// proved it vacuous here — the data-driven harness pre-sets the active pane via _testSetActivePane and
+// update_draft_prompt writes to coreState.activePaneId (it has no pane_id param), so it re-tested
+// "write to the already-active pane", not "a voice-created pane becomes active". The real create->active
+// contract is pinned properly in tests/test_action_create_pane.ts, tests 1/2/3/8 wsm-e2e-pinned-c6b9.)
 
-// Scenarios 1/2/4/5/6 run through the plain data-driven harness below. Scenario 3 (approval-vote
+// Scenarios 1/2/4/5 run through the plain data-driven harness below. Scenario 3 (approval-vote
 // sequencing) needs a gated pane wired up first (see "Scenario 3" section further down) — its
 // step timeline is still DATA, but it carries its own `it()` because of that extra rigging.
 const DATA_DRIVEN_SCENARIOS: ConvoScenario[] = [
@@ -151,7 +144,6 @@ const DATA_DRIVEN_SCENARIOS: ConvoScenario[] = [
   scenarioBargeIn,
   scenarioMultiTurnBleed,
   scenarioDictationThenThought,
-  scenarioOpenPaneVoiceConfirm,
 ];
 
 describe("conversation golden-scripts (DSL over the REG1 oracle)", () => {

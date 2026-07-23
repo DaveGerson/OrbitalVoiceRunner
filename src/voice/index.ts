@@ -1946,7 +1946,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // turn boundary below (interrupted / turnComplete / generationComplete) and, via
           // state.flushPendingThought, by the two teardown paths outside this closure — reusing
           // handleModelUtterance means "one gemini_text log / one recentTurns push / one transcript_text
-          // frame / one Agentic-Thought bullet (length>2 guard on the JOINED text)" fall out for free.
+          // frame per turn" fall out for free. (j07x: the thought NO LONGER writes a pane-draft bullet —
+          // the order pad shows only the structured update_draft_prompt output.)
           // trim() (not a bare truthiness check) so a lone-whitespace buffer flushes to nothing rather
           // than a stray near-empty frame.
           const flushModelThinking = (): void => {
@@ -2043,11 +2044,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // answer "already done" and DO NOT re-run. Reads (readOnly) are exempt. The store lookup is
           // best-effort: any fault returns false (falls through to normal dispatch — never blocks it).
           // Extracted from runToolCall (Phase 7 CC refactor) — byte-identical predicate.
-          const isReplayShortCircuit = (cid: string, name: string): boolean => {
+          // nx2a review fix: idempotency/replay keys off the RAW call.id (undefined -> never suppress),
+          // NOT the synthetic wire id — a synthetic fc-<turn>-<i> is turn-stable and collides across two
+          // distinct id-less calls in one turn, which would FALSELY suppress the second as a replay.
+          const isReplayShortCircuit = (callId: string | undefined, name: string): boolean => {
             const replayDef = REGISTRY.find((d: any) => d.name === name);
-            if (!(store && cid && replayDef && !replayDef.readOnly)) return false;
+            if (!(store && callId && replayDef && !replayDef.readOnly)) return false;
             try {
-              return store.hasSucceededIdempotencyKey(cid);
+              return store.hasSucceededIdempotencyKey(callId);
             } catch {
               return false; // store fault -> proceed; the guard must never block dispatch.
             }
@@ -2058,7 +2062,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // idempotency_key, so `getActionLog` (and any operator-facing audit view) can tell "this ran"
           // apart from "this was replayed and skipped". Never throws; a store fault here must not
           // affect the tool response already being sent in the caller.
-          const recordReplaySuppressed = (cid: string, name: string, ixnId: string): void => {
+          const recordReplaySuppressed = (callId: string | undefined, name: string, ixnId: string): void => {
             if (!store) return;
             const replayDef = REGISTRY.find((d: any) => d.name === name);
             try {
@@ -2067,7 +2071,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 capability: replayDef?.capability ?? "unknown",
                 result_kind: "replay_suppressed",
                 ms: 0,
-                idempotency_key: cid,
+                idempotency_key: callId ?? null,
                 surface: "voice",
                 interaction_id: ixnId ?? null,
               });
@@ -2098,8 +2102,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             try {
               // REG1 phase-C: unified registry dispatch. runAction is itself try/caught + never throws; the
               // outer catch here is belt-and-suspenders. A re-delivered side-effecting call short-circuits.
-              if (isReplayShortCircuit(cid, name)) {
-                recordReplaySuppressed(cid, name, ixnId);
+              if (isReplayShortCircuit(call.id, name)) {
+                recordReplaySuppressed(call.id, name, ixnId);
                 session.sendToolResponse({
                   functionResponses: [{ name, id: cid, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
                 });
@@ -2108,7 +2112,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                   functionResponses: [{ name, id: cid, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
                 });
               } else {
-                const actionCtx: ActionContext = buildActionContext(cid, name);
+                // buildActionContext's callId is the audit idempotency key -> use the RAW call.id
+                // (undefined for an id-less call = no dedup, pre-nx2a semantics). The synthetic cid is
+                // ONLY for the wire response id below (Gemini requires a matching id).
+                const actionCtx: ActionContext = buildActionContext(call.id, name);
                 const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
                 let outputProjection: any = undefined;
                 try {

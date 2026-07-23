@@ -320,7 +320,10 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       // set ONLY by a UI focus message / switch_active_pane, which loses the race against a voice-only
       // create-then-command flow. ctx.setActivePane mutates the SAME per-connection activePaneId that
       // dispatchProposal reads, so the next voice command on this connection targets the new pane.
-      activateCreatedPane(ctx, pane_id, "voice");
+      // origin = the REAL dispatch surface (review fix: was hardcoded "voice", so a REST create — served
+      // by this same def via POST /api/terminals — stole operator focus). activateCreatedPane only
+      // activates on origin==='voice', so a REST/recipe create no longer yanks the operator's view.
+      activateCreatedPane(ctx, pane_id, ctx.surface);
       return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
     };
 
@@ -329,11 +332,12 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       pane_id ?? null,
       `Create pane ${pane_id} (${command}) in ${project_id}`,
       createPaneEffect,
-      // kzt: serializable restart-intent. origin:"voice" -> the rebuild returns the voice-shaped
-      // string. Keys in LOCKSTEP with buildActionRun's CreatePaneParams (src/actionEffects.ts).
+      // kzt: serializable restart-intent. origin = the REAL dispatch surface (review fix: was hardcoded
+      // "voice", so a rehydrated REST/recipe create newly stole focus post-restart). Keys in LOCKSTEP
+      // with buildActionRun's CreatePaneParams (src/actionEffects.ts).
       {
         ...(ctx.versionStamp ?? {}),
-        origin: "voice",
+        origin: ctx.surface,
         paneId: pane_id,
         cwd: ctx.manager.ledger.workspaces[project_id]?.directory,
         command,

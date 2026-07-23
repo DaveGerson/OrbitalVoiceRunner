@@ -178,16 +178,12 @@ describe("selectApprovalTarget (BUG-007)", () => {
     assert.strictEqual(r.via, "only");
   });
 
-  it("single pending + NON-matching fragment -> ambiguous (clarify), NOT resolved", () => {
-    const r = selectApprovalTarget([entries[0]], { fragment: "docker build" }, null);
-    assert.ok(r.ambiguous, "single pending with non-matching fragment must be ambiguous");
-    assert.strictEqual(r.messageId, undefined);
-  });
-
-  it("single pending + MATCHING fragment -> resolves via only", () => {
-    const r = selectApprovalTarget([entries[0]], { fragment: "npm install" }, null);
-    assert.strictEqual(r.messageId, "m1");
-    assert.strictEqual(r.via, "only");
+  // cqtz REVERTED (2026-07-23): a single pending entry resolves via:"only" regardless of any incidental
+  // fragment (a bare affirmation like "approve, sounds good" carries an incidental non-matching fragment
+  // and must NOT clarify on the common single-item happy path). Both fragments resolve the lone entry.
+  it("single pending + ANY fragment (matching or not) -> resolves via only (single-item happy path)", () => {
+    assert.strictEqual(selectApprovalTarget([entries[0]], { fragment: "npm install" }, null).via, "only");
+    assert.strictEqual(selectApprovalTarget([entries[0]], { fragment: "sounds good" }, null).via, "only");
   });
 
   it("P0-B: fragment present but matches ZERO with >1 pending -> ambiguous, NOT lastAnnounced over-approve", () => {
@@ -837,11 +833,6 @@ describe("U1 — voice resolves a staged pendingAction (bead wsm-e2e-pinned-9fe)
       const r = selectPendingAction([A], undefined);
       assert.strictEqual(r.id, "a");
       assert.strictEqual(r.via, "only");
-    });
-    it("single action + NON-matching fragment -> ambiguous (clarify)", () => {
-      const r = selectPendingAction([A], { fragment: "docker build" });
-      assert.strictEqual(r.ambiguous, true);
-      assert.strictEqual(r.id, undefined);
     });
     it("ordinal 2 -> the second action", () => {
       const r = selectPendingAction([A, B], { ordinal: 2 });
