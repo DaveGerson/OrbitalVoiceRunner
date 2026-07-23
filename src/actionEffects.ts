@@ -37,6 +37,7 @@ import path from "path";
 import { actionSchemaHash } from "./actions/registry";
 import { buildExportSnapshot, composeExportMarkdown, writeExportArtifactAtomic, EXPORT_BASENAME } from "./actions/defs/export";
 import { findPaneOwningProject } from "./paneOwnership";
+import { activateCreatedPane } from "./paneActivation";
 import { getHistoryBridge } from "./historyBridge";
 import { respawnFromLedger } from "./actions/respawnFromLedger";
 import type { ActionContext } from "./actions/types";
@@ -223,25 +224,8 @@ export interface ActionEffectDeps {
   setActivePane?: (paneId: string | null) => void;
 }
 
-/** Activate a newly created pane — make it the operator's active WRITE target + broadcast the view
- *  switch — but ONLY for an operator-initiated VOICE create. A REST/recipe/dispatch_group background
- *  spawn must never steal the operator's focus, so a non-voice OR unknown origin does NOT activate
- *  (fail-safe: undefined origin is treated as non-voice, never as voice). The broadcast mirrors
- *  switch_active_pane's wire contract (panes_write.ts) so the browser remounts its xterm on the new
- *  pane and subscribes the PTY stream; without it a voice-created pane leaves the browser on the OLD
- *  pane and the new pane's stdout has no listener ("you can see them, but I can't"). */
-export function activateCreatedPane(
-  deps: { setActivePane?: (paneId: string | null) => void; broadcast: (msg: any) => void },
-  paneId: string | null | undefined,
-  origin?: string
-): void {
-  if (!paneId) return;
-  if (origin !== "voice") return; // fail-safe: only an explicit voice origin steals operator focus
-  if (deps.setActivePane) {
-    deps.setActivePane(paneId);
-  }
-  deps.broadcast({ type: "switch_active_pane", paneId });
-}
+// activateCreatedPane moved to the dependency-free leaf src/paneActivation.ts (imported above) to
+// break the panes_write <-> actionEffects circular import (wsm-e2e-pinned-c6b9 regression).
 
 /** A capability builder: turns a rehydrated intent + live deps into the deferred-effect thunk. */
 type EffectBuilder = (intent: ActionIntent, deps: ActionEffectDeps) => () => string;

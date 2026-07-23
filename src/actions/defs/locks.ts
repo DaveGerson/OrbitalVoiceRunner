@@ -152,21 +152,27 @@ function legacyApplyPanePerms(
   );
   if (g.disposition === "forbidden") {
     return {
-      kind: "ok",
-      output: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.`,
+      kind: "blocked",
+      reason: `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.`,
     };
   }
   if (g.disposition === "deferred") {
     return {
-      kind: "ok",
-      output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+      kind: "pending",
+      messageId: g.actionId,
+      summary: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+      extra: {
+        output: `'${g.summary}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+      },
     };
   }
   return { kind: "ok", output: applyPanePerms() };
 }
 
 /**
- * The P4 delegate: route the mode change through ctx.applyPaneMode (the live choke point, bead 1y8).
+ * The P4 (multi-cli) live mode-switch choke-point delegate: routes through ctx.applyPaneMode to reach
+ * the running process (live-signal / restart-resume). Retained when ctx.applyPaneMode is wired.
+ *
  * The output strings are mapped from PaneModeResult so the voice-tool goldens stay byte-for-byte for
  * the gate dispositions (forbidden / deferred), and a live success reads the same "updated ...
  * successfully" shape. Returns null if ctx.applyPaneMode is not wired (caller falls back to legacy).
@@ -182,9 +188,26 @@ async function applyPaneModeDelegate(
   if (r.ok) {
     return { kind: "ok", output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` };
   }
-  // forbidden / deferred / unsupported / live-signal-timeout all carry an operator-facing reason
-  // (the forbidden + deferred reasons are byte-for-byte the legacy gate-disposition strings).
-  return { kind: "ok", output: r.reason ?? `Could not set pane ${pane_id} permissions to ${permissions_mode}.` };
+  if (r.kind === "deferred") {
+    return {
+      kind: "pending",
+      messageId: r.actionId ?? "",
+      summary: r.reason ?? `'Set pane ${pane_id} permissions to ${permissions_mode}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+      extra: {
+        output: r.reason ?? `'Set pane ${pane_id} permissions to ${permissions_mode}' needs operator confirmation (gated Ask). I've queued it — confirm to apply.`,
+      },
+    };
+  }
+  if (r.kind === "forbidden") {
+    return {
+      kind: "blocked",
+      reason: r.reason ?? `Error: the 'set_pane_permissions' capability is gated Off for pane ${pane_id}; forbidden by policy.`,
+    };
+  }
+  return {
+    kind: "error",
+    message: r.reason ?? `Could not set pane ${pane_id} permissions to ${permissions_mode}.`,
+  };
 }
 
 export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {

@@ -79,7 +79,8 @@
         "update_metadata": "Auto",
         "write_to_pane": "Ask"
       },
-      "pane_id": null
+      "pane_id": null,
+      "permissions_mode": "Inherit"
     }
   },
   "get_pane_summary": {
@@ -225,7 +226,9 @@
     "output": "'Set global permissions to Full Auto' needs operator confirmation (gated Ask). I've queued it — confirm to apply."
   },
   "set_pane_permissions": {
-    "output": "'Set pane gold-perm-pane permissions to Read-Only' needs operator confirmation (gated Ask). I've queued it — confirm to apply."
+    "messageId": "<ID>",
+    "output": "'Set pane gold-perm-pane permissions to Read-Only' needs operator confirmation (gated Ask). I've queued it — confirm to apply.",
+    "status": "pending_approval"
   },
   "set_pane_permissions.invalid_mode": {
     "output": "Invalid permissions mode \"Nonsense\". Must be one of: Full Auto, Human-in-the-Loop, Read-Only."

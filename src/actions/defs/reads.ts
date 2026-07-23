@@ -39,6 +39,7 @@ import { ALL_CAPABILITIES } from "../../gateSurface";
 import { stripAnsiSequences, redactSecrets } from "../../terminal";
 import { getHistoryBridge } from "../../historyBridge";
 import { serializePending } from "../../pendingApprovals";
+import { findPaneOwningProject } from "../../paneOwnership";
 
 /** Empty-params schema (pins declarations -> properties {}), shared by the no-arg reads. */
 const NoParams = z.object({});
@@ -290,6 +291,29 @@ export const getAttentionDigest: ActionDef<typeof NoParams> = {
   },
 };
 
+// Fully DEFENSIVE (review fix): mode is an additive observability field on get_pane_gates — it must
+// NEVER throw and break the core gates read. findPaneOwningProject expects a fully-shaped manager (it
+// iterates workspaces) and throws on the minimal fakes some ctx-level tests inject, so guard it.
+// Extracted from resolvePanePermissionsMode to hold both functions at CC <= 10.
+function paneModeFromLookup(manager: NonNullable<ActionContext["manager"]>, paneId: string): string | null {
+  try {
+    const owned = findPaneOwningProject(manager, paneId);
+    if (owned?.pane?.permissions_mode) return owned.pane.permissions_mode;
+  } catch { /* fall through to terminal/global */ }
+  const term = manager.terminals?.[paneId];
+  return term?.permissionsMode ?? null;
+}
+
+function resolvePanePermissionsMode(paneId: string | undefined, ctx: ActionContext): string {
+  const manager = ctx.manager;
+  if (!manager) return "Human-in-the-Loop";
+  if (paneId) {
+    const mode = paneModeFromLookup(manager, paneId);
+    if (mode) return mode;
+  }
+  return manager.globalPermissionsMode ?? "Human-in-the-Loop";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // get_pane_gates (server.ts:3382)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -310,7 +334,8 @@ export const getPaneGates: ActionDef<typeof OptionalPaneIdParams> = {
     for (const c of ALL_CAPABILITIES) {
       resolved[c] = ctx.effectiveCapabilityGateFor(pane_id || null, c);
     }
-    return { kind: "ok", output: { pane_id: pane_id ?? null, gates: resolved } };
+    const permissions_mode = resolvePanePermissionsMode(pane_id, ctx);
+    return { kind: "ok", output: { pane_id: pane_id ?? null, permissions_mode, gates: resolved } };
   },
 };
 

@@ -25,7 +25,7 @@ import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
 import { findPaneOwningProject } from "../../paneOwnership";
-import { activateCreatedPane } from "../../actionEffects";
+import { activateCreatedPane } from "../../paneActivation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // switch_active_pane — UNGATED focus move (server.ts:2613-2632).

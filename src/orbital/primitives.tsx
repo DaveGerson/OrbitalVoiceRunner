@@ -194,12 +194,15 @@ export function PostureChip({ posture, mode, style = {} }: {
 }) {
   const skin = posture ? POSTURE_SKIN[posture] : mode ? MODE_SKIN[mode] : null;
   if (!skin) return null; // no server truth — no chip (never a guess)
+  const isFullAuto = posture === "OPEN" || mode === "Full Auto";
   return (
     <span data-testid="posture-chip" data-posture={posture ?? mode} title={skin.tip} style={{
       display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999,
       border: "1.5px solid " + INK, background: skin.bg, color: skin.fg,
       fontFamily: "DM Sans, sans-serif", fontSize: 12, fontWeight: 800,
-      letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
+      letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5,
+      boxShadow: isFullAuto ? "0 0 6px #4db892" : "none",
+      ...style,
     }}>{skin.label}</span>
   );
 }
