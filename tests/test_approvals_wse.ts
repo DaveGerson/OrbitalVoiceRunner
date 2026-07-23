@@ -178,6 +178,18 @@ describe("selectApprovalTarget (BUG-007)", () => {
     assert.strictEqual(r.via, "only");
   });
 
+  it("single pending + NON-matching fragment -> ambiguous (clarify), NOT resolved", () => {
+    const r = selectApprovalTarget([entries[0]], { fragment: "docker build" }, null);
+    assert.ok(r.ambiguous, "single pending with non-matching fragment must be ambiguous");
+    assert.strictEqual(r.messageId, undefined);
+  });
+
+  it("single pending + MATCHING fragment -> resolves via only", () => {
+    const r = selectApprovalTarget([entries[0]], { fragment: "npm install" }, null);
+    assert.strictEqual(r.messageId, "m1");
+    assert.strictEqual(r.via, "only");
+  });
+
   it("P0-B: fragment present but matches ZERO with >1 pending -> ambiguous, NOT lastAnnounced over-approve", () => {
     // entries [npm install (m1), rm -rf build (m2), docker build (m3)]; "kubernetes" matches none.
     // Even with a lastAnnounced of m3 (deploy-like), a present-but-missed by-name fragment must
@@ -825,6 +837,11 @@ describe("U1 — voice resolves a staged pendingAction (bead wsm-e2e-pinned-9fe)
       const r = selectPendingAction([A], undefined);
       assert.strictEqual(r.id, "a");
       assert.strictEqual(r.via, "only");
+    });
+    it("single action + NON-matching fragment -> ambiguous (clarify)", () => {
+      const r = selectPendingAction([A], { fragment: "docker build" });
+      assert.strictEqual(r.ambiguous, true);
+      assert.strictEqual(r.id, undefined);
     });
     it("ordinal 2 -> the second action", () => {
       const r = selectPendingAction([A, B], { ordinal: 2 });

@@ -402,13 +402,24 @@ function hasLastAnnounced(entries: TargetableEntry[], lastAnnouncedId: string | 
   return !!lastAnnouncedId && entries.some((e) => e.messageId === lastAnnouncedId);
 }
 
+/** The lone-pending case (wsm-e2e-pinned-cqtz): a single entry resolves via:"only" UNLESS the operator
+ *  named a fragment that clearly does not match it (e.g. "approve docker build" while only "npm test" is
+ *  pending) — then CLARIFY rather than wrongly resolve. A bare vote (no fragment) or a matching fragment
+ *  still resolves. Extracted to keep selectApprovalTarget at CC <= 10. */
+function resolveLoneApprovalTarget(entry: TargetableEntry, hint: TargetHint | undefined): TargetResult {
+  if (hint?.fragment && fragmentMatches([entry], fragmentNeedle(hint.fragment), (e) => `${e.instruction} ${e.terminalId}`).length === 0) {
+    return { ambiguous: true };
+  }
+  return { messageId: entry.messageId, via: "only" };
+}
+
 export function selectApprovalTarget(
   entries: TargetableEntry[],
   hint: TargetHint | undefined,
   lastAnnouncedId: string | null
 ): TargetResult {
   if (entries.length === 0) return {};
-  if (entries.length === 1) return { messageId: entries[0].messageId, via: "only" };
+  if (entries.length === 1) return resolveLoneApprovalTarget(entries[0], hint);
 
   // 1. Fragment match against instruction or pane id.
   // A PRESENT fragment is an explicit by-name targeting signal. With >1 pending, if it matches
@@ -463,12 +474,21 @@ export interface ActionTargetResult {
   via?: "only" | "ordinal" | "fragment";
 }
 
+/** Lone-pending-action twin of resolveLoneApprovalTarget (wsm-e2e-pinned-cqtz). Extracted to keep
+ *  selectPendingAction at CC <= 10. */
+function resolveLonePendingAction(action: PendingActionLike, hint: TargetHint | undefined): ActionTargetResult {
+  if (hint?.fragment && fragmentMatches([action], fragmentNeedle(hint.fragment), (a) => a.summary).length === 0) {
+    return { ambiguous: true };
+  }
+  return { id: action.id, summary: action.summary, via: "only" };
+}
+
 export function selectPendingAction(
   actions: PendingActionLike[],
   hint: TargetHint | undefined,
 ): ActionTargetResult {
   if (actions.length === 0) return {};
-  if (actions.length === 1) return { id: actions[0].id, summary: actions[0].summary, via: "only" };
+  if (actions.length === 1) return resolveLonePendingAction(actions[0], hint);
 
   // Ordinal ("the second one" -> 2; "the last one" -> -1).
   if (hint?.ordinal !== undefined) {
