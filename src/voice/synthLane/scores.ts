@@ -98,11 +98,14 @@ export const SCORES: Record<ScoreName, Score> = {
     say("This is a microphone check for the synthetic operator lane."),
     awaitTurnDone(),
   ],
+  // Conversational, NON-actionable turns (keyed-run incident 2026-07-22): placeholder phrases like
+  // "first dictation phrase" read as things-to-do, so the model sometimes proposes a command instead
+  // of replying — cleaner realistic dictation traces come from plain talk it can only answer.
   dictation: [
-    say("First dictation phrase"),
+    say("Good morning. Can you hear me clearly on the line?"),
     awaitTurnDone(),
     gap(500),
-    say("Second dictation phrase"),
+    say("Great, thank you. That is all I needed to check for now."),
     awaitTurnDone(),
     gap(500),
   ],

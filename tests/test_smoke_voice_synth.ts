@@ -80,7 +80,7 @@ function checkOutcomeForTest(
       if (outcome.userTranscripts < 1) return { ok: false, reason: "spike userTranscripts < 1" };
       return { ok: true };
     case "dictation":
-      if (outcome.janusTranscripts < 2) return { ok: false, reason: "dictation janusTranscripts < 2" };
+      if (outcome.userTranscripts < 2) return { ok: false, reason: "dictation userTranscripts < 2" };
       return { ok: true };
     case "approval":
       if (!outcome.approvalResolved) return { ok: false, reason: "approval not resolved" };
