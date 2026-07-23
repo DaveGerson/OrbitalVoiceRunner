@@ -83,9 +83,6 @@ function draftText(running: RunningServer, projectId: string, paneId: string): s
   return running.manager.ledger.getDraft(projectId, paneId)?.text;
 }
 
-function agenticBullet(text: string): string {
-  return `* **Agentic Thought**: *${text}*`;
-}
 
 async function closeClient(client: WebSocket): Promise<void> {
   if (client && client.readyState !== WebSocket.CLOSED) {
@@ -120,7 +117,7 @@ describe("trace replay — committed incident trace reproduces the coalesced-tho
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
-  it("exactly ONE Janus transcript_text frame + ONE Agentic Thought draft bullet, carrying the raw-concatenated sentence", async () => {
+  it("exactly ONE Janus transcript_text frame carrying the raw-concatenated sentence (and the thought does NOT write the draft)", async () => {
     const PROJECT = "trace_replay_proj";
     const PANE = "trace-replay-pane";
     registerActivePane(running, PROJECT, PANE);
@@ -134,7 +131,8 @@ describe("trace replay — committed incident trace reproduces the coalesced-tho
     assert.strictEqual(janusFrames.length, 1, `expected exactly ONE Janus transcript_text frame, got ${janusFrames.length}: ${JSON.stringify(janusFrames.map((f) => f.text))}`);
     assert.strictEqual(janusFrames[0].text, JOINED_INCIDENT, "the replayed trace reproduces the raw-concatenated incident sentence byte-for-byte");
 
-    assert.strictEqual(draftText(running, PROJECT, PANE), agenticBullet(JOINED_INCIDENT), "exactly one Agentic Thought bullet, holding the joined text");
+    const d137 = draftText(running, PROJECT, PANE);
+    assert.ok(!d137 || !d137.includes("Agentic Thought"), `j07x: the model thought must NOT write the pane draft (order pad = structured prompt only); it surfaces via the transcript_text frame + log, got draft: ${d137}`);
     assert.strictEqual(recentTurns.size(), 1, "exactly one recentTurns push for the replayed turn");
   });
 
@@ -231,7 +229,8 @@ describe("trace replay — tap round-trip (capture with flag ON, then replay the
     const replayFrames = clientMessages.slice(seenReplay).filter((m) => m.type === "transcript_text" && m.sender === "Janus");
     assert.strictEqual(replayFrames.length, originalFrames.length, "capture -> replay round-trip reproduces an IDENTICAL downstream frame count");
     assert.strictEqual(replayFrames[0].text, originalFrames[0].text, "and identical frame content");
-    assert.strictEqual(draftText(running, REPLAY_PROJECT, REPLAY_PANE), agenticBullet(joined), "and an identical single Agentic Thought bullet");
+    const d235 = draftText(running, REPLAY_PROJECT, REPLAY_PANE);
+    assert.ok(!d235 || !d235.includes("Agentic Thought"), `j07x: the replayed thought must NOT write the pane draft, got: ${d235}`);
     assert.strictEqual(recentTurns.size(), 1, "and an identical single recentTurns push");
   });
 });

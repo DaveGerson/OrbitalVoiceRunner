@@ -134,4 +134,23 @@ test.describe("voice lane WS frame injection (?mock=1 harness) — bead wsm-e2e-
     // the last chunk's text.
     await expect(feed.getByText(chunks[0], { exact: false })).not.toContainText(chunks[2].trim());
   });
+
+  test("f. a draft_updated frame fills burner-draft, and a transcript_text(Janus) frame mints a bubble WITHOUT altering burner-draft", async ({ page }) => {
+    await gotoKitchen(page);
+    // burner-draft (the Order Pad) only renders once a station is opened. Open the default-active
+    // seeded pane's station (mock_pane_1 = "React Frontend", the first card) — injectDraftUpdate below
+    // targets mock_pane_1, so its burner must be the open one.
+    await page.getByTestId("station-card").first().click();
+    const draft = page.getByTestId("burner-draft");
+    await expect(draft).toHaveValue("");
+
+    // 1. Inject draft_updated frame -> fills burner-draft
+    await page.evaluate(([p, t]) => window.__ORBITAL_E2E__?.injectDraftUpdate(p, t), ["mock_pane_1", "Check and see what's going on."]);
+    await expect(draft).toHaveValue("Check and see what's going on.");
+
+    // 2. Inject transcript_text(Janus) frame -> mints KitchenRadio bubble WITHOUT altering burner-draft
+    await injectVoiceFrame(page, { type: "transcript_text", sender: "Janus", text: "I'm thinking about something." });
+    await expect(page.getByTestId("radio-transcript")).toContainText("I'm thinking about something.");
+    await expect(draft).toHaveValue("Check and see what's going on.");
+  });
 });

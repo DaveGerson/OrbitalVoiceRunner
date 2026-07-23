@@ -408,6 +408,12 @@ export function selectApprovalTarget(
   lastAnnouncedId: string | null
 ): TargetResult {
   if (entries.length === 0) return {};
+  // NOTE (wsm-e2e-pinned-cqtz REVERTED 2026-07-23): a single pending entry resolves via:"only"
+  // unconditionally. A prior fix clarified when a present fragment didn't match, but adversarial
+  // review proved it over-triggers on ordinary affirmations ("approve, sounds good" -> incidental
+  // fragment "sounds good" -> false "which one?" for a single item), degrading the common happy path.
+  // The parser cannot distinguish that from a genuine imperative mis-vote at the selector level, so
+  // cqtz is re-opened for a better approach (candidate: stopword the affirmations). Fails-safe either way.
   if (entries.length === 1) return { messageId: entries[0].messageId, via: "only" };
 
   // 1. Fragment match against instruction or pane id.
@@ -468,6 +474,7 @@ export function selectPendingAction(
   hint: TargetHint | undefined,
 ): ActionTargetResult {
   if (actions.length === 0) return {};
+  // cqtz REVERTED (see selectApprovalTarget): a single pending action resolves via:"only" unconditionally.
   if (actions.length === 1) return { id: actions[0].id, summary: actions[0].summary, via: "only" };
 
   // Ordinal ("the second one" -> 2; "the last one" -> -1).

@@ -60,7 +60,7 @@ const scenarioCoalesce: ConvoScenario = {
   steps: [modelThinks(...FRAGMENTS_COALESCE), turnComplete()],
   expect: {
     frames: [{ sender: "Janus", text: JOINED_COALESCE }],
-    draftText: agenticThoughtBullet(JOINED_COALESCE),
+    draftText: null,
     recentTurns: { size: 1, latestJanus: JOINED_COALESCE },
     logKinds: { gemini_thinking: FRAGMENTS_COALESCE.length, gemini_text: 1 },
   },
@@ -76,15 +76,14 @@ const scenarioBargeIn: ConvoScenario = {
   steps: [modelThinks(...FRAGMENTS_BARGE_IN), interrupted()],
   expect: {
     frames: [{ sender: "Janus", text: JOINED_BARGE_IN }],
-    draftText: agenticThoughtBullet(JOINED_BARGE_IN),
+    draftText: null,
     recentTurns: { size: 1, latestJanus: JOINED_BARGE_IN },
   },
 };
 
 // ── Scenario 4 — multi-turn bleed: two independent model-thought turns with an operator dictation
 // IN BETWEEN. Each thought flush must stay uncontaminated by the other turn's fragments, the
-// dictation must land as exactly one User Dictation bullet, and draft ordering must match arrival
-// order (thought1, dictation, thought2) — no cross-turn bleed either direction. ───────────────────
+// dictation must land as transcript/log (NOT draft), and no cross-turn bleed either direction. ───
 const BLEED_TURN1 = ["First", " thought", " here."];
 const BLEED_JOINED1 = "First thought here.";
 const BLEED_DICTATION = "Please continue the deployment.";
@@ -104,18 +103,13 @@ const scenarioMultiTurnBleed: ConvoScenario = {
       { sender: "User", text: BLEED_DICTATION },
       { sender: "Janus", text: BLEED_JOINED2 },
     ],
-    draftText: [
-      agenticThoughtBullet(BLEED_JOINED1),
-      userDictationBullet(BLEED_DICTATION),
-      agenticThoughtBullet(BLEED_JOINED2),
-    ].join("\n"),
+    draftText: null,
     recentTurns: { size: 3, latestJanus: BLEED_JOINED2, latestUser: BLEED_DICTATION },
   },
 };
 
-// ── Scenario 5 — dictation/turn interplay: operator dictation THEN a model thought turn. One User
-// Dictation bullet followed by one Agentic Thought bullet, in that order; one transcript_text frame
-// per side. ─────────────────────────────────────────────────────────────────────────────────────
+// ── Scenario 5 — dictation/turn interplay: operator dictation THEN a model thought turn. No draft
+// bullets appended; one transcript_text frame per side. ─────────────────────────────────────────
 const INTERPLAY_DICTATION = "Kick off the build when ready.";
 const INTERPLAY_FRAGMENTS = ["Starting", " the build", " now."];
 const INTERPLAY_JOINED = "Starting the build now.";
@@ -131,10 +125,16 @@ const scenarioDictationThenThought: ConvoScenario = {
       { sender: "User", text: INTERPLAY_DICTATION },
       { sender: "Janus", text: INTERPLAY_JOINED },
     ],
-    draftText: [userDictationBullet(INTERPLAY_DICTATION), agenticThoughtBullet(INTERPLAY_JOINED)].join("\n"),
+    draftText: null,
     recentTurns: { size: 2, latestUser: INTERPLAY_DICTATION, latestJanus: INTERPLAY_JOINED },
   },
 };
+
+// (Removed the "open pane by voice -> confirm -> update_draft_prompt" scenario: adversarial review
+// proved it vacuous here — the data-driven harness pre-sets the active pane via _testSetActivePane and
+// update_draft_prompt writes to coreState.activePaneId (it has no pane_id param), so it re-tested
+// "write to the already-active pane", not "a voice-created pane becomes active". The real create->active
+// contract is pinned properly in tests/test_action_create_pane.ts, tests 1/2/3/8 wsm-e2e-pinned-c6b9.)
 
 // Scenarios 1/2/4/5 run through the plain data-driven harness below. Scenario 3 (approval-vote
 // sequencing) needs a gated pane wired up first (see "Scenario 3" section further down) — its

@@ -178,6 +178,14 @@ describe("selectApprovalTarget (BUG-007)", () => {
     assert.strictEqual(r.via, "only");
   });
 
+  // cqtz REVERTED (2026-07-23): a single pending entry resolves via:"only" regardless of any incidental
+  // fragment (a bare affirmation like "approve, sounds good" carries an incidental non-matching fragment
+  // and must NOT clarify on the common single-item happy path). Both fragments resolve the lone entry.
+  it("single pending + ANY fragment (matching or not) -> resolves via only (single-item happy path)", () => {
+    assert.strictEqual(selectApprovalTarget([entries[0]], { fragment: "npm install" }, null).via, "only");
+    assert.strictEqual(selectApprovalTarget([entries[0]], { fragment: "sounds good" }, null).via, "only");
+  });
+
   it("P0-B: fragment present but matches ZERO with >1 pending -> ambiguous, NOT lastAnnounced over-approve", () => {
     // entries [npm install (m1), rm -rf build (m2), docker build (m3)]; "kubernetes" matches none.
     // Even with a lastAnnounced of m3 (deploy-like), a present-but-missed by-name fragment must

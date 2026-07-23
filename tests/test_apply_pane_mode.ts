@@ -30,6 +30,8 @@ import { CodexAdapter } from "../src/agents/codex";
 import { CustomAdapter } from "../src/agents/custom";
 import { PendingApprovalStore } from "../src/pendingApprovals";
 import { PendingActionStore } from "../src/pendingActions";
+import { getPaneGates } from "../src/actions/defs/reads";
+import { promotePaneMode } from "../src/actions/defs/locks";
 
 // Shift+Tab = ESC [ Z = 0x1b 0x5b 0x5a — Claude's live mode-cycle key.
 const SHIFT_TAB = "\x1b\x5b\x5a";
@@ -347,3 +349,50 @@ describe("PendingActionStore.drainForPane (spec §11)", () => {
     assert.deepStrictEqual(store.drainForPane("none"), []);
   });
 });
+
+describe("Full Auto observability fix (wsm-e2e-pinned-k8kl)", () => {
+  it("getPaneGates.handler reports the pane's permissions_mode", async () => {
+    const fakeCtx: any = {
+      effectiveCapabilityGateFor: () => "Auto",
+      manager: {
+        terminals: {
+          pane_auto: { permissionsMode: "Full Auto" },
+        },
+        ledger: {
+          getProject: () => ({
+            panes: {
+              pane_auto: { permissions_mode: "Full Auto" },
+            },
+          }),
+        },
+      },
+    };
+    const res = await getPaneGates.handler({ pane_id: "pane_auto" }, fakeCtx);
+    assert.strictEqual(res.kind, "ok");
+    const out = (res as any).output;
+    assert.strictEqual(out.pane_id, "pane_auto");
+    assert.strictEqual(out.permissions_mode, "Full Auto");
+  });
+
+  it("applyPaneModeDelegate surfaces deferred promotion as pending (not ok)", async () => {
+    const pane = makeScriptedPane({ adapter: new ClaudeAdapter(), frameAfterWrite: FULL_AUTO_MARKER });
+    const deferGate: PaneModeDeps["gateOrDefer"] = (_cap, _pane, summary) => ({
+      disposition: "deferred",
+      actionId: "act_defer_promo",
+      summary: "Set pane pane_promo permissions to Full Auto",
+    });
+
+    const fakeCtx: any = {
+      manager: {
+        terminals: { pane_promo: pane },
+        ledger: { getProject: () => ({ panes: { pane_promo: { permissions_mode: "Human-in-the-Loop" } } }) },
+      },
+      applyPaneMode: (paneId: string, targetMode: Mode, source: any) =>
+        applyPaneMode(paneId, targetMode, source, pane as any, baseDeps({ gateOrDefer: deferGate })),
+    };
+
+    const res = await promotePaneMode.handler({ project_id: "p1", pane_id: "pane_promo", permissions_mode: "Full Auto" }, fakeCtx);
+    assert.strictEqual(res.kind, "pending", "deferred promotion must return kind:'pending', not 'ok'");
+  });
+});
+

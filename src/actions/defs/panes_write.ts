@@ -25,6 +25,7 @@ import { z } from "zod";
 import type { ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
 import { findPaneOwningProject } from "../../paneOwnership";
+import { activateCreatedPane } from "../../paneActivation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // switch_active_pane — UNGATED focus move (server.ts:2613-2632).
@@ -319,18 +320,10 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       // set ONLY by a UI focus message / switch_active_pane, which loses the race against a voice-only
       // create-then-command flow. ctx.setActivePane mutates the SAME per-connection activePaneId that
       // dispatchProposal reads, so the next voice command on this connection targets the new pane.
-      if (pane_id) {
-        ctx.setActivePane(pane_id);
-        // Issue C (latent VIEW desync): setActivePane above only moves the SERVER's per-connection
-        // WRITE target. The OPERATOR'S browser xterm is mounted on activeTerminal.id and follows ONLY
-        // a switch_active_pane broadcast (App.tsx -> setActiveTerminalId). Without this, a VOICE-created
-        // pane leaves the browser on the OLD pane, so the new pane's stdout_chunk frames have no
-        // listener and the agent's output is invisible until the operator manually clicks it
-        // (round3c: "you can see them, but I can't"). Mirror switch_active_pane's proven wire contract
-        // (panes_write.ts:64) so the browser remounts TerminalView on the new pane and subscribes its
-        // PTY stream — keeping the server write target and the browser view in lockstep.
-        ctx.broadcast({ type: "switch_active_pane", paneId: pane_id });
-      }
+      // origin = the REAL dispatch surface (review fix: was hardcoded "voice", so a REST create — served
+      // by this same def via POST /api/terminals — stole operator focus). activateCreatedPane only
+      // activates on origin==='voice', so a REST/recipe create no longer yanks the operator's view.
+      activateCreatedPane(ctx, pane_id, ctx.surface);
       return `Pane ${pane_id} created under project ${project_id}. Result: ${result}`;
     };
 
@@ -339,11 +332,12 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
       pane_id ?? null,
       `Create pane ${pane_id} (${command}) in ${project_id}`,
       createPaneEffect,
-      // kzt: serializable restart-intent. origin:"voice" -> the rebuild returns the voice-shaped
-      // string. Keys in LOCKSTEP with buildActionRun's CreatePaneParams (src/actionEffects.ts).
+      // kzt: serializable restart-intent. origin = the REAL dispatch surface (review fix: was hardcoded
+      // "voice", so a rehydrated REST/recipe create newly stole focus post-restart). Keys in LOCKSTEP
+      // with buildActionRun's CreatePaneParams (src/actionEffects.ts).
       {
         ...(ctx.versionStamp ?? {}),
-        origin: "voice",
+        origin: ctx.surface,
         paneId: pane_id,
         cwd: ctx.manager.ledger.workspaces[project_id]?.directory,
         command,

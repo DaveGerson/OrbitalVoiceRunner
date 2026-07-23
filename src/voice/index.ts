@@ -659,7 +659,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     broadcast,
     broadcastLedgerUpdate,
     broadcastDraft,
-    appendActiveDraft,
     activeDraftTarget,
     sanitizeSettingsForClient,
     coreState,
@@ -1873,17 +1872,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
 
             const cleanUtter = userUtterance.trim();
             if (!shouldRouteUtterance(cleanUtter)) return;
-            // A4: route any utterance with non-whitespace content so bare votes ("no"/"ok", 2 chars) reach
-            // the parser. Empty/whitespace drops. Step 6: capture dictation into the ACTIVE pane's WIP
-            // draft (raw material the operator refines before sending). Only non-approval utterances
-            // reach the draft so bare approval votes do not land as dictation bullets (wsm-e2e-pinned-pvwg).
-            // No-op if no pane open. KNOWN DELTA (accepted): this guard is the TS parser; in FLIP mode
-            // (JANUS_APPROVAL_PYTHON_PRIMARY below) routing follows Python's verdict, so on a parser
-            // disagreement dictation capture and vote consumption can diverge for that one utterance.
-            // SHADOW (default) routes on the byte-identical TS result, so guard === router there.
-            if (parseApprovalIntent(cleanUtter).intent === "none") {
-              appendActiveDraft(`* **User Dictation**: ${cleanUtter}`, "operator");
-            }
+            // wsm-e2e-pinned-j07x (operator decision 2026-07-22): operator dictation NO LONGER writes the
+            // pane draft — the order pad shows ONLY the structured update_draft_prompt output. Dictation
+            // still reaches recentTurns + the transcript_text(User) frame above, so the radio/log are intact.
 
             // Voice-UX wave 3: the spoken destructive-confirm protocol gets FIRST look at every routed
             // utterance — a synchronous TS choke point ahead of the approval-intent routing below, so a
@@ -1947,18 +1938,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             } catch (err) {
               console.error("[VOICE] failed to send transcript_text frame (client socket likely closed):", err);
             }
-            // Step 6: capture Janus's spoken thought into the ACTIVE pane's WIP draft.
-            const cleanUtter = modelUtterance.trim();
-            if (cleanUtter.length > 2) {
-              appendActiveDraft(`* **Agentic Thought**: *${cleanUtter}*`, "janus");
-            }
+            // wsm-e2e-pinned-j07x: agentic thoughts NO LONGER write the pane draft (order pad = structured
+            // prompt only). The thought still surfaces via the transcript_text(Janus) frame above + the log.
           };
 
           // wsm-e2e-pinned-zmu5: the SINGLE flush point for state.pendingModelThinking. Reused by every
           // turn boundary below (interrupted / turnComplete / generationComplete) and, via
           // state.flushPendingThought, by the two teardown paths outside this closure — reusing
           // handleModelUtterance means "one gemini_text log / one recentTurns push / one transcript_text
-          // frame / one Agentic-Thought bullet (length>2 guard on the JOINED text)" fall out for free.
+          // frame per turn" fall out for free. (j07x: the thought NO LONGER writes a pane-draft bullet —
+          // the order pad shows only the structured update_draft_prompt output.)
           // trim() (not a bare truthiness check) so a lone-whitespace buffer flushes to nothing rather
           // than a stray near-empty frame.
           const flushModelThinking = (): void => {
@@ -2055,11 +2044,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // answer "already done" and DO NOT re-run. Reads (readOnly) are exempt. The store lookup is
           // best-effort: any fault returns false (falls through to normal dispatch — never blocks it).
           // Extracted from runToolCall (Phase 7 CC refactor) — byte-identical predicate.
-          const isReplayShortCircuit = (call: any, name: string): boolean => {
+          // nx2a review fix: idempotency/replay keys off the RAW call.id (undefined -> never suppress),
+          // NOT the synthetic wire id — a synthetic fc-<turn>-<i> is turn-stable and collides across two
+          // distinct id-less calls in one turn, which would FALSELY suppress the second as a replay.
+          const isReplayShortCircuit = (callId: string | undefined, name: string): boolean => {
             const replayDef = REGISTRY.find((d: any) => d.name === name);
-            if (!(store && call.id && replayDef && !replayDef.readOnly)) return false;
+            if (!(store && callId && replayDef && !replayDef.readOnly)) return false;
             try {
-              return store.hasSucceededIdempotencyKey(call.id);
+              return store.hasSucceededIdempotencyKey(callId);
             } catch {
               return false; // store fault -> proceed; the guard must never block dispatch.
             }
@@ -2070,7 +2062,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // idempotency_key, so `getActionLog` (and any operator-facing audit view) can tell "this ran"
           // apart from "this was replayed and skipped". Never throws; a store fault here must not
           // affect the tool response already being sent in the caller.
-          const recordReplaySuppressed = (call: any, name: string, ixnId: string): void => {
+          const recordReplaySuppressed = (callId: string | undefined, name: string, ixnId: string): void => {
             if (!store) return;
             const replayDef = REGISTRY.find((d: any) => d.name === name);
             try {
@@ -2079,7 +2071,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 capability: replayDef?.capability ?? "unknown",
                 result_kind: "replay_suppressed",
                 ms: 0,
-                idempotency_key: call.id ?? null,
+                idempotency_key: callId ?? null,
                 surface: "voice",
                 interaction_id: ixnId ?? null,
               });
@@ -2104,32 +2096,51 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             }
           };
 
-          const runToolCall = async (call: any, ixnId: string, session: any): Promise<void> => {
+          const runToolCall = async (call: any, cid: string, ixnId: string, session: any): Promise<void> => {
             const name = call.name;
             const args = call.args as Record<string, any>;
             try {
               // REG1 phase-C: unified registry dispatch. runAction is itself try/caught + never throws; the
               // outer catch here is belt-and-suspenders. A re-delivered side-effecting call short-circuits.
-              if (isReplayShortCircuit(call, name)) {
-                recordReplaySuppressed(call, name, ixnId);
+              if (isReplayShortCircuit(call.id, name)) {
+                recordReplaySuppressed(call.id, name, ixnId);
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
+                  functionResponses: [{ name, id: cid, response: { output: `Already handled (${name} was applied on a prior delivery of this request).` } }],
                 });
               } else if (isProposalDuplicate(name, args)) {
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
+                  functionResponses: [{ name, id: cid, response: { output: `Duplicate proposal suppressed (same instruction was just dispatched to this pane).` } }],
                 });
               } else {
-                const actionCtx: ActionContext = buildActionContext(call.id!, name);
+                // buildActionContext's callId is the audit idempotency key -> use the RAW call.id
+                // (undefined for an id-less call = no dedup, pre-nx2a semantics). The synthetic cid is
+                // ONLY for the wire response id below (Gemini requires a matching id).
+                const actionCtx: ActionContext = buildActionContext(call.id, name);
                 const result = await runAction(REGISTRY, name!, (args ?? {}) as Record<string, unknown>, actionCtx);
-                interactionLog.log({ interactionId: ixnId, kind: "action_result", data: { name, callId: call.id, resultKind: (result as { kind?: string })?.kind } });
-                resultToToolResponse(result, session, name!, call.id!);
+                let outputProjection: any = undefined;
+                try {
+                  outputProjection = capActionPayload(
+                    redactDeep(projectActionResult(result as ActionResult), redactSecrets) as ActionActivityPayload,
+                    512
+                  );
+                } catch { /* fail-soft: projection must never break dispatch */ }
+                interactionLog.log({
+                  interactionId: ixnId,
+                  kind: "action_result",
+                  data: {
+                    name,
+                    callId: cid,
+                    resultKind: (result as { kind?: string })?.kind,
+                    ...(outputProjection !== undefined ? { output: outputProjection } : {}),
+                  },
+                });
+                resultToToolResponse(result, session, name!, cid);
                 maybeSpeakCreatePaneAck(name!, result, session);
                 // hwu.7: re-key the read-only ActionPanel to this completed call. Emitted AFTER the
                 // tool response is on its way to Gemini and is non-throwing — a broadcast fault can
                 // never break the response path or add latency to the audio turn. Once per completed
                 // dispatch only (never the replay/duplicate short-circuits, never per audio frame).
-                emitActionActivity(broadcast, name!, call.id!, result, redactSecrets, Date.now());
+                emitActionActivity(broadcast, name!, cid, result, redactSecrets, Date.now());
               }
             } catch (toolErr) {
               console.error(`[TOOL] Handler for "${name}" threw:`, toolErr);
@@ -2140,7 +2151,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 // overwhelmingly common secret-free case.
                 const errText = redactSecrets(toolErr instanceof Error ? toolErr.message : String(toolErr));
                 session.sendToolResponse({
-                  functionResponses: [{ name, id: call.id, response: { output: `Internal error while handling ${name}: ${errText}` } }]
+                  functionResponses: [{ name, id: cid, response: { output: `Internal error while handling ${name}: ${errText}` } }]
                 });
               } catch { /* session already torn down; nothing more we can do */ }
             }
@@ -2150,13 +2161,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // and clears the barge-in latch per call, as the inline loop did).
           const handleToolCalls = async (message: LiveServerMessage, session: Session): Promise<void> => {
             if (!message.toolCall) return;
-            for (const call of message.toolCall.functionCalls || []) {
+            const calls = message.toolCall.functionCalls || [];
+            for (let i = 0; i < calls.length; i++) {
+              const call = calls[i];
               const ixnId = turnId();
+              const cid = call.id ?? `fc-${ixnId}-${i}`;
               setModelTurn(); // B1: entering the toolCall loop is a model turn -> clear barge-in latch.
-              interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name: call.name, callId: call.id, args: call.args ?? {} } });
+              interactionLog.log({ interactionId: ixnId, kind: "tool_call", data: { name: call.name, callId: cid, args: call.args ?? {} } });
               // Guard every tool handler: an uncaught throw here would escape the Gemini SDK onmessage
               // callback, leave this call.id unanswered, and stall the conversation.
-              await runToolCall(call, ixnId, session);
+              await runToolCall(call, cid, ixnId, session);
             }
           };
 

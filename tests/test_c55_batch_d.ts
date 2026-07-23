@@ -205,10 +205,12 @@ describe("c55 Batch D — set_pane_permissions (route-param alias + permissions 
       { project_id: "proj", pane_id: "p1", permissions: "Read-Only" },
       ctx,
     );
-    // Faithful to the existing def: deferred still answers a kind:"ok" narration ("needs operator
-    // confirmation"), and the effect is NOT applied (the inline route applied unconditionally — delta).
-    assert.strictEqual(result.kind, "ok");
-    assert.match((result as { output: string }).output, /needs operator confirmation/i);
+    // wsm-e2e-pinned-k8kl: a deferred set_pane_permissions now HONESTLY answers kind:"pending" (was a
+    // false kind:"ok" — the operator saw "ok" for a change that never applied). This aligns it with
+    // batch-D's own status-via-kinds design (Ask -> pending -> 202). The narration is preserved
+    // byte-for-byte in `summary` (and `extra.output`); the effect is still NOT applied.
+    assert.strictEqual(result.kind, "pending");
+    assert.match((result as { summary: string }).summary, /needs operator confirmation/i);
     assert.strictEqual(setMode, "", "gated Ask must NOT apply the permission change yet (behaviorDelta vs ungated inline)");
   });
 });

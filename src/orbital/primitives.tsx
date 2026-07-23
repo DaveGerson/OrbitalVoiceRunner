@@ -194,12 +194,19 @@ export function PostureChip({ posture, mode, style = {} }: {
 }) {
   const skin = posture ? POSTURE_SKIN[posture] : mode ? MODE_SKIN[mode] : null;
   if (!skin) return null; // no server truth — no chip (never a guess)
+  // The Full-Auto glow MUST mirror the label's posture-wins precedence (skin above): during a stop-all
+  // freeze posture="LOCKED" (red "read-only" label) while the persisted mode can still read "Full Auto"
+  // — an OR here would paint a green Full-Auto halo on a red LOCKED chip (self-contradictory at exactly
+  // the emergency moment). k8kl adversarial-review fix.
+  const isFullAuto = posture ? posture === "OPEN" : mode === "Full Auto";
   return (
     <span data-testid="posture-chip" data-posture={posture ?? mode} title={skin.tip} style={{
       display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 999,
       border: "1.5px solid " + INK, background: skin.bg, color: skin.fg,
       fontFamily: "DM Sans, sans-serif", fontSize: 12, fontWeight: 800,
-      letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5, ...style,
+      letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap", lineHeight: 1.5,
+      boxShadow: isFullAuto ? "0 0 6px #4db892" : "none",
+      ...style,
     }}>{skin.label}</span>
   );
 }

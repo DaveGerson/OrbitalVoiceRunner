@@ -186,7 +186,7 @@ describe("voice dictation vote filtering (bare votes do not contaminate WIP draf
     assert.strictEqual(Boolean(draft?.includes("* **User Dictation**: approve")), false, "draft must NOT contain dictation bullet when nothing pending");
   });
 
-  it("(iii) a normal utterance -> bullet appended", async () => {
+  it("(iii) a normal utterance NO LONGER writes the draft (wsm-e2e-pinned-j07x: order pad = structured prompt only)", async () => {
     const PROJECT = "dict_proj_3";
     const PANE = "dict-pane-3";
     currentProject = PROJECT;
@@ -203,6 +203,9 @@ describe("voice dictation vote filtering (bare votes do not contaminate WIP draf
     await runConvoScenario(makeEnv(), steps);
 
     const draft = draftText(PROJECT, PANE);
-    assert.ok(draft?.includes(`* **User Dictation**: ${normalText}`), `draft must contain dictation bullet for normal speech, got: ${draft}`);
+    // j07x (operator decision 2026-07-22): dictation NO LONGER writes the draft — the order pad shows
+    // ONLY the structured update_draft_prompt output. A normal utterance still reaches recentTurns +
+    // the transcript_text(User) frame, but it must NOT append a dictation bullet to the pane draft.
+    assert.ok(!draft || !draft.includes("User Dictation"), `dictation must NOT write the pane draft, got: ${draft}`);
   });
 });

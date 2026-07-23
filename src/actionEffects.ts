@@ -37,6 +37,7 @@ import path from "path";
 import { actionSchemaHash } from "./actions/registry";
 import { buildExportSnapshot, composeExportMarkdown, writeExportArtifactAtomic, EXPORT_BASENAME } from "./actions/defs/export";
 import { findPaneOwningProject } from "./paneOwnership";
+import { activateCreatedPane } from "./paneActivation";
 import { getHistoryBridge } from "./historyBridge";
 import { respawnFromLedger } from "./actions/respawnFromLedger";
 import type { ActionContext } from "./actions/types";
@@ -220,7 +221,11 @@ export interface ActionEffectDeps {
   broadcast: (msg: any) => void;
   broadcastLedgerUpdate: () => void;
   sanitizeSettingsForClient: (s: any) => any;
+  setActivePane?: (paneId: string | null) => void;
 }
+
+// activateCreatedPane moved to the dependency-free leaf src/paneActivation.ts (imported above) to
+// break the panes_write <-> actionEffects circular import (wsm-e2e-pinned-c6b9 regression).
 
 /** A capability builder: turns a rehydrated intent + live deps into the deferred-effect thunk. */
 type EffectBuilder = (intent: ActionIntent, deps: ActionEffectDeps) => () => string;
@@ -274,6 +279,7 @@ function buildCreatePane(intent: ActionIntent, deps: ActionEffectDeps): () => st
     }
     deps.broadcastLedgerUpdate();
     deps.broadcast({ type: "terminals_updated" });
+    activateCreatedPane(deps, p.paneId, p.origin);
     // Reproduce the EXACT confirm string of the originating staging site (Risk 1 drift guard).
     // The side effects above are identical across origins; only the return string differs.
     return createPaneConfirm(p, projectId, result);

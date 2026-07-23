@@ -29,6 +29,7 @@ import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import { teardownServerSuite } from "./helpers/teardown";
 import { normalizePreset, presetCommand, UniversalTerminal } from "../src/terminal";
 import type { RunningServer } from "../server";
+import { buildActionRun } from "../src/actionEffects";
 
 interface AddTerminalCall {
   terminalId: string;
@@ -517,5 +518,113 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
         (running.manager.settings.advanced.capabilityGates as any).create_pane = prevGate;
       }
     }
+  });
+
+  // ── (1) DEFERRED-in-process: Ask gate -> deferred -> confirm -> switch_active_pane + setActivePane ──
+  it("deferred create_pane in-process: switch_active_pane fires only on confirm", async () => {
+    const prevGate = (running.manager.settings.advanced.capabilityGates as any)?.create_pane;
+    (running.manager.settings.advanced.capabilityGates as any).create_pane = "Ask";
+
+    try {
+      running._testSetActivePane!("old-pane");
+      wsMessages = [];
+
+      const callId = session.emitToolCall("create_pane", {
+        project_id: "cp_proj",
+        pane_id: "cp-voice-def-1",
+        tool_preset: "Claude Code",
+        permissions_mode: "Human-in-the-Loop",
+      });
+      const response = await waitFor(() => mock.responseFor(callId));
+      assert.match(String(response), /confirmation|queued|pending|staged|deferred/i, "create_pane disposition is pending under Ask gate");
+
+      const initialSwitches = wsMessages.filter((m) => m.type === "switch_active_pane");
+      assert.strictEqual(initialSwitches.length, 0, "no switch_active_pane frame when deferred");
+
+      const pendingRes = await api("/api/actions/pending");
+      const pendingList = await pendingRes.json();
+      const staged = pendingList.find((a: any) => a.params?.paneId === "cp-voice-def-1" || a.summary?.includes("cp-voice-def-1"));
+      assert.ok(staged, "staged action found in pending actions");
+
+      const confirmRes = await api(`/api/actions/${staged.id}/confirm`, { method: "POST" });
+      assert.strictEqual(confirmRes.status, 200, "confirm succeeded");
+
+      await waitFor(() => wsMessages.some((m) => m.type === "switch_active_pane" && m.paneId === "cp-voice-def-1"));
+      const confirmSwitches = wsMessages.filter((m) => m.type === "switch_active_pane" && m.paneId === "cp-voice-def-1");
+      assert.strictEqual(confirmSwitches.length, 1, "switch_active_pane fired for confirmed paneId");
+    } finally {
+      if (prevGate !== undefined) {
+        (running.manager.settings.advanced.capabilityGates as any).create_pane = prevGate;
+      } else {
+        setCreatePaneAuto();
+      }
+    }
+  });
+
+  // ── (2) POST-RESTART: buildActionRun / rehydrated effect calls setActivePane + switch_active_pane ──
+  it("post-restart rehydrated create_pane effect calls setActivePane and broadcasts switch_active_pane", () => {
+    let activeSet: string | null = null;
+    const broadcasts: any[] = [];
+
+    const mockDeps = {
+      manager: running.manager,
+      broadcast: (msg: any) => broadcasts.push(msg),
+      broadcastLedgerUpdate: () => {},
+      sanitizeSettingsForClient: (s: any) => s,
+      setActivePane: (id: string | null) => { activeSet = id; },
+    };
+
+    const run = buildActionRun(
+      {
+        capability: "create_pane",
+        params: {
+          origin: "voice",
+          paneId: "cp-rehydrate-2",
+          projectId: "cp_proj",
+          command: "bash",
+          toolPreset: "Claude Code",
+        },
+      },
+      mockDeps as any
+    );
+
+    run();
+
+    assert.strictEqual(activeSet, "cp-rehydrate-2", "rehydrated voice create_pane called setActivePane");
+    const switchMsg = broadcasts.find((m) => m.type === "switch_active_pane" && m.paneId === "cp-rehydrate-2");
+    assert.ok(switchMsg, "rehydrated voice create_pane broadcasted switch_active_pane");
+  });
+
+  // ── (3) ORIGIN: rest or recipe origin create_pane does NOT switch_active_pane ──
+  it("rest/recipe origin create_pane does NOT switch_active_pane", () => {
+    let activeSet: string | null = null;
+    const broadcasts: any[] = [];
+
+    const mockDeps = {
+      manager: running.manager,
+      broadcast: (msg: any) => broadcasts.push(msg),
+      broadcastLedgerUpdate: () => {},
+      sanitizeSettingsForClient: (s: any) => s,
+      setActivePane: (id: string | null) => { activeSet = id; },
+    };
+
+    const runRest = buildActionRun(
+      {
+        capability: "create_pane",
+        params: {
+          origin: "rest",
+          paneId: "cp-rest-3",
+          projectId: "cp_proj",
+          command: "bash",
+        },
+      },
+      mockDeps as any
+    );
+
+    runRest();
+
+    assert.strictEqual(activeSet, null, "rest origin create_pane must NOT call setActivePane");
+    const restSwitch = broadcasts.find((m) => m.type === "switch_active_pane");
+    assert.strictEqual(restSwitch, undefined, "rest origin create_pane must NOT broadcast switch_active_pane");
   });
 });

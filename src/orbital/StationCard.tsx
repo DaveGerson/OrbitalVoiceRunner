@@ -63,7 +63,7 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         {/* Phase 3, Step 3.3: the pane's open instruction-draft state, at a glance. */}
         {!list && <ExchangeStateChip exchange={exchange} />}
         {/* 2K.2: the pane's autonomy at a glance — server truth (posture/permissions_mode), visual only */}
-        {!list && <PostureChip posture={st.posture} mode={st.mode} />}
+        <PostureChip posture={st.posture} mode={st.mode} />
         {!list && <AutonomyBadge until={st.autonomy_until} />}
         {!list && <StatusBadge status={st.status} />}
       </div>
@@ -117,7 +117,6 @@ export function StationCard({ st, accentHex, dark, compact, tilt = 0, onOpen, la
         borderTop: list ? "none" : "1.5px dashed " + deriveFooterBorderColor(dark), flex: list ? 1 : "none",
       }}>
         {list && <ExchangeStateChip exchange={exchange} />}
-        {list && <PostureChip posture={st.posture} mode={st.mode} />}
         {list && <AutonomyBadge until={st.autonomy_until} />}
         {list && <StatusBadge status={st.status} />}
         <Pips steps={PIP_COUNT} done={st.contextPips} color={accentHex} label={st.contextLabel} />
