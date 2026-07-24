@@ -13,6 +13,8 @@ import {
   buildExchangeMetricsReport,
   UNCORRELATED_COMPLETIONS_NOTE,
   NOTIFICATION_LATENCY_NOTE,
+  SPEECH_TO_DRAFT_LATENCY_NOTE,
+  CLARIFICATION_PRE_EXCHANGE_NOTE,
   type ExchangeMetricsReport,
 } from "../src/exchanges/metrics";
 import { REGISTRY } from "../src/actions/registry";
@@ -47,7 +49,12 @@ describe("metrics: zero-activity DB -> all-zero report", () => {
     assert.deepStrictEqual(report.recoveryState, {
       interruptedEvents: 0, revertedMissingApprovalEvents: 0, retriedEvents: 0, currentlyInterruptedExchanges: 0,
     });
-    assert.deepStrictEqual(report.notes, [UNCORRELATED_COMPLETIONS_NOTE, NOTIFICATION_LATENCY_NOTE]);
+    assert.deepStrictEqual(report.notes, [
+      UNCORRELATED_COMPLETIONS_NOTE,
+      NOTIFICATION_LATENCY_NOTE,
+      SPEECH_TO_DRAFT_LATENCY_NOTE,
+      CLARIFICATION_PRE_EXCHANGE_NOTE,
+    ]);
     s.close();
   });
 });
@@ -138,19 +145,45 @@ describe("metrics: draftEditCounts", () => {
 });
 
 describe("metrics: latency percentiles — deterministic nearest-rank", () => {
-  it("speechToDraftLatency: exchange_created -> first draft-milestone event, p50/p95 over 4 known samples", () => {
+  it("speechToDraftLatency: exchange_created -> first draft-milestone event (draft_revised), p50/p95 over 4 known samples", () => {
     const s = freshStore();
     const samples = [100, 200, 300, 400];
     samples.forEach((ms, i) => {
       const row = s.insertExchange({ project_id: "p1", pane_id: `pane-${i}`, state: "draft" });
       s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "exchange_created", ts: 1000 });
-      s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "target_resolved", ts: 1000 + ms });
+      // target_resolved is co-timestamped with exchange_created at mint (persistCreate) — it is no
+      // longer a draft milestone (that was the speechToDraftLatency artifact this suite closes).
+      s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "target_resolved", ts: 1000 });
+      s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "draft_revised", ts: 1000 + ms });
     });
     const report = buildExchangeMetricsReport(s);
     assert.ok(report.speechToDraftLatency);
     assert.strictEqual(report.speechToDraftLatency!.count, 4);
     assert.strictEqual(report.speechToDraftLatency!.p50, 200, "nearest-rank p50 over [100,200,300,400]");
     assert.strictEqual(report.speechToDraftLatency!.p95, 400, "nearest-rank p95 over [100,200,300,400]");
+    s.close();
+  });
+
+  it("speechToDraftLatency: a persistCreate-shaped fixture (exchange_created + co-timestamped target_resolved, no later milestone) yields null — the co-timestamp artifact is gone", () => {
+    const s = freshStore();
+    const row = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft" });
+    s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "exchange_created", ts: 1000 });
+    s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "target_resolved", ts: 1000 });
+    const report = buildExchangeMetricsReport(s);
+    assert.strictEqual(report.speechToDraftLatency, null, "target_resolved alone must no longer yield a spurious 0 sample");
+    s.close();
+  });
+
+  it("speechToDraftLatency: exchange_created + co-timestamped target_resolved + delivery_attempted(1300) measures created->first GENUINE forward progress (300ms), not the mint-time resolve", () => {
+    const s = freshStore();
+    const row = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft" });
+    s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "exchange_created", ts: 1000 });
+    s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "target_resolved", ts: 1000 });
+    s.appendExchangeEvent({ exchange_id: row.exchange_id, event_type: "delivery_attempted", ts: 1300 });
+    const report = buildExchangeMetricsReport(s);
+    assert.ok(report.speechToDraftLatency);
+    assert.strictEqual(report.speechToDraftLatency!.count, 1);
+    assert.strictEqual(report.speechToDraftLatency!.p50, 300);
     s.close();
   });
 
@@ -223,6 +256,20 @@ describe("metrics: recoveryState", () => {
       interruptedEvents: 1, revertedMissingApprovalEvents: 1, retriedEvents: 2,
       currentlyInterruptedExchanges: 1,
     });
+    s.close();
+  });
+});
+
+describe("metrics: clarificationCauses — parity guard against the live producer shape", () => {
+  it("a clarification_requested event with payload.cause='dispatch_clarify' (the exact shape recordClarificationRequested writes) makes clarificationCauses non-empty", () => {
+    const s = freshStore();
+    const row = s.insertExchange({ project_id: "p1", pane_id: "pane-1", state: "draft" });
+    s.appendExchangeEvent({
+      exchange_id: row.exchange_id, event_type: "clarification_requested", ts: 1000,
+      payload_redacted_json: JSON.stringify({ cause: "dispatch_clarify" }),
+    });
+    const report = buildExchangeMetricsReport(s);
+    assert.deepStrictEqual(report.clarificationCauses, { dispatch_clarify: 1 });
     s.close();
   });
 });

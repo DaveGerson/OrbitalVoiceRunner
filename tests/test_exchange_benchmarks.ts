@@ -80,19 +80,22 @@
 //   5. every interruption ended in an explicit state (interrupted/cancelled/agent_complete/
 //      agent_failed/draft — never left ambiguous)
 //
-// ── BUG NOTE (pre-existing, documented gap — NOT introduced by this harness) ───────────────────
-// src/exchanges/metrics.ts's own `wrongTargetDeliveries` and `clarificationCounts` derive from the
+// ── BUG NOTE (residual, annotated gap — NOT introduced by this harness) ────────────────────────
+// src/exchanges/metrics.ts's own `wrongTargetDeliveries` and `clarificationCauses` derive from the
 // `target_resolved` / `clarification_requested` ExchangeEventType union members (src/exchanges/
-// types.ts) — NEITHER is emitted by any producer in this codebase today (the instruction-routing
-// layer's real ambiguity/retarget clarifies, exercised live by this very battery's FLEET journey,
-// never append either event type). That means metrics.ts's own report reads `wrongTargetDeliveries:
-// 0` and `clarificationCauses: {}` against a DB this battery has PROVEN contains a real, resolved
-// clarification and zero wrong-target deliveries — the zero is right by luck of this harness's own
-// correct behavior, not because the metric can see clarifications happening at all. This is why the
-// task brief requires the harness to measure wrong-target/clarification independently (see above) —
-// this file's own `metrics_5_2.clarificationCauses` field will read `{}` even though
-// `clarification_counts` (the harness's own measurement) is non-empty; this divergence IS the
-// evidence for the gap, preserved in the emitted report for a reader to see directly.
+// types.ts). Both ARE wired as of Phase 5.4 (this note used to say "no producer in this codebase
+// today"; that was stale): every `createExchange` appends `target_resolved` (persistCreate) and the
+// dispatch clarify seam appends `clarification_requested` (recordClarificationRequested, called from
+// src/voice/index.ts settleExchangeForDispatch) — see tests/test_exchange_metrics_live.ts for the
+// live producer-chain proof. `metrics_5_2.clarificationCauses` still reads `{}` for THIS harness
+// specifically, though, because the FLEET journey's clarify is a PRE-EXCHANGE targetResolver clarify
+// (retarget_instruction) — it fires before any exchange exists, and exchange_events.exchange_id is
+// NOT NULL, so that turn structurally cannot carry an exchange event (see
+// `CLARIFICATION_PRE_EXCHANGE_NOTE`, src/exchanges/metrics.ts). This is why the task brief requires
+// the harness to measure wrong-target/clarification independently (see above) — the divergence
+// between this file's own `metrics_5_2.clarificationCauses` (`{}`) and `clarification_counts` (the
+// harness's own measurement, non-empty) IS the residual, annotated gap, preserved in the emitted
+// report for a reader to see directly.
 //
 // ── Real waits (unavoidable) ────────────────────────────────────────────────────────────────────
 // The REAL PaneSignalBus (src/paneSignalBus.ts) enforces a 5000ms cross-kind cooldown per pane

@@ -55,6 +55,10 @@ export interface PruneOpts {
   /** Durable attention row cap (W5). Default ATTENTION_ROW_CAP (50) — cap-eviction keeps the newest,
    *  dropping dismissed first then oldest, matching pruneAttentionQueue's in-memory cap. */
   attentionCap?: number;
+  /** transcripts TTL in days (schema v13, bead 98f2 — durable transcript sink). Default 30 — same
+   *  append-only, bounded-at-rest posture as exchange_events: transcripts hold the longest-lived
+   *  at-rest copies of operator ASR / Janus narration text, so they get the same bounded retention. */
+  transcriptsTtlDays?: number;
 }
 
 /**
@@ -98,6 +102,7 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
   const eeCutoff = ttlCutoffMs(opts.now, opts.exchangeEventsTtlDays);
   const exCutoff = ttlCutoffMs(opts.now, opts.exchangesTtlDays);
   const cdelCutoff = ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays);
+  const trCutoff = ttlCutoffMs(opts.now, opts.transcriptsTtlDays);
   // W5 attention (minute-scale, ms-based — not the day-scale ttlCutoffMs helper).
   const attnActiveCutoff = opts.now - (opts.attentionTtlMs ?? ATTENTION_ACTIVE_TTL_MS);
   const attnDismissedCutoff = opts.now - (opts.attentionDismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS);
@@ -149,6 +154,11 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
       ).run(exCutoff);
       db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(cdelCutoff);
     } catch { /* pre-v12 DB: tables absent, skip */ }
+    // Durable transcript sink (schema v13, bead 98f2): append-only, same bounded 30d TTL as
+    // exchange_events. Guarded — a pre-v13 DB (table absent) must not fail the whole boot-prune txn.
+    try {
+      db.prepare("DELETE FROM transcripts WHERE ts < ?").run(trCutoff);
+    } catch { /* pre-v13 DB: table absent, skip */ }
     // W5 (BUG-013 residual): DURABLE attention retention. Two-tier TTL (active vs shorter dismissed),
     // then cap-eviction keeping the newest attnCap rows (drop dismissed first, then oldest — the
     // dismissed-ASC/timestamp-DESC keep order). Own try/catch so a pre-attention-table DB skips it.
@@ -213,6 +223,8 @@ export interface SweepOpts {
   attentionDismissedTtlMs?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
+  /** transcripts TTL in days (schema v13, bead 98f2). Default 30 — see PruneOpts. */
+  transcriptsTtlDays?: number;
 }
 
 export interface SweepResult {
@@ -309,6 +321,13 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM context_deliveries WHERE delivery_id IN (SELECT delivery_id FROM context_deliveries WHERE ts < ? LIMIT ?)",
       [ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays)]);
   } catch { /* pre-v12 DB: tables absent, skip */ }
+  // Durable transcript sink (schema v13, bead 98f2): same batched pattern, own try/catch so a
+  // pre-v13 DB (table absent) doesn't fail the whole sweep tick.
+  try {
+    step("transcripts",
+      "DELETE FROM transcripts WHERE id IN (SELECT id FROM transcripts WHERE ts < ? ORDER BY id LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.transcriptsTtlDays)]);
+  } catch { /* pre-v13 DB: table absent, skip */ }
   // W5 (BUG-013 residual): the batched TTL twin of the boot attention prune — two-tier (active vs
   // shorter dismissed) so SweepResult.deleted reports an "attention" category. Own try/catch so a
   // pre-attention-table DB skips it. (Cap-eviction is boot-only, design §6 — the sweep is TTL-only.)

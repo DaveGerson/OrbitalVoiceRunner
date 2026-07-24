@@ -170,3 +170,18 @@ export type AgentExchangeRow = import("../exchanges/types").AgentExchange;
 export type ExchangeEventRow = import("../exchanges/types").ExchangeEvent;
 /** Raw `context_deliveries` row (schema v12). Column-for-column with `ContextDelivery`. */
 export type ContextDeliveryRow = import("../exchanges/types").ContextDelivery;
+
+/** Raw `transcripts` row (schema v13, durable transcript sink — bead 98f2). Append-only,
+ *  opt-in-only (src/transcripts/flag.ts). `text_redacted` is persisted VERBATIM by the store — the
+ *  caller (src/transcripts/sink.ts) redacts BEFORE calling recordTranscript, same convention as
+ *  `exchange_events.payload_redacted_json`. */
+export interface TranscriptRow {
+  id: number;
+  ts: number;
+  channel: "operator" | "model";
+  session_id: string | null;
+  project_id: string | null;
+  pane_id: string | null;
+  interaction_id: string | null;
+  text_redacted: string;
+}

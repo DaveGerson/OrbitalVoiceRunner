@@ -55,6 +55,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts, appendThinkingFragment } from "../liveTranscripts";
+import { recordLiveTranscripts } from "../transcripts/sink";
 import { createLiveTraceWriter, wrapOnMessageWithCapture } from "./liveTraceCapture";
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
@@ -2204,6 +2205,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // approval router + dictation + transcript frame all read userUtterance. (The 2026-06 live
             // capture showed every operator utterance on inputTranscription while userUtterance was empty.)
             const { operator: userUtterance, model: modelUtterance, modelThinking } = extractTranscripts(message);
+
+            // Bead 98f2 (durable transcript sink): OPT-IN persistence of BOTH channels — gated
+            // internally by JANUS_TRANSCRIPT_SINK (src/transcripts/flag.ts), so this is a no-op cost
+            // when off (the production default). A single local SQLite insert when enabled; crosses
+            // no Python seam (I/O shell stays in TS, per the 2026-06-19 ADR).
+            recordLiveTranscripts(store, { operator: userUtterance, model: modelUtterance, modelThinking }, {
+              sessionId: state.voiceSessionId,
+              projectId: manager.ledger.activeProjectId,
+              paneId: coreState.activePaneId,
+              interactionId: state.currentInteractionId,
+            });
 
             if (modelThinking) {
               interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });

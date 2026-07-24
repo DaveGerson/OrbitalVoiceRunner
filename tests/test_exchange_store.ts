@@ -20,9 +20,9 @@ function freshStore(): JanusStore {
 }
 
 describe("AgentExchange spine: schema", () => {
-  it("bumps SCHEMA_VERSION to 12 and creates the three new tables + indexes", () => {
+  it("v12 created the three new tables + indexes (SCHEMA_VERSION has since advanced past 12, e.g. bead 98f2's v13 transcripts table)", () => {
     const s = freshStore();
-    assert.equal(SCHEMA_VERSION, 12);
+    assert.ok(SCHEMA_VERSION >= 12);
     const names = (s.db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table'"
     ).all() as any[]).map((r) => r.name);

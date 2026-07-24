@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn.
  *  Exported (not just `applyMigrations`) so tests can build a pre-migration fixture DB by
@@ -454,6 +454,31 @@ export const MIGRATIONS: ((db: Database.Database) => void)[] = [
     if (hasTable("events")) db.exec(`
       ALTER TABLE events ADD COLUMN exchange_id TEXT;
       CREATE INDEX idx_events_exchange ON events(exchange_id);
+    `);
+  },
+  // v13 (bead 98f2 — durable transcript sink): an OPT-IN, append-only table for BOTH voice channels
+  // (operator ASR + Janus narration), fed from src/liveTranscripts.ts's extractTranscripts via
+  // src/transcripts/sink.ts. Purely additive (new table only, no ALTER) — no existence guard is
+  // needed (mirrors the v5/v6/v9/v10 additive-table migrations). Column named `text_redacted` (not
+  // `text`) to encode the redaction-at-boundary contract explicitly: the caller (the sink) pre-
+  // redacts via redactSecrets BEFORE calling recordTranscript — the store persists verbatim, the
+  // exact same convention as exchange_events.payload_redacted_json. The sink itself is gated OFF by
+  // default (JANUS_TRANSCRIPT_SINK, src/transcripts/flag.ts) — this migration applies unconditionally
+  // (schema always advances), but no row is EVER written unless an operator opts in.
+  (db) => {
+    db.exec(`
+      CREATE TABLE transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        session_id TEXT,
+        project_id TEXT,
+        pane_id TEXT,
+        interaction_id TEXT,
+        text_redacted TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX idx_transcripts_ts ON transcripts(ts);
+      CREATE INDEX idx_transcripts_session_ts ON transcripts(session_id, ts);
     `);
   },
 ];

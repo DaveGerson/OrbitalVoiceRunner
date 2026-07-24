@@ -702,6 +702,7 @@ function ensureCore(): void {
       eventsTtlDays: 30,
       archiveTtlDays: 14,
       scrollbackDirs: [process.cwd()],
+      transcriptsTtlDays: 30,
     });
   });
   store = storeInit.store;
@@ -1396,7 +1397,7 @@ function startRetentionSweepTimer(store: JanusStore | null): NodeJS.Timeout | nu
   if (!store) return null;
   const retentionSweepTimer = setInterval(() => {
     try {
-      store.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14 });
+      store.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14, transcriptsTtlDays: 30 });
     } catch (e) {
       console.error("[STORE] periodic retention sweep failed (will retry next tick):", e);
     }
