@@ -11,6 +11,7 @@
 import type { Terminal, PaneMeta, Workspace, PendingCommand } from "./types";
 import type { ProjectNote } from "./classic/hooks/useLedgerData";
 import type { EarconType } from "./announcementKinds";
+import { requestNotifyPermission } from "./utils/notify";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status resolution + pane filtering (the `term?.status || (pane.alive ? …)` idiom, repeated
@@ -429,6 +430,11 @@ export interface WsHandlerCtx {
 type WsHandler = (msg: any, ctx: WsHandlerCtx) => void;
 
 function handleApprovalPending(msg: any, ctx: WsHandlerCtx): void {
+  // BUG-037(b): ask for desktop-notification permission on the first approval_pending. The guarded
+  // helper self-no-ops unless Notification.permission === "default", so this fires the browser prompt
+  // exactly once (the permission leaves "default" after the first decision). triggerDesktopNotification
+  // stays gated on `granted` — this only wires the REQUEST, not the firing.
+  requestNotifyPermission();
   ctx.playEarcon("alert");
   ctx.triggerDesktopNotification("🚨 Approval Pending", `Node ${msg.terminalId} is waiting for execute confirm: ${msg.cmd}`);
   ctx.setPendingCommands((prev: any[]) => {

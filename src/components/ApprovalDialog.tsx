@@ -192,8 +192,20 @@ export function ApprovalDialog({
     capLabel,
   } = deriveApprovalDisplayState({ posture, effectiveGates, effectiveMode, capability });
 
+  // BUG-037(a): stable, per-dialog ids so stacked dialogs don't collide their aria-labelledby /
+  // aria-describedby targets. Derived from the unique messageId.
+  const headingId = `approval-title-${messageId}`;
+  const cmdId = `approval-cmd-${messageId}`;
+
   return (
-    <div data-testid="approval-dialog" className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
+    <div
+      data-testid="approval-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby={headingId}
+      aria-describedby={cmdId}
+      className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4"
+    >
       <div className="w-full max-w-[620px] bg-[#111] border-2 border-amber-500/50 rounded-xl p-6 shadow-2xl shadow-black/80 animate-in slide-in-from-bottom-10 fade-in duration-300">
         <div className="flex items-start gap-5">
           <div className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-500/20 border border-amber-500/50 flex items-center justify-center">
@@ -201,11 +213,15 @@ export function ApprovalDialog({
           </div>
           <div className="flex-1">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-[#d97706]">Proposed Command Execution</h3>
+              <h3 id={headingId} className="text-xs font-mono font-bold uppercase tracking-widest text-[#d97706]">Proposed Command Execution</h3>
               <span className="text-xs font-mono opacity-40">Target: {terminalId}</span>
             </div>
 
-            <p className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all">
+            <p
+              id={cmdId}
+              aria-live="assertive"
+              className="text-sm font-mono text-white/90 bg-black/40 p-2 rounded border border-white/5 mb-4 break-all"
+            >
               {cmd}
             </p>
 
