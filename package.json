@@ -40,6 +40,7 @@
     "@homebridge/node-pty-prebuilt-multiarch": "^0.13.1",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "@xterm/headless": "^5.5.0",
     "better-sqlite3": "^12.10.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",

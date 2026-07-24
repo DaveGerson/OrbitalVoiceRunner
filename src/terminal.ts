@@ -13,6 +13,9 @@ import {
 } from "./statusMachine";
 import { AgentAdapter, createAdapter } from "./agents";
 import { withPaneLifecycleLock } from "./lifecycleLock";
+import type { Terminal as XtermTerminal } from "@xterm/headless";
+import xtermHeadless from "@xterm/headless";
+const { Terminal } = xtermHeadless;
 
 // Status-machine input to applyStatusEvent and its extracted side-effect helpers.
 type StatusEvent =
@@ -243,9 +246,17 @@ export function appendRawCapped(existing: string, chunk: string, max: number): s
 }
 
 export function stripAnsiSequences(text: string): string {
+  // Matches OSC sequences (ESC ] ... BEL and ESC ] ... ST/ESC \)
+  const oscEscape = /\u001b\][^\u001b]*(?:\u0007|\u001b\\)/g;
   // Matches ANSI color/style escape sequences
   const ansiEscape = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
-  return text.replace(ansiEscape, '');
+  // Matches stray C0 control bytes except \t \n \r
+  const c0Controls = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
+
+  return text
+    .replace(oscEscape, '')
+    .replace(ansiEscape, '')
+    .replace(c0Controls, '');
 }
 
 /**
@@ -446,6 +457,17 @@ export class UniversalTerminal {
   // pane is (re)opened so scrollback renders with correct colors/layout.
   private rawBackfill = "";
   public maxRawBackfillChars = 200_000;
+  private vt: XtermTerminal | null = null;
+  // Model-lane reconcile watermark: the emulator NORMAL-buffer row index up to which committed
+  // rows have been pushed to `outputBuffer`. `vtLinesFed` (normal-buffer line-feeds, via onLineFeed)
+  // is used ONLY to shift this watermark down when xterm's scrollback saturates and evicts+renumbers
+  // rows from the top — otherwise the watermark would drift past ~1k lines. The watermark is a real
+  // BUFFER index (not a line-feed proxy), so autowrap continuation rows and absolute cursor moves are
+  // handled truthfully; `vtPrevLinesFed` yields the per-reconcile eviction delta.
+  private vtReconciledRow = 0;
+  private vtLinesFed = 0;
+  private vtPrevLinesFed = 0;
+  private vtPrevBufLen = 0;
   public status: "Running" | "Exited" | "Idle" = "Idle";
   public permissionsMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only";
   public toolPreset: "Claude Code" | "Codex" | "Antigravity" | "Custom";
@@ -977,6 +999,23 @@ export class UniversalTerminal {
     // during a stop→start gap, or input queued during an overlapping-restart race. After ANY
     // successful boot markSpawnReady drains pendingInput to [], and a session that DIED pre-ready
     // has its queue cleared by the onExit teardown (3P.4) — so dead-session input never replays.
+    // Dispose any prior emulator first so a restart (stop→start) never leaks an emulator or a
+    // stale onLineFeed listener. `scrollback` is generous; the watermark shifts with eviction so
+    // the model lane stays correct even once it saturates and rows are evicted.
+    this.vt?.dispose();
+    this.vt = new Terminal({
+      cols: this.cols,
+      rows: this.rows,
+      scrollback: Math.max(1000, this.maxBufferLines),
+      allowProposedApi: true
+    });
+    this.vtReconciledRow = 0;
+    this.vtLinesFed = 0;
+    this.vtPrevLinesFed = 0;
+    this.vtPrevBufLen = 0;
+    // Count NORMAL-buffer line-feeds only: alt-screen feeds must not perturb the eviction delta or
+    // the watermark (the alt buffer is separate scrollback the model lane never commits).
+    this.vt.onLineFeed(() => { if (this.vt && this.vt.buffer.active.type === "normal") this.vtLinesFed++; });
     const preSpawn = this.pendingInput.slice();
     this.transport = transport;
     this.usingNodePty = usingNodePty;
@@ -1027,11 +1066,10 @@ export class UniversalTerminal {
       if (this.onOutput) {
         this.onOutput(this.terminalId, decoded);
       }
-      const cleanLines = stripAnsiSequences(decoded).split(/\r?\n/).filter((l: string) => l.trim() !== '');
-      this.outputBuffer.push(...cleanLines);
-      this.totalLines += cleanLines.length;
-      if (this.outputBuffer.length > this.maxBufferLines) {
-        this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
+      if (this.vt) {
+        this.vt.write(decoded, () => {
+          this.reconcileVt();
+        });
       }
     });
 
@@ -1097,6 +1135,7 @@ export class UniversalTerminal {
     if (cols < 1 || rows < 1) return;
     this.cols = Math.floor(cols);
     this.rows = Math.floor(rows);
+    this.vt?.resize(this.cols, this.rows);
     if (this.transport) {
       this.transport.resize(this.cols, this.rows);
     }
@@ -1224,8 +1263,33 @@ export class UniversalTerminal {
     this.transport.write(bytes);
   }
 
-  getRecentOutput(linesCount = 10): string {
-    return this.outputBuffer.slice(-linesCount).join('\n');
+  getRecentOutput(linesCount = 10, offset = 0): string {
+    // Snapshot read: render the last `linesCount` non-blank lines DIRECTLY from the emulator's
+    // current clean grid (scrollback + viewport). This is the authoritative rendered screen, so
+    // it is robust to the two things that defeat chunk-accumulation: in-place REPAINTS and
+    // ABSOLUTE cursor positioning. Windows ConPTY, for example, prints a command's result and
+    // then jumps to the prompt with `ESC[row;colH` (a CUP, NOT a newline) — the text is on the
+    // grid but no line-feed fires, so an accumulation keyed off line-feeds would miss it.
+    // `offset` pages backward: skip the newest `offset` non-blank rows before collecting
+    // `linesCount`, so scrollback WINDOWING composes OVER the clean grid instead of the raw buffer
+    // (offset defaults to 0 → byte-identical to a plain tail read). Scanning bottom-up stops as
+    // soon as we have enough lines (cheap even with deep scrollback).
+    const buf = this.vt?.buffer.active;
+    if (buf && buf.type === "normal") {
+      const lines: string[] = [];
+      let skipped = 0;
+      for (let bi = buf.length - 1; bi >= 0 && lines.length < linesCount; bi--) {
+        const s = buf.getLine(bi)?.translateToString(true) ?? "";
+        if (s.trim() === "") continue;
+        if (skipped < offset) { skipped++; continue; }
+        lines.push(s);
+      }
+      if (lines.length > 0) { lines.reverse(); return lines.join("\n"); }
+    }
+    // Fallback (no emulator yet, alternate screen, or empty grid): window the committed model lane.
+    const end = Math.max(0, this.outputBuffer.length - offset);
+    const start = Math.max(0, end - linesCount);
+    return this.outputBuffer.slice(start, end).join("\n");
   }
 
   /** Only-new-since-last-read lines (model lane). Advances the model cursor.
@@ -1238,6 +1302,93 @@ export class UniversalTerminal {
     const lines = this.outputBuffer.slice(from - bufStart).join("\n");
     this.modelCursor = this.totalLines;
     return { lines, dropped };
+  }
+
+  /**
+   * TEST SEAM (x6oo). Deterministic drain barrier for the headless VT emulator.
+   *
+   * `@xterm/headless` `Terminal.write()` parses ASYNCHRONOUSLY (its internal write
+   * buffer flushes on a microtask/timer), but `consumeDelta()`/`totalLines` are SYNC.
+   * Emulator-backed tests write a stream through the injected fake transport's onData
+   * and then `await term.drainVtForTest()` before asserting on `getRecentOutput()`/
+   * `consumeDelta()`, so they never race the parser.
+   *
+   * It awaits the emulator's write buffer via an empty write (whose callback fires only
+   * after all previously-queued chunks are parsed), then runs a FINAL reconcile so the
+   * current cursor row is observable too. No-op when there is no emulator.
+   */
+  async drainVtForTest(): Promise<void> {
+    if (!this.vt) return;
+    await new Promise<void>(r => this.vt!.write("", r));
+    // A drain observes the FINAL rendered grid, so flush the cursor's own row too.
+    this.reconcileVt({ final: true });
+  }
+
+  /**
+   * Commit newly-FINALIZED emulator rows (the append-only lane behind `consumeDelta` /
+   * get_pane_delta) into the model-lane `outputBuffer`.
+   *
+   * Only rows STRICTLY ABOVE the live cursor row are committed. A row at or below the cursor is
+   * still being written — streamed tokens, in-place `\r`/cursor-up redraws, spinner frames — so
+   * committing it eagerly (and advancing past it) duplicates growing prefixes or leaks transient
+   * frames: the exact gibberish x6oo removes. A finalized row renders once, cleanly. `final`
+   * (teardown / drain) also flushes the cursor's OWN row, so a one-shot line with no trailing
+   * newline (`echo x` before exit) is not dropped.
+   *
+   * The watermark `vtReconciledRow` is a real NORMAL-buffer ROW INDEX (not a line-feed proxy):
+   *  - it is compared against the ACTUAL cursor row (`baseY+cursorY`), so autowrap continuation
+   *    rows and absolute cursor positioning (`ESC[r;cH`) map to the right rows;
+   *  - it is monotonic (never moves backward for a same-buffer read), so a cursor-up redraw above
+   *    it cannot re-commit finalized rows;
+   *  - the ALTERNATE screen is skipped, and because alt is a SEPARATE buffer the normal-buffer
+   *    watermark is preserved untouched across the excursion — no rows are re-committed on return;
+   *  - when the scrollback saturates, xterm evicts+renumbers rows from the top, so the watermark
+   *    is shifted down by the per-reconcile normal-buffer line-feed delta (exact for the streaming
+   *    output that is the only way to reach the cap).
+   *
+   * Known limitations (tracked as follow-up beads, not blockers for the gibberish fix):
+   *  - alt-screen TUI content is not summarized into the model lane (skipped, above);
+   *  - a multi-row block redrawn IN PLACE via cursor-up in the NORMAL buffer commits its
+   *    first-frame values (the monotonic watermark won't re-commit a finalized row);
+   *  - a still-live line with no trailing newline (a prompt) is absent from the incremental
+   *    delta until finalized — the SNAPSHOT read `getRecentOutput` (get_pane_summary) renders the
+   *    grid directly and always shows it, so only get_pane_delta lags.
+   */
+  private reconcileVt(opts?: { final?: boolean }): void {
+    if (!this.vt) return;
+    const buffer = this.vt.buffer.active;
+    if (buffer.type === "alternate") return;
+    // Eviction shift: xterm's buffer holds at most `rows + scrollback` rows; past that, each new
+    // row evicts one from the TOP and renumbers all indices down by one — so drag the watermark
+    // down with them. Rows evicted since last reconcile = the new rows that overflowed the capacity
+    // that was still free (`feedDelta` counts normal-buffer line-feeds, exact for the streaming
+    // output that is the only way to reach the cap).
+    const feedDelta = this.vtLinesFed - this.vtPrevLinesFed;
+    this.vtPrevLinesFed = this.vtLinesFed;
+    const cap = this.rows + Math.max(1000, this.maxBufferLines);
+    const evicted = Math.max(0, feedDelta - Math.max(0, cap - this.vtPrevBufLen));
+    this.vtPrevBufLen = buffer.length;
+    if (evicted > 0) {
+      this.vtReconciledRow = Math.max(0, this.vtReconciledRow - evicted);
+    }
+    const cursorRow = buffer.baseY + buffer.cursorY;       // ACTUAL live cursor row (buffer index)
+    const lastRow = opts?.final ? cursorRow : cursorRow - 1;
+    let pushed = 0;
+    for (let bi = this.vtReconciledRow; bi <= lastRow; bi++) {
+      if (bi < 0 || bi >= buffer.length) continue;
+      const str = buffer.getLine(bi)?.translateToString(true) ?? "";
+      if (str.trim() === "") continue;
+      this.outputBuffer.push(str);
+      pushed++;
+    }
+    this.totalLines += pushed;
+    if (lastRow + 1 > this.vtReconciledRow) {
+      this.vtReconciledRow = lastRow + 1;
+    }
+
+    if (this.outputBuffer.length > this.maxBufferLines) {
+      this.outputBuffer.splice(0, this.outputBuffer.length - this.maxBufferLines);
+    }
   }
 
   public async stop(): Promise<void> {
@@ -1255,6 +1406,16 @@ export class UniversalTerminal {
   }
 
   private async _doStop(): Promise<void> {
+    // Flush the emulator's async write buffer BEFORE the final reconcile so a trailing chunk
+    // (a one-shot line with no newline, or output landing right at stop) is captured, not
+    // dropped — mirrors drainVtForTest. Then dispose. `reconcileVt` is a no-op once `vt` is
+    // null, so a second stop() stays safe.
+    if (this.vt) {
+      try { await new Promise<void>(r => this.vt!.write("", r)); } catch { /* already torn down */ }
+      this.reconcileVt({ final: true });
+      this.vt.dispose();
+      this.vt = null;
+    }
     // Clear both timers up front so a stopped pane never leaves work alive
     // (prevents the runner from hanging on lingering intervals).
     this.clearProbeTimer();
@@ -1907,11 +2068,11 @@ export class OrchestratorManager {
     };
   }
 
-  getPaneSummary(paneId: string, limit = 20) {
+  getPaneSummary(paneId: string, limit = 20, offset = 0) {
     if (!this.terminals[paneId]) {
       return `Error: Pane ${paneId} does not exist.`;
     }
-    const recentOut = this.terminals[paneId].getRecentOutput(limit);
+    const recentOut = this.terminals[paneId].getRecentOutput(limit, offset);
     // WS-B: redactSecrets runs AFTER ANSI stripping (getRecentOutput already strips ANSI).
     // This covers both the standard get_pane_summary tool response and the HiTL rationale
     // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
