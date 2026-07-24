@@ -1,14 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert";
 
-// BUG-043 (P3, misleading health signal) — RED TDD pins for the smoke:claude readiness/timeout fix.
+// BUG-043 (P3, misleading health signal) — pins for the smoke:claude readiness/timeout fix.
 //
 // scripts/smoke-claude-pane.ts hardcodes STARTUP_MS=6000 / RESPONSE_MS=25000 and BLINDLY submits the
 // prompt after a fixed 6s sleep. A plugin-heavy Claude (e.g. a memory plugin that stands up its own
 // service) is still initializing well past 6s, so the prompt is submitted before the CLI can accept
 // it and the smoke false-FAILs a healthy pane.
 //
-// Required post-fix behavior these tests pin (see scratchpad/design/W1-delivery.md for the contract):
+// The behavior these tests pin:
 //   (a) A PURE exported helper resolveSmokeTimeouts(env) -> { startupMs, responseMs }:
 //         - env-overridable via JANUS_SMOKE_STARTUP_MS / JANUS_SMOKE_RESPONSE_MS
 //         - guarded parsing: non-numeric / negative / zero / empty -> the default

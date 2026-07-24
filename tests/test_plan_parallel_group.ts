@@ -312,3 +312,130 @@ describe("execute_plan parallel group — join-gated advancement (observe layer,
     );
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// FAILURE-THEN-JOIN SEAM (BUG-011 stall + dishonest narration): a group member REFUSED at dispatch
+// (gated Off -> blocked -> step "failed") never produces a pane edge. Before this fix, observe's
+// isGroupComplete required EVERY member "completed", so the surviving members finishing could never
+// settle the group: plan.status wedged "running" forever, the tail step was unreachable, and NO
+// plan_paused/plan_completed frame ever fired. And dispatchParallelGroup narrated "N steps running
+// concurrently" even when a member was refused. This suite drives the REAL execute_plan handler AND
+// the REAL attachObserve pipeline over ONE shared manager (like scratchpad/repro_blocked_member_stall.ts)
+// to pin: honest narration, a non-stalling settle, and the eyes-off plan_paused announcement.
+// Hermetic pane ids (bm1..bm4) keep the module-singleton dispatchJoinTracker from cross-settling.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/** Leading group "gb" on bm1/bm2/bm3, then one trailing sequential step on bm4. */
+function blockedGroupPlanSteps(): FakeStep[] {
+  return [
+    { id: "step_0", terminalId: "bm1", command: "c0", expectedTransition: "idle", status: "pending", group: "gb" },
+    { id: "step_1", terminalId: "bm2", command: "c1", expectedTransition: "idle", status: "pending", group: "gb" },
+    { id: "step_2", terminalId: "bm3", command: "c2", expectedTransition: "idle", status: "pending", group: "gb" },
+    { id: "step_3", terminalId: "bm4", command: "c3", expectedTransition: "idle", status: "pending" },
+  ];
+}
+
+interface BlockedHarness {
+  ctx: ActionContext;
+  manager: OrchestratorManager;
+  plan: { id: string; name: string; steps: FakeStep[]; currentStepIndex: number; status: string };
+  broadcasts: Array<Record<string, unknown>>;
+}
+
+/** ONE manager wired for BOTH the execute_plan handler (dispatchProposal returns the per-target
+ *  outcome; default executed) and the observe pipeline (terminals/pushAttention/ledger), so the plan
+ *  dispatched by execute_plan is the SAME object attachObserve later settles — a true E2E of the
+ *  dispatch->observe seam. broadcasts is shared across both surfaces so plan_paused frames are visible. */
+function makeBlockedGroupHarness(steps: FakeStep[], outcomes: Record<string, DispatchOutcome> = {}): BlockedHarness {
+  const broadcasts: Array<Record<string, unknown>> = [];
+  const plan = { id: "plan_bm", name: "Bm", steps, currentStepIndex: 0, status: "idle" };
+  const attentionQueue: unknown[] = [];
+  const term = () => ({ status: "Idle", runtimeType: "claude", lastCommand: "" });
+  const manager = {
+    terminals: { bm1: term(), bm2: term(), bm3: term(), bm4: term() },
+    attentionQueue,
+    pushAttention: (item: unknown) => attentionQueue.push(item),
+    settings: { secrets: {} },
+    ledger: {
+      watchRules: [] as unknown[],
+      plans: [plan],
+      activeProjectId: "proj_bm",
+      save: (_force?: boolean): void => {},
+    },
+  } as unknown as OrchestratorManager;
+  const ctx = {
+    session: null,
+    callId: "call_bm",
+    manager,
+    dispatchProposal: (opts: { targetId: string }): DispatchOutcome => outcomes[opts.targetId] ?? { kind: "executed", text: "ran" },
+    broadcast: (m: unknown): void => { broadcasts.push(m as Record<string, unknown>); },
+    redact: (s: string) => s,
+  } as unknown as ActionContext;
+  return { ctx, manager, plan, broadcasts };
+}
+
+const outputOf = (r: unknown): string => String((r as { output: unknown }).output);
+
+describe("execute_plan parallel group — failure-then-join (BUG-011 stall + honest narration)", () => {
+  it("blocked member: honest narration at dispatch (NOT 'N running concurrently')", async () => {
+    const { ctx } = makeBlockedGroupHarness(blockedGroupPlanSteps(), { bm2: { kind: "blocked", text: "gated Off" } });
+    const result = await runAction(REGISTRY, "execute_plan", { plan_id: "plan_bm" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    const out = outputOf(result);
+    assert.ok(/blocked/i.test(out), `narration must name the refused member: ${out}`);
+    assert.ok(/2 of 3/.test(out), `narration must report how many of the group actually started: ${out}`);
+    assert.ok(!/running concurrently/i.test(out), `narration must NOT falsely claim every member is running: ${out}`);
+  });
+
+  it("blocked member: the group SETTLES (plan pauses) once the survivors go idle — it does NOT hang running", async () => {
+    const { ctx, manager, plan, broadcasts } = makeBlockedGroupHarness(
+      blockedGroupPlanSteps(),
+      { bm2: { kind: "blocked", text: "gated Off" } },
+    );
+    // Dispatch: the Off member's step fails; the two survivors run; the plan is still running.
+    const result = await runAction(REGISTRY, "execute_plan", { plan_id: "plan_bm" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.deepStrictEqual(
+      plan.steps.map((s) => s.status),
+      ["running", "failed", "running", "pending"],
+      "blocked member's step is failed; the two survivors run; the tail is pending",
+    );
+    assert.strictEqual(plan.status, "running", "a partial-block keeps the plan running until the survivors settle");
+
+    // Observe: feed idle edges for ONLY the two members that ran (the blocked one never produces one).
+    const { onOutput } = attachObserve(manager, makeObserveDeps((m) => broadcasts.push(m as Record<string, unknown>)) as never);
+    onOutput("bm1", "tests passed\n");
+    onOutput("bm3", "tests passed\n");
+
+    assert.strictEqual(plan.status, "paused", "the group settled WITH a failed member -> the plan PAUSES (was: wedged 'running' forever)");
+    assert.notStrictEqual(plan.status, "running", "the plan must NOT hang as running");
+    assert.strictEqual(plan.currentStepIndex, 0, "a failed group never advances past itself; the tail stays unreached");
+    assert.strictEqual(plan.steps[3].status, "pending", "the tail sequential step is never auto-run");
+    assert.ok(
+      broadcasts.some((b) => b.type === "plan_paused" && b.planId === "plan_bm"),
+      "the plan_paused frame the eyes-off operator hears is emitted (the sequential failure-edge frame)",
+    );
+    assert.ok(
+      !broadcasts.some((b) => b.type === "plan_completed"),
+      "a group with a failed member never reports plan_completed",
+    );
+  });
+
+  it("ALL-blocked group: settles PAUSED at dispatch (never a running zombie)", async () => {
+    const offAll = { bm1: { kind: "blocked", text: "off" }, bm2: { kind: "blocked", text: "off" }, bm3: { kind: "blocked", text: "off" } } as Record<string, DispatchOutcome>;
+    const { ctx, plan } = makeBlockedGroupHarness(blockedGroupPlanSteps(), offAll);
+    const result = await runAction(REGISTRY, "execute_plan", { plan_id: "plan_bm" }, ctx);
+    assert.strictEqual(result.kind, "ok");
+    assert.deepStrictEqual(
+      plan.steps.slice(0, 3).map((s) => s.status),
+      ["failed", "failed", "failed"],
+      "every group member was refused -> every group step is failed",
+    );
+    assert.strictEqual(plan.status, "paused", "an all-blocked group settled at dispatch must be PAUSED, not a running zombie");
+    // REST: worst-of severity maps an all-blocked group to the blocked (403) outcome.
+    assert.strictEqual((result as { meta?: { outcome?: string } }).meta?.outcome, "blocked", "worst-of severity stamps blocked (-> 403)");
+    const out = outputOf(result);
+    assert.ok(/blocked/i.test(out), `narration is honest about the blocks: ${out}`);
+    assert.ok(!/running concurrently/i.test(out), `narration must NOT claim steps are running: ${out}`);
+  });
+});

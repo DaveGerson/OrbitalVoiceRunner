@@ -30,6 +30,9 @@ const TONE_TABLE: Record<EarconType, [number, number, number][]> = {
   blocked: [[330, 0, 0.14], [220, 0.12, 0.22]],                 // E4→A3 low falling — command blocked
   // A crisp two-note "lock clicked" rise — the operator learns it as "autonomy changed".
   permission: [[494, 0, 0.10], [622, 0.09, 0.16]],              // B4→D#5 short rising — permission_changed
+  // RESERVED / vocabulary-only (BUG-018): a note-saved tone with NO producer yet — no call site
+  // passes "note" to playEarcon. Kept in the table (and isEarconType) so a future note-save broadcast
+  // can ring it without re-plumbing the vocabulary; delete this entry if that path never materializes.
   note: [[659.25, 0, 0.12]],                                    // single E5 blip — note saved
 };
 

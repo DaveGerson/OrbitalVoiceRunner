@@ -19,8 +19,6 @@
 //         • permission_changed → "permission"
 //       and the three tones are pairwise DISTINCT.
 //
-// These are RED until the fix lands: today isEarconType rejects "blocked"/"permission"/"note", and
-// earconForFrame returns null for command_blocked/permission_changed (only approval_pending is mapped).
 // Pure — imports the REAL earcon + helper modules the hook uses (no React/DOM).
 //
 // Runner: npx tsx --test --test-force-exit tests/test_earcon_differentiation.ts

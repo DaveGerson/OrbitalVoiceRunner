@@ -355,9 +355,18 @@ function leadingGroup(steps: any[], startIndex: number): any[] {
   return group;
 }
 
-/** True once EVERY member of a leading parallel group has completed (its join is satisfied). */
-function isGroupComplete(group: any[]): boolean {
-  return group.length > 0 && group.every((s) => s.status === "completed");
+/** True once EVERY member of a leading parallel group has SETTLED (completed OR failed). The join
+ *  can make no further progress once this holds — the plan then advances (all completed) or pauses
+ *  (any failed). BUG-011: this must NOT require all-completed, or a member that failed at dispatch
+ *  (gated Off -> "failed", no pane edge ever coming) wedges the join and the plan runs forever. */
+function isGroupSettled(group: any[]): boolean {
+  return group.length > 0 && group.every((s) => s.status === "completed" || s.status === "failed");
+}
+
+/** True when a settled group carries at least one FAILED member (a dispatch-time refusal that never
+ *  ran, or a runtime failure) — the plan cannot proceed past the group, so it pauses. */
+function groupHasFailure(group: any[]): boolean {
+  return group.some((s) => s.status === "failed");
 }
 
 /**
@@ -783,19 +792,25 @@ ${redact(rawOutput.slice(-3000))}`;
     });
   }
 
-  /** A failure transition on the running step: fail the step + pause the plan. */
-  function failPlanStep(plan: any, currentStep: any, terminalId: string, transition: Transition): void {
-    currentStep.status = "failed";
+  /**
+   * The SHARED plan-level PAUSE emission (BUG-011): flip the plan paused, surface a redacted
+   * attention item, and emit the plan_paused WS frame + announcement so an eyes-off operator HEARS
+   * the pause. Used by both the sequential/runtime failure edge (failPlanStep) and the parallel-group
+   * settled-with-failure join (pauseGroupOnFailure). The plan_paused frame message is kept identical
+   * to the pre-BUG-011 sequential wording so that path stays byte-identical.
+   */
+  function emitPlanPaused(plan: any, terminalId: string, attnMessage: string, announceSummary: string): void {
     plan.status = "paused";
-    console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
     const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through). A paused
+    // plan's attention item is always the "build-failed" severity class (both the sequential failure
+    // edge and the parallel-group failure join surface it that way).
     manager.pushAttention({
       id: itemID,
       type: "build-failed",
       terminalId,
       projectId: manager.ledger.activeProjectId || "default_project",
-      message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+      message: attnMessage,
       timestamp: new Date().toISOString(),
       dismissed: false
     });
@@ -808,16 +823,48 @@ ${redact(rawOutput.slice(-3000))}`;
     announcementBus.enqueue({
       kind: "plan_paused",
       terminalId,
-      summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
+      summary: announceSummary
     });
+  }
+
+  /** A failure transition on the running step: fail the step + pause the plan. */
+  function failPlanStep(plan: any, currentStep: any, terminalId: string, transition: Transition): void {
+    currentStep.status = "failed";
+    console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
+    emitPlanPaused(
+      plan,
+      terminalId,
+      `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+      `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
+    );
+  }
+
+  /**
+   * BUG-011: the leading parallel group SETTLED (every member completed-or-failed) with at least one
+   * FAILED member — a dispatch-time refusal (gated Off) that never produced a pane edge, or a runtime
+   * failure. The tail sequential step is unreachable past a failed member, so PAUSE the plan the SAME
+   * way a sequential step failure does (same plan_paused frame + announcement the operator hears),
+   * rather than leaving it "running" forever. currentStepIndex is deliberately NOT advanced.
+   */
+  function pauseGroupOnFailure(plan: any, group: any[], terminalId: string): void {
+    const failed = group.filter((s: any) => s.status === "failed").length;
+    console.log(`[PLAN PAUSED] Plan '${plan.name}' paused: ${failed} of ${group.length} parallel step(s) failed.`);
+    emitPlanPaused(
+      plan,
+      terminalId,
+      `Plan '${plan.name}' was paused: ${failed} of ${group.length} parallel step(s) did not complete.`,
+      `Plan '${plan.name}' paused: ${failed} of ${group.length} parallel steps did not complete.`
+    );
   }
 
   /**
    * BUG-011: settle ONE completed member of the leading group. Marks it completed + broadcasts
-   * plan_step_completed; the plan advances PAST the whole group (to the first post-group step, via the
-   * existing advance/complete path) ONLY once EVERY member has completed — never on the first member's
-   * edge. group.length===1 (a step with no group marker) satisfies isGroupComplete immediately, so the
-   * sequential advance is byte-identical to pre-BUG-011.
+   * plan_step_completed; then acts ONLY once the whole group has SETTLED (every member completed OR
+   * failed — never on the first member's edge, and no longer wedged by a member that failed at
+   * dispatch). A settled group with any FAILED member pauses the plan (pauseGroupOnFailure); an
+   * all-completed group advances PAST the group via the existing advance/complete path. group.length===1
+   * (a step with no group marker) settles immediately on its own completion, so the sequential advance
+   * is byte-identical to pre-BUG-011.
    */
   function completeGroupMember(plan: any, group: any[], member: any, terminalId: string): void {
     member.status = "completed";
@@ -828,7 +875,11 @@ ${redact(rawOutput.slice(-3000))}`;
       stepId: member.id,
       message: `Plan step completed successfully on '${terminalId}'.`
     });
-    if (!isGroupComplete(group)) return; // group still joining — do NOT advance past it yet.
+    if (!isGroupSettled(group)) return; // group still joining — do NOT settle past it yet.
+    if (groupHasFailure(group)) {
+      pauseGroupOnFailure(plan, group, terminalId); // a failed member blocks the tail — pause, don't advance.
+      return;
+    }
     const nextIndex = plan.currentStepIndex + group.length;
     if (nextIndex < plan.steps.length) {
       advanceToNextPlanStep(plan, nextIndex);

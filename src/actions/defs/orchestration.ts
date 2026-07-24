@@ -242,15 +242,57 @@ function dispatchSingleStep(ctx: ActionContext, plan: any): { resp: string; outc
   };
 }
 
+/** Per-member dispatch tally for the HONEST parallel-group read-back (BUG-011): how many members
+ *  actually started (executed -> running), how many are staged awaiting approval (pending), and how
+ *  many were refused at the gate (blocked / clarify / error). Mirrors narrateDispatch's
+ *  staged-vs-refused split so an eyes-off operator hears what really got off the ground. */
+interface GroupDispatchTally {
+  running: number;
+  staged: number;
+  refused: number;
+}
+
+/** Fold ONE member's dispatch outcome into the tally (executed=running, pending=staged, everything
+ *  else — blocked/clarify/error — refused, matching applyMemberOutcome's failed-step mapping). */
+function tallyMember(tally: GroupDispatchTally, out: DispatchOutcome): void {
+  if (out.kind === "executed") tally.running++;
+  else if (out.kind === "pending") tally.staged++;
+  else tally.refused++;
+}
+
+/** Honest spoken read-back for a fanned-out parallel group — reflects the ACTUAL dispatch outcomes
+ *  (started / awaiting approval / blocked) instead of blindly claiming every member is "running
+ *  concurrently". When nothing got off the ground it mirrors the single-step path's "Could not start
+ *  plan" refusal wording; a clean fan-out keeps the original happy-path sentence byte-identical. */
+function narrateParallelGroup(planName: string, total: number, tally: GroupDispatchTally): string {
+  const started = tally.running + tally.staged;
+  if (started === 0) {
+    return `Could not start plan '${planName}': all ${total} parallel steps were blocked.`;
+  }
+  if (tally.staged === 0 && tally.refused === 0) {
+    return `Started parallel execution of plan '${planName}': ${total} steps running concurrently.`;
+  }
+  const parts = [`Started ${started} of ${total} steps of plan '${planName}'`];
+  if (tally.staged > 0) parts.push(`${tally.staged} awaiting approval`);
+  if (tally.refused > 0) parts.push(`${tally.refused} blocked`);
+  return parts.join("; ") + ".";
+}
+
 /** Fan a LEADING parallel group out through the SAME gated pane-write choke-point — one
  *  ctx.dispatchProposal per member (each gating exactly as a lone plan step: capability "execute_plan",
  *  a DISTINCT synthetic pendingId), registering a dispatchJoinTracker group for the later "all done"
  *  join. Deliberately NOT stageDispatchGroup: its forceStage would turn every member into a pending
  *  approval even under Full Auto, diverging from the single-step gating contract. Plan advancement stays
- *  the observe layer's job (currentStepIndex is NOT touched here). */
+ *  the observe layer's job (currentStepIndex is NOT touched here) — EXCEPT the all-refused case, which
+ *  settled at dispatch (no pane edge is coming to settle the join), so it pauses here for parity with
+ *  dispatchSingleStep's blocked branch. */
 function dispatchParallelGroup(ctx: ActionContext, plan: any, group: any[]): { resp: string; outcome: ExecutePlanOutcome } {
-  const join = dispatchJoinTracker.create(`Plan '${plan.name}'`, group[0].command, group.map((s) => s.terminalId));
+  // The join name is wrapped by the completion narration as `Dispatch '<name>' complete`
+  // (src/observe/index.ts), so keep the label unquoted here — `Plan '<name>'` would read back as the
+  // doubled-quote "Dispatch 'Plan 'X'' complete". `Plan <name>` narrates cleanly as "Dispatch 'Plan X' complete".
+  const join = dispatchJoinTracker.create(`Plan ${plan.name}`, group[0].command, group.map((s) => s.terminalId));
   let worst: ExecutePlanOutcome = "executed";
+  const tally: GroupDispatchTally = { running: 0, staged: 0, refused: 0 };
   group.forEach((step, i) => {
     const stepOutcome = ctx.dispatchProposal({
       sess: ctx.session,
@@ -263,12 +305,19 @@ function dispatchParallelGroup(ctx: ActionContext, plan: any, group: any[]): { r
       capability: "execute_plan",
     });
     applyMemberOutcome(join.id, i, step, stepOutcome);
+    tallyMember(tally, stepOutcome);
     const mo = memberOutcome(stepOutcome);
     if (OUTCOME_SEVERITY[mo] > OUTCOME_SEVERITY[worst]) worst = mo;
   });
   ctx.broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
+  // BUG-011: when NOTHING got off the ground (every member refused at the gate), the group settled at
+  // dispatch — there is no pane edge coming to settle the join, so the plan would sit "running" forever
+  // (a zombie). Pause it right here, mirroring dispatchSingleStep's blocked branch. A group with any
+  // member running/staged stays "running" and settles later in the observe layer (isGroupSettled),
+  // which pauses the plan if any member ended up failed.
+  if (tally.running === 0 && tally.staged === 0) plan.status = "paused";
   return {
-    resp: `Started parallel execution of plan '${plan.name}': ${group.length} steps running concurrently.`,
+    resp: narrateParallelGroup(plan.name, group.length, tally),
     outcome: worst,
   };
 }

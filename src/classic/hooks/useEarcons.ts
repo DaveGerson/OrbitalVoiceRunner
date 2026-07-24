@@ -131,6 +131,50 @@ export function useEarcons(): Earcons {
         gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.1 + 0.5);
         osc2.start(now + 0.1);
         osc2.stop(now + 0.1 + 0.62);
+      } else if (type === "blocked") {
+        // BUG-018: a DARKER, lower falling pair (E4→A3) than `alert` (440/554) so an eyes-off
+        // operator hears a command was HELD BACK, not that a pane needs an OK. Mirrors the kitchen
+        // tone (src/utils/earcon.ts TONE_TABLE.blocked) so the two UIs sound the same.
+        const now = ctx.currentTime;
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(330, now); // E4
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
+        osc.start(now);
+        osc.stop(now + 0.18);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.type = "triangle";
+        osc2.frequency.setValueAtTime(220, now + 0.12); // A3
+        gain2.gain.setValueAtTime(0.05, now + 0.12);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.12 + 0.24);
+      } else if (type === "permission") {
+        // BUG-018: a crisp two-note RISE (B4→D#5) — the operator learns it as "autonomy changed",
+        // audibly distinct from alert (falling) and blocked (low falling). Mirrors the kitchen tone
+        // (src/utils/earcon.ts TONE_TABLE.permission).
+        const now = ctx.currentTime;
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(493.88, now); // B4
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+        osc.start(now);
+        osc.stop(now + 0.12);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.type = "triangle";
+        osc2.frequency.setValueAtTime(622.25, now + 0.09); // D#5
+        gain2.gain.setValueAtTime(0.05, now + 0.09);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.09 + 0.16);
+        osc2.start(now + 0.09);
+        osc2.stop(now + 0.09 + 0.18);
       }
     } catch (e) {}
   };

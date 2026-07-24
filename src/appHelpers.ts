@@ -522,10 +522,24 @@ function handleCommandAutoExecuted(msg: any, ctx: WsHandlerCtx): void {
 }
 
 function handleCommandBlocked(msg: any, ctx: WsHandlerCtx): void {
-  ctx.playEarcon("alert");
+  // BUG-018: ring the DEDICATED "blocked" tone (darker/lower than "alert") — parity with the kitchen
+  // (src/orbital/useOrbitalData.ts command_blocked → "blocked") so an eyes-off operator hears a
+  // held-back command as distinct from a pane that needs an OK (approval_pending → "alert").
+  ctx.playEarcon("blocked");
   ctx.triggerDesktopNotification("⛔ Command Blocked (Read-Only)", `Node ${msg.terminalId} locked: ${msg.cmd}`);
   ctx.setBlockedNotification({ terminalId: msg.terminalId, cmd: msg.cmd, reason: msg.reason });
   setTimeout(() => ctx.setBlockedNotification(null), 4000);
+}
+
+// BUG-018: an autonomy transition (permission_changed) reaches the classic UI with its own DISTINCT
+// "permission" tone — parity with the kitchen (src/orbital/useOrbitalData.ts permission_changed →
+// "permission") so an eyes-off operator HEARS that a pane's mode actually changed. The frame carries
+// { paneId, from, to }; the desktop note names both sides of the switch (mirrors the kitchen's).
+function handlePermissionChanged(msg: any, ctx: WsHandlerCtx): void {
+  ctx.playEarcon("permission");
+  if (typeof msg.paneId === "string" && typeof msg.from === "string" && typeof msg.to === "string") {
+    ctx.triggerDesktopNotification("🔒 Autonomy changed", `${msg.paneId}: ${msg.from} → ${msg.to}`);
+  }
 }
 
 function handleGrounding(msg: any, ctx: WsHandlerCtx): void {
@@ -595,6 +609,7 @@ export const WS_HANDLERS: Record<string, WsHandler> = {
   settings_updated: handleSettingsUpdated,
   command_auto_executed: handleCommandAutoExecuted,
   command_blocked: handleCommandBlocked,
+  permission_changed: handlePermissionChanged,
   stdout_chunk: (msg, ctx) => ctx.queueStdoutChunk(msg.terminalId, msg.chunk),
   transcript_text: (msg, ctx) => ctx.setTranscript((prev: any[]) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50)),
   grounding: handleGrounding,
