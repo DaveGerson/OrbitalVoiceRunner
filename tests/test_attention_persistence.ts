@@ -488,6 +488,37 @@ describe("W5 attentionQueue persistence — BUG-013 residual (RED)", () => {
     }
   });
 
+  // Closes the gap that the (a/cap) test explicitly defers here ("the durable table is bounded by the
+  // retention sweep, not by push"): retention must CAP the durable table, not only TTL-evict it. A fake
+  // that adds the TTL DELETE but forgets the cap-eviction DELETE (design §6) passes every other test.
+  it("(d) the retention boot prune CAPS the durable attention table at ATTENTION_QUEUE_CAP, keeping the newest", () => {
+    const { dir, prev } = mkcwd("retention-cap");
+    const store = new JanusStore(":memory:"); store.init();
+    try {
+      const now = 1_700_000_000_000;
+      const N = ATTENTION_QUEUE_CAP + 5; // 55 rows, ALL fresh (within TTL) so ONLY the cap can evict.
+      for (let i = 0; i < N; i++) {
+        // i=0 is the NEWEST (ts=now), i=N-1 the OLDEST — all within seconds, far inside the 10-min TTL.
+        store.upsertAttention({
+          id: `att_cap_${i}`, type: "error", terminal_id: "t1", project_id: "p1",
+          message: `m${i}`, timestamp: now - i * 1000, dismissed: false, details: null,
+        });
+      }
+      assert.equal(store.getAttention({ includeDismissed: true }).length, N, "precondition: all 55 persisted");
+
+      store.bootMaintenance({ now, eventsTtlDays: 30, archiveTtlDays: 14, scrollbackDirs: [dir] });
+
+      const liveIds = store.getAttention({ includeDismissed: true }).map((r) => r.id);
+      assert.equal(liveIds.length, ATTENTION_QUEUE_CAP,
+        `the durable table is capped at ATTENTION_QUEUE_CAP=${ATTENTION_QUEUE_CAP} by retention (design §6 cap-eviction, not just TTL)`);
+      assert.ok(liveIds.includes("att_cap_0"), "the NEWEST row is kept");
+      assert.ok(!liveIds.includes(`att_cap_${N - 1}`), "the OLDEST over-cap row is evicted");
+    } finally {
+      store.close();
+      restore(prev, dir);
+    }
+  });
+
   it("(d) the incremental retention sweep also prunes durable attention rows past the TTL", () => {
     const { dir, prev } = mkcwd("retention-sweep");
     const store = new JanusStore(":memory:"); store.init();
