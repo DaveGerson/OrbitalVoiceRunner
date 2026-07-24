@@ -1,5 +1,11 @@
 # Orbital Harness — Assessment by Maya Chen (Solo Founder / Power User)
 
+> ⚠️ **HISTORICAL ASSESSMENT — round one, 2026-05-28. SUPERSEDED — DO NOT READ AS CURRENT FACT.**
+> This review's headline blockers (no voice-approval path, dead transcripts, blind approvals,
+> orphaned approvals) were RESOLVED on `main` after PR134. The prose below is preserved as a
+> historical artifact, not a current assessment. For the current forward wishlist, see
+> `docs/roadmap/next-level/`.
+
 ## Who I am and what I need
 
 I'm a solo technical founder. On a normal day I have 4–6 AI coding agents (Claude

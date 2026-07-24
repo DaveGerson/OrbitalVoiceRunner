@@ -24,7 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseTapFailures, decideOutcome } from "../scripts/run-unit.mjs";
+import { parseTapFailures, decideOutcome, filterBenignTeardownNoise } from "../scripts/run-unit.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -175,4 +175,39 @@ test("decideOutcome: both fail but one leg is UNPARSEABLE (crash, no test names)
   const o = decideOutcome(leg(1, ["a"]), { status: 1, failures: new Set<string>(), parseable: false });
   assert.equal(o.exit, 1);
   assert.equal(o.reason, "unparseable-leg");
+});
+
+// ---------------------------------------------------------------------------------------------
+// 4. filterBenignTeardownNoise — BEAD ox1q: ConPTY "AttachConsole failed" teardown noise is
+//    endemic Windows harness noise from the forked console-list agent racing the synchronous pty
+//    kill (~42x in a fully green battery). It must be filtered from echoed stderr WITHOUT
+//    suppressing real errors, and the teardown fingerprint (sawTeardownCrash) must still fire.
+// ---------------------------------------------------------------------------------------------
+
+test("filterBenignTeardownNoise: drops only benign AttachConsole lines, real errors still surface", () => {
+  const stderr = [
+    "conpty_console_list_agent: AttachConsole failed",
+    "AssertionError [ERR_ASSERTION]: expected 1 to equal 2",
+    "AttachConsole failed (again)",
+  ].join("\n");
+
+  const { cleaned, droppedCount, sawTeardownCrash } = filterBenignTeardownNoise(stderr);
+
+  assert.doesNotMatch(cleaned, /AttachConsole failed/, "benign teardown lines must be filtered out");
+  assert.match(
+    cleaned,
+    /AssertionError \[ERR_ASSERTION\]: expected 1 to equal 2/,
+    "a real error line must survive the filter verbatim",
+  );
+  assert.equal(droppedCount, 2, "exactly the two AttachConsole lines must be counted as dropped");
+  assert.equal(sawTeardownCrash, true, "the teardown fingerprint must still fire when benign noise was present");
+});
+
+test("filterBenignTeardownNoise: no-op on clean stderr with no AttachConsole noise", () => {
+  const stderr = "Error: boom\n";
+  const { cleaned, droppedCount, sawTeardownCrash } = filterBenignTeardownNoise(stderr);
+
+  assert.equal(cleaned.replace(/\n+$/, ""), stderr.replace(/\n+$/, ""), "clean stderr must pass through unchanged");
+  assert.equal(droppedCount, 0, "nothing should be dropped from clean stderr");
+  assert.equal(sawTeardownCrash, false, "no teardown fingerprint should fire on clean stderr");
 });

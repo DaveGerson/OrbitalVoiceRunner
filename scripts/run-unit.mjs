@@ -54,6 +54,40 @@ const RUNNER = "tsx";
 const BASE_ARGS = ["--test", "--test-force-exit"];
 const DEFAULT_GLOB = "tests/*.ts";
 
+// BEAD ox1q: node-pty's conpty_console_list_agent races the synchronous pty kill on Windows and
+// intermittently logs "AttachConsole failed" to stderr during test teardown — benign, endemic
+// harness noise (NOT a test failure) that showed up ~42x in a fully green battery and obscured
+// root-causing real stderr in bxpk. This regex is intentionally NARROW (the literal phrase only)
+// so it can never mask a real error line that merely mentions consoles/attaching in passing.
+const BENIGN_TEARDOWN_RE = /AttachConsole failed/;
+
+/**
+ * Pure: filter the known-benign ConPTY teardown noise out of a leg's raw stderr, WITHOUT hiding
+ * any other line. Returns `{ cleaned, sawTeardownCrash, droppedCount }`:
+ *   - `cleaned` — stderr with every line matching BENIGN_TEARDOWN_RE removed, lines rejoined with
+ *     "\n". Real errors (anything not matching the narrow pattern) pass through verbatim.
+ *   - `droppedCount` — how many lines were dropped (surfaced in a breadcrumb so nothing is
+ *     silently hidden).
+ *   - `sawTeardownCrash` — true iff at least one line was dropped; this is the SAME fingerprint
+ *     the retry banner and the conservative-RED unparseable-leg path depend on, now derived from
+ *     the filter itself rather than a raw `.includes()` on the unfiltered blob.
+ */
+export function filterBenignTeardownNoise(stderr) {
+  const text = stderr ?? "";
+  if (!text) return { cleaned: "", sawTeardownCrash: false, droppedCount: 0 };
+  const lines = text.split(/\r?\n/);
+  const kept = [];
+  let droppedCount = 0;
+  for (const line of lines) {
+    if (BENIGN_TEARDOWN_RE.test(line)) {
+      droppedCount += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { cleaned: kept.join("\n"), sawTeardownCrash: droppedCount > 0, droppedCount };
+}
+
 // bead 1p84: repo-root sentinel files a well-behaved battery must never create at process.cwd()
 // (an operator's own dev-time .janus.db/.janus_settings.json are pre-existing and must NOT be
 // flagged — only a NEWLY created one, during THIS run, is a leak).
@@ -165,7 +199,18 @@ function runLeg(extraArgs, tapFile) {
     shell: true,
     encoding: "utf8",
   });
-  if (res.stderr) process.stderr.write(res.stderr);
+
+  // BEAD ox1q: filter the known-benign ConPTY "AttachConsole failed" teardown noise before
+  // echoing stderr — real errors pass through untouched; the dropped count is surfaced in a
+  // single breadcrumb rather than silently swallowed.
+  const noise = filterBenignTeardownNoise(res.stderr ?? "");
+  if (noise.cleaned) process.stderr.write(noise.cleaned.endsWith("\n") ? noise.cleaned : `${noise.cleaned}\n`);
+  if (noise.droppedCount > 0) {
+    console.warn(
+      `[run-unit] filtered ${noise.droppedCount} benign ConPTY teardown line(s) ("${TEARDOWN_SIGNATURE}") — ` +
+        `known node-pty console-list-agent noise, not a real error.`,
+    );
+  }
 
   let tapText = "";
   try { tapText = fs.readFileSync(tapFile, "utf8"); } catch { /* file may be absent on a hard crash */ }
@@ -177,7 +222,7 @@ function runLeg(extraArgs, tapFile) {
     // A non-zero leg is "parseable" iff we actually extracted >=1 failing name; a clean leg is
     // trivially parseable (no failures to compute).
     parseable: res.status === 0 || failures.size > 0,
-    sawTeardownCrash: (res.stderr ?? "").includes(TEARDOWN_SIGNATURE),
+    sawTeardownCrash: noise.sawTeardownCrash,
   };
 }
 

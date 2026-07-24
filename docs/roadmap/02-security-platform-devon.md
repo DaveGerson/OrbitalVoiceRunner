@@ -1,5 +1,11 @@
 # Security & Platform Assessment — Orbital Harness (Janus Terminal Orchestrator)
 
+> ⚠️ **HISTORICAL ASSESSMENT — round one, 2026-05-28. SUPERSEDED — DO NOT READ AS CURRENT FACT.**
+> This review's headline blockers (no voice-approval path, dead transcripts, blind approvals,
+> orphaned approvals) were RESOLVED on `main` after PR134. The prose below is preserved as a
+> historical artifact, not a current assessment. For the current forward wishlist, see
+> `docs/roadmap/next-level/`.
+
 **Reviewer:** Devon Park, Senior Platform & Security Engineer
 **Date:** 2026-05-28
 **Scope:** Whether this tool *works* (the permissions/approval/execution machinery is complete and correct) and whether it *fits* (a security-conscious engineer would trust this loop driving AI agents on a dev machine).
