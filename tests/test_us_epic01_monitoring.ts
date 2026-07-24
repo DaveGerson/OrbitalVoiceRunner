@@ -24,6 +24,7 @@ import assert from "node:assert";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
@@ -786,5 +787,24 @@ describe("US-1.5 Capturing launch intent (P1)", () => {
 // Close the shared undici (fetch) keep-alive pool ONCE, after every server suite has finished, so its
 // socket can't linger into --test-force-exit's process.exit() — without breaking mid-file fetches.
 after(async () => { await closeFetchPool(); });
+
+// bead 1p84 regression: every one of the five stories above chdirs into its own mkdtemp cwd before
+// loadLiveHelpers()/server.ts is ever evaluated (see the header + loadLiveHelpers() doc comment),
+// so the process-wide JanusStore singleton should root its .janus.db in a per-suite tmpdir —
+// NEVER at the repo checkout. This is the concrete 1p84 symptom: on a stable-scratch-rooted store,
+// the repo root stays clean across the whole five-story file.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+after(() => {
+  assert.equal(
+    fs.existsSync(path.join(repoRoot, ".janus.db")),
+    false,
+    "the five-story EPIC 01 file must not leak a repo-root .janus.db",
+  );
+  assert.equal(
+    fs.existsSync(path.join(repoRoot, ".janus_settings.json")),
+    false,
+    "the five-story EPIC 01 file must not leak a repo-root .janus_settings.json",
+  );
+});
 
 }); // EPIC 01 parent suite (concurrency:false — see header)

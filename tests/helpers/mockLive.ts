@@ -8,8 +8,50 @@
 //
 // Net effect: the entire voice -> tool-dispatch -> approval pipeline runs with no
 // Gemini API key and no microphone, exercising the genuine server code paths.
+//
+// bead c1ky/1p84 — loadMockLive(): this file used to STATICALLY value-import ../../server, which
+// made it the sole ~40-file drag root for server.ts's (formerly eager) module-scope boot: every
+// test that imported this helper evaluated server.ts at MODULE LOAD time, before any hook could
+// set JANUS_NO_AUTOSTART or chdir into a tmpdir (bxpk). It is now a DEFERRED, memoized loader:
+//   - JANUS_NO_AUTOSTART=1 is set at module top (cheap, has no import-order dependency).
+//   - JANUS_DB, if not already set by the caller, is pointed at a STABLE scratch root — a single
+//     mkdtemp'd directory OUTSIDE the repo checkout AND outside any per-suite tmpdir. Without this,
+//     the process-wide JanusStore singleton (opened once, at the FIRST post-chdir dynamic import)
+//     roots itself inside whichever suite's tmpdir happened to import first; that suite's
+//     afterEach then rmSync's the directory out from under the still-open sqlite handle — on
+//     Windows this fails silently and leaks a tmpdir every run (1p84).
+//   - THEN server.ts is imported, via top-level await, so existing call sites
+//     (`await import("./helpers/mockLive")`) and the synchronous `installMockLive()` keep working
+//     unchanged.
+// An explicit JANUS_DB set by the caller BEFORE the first load (e.g. tests/test_boot_quarantine.ts
+// pointing at its own seeded db) is NEVER overwritten.
 
-import { setLiveConnector } from "../../server";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+
+process.env.JANUS_NO_AUTOSTART = "1";
+if (!process.env.JANUS_DB) {
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-mocklive-store-"));
+  process.env.JANUS_DB = path.join(scratchDir, ".janus.db");
+}
+
+const { setLiveConnector } = await import("../../server");
+
+/**
+ * Preferred entry point (bead c1ky insight b): await this before using installMockLive()/
+ * setLiveConnector to make the deferred-load + env-guard contract explicit at the call site,
+ * rather than relying on side effects of this module merely being imported. Memoized — the
+ * module-top env guard above only ever runs once per process regardless of how many times this
+ * (or a plain `import`) is used.
+ */
+export async function loadMockLive(): Promise<{
+  installMockLive: typeof installMockLive;
+  waitFor: typeof waitFor;
+  setLiveConnector: typeof setLiveConnector;
+}> {
+  return { installMockLive, waitFor, setLiveConnector };
+}
 
 export interface MockLiveSession {
   /** The exact params object the server passed to live.connect (model, config, callbacks). */

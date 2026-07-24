@@ -123,12 +123,20 @@ describe("p85 — boot rehydrate loop QUARANTINEs a drifted/legacy intent and re
     seed.close();
 
     // ── Boot the REAL server against the seeded file. ───────────────────────────────────────────
-    // JANUS_DB -> our seeded db (the module-level `store` opens this at import). SQLite is the
-    // ONLY ledger backend (dbt3), so the loop's `if (store)` audit always fires on a healthy boot.
+    // JANUS_DB -> our seeded db. bead c1ky: the store is no longer opened eagerly at import —
+    // ensureCore() (memoized) opens it lazily at the FIRST startServer() call below, honoring
+    // this explicit JANUS_DB. SQLite is the ONLY ledger backend (dbt3), so the loop's `if (store)`
+    // audit always fires on a healthy boot; the rehydrate/quarantine loop still runs inside
+    // startServer() BEFORE the reader connection opens below, so ordering is unchanged.
     // JANUS_NO_AUTOSTART=1 -> the module tail must NOT auto-start a second server on import.
     setEnv("JANUS_DB", dbPath);
     setEnv("JANUS_NO_AUTOSTART", "1");
     setEnv("NODE_ENV", "test");
+    // bead 1p84: this suite never chdirs (no PTY/pane needs a cwd here), so the OrchestratorManager
+    // constructed inside startServer() would otherwise resolve its cwd-relative default
+    // ".janus_settings.json" against the repo root. Anchor it into our own tmpDir instead — same
+    // rationale as JANUS_DB above, just for the settings side of boot.
+    setEnv("JANUS_SETTINGS_PATH", join(tmpDir, ".janus_settings.json"));
 
     const serverMod = await import("../server");
     // listen:false — the rehydrate loop runs inside startServer() before any optional listen(); we

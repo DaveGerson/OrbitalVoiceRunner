@@ -54,6 +54,32 @@ const RUNNER = "tsx";
 const BASE_ARGS = ["--test", "--test-force-exit"];
 const DEFAULT_GLOB = "tests/*.ts";
 
+// bead 1p84: repo-root sentinel files a well-behaved battery must never create at process.cwd()
+// (an operator's own dev-time .janus.db/.janus_settings.json are pre-existing and must NOT be
+// flagged — only a NEWLY created one, during THIS run, is a leak).
+const REPO_ROOT_SENTINELS = [".janus.db", ".janus.db-wal", ".janus.db-shm", ".janus_settings.json"];
+
+/**
+ * Pure: given a before/after snapshot of `{ [sentinelName]: boolean }` (existence at
+ * process.cwd()), return the sentinel names that are ABSENT before and PRESENT after — i.e.
+ * genuinely created DURING the run. A sentinel present before the run (an operator's own DB)
+ * is never flagged, even if it's still present after.
+ */
+export function detectRepoRootLeak(before, after) {
+  const leaked = [];
+  for (const name of REPO_ROOT_SENTINELS) {
+    if (!before[name] && after[name]) leaked.push(name);
+  }
+  return leaked;
+}
+
+/** Snapshot `REPO_ROOT_SENTINELS` existence at `cwd` (defaults to process.cwd()). */
+function snapshotRepoRootSentinels(cwd = process.cwd()) {
+  const snap = {};
+  for (const name of REPO_ROOT_SENTINELS) snap[name] = fs.existsSync(path.join(cwd, name));
+  return snap;
+}
+
 /**
  * Pure: extract the set of failing test names from a node:test TAP-reporter file.
  * Matches `not ok <n> - <name>` (TAP13). Returns a Set of names (trimmed). For a genuine
@@ -202,16 +228,43 @@ function reportOutcome(outcome, leg1, leg2) {
   return leg2.status ?? 1;
 }
 
+/**
+ * bead 1p84: assert the battery leaves NO repo-root .janus.db / .janus_settings.json artifact.
+ * Snapshot before/after the WHOLE run (both legs, if a retry happened) so a leak from either leg
+ * is caught. A non-empty leak list is loud and forces a non-zero exit even if the tests
+ * themselves were green — cleanliness is part of the gate, not an afterthought.
+ */
+function assertRepoRootCleanliness(before) {
+  const after = snapshotRepoRootSentinels();
+  const leaked = detectRepoRootLeak(before, after);
+  if (leaked.length > 0) {
+    console.error(
+      `\n[run-unit] REPO-ROOT LEAK: the unit battery created ${leaked.join(", ")} at ` +
+        `${process.cwd()} during this run. A test imported server.ts (or otherwise constructed ` +
+        `a JanusStore/OrchestratorManager) without rooting it in a tmpdir/scratch dir — fix the ` +
+        `offending test (see tests/helpers/mockLive.ts's loadMockLive() for the pattern) rather ` +
+        `than deleting the file and moving on.`,
+    );
+  }
+  return leaked;
+}
+
 function main() {
   const extra = process.argv.slice(2);
+  const beforeSentinels = snapshotRepoRootSentinels();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-run-unit-"));
   try {
     const leg1 = runLeg(extra, path.join(tmpDir, "leg1.tap"));
-    if (leg1.status === 0) process.exit(0);
+    if (leg1.status === 0) {
+      const leaked = assertRepoRootCleanliness(beforeSentinels);
+      process.exit(leaked.length > 0 ? 1 : 0);
+    }
 
     logRetryBanner(leg1);
     const leg2 = runLeg(extra, path.join(tmpDir, "leg2.tap"));
-    process.exit(reportOutcome(decideOutcome(leg1, leg2), leg1, leg2));
+    const outcomeExit = reportOutcome(decideOutcome(leg1, leg2), leg1, leg2);
+    const leaked = assertRepoRootCleanliness(beforeSentinels);
+    process.exit(outcomeExit !== 0 ? outcomeExit : leaked.length > 0 ? 1 : 0);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }

@@ -308,6 +308,9 @@ describe("AgentExchange spine: boot recovery wired into the REAL server boot seq
     setEnv("JANUS_DB", dbPath);
     setEnv("JANUS_NO_AUTOSTART", "1");
     setEnv("NODE_ENV", "test");
+    // bead 1p84: this suite never chdirs, so OrchestratorManager's cwd-relative default settings
+    // path would otherwise resolve against the repo root — anchor it into our own tmpDir instead.
+    setEnv("JANUS_SETTINGS_PATH", join(tmpDir, ".janus_settings.json"));
 
     const serverMod = await import("../server");
     // listen:false — the boot-recovery call site runs at module scope, before startServer() is
