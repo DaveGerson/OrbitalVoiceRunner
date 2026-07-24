@@ -32,13 +32,37 @@
  * toHttp (surfaces = {'rest'}), so these UI-shaped outputs never leak through resultToToolResponse.
  */
 import { z } from "zod";
-import type { ActionDef, ActionResult } from "../types";
+import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { ALWAYS_ALLOWED } from "../types";
 import { serializePending } from "../../pendingApprovals";
 
 const NoParams = z.object({});
 const IdParams = z.object({ id: z.string() });
 const ApproveParams = z.object({ messageId: z.string(), approved: z.boolean() });
+
+/**
+ * BUG-017: cross-workspace scope guards for the REST approve/reject + list handlers. Enforcement
+ * engages ONLY when the caller supplies a scope (`ctx.callerWorkspaceId`, threaded from the request
+ * by buildRestActionContext) AND the pending has a KNOWN workspace. A scopeless request (every
+ * single-workspace deployment / existing test) and a workspace-less pending both disable it — hence
+ * this depends on `PendingApprovalStore.workspaceFor` being populated, which happens only on a
+ * durable JanusStore boot (a scopeless in-memory store returns undefined -> no enforcement, foreign
+ * to nobody). Extracted as tiny pure helpers so each handler stays flat (McCabe CC <= 10).
+ */
+function scopeMismatch(ctx: ActionContext, messageId: string): boolean {
+  const caller = ctx.callerWorkspaceId;
+  if (caller === undefined) return false;                       // scopeless request -> no enforcement
+  const owner = ctx.pendingApprovals.workspaceFor(messageId);
+  return owner !== undefined && owner !== caller;               // engage only when the pending has a scope
+}
+
+/** BUG-017: a pending is visible to a scoped caller iff it is own-workspace or workspace-less. */
+function visibleToCaller(ctx: ActionContext, messageId: string): boolean {
+  const caller = ctx.callerWorkspaceId;
+  if (caller === undefined) return true;                        // scopeless list -> unfiltered
+  const owner = ctx.pendingApprovals.workspaceFor(messageId);
+  return owner === undefined || owner === caller;               // keep own + workspace-less (foreign to no one)
+}
 
 /**
  * wsm-e2e-pinned-f9ne: shared top-level kind:'error' -> {status,body} projection for all five
@@ -70,7 +94,11 @@ export const listPendingCommands: ActionDef<typeof NoParams> = {
   },
   handler: (_args, ctx): ActionResult => ({
     kind: "ok",
-    output: ctx.pendingApprovals.all().map((p) => serializePending(p)),
+    // BUG-017: omit foreign-workspace pendings when the caller supplies a scope (own + workspace-less kept).
+    output: ctx.pendingApprovals
+      .all()
+      .filter((p) => visibleToCaller(ctx, p.messageId))
+      .map((p) => serializePending(p)),
   }),
 };
 
@@ -216,6 +244,10 @@ export const approvePendingCommand: ActionDef<typeof ApproveParams> = {
   },
   handler: (args, ctx): ActionResult => {
     if (!ctx.pendingApprovals.has(args.messageId)) return { kind: "ok", output: { outcome: "not_found" } satisfies ApproveOutcome };
+    // BUG-017: refuse a cross-workspace resolve BEFORE applyResolution — no pane write, the pending
+    // survives — and surface it as not_found (404) so a foreign id is never confirmed as forbidden.
+    // Covers BOTH verbs (a foreign-scope reject is its own cross-workspace DoS on a staged command).
+    if (scopeMismatch(ctx, args.messageId)) return { kind: "ok", output: { outcome: "not_found" } satisfies ApproveOutcome };
     const action = ctx.applyResolution(args.messageId, args.approved ? "approve" : "reject");
     if (action.reason === "not_found") return { kind: "ok", output: { outcome: "not_found" } satisfies ApproveOutcome };
     if (action.reason === "dead_pane") return { kind: "ok", output: { outcome: "dead_pane" } satisfies ApproveOutcome };
