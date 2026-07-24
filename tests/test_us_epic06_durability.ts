@@ -253,6 +253,10 @@ describe("US-6.2 history truncation is tail-keeping (characterization)", () => {
     process.env.JANUS_NO_AUTOSTART = "1";
     ({ dir, prev } = mkcwd("hist-tail"));
     serverMod = await import("../server");
+    // bead c1ky: `manager` is lazy now — boot core explicitly (we've already chdir'd into a tmpdir
+    // via mkcwd, so the store/db land there, not in the repo root) so setLimits() below can tighten
+    // the live limits it reads/writes off serverMod.manager.settings.advanced.
+    serverMod.ensureCore();
     hm = serverMod.HistoryManager.getInstance();
     // Limits are read LIVE (HistoryManager.getLimits -> manager.settings.advanced), so each test
     // tightens them via setLimits() just before driving the manager.

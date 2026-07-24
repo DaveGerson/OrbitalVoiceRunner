@@ -484,8 +484,12 @@ export class HistoryManager {
   }
 
   private getLimits() {
-    const maxCmds = manager.settings?.advanced?.historyMaxCommands ?? 50;
-    const maxOutput = manager.settings?.advanced?.historyMaxOutputLength ?? 5000;
+    // bead c1ky: `manager` is lazily assigned by ensureCore() now — a bare value-import that never
+    // boots core (e.g. a HistoryManager-only unit test) leaves it undefined, so guard `manager`
+    // itself before reading .settings. The 50/5000 defaults match SystemSettings, i.e. the exact
+    // values a fresh (settings-file-less) EAGER manager used to yield on origin/main.
+    const maxCmds = manager?.settings?.advanced?.historyMaxCommands ?? 50;
+    const maxOutput = manager?.settings?.advanced?.historyMaxOutputLength ?? 5000;
     return { maxCmds, maxOutput };
   }
 
@@ -677,11 +681,14 @@ registerHistoryBridge(HistoryManager.getInstance());
 // function, byte-for-byte the same boot-at-import behavior those two paths always had) — and it
 // runs at the top of `startServer()` for every OTHER caller (tests, the offline simulator, library
 // use), so a plain value-import alone can never construct a store/manager or touch disk.
+// EXPORTED (bead c1ky follow-up) so a HistoryManager-only unit test that has already chdir'd into a
+// tmpdir can boot core explicitly — restoring the pre-lazy contract (a live `manager.settings`)
+// without the store landing in the repo root.
 let coreInitialized = false;
 let store: JanusStore | null = null;
 export let manager: OrchestratorManager;
 
-function ensureCore(): void {
+export function ensureCore(): void {
   if (coreInitialized) return;
   coreInitialized = true;
 
