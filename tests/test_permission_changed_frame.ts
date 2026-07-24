@@ -120,4 +120,17 @@ describe("BUG-018 permission_changed — applyPaneMode emits it on a confirmed s
     assert.strictEqual(res.ok, false);
     assert.ok(!frames.some((m) => m.type === "permission_changed"), "no permission_changed on a forbidden (never-applied) change");
   });
+
+  // The spec is "confirmed applied switch ONLY — never on a forbidden OR deferred gate." A DEFERRED
+  // gate stashes the run closure for a later operator confirm and never runs execute() now, so no
+  // frame may broadcast at deferral time. This pins the other half of the "real applied change only"
+  // invariant, guarding against an emit placed OUTSIDE execute()'s success block.
+  it("a DEFERRED gate emits NO permission_changed frame (queued, not yet applied)", async () => {
+    const pane = makeScriptedPane({ frameAfterWrite: FULL_AUTO_MARKER });
+    const frames: any[] = [];
+    const defer: PaneModeDeps["gateOrDefer"] = () => ({ disposition: "deferred", actionId: "act_pc", summary: "Set pane pane_def permissions to Full Auto" });
+    const res = await applyPaneMode("pane_def", "Full Auto", "voice", pane, baseDeps({ gateOrDefer: defer, broadcast: (m) => frames.push(m) }));
+    assert.strictEqual(res.ok, false);
+    assert.ok(!frames.some((m) => m.type === "permission_changed"), "no permission_changed on a deferred (not-yet-applied) change");
+  });
 });

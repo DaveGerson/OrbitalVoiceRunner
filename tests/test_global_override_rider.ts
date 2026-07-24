@@ -121,6 +121,22 @@ describe("BUG-003 rider — set_pane_permissions appends the global-override rid
     const lo = String(res.output).toLowerCase();
     assert.ok(!lo.includes("global") && !lo.includes("inherit"), "no rider text on a clean Inherit success");
   });
+
+  // The Inherit guard MUST hold on the DELEGATE path too (both tools share applyPaneModeDelegate). A
+  // rider wired UNCONDITIONALLY into the delegate's ok-branch — instead of through the Inherit-guarded
+  // helper — would pass every non-Inherit test above yet wrongly rider a clean Inherit+live-term
+  // success. This pins the guard on the live path, not just the ledger-only one.
+  it("global == Inherit on the DELEGATE path (live term) → NO rider either", async () => {
+    const ctx = makeCtx({ globalMode: "Inherit", paneId: "p_clean_del", projectId: "proj", wireLiveTerm: true });
+    const res: any = await setPanePermissions.handler(
+      { project_id: "proj", pane_id: "p_clean_del", permissions_mode: TARGET },
+      ctx,
+    );
+    assert.strictEqual(res.kind, "ok");
+    assert.strictEqual(String(res.output), cleanSuccess("p_clean_del", TARGET), "Inherit success on the delegate path must stay clean");
+    const lo = String(res.output).toLowerCase();
+    assert.ok(!lo.includes("global") && !lo.includes("inherit"), "no rider text on a clean Inherit delegate success");
+  });
 });
 
 describe("BUG-003 rider — promote_pane_mode appends the global-override rider (global != Inherit)", () => {
@@ -152,6 +168,20 @@ describe("BUG-003 rider — promote_pane_mode appends the global-override rider 
     );
     assert.strictEqual(res.kind, "ok");
     assert.strictEqual(String(res.output), cleanSuccess("pp_clean", TARGET), "Inherit success must stay clean");
+  });
+
+  // Same delegate-path Inherit guard for promote_pane_mode (it too routes live changes through the
+  // shared applyPaneModeDelegate) — an unconditional delegate rider must not slip through here.
+  it("global == Inherit on the DELEGATE path (live term) → NO rider either", async () => {
+    const ctx = makeCtx({ globalMode: "Inherit", paneId: "pp_clean_del", projectId: "proj", wireLiveTerm: true });
+    const res: any = await promotePaneMode.handler(
+      { project_id: "proj", pane_id: "pp_clean_del", permissions_mode: TARGET },
+      ctx,
+    );
+    assert.strictEqual(res.kind, "ok");
+    assert.strictEqual(String(res.output), cleanSuccess("pp_clean_del", TARGET), "Inherit success on the delegate path must stay clean");
+    const lo = String(res.output).toLowerCase();
+    assert.ok(!lo.includes("global") && !lo.includes("inherit"), "no rider text on a clean Inherit delegate success");
   });
 });
 
