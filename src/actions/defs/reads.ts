@@ -54,6 +54,23 @@ const OptionalPaneIdParams = z.object({
   pane_id: z.string().optional(),
 });
 
+/**
+ * BUG-030(a): get_pane_summary windowing. `limit` (1..500, default applied in the handler) and
+ * `offset` (>=0 lines back from the tail, default 0) are OPTIONAL but STRICTLY VALIDATED — an
+ * out-of-range value is REJECTED (throws) at parse, NOT silently clamped.
+ */
+const PaneSummaryParams = z.object({
+  pane_id: z.string(),
+  limit: z.number().int().min(1).max(500).optional(),
+  offset: z.number().int().min(0).optional(),
+});
+
+/** BUG-030(b): search_pane_output — a required keyword alongside the pane id. */
+const SearchPaneOutputParams = z.object({
+  pane_id: z.string(),
+  keyword: z.string(),
+});
+
 /** The shape one .janus_history.json entry carries (mirrors server.ts:93 HistoryEntry). */
 interface HistoryEntry {
   command: string;
@@ -152,11 +169,11 @@ export const getPaneCommandHistory: ActionDef<typeof PaneIdParams> = {
 // ─────────────────────────────────────────────────────────────────────────────
 // get_pane_summary (server.ts:2565)
 // ─────────────────────────────────────────────────────────────────────────────
-export const getPaneSummary: ActionDef<typeof PaneIdParams> = {
+export const getPaneSummary: ActionDef<typeof PaneSummaryParams> = {
   name: "get_pane_summary",
   description:
-    "Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted). Primary observation path. Pull, not push. NOTE: known secret patterns (AWS keys, JWTs, PEM blocks, GitHub/Slack tokens, Google API keys, generic key=value secrets) are scrubbed and replaced with [REDACTED:*] tokens before this response is sent. This is NOT a delta — it is a snapshot of the most recent lines only; incremental diffing is a later workstream.",
-  params: PaneIdParams,
+    "Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted). Primary observation path. Pull, not push. Optional `limit` (default 20, max 500) sets how many lines to return; optional `offset` (>=0, lines back from the tail, default 0) pages BACKWARD through recent output to reach an older window (offset=20 with limit=20 returns the 20 lines just before the newest 20). NOTE: known secret patterns (AWS keys, JWTs, PEM blocks, GitHub/Slack tokens, Google API keys, generic key=value secrets) are scrubbed and replaced with [REDACTED:*] tokens before this response is sent. This is NOT a delta — it is a snapshot of the most recent lines only; incremental diffing is get_pane_delta.",
+  params: PaneSummaryParams,
   capability: "read_pane",
   readOnly: true,
   surfaces: new Set(["voice", "rest"]),
@@ -170,8 +187,9 @@ export const getPaneSummary: ActionDef<typeof PaneIdParams> = {
     }
     // getPaneSummary returns either a fenced, redacted code block OR the literal
     // `Error: Pane <id> does not exist.` STRING for a missing pane — either way it is an ok-kind
-    // string output (the pane-missing case is NOT an ActionResult error).
-    return { kind: "ok", output: ctx.manager.getPaneSummary(args.pane_id) };
+    // string output (the pane-missing case is NOT an ActionResult error). limit/offset are threaded
+    // (defaults 20 / 0) so a bare pane_id call is behavior-preserving.
+    return { kind: "ok", output: ctx.manager.getPaneSummary(args.pane_id, args.limit ?? 20, args.offset ?? 0) };
   },
 };
 
@@ -198,6 +216,49 @@ export const getPaneDelta: ActionDef<typeof PaneIdParams> = {
     // '[No new output since last read]' string, or the `Error: Pane <id> does not exist.` string.
     // All ok-kind output, same pane-missing caveat as get_pane_summary.
     return { kind: "ok", output: ctx.manager.getPaneDelta(args.pane_id) };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// search_pane_output (BUG-030(b)) — search the pane's scrollback FILE beyond the in-memory ring
+// ─────────────────────────────────────────────────────────────────────────────
+export const searchPaneOutput: ActionDef<typeof SearchPaneOutputParams> = {
+  name: "search_pane_output",
+  description:
+    "Search this pane's full scrollback history (beyond the last ~100 lines held in memory) for a keyword, case-insensitively. Returns up to 50 matching lines (ANSI-stripped, secret-redacted) or a clear no-match message. Use it to find an earlier error/URL/value that scrolled off the recent-output window.",
+  params: SearchPaneOutputParams,
+  capability: "read_pane",
+  readOnly: true,
+  surfaces: new Set(["voice"]),
+  handler: (args, ctx): ActionResult => {
+    // Same read_pane Off-veto guard as get_pane_summary (block only on an EXPLICIT operator Off; reads
+    // stay available during a STOP-ALL freeze). searchScrollback returns a fenced redacted block, a
+    // no-match message, or the standard `Error: Pane <id> does not exist.` string — all ok-kind.
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(args.pane_id, "read_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy." };
+    }
+    return { kind: "ok", output: ctx.manager.searchScrollback(args.pane_id, args.keyword) };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_pane_errors (BUG-031) — structured {errors, warnings, exit_code, last_command} summary
+// ─────────────────────────────────────────────────────────────────────────────
+export const getPaneErrors: ActionDef<typeof PaneIdParams> = {
+  name: "get_pane_errors",
+  description:
+    "Return a structured summary of a pane's problems instead of raw log noise: {errors, warnings, exit_code, last_command}. Errors/warnings are the semantically-detected lines (secret-redacted); exit_code is the process's captured exit status when it has exited. Prefer this over get_pane_summary when the operator asks 'did it fail?' / 'any errors?'.",
+  params: PaneIdParams,
+  capability: "read_pane",
+  readOnly: true,
+  surfaces: new Set(["voice"]),
+  handler: (args, ctx): ActionResult => {
+    // Same read_pane Off-veto guard as get_pane_summary. getPaneErrors returns a structured object
+    // (or a {error} marker for a missing pane); readOnly:true so runAction re-redacts string leaves.
+    if (!ctx.isFrozen() && ctx.effectiveCapabilityGateFor(args.pane_id, "read_pane") === "Off") {
+      return { kind: "ok", output: "Error: the 'read_pane' capability is gated Off; reading pane content is forbidden by policy." };
+    }
+    return { kind: "ok", output: ctx.manager.getPaneErrors(args.pane_id) };
   },
 };
 
@@ -512,6 +573,8 @@ export const READS_ACTIONS: ActionDef[] = [
   getPaneCommandHistory,
   getPaneSummary,
   getPaneDelta,
+  searchPaneOutput,
+  getPaneErrors,
   listPendingApprovals,
   getAttentionDigest,
   getPaneGates,

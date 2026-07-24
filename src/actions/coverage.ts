@@ -84,6 +84,12 @@ export const INTENTIONAL_ASYMMETRY: Readonly<Record<string, ReadonlySet<Surface>
   get_pane_delta: new Set<Surface>(["voice"]),
   list_pending_approvals: new Set<Surface>(["voice"]),
   get_attention_digest: new Set<Surface>(["voice"]),
+  // BUG-030(b) / BUG-031: two net-new voice-only model-facing pane reads. search_pane_output greps
+  // the pane scrollback file; get_pane_errors returns the structured {errors,warnings,exit_code,
+  // last_command} summary. Both are the model's pull-observation lane (same family as get_pane_delta)
+  // — a REST twin is not planned, so they are allow-listed voice-only.
+  search_pane_output: new Set<Surface>(["voice"]),
+  get_pane_errors: new Set<Surface>(["voice"]),
   // get_project_notes / search_notes: voice-only model-facing reads (the operator-direct UI reads are the
   // separate rest-only read_project_notes def). Convergence residue — a REST twin remains a future item.
   get_project_notes: new Set<Surface>(["voice"]),

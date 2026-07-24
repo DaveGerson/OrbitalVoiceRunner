@@ -13,6 +13,9 @@ import {
 } from "./statusMachine";
 import { AgentAdapter, createAdapter } from "./agents";
 import { withPaneLifecycleLock } from "./lifecycleLock";
+// BUG-031: pure structured-signal extractor. Both this import and paneSignals' redactSecrets import
+// from here are used LAZILY (at call time, never at module-eval), so the static cycle is TDZ-safe.
+import { extractOutputSignals } from "./paneSignals";
 
 // Status-machine input to applyStatusEvent and its extracted side-effect helpers.
 type StatusEvent =
@@ -527,6 +530,10 @@ export class UniversalTerminal {
   private killEscalationMs = 1000;
   public lastStatusChangeAt: number = Date.now();
   public lastCommand = "";
+  // BUG-031: the node-pty exit code captured from transport.onExit (undefined until the process
+  // exits). Authoritative — get_pane_errors PREFERS this over any text-scraped code (nullish-merged,
+  // so a genuine exit code of 0 survives).
+  public lastExitCode?: number;
   // runtime_type drives the prompt-regex gating (I4): Custom preset ⇒ "shell";
   // agent CLIs (Claude Code/Codex/Antigravity) ⇒ "interactive_cli".
   public runtimeType: RuntimeType;
@@ -1044,13 +1051,17 @@ export class UniversalTerminal {
 
     // Lifecycle (Tier 0, design §3) — kept verbatim in semantics: a real exit
     // maps to status="Exited" and tears down the probe/idle timers.
-    transport.onExit(() => {
+    transport.onExit((info) => {
       // 3P.1 generation guard (same predicate as onData): a REPLACED transport's late exit must
       // not mark the NEW spawn "Exited" or clear the NEW spawn's probe/idle/ready timers. The
       // null case (stopped, not respawned) passes through so a post-stop exit still lands the
       // deterministic "Exited" status.
       if (this.transport !== transport && this.transport !== null) return;
       const ownExit = this.transport === transport;
+      // BUG-031: capture node-pty's authoritative exit code (get_pane_errors prefers it over any
+      // text-scraped code). Set only for a live/own or post-stop exit (the replaced-transport case
+      // already returned above), so a stale spawn can't clobber the current pane's code.
+      this.lastExitCode = info.exitCode;
       this.status = "Exited";
       this.lastStatusChangeAt = Date.now();
       this.clearProbeTimer();
@@ -1235,8 +1246,36 @@ export class UniversalTerminal {
     this.transport.write(bytes);
   }
 
-  getRecentOutput(linesCount = 10): string {
-    return this.outputBuffer.slice(-linesCount).join('\n');
+  // BUG-030(a): `offset` selects an OLDER window (lines back from the tail). offset=0 is the current
+  // tail — byte-identical to the old slice(-linesCount). window end=len-offset, start=max(0,end-count).
+  getRecentOutput(linesCount = 10, offset = 0): string {
+    const end = this.outputBuffer.length - offset;
+    if (end <= 0) return '';
+    const start = Math.max(0, end - linesCount);
+    return this.outputBuffer.slice(start, end).join('\n');
+  }
+
+  // BUG-030(b): case-insensitive search over this pane's 512KB scrollback FILE (reaching lines beyond
+  // the in-memory ring). The file stores RAW chunks incl. ANSI, so each match is ANSI-stripped THEN
+  // secret-redacted before it leaves the process; results are bounded to `maxMatches`.
+  public searchScrollback(keyword: string, maxMatches = 50): string[] {
+    const file = `.janus_scrollback_${this.terminalId}.log`;
+    try {
+      if (!fs.existsSync(file)) return [];
+      const needle = keyword.toLowerCase();
+      const out: string[] = [];
+      for (const raw of fs.readFileSync(file, 'utf-8').split(/\r?\n/)) {
+        const line = stripAnsiSequences(raw);
+        if (line.trim() === '') continue;
+        if (line.toLowerCase().includes(needle)) {
+          out.push(redactSecrets(line));
+          if (out.length >= maxMatches) break;
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
   }
 
   /** Only-new-since-last-read lines (model lane). Advances the model cursor.
@@ -1918,16 +1957,51 @@ export class OrchestratorManager {
     };
   }
 
-  getPaneSummary(paneId: string, limit = 20) {
+  getPaneSummary(paneId: string, limit = 20, offset = 0) {
     if (!this.terminals[paneId]) {
       return `Error: Pane ${paneId} does not exist.`;
     }
-    const recentOut = this.terminals[paneId].getRecentOutput(limit);
+    // BUG-030(a): `offset` pages backward through recent output (older window). offset=0 is the tail,
+    // so the 2-arg HiTL rationale snapshot (getPaneSummary(targetId, 5)) is unaffected.
+    const recentOut = this.terminals[paneId].getRecentOutput(limit, offset);
     // WS-B: redactSecrets runs AFTER ANSI stripping (getRecentOutput already strips ANSI).
     // This covers both the standard get_pane_summary tool response and the HiTL rationale
     // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
     const safeOut = redactSecrets(recentOut || "[No new output]");
     return `\`\`\`\n${safeOut}\n\`\`\``;
+  }
+
+  /** BUG-030(b): case-insensitive search over a pane's scrollback FILE (beyond the in-memory ring).
+   *  Returns a fenced block of redacted, ANSI-stripped matches, a clear no-match message, or the
+   *  standard pane-missing string. Mirrors the getPaneSummary/getPaneDelta string-result shape. */
+  searchScrollback(paneId: string, keyword: string): string {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return `Error: Pane ${paneId} does not exist.`;
+    }
+    const matches = term.searchScrollback(keyword);
+    if (matches.length === 0) {
+      return `No lines in pane ${paneId} scrollback match "${keyword}".`;
+    }
+    return "```\n" + matches.join("\n") + "\n```";
+  }
+
+  /** BUG-031: structured problem summary for the narration lane. Runs the whole in-memory ring
+   *  through extractOutputSignals; exit_code prefers the authoritative captured pty code (nullish
+   *  merge, so a captured 0 survives) and falls back to the text-scraped code. last_command redacted. */
+  getPaneErrors(paneId: string) {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return { error: `Pane ${paneId} does not exist.` };
+    }
+    const signals = extractOutputSignals(term.getRecentOutput(term.maxBufferLines));
+    return {
+      pane_id: paneId,
+      errors: signals.errors,
+      warnings: signals.warnings,
+      exit_code: term.lastExitCode ?? signals.exitCode, // nullish: a captured 0 must survive
+      last_command: redactSecrets(term.lastCommand || ""),
+    };
   }
 
   /** Push-observation pull side: only-new lines since the model last read this pane,
