@@ -29,6 +29,7 @@
 import type { AgentAdapter, Mode } from "./agents";
 import type { PendingApprovalStore } from "./pendingApprovals";
 import type { PendingActionStore } from "./pendingActions";
+import { globalOverrideRiderForMode } from "./globalOverrideRider";
 // 3V.4: the PLM3 version stamp for the staged Ask-intent. registry.ts is pure (zod + static
 // ActionDefs, no server boot) — the same import actionEffects.ts already takes.
 import { actionSchemaHash } from "./actions/registry";
@@ -73,6 +74,14 @@ export interface PaneModeDeps {
   broadcast: (msg: unknown) => void;
   /** Persist the resolved mode to the ledger (PERSIST-WINS). Called inside the gated run closure. */
   persistMode: (paneId: string, mode: Mode) => void;
+  /**
+   * BUG-003 honesty rider: reads the manager's CURRENT global permissions mode at APPLY time. On the
+   * Ask→confirm path the confirm-time success string is generated when the operator confirms (LATER
+   * than propose time), so this is a getter evaluated then — never a propose-time snapshot. Optional so
+   * test harnesses / callers that don't wire it default to "Inherit" (no rider). Wired in
+   * gating/index.ts to the live manager.globalPermissionsMode.
+   */
+  getGlobalPermissionsMode?: () => string;
   /** Read-after-write ceiling (ms) for the live-signal convergence poll. Default 1500. */
   readAfterWriteTimeoutMs?: number;
   /** Read-after-write poll interval (ms). Default 25. */
@@ -224,7 +233,12 @@ export async function applyPaneMode(
     // executePromise itself rejected, so the Auto path's `await` below still sees the rejection
     // unchanged.
     executePromise.catch((e) => console.error("[applyPaneMode] deferred mode-change failed:", e));
-    return `Setting pane ${paneId} permissions to ${targetMode}.`;
+    // BUG-003: append the global-override honesty rider computed at APPLY time (confirm time on the
+    // Ask→confirm path — this closure is what the gate replays when the operator confirms). Identical
+    // wording to the immediate voice handlers (locks.ts) + the restart replay (actionEffects.ts) via
+    // the shared leaf; byte-clean ("" ) when global is Inherit or the getter is unwired.
+    const rider = globalOverrideRiderForMode(deps.getGlobalPermissionsMode?.());
+    return `Setting pane ${paneId} permissions to ${targetMode}.${rider}`;
   };
 
   const g = deps.gateOrDefer(

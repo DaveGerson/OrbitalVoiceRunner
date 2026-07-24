@@ -26,6 +26,7 @@ import { findPaneOwningProject } from "../../paneOwnership";
 import { clampAutonomyMinutes, sanitizeAutonomyCapabilities } from "../../gating/autonomyWindows";
 import { profileLoosens } from "../../gating/postureProfiles";
 import { findPostureProfileByName, normalizeGateMap } from "../../settingsGatesRoundTrip";
+import { globalOverrideRiderForMode } from "../../globalOverrideRider";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_global_permissions — server.ts:2887 (GATED, durable Ask-defer via gateOrDefer)
@@ -117,21 +118,21 @@ const VALID_MODES = ["Full Auto", "Human-in-the-Loop", "Read-Only"] as const;
 type JanusMode = (typeof VALID_MODES)[number];
 
 /**
- * BUG-003 — the global-override HONESTY rider. effectiveModeFor (src/gating/index.ts:534-540) is
- * GLOBAL-FIRST by design: whenever ctx.manager.globalPermissionsMode !== "Inherit", that global mode
- * DOMINATES the per-pane mode, so a pane-permission change reports success but has NO gating effect
- * until the global mode returns to Inherit. This helper is the eyes-off honesty fix (NOT a precedence
- * change): it returns a leading-space spoken rider that (1) names the current global mode, (2) states
- * the pane change has no gating effect, (3) says it stays that way until global is Inherit. When global
- * IS "Inherit" it returns "" so the success string stays byte-for-byte the clean original. Keeping the
- * branch here (not inline in the ok-returns) keeps both handler paths flat under the complexity gate.
+ * BUG-003 — the global-override HONESTY rider for the immediate voice handlers. effectiveModeFor
+ * (src/gating/index.ts:534-540) is GLOBAL-FIRST by design: whenever ctx.manager.globalPermissionsMode
+ * !== "Inherit", that global mode DOMINATES the per-pane mode, so a pane-permission change reports
+ * success but has NO gating effect until the global mode returns to Inherit. This wrapper reads the
+ * CURRENT global mode off the ctx and delegates to the shared globalOverrideRiderForMode leaf
+ * (src/globalOverrideRider.ts) — the SINGLE source of the rider wording, so the confirm-time
+ * (applyPaneMode.ts) and post-restart replay (actionEffects.ts) success strings speak the identical
+ * message. When global IS "Inherit" the leaf returns "" so the success string stays byte-for-byte the
+ * clean original. Keeping the ctx read here (not inline in the ok-returns) keeps both handler paths
+ * flat under the complexity gate.
  */
 function globalOverrideRider(
   ctx: Parameters<ActionDef<typeof SetPanePermissionsParams>["handler"]>[1],
 ): string {
-  const global = ctx.manager.globalPermissionsMode;
-  if (global === "Inherit") return "";
-  return ` Heads up: the global autonomy mode is ${global}, so this pane setting has no gating effect until you set the global mode back to Inherit.`;
+  return globalOverrideRiderForMode(ctx.manager.globalPermissionsMode);
 }
 
 /**
