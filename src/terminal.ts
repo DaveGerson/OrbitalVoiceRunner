@@ -2,6 +2,7 @@ import { PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import path from "path";
 import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES, DEFAULT_VOICE_UX } from "./types";
+import type { StoredAttention } from "./store/types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES, pruneAttentionQueue } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
@@ -244,6 +245,11 @@ export function appendRawCapped(existing: string, chunk: string, max: number): s
   const combined = existing + chunk;
   return combined.length > max ? combined.slice(combined.length - max) : combined;
 }
+
+// W4 (BUG-006 residual): the number of most-recently-rendered lines runProbeTick feeds to the
+// adapter's isLikelyBusy check. Matches the existing getRecentOutput(5) tail window — a live
+// spinner keeps that window "busy" through a silent thinking gap; a finished turn scrolls it away.
+const AGENT_BUSY_TAIL_LINES = 5;
 
 export function stripAnsiSequences(text: string): string {
   // Matches ANSI color/style escape sequences
@@ -819,11 +825,20 @@ export class UniversalTerminal {
     // P0-1: interactive_cli (agent) panes have no resting-shell signal — an agent
     // at its prompt is process-indistinguishable from an agent mid-turn (both are
     // one blocked process with no foreground child-shell). The busy-biased
-    // authoritative probe would therefore report them "Running" forever and never
-    // fire onIdle. Never run the authoritative probe for them; downgrade to a
-    // fallback probe so output quiescence drives idle (decideStatus fallback path).
+    // authoritative *process* probe would therefore report them "Running" forever and
+    // never fire onIdle. So we NEVER consult this.statusProbe for them (the P0-1 gate).
+    // The busy signal instead comes from the RENDERED tail (BUG-006 residual fix): when
+    // the adapter recognizes a live "working"/"thinking" marker we synthesize an
+    // AUTHORITATIVE busy probe so decideStatus keeps the pane Running across a long
+    // thinking gap; with no marker we emit today's fallback no-child probe so a truly
+    // resting agent still debounces to Idle at the agentIdleTimeoutMs floor (the
+    // decideStatus interactive_cli recovery re-arms the quiescence debounce).
     if (this.runtimeType === "interactive_cli") {
-      this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } });
+      const tail = stripAnsiSequences(this.getRecentOutput(AGENT_BUSY_TAIL_LINES));
+      const probe: ProbeResult = this.adapter.isLikelyBusy(tail)
+        ? { hasRunningChild: true, confidence: "authoritative" }
+        : { hasRunningChild: false, confidence: "fallback" };
+      this.applyStatusEvent({ kind: "probe", probe });
       return;
     }
     if (this.probeInFlight) return; // 4E.2: previous async probe still running — skip this tick
@@ -1380,6 +1395,37 @@ export class UniversalTerminal {
   }
 }
 
+// BUG-013 residual (W5): AttentionItem ⇄ StoredAttention pure mappers. The durable `timestamp` is
+// epoch-ms INTEGER; the in-memory one is an ISO string. An unparseable ISO falls back to now() on
+// the forward write so the `timestamp INTEGER NOT NULL` column and `ORDER BY timestamp DESC` stay
+// well-defined (matches pruneAttentionQueue's NaN-is-infinitely-old handling).
+export function toStoredAttention(item: AttentionItem): StoredAttention {
+  const ms = Date.parse(item.timestamp);
+  return {
+    id: item.id,
+    type: item.type,
+    terminal_id: item.terminalId,
+    project_id: item.projectId,
+    message: item.message,
+    timestamp: Number.isNaN(ms) ? Date.now() : ms,
+    dismissed: item.dismissed,
+    details: item.details ?? null,
+  };
+}
+
+export function fromStoredAttention(row: StoredAttention): AttentionItem {
+  return {
+    id: row.id,
+    type: row.type as AttentionItem["type"],
+    terminalId: row.terminal_id,
+    projectId: row.project_id,
+    message: row.message,
+    timestamp: new Date(row.timestamp).toISOString(),
+    dismissed: row.dismissed,
+    details: row.details,
+  };
+}
+
 export class OrchestratorManager {
   public terminals: Record<string, UniversalTerminal> = {};
   public activeId: string | null = null;
@@ -1641,7 +1687,69 @@ export class OrchestratorManager {
     this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
     this.ledger.switchContext(activeCtx);
 
+    // BUG-013 residual (W5): rehydrate un-dismissed attention survivors from the durable table
+    // BEFORE reconcilePanesInert, so a restarted server re-reports prior-session alerts and the
+    // subsequent announceBootRecovery push lands ON TOP through the same pushAttention seam. The
+    // module-scope store.bootMaintenance retention prune (server.ts) already ran before the manager
+    // was constructed, so a stale (>TTL) row is swept before it can be rehydrated here.
+    this.hydrateAttentionFromStore();
+
     this.reconcilePanesInert(activeCtx);
+  }
+
+  /**
+   * BUG-013 residual (W5) — the single write-through choke-point for EVERY attention push (the six
+   * former `attentionQueue.push({...}); pruneAttention()` sites route here): append in-memory, apply
+   * the BUG-035 cap/TTL prune in-memory, then best-effort write-through to the durable attention
+   * table. Durable rows are NOT capped/evicted here — that is retention's job (src/store/retention.ts).
+   */
+  public pushAttention(item: AttentionItem): void {
+    this.attentionQueue.push(item);
+    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, in-memory
+    try {
+      this.ledger.upsertAttention(toStoredAttention(item));
+    } catch { /* durable best-effort — an in-memory item is never lost on a store fault */ }
+  }
+
+  /** Dismiss one attention item: flip the in-memory flag AND write through to the durable table.
+   *  Dismiss ≠ delete (the row lingers, dismissed, until retention reaps it). Returns whether an
+   *  in-memory item was found (the orient.ts single-id path uses this for found/not-found narration). */
+  public dismissAttention(id: string): boolean {
+    const item = this.attentionQueue.find((i) => i.id === id);
+    if (item) item.dismissed = true;
+    try {
+      this.ledger.dismissAttention(id);
+    } catch { /* durable best-effort */ }
+    return !!item;
+  }
+
+  /** Dismiss ALL live items: flip every in-memory item AND write through each dismissal. Returns the
+   *  count that were live before the flip (the orient.ts dismiss-all path uses it for its narration). */
+  public dismissAllAttention(): number {
+    const live = this.attentionQueue.filter((i) => !i.dismissed);
+    for (const i of live) {
+      i.dismissed = true;
+      try {
+        this.ledger.dismissAttention(i.id);
+      } catch { /* durable best-effort */ }
+    }
+    return live.length;
+  }
+
+  /** Boot hydration (constructor-called): load un-dismissed durable survivors into the in-memory
+   *  queue, reverse-mapped, then re-impose the in-memory BUG-035 cap/TTL. Best-effort — an empty
+   *  queue on a store fault is the pre-fix legacy behavior. */
+  private hydrateAttentionFromStore(): void {
+    try {
+      for (const row of this.ledger.getAttention({ includeDismissed: false })) {
+        this.attentionQueue.push(fromStoredAttention(row));
+      }
+      // Re-impose the in-memory CAP only (ttl disabled). The durable table is already TTL-bounded by
+      // retention (bootMaintenance runs before construction), so a survivor row is a legitimately-live
+      // alert — applying the wall-clock TTL here would wrongly evict a durable row whose own timestamp
+      // predates this process (e.g. an alert that outlived a long downtime). Cap still bounds the set.
+      pruneAttentionQueue(this.attentionQueue, Date.now(), { ttlMs: Infinity, dismissedTtlMs: Infinity });
+    } catch { /* durable best-effort; empty queue on failure is the legacy behavior */ }
   }
 
   /**
@@ -1698,7 +1806,9 @@ export class OrchestratorManager {
     const n = wasLive.length;
     const list = wasLive.join(", ");
     console.log(`[boot] ${n} pane${n === 1 ? "" : "s"} were live before this restart, now inert: ${list}`);
-    this.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam so this boot-recovery item is
+    // ALSO persisted durably (write-through + in-memory BUG-035 prune), not just parked in memory.
+    this.pushAttention({
       id: "att_" + Math.random().toString(36).substring(2, 11),
       // "idle" = informational (no failure, no held request) — matches the existing dispatch-join
       // completion idiom in src/observe/index.ts (settleDispatchJoin). Not actionable via
@@ -1713,7 +1823,6 @@ export class OrchestratorManager {
       timestamp: new Date().toISOString(),
       dismissed: false,
     });
-    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, same as every other attentionQueue push
   }
 
   addTerminal(

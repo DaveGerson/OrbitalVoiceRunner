@@ -418,7 +418,9 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
       const done = g.members.filter((m) => m.status === "done").length;
       const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
       const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
-      manager.attentionQueue.push({
+      // BUG-013 residual (W5): route through the pushAttention seam (in-memory append + BUG-035
+      // prune + durable write-through) instead of the raw array push + redundant pruneAttention().
+      manager.pushAttention({
         id: "att_" + Math.random().toString(36).substring(2, 11),
         // Informational completion item ("idle" — widened onto AttentionItem.type for this).
         type: "idle",
@@ -428,7 +430,6 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
         timestamp: new Date().toISOString(),
         dismissed: false
       });
-      pruneAttention(); // BUG-035 cap/TTL
       broadcast({ type: "attention_updated", queue: manager.attentionQueue });
       broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
       announcementBus.enqueue({ kind: "completion", terminalId, summary });
@@ -691,7 +692,8 @@ ${redact(rawOutput.slice(-3000))}`;
         // cross-pane write happens here. (architecture §5: Remove watch-rule autonomous writes.)
         console.log(`[WATCH RULE NUDGE] Rule ${rule.id} matched: suggesting '${rule.actionCommand}' for '${rule.actionTerminalId}' (not writing).`);
         const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-        manager.attentionQueue.push({
+        // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+        manager.pushAttention({
           id: itemID,
           type: "confirmation",
           terminalId: rule.actionTerminalId,
@@ -706,7 +708,6 @@ ${redact(rawOutput.slice(-3000))}`;
             targetTerminalId: rule.actionTerminalId,
           },
         });
-        pruneAttention(); // BUG-035 cap/TTL
         broadcast({ type: "attention_updated", queue: manager.attentionQueue });
         broadcast({
           type: "watch_rule_suggested",
@@ -741,7 +742,8 @@ ${redact(rawOutput.slice(-3000))}`;
     nextStep.status = "pending";
     plan.status = "paused";
     const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    manager.pushAttention({
       id: itemID,
       type: "confirmation",
       terminalId: nextStep.terminalId,
@@ -757,7 +759,6 @@ ${redact(rawOutput.slice(-3000))}`;
         targetTerminalId: nextStep.terminalId,
       },
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
     announcementBus.enqueue({
       kind: "plan_paused",
@@ -788,7 +789,8 @@ ${redact(rawOutput.slice(-3000))}`;
     plan.status = "paused";
     console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
     const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    manager.pushAttention({
       id: itemID,
       type: "build-failed",
       terminalId,
@@ -797,7 +799,6 @@ ${redact(rawOutput.slice(-3000))}`;
       timestamp: new Date().toISOString(),
       dismissed: false
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
     broadcast({
       type: "plan_paused",
@@ -880,7 +881,8 @@ ${redact(rawOutput.slice(-3000))}`;
     const id = "att_" + Math.random().toString(36).substring(2, 11);
     // WS-B: scrub the chunk before it becomes a displayed/announced hint.
     const hint = redact(cleanChunk.trim()).slice(-160);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    manager.pushAttention({
       id,
       type: transition,
       terminalId,
@@ -889,7 +891,6 @@ ${redact(rawOutput.slice(-3000))}`;
       timestamp: new Date().toISOString(),
       dismissed: false
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
 
     // WS-D (BUG-024): high-severity proactive announcement (reuses the existing lastStates

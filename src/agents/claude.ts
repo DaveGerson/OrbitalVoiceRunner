@@ -25,6 +25,17 @@ const PERMISSION_MODE: Record<Mode, string> = {
   "Read-Only": "plan",
 };
 
+// BUG-006 residual — Claude Code "working"/"thinking" markers. The interruptible turn shows
+// "(esc to interrupt)" for its whole duration and a spinner glyph that updates on the status line.
+// The braille range (U+2800–U+28FF) is the animated spinner; the star glyphs are Claude's own
+// working glyphs. Deliberately EXCLUDES the mode pill "⏵⏵" (U+23F5) so a settled accept-edits pill
+// reads NOT busy. This adapter OWNS this list (per-CLI, not one global regex).
+const CLAUDE_BUSY_MARKERS: RegExp[] = [
+  /esc to interrupt/i,
+  /[⠀-⣿]/, // braille spinner
+  /[✳✱✶✷✴✽✻✹]/, // Claude working-glyph spinners
+];
+
 export class ClaudeAdapter implements AgentAdapter {
   readonly preset = "Claude Code" as const;
   private readonly bin: string;
@@ -119,5 +130,9 @@ export class ClaudeAdapter implements AgentAdapter {
 
   bypassFlag(): string {
     return SKIP_FLAG;
+  }
+
+  isLikelyBusy(recentTail: string): boolean {
+    return CLAUDE_BUSY_MARKERS.some((re) => re.test(recentTail));
   }
 }

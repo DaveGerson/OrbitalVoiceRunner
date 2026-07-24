@@ -101,6 +101,18 @@ function makeCtx(opts?: {
     effectiveCapabilityGateFor: () => "Auto",
     manager: {
       attentionQueue,
+      // W5: dismiss routes through the manager seam now (in-memory flip + durable write-through);
+      // the structural double mirrors the old in-memory behavior for these assertions.
+      dismissAttention: (id: string): boolean => {
+        const it = attentionQueue.find((i) => i.id === id);
+        if (it) it.dismissed = true;
+        return !!it;
+      },
+      dismissAllAttention: (): number => {
+        const live = attentionQueue.filter((i) => !i.dismissed);
+        live.forEach((i) => (i.dismissed = true));
+        return live.length;
+      },
       ledger: {
         plans,
         save: (force: boolean): void => {

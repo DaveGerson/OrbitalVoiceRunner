@@ -249,9 +249,12 @@ function makeObserveManager(plan: ObservePlan): OrchestratorManager {
   // Idle, NON-shell panes so a benign chunk classifies as a plain "idle" edge (classifyIdleRefinement:
   // a non-shell pane is always "idle", never the shell-prompt "prompt" refinement).
   const term = () => ({ status: "Idle", runtimeType: "claude", lastCommand: "" });
+  const attentionQueue: unknown[] = [];
   return {
     terminals: { obs1: term(), obs2: term(), obs3: term(), obs4: term() },
-    attentionQueue: [] as unknown[],
+    attentionQueue,
+    // W5: observe push sites route through manager.pushAttention now (mirror the in-memory append).
+    pushAttention: (item: unknown) => attentionQueue.push(item),
     settings: { secrets: {} },
     ledger: {
       watchRules: [] as unknown[],

@@ -25,6 +25,17 @@ const APPROVAL: Record<Mode, string> = {
   "Read-Only": "on-request",
 };
 
+// BUG-006 residual — Codex "working"/"thinking" markers (LOW confidence, like parseCurrentMode:
+// binary not local; finalize against a live capture behind the multi-cli verification bead). A
+// working turn shows a braille spinner glyph + "Esc to interrupt" and a "Working"/"Thinking" status
+// word. This adapter OWNS this list (per-CLI, not one global regex).
+const CODEX_BUSY_MARKERS: RegExp[] = [
+  /esc to interrupt/i,
+  /[⠀-⣿]/, // braille spinner
+  /\bWorking\b/,
+  /\bThinking\b/,
+];
+
 export class CodexAdapter implements AgentAdapter {
   readonly preset = "Codex" as const;
   private readonly bin: string;
@@ -92,5 +103,9 @@ export class CodexAdapter implements AgentAdapter {
 
   bypassFlag(): string {
     return BYPASS_FLAG;
+  }
+
+  isLikelyBusy(recentTail: string): boolean {
+    return CODEX_BUSY_MARKERS.some((re) => re.test(recentTail));
   }
 }

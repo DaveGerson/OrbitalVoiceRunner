@@ -313,16 +313,14 @@ export const dismissAttention: ActionDef<typeof DismissAttentionParams> = {
     const targetId = args.id;
     let output: string;
     if (targetId) {
-      const item = ctx.manager.attentionQueue.find((i) => i.id === targetId);
-      if (item) {
-        item.dismissed = true;
-        output = `Dismissed attention item ${targetId}.`;
-      } else {
-        output = `No attention item found with id ${targetId}.`;
-      }
+      // W5 (BUG-013 residual): dismiss write-through — the manager seam flips the in-memory flag
+      // AND persists store.dismissAttention (dismiss ≠ delete, so it does not resurrect on restart).
+      const found = ctx.manager.dismissAttention(targetId);
+      output = found
+        ? `Dismissed attention item ${targetId}.`
+        : `No attention item found with id ${targetId}.`;
     } else {
-      const count = ctx.manager.attentionQueue.filter((i) => !i.dismissed).length;
-      ctx.manager.attentionQueue.forEach((i) => (i.dismissed = true));
+      const count = ctx.manager.dismissAllAttention();
       output = `Dismissed all ${count} pending attention item${count === 1 ? "" : "s"}.`;
     }
     ctx.pruneAttention();

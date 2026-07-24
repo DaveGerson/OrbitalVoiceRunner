@@ -102,9 +102,12 @@ function makeObserveDeps(opts: {
 
 // A minimal fake manager that exposes only what attachObserve's ears read (status, lastCommand).
 function fakeManager(status: string, lastCommand = ""): OrchestratorManager {
+  const attentionQueue: unknown[] = [];
   return {
     terminals: { A: { status, runtimeType: "shell", lastCommand } },
-    attentionQueue: [],
+    attentionQueue,
+    // W5: observe push sites route through manager.pushAttention now (mirror the in-memory append).
+    pushAttention: (item: unknown) => attentionQueue.push(item),
     settings: { secrets: {} },
     ledger: { watchRules: [], plans: [], activeProjectId: "proj", save: () => {} },
   } as unknown as OrchestratorManager;

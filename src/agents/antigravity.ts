@@ -156,4 +156,12 @@ export class AntigravityAdapter implements AgentAdapter {
   bypassFlag(): string {
     return SKIP_FLAG;
   }
+
+  // BUG-006 residual — agy's in-session working markers are UNVERIFIED (parseCurrentMode is a null
+  // stub; an agy session shows no mode pill and its status line is just "Gemini 3.x …"). Default
+  // conservative: no marker ⇒ pure output-quiescence, no worse than today. Fill in behind the
+  // multi-cli-live-switch-verification bead once captured live.
+  isLikelyBusy(_recentTail: string): boolean {
+    return false;
+  }
 }

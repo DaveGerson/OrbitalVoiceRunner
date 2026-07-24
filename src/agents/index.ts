@@ -56,6 +56,16 @@ export interface AgentAdapter {
   capabilities(): Capabilities;
 
   /**
+   * True when `recentTail` (the last N rendered output lines, ANSI-stripped) carries a live
+   * "working"/"thinking" marker for THIS CLI — i.e. a turn is in progress and the pane must read
+   * Running even if output has paused (BUG-006 residual: the agent "thinking pause" false-idle).
+   * Pure, data-driven per adapter (each owns its own marker list); NOT one global regex. Must
+   * return false on an empty/settled tail (a bare prompt, a mode pill) so a resting agent still
+   * debounces to Idle. No side effects.
+   */
+  isLikelyBusy(recentTail: string): boolean;
+
+  /**
    * The per-CLI permission-BYPASS flag (Full-Auto string mutation). Claude/agy use
    * --dangerously-skip-permissions; Codex uses --dangerously-bypass-approvals-and-sandbox;
    * Custom has none. Returned so src/terminal.ts's flag-injection choke point can be

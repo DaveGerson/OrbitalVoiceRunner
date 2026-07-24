@@ -71,6 +71,9 @@ function makeManager(id: string, opts: FakeOpts = {}) {
   const manager = {
     terminals: { [id]: { status: opts.status ?? "Running", runtimeType: opts.runtimeType ?? "shell", lastCommand: opts.lastCommand ?? "" } },
     attentionQueue,
+    // W5: the observe push sites route through manager.pushAttention now; the structural double
+    // mirrors the real in-memory append so the existing attentionQueue assertions still hold.
+    pushAttention: (item: any) => attentionQueue.push(item),
     settings: { secrets: {} },
     ledger: {
       watchRules: [] as any[],

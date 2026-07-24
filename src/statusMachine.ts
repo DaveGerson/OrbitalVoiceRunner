@@ -71,7 +71,7 @@ const NO_CHANGE = (status: Status): DecideResult => ({
 });
 
 export function decideStatus(inp: DecideInputs): DecideResult {
-  const { event, currentStatus, confidence, idleTimerArmed } = inp;
+  const { event, currentStatus, confidence, idleTimerArmed, runtimeType } = inp;
 
   // Tier 0 — Exited is terminal and immune to all lower tiers.
   if (currentStatus === "Exited") {
@@ -107,19 +107,10 @@ export function decideStatus(inp: DecideInputs): DecideResult {
       // An input means a turn is starting — optimistic Running (Tier A kick, I2).
       return setRunning();
 
-    case "probe": {
-      if (event.probe.confidence === "authoritative") {
-        if (event.probe.hasRunningChild) {
-          // I2 — authoritative busy wins, cancel any pending idle timer.
-          return setRunning();
-        }
-        // No running child: eligible for Idle but debounced by idleTimeoutMs.
-        return armIdleOnce();
-      }
-      // Fallback-confidence probe carries no authoritative signal; ignore it and
-      // let output/quiescence drive.
-      return NO_CHANGE(currentStatus);
-    }
+    case "probe":
+      // Probe-tick handling is extracted to keep decideStatus under the CC gate; the W4 busy→idle
+      // recovery branch (see decideProbeEvent) is the added surface.
+      return decideProbeEvent(event.probe, currentStatus, runtimeType, setRunning, armIdleOnce);
 
     case "output": {
       if (confidence === "authoritative") {
@@ -159,4 +150,32 @@ export function decideStatus(inp: DecideInputs): DecideResult {
     default:
       return NO_CHANGE(currentStatus);
   }
+}
+
+/**
+ * Probe-tick decision (extracted from decideStatus's `case "probe"` for the CC gate). Takes the
+ * two shared closures so status/timer bookkeeping stays defined once in decideStatus.
+ *  - Authoritative busy ⇒ setRunning (I2, cancel pending idle). Authoritative no-child ⇒ armIdleOnce.
+ *  - W4 (BUG-006 residual) busy→idle recovery: a FALLBACK no-child probe while Running on an
+ *    interactive_cli (agent) pane is the "agent stopped looking busy" signal — arm the quiescence
+ *    debounce (once) so the pane reaches Idle at the agentIdleTimeoutMs floor after an
+ *    authoritative-busy period ends. armIdleOnce() only arms when no timer is pending, so a stream
+ *    of no-child ticks cannot keep re-arming it. Scoped tightly to interactive_cli so the legacy
+ *    shell FallbackProbe path is byte-identical (a fallback BUSY tick carries no trustworthy signal
+ *    and is still ignored).
+ */
+function decideProbeEvent(
+  probe: ProbeResult,
+  currentStatus: Status,
+  runtimeType: RuntimeType,
+  setRunning: () => DecideResult,
+  armIdleOnce: () => DecideResult,
+): DecideResult {
+  if (probe.confidence === "authoritative") {
+    return probe.hasRunningChild ? setRunning() : armIdleOnce();
+  }
+  if (!probe.hasRunningChild && currentStatus === "Running" && runtimeType === "interactive_cli") {
+    return armIdleOnce();
+  }
+  return NO_CHANGE(currentStatus);
 }

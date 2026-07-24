@@ -47,6 +47,14 @@ export interface PruneOpts {
    *  that it three-way-joins via inject_id — pruning all three on the same cadence keeps the join
    *  honest instead of leaving orphaned halves. */
   contextInjectionsTtlDays?: number;
+  /** Durable attention ACTIVE-row TTL in MS (W5). Default ATTENTION_ACTIVE_TTL_MS (10min) — minute-
+   *  scale, NOT day-scale like the siblings above; mirrors the in-memory BUG-035 prune. */
+  attentionTtlMs?: number;
+  /** Durable attention DISMISSED-row TTL in MS (W5). Default ATTENTION_DISMISSED_TTL_MS (1min). */
+  attentionDismissedTtlMs?: number;
+  /** Durable attention row cap (W5). Default ATTENTION_ROW_CAP (50) — cap-eviction keeps the newest,
+   *  dropping dismissed first then oldest, matching pruneAttentionQueue's in-memory cap. */
+  attentionCap?: number;
 }
 
 /**
@@ -57,6 +65,15 @@ export interface PruneOpts {
  * idempotency_key row far past it while still bounding the append-only log.
  */
 export const ACTION_LOG_TTL_DAYS = 30;
+
+// BUG-013 residual (W5) — DURABLE attention retention policy. Attention is MINUTE-scale, unlike the
+// day-scale TTLs the rest of this module uses: it must respect the SAME cap/TTL as the in-memory
+// BUG-035 pruneAttentionQueue (src/announcementBus.ts) so the persisted table cannot grow unbounded
+// or outlive its in-memory twin. Values mirror ATTENTION_TTL_MS / ATTENTION_DISMISSED_TTL_MS /
+// ATTENTION_QUEUE_CAP there (kept local so a store module does not depend on the announcement layer).
+export const ATTENTION_ACTIVE_TTL_MS = 10 * 60 * 1000; // 600_000 — active rows
+export const ATTENTION_DISMISSED_TTL_MS = 60 * 1000;   // dismissed rows evict on a shorter tier
+export const ATTENTION_ROW_CAP = 50;                   // max durable rows (cap-eviction on boot)
 
 // Grace window applied past a deferred row's own `expires_at` before the boot prune
 // reclaims it (bead 1qs). The in-memory sweep (gating/index.ts) already retires expired
@@ -81,6 +98,10 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
   const eeCutoff = ttlCutoffMs(opts.now, opts.exchangeEventsTtlDays);
   const exCutoff = ttlCutoffMs(opts.now, opts.exchangesTtlDays);
   const cdelCutoff = ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays);
+  // W5 attention (minute-scale, ms-based — not the day-scale ttlCutoffMs helper).
+  const attnActiveCutoff = opts.now - (opts.attentionTtlMs ?? ATTENTION_ACTIVE_TTL_MS);
+  const attnDismissedCutoff = opts.now - (opts.attentionDismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS);
+  const attnCap = opts.attentionCap ?? ATTENTION_ROW_CAP;
   const tx = db.transaction(() => {
     db.prepare("DELETE FROM events WHERE ts < ?").run(evCutoff);          // triggers keep events_fts in sync
     db.prepare("DELETE FROM panes_archive WHERE archived_at < ?").run(arCutoff);
@@ -128,6 +149,17 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
       ).run(exCutoff);
       db.prepare("DELETE FROM context_deliveries WHERE ts < ?").run(cdelCutoff);
     } catch { /* pre-v12 DB: tables absent, skip */ }
+    // W5 (BUG-013 residual): DURABLE attention retention. Two-tier TTL (active vs shorter dismissed),
+    // then cap-eviction keeping the newest attnCap rows (drop dismissed first, then oldest — the
+    // dismissed-ASC/timestamp-DESC keep order). Own try/catch so a pre-attention-table DB skips it.
+    try {
+      db.prepare(
+        "DELETE FROM attention WHERE (dismissed=0 AND timestamp < ?) OR (dismissed=1 AND timestamp < ?)"
+      ).run(attnActiveCutoff, attnDismissedCutoff);
+      db.prepare(
+        "DELETE FROM attention WHERE id NOT IN (SELECT id FROM attention ORDER BY dismissed ASC, timestamp DESC LIMIT ?)"
+      ).run(attnCap);
+    } catch { /* attention table absent, skip */ }
   });
   tx();
   // Orphaned scrollback sweep: delete .log files not referenced by any live or archived pane.
@@ -175,6 +207,10 @@ export interface SweepOpts {
   contextDeliveriesTtlDays?: number;
   /** context_injections TTL in days (schema v10, Phase 5.5). Default 30 — see PruneOpts. */
   contextInjectionsTtlDays?: number;
+  /** Durable attention ACTIVE-row TTL in MS (W5). Default ATTENTION_ACTIVE_TTL_MS (10min). */
+  attentionTtlMs?: number;
+  /** Durable attention DISMISSED-row TTL in MS (W5). Default ATTENTION_DISMISSED_TTL_MS (1min). */
+  attentionDismissedTtlMs?: number;
   /** Max rows deleted per TABLE per tick. Default 1000. */
   batchLimit?: number;
 }
@@ -203,6 +239,9 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
   const gtuCutoff = ttlCutoffMs(opts.now, opts.geminiTurnUsageTtlDays);
   const eeCutoff = ttlCutoffMs(opts.now, opts.exchangeEventsTtlDays);
   const pendingCutoff = opts.now - PENDING_PRUNE_GRACE_MS;
+  // W5 attention (minute-scale, ms-based).
+  const attnActiveCutoff = opts.now - (opts.attentionTtlMs ?? ATTENTION_ACTIVE_TTL_MS);
+  const attnDismissedCutoff = opts.now - (opts.attentionDismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS);
 
   const deleted: Record<string, number> = {};
   let more = false;
@@ -270,6 +309,14 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM context_deliveries WHERE delivery_id IN (SELECT delivery_id FROM context_deliveries WHERE ts < ? LIMIT ?)",
       [ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays)]);
   } catch { /* pre-v12 DB: tables absent, skip */ }
+  // W5 (BUG-013 residual): the batched TTL twin of the boot attention prune — two-tier (active vs
+  // shorter dismissed) so SweepResult.deleted reports an "attention" category. Own try/catch so a
+  // pre-attention-table DB skips it. (Cap-eviction is boot-only, design §6 — the sweep is TTL-only.)
+  try {
+    step("attention",
+      "DELETE FROM attention WHERE id IN (SELECT id FROM attention WHERE (dismissed=0 AND timestamp < ?) OR (dismissed=1 AND timestamp < ?) LIMIT ?)",
+      [attnActiveCutoff, attnDismissedCutoff]);
+  } catch { /* attention table absent, skip */ }
 
   return { deleted, more };
 }
