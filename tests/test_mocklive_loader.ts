@@ -1,9 +1,10 @@
 // tests/test_mocklive_loader.ts — bead c1ky (insight b) + 1p84: acceptance for `loadMockLive()`,
 // an exported async loader in tests/helpers/mockLive.ts that OWNS the env guard
-// (JANUS_NO_AUTOSTART=1) and a STABLE scratch root for JANUS_DB — a mkdtemp'd directory OUTSIDE
-// the repo checkout AND outside any per-suite tmpdir, so the process-wide JanusStore singleton
-// (opened once, at the FIRST post-chdir dynamic import of server.ts) never roots at a per-suite
-// tmpdir a later afterEach rmSync's out from under the still-open sqlite handle (the 1p84 leak).
+// (JANUS_NO_AUTOSTART=1) and a STABLE JANUS_DB root — now an IN-MEMORY (":memory:") DB, outside the
+// repo checkout and free of any per-suite tmpdir, so the process-wide JanusStore singleton (opened
+// once, at the FIRST post-chdir dynamic import of server.ts) never roots at a per-suite tmpdir a
+// later afterEach rmSync's out from under the still-open sqlite handle (the 1p84 leak), and leaves
+// no %TEMP% scratch dir behind per process.
 //
 // FAILS before the fix: loadMockLive is not exported from tests/helpers/mockLive.ts.
 //
@@ -35,18 +36,23 @@ test("loadMockLive() sets JANUS_NO_AUTOSTART=1", async () => {
   assert.equal(process.env.JANUS_NO_AUTOSTART, "1");
 });
 
-test("loadMockLive() roots JANUS_DB at an absolute path under the OS tmpdir, never the repo", async () => {
+test("loadMockLive() roots JANUS_DB at a STABLE non-repo location, never the repo checkout", async () => {
   const { loadMockLive } = await import("./helpers/mockLive");
   await (loadMockLive as any)();
   const janusDb = process.env.JANUS_DB;
   assert.ok(janusDb, "JANUS_DB must be set");
-  assert.ok(path.isAbsolute(janusDb!), `JANUS_DB must be absolute, got: ${janusDb}`);
+  // bead 1p84 (+ adversarial review): the store must NOT root under the repo checkout and must not
+  // sit in a doomed per-suite tmpdir. The loader now defaults to an IN-MEMORY DB (":memory:") — no
+  // on-disk artifact at all, which satisfies that intent even more strongly than the prior absolute
+  // OS-tmpdir file (and eliminates the %TEMP% scratch-dir accumulation). Accept either the in-memory
+  // DB or an absolute non-repo OS-tmpdir path.
+  const inMemory = janusDb === ":memory:";
   assert.ok(
-    janusDb!.startsWith(os.tmpdir()),
-    `JANUS_DB must live under the OS tmpdir, got: ${janusDb}`,
+    inMemory || (path.isAbsolute(janusDb!) && janusDb!.startsWith(os.tmpdir())),
+    `JANUS_DB must be ":memory:" or an absolute OS-tmpdir path, got: ${janusDb}`,
   );
   assert.ok(
-    !janusDb!.startsWith(repoRoot),
+    inMemory || !janusDb!.startsWith(repoRoot),
     `JANUS_DB must NOT live under the repo checkout, got: ${janusDb}`,
   );
 });

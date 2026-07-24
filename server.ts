@@ -1220,6 +1220,15 @@ function operatorSendOverflow(paneId: string, text: string): number {
   return renderedOverflow(text, profile);
 }
 
+/** neg1 (adversarial-review fix): the rendered-instruction size ceiling for a pane's tool preset,
+ *  passed to withExchangeCorrelationHint so the request-mode correlation hint can never push a
+ *  delivered instruction past the cap the operator draft was already validated against. Custom
+ *  profile for an unknown/missing preset. */
+function paneRenderMaxChars(paneId: string): number {
+  const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
+  return (RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom).maxChars;
+}
+
 /**
  * Phase 4, Step 4.3 (REST-lane gap closure): the Workbench POST draft/send route writes directly
  * (`term.writeInput`) — it never goes through dispatchProposal/applyDispatchDecision, so unlike
@@ -1339,7 +1348,7 @@ function registerDraftAndSettingsRoutes(
     // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on
     // the ORIGINAL `text` (the echo-veto in legacyCompletionEligible compares the pane's echo
     // against the operator's own recorded command); only the actual pane write is augmented.
-    const deliveredText = withExchangeCorrelationHint(text, exchangeId);
+    const deliveredText = withExchangeCorrelationHint(text, exchangeId, undefined, paneRenderMaxChars(paneId));
     HistoryManager.getInstance().addCommand(paneId, text, exchangeId);
     try {
       term.writeInput(deliveredText);

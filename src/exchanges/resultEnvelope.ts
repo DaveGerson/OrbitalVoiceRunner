@@ -373,14 +373,24 @@ export function withExchangeCorrelationHint(
   rendered: string,
   exchangeId: string | null | undefined,
   mode: ResultEnvelopeMode = RESULT_ENVELOPE_MODE,
+  maxChars?: number,
 ): string {
   if (mode !== "request") return rendered;
   if (!exchangeId) return rendered;
   if (!rendered.includes(COMPLETION_REQUEST_LINE)) return rendered;
-  return rendered.replace(
+  const hinted = rendered.replace(
     COMPLETION_REQUEST_LINE,
     `${COMPLETION_REQUEST_LINE} ${COMPLETION_REQUEST_EXCHANGE_HINT(exchangeId)}`,
   );
+  // neg1 (adversarial-review fix): the correlation hint is best-effort request-mode framing, and
+  // callers validated the PRE-hint text against the pane's size ceiling (`maxChars`) — the ~30-char
+  // hint must NEVER push the DELIVERED text past that ceiling (spec §6.2: over-limit is refused, never
+  // silently truncated). When a `maxChars` budget is supplied and appending the hint would exceed it,
+  // drop the hint and deliver the un-hinted, already-in-bounds text: correlation is optional, staying
+  // within the size contract is not. Omitting `maxChars` preserves the prior unbounded behavior (used
+  // by the pure unit tests, which don't model a pane cap).
+  if (maxChars !== undefined && hinted.length > maxChars) return rendered;
+  return hinted;
 }
 
 export function scanForResultEnvelope(text: string, opts: ScanOptions = {}): ScanResult {

@@ -26,14 +26,16 @@
 // An explicit JANUS_DB set by the caller BEFORE the first load (e.g. tests/test_boot_quarantine.ts
 // pointing at its own seeded db) is NEVER overwritten.
 
-import path from "node:path";
-import fs from "node:fs";
-import os from "node:os";
-
 process.env.JANUS_NO_AUTOSTART = "1";
 if (!process.env.JANUS_DB) {
-  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-mocklive-store-"));
-  process.env.JANUS_DB = path.join(scratchDir, ".janus.db");
+  // bead c1ky/1p84 (+ adversarial review): the implicit mock-live store defaults to an IN-MEMORY
+  // SQLite DB — process-lifetime, ZERO on-disk artifact. The prior stable-scratch-dir approach left
+  // an uncollected %TEMP%\janus-mocklive-store-* directory per test process (accumulating disk use;
+  // observed 400 dirs / ~130 MB on one host). ":memory:" satisfies the 1p84 "stable, never-doomed
+  // root" intent even better — there is no file to leak, nor to be rmSync'd out from under an open
+  // handle on Windows. A caller needing an on-disk store (e.g. tests/test_boot_quarantine.ts pointing
+  // at its own seeded db) still sets JANUS_DB explicitly BEFORE the first load — never overwritten.
+  process.env.JANUS_DB = ":memory:";
 }
 
 const { setLiveConnector } = await import("../../server");

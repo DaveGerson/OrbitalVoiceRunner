@@ -28,7 +28,8 @@
 import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
 import type { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
-import { redactSecrets, type OrchestratorManager } from "../terminal";
+import { redactSecrets, normalizePreset, type OrchestratorManager } from "../terminal";
+import { RENDER_PROFILES } from "../exchanges/instructionEnvelope";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
 import { parseApprovalIntentShadowed, isApprovalPythonPrimary, resolveApprovalIntent } from "../approvalShadow";
@@ -1417,7 +1418,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // above actually produced an id. The exchange's persisted `distilled_instruction` stays the
       // pre-augment `instruction` (already minted inside stampExchangeForDispatch) — this token is
       // per-delivery framing, not durable operator content.
-      const deliveredInstruction = withExchangeCorrelationHint(instruction, exchangeId);
+      // neg1 (adversarial-review fix): cap the delivered text so the request-mode correlation hint
+      // can never push a rendered instruction past the pane's size ceiling (spec §6.2).
+      const deliveredMaxChars = (RENDER_PROFILES[normalizePreset(term?.toolPreset)] ?? RENDER_PROFILES.Custom).maxChars;
+      const deliveredInstruction = withExchangeCorrelationHint(instruction, exchangeId, undefined, deliveredMaxChars);
 
       const outcome = applyDispatchDecision(
         decision,

@@ -370,6 +370,31 @@ describe("resultEnvelope: withExchangeCorrelationHint (neg1 — live correlation
     const withExplicit = withExchangeCorrelationHint(rendered, "exch_test_123", RESULT_ENVELOPE_MODE);
     assert.equal(withDefault, withExplicit);
   });
+
+  // neg1 (adversarial-review fix): the hint must never push the DELIVERED text past the pane's size
+  // ceiling — the guard at the send seams measured only the PRE-hint text.
+  it("request mode + maxChars: the hint is DROPPED (un-hinted text delivered) when it would exceed the cap", () => {
+    const rendered = renderedWithCompletionLine();
+    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    assert.ok(hinted.length > rendered.length, "sanity: the hint grows the text");
+    const cap = hinted.length - 1; // the un-hinted text fits, the hinted text does not
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request", cap);
+    assert.equal(out, rendered, "best-effort correlation is dropped rather than overflow the size ceiling");
+  });
+
+  it("request mode + maxChars: the hint is KEPT when it fits exactly within the cap", () => {
+    const rendered = renderedWithCompletionLine();
+    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request", hinted.length);
+    assert.equal(out, hinted, "a hint that fits exactly at the cap is delivered");
+    assert.ok(out.includes("exch_test_123"));
+  });
+
+  it("maxChars omitted: unbounded (prior behavior) — the hint is applied regardless of length", () => {
+    const rendered = renderedWithCompletionLine();
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    assert.ok(out.includes("exch_test_123"), "no cap supplied → hint applied");
+  });
 });
 
 describe("resultEnvelope + ExchangeService: live correlation settlement (neg1)", () => {
