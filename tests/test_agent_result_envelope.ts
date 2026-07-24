@@ -18,8 +18,10 @@ import {
   resultEnvelopeActive,
   RESULT_ENVELOPE_MODE,
   COMPLETION_REQUEST_LINE,
+  withExchangeCorrelationHint,
 } from "../src/exchanges/resultEnvelope";
 import { ExchangeService } from "../src/exchanges/service";
+import { RENDER_PROFILES, renderEnvelope, type InstructionEnvelope } from "../src/exchanges/instructionEnvelope";
 
 /** Create + stage + deliver one exchange on `paneId`; returns its id. Mirrors the identical
  *  helper in tests/test_exchange_correlation.ts. */
@@ -303,5 +305,141 @@ describe("resultEnvelope + ExchangeService: trust-boundary correlation", () => {
     const svc = new ExchangeService();
     const outcome = svc.recordReportedOutcome("pane-ghost", "exch_whatever", "complete", "nothing here");
     assert.equal(outcome, null);
+  });
+});
+
+// ── neg1: live correlation — withExchangeCorrelationHint ───────────────────────────────────────
+
+const RICH_ENVELOPE: InstructionEnvelope = {
+  objective: "run the full test suite",
+  relevant_context: ["ci is red"],
+  constraints: ["do not skip any suite"],
+  requested_output: "a pass/fail summary",
+  completion_signal: "all suites report",
+  operator_language: "en",
+};
+
+function renderedWithCompletionLine(): string {
+  const rendered = renderEnvelope(RICH_ENVELOPE, RENDER_PROFILES["Claude Code"]);
+  assert.ok(rendered.includes(COMPLETION_REQUEST_LINE), "fixture must carry the completion-request line");
+  return rendered;
+}
+
+describe("resultEnvelope: withExchangeCorrelationHint (neg1 — live correlation)", () => {
+  it("request mode + non-empty exchangeId: the delivered completion line carries the exchange_id", () => {
+    const rendered = renderedWithCompletionLine();
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    assert.ok(out.includes(COMPLETION_REQUEST_LINE));
+    assert.ok(out.includes("exch_test_123"), "the rendered line must carry the exchange id");
+  });
+
+  it("request mode: the appended hint is prose, never a parseable JSON key — and never self-settles", () => {
+    const rendered = renderedWithCompletionLine();
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    assert.ok(!out.includes('"exchange_id"'), "must never spell the literal JSON key");
+    const scan = scanForResultEnvelope(out, ACCEPT);
+    assert.equal(scan.found, false, "the delivered instruction text itself must never self-settle");
+  });
+
+  it("mode 'accept': byte-identical — request-only behavior", () => {
+    const rendered = renderedWithCompletionLine();
+    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "accept"), rendered);
+  });
+
+  it("mode 'off': byte-identical", () => {
+    const rendered = renderedWithCompletionLine();
+    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "off"), rendered);
+  });
+
+  it("request mode + undefined/null/'' exchangeId: no dangling hint", () => {
+    const rendered = renderedWithCompletionLine();
+    assert.equal(withExchangeCorrelationHint(rendered, undefined, "request"), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, null, "request"), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, "", "request"), rendered);
+  });
+
+  it("request mode but rendered has NO completion line: a bare shell pane never gets a hint", () => {
+    const rendered = renderEnvelope(RICH_ENVELOPE, RENDER_PROFILES.Custom);
+    assert.ok(!rendered.includes(COMPLETION_REQUEST_LINE));
+    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "request"), rendered);
+  });
+
+  it("default mode arg omitted resolves to the module-cached RESULT_ENVELOPE_MODE", () => {
+    const rendered = renderedWithCompletionLine();
+    const withDefault = withExchangeCorrelationHint(rendered, "exch_test_123");
+    const withExplicit = withExchangeCorrelationHint(rendered, "exch_test_123", RESULT_ENVELOPE_MODE);
+    assert.equal(withDefault, withExplicit);
+  });
+});
+
+describe("resultEnvelope + ExchangeService: live correlation settlement (neg1)", () => {
+  it("a LIVE echoed envelope whose id matches the delivered instruction's carried id settles the exchange", () => {
+    const svc = new ExchangeService();
+    const id = delivered(svc, "pane-1");
+    svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
+
+    const rendered = renderedWithCompletionLine();
+    const deliveredLine = withExchangeCorrelationHint(rendered, id, "request");
+    assert.ok(deliveredLine.includes(id), "the delivered line must carry the live agent's own exchange id");
+
+    const echo = JSON.stringify({ exchange_id: id, status: "complete", summary: "done" });
+    const scan = scanForResultEnvelope(echo, ACCEPT);
+    assert.ok(scan.found);
+    assert.equal(scan.envelope!.exchangeId, id);
+
+    const outcome = svc.recordReportedOutcome(
+      "pane-1",
+      scan.envelope!.exchangeId,
+      scan.envelope!.status,
+      scan.envelope!.summary,
+      scan.envelope!.redactedEnvelopeJson,
+    );
+    assert.ok(outcome);
+    assert.equal(svc.get(id)!.state, "agent_complete");
+  });
+
+  it("a forged/unknown id on the same pane is STILL ignored", () => {
+    const svc = new ExchangeService();
+    const id = delivered(svc, "pane-1");
+    svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
+
+    const outcome = svc.recordReportedOutcome("pane-1", "exch_FORGED", "complete", "not really");
+    assert.equal(outcome, null);
+    assert.equal(svc.get(id)!.state, "running", "the real exchange stays untouched");
+  });
+
+  it("a stale-after-retry id is STILL ignored once a second delivery has superseded it", () => {
+    const svc = new ExchangeService();
+    const first = delivered(svc, "pane-1", "first instruction");
+    svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
+    const second = delivered(svc, "pane-1", "second instruction"); // supersedes `first`
+    assert.equal(svc.get(first)!.state, "interrupted");
+
+    const outcome = svc.recordReportedOutcome("pane-1", first, "complete", "late report");
+    assert.equal(outcome, null);
+    assert.equal(svc.get(first)!.state, "interrupted", "stale id remains rejected");
+    assert.equal(svc.get(second)!.state, "delivered", "the current exchange is untouched");
+  });
+
+  it("redaction-at-boundary preserved: a settled summary carrying a planted secret is redacted before persistence", () => {
+    const svc = new ExchangeService();
+    const id = delivered(svc, "pane-1");
+    svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
+
+    const plantedSecret = "AKIAIOSFODNN7EXAMPLE";
+    const echo = JSON.stringify({ exchange_id: id, status: "complete", summary: `done, leaked ${plantedSecret}` });
+    const scan = scanForResultEnvelope(echo, ACCEPT);
+    assert.ok(scan.found);
+    assert.ok(!scan.envelope!.summary.includes(plantedSecret));
+
+    svc.recordReportedOutcome(
+      "pane-1",
+      scan.envelope!.exchangeId,
+      scan.envelope!.status,
+      scan.envelope!.summary,
+      scan.envelope!.redactedEnvelopeJson,
+    );
+    assert.equal(svc.get(id)!.state, "agent_complete");
+    assert.ok(!svc.get(id)!.resultSummary!.includes(plantedSecret), "stored summary must not carry the raw secret");
   });
 });

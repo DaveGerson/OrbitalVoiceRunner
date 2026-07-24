@@ -41,6 +41,7 @@ import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } f
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { mintExchangeForSend } from "../exchanges/deliveryHooks";
+import { withExchangeCorrelationHint } from "../exchanges/resultEnvelope";
 import type { ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
@@ -1409,6 +1410,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // AgentExchange spine (task C): mint BEFORE the effect switch (spec §5) — a no-op when the
       // flag is off.
       const exchangeId = stampExchangeForDispatch(targetId, instruction, opts.trigger);
+      // neg1: live correlation — append THIS exchange's own id (prose, request mode only) to the
+      // completion-request line so a live agent can echo it back in a result envelope. A no-op
+      // (byte-identical `instruction`) unless JANUS_AGENT_RESULT_ENVELOPE=request and the mint
+      // above actually produced an id. The exchange's persisted `distilled_instruction` stays the
+      // pre-augment `instruction` (already minted inside stampExchangeForDispatch) — this token is
+      // per-delivery framing, not durable operator content.
+      const deliveredInstruction = withExchangeCorrelationHint(instruction, exchangeId);
 
       const outcome = applyDispatchDecision(
         decision,
@@ -1425,7 +1433,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           getActivePaneId: () => coreState.activePaneId,
           isPaneActiveForWrite,
           targetId,
-          instruction,
+          instruction: deliveredInstruction,
           capability,
           kind,
           trigger: opts.trigger,

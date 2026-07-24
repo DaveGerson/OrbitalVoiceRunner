@@ -477,3 +477,65 @@ describe("exchange observation: result envelope integration", () => {
     store.close();
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// 6. neg1 §5.3: a manual command typed into a terminal_idle-parked pane must never mis-settle it
+//    via the legacy prose heuristic (the correlation guard, ExchangeService.
+//    lastCommandBelongsToActiveExchange, consulted by settleTerminalOutcome).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+describe("exchange observation: manual command in a parked pane never mis-settles (neg1 §5.3)", () => {
+  it("a manual command typed after the exchange is parked at terminal_idle does NOT settle it via the legacy heuristic", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const parkEntries: HistoryEntry[] = [{ command: "run tests", timestamp: "t", output: "" }];
+    const { onIdle } = attachObserve(manager, makeDeps([], parkEntries));
+    await onIdle("p1"); // drives delivered -> terminal_idle
+    assert.equal(stateOf(id), "terminal_idle", "precondition: the exchange is parked idle");
+
+    // Operator manually types a command directly into the pane — recorded on the command log with
+    // exchangeId null, breaking the correlation between the pane's active exchange and the output
+    // tail onIdle is about to read.
+    getExchangeService().recordManualCommand("p1", "echo hi");
+    const manualEntries: HistoryEntry[] = [
+      { command: "echo hi", timestamp: "t", output: "echo hi\nhi\nDone.\n", finalResponse: "ran echo" },
+    ];
+    const { onIdle: onIdle2 } = attachObserve(manager, makeDeps([], manualEntries));
+    await onIdle2("p1");
+    assert.equal(stateOf(id), "terminal_idle", "the manual command's own done-line must never settle the parked exchange");
+  });
+
+  it("regression: the NORMAL delivery-correlated path still settles via the legacy heuristic", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1"); // delivery is the last command-log entry for p1
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const entries: HistoryEntry[] = [
+      { command: "run tests", timestamp: "t", output: "running...\nDone.\n", finalResponse: "tests passed" },
+    ];
+    const { onIdle } = attachObserve(manager, makeDeps([], entries));
+    await onIdle("p1");
+    assert.equal(stateOf(id), "agent_complete", "the guard's true branch must not overblock the normal correlated path");
+  });
+
+  it("the manual-command suppression does NOT clear the pane's active-exchange marker", async () => {
+    resetExchangeServiceForTests();
+    const id = deliverExchange("p1");
+    getExchangeService().onPaneSignal({ paneId: "p1", kind: "running" });
+    const { manager } = makeManager("p1");
+    const parkEntries: HistoryEntry[] = [{ command: "run tests", timestamp: "t", output: "" }];
+    const { onIdle } = attachObserve(manager, makeDeps([], parkEntries));
+    await onIdle("p1");
+
+    getExchangeService().recordManualCommand("p1", "echo hi");
+    const manualEntries: HistoryEntry[] = [
+      { command: "echo hi", timestamp: "t", output: "echo hi\nhi\nDone.\n", finalResponse: "ran echo" },
+    ];
+    const { onIdle: onIdle2 } = attachObserve(manager, makeDeps([], manualEntries));
+    await onIdle2("p1");
+
+    assert.equal(getExchangeService().activeExchangeForPane("p1"), id, "manual writes never advance/clear the lifecycle marker");
+  });
+});

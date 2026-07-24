@@ -40,6 +40,7 @@ import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migr
 import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
 import { mintExchangeForSend, beginExchangeDelivery, completeExchangeDelivery, failExchangeDelivery } from "./src/exchanges/deliveryHooks";
 import { renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { withExchangeCorrelationHint } from "./src/exchanges/resultEnvelope";
 import { viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, convergeTypedDraftEdit } from "./src/exchanges/draftRegistry";
 import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
@@ -1326,9 +1327,14 @@ function registerDraftAndSettingsRoutes(
     // flags are active.
     const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
     beginExchangeDeliveryForWorkbenchSend(exchangeId);
+    // neg1: live correlation — append this exchange's own id (prose, request mode only) to the
+    // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on
+    // the ORIGINAL `text` (the echo-veto in legacyCompletionEligible compares the pane's echo
+    // against the operator's own recorded command); only the actual pane write is augmented.
+    const deliveredText = withExchangeCorrelationHint(text, exchangeId);
     HistoryManager.getInstance().addCommand(paneId, text, exchangeId);
     try {
-      term.writeInput(text);
+      term.writeInput(deliveredText);
     } catch (e) {
       failExchangeDeliveryForWorkbenchSend(exchangeId, "workbench_write_threw");
       throw e;
