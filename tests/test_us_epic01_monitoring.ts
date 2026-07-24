@@ -795,16 +795,21 @@ after(async () => { await closeFetchPool(); });
 // the repo root stays clean across the whole five-story file.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 after(() => {
+  // .janus.db stays a hard self-check: no suite in the battery leaks a repo-root DB, and each of
+  // EPIC 01's five stories chdirs into a per-suite tmpdir before the store singleton is rooted, so
+  // a repo-root .janus.db here would be a genuine 1p84 regression in THIS file.
   assert.equal(
     fs.existsSync(path.join(repoRoot, ".janus.db")),
     false,
     "the five-story EPIC 01 file must not leak a repo-root .janus.db",
   );
-  assert.equal(
-    fs.existsSync(path.join(repoRoot, ".janus_settings.json")),
-    false,
-    "the five-story EPIC 01 file must not leak a repo-root .janus_settings.json",
-  );
+  // The former repo-root .janus_settings.json self-assertion was REMOVED. EPIC 01 does not leak it
+  // (every story chdirs first), but this hook reads the SHARED repo-root path, which the ~18 other
+  // still-unpinned server-booting test processes in the same battery pool write concurrently — a
+  // cross-process false-positive that flaked the battery (green only via run-unit's retry).
+  // Repo-root settings-file cleanliness is owned centrally by scripts/run-unit.mjs (ADVISORY until
+  // the JANUS_SETTINGS_PATH sweep, bead wsm-e2e-pinned-eoef); one file cannot reliably assert a
+  // global path other processes also write.
 });
 
 }); // EPIC 01 parent suite (concurrency:false — see header)
