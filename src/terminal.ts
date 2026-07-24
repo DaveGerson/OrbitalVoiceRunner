@@ -1263,26 +1263,33 @@ export class UniversalTerminal {
     this.transport.write(bytes);
   }
 
-  getRecentOutput(linesCount = 10): string {
+  getRecentOutput(linesCount = 10, offset = 0): string {
     // Snapshot read: render the last `linesCount` non-blank lines DIRECTLY from the emulator's
     // current clean grid (scrollback + viewport). This is the authoritative rendered screen, so
     // it is robust to the two things that defeat chunk-accumulation: in-place REPAINTS and
     // ABSOLUTE cursor positioning. Windows ConPTY, for example, prints a command's result and
     // then jumps to the prompt with `ESC[row;colH` (a CUP, NOT a newline) — the text is on the
     // grid but no line-feed fires, so an accumulation keyed off line-feeds would miss it.
-    // Scanning bottom-up stops as soon as we have enough lines (cheap even with deep scrollback).
+    // `offset` pages backward: skip the newest `offset` non-blank rows before collecting
+    // `linesCount`, so scrollback WINDOWING composes OVER the clean grid instead of the raw buffer
+    // (offset defaults to 0 → byte-identical to a plain tail read). Scanning bottom-up stops as
+    // soon as we have enough lines (cheap even with deep scrollback).
     const buf = this.vt?.buffer.active;
     if (buf && buf.type === "normal") {
       const lines: string[] = [];
+      let skipped = 0;
       for (let bi = buf.length - 1; bi >= 0 && lines.length < linesCount; bi--) {
         const s = buf.getLine(bi)?.translateToString(true) ?? "";
         if (s.trim() === "") continue;
+        if (skipped < offset) { skipped++; continue; }
         lines.push(s);
       }
       if (lines.length > 0) { lines.reverse(); return lines.join("\n"); }
     }
-    // Fallback: committed model lane (no emulator yet, on the alternate screen, or empty grid).
-    return this.outputBuffer.slice(-linesCount).join("\n");
+    // Fallback (no emulator yet, alternate screen, or empty grid): window the committed model lane.
+    const end = Math.max(0, this.outputBuffer.length - offset);
+    const start = Math.max(0, end - linesCount);
+    return this.outputBuffer.slice(start, end).join("\n");
   }
 
   /** Only-new-since-last-read lines (model lane). Advances the model cursor.
@@ -2061,11 +2068,11 @@ export class OrchestratorManager {
     };
   }
 
-  getPaneSummary(paneId: string, limit = 20) {
+  getPaneSummary(paneId: string, limit = 20, offset = 0) {
     if (!this.terminals[paneId]) {
       return `Error: Pane ${paneId} does not exist.`;
     }
-    const recentOut = this.terminals[paneId].getRecentOutput(limit);
+    const recentOut = this.terminals[paneId].getRecentOutput(limit, offset);
     // WS-B: redactSecrets runs AFTER ANSI stripping (getRecentOutput already strips ANSI).
     // This covers both the standard get_pane_summary tool response and the HiTL rationale
     // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
