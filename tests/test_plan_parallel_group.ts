@@ -29,6 +29,14 @@ import { runAction } from "../src/actions/gemini";
 import { dispatchJoinTracker } from "../src/dispatch/joinTracker";
 import type { ActionContext, DispatchOutcome } from "../src/actions/types";
 
+// ── observe-layer harness (join-gated advancement suite at the bottom) — idiom lifted verbatim from
+//    tests/test_observe_pipeline.ts so handlePlansTrigger's group-awareness (design §c) is driven E2E. ──
+import { attachObserve } from "../src/observe";
+import { AnnouncementBus, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "../src/announcementBus";
+import { PaneSignalBus } from "../src/paneSignalBus";
+import { InteractionLogger } from "../src/interactionLog";
+import type { OrchestratorManager } from "../src/terminal";
+
 // ── A step in a fake plan, optionally carrying the new parallel-group marker. ──────────────────────
 interface FakeStep {
   id: string;
@@ -143,6 +151,33 @@ describe("execute_plan — leading parallel group (BUG-011)", () => {
     assert.strictEqual(plan.currentStepIndex, 0, "the group has not advanced — index stays at the group start");
     assert.strictEqual(plan.status, "running", "the plan is running");
   });
+
+  // GATING GUARD (BUG-011): every member — including a refused one — must be routed through the SAME
+  // gated choke-point ctx.dispatchProposal. This pins that a lazy fan-out can't silently write a
+  // member around the gate, AND that a per-member refusal (Off pane -> blocked) is HONORED: the
+  // member's step is failed (not left running forever) and the join records it blocked. Mirrors the
+  // single-step handler's blocked->failed mapping (orchestration.ts) and the per-target gating idiom
+  // from tests/test_dispatch_join.ts / test_c55_9_execute_plan.ts's Off->blocked case. Deliberately
+  // mechanism-agnostic (no capability-string assertion — the design leaves that a free choice).
+  it("routes a gated-Off member through the choke-point and honors its refusal (blocked -> step failed)", async () => {
+    const { ctx, plan, rec } = makePlanCtx(threeParallelPlusTail(), { p2: { kind: "blocked", text: "gated Off" } });
+    const { result, group } = await runExecutePlan(ctx);
+    assert.strictEqual(result.kind, "ok");
+    // All 3 members attempted through the gate — the Off pane is REFUSED there, never written around it.
+    assert.strictEqual(rec.dispatched.length, 3, "every member (incl. the Off pane) is routed through ctx.dispatchProposal");
+    assert.ok(rec.dispatched.some((d) => d.targetId === "p2"), "the Off pane member went through the gated choke-point");
+    // The refusal is honored on the plan board: p2's step is failed, NOT left sitting 'running'
+    // (a member stuck 'running' would make the join wait forever); the other two run.
+    assert.deepStrictEqual(
+      plan.steps.map((s) => s.status),
+      ["running", "failed", "running", "pending"],
+      "blocked member's step is failed; the two auto-executed members run; the tail stays pending",
+    );
+    // And the join group records the member as blocked (per-target gating, like dispatch_to_panes).
+    assert.ok(group, "a join group is registered even with a blocked member");
+    const m2 = group!.members.find((m) => m.paneId === "p2");
+    assert.strictEqual(m2!.status, "blocked", "the join group records the Off member as blocked");
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -171,5 +206,106 @@ describe("execute_plan — sequential guard (no group marker: unchanged)", () =>
     await runExecutePlan(ctx);
     assert.deepStrictEqual(plan.steps.map((s) => s.status), ["running", "pending", "pending"]);
     assert.strictEqual(plan.currentStepIndex, 0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// JOIN-GATED ADVANCEMENT (observe layer, BUG-011 design §c): execute_plan (above) only DISPATCHES the
+// group and pins index==0; the advancement authority lives in src/observe/index.ts's handlePlansTrigger.
+// The REQUIRED post-fix behavior: a plan advances PAST a leading parallel group ONLY once EVERY member
+// has reached its expectedTransition — never on the first member's edge. Without this, the cheap fake
+// the campaign warns about (advance the moment the first member completes) would pass the dispatch-side
+// suite above. Drives the REAL attachObserve pipeline (harness idiom: tests/test_observe_pipeline.ts).
+//
+// Hermetic pane ids (obs1..obs4) so the module-singleton dispatchJoinTracker (which the execute_plan
+// suite above populates on p1/p2/p3) can never settle a lingering group on this suite's edges.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+interface ObservePlan {
+  id: string;
+  name: string;
+  steps: FakeStep[];
+  currentStepIndex: number;
+  status: string;
+}
+
+/** A plan whose leading 3 steps form parallel group "g1" (obs1/obs2/obs3), then one sequential tail. */
+function groupPlan(): ObservePlan {
+  return {
+    id: "plan_obs",
+    name: "P",
+    currentStepIndex: 0,
+    status: "running",
+    steps: [
+      { id: "step_0", terminalId: "obs1", command: "c0", expectedTransition: "idle", status: "running", group: "g1" },
+      { id: "step_1", terminalId: "obs2", command: "c1", expectedTransition: "idle", status: "running", group: "g1" },
+      { id: "step_2", terminalId: "obs3", command: "c2", expectedTransition: "idle", status: "running", group: "g1" },
+      { id: "step_3", terminalId: "obs4", command: "c3", expectedTransition: "idle", status: "pending" },
+    ],
+  };
+}
+
+function makeObserveManager(plan: ObservePlan): OrchestratorManager {
+  // Idle, NON-shell panes so a benign chunk classifies as a plain "idle" edge (classifyIdleRefinement:
+  // a non-shell pane is always "idle", never the shell-prompt "prompt" refinement).
+  const term = () => ({ status: "Idle", runtimeType: "claude", lastCommand: "" });
+  return {
+    terminals: { obs1: term(), obs2: term(), obs3: term(), obs4: term() },
+    attentionQueue: [] as unknown[],
+    settings: { secrets: {} },
+    ledger: {
+      watchRules: [] as unknown[],
+      plans: [plan],
+      activeProjectId: "proj_test",
+      save: () => {},
+    },
+  } as unknown as OrchestratorManager;
+}
+
+function makeObserveDeps(broadcast: (msg: unknown) => void) {
+  return {
+    broadcast,
+    announcementBus: new AnnouncementBus({ broadcast: () => {}, getTemplates: () => DEFAULT_ANNOUNCEMENT_TEMPLATES }),
+    paneSignalBus: new PaneSignalBus(0),
+    pruneAttention: () => {},
+    interactionLog: new InteractionLogger({ sink: () => {} }),
+    getLastInteractionId: () => null,
+    setLastInteractionId: (_v: string | null) => {},
+    redact: (s: string) => s,
+    historyManager: { loadHistory: () => [], saveHistory: () => {}, appendOutputToLastCommand: () => {} },
+    ai: {} as never,
+  };
+}
+
+/** Feed one benign 'idle' transition edge for `paneId` through the real observe pipeline. */
+function idleEdge(onOutput: (t: string, c: string) => void, paneId: string): void {
+  onOutput(paneId, "tests passed\n");
+}
+
+describe("execute_plan parallel group — join-gated advancement (observe layer, BUG-011)", () => {
+  it("does NOT advance past the group on the FIRST member's idle edge (still joining)", () => {
+    const plan = groupPlan();
+    const { onOutput } = attachObserve(makeObserveManager(plan), makeObserveDeps(() => {}) as never);
+    idleEdge(onOutput, "obs1");
+    assert.strictEqual(plan.currentStepIndex, 0, "one member done is NOT the whole group — index must stay at the group start");
+    assert.strictEqual(plan.status, "running", "the plan is still running (the group is joining), not paused/advanced");
+    assert.strictEqual(plan.steps[0].status, "completed", "the settled member is marked completed");
+    assert.strictEqual(plan.steps[1].status, "running", "the not-yet-settled members stay running");
+    assert.strictEqual(plan.steps[2].status, "running");
+  });
+
+  it("advances past the whole group ONLY after the LAST member settles", () => {
+    const plan = groupPlan();
+    const { onOutput } = attachObserve(makeObserveManager(plan), makeObserveDeps(() => {}) as never);
+    idleEdge(onOutput, "obs1");
+    idleEdge(onOutput, "obs2");
+    assert.strictEqual(plan.currentStepIndex, 0, "two of three members done still does NOT advance the group");
+    idleEdge(onOutput, "obs3");
+    assert.strictEqual(plan.currentStepIndex, 3, "once every member settles, advance PAST the group to the first post-group step");
+    assert.deepStrictEqual(
+      plan.steps.map((s) => s.status),
+      ["completed", "completed", "completed", "pending"],
+      "all 3 members completed; the post-group step is surfaced (pending) — never auto-run",
+    );
   });
 });
