@@ -35,9 +35,11 @@ function deleteScrollback(id: string): void {
 }
 
 const PANE = "scrollsearch-p1";
-// The needle sits on the FIRST file line (well beyond a 100-line ring) and carries an AWS-key-shaped
-// secret so we can assert both "found beyond the ring" and "redacted on egress" in one line.
-const NEEDLE_LINE = "STARTUP_MARKER build boot token=AKIA1234567890ABCD99 ready";
+// The needle sits on the FIRST file line (well beyond a 100-line ring). It carries an AWS-key-shaped
+// secret AND is wrapped in real ANSI SGR codes (the file stores RAW chunks incl. ANSI — see
+// appendScrollback(decoded)), so one line pins three properties at once: "found beyond the ring",
+// "secret redacted on egress", and "ANSI stripped on egress".
+const NEEDLE_LINE = "\u001b[32mSTARTUP_MARKER\u001b[0m build boot token=AKIA1234567890ABCD99 ready";
 
 before(() => {
   // 1 needle line + 200 filler lines -> the needle is far outside the last-100-line in-memory buffer.
@@ -91,6 +93,17 @@ describe("BUG-030(b): OrchestratorManager.searchScrollback", () => {
     const out = String(m.searchScrollback(PANE, "startup_marker"));
     assert.match(out, /\[REDACTED/i, "the AWS-key-shaped token is scrubbed");
     assert.ok(!/AKIA1234567890ABCD99/.test(out), "the raw secret must not leak");
+  });
+
+  it("strips ANSI escape sequences from matched lines", () => {
+    // The scrollback file stores RAW chunks incl. ANSI (the needle is wrapped in SGR color codes).
+    // A search that forgets stripAnsiSequences would still 'find' the line but leak the escape bytes.
+    const m = makeManagerWithPane();
+    const out = String(m.searchScrollback(PANE, "startup_marker"));
+    // stripAnsiSequences removes the ESC + the "[32m" body as a unit, so the definitive check is
+    // simply that no raw ESC (0x1b) byte survives on egress.
+    assert.ok(!out.includes(String.fromCharCode(27)), "no bare ESC (0x1b) byte survives in the returned match");
+    assert.match(out, /STARTUP_MARKER build boot/, "the human-readable text is intact after stripping");
   });
 
   it("returns a clear no-match message when nothing matches", () => {

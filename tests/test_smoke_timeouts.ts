@@ -18,11 +18,20 @@ import assert from "node:assert";
 //       submitting. Injectable clock (setTimer/clearTimer) + injectable signals (term.onReady /
 //       term.onOutput) make it unit-testable WITHOUT a live claude binary.
 //
-// RED status: resolveSmokeTimeouts and waitForReady do NOT yet exist as exports of
-// scripts/smoke-claude-pane.ts, so this file fails to load / the calls throw (planned-but-missing
-// export — acceptable per the campaign brief). The fix ALSO guards the module's main() behind a
-// direct-run check so this import is side-effect-free (no pane spawn) once it lands.
-import { resolveSmokeTimeouts, waitForReady } from "../scripts/smoke-claude-pane";
+// RED status: scripts/smoke-claude-helpers.ts does NOT yet exist — the fix EXTRACTS resolveSmokeTimeouts
+// and waitForReady into this NEW pure module — so this file fails to load with a module-not-found link
+// error (planned-but-missing module; acceptable per the campaign brief). The module body never
+// evaluates, so nothing spawns.
+//
+// SAFETY — why a dedicated pure module, NOT scripts/smoke-claude-pane.ts: that script imports
+// UniversalTerminal and its main() spawns a LIVE `claude` pane and then calls process.exit(). Importing
+// it from a unit test would — the moment these exports exist — run main() unless a fiddly ESM
+// direct-run guard is written perfectly, and a stray process.exit() from main() would tear down the
+// whole test runner (poisoning every other suite). These two helpers are pure (no PTY, no spawn, no
+// terminal.ts import), so they live in their own module with no main(); the test import is then
+// provably pane-spawn-safe REGARDLESS of how that guard is written. smoke-claude-pane.ts imports these
+// same exports and keeps its own (still-guarded) main().
+import { resolveSmokeTimeouts, waitForReady } from "../scripts/smoke-claude-helpers";
 
 // A deterministic, injectable clock: no wall-clock, no mock.timers, no real setTimeout. `advance`
 // fires due timers in time order and tolerates re-arm/clear from within a fired callback.
@@ -88,7 +97,7 @@ test("resolveSmokeTimeouts falls back to defaults on non-numeric / negative / ze
 // (b) waitForReady — onReady + output-quiescence gate (no fixed 6s sleep)
 // ---------------------------------------------------------------------------------------------
 
-test("waitForReady does NOT submit at a fixed 6s — it waits for onReady AND an output-quiescence window", async () => {
+test("waitForReady does NOT submit at a fixed 6s — it waits for onReady AND a RE-ARMING output-quiescence window", async () => {
   const clock = new ManualClock();
   const term: { onReady?: (id: string) => void; onOutput?: (id: string, chunk: string) => void } = {};
   const p = waitForReady(term, {
@@ -104,13 +113,21 @@ test("waitForReady does NOT submit at a fixed 6s — it waits for onReady AND an
   await Promise.resolve();
   assert.strictEqual(settled, false, "must NOT be ready at the old fixed 6s mark — the child has not signalled onReady");
 
-  term.onReady!("smoke"); // first PTY data == readiness edge; the quiescence window now begins
-  clock.advance(1000); // < quietMs
-  term.onOutput!("smoke", "startup banner..."); // more startup output RE-ARMS the quiet window
+  term.onReady!("smoke"); // t=6000: first PTY data == readiness edge; the quiescence window arms (elapses at 7500)
+  clock.advance(1000); // t=7000, < quietMs
+  term.onOutput!("smoke", "startup banner..."); // more startup output RE-ARMS the quiet window -> now elapses at 8500
   await Promise.resolve();
   assert.strictEqual(settled, false, "still not ready: output must be quiet for quietMs AFTER onReady");
 
-  clock.advance(1500); // quietMs of silence after the last chunk
+  // RE-ARM pin: at t=7500 the ORIGINAL (pre-chunk) quiet window would have elapsed. A fake that arms
+  // ONCE on onReady but never re-arms on later output would wrongly resolve HERE — declaring a
+  // still-noisy child "quiescent", the exact false-signal BUG-043 is about. The correct gate pushed
+  // the window out to 8500, so it must stay pending at 7500.
+  clock.advance(500); // t=7500
+  await Promise.resolve();
+  assert.strictEqual(settled, false, "RE-ARM: still pending at t=7500 — the t=7000 chunk pushed the quiet window to 8500");
+
+  clock.advance(1000); // t=8500: quietMs of silence after the LAST chunk finally elapses
   const res = await p;
   assert.strictEqual(settled, true, "resolves once the pane is ready and output has quiesced");
   assert.deepStrictEqual(res, { ready: true, reason: "quiescent" });

@@ -93,8 +93,44 @@ test("paced submit leaves a SHORT prompt at the base gap (scaling never lowers b
     term.writeInput("go");
     await Promise.resolve(); await Promise.resolve();
     assert.deepStrictEqual(writes, ["go"], "body first, CR deferred");
-    mock.timers.tick(20);
-    assert.deepStrictEqual(writes, ["go", "\r"], "short prompt still submits at the base 20ms gap");
+    // Pin the LOWER bound, not just "CR eventually arrives": at t=19 the CR must STILL be deferred.
+    // A fake that drops the max() and uses ceil(len/4) directly would fire the CR at t=1 (ceil(2/4)=1)
+    // and still look green if we only ticked to 20 — this catches that clamp-down/ignore-floor fake.
+    mock.timers.tick(19);
+    assert.deepStrictEqual(
+      writes,
+      ["go"],
+      "CR STILL deferred at t=19ms: the base floor (20) wins — ceil(2/4)=1 must NOT lower the gap (scaling only raises)",
+    );
+    mock.timers.tick(1); // t=20ms — the base floor elapses
+    assert.deepStrictEqual(writes, ["go", "\r"], "short prompt submits at EXACTLY the base 20ms floor (scaling never lowers it)");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+// (b) UPPER-side guard on the max(): a LARGE configured gap must NOT be clamped DOWN by the length
+// term. With submitEnterDelayMs=200 > ceil(280/4)=70, the effective gap stays 200 — proving the fix
+// takes max(floor, lengthTerm), never min(). Green now (current code has no scaling: gap==200) AND
+// post-fix (max(200,70)==200); a `min`/`ceil(len/4)`-only fake fires the CR at 70 and FAILS here.
+test("paced submit does NOT clamp a LARGE configured gap down to the length term (max(), not min())", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const term = new UniversalTerminal("submit-scale-largegap", ".", "cmd");
+    const { transport, writes } = makeFakeTransport();
+    (term as any).transport = transport;
+    (term as any).spawnReady = true;
+    (term as any).submitEnterDelayMs = 200; // strictly greater than ceil(280/4)=70
+
+    term.writeInput(LONG_280);
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepStrictEqual(writes, [LONG_280], "body first, CR deferred");
+    mock.timers.tick(70); // the length term (70) would fire the CR HERE if the gap were clamped down
+    assert.deepStrictEqual(writes, [LONG_280], "CR STILL deferred at t=70ms — the larger configured 200ms gap wins over the length term");
+    mock.timers.tick(129); // t=199ms — one tick short of the configured gap
+    assert.deepStrictEqual(writes, [LONG_280], "still deferred at t=199ms");
+    mock.timers.tick(1); // t=200ms — the configured gap elapses
+    assert.deepStrictEqual(writes, [LONG_280, "\r"], "CR delivered at the configured 200ms gap, not clamped down to 70ms");
   } finally {
     mock.timers.reset();
   }

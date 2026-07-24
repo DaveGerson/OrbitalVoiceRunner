@@ -145,6 +145,36 @@ describe("BUG-017 (b) — approve_pending_command handler scope enforcement", ()
     applyResultToHttp(findDef("approve_pending_command"), result, { messageId: "m1", approved: true }, res);
     assert.strictEqual(sent.status, 200);
   });
+
+  it("FOREIGN scope on a REJECT (approved:false) is ALSO 404 with no side effect (the handler covers BOTH verbs)", async () => {
+    // The SAME handler serves approve AND reject (approved decides the verb). A foreign-scope reject is
+    // its own cross-workspace harm — a DoS that CANCELS another workspace's staged command — so the
+    // scope guard must fire before applyResolution regardless of the verb, not just for approve.
+    const { ctx, rec } = makeScopeCtx({
+      callerWorkspaceId: "ws_alpha",
+      workspaceFor: () => "ws_beta",
+      applyResolution: () => ({ reason: "rejected", doWrite: false }),
+    });
+    const result = await runAction(REGISTRY, "approve_pending_command", { messageId: "m1", approved: false }, ctx);
+    // RED: today the unscoped handler resolves (rejects) the FOREIGN pending — applyResolution runs.
+    assert.strictEqual(rec.resolutionCalls.length, 0, "a foreign-scope REJECT must NOT resolve the pending either (no delete)");
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("approve_pending_command"), result, { messageId: "m1", approved: false }, res);
+    assert.strictEqual(sent.status, 404, "a foreign-scope reject also surfaces as 404 not_found (never confirm a foreign id)");
+  });
+
+  it("caller scope + a WORKSPACE-LESS pending -> applyResolution runs (enforcement needs BOTH scopes; back-compat guard)", async () => {
+    // A pending with NO workspace (undefined) — a hydrated survivor, or any pending on a scopeless
+    // in-memory store — is foreign to NOBODY. Enforcement engages iff the caller HAS a scope AND the
+    // pending HAS a workspace; a fix that scopes on `owner !== caller` alone would wrongly 404 this.
+    // GREEN before AND after the fix: catches an over-enforcing guard that drops the `owner !== undefined` half.
+    const { ctx, rec } = makeScopeCtx({ callerWorkspaceId: "ws_alpha", workspaceFor: () => undefined });
+    const result = await runAction(REGISTRY, "approve_pending_command", { messageId: "m1", approved: true }, ctx);
+    assert.deepStrictEqual(rec.resolutionCalls, ["m1"], "a workspace-less pending is resolvable by any scoped caller");
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("approve_pending_command"), result, { messageId: "m1", approved: true }, res);
+    assert.strictEqual(sent.status, 200);
+  });
 });
 
 describe("BUG-017 (c) — list_pending_commands handler scope filtering", () => {
@@ -172,6 +202,24 @@ describe("BUG-017 (c) — list_pending_commands handler scope filtering", () => 
     applyResultToHttp(findDef("list_pending_commands"), result, {}, res);
     const arr = sent.json as Array<{ messageId: string }>;
     assert.ok(arr.some((p) => p.messageId === "mA") && arr.some((p) => p.messageId === "mB"), "scopeless list is unfiltered");
+  });
+
+  it("a WORKSPACE-LESS pending is KEPT for a scoped caller (foreign to no one; back-compat guard)", async () => {
+    // The list filter must only drop pendings whose workspace DIFFERS from the caller's — a pending
+    // with NO workspace (undefined) is visible to everyone. GREEN before AND after the fix: it catches
+    // an over-enforcing filter that scopes workspace-less pendings out along with genuinely foreign ones.
+    const pendings = [
+      { messageId: "mA", instruction: "ls", kind: "shell", terminalId: "tA", timestamp: Date.now() },
+      { messageId: "mNo", instruction: "pwd", kind: "shell", terminalId: "tNo", timestamp: Date.now() },
+    ];
+    const wsFor = (id: string) => (id === "mA" ? "ws_alpha" : undefined); // mNo has NO workspace scope
+    const { ctx } = makeScopeCtx({ callerWorkspaceId: "ws_alpha", approvalsList: pendings, workspaceFor: wsFor });
+    const result = await runAction(REGISTRY, "list_pending_commands", {}, ctx);
+    const { res, sent } = makeFakeRes();
+    applyResultToHttp(findDef("list_pending_commands"), result, {}, res);
+    const arr = sent.json as Array<{ messageId: string }>;
+    assert.ok(arr.some((p) => p.messageId === "mA"), "own-workspace pending is kept");
+    assert.ok(arr.some((p) => p.messageId === "mNo"), "workspace-less pending is kept for a scoped caller (foreign to no one)");
   });
 });
 

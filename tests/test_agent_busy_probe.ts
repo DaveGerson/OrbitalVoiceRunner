@@ -30,7 +30,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { createAdapter, type AgentAdapter } from "../src/agents";
 import { decideStatus, type Status, type RuntimeType } from "../src/statusMachine";
-import type { ProbeResult } from "../src/statusProbe";
+import type { ProbeResult, StatusProbe } from "../src/statusProbe";
+import { UniversalTerminal } from "../src/terminal";
 
 // The planned adapter method under test. Cast through this shape so the tests
 // transpile before the method exists (tsx/esbuild strips types); a missing method
@@ -329,5 +330,107 @@ describe("W4(c): interactive_cli busy truth across a >3500ms thinking gap", () =
     }
     assert.strictEqual(r.finalStatus, "Idle", "a resting agent must still reach Idle");
     assert.strictEqual(r.onIdleCount, 1, "exactly one Running->Idle edge for the resting agent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W4(b): real-seam integration (drive the ACTUAL runProbeTick, not a replay).
+//
+// The W4(c) replay above calls the REAL decideStatus and the REAL adapter, but it
+// REIMPLEMENTS runProbeTick's interactive_cli branch (synthProbe) and
+// effectiveIdleMs. That is faithful to the test_status_machine.ts idiom, yet it
+// means a broken PRODUCTION runProbeTick — one that never calls isLikelyBusy, uses
+// the wrong tail window, emits the wrong confidence, or (the subtle one) emits an
+// AUTHORITATIVE no-child probe that collapses the agent idle floor to ~2000ms —
+// would still pass every W4(c) assertion (synthProbe hardcodes confidence:"fallback"
+// on the not-busy path, so the replay structurally cannot see a floor collapse).
+//
+// These tests close that gap: they drive the REAL UniversalTerminal.runProbeTick →
+// applyStatusEvent → effectiveIdleMs → decideStatus wiring, with the busy/quiet tail
+// injected into the public outputBuffer that getRecentOutput(5) reads. No PTY is
+// spawned (start() is never called); no wall-clock sleeps (the recovery-arm delay is
+// captured via a patched setTimeout — the same idiom as test_status_gating.ts's
+// armedDelayFor).
+// ---------------------------------------------------------------------------
+
+/** interactive_cli never consults the process probe (P0-1 gate); the ctor still needs one. */
+class ScriptedProbe implements StatusProbe {
+  probe(_shellPid: number): ProbeResult {
+    return { hasRunningChild: false, confidence: "fallback" };
+  }
+}
+
+/** A real interactive_cli UniversalTerminal, mid-turn (Running), WITHOUT spawning a PTY. */
+function makeAgentTerminal(preset: "Claude Code" | "Codex"): UniversalTerminal {
+  const term = new UniversalTerminal(
+    `w4b-${Math.random().toString(16).slice(2)}`,
+    ".",
+    "bash",
+    preset,
+    "Human-in-the-Loop",
+    "",
+    "default_project",
+    new ScriptedProbe(),
+  );
+  (term as any).shellPid = 1234; // runProbeTick early-returns without a shellPid
+  term.status = "Running"; // a turn is in progress
+  return term;
+}
+
+describe("W4(b): real UniversalTerminal.runProbeTick busy-check (integration)", () => {
+  it("a busy tail makes the REAL runProbeTick emit an AUTHORITATIVE busy probe (Running)", async () => {
+    // Exercises the actual seam: getRecentOutput(5) → adapter.isLikelyBusy → an
+    // authoritative busy probe → decideStatus.setRunning. Pre-fix the interactive_cli
+    // branch blindly emits {hasRunningChild:false, confidence:"fallback"}
+    // (terminal.ts:811-814) REGARDLESS of the tail, so lastConfidence reads "fallback"
+    // — the residual defect, observed at the production seam the replay cannot reach.
+    const term = makeAgentTerminal("Claude Code");
+    assert.strictEqual(term.runtimeType, "interactive_cli");
+    term.outputBuffer = [CLAUDE_BUSY_SPINNER];
+
+    (term as any).runProbeTick();
+
+    assert.strictEqual(
+      (term as any).lastConfidence,
+      "authoritative",
+      "a live busy tail must drive an AUTHORITATIVE probe, not the blanket fallback downgrade",
+    );
+    assert.strictEqual(term.status, "Running", "authoritative busy keeps the pane Running");
+    assert.strictEqual((term as any).idleTimer, null, "an authoritative busy tick clears any pending idle timer");
+    await term.stop();
+  });
+
+  it("a quiet tail makes the REAL runProbeTick re-arm the quiescence debounce at exactly agentIdleTimeoutMs", async () => {
+    // The not-busy path at the production seam: a fallback no-child probe whose
+    // decideStatus recovery re-arms the quiescence debounce (once) on a Running
+    // interactive_cli pane. The captured armed delay PINS THE FLOOR: it must equal
+    // agentIdleTimeoutMs (3500ms). Pre-fix the fallback probe is ignored (decideStatus
+    // NO_CHANGE), nothing arms, and the capture stays -1 (RED). A fix that instead
+    // emitted an AUTHORITATIVE no-child probe would arm at
+    // max(idleTimeoutMs, probeIntervalMs) ≈ 2000ms — this assertion catches that floor
+    // collapse, which the W4(c) replay (synthProbe hardcodes fallback) cannot.
+    const term = makeAgentTerminal("Claude Code");
+    term.outputBuffer = ["Here is the summary of the change.", "> "]; // settled composer, no marker
+
+    let captured = -1;
+    const realSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (fn: any, ms?: number) => {
+      captured = ms ?? 0;
+      return realSetTimeout(() => {}, 100000) as any; // a real, cleanable handle that never fires fn
+    };
+    try {
+      (term as any).runProbeTick();
+    } finally {
+      (globalThis as any).setTimeout = realSetTimeout;
+    }
+
+    assert.strictEqual(term.status, "Running", "arming the debounce does not itself change status");
+    assert.strictEqual((term as any).lastConfidence, "fallback", "no working marker ⇒ a fallback no-child probe");
+    assert.strictEqual(
+      captured,
+      term.agentIdleTimeoutMs,
+      `the quiescence debounce must re-arm at the agentIdleTimeoutMs floor (${term.agentIdleTimeoutMs}ms), not a shortened authoritative floor`,
+    );
+    await term.stop();
   });
 });

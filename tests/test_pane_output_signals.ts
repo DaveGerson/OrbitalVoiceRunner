@@ -196,6 +196,25 @@ describe("BUG-031(c): get_pane_errors reports structured signals", () => {
     assert.ok(!res.warnings.some((l: string) => /50% linking|Compiling/.test(l)));
   });
 
+  // The AUTHORITATIVE pty exit code (captured in term.lastExitCode) must actually be surfaced
+  // AND preferred over the text-scraped one — a getPaneErrors that only ever reports the
+  // text-extracted code would pass the test above yet never expose the real captured code.
+  it("exposes and prefers the captured pty exit code over the text-extracted one", () => {
+    const m = setup();
+    m.terminals["errpane"].lastExitCode = 7; // real pty code, differs from the buffer's "code 1"
+    const res: any = m.getPaneErrors("errpane");
+    assert.strictEqual(res.exit_code, 7, "captured lastExitCode is surfaced and wins over the text 'code 1'");
+  });
+
+  // Zero-exit contract: a captured 0 must survive the merge (`?? `, not `||`). A `||` impl would
+  // wrongly fall through to the text-extracted "code 1" here.
+  it("does not drop a captured zero exit code (nullish merge, not falsy)", () => {
+    const m = setup();
+    m.terminals["errpane"].lastExitCode = 0; // clean exit; buffer's text 'code 1' must NOT override it
+    const res: any = m.getPaneErrors("errpane");
+    assert.strictEqual(res.exit_code, 0, "a captured 0 survives (a '||' merge would report 1)");
+  });
+
   it("returns a does-not-exist marker for an unknown pane", () => {
     const m = setup();
     const res: any = m.getPaneErrors("ghost");

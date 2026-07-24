@@ -205,6 +205,11 @@ export async function applyPaneMode(
     if (targetMode === "Full Auto") drainPaneOnPromotion(paneId, deps);
     deps.broadcast({ type: "settings_updated", paneId, permissionsMode: targetMode });
     deps.broadcast({ type: "terminals_updated", paneId });
+    // BUG-018: a client-facing autonomy-change frame, emitted ONLY here inside execute()'s success
+    // block — i.e. on a CONFIRMED applied switch, never on a forbidden/deferred gate (those return
+    // before execute()). `from` is the PRE-change mode captured above; `to` is the target. It gives
+    // the frontend a dedicated hook to ring the "permission" earcon (a mode change you can HEAR).
+    deps.broadcast({ type: "permission_changed", paneId, from: fromMode, to: targetMode });
     return { ok: true, kind: plan.kind, reason: `Pane ${paneId} mode set to ${targetMode}.` };
   };
 

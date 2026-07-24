@@ -278,6 +278,18 @@ const CommandBlockedFrame = z.object({
   reason: z.string().optional(),
 }).passthrough();
 
+/** BUG-018 — src/applyPaneMode.ts execute() success block — `{paneId, from, to}`, emitted ONLY on a
+ *  CONFIRMED applied mode switch (never on a forbidden/deferred gate). `from`/`to` are Mode strings
+ *  ("Full Auto"|"Human-in-the-Loop"|"Read-Only"|"Inherit"); kept as loose optional strings per the
+ *  catalog's deliberate passthrough posture. Consumed by Kitchen's handleObserveFrame → rings the
+ *  "permission" earcon. */
+const PermissionChangedFrame = z.object({
+  type: z.literal("permission_changed"),
+  paneId: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+}).passthrough();
+
 /** src/announcementBus.ts toNotification (flush()) — `{id, kind, terminalId, severity, message, timestamp}`. */
 const ProactiveNotificationFrame = z.object({
   type: z.literal("proactive_notification"),
@@ -475,6 +487,7 @@ export const FRAME_SCHEMAS = {
   action_resolved: ActionResolvedFrame,
   command_auto_executed: CommandAutoExecutedFrame,
   command_blocked: CommandBlockedFrame,
+  permission_changed: PermissionChangedFrame,
   proactive_notification: ProactiveNotificationFrame,
   proactive_earcon: ProactiveEarconFrame,
   error: ErrorFrame,

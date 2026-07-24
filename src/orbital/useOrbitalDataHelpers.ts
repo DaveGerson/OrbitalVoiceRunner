@@ -23,8 +23,8 @@ export const OBSERVE_FRAME_TYPES = [
   "plans_updated", "attention_updated", "templates_updated", "layouts_updated", "handoffs_updated",
   "settings_updated", "switch_active_pane", "frozen", "stop_all", "approval_pending",
   "approval_resolved", "action_pending", "action_resolved", "command_auto_executed",
-  "command_blocked", "proactive_notification", "proactive_earcon", "error", "daemon_state",
-  "action_activity",
+  "command_blocked", "permission_changed", "proactive_notification", "proactive_earcon", "error",
+  "daemon_state", "action_activity",
 ] as const;
 
 export const VOICE_FRAME_TYPES = [
@@ -35,8 +35,10 @@ export const VOICE_FRAME_TYPES = [
 // ── handleObserveFrame helpers ───────────────────────────────────────────
 
 // Frame-type → hands-free earcon (UX_BRIEF §4: eyes-off, a state change with no sound is a bug).
-// Only the two attention-worthy lifecycle frames chime: an open approval (a pane needs you) rings
-// the falling "alert"; a finished pane plays the rising "completion" pair. Everything else is null.
+// The attention-worthy lifecycle frames each ring a DISTINCT tone so an eyes-off operator can tell
+// them apart: an open approval (a pane needs you) rings the falling "alert"; a held-back command
+// rings the darker "blocked"; an autonomy transition rings the crisp "permission". A finished pane
+// plays the rising "completion" pair (keyed on pane_transition below). Everything else is null.
 //
 // IMPORTANT — frame shapes the server ACTUALLY emits (verified against src/observe/index.ts):
 //   • `approval_pending` is a real top-level frame type → maps straight here.
@@ -45,6 +47,11 @@ export const VOICE_FRAME_TYPES = [
 //     tone is keyed on that transition value in `earconForObserveFrame`, NOT on a frame type here.
 const FRAME_EARCON: Record<string, EarconType> = {
   approval_pending: "alert",
+  // BUG-018: differentiate the attention lifecycle. A held-back command rings the darker "blocked"
+  // (was the warn→alert default), and an autonomy transition rings the crisp "permission" — both
+  // audibly distinct from approval_pending's "alert" so an eyes-off operator can tell them apart.
+  command_blocked: "blocked",
+  permission_changed: "permission",
 };
 
 /** The earcon a given observe-lane frame TYPE should play, or null for no tone. Type-keyed only —

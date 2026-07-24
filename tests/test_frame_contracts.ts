@@ -66,6 +66,7 @@ const EMITTED_FRAME_TYPES = [
   "action_resolved",                 // src/actions/defs/approvals_rest.ts:142/178, src/voiceApprovalRouting.ts:104/112/121, src/voice/spokenConfirm.ts:116/122, src/gating/index.ts:1374 (sweep)
   "command_auto_executed",           // server.ts:1217, src/dispatch/paneWrite.ts:259, src/gating/index.ts:1108 (WS_EVT.AUTO_EXECUTED)
   "command_blocked",                 // src/dispatch/paneWrite.ts:219/222, src/gating/index.ts:1113/1119/1138 (WS_EVT.BLOCKED)
+  "permission_changed",              // src/applyPaneMode.ts:208 (execute() success block — confirmed applied switch only)
   "proactive_notification",          // src/announcementBus.ts:322/338 (toNotification, flush())
   "proactive_earcon",                // src/announcementBus.ts:269 (deliver())
   "error",                           // src/voice/index.ts:813/2461/2519 (voice-socket-only)

@@ -57,6 +57,18 @@ describe("BUG-030(a): UniversalTerminal.getRecentOutput honors offset (older win
     assert.strictEqual(older[19], "line-040", "window ends 20 lines back from the tail");
     assert.ok(!older.includes("line-060"), "the older window must NOT contain the newest line");
   });
+
+  // Guard against a fix that honors `offset` but silently CLAMPS every window to 20 lines
+  // (all offset assertions above use limit=20, so they'd pass a limit->20 clamp unnoticed).
+  it("limit=50 returns a 50-line window (limit is honored, NOT clamped to the default 20)", () => {
+    const t: any = new UniversalTerminal("sumwin-t2", ".", "shell");
+    feed(t, sixtyLines());
+    const win = t.getRecentOutput(50, 0).split("\n");
+    assert.strictEqual(win.length, 50, "limit=50 yields 50 lines, not clamped to 20");
+    assert.strictEqual(win[0], "line-011", "50-line window reaches back to line-011");
+    assert.strictEqual(win[49], "line-060", "and still ends at the newest line");
+    assert.ok(!win.includes("line-010"), "exactly 50 lines back from the tail — line-010 is excluded");
+  });
 });
 
 describe("BUG-030(a): OrchestratorManager.getPaneSummary threads offset", () => {
@@ -82,6 +94,15 @@ describe("BUG-030(a): OrchestratorManager.getPaneSummary threads offset", () => 
     assert.match(s, /line-021/, "older window includes line-021");
     assert.match(s, /line-040/, "older window includes line-040");
     assert.ok(!/line-060/.test(s), "older window must NOT re-show the newest line");
+  });
+
+  // The validation JSON's explicit ask: "assert get_pane_summary limit=50 returns >20 lines".
+  // Pins that `limit` is threaded as a real count, not accepted-then-clamped to 20.
+  it("limit=50 fences MORE than the default-20 window (limit honored, not clamped)", () => {
+    const s = setup().getPaneSummary("sumwin-m", 50, 0);
+    assert.match(s, /line-011/, "50-line window reaches back to line-011 (>20 lines)");
+    assert.match(s, /line-060/, "still includes the newest line");
+    assert.ok(!/line-010/.test(s), "window is exactly 50 lines, not the whole 60-line buffer");
   });
 });
 
