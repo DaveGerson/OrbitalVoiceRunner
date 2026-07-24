@@ -250,6 +250,11 @@ export interface ActionContext {
   /** The per-connection spoken utterance (server.ts:2233). propose_command uses it as the dispatch
    *  trigger (`currentSessionUserUtterance || "Spoken execute command"`). Empty string off the voice path. */
   userUtterance?: string;
+  /** REST caller workspace scope (BUG-017), threaded from the request by buildRestActionContext
+   *  (query `?workspaceId=` on GET / body `workspaceId` on POST). Undefined on voice/WS/test paths and
+   *  on scopeless REST requests — enforcement in the approve/reject + list handlers engages ONLY when
+   *  this is defined AND the pending has a workspace (back-compat: a scopeless request is unchanged). */
+  callerWorkspaceId?: string;
   broadcast: (msg: unknown) => void;
   /** Re-broadcast the ledger snapshot (server.ts:831 broadcastLedgerUpdate) — note/project mutators
    *  fan this out after a write so the UI refreshes. Injected so handlers don't reach into closures. */

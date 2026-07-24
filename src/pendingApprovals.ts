@@ -690,6 +690,20 @@ export class PendingApprovalStore {
     return this.sessions[messageId];
   }
 
+  /**
+   * BUG-017: the add()-time workspace scope for a pending, or undefined for an unknown id. Reads the
+   * existing `workspaceForId` map — no new state.
+   *
+   * ENFORCEMENT DEPENDENCY: `workspaceForId` is populated ONLY when a durable JanusStore is present
+   * (add() populates it iff `this.store` is set; hydrateFromStore repopulates it for cold survivors).
+   * A scopeless in-memory store returns undefined here, which correctly DISABLES cross-workspace
+   * enforcement in the REST approve/list handlers (a pending whose workspace is unknown is foreign to
+   * nobody). So the REST scoping built on this accessor is live only on a real durable server boot.
+   */
+  workspaceFor(messageId: string): string | undefined {
+    return this.workspaceForId[messageId];
+  }
+
   has(messageId: string): boolean {
     return messageId in this.records;
   }

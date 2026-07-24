@@ -386,17 +386,24 @@ export function classifySecrets(text: string): SecretScan {
 }
 
 /**
- * Issue B: default gap (ms) between writing a submitted command's BODY and its terminating CR, so a
- * ConPTY-hosted TUI (Claude Code) reads the CR as a DISCRETE Enter keypress rather than absorbing it
- * into a paste burst. A combined `body + "\r"` write submits SHORT prompts fine, but for longer /
- * multi-clause instructions Claude's paste-burst detector treats the whole chunk (incl. the trailing
- * CR) as pasted text, so the CR lands as a literal newline in the composer and the prompt sits
- * staged-but-unsubmitted (reproduced via smoke:claude with a ~280-char prompt). 0 disables the gap
- * (synchronous two-write). Override via JANUS_PTY_SUBMIT_DELAY_MS.
+ * Issue B / BUG-042: default gap (ms) between writing a submitted command's BODY and its terminating
+ * CR, so a ConPTY-hosted TUI (Claude Code) reads the CR as a DISCRETE Enter keypress rather than
+ * absorbing it into a paste burst. A combined `body + "\r"` write submits SHORT prompts fine, but for
+ * longer / multi-clause instructions Claude's paste-burst detector treats the whole chunk (incl. the
+ * trailing CR) as pasted text, so the CR lands as a literal newline in the composer and the prompt
+ * sits staged-but-unsubmitted (reproduced via smoke:claude with a ~280-char prompt).
+ *
+ * BUG-042 fix: the default floor is raised 20 -> 60ms (20ms was too short for a long ConPTY paste
+ * burst to drain before the CR). On the PACED path deliverSubmit further SCALES the pre-CR gap with
+ * body length — effectiveGap = max(submitEnterDelayMs, ceil(command.length / 4)) — so a longer prompt
+ * gets a strictly larger gap (a 280-char body -> 70ms > the 60ms floor). Scaling only ever RAISES the
+ * gap, never lowers it (max, not min); a larger configured floor still wins. 0 disables the gap
+ * (synchronous two-write opt-out; scaling does NOT apply on that branch). Override via
+ * JANUS_PTY_SUBMIT_DELAY_MS (a finite value >= 0 wins; 0 keeps the synchronous opt-out).
  */
 const DEFAULT_PTY_SUBMIT_DELAY_MS = (() => {
   const n = Number(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
-  return Number.isFinite(n) && n >= 0 ? n : 20;
+  return Number.isFinite(n) && n >= 0 ? n : 60;
 })();
 
 // wsm-e2e-pinned-ztd: tagged entry for UniversalTerminal's pre-spawn-ready queue — 'submit' bytes
@@ -1186,6 +1193,10 @@ export class UniversalTerminal {
       this.transport.write("\r");
       return;
     }
+    // BUG-042: on the PACED path, scale the pre-CR gap with body length so a longer prompt gives
+    // ConPTY more time to drain the paste burst before the CR arrives as its own discrete read. The
+    // max() ensures scaling only ever RAISES the gap (never clamps a larger configured floor down).
+    const gap = Math.max(this.submitEnterDelayMs, Math.ceil(command.length / 4));
     this.submitChain = this.submitChain.then(
       () =>
         new Promise<void>((resolve) => {
@@ -1194,7 +1205,7 @@ export class UniversalTerminal {
           setTimeout(() => {
             if (this.transport) this.transport.write("\r");
             resolve();
-          }, this.submitEnterDelayMs);
+          }, gap);
         }),
     );
   }
