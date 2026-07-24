@@ -61,14 +61,20 @@ const OptionalPaneIdParams = z.object({
  */
 const PaneSummaryParams = z.object({
   pane_id: z.string(),
-  limit: z.number().int().min(1).max(500).optional(),
-  offset: z.number().int().min(0).optional(),
+  // FC(4): this def is ALSO a REST GET (rest.path below), where query args arrive as STRINGS —
+  // a plain z.number() rejects "50" -> 400. z.coerce.number() parses the string first (matching the
+  // src/actions/defs/observability.ts:57-62 convention), while .int().min().max() keep OUT-OF-RANGE
+  // values REJECTIONS (throws at parse), NOT silent clamps. undefined still short-circuits (.optional).
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
 });
 
 /** BUG-030(b): search_pane_output — a required keyword alongside the pane id. */
 const SearchPaneOutputParams = z.object({
   pane_id: z.string(),
-  keyword: z.string(),
+  // FC(3): min(1) — an empty keyword matches EVERY line (includes("") is always true), turning a
+  // targeted scrollback search into a full dump; reject "" at parse.
+  keyword: z.string().min(1),
 });
 
 /** The shape one .janus_history.json entry carries (mirrors server.ts:93 HistoryEntry). */

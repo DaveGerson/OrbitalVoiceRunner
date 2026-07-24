@@ -410,10 +410,19 @@ export function classifySecrets(text: string): SecretScan {
  * (synchronous two-write opt-out; scaling does NOT apply on that branch). Override via
  * JANUS_PTY_SUBMIT_DELAY_MS (a finite value >= 0 wins; 0 keeps the synchronous opt-out).
  */
-const DEFAULT_PTY_SUBMIT_DELAY_MS = (() => {
-  const n = Number(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
+/**
+ * BUG-042: resolve the submit-delay floor from an env value. An empty / whitespace-only string is
+ * UNSET (-> 60ms default), NOT zero — `Number("") === 0` would otherwise pass the `>= 0` guard and
+ * SILENTLY disable pacing (long prompts left staged-but-unsubmitted). An explicit "0" is still
+ * honored as the synchronous two-write opt-out. Any non-finite / negative value also falls to 60.
+ * Exported so the empty-vs-"0" contract is unit-testable without re-evaluating the module const.
+ */
+export function resolveSubmitDelayMs(raw: string | undefined): number {
+  if (raw == null || raw.trim() === "") return 60;
+  const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : 60;
-})();
+}
+const DEFAULT_PTY_SUBMIT_DELAY_MS = resolveSubmitDelayMs(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
 
 // wsm-e2e-pinned-ztd: tagged entry for UniversalTerminal's pre-spawn-ready queue — 'submit' bytes
 // need the deliverSubmit body/CR split, 'raw' bytes must flush verbatim (no CR appended).
@@ -959,6 +968,13 @@ export class UniversalTerminal {
       try { orphan.kill("SIGKILL"); } catch { /* already dead */ }
     }
 
+    // BUG-031: this is a FRESH run — clear the PRIOR run's captured exit code. transport.onExit (the
+    // ONLY setter of lastExitCode) will not fire until THIS spawn ends, so without the reset a
+    // just-restarted (now-running) pane would report the previous run's exit code via get_pane_errors.
+    // Reset here, near the transport swap and BEFORE the (possibly degraded) spawn, so even a failed
+    // respawn cannot surface a stale code.
+    this.lastExitCode = undefined;
+
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
     // QW2: pty.spawn throws SYNCHRONOUSLY on native/ENOENT failures and propagates
     // out through createPtyTransport. Guard the single spawn chokepoint so a failed
@@ -1226,10 +1242,15 @@ export class UniversalTerminal {
     this.submitChain = this.submitChain.then(
       () =>
         new Promise<void>((resolve) => {
-          if (!this.transport) { resolve(); return; }
-          this.transport.write(command);
+          // BUG-042: capture the transport IDENTITY at body-write time. The gap is length-scaled and
+          // can outlast a restart that swaps in a NEW transport; the deferred CR must fire ONLY if the
+          // SAME transport is still current — a bare `if (this.transport)` check would write a stray
+          // \r into the new pane. Body + CR both target the captured `t`, CR gated on identity.
+          const t = this.transport;
+          if (!t) { resolve(); return; }
+          t.write(command);
           setTimeout(() => {
-            if (this.transport) this.transport.write("\r");
+            if (this.transport === t) t.write("\r");
             resolve();
           }, gap);
         }),
@@ -1834,6 +1855,18 @@ export class OrchestratorManager {
     sessionId = "",
     projectId = ""
   ): string {
+    // FC(2) security: the pane id is caller/model-supplied (create_pane, recipes, layouts) and is
+    // interpolated into the pane's scrollback FILENAME `.janus_scrollback_<id>.log` at THREE sites
+    // (loadScrollback / appendScrollback / searchScrollback). A traversal id (`../../x`, `..\x`) would
+    // — on Windows especially, via lexical `..` normalization — let search_pane_output read OUTSIDE the
+    // workspace. Validate the charset HERE at the single creation choke-point rather than basename-
+    // pinning one call site: it is the source guard, so it neutralizes every derived filename at once
+    // (and every existing pane id — term-1, pane_1, claude_1, recipe/layout ids — already conforms).
+    // The allowed set excludes BOTH separators (`/` `\`) and `:`, so no id can form a path segment,
+    // drive-relative path, or NTFS ADS — traversal is structurally impossible.
+    if (!/^[A-Za-z0-9_.-]+$/.test(terminalId)) {
+      return `Invalid pane id '${terminalId}': only letters, digits, and _ . - are allowed.`;
+    }
     if (this.terminals[terminalId]) {
       return `Terminal '${terminalId}' already exists.`;
     }
@@ -2103,7 +2136,11 @@ export class OrchestratorManager {
     if (!term) {
       return { error: `Pane ${paneId} does not exist.` };
     }
-    const signals = extractOutputSignals(term.getRecentOutput(term.maxBufferLines));
+    // BUG-031: extractOutputSignals is documented to receive ALREADY-ANSI-STRIPPED text, but
+    // loadScrollback (start()) seeds outputBuffer from the RAW scrollback file (ANSI intact), so the
+    // ring can carry escape bytes after a restart. Strip defensively here (as runProbeTick already
+    // does) so returned error lines are escape-free and an ANSI-split secret can't dodge redaction.
+    const signals = extractOutputSignals(stripAnsiSequences(term.getRecentOutput(term.maxBufferLines)));
     return {
       pane_id: paneId,
       errors: signals.errors,
