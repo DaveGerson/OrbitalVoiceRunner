@@ -577,6 +577,13 @@ ${redact(rawOutput.slice(-3000))}`;
     if (!activeId) return;
     const tail = idleHistoryTail(terminalId);
     if (settleIdleEnvelope(terminalId, tail.output)) return;
+    // neg1 (§5.3 mis-settle fix): the envelope path above is already correlation-safe (it requires
+    // the echoed exchange_id to match), but the legacy prose heuristic below is NOT — it reads
+    // whatever the pane's most recent output tail happens to be. If the last command written to
+    // this pane was a MANUAL write (recordManualCommand, exchangeId null) rather than this
+    // exchange's own delivery, that output tail belongs to the manual command, not to the
+    // exchange — never let the legacy heuristic settle off it.
+    if (!getExchangeService().lastCommandBelongsToActiveExchange(terminalId)) return;
     const eligible = legacyCompletionEligible({
       exchangeState: getExchangeService().get(activeId)?.state,
       command: tail.command,

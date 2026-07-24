@@ -122,6 +122,18 @@ export function enforcementOf(cap: Capability): CapabilityEnforcement {
  * Returns the de-duplicated set of every ActionDef.capability, with the ALWAYS_ALLOWED sentinel
  * removed (it is not a matrix row). Order is first-seen across the registry. This REPLACES the
  * hand-maintained gateSurface.ALL_CAPABILITIES.
+ *
+ * BEAD qtr6 — reconciling the 27-vs-26 capability count: there are TWO legitimate counts, each
+ * authoritative for a different audience, and this function's output is the SMALLER one.
+ *   - 27 = CAPABILITY_DEFS.length — the operator-tunable gate matrix (the settings surface); every
+ *     row, including `deliver_handoff`, gets an Auto/Ask/Off dial.
+ *   - 26 = deriveCapabilities(REGISTRY).length — the registry-derived CI catalog count rendered by
+ *     scripts/catalog.ts ("26 gated capabilities").
+ * The single-row delta is `deliver_handoff`: its ActionDef declares `capability: ALWAYS_ALLOWED`
+ * (see src/actions/defs/handoff.ts), so runAction does not double-gate it here — its real gate is
+ * delegated to `ctx.dispatchProposal({ capability: 'deliver_handoff' })`. That makes it invisible
+ * to this registry-walk (26) while still present as a tunable matrix row (27). No behavior change
+ * either way — this is purely which count to quote to which audience.
  */
 export function deriveCapabilities(registry: readonly ActionDef[]): Capability[] {
   const seen = new Set<Capability>();

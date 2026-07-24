@@ -6,7 +6,7 @@ import type { StoredPane, StoredPendingApproval, StoredPendingAction, StoredHand
 import type {
   PaneRow, ArchivedPaneRow, ProjectRow, NoteRow, PendingApprovalRow, PendingActionRow,
   AttentionRow, HandoffRow, ValueRow, CountRow, IdRow, SearchHitRow,
-  AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow,
+  AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow, TranscriptRow,
 } from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
 import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState, ExchangeEventType } from "../exchanges/types";
@@ -1849,6 +1849,55 @@ export class JanusStore {
       ).all(since, limit) as ContextDeliveryRow[]).map(r => ({ ...r }));
     } catch (e) {
       console.error("[store] getContextDeliveries failed:", e);
+      return [];
+    }
+  }
+
+  // ── transcripts (schema v13, bead 98f2 — durable transcript sink) ───────────────────────────────
+  // OPT-IN observability: a transcript row is useful-but-not-critical (mirrors recordContextInjection/
+  // insertContextDelivery's contract exactly) — a DB fault on the voice hot path must degrade, never
+  // throw. The store does NOT redact: `text_redacted` is persisted VERBATIM — the caller
+  // (src/transcripts/sink.ts) is the redaction boundary, exactly like exchange_events.
+
+  /** Append one transcript row. Fail-soft: swallows + console.error on any DB error — a sink/store
+   *  fault must never break the voice hot path that feeds it. */
+  recordTranscript(input: {
+    channel: "operator" | "model";
+    text_redacted: string;
+    session_id?: string | null;
+    project_id?: string | null;
+    pane_id?: string | null;
+    interaction_id?: string | null;
+    ts?: number;
+  }): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO transcripts(ts,channel,session_id,project_id,pane_id,interaction_id,text_redacted)
+         VALUES(@ts,@channel,@session_id,@project_id,@pane_id,@interaction_id,@text_redacted)`
+      ).run({
+        ts: input.ts ?? Date.now(),
+        channel: input.channel,
+        session_id: input.session_id ?? null,
+        project_id: input.project_id ?? null,
+        pane_id: input.pane_id ?? null,
+        interaction_id: input.interaction_id ?? null,
+        text_redacted: input.text_redacted,
+      });
+    } catch (e) {
+      console.error("[store] recordTranscript failed:", e);
+    }
+  }
+
+  /** Transcript rows since `sinceMs` (ts >=), oldest first (ts ASC, id tiebreak — mirrors
+   *  `listExchangeEventsSince`'s ordering). Fail-soft: an unexpected DB error yields an empty array. */
+  listTranscriptsSince(sinceMs: number, opts: { limit?: number } = {}): TranscriptRow[] {
+    const limit = opts.limit ?? 1_000_000;
+    try {
+      return (this.db.prepare(
+        "SELECT * FROM transcripts WHERE ts >= ? ORDER BY ts ASC, id ASC LIMIT ?"
+      ).all(sinceMs, limit) as TranscriptRow[]).map(r => ({ ...r }));
+    } catch (e) {
+      console.error("[store] listTranscriptsSince failed:", e);
       return [];
     }
   }

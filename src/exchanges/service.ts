@@ -453,6 +453,28 @@ export class ExchangeService {
   }
 
   /**
+   * neg1 (§5.3 mis-settle fix): does the MOST RECENT command-log entry for this pane belong to the
+   * pane's own currently-active exchange? A pure read over the existing `paneActive` +
+   * `commandLogs` maps — no CAS, no store write, no redaction surface touched.
+   *
+   * This is the correlation signal `settleTerminalOutcome` (src/observe/index.ts) needs before
+   * trusting the conservative legacy prose heuristic: without it, a manual command typed directly
+   * into a pane whose exchange is parked at `terminal_idle` could settle that exchange off the
+   * MANUAL command's own output tail (a "Done." line the manual command itself printed), even
+   * though that output has nothing to do with the delivered instruction. Returns `false` — never
+   * throws — when there is no active exchange on the pane, or no command has been logged for it
+   * at all; both are "nothing to correlate against", the same conservative answer as a genuine
+   * mismatch.
+   */
+  lastCommandBelongsToActiveExchange(paneId: string): boolean {
+    const activeId = this.paneActive.get(paneId);
+    if (!activeId) return false;
+    const log = this.commandLogs.get(paneId);
+    if (!log || log.length === 0) return false;
+    return log[log.length - 1].exchangeId === activeId;
+  }
+
+  /**
    * Boot recovery: quarantine every uncertain in-flight exchange this IN-MEMORY machine still
    * knows about (delegates to the machine), then clear the active-pane binding UNCONDITIONALLY —
    * the correlator's binding is cleared on boot (spec §4 hard rules), so no post-boot pane signal

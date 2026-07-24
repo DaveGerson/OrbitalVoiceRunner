@@ -99,7 +99,11 @@ export { COMPLETION_REQUEST_LINE };
 //                    finalResponse heuristic in src/observe/index.ts. Both funnel into the exact
 //                    same trust boundary and settlement path (ExchangeService.recordReportedOutcome)
 //                    — "request" changes nothing about HOW a report is validated, only that callers
-//                    are told it is worth inviting one.
+//                    are told it is worth inviting one. (neg1) "request" mode now ALSO does one more
+//                    thing, still coherence-only: `withExchangeCorrelationHint` (below) appends the
+//                    live delivery's OWN exchange_id to that same one invitation line, in prose, so
+//                    an agent that answers with a structured envelope has an id to echo — it is
+//                    STILL the one existing invitation line, not a second competing prompt.
 export type ResultEnvelopeMode = "off" | "accept" | "request";
 
 const RESULT_ENVELOPE_MODES: readonly ResultEnvelopeMode[] = ["off", "accept", "request"];
@@ -334,6 +338,61 @@ function pickLastValidCandidate(
  * against the pane's own active delivery marker before applying anything — this function has no
  * pane/exchange context to do that itself.
  */
+// ── neg1: live correlation — give a LIVE agent its own exchange_id to echo back ─────────────────
+//
+// The rendered instruction delivered to an agent never included its own exchange_id, so a live
+// agent had no correlatable id to echo in a result envelope — `scanForResultEnvelope` only ever
+// settled PLANTED/fixture reports (a test hand-crafting `{"exchange_id": <the real id>, ...}`).
+// This closes that gap: under "request" mode, append the id to the ONE existing invitation line
+// (`COMPLETION_REQUEST_LINE`) as PROSE, never as a second JSON-shaped prompt.
+
+/** Request-mode-only suffix appended to `COMPLETION_REQUEST_LINE` so a LIVE agent knows its OWN
+ *  exchange id to echo back in a result envelope. Deliberately prose, not JSON — it never spells
+ *  the literal quoted key `"exchange_id"` (uses "exchange id" with a space) so the appended hint
+ *  itself can never be mistaken for, or self-echo-parsed as, a candidate result envelope by
+ *  `scanForResultEnvelope`'s own `"exchange_id"` prefilter. */
+export function COMPLETION_REQUEST_EXCHANGE_HINT(exchangeId: string): string {
+  return `(this exchange id: ${exchangeId})`;
+}
+
+/**
+ * Live correlation (neg1): append the exchange id, in prose, to the ONE existing completion-
+ * request invitation line so a live terminal agent can echo a correlatable result envelope back.
+ *
+ * A no-op — `rendered` returned byte-identical — unless ALL of:
+ *   - `mode === "request"` (accept/off never get the hint — only request mode invites a report);
+ *   - `exchangeId` is a non-empty string;
+ *   - `rendered` actually contains `COMPLETION_REQUEST_LINE` (a Custom/bare-shell render with
+ *     `requestCompletionEnvelope: false` never gets a correlation hint it never asked for).
+ *
+ * `mode` defaults to the module-cached `RESULT_ENVELOPE_MODE` (the established read-once-at-boot
+ * idiom) — callers may pass an explicit mode for tests, but production call sites never re-read
+ * `process.env` here.
+ */
+export function withExchangeCorrelationHint(
+  rendered: string,
+  exchangeId: string | null | undefined,
+  mode: ResultEnvelopeMode = RESULT_ENVELOPE_MODE,
+  maxChars?: number,
+): string {
+  if (mode !== "request") return rendered;
+  if (!exchangeId) return rendered;
+  if (!rendered.includes(COMPLETION_REQUEST_LINE)) return rendered;
+  const hinted = rendered.replace(
+    COMPLETION_REQUEST_LINE,
+    `${COMPLETION_REQUEST_LINE} ${COMPLETION_REQUEST_EXCHANGE_HINT(exchangeId)}`,
+  );
+  // neg1 (adversarial-review fix): the correlation hint is best-effort request-mode framing, and
+  // callers validated the PRE-hint text against the pane's size ceiling (`maxChars`) — the ~30-char
+  // hint must NEVER push the DELIVERED text past that ceiling (spec §6.2: over-limit is refused, never
+  // silently truncated). When a `maxChars` budget is supplied and appending the hint would exceed it,
+  // drop the hint and deliver the un-hinted, already-in-bounds text: correlation is optional, staying
+  // within the size contract is not. Omitting `maxChars` preserves the prior unbounded behavior (used
+  // by the pure unit tests, which don't model a pane cap).
+  if (maxChars !== undefined && hinted.length > maxChars) return rendered;
+  return hinted;
+}
+
 export function scanForResultEnvelope(text: string, opts: ScanOptions = {}): ScanResult {
   const { mode, maxScanChars, maxCandidates, redact } = resolveScanOptions(opts);
   if (!resultEnvelopeActive(mode) || !text) {

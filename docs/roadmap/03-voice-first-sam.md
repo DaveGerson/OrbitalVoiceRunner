@@ -1,5 +1,11 @@
 # Voice-First Assessment — Orbital Harness / Janus Terminal Orchestrator
 
+> ⚠️ **HISTORICAL ASSESSMENT — round one, 2026-05-28. SUPERSEDED — DO NOT READ AS CURRENT FACT.**
+> This review's headline blockers (no voice-approval path, dead transcripts, blind approvals,
+> orphaned approvals) were RESOLVED on `main` after PR134. The prose below is preserved as a
+> historical artifact, not a current assessment. For the current forward wishlist, see
+> `docs/roadmap/next-level/`.
+
 **Reviewer persona:** Sam Rivera, voice-first developer. I drive my dev work by speech, often
 away from the keyboard (RSI). I do not care about how pretty the UI is — I care whether the
 loop *mic → PCM → WebSocket → Gemini → audio back + tool calls* actually closes, whether I can

@@ -229,6 +229,32 @@ describe("exchange correlation: legacy/manual commands are never adopted", () =>
     svc.recordManualCommand("pane-1", "ls -la");
     assert.equal(svc.get(id)!.state, "delivered", "a manual write is not an exchange event");
   });
+
+  // neg1: lastCommandBelongsToActiveExchange — the §5.3 mis-settle guard's correlation signal.
+  it("lastCommandBelongsToActiveExchange: true right after a delivery (the last command-log entry IS the active marker)", () => {
+    const svc = new ExchangeService();
+    delivered(svc, "pane-1");
+    assert.equal(svc.lastCommandBelongsToActiveExchange("pane-1"), true);
+  });
+
+  it("lastCommandBelongsToActiveExchange: false after a subsequent manual write breaks correlation", () => {
+    const svc = new ExchangeService();
+    delivered(svc, "pane-1");
+    svc.recordManualCommand("pane-1", "ls");
+    assert.equal(svc.lastCommandBelongsToActiveExchange("pane-1"), false);
+  });
+
+  it("lastCommandBelongsToActiveExchange: false when there is no active exchange on the pane at all", () => {
+    const svc = new ExchangeService();
+    svc.recordManualCommand("pane-1", "ls");
+    assert.equal(svc.lastCommandBelongsToActiveExchange("pane-1"), false);
+  });
+
+  it("lastCommandBelongsToActiveExchange: false when no commands have been logged yet for a bound pane", () => {
+    const svc = new ExchangeService();
+    // No commands logged at all for this pane (nothing has been delivered or typed).
+    assert.equal(svc.lastCommandBelongsToActiveExchange("pane-never-touched"), false);
+  });
 });
 
 describe("exchange correlation: recovery never invents history", () => {

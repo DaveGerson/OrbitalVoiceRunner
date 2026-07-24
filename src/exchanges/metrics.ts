@@ -19,7 +19,11 @@
 //     TRIPWIRE, not unwired); (b) `clarificationCauses` counts only POST-exchange clarifies — the
 //     target resolver's own pre-exchange "which pane did you mean" turn cannot carry an exchange
 //     event (exchange_events.exchange_id is NOT NULL; decision of record in
-//     docs/review/2026-07-10-release-validation-5.5.md).
+//     docs/review/2026-07-10-release-validation-5.5.md; see `CLARIFICATION_PRE_EXCHANGE_NOTE`).
+//   - `target_resolved` is CO-TIMESTAMPED with `exchange_created` at mint time (persistCreate stamps
+//     both at `snap.createdAt`), so it is EXCLUDED from `DRAFT_MILESTONE_EVENT_TYPES` below — including
+//     it produced a constant-0 `speechToDraftLatency` sample on every live exchange (the mint-time
+//     resolve, not a genuine forward-progress signal). See `SPEECH_TO_DRAFT_LATENCY_NOTE`.
 //   - `delivery_succeeded`/`delivery_failed` events do not carry `draft_version` in their payload
 //     today (`ExchangeService.completeDelivery`/`failDelivery` append them with no `opts.payload`) —
 //     `duplicateDeliveries` is therefore derived from EVENT ADJACENCY (two `delivery_succeeded`
@@ -221,8 +225,12 @@ function countDraftEditsPerExchange(events: ExchangeEvent[]): Record<string, num
 
 // ── latency metrics ──────────────────────────────────────────────────────────────────────────────
 
+// `target_resolved` deliberately excluded (see the module-header EVENT-VOCABULARY CAVEATS): it is
+// co-timestamped with `exchange_created` at mint (persistCreate), so counting it as a milestone
+// produced a constant-0 `speechToDraftLatency` sample on every live exchange — an artifact of
+// synchronous draft resolution, not a genuine forward-progress signal.
 const DRAFT_MILESTONE_EVENT_TYPES: ReadonlySet<ExchangeEventType> = new Set([
-  "draft_revised", "target_resolved", "approval_requested", "delivery_attempted",
+  "draft_revised", "approval_requested", "delivery_attempted",
 ]);
 
 function computeSpeechToDraftLatency(byExchange: Map<string, ExchangeEvent[]>): LatencyStats | null {
@@ -325,6 +333,22 @@ export const NOTIFICATION_LATENCY_NOTE =
   "src/exchanges/replay.ts's terminalTransitions/resultSummaries for those), not the notification's " +
   "own timestamp.";
 
+export const SPEECH_TO_DRAFT_LATENCY_NOTE =
+  "speechToDraftLatency excludes target_resolved from its draft-milestone set: persistCreate " +
+  "(src/exchanges/service.ts) appends target_resolved CO-TIMESTAMPED with exchange_created at mint " +
+  "time (every exchange is minted with an already-resolved target), so counting it as a milestone " +
+  "produced a constant-0 sample on all live traffic. A null/absent sample means the exchange never " +
+  "moved past its mint-time resolve (draft_revised / approval_requested / delivery_attempted) within " +
+  "the report window — never fabricated as 0.";
+
+export const CLARIFICATION_PRE_EXCHANGE_NOTE =
+  "clarificationCauses counts only POST-mint clarifies (the dispatch_clarify seam, recordClarification" +
+  "Requested called from src/voice/index.ts settleExchangeForDispatch). The target resolver's / focus " +
+  "resolver's own PRE-exchange \"which pane did you mean\" clarify (src/voice/targetResolver.ts) fires " +
+  "BEFORE any exchange exists, and exchange_events.exchange_id is NOT NULL, so that turn cannot carry " +
+  "an exchange event — it is not counted here, by schema, not by omission (decision of record: " +
+  "docs/review/2026-07-10-release-validation-5.5.md).";
+
 /**
  * Build the deterministic communication-quality metrics report (task B) from durable rows/events in
  * `[sinceMs, +inf)`. Deterministic: given the same rows, always returns the same JSON.
@@ -362,6 +386,11 @@ export function buildExchangeMetricsReport(
     resultNotificationLatency: null,
     contextCost: computeContextCost(exchanges, deliveries),
     recoveryState: computeRecoveryState(exchanges, events),
-    notes: [UNCORRELATED_COMPLETIONS_NOTE, NOTIFICATION_LATENCY_NOTE],
+    notes: [
+      UNCORRELATED_COMPLETIONS_NOTE,
+      NOTIFICATION_LATENCY_NOTE,
+      SPEECH_TO_DRAFT_LATENCY_NOTE,
+      CLARIFICATION_PRE_EXCHANGE_NOTE,
+    ],
   };
 }

@@ -10,6 +10,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 import { REGISTRY } from "../src/actions/registry";
@@ -608,5 +611,47 @@ describe("§8.4 migrated proof tools (both gating styles)", () => {
     assert.strictEqual(result.kind, "ok");
     assert.match((result as { output: string }).output, /gated Off/i);
     assert.deepStrictEqual(calls.amended, [], "Off must not mutate");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BEAD qtr6 — 27-vs-26 capability count reconciliation.
+//
+// CAPABILITY_DEFS (the operator-tunable gate matrix) has 27 rows while
+// deriveCapabilities(REGISTRY) (the registry-derived CI catalog) yields 26, because
+// deliver_handoff is registry-level ALWAYS_ALLOWED (its real gate is delegated to
+// ctx.dispatchProposal(capability:'deliver_handoff')) and is therefore never emitted by
+// deriveCapabilities. This discrepancy confused external docs once; these tests pin (a) that the
+// deriveCapabilities() site carries an authoritative explanatory comment, and (b) the exact
+// 27-vs-26 delta so the comment can never silently drift out of truth.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("BEAD qtr6: 27-vs-26 capability count reconciliation", () => {
+  it("the deriveCapabilities() site carries an authoritative comment explaining the 27-vs-26 split", () => {
+    const HERE = path.dirname(fileURLToPath(import.meta.url));
+    const src = fs.readFileSync(path.resolve(HERE, "..", "src", "actions", "capabilities.ts"), "utf8");
+    const marker = "export function deriveCapabilities";
+    const idx = src.indexOf(marker);
+    assert.notStrictEqual(idx, -1, "deriveCapabilities() must exist in src/actions/capabilities.ts");
+    const window = src.slice(Math.max(0, idx - 900), idx);
+    for (const needle of ["27", "26", "deliver_handoff", "tunable", "catalog"]) {
+      assert.ok(
+        window.toLowerCase().includes(needle.toLowerCase()),
+        `comment immediately above deriveCapabilities() must mention "${needle}" (authoritative 27-vs-26 explanation)`,
+      );
+    }
+  });
+
+  it("reconciliation lock: CAPABILITY_DEFS=27, deriveCapabilities(REGISTRY)=26, delta is exactly deliver_handoff", () => {
+    assert.strictEqual(CAPABILITY_DEFS.length, 27, "CAPABILITY_DEFS (operator-tunable matrix) must have 27 rows");
+    const derived = deriveCapabilities(REGISTRY);
+    assert.strictEqual(derived.length, 26, "deriveCapabilities(REGISTRY) (registry-derived catalog) must yield 26");
+
+    const derivedSet = new Set(derived);
+    const onlyInDefs = CAPABILITY_DEFS.map((d) => d.id).filter((id) => !derivedSet.has(id));
+    assert.deepStrictEqual(
+      onlyInDefs,
+      ["deliver_handoff"],
+      "the entire 27-vs-26 discrepancy must be exactly deliver_handoff (registry-level ALWAYS_ALLOWED)",
+    );
   });
 });

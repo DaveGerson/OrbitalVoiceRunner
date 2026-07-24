@@ -24,6 +24,7 @@ import assert from "node:assert";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";
@@ -786,5 +787,29 @@ describe("US-1.5 Capturing launch intent (P1)", () => {
 // Close the shared undici (fetch) keep-alive pool ONCE, after every server suite has finished, so its
 // socket can't linger into --test-force-exit's process.exit() — without breaking mid-file fetches.
 after(async () => { await closeFetchPool(); });
+
+// bead 1p84 regression: every one of the five stories above chdirs into its own mkdtemp cwd before
+// loadLiveHelpers()/server.ts is ever evaluated (see the header + loadLiveHelpers() doc comment),
+// so the process-wide JanusStore singleton should root its .janus.db in a per-suite tmpdir —
+// NEVER at the repo checkout. This is the concrete 1p84 symptom: on a stable-scratch-rooted store,
+// the repo root stays clean across the whole five-story file.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+after(() => {
+  // .janus.db stays a hard self-check: no suite in the battery leaks a repo-root DB, and each of
+  // EPIC 01's five stories chdirs into a per-suite tmpdir before the store singleton is rooted, so
+  // a repo-root .janus.db here would be a genuine 1p84 regression in THIS file.
+  assert.equal(
+    fs.existsSync(path.join(repoRoot, ".janus.db")),
+    false,
+    "the five-story EPIC 01 file must not leak a repo-root .janus.db",
+  );
+  // The former repo-root .janus_settings.json self-assertion was REMOVED. EPIC 01 does not leak it
+  // (every story chdirs first), but this hook reads the SHARED repo-root path, which the ~18 other
+  // still-unpinned server-booting test processes in the same battery pool write concurrently — a
+  // cross-process false-positive that flaked the battery (green only via run-unit's retry).
+  // Repo-root settings-file cleanliness is owned centrally by scripts/run-unit.mjs (ADVISORY until
+  // the JANUS_SETTINGS_PATH sweep, bead wsm-e2e-pinned-eoef); one file cannot reliably assert a
+  // global path other processes also write.
+});
 
 }); // EPIC 01 parent suite (concurrency:false — see header)

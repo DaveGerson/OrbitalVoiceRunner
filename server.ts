@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { pathToFileURL } from "url";
 import { GoogleGenAI, Type } from "@google/genai";
 import type { LiveConnectParameters, Session } from "@google/genai";
 import { WebSocketServer } from "ws";
@@ -39,6 +40,7 @@ import { migrateOnBootIfNeeded, initStoreWithQuarantine } from "./src/store/migr
 import { initExchangeSpineOnBoot } from "./src/exchanges/spine";
 import { mintExchangeForSend, beginExchangeDelivery, completeExchangeDelivery, failExchangeDelivery } from "./src/exchanges/deliveryHooks";
 import { renderedOverflow, RENDER_PROFILES, instructionEnvelopeIsPrimary, instructionEnvelopeActive } from "./src/exchanges/instructionEnvelope";
+import { withExchangeCorrelationHint } from "./src/exchanges/resultEnvelope";
 import { viewOpenDraft, clearOpenDraft, clearProseOverride, invalidateOutstandingApproval, convergeTypedDraftEdit } from "./src/exchanges/draftRegistry";
 import { projectFleetExchangeSummaries } from "./src/exchanges/fleetProjection";
 import type { CapabilityGate } from "./src/types";
@@ -76,6 +78,38 @@ import { isLoopbackAddress, isOriginAllowed, parseAllowedOrigins, timingSafeEqua
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
+
+// bead c1ky — the entrypoint gate. A plain VALUE-import of this module (every test file that
+// does `await import("../server")` to grab a type/helper, or an operator's own tooling script)
+// must NEVER be mistaken for "this process's job is to BE the Janus server" — that mistake is
+// exactly what let a bare import autostart a bind on :3000 and root a JanusStore singleton at
+// whatever the importer's cwd happened to be (bxpk's fingerprint). This function is the single
+// source of truth both the eager boot trigger below AND the autostart tail consult.
+//
+//   - PROD: esbuild bundles this file to CJS (dist/server.cjs, `node dist/server.cjs`).
+//     `require.main === module` is the canonical Node idiom there.
+//   - DEV: `tsx server.ts` runs this file as ESM. Compare `import.meta.url` (this module's own
+//     URL) to the resolved path Node was invoked with (`process.argv[1]`).
+//
+// `import.meta` is empty in the esbuild CJS bundle (a documented esbuild caveat — the same one
+// scripts/run-unit.mjs:221-223 works around for its own invokedDirectly check), so the CJS branch
+// is checked FIRST and is self-sufficient in prod; the import.meta branch is inert there (empty
+// object -> `.url` is undefined -> the comparison is false -> falls through to `return false`,
+// which is correct: a CJS bundle that somehow fails the require.main check is not the entrypoint).
+function isServerEntrypoint(): boolean {
+  try {
+    if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
+      return true;
+    }
+  } catch { /* not a CJS context */ }
+  try {
+    const invokedPath = process.argv[1];
+    if (invokedPath && import.meta.url === pathToFileURL(path.resolve(invokedPath)).href) {
+      return true;
+    }
+  } catch { /* import.meta unavailable in this bundle target */ }
+  return false;
+}
 
 // ── Correlated interaction log (Issue #1 instrumentation + "capture voice/thinking/actions/system,
 // analyzed together") ───────────────────────────────────────────────────────────────────────────
@@ -450,8 +484,12 @@ export class HistoryManager {
   }
 
   private getLimits() {
-    const maxCmds = manager.settings?.advanced?.historyMaxCommands ?? 50;
-    const maxOutput = manager.settings?.advanced?.historyMaxOutputLength ?? 5000;
+    // bead c1ky: `manager` is lazily assigned by ensureCore() now — a bare value-import that never
+    // boots core (e.g. a HistoryManager-only unit test) leaves it undefined, so guard `manager`
+    // itself before reading .settings. The 50/5000 defaults match SystemSettings, i.e. the exact
+    // values a fresh (settings-file-less) EAGER manager used to yield on origin/main.
+    const maxCmds = manager?.settings?.advanced?.historyMaxCommands ?? 50;
+    const maxOutput = manager?.settings?.advanced?.historyMaxOutputLength ?? 5000;
     return { maxCmds, maxOutput };
   }
 
@@ -631,20 +669,39 @@ export class HistoryManager {
 // racing the debounced flush with direct file I/O (review block on PR #68).
 registerHistoryBridge(HistoryManager.getInstance());
 
-// WS-M/Handoffs: the persistent JanusStore (SQLite) — dbt3: the ONLY ledger backend (the
-// JANUS_LEDGER_BACKEND=legacy escape hatch + the in-memory/JSON `Ledger` implementation it
-// selected are retired). better-sqlite3 loads cleanly under tsx (confirmed by the store unit
-// tests + smoke), so a static import is fine here — unlike node-pty which the transport layer
-// loads via createRequire. init() applies migrations (idempotent); bootMaintenance() prunes
-// stale rows/scrollback. Created BEFORE the manager so it can serve as the manager's ledger.
-// 3V.5: store-init failure used to SILENTLY fall back to the legacy JSON ledger — but a previous
-// boot's migration already renamed .janus_ledger.json to .bak (and LEDGER_MIGRATED_KEY blocks any
-// re-import), so a corrupt .janus.db booted the app EMPTY on legacy and stranded every new write.
-// initStoreWithQuarantine instead renames the bad DB (plus -wal/-shm twins) to .janus.db.corrupt-<ts>
-// (loudly, recoverably) and retries ONCE with a fresh DB. With no fallback backend left to catch a
-// SECOND failure, that outcome is now a fatal boot error (see below) rather than a silent downgrade.
+// WS-M/Handoffs: the persistent JanusStore (SQLite) + the manager it backs. dbt3: SQLite is the
+// ONLY ledger backend (the JANUS_LEDGER_BACKEND=legacy escape hatch + the in-memory/JSON `Ledger`
+// implementation it selected are retired).
+//
+// bead c1ky: this used to be EAGER module-scope boot code — it ran the instant server.ts was
+// evaluated, even by a bare value-import (a test grabbing a type/helper, an operator's tooling
+// script). That meant every such import silently bound a store at the importer's cwd. It is now
+// `ensureCore()`: an idempotent, memoized boot routine. It still runs at IMPORT time for the real
+// entrypoint (prod `node dist/server.cjs` / dev `tsx server.ts` — see the trigger right after this
+// function, byte-for-byte the same boot-at-import behavior those two paths always had) — and it
+// runs at the top of `startServer()` for every OTHER caller (tests, the offline simulator, library
+// use), so a plain value-import alone can never construct a store/manager or touch disk.
+// EXPORTED (bead c1ky follow-up) so a HistoryManager-only unit test that has already chdir'd into a
+// tmpdir can boot core explicitly — restoring the pre-lazy contract (a live `manager.settings`)
+// without the store landing in the repo root.
+let coreInitialized = false;
 let store: JanusStore | null = null;
-{
+export let manager: OrchestratorManager;
+
+export function ensureCore(): void {
+  if (coreInitialized) return;
+  coreInitialized = true;
+
+  // better-sqlite3 loads cleanly under tsx (confirmed by the store unit tests + smoke), so a
+  // static import is fine here — unlike node-pty which the transport layer loads via
+  // createRequire. init() applies migrations (idempotent); bootMaintenance() prunes stale
+  // rows/scrollback. Created BEFORE the manager so it can serve as the manager's ledger.
+  // 3V.5: store-init failure used to SILENTLY fall back to the legacy JSON ledger — but a previous
+  // boot's migration already renamed .janus_ledger.json to .bak (and LEDGER_MIGRATED_KEY blocks any
+  // re-import), so a corrupt .janus.db booted the app EMPTY on legacy and stranded every new write.
+  // initStoreWithQuarantine instead renames the bad DB (plus -wal/-shm twins) to .janus.db.corrupt-<ts>
+  // (loudly, recoverably) and retries ONCE with a fresh DB. With no fallback backend left to catch a
+  // SECOND failure, that outcome is now a fatal boot error (see below) rather than a silent downgrade.
   const storeInit = initStoreWithQuarantine(process.env.JANUS_DB || ".janus.db", (s) => {
     s.init();
     s.bootMaintenance({
@@ -652,6 +709,7 @@ let store: JanusStore | null = null;
       eventsTtlDays: 30,
       archiveTtlDays: 14,
       scrollbackDirs: [process.cwd()],
+      transcriptsTtlDays: 30,
     });
   });
   store = storeInit.store;
@@ -681,16 +739,14 @@ let store: JanusStore | null = null;
     console.error("[STORE] JanusStore unavailable even after the quarantine retry — SQLite is the only ledger backend, so the server cannot boot. Check disk space/permissions for JANUS_DB (or the CWD default .janus.db); the preceding [STORE] log lines carry the underlying error.");
     throw new Error("[STORE] JanusStore failed to initialize and there is no fallback ledger backend (dbt3 retired JANUS_LEDGER_BACKEND=legacy). Refusing to boot.");
   }
-}
 
-// AgentExchange spine (Phase 1, Step 1.5b): wire the durable persistence bridge + run boot
-// recovery — MUST happen after the store above is live and BEFORE the manager/panes exist (this
-// is still synchronous module-scope boot; panes boot INERT — CLAUDE.md — so nothing can race this
-// with a real exchange write). `off` mode (the production default) is a complete no-op: the store
-// is never wired, recovery never walks agent_exchanges. Never fatal — a recovery failure is
-// logged loudly and boot continues (initExchangeSpineOnBoot's own try/catch); only the store-init
-// failure above is fatal.
-{
+  // AgentExchange spine (Phase 1, Step 1.5b): wire the durable persistence bridge + run boot
+  // recovery — MUST happen after the store above is live and BEFORE the manager/panes exist (this
+  // is still synchronous boot; panes boot INERT — CLAUDE.md — so nothing can race this with a real
+  // exchange write). `off` mode (the production default) is a complete no-op: the store is never
+  // wired, recovery never walks agent_exchanges. Never fatal — a recovery failure is logged
+  // loudly and boot continues (initExchangeSpineOnBoot's own try/catch); only the store-init
+  // failure above is fatal.
   const exchangeRecovery = initExchangeSpineOnBoot(store);
   if (exchangeRecovery) {
     console.log(
@@ -706,23 +762,32 @@ let store: JanusStore | null = null;
       );
     }
   }
+
+  // WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the manager's
+  // ledger — making drafts/context/approvals/etc. durable across restart. dbt3: SQLite is the
+  // ONLY backend now (the fatal throw above guarantees `store` is non-null here).
+  manager = new OrchestratorManager({ ledger: store });
+  console.log("[STORE] OrchestratorManager ledger backend: SQLite (durable, the only backend).");
+
+  // `store` is a process-wide singleton: created once here (the FIRST ensureCore() call) and
+  // SHARED by every startServer() call thereafter. Releasing it is therefore a PROCESS-level
+  // concern, not a per-server one — closing it inside an individual server's close() would pull
+  // the shared DB handle out from under any sibling server still running in the same process
+  // (e.g. multiple in-process test suites under `tsx --test`, which previously made
+  // test_live_harness flake at the file level). We close it exactly once, synchronously, on
+  // process exit: better-sqlite3 writes are already durable per-statement, so this is pure handle
+  // cleanup, and a synchronous close in the 'exit' handler finishes before teardown — avoiding the
+  // UV_HANDLE_CLOSING abort that a still-in-flight close hit.
+  process.once("exit", () => { try { store?.close(); } catch { /* best-effort handle cleanup */ } });
 }
 
-// WS-M cutover seam (design §5.3). The store satisfies LedgerLike, so it IS the manager's
-// ledger — making drafts/context/approvals/etc. durable across restart. dbt3: SQLite is the
-// ONLY backend now (the fatal throw above guarantees `store` is non-null here).
-export const manager = new OrchestratorManager({ ledger: store });
-console.log("[STORE] OrchestratorManager ledger backend: SQLite (durable, the only backend).");
-
-// `store` is a process-wide singleton: created once here at import and SHARED by every
-// startServer() call. Releasing it is therefore a PROCESS-level concern, not a per-server one —
-// closing it inside an individual server's close() would pull the shared DB handle out from under
-// any sibling server still running in the same process (e.g. multiple in-process test suites under
-// `tsx --test`, which previously made test_live_harness flake at the file level). We close it
-// exactly once, synchronously, on process exit: better-sqlite3 writes are already durable
-// per-statement, so this is pure handle cleanup, and a synchronous close in the 'exit' handler
-// finishes before teardown — avoiding the UV_HANDLE_CLOSING abort that a still-in-flight close hit.
-process.once("exit", () => { try { store?.close(); } catch { /* best-effort handle cleanup */ } });
+// Eager trigger: ONLY the real entrypoint (prod `node dist/server.cjs` / dev `tsx server.ts`)
+// boots core at import time — byte-for-byte the same observable boot behavior those two paths
+// always had. Every other importer (tests, the offline simulator, library callers) instead gets
+// core lazily, at the top of startServer() below, so a bare value-import stays inert.
+if (isServerEntrypoint()) {
+  ensureCore();
+}
 
 // QW1 — process-level error net (bead qw1). This orchestrator drives PTYs and a Gemini Live
 // socket; a throw at an async edge (a PTY data event, a Gemini callback) surfaces here as an
@@ -1155,6 +1220,15 @@ function operatorSendOverflow(paneId: string, text: string): number {
   return renderedOverflow(text, profile);
 }
 
+/** neg1 (adversarial-review fix): the rendered-instruction size ceiling for a pane's tool preset,
+ *  passed to withExchangeCorrelationHint so the request-mode correlation hint can never push a
+ *  delivered instruction past the cap the operator draft was already validated against. Custom
+ *  profile for an unknown/missing preset. */
+function paneRenderMaxChars(paneId: string): number {
+  const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
+  return (RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom).maxChars;
+}
+
 /**
  * Phase 4, Step 4.3 (REST-lane gap closure): the Workbench POST draft/send route writes directly
  * (`term.writeInput`) — it never goes through dispatchProposal/applyDispatchDecision, so unlike
@@ -1270,9 +1344,14 @@ function registerDraftAndSettingsRoutes(
     // flags are active.
     const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
     beginExchangeDeliveryForWorkbenchSend(exchangeId);
+    // neg1: live correlation — append this exchange's own id (prose, request mode only) to the
+    // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on
+    // the ORIGINAL `text` (the echo-veto in legacyCompletionEligible compares the pane's echo
+    // against the operator's own recorded command); only the actual pane write is augmented.
+    const deliveredText = withExchangeCorrelationHint(text, exchangeId, undefined, paneRenderMaxChars(paneId));
     HistoryManager.getInstance().addCommand(paneId, text, exchangeId);
     try {
-      term.writeInput(text);
+      term.writeInput(deliveredText);
     } catch (e) {
       failExchangeDeliveryForWorkbenchSend(exchangeId, "workbench_write_threw");
       throw e;
@@ -1334,7 +1413,7 @@ function startRetentionSweepTimer(store: JanusStore | null): NodeJS.Timeout | nu
   if (!store) return null;
   const retentionSweepTimer = setInterval(() => {
     try {
-      store.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14 });
+      store.sweepMaintenance({ now: Date.now(), eventsTtlDays: 30, archiveTtlDays: 14, transcriptsTtlDays: 30 });
     } catch (e) {
       console.error("[STORE] periodic retention sweep failed (will retry next tick):", e);
     }
@@ -1508,6 +1587,12 @@ function createMemorySubsystem(
 }
 
 async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
+  // bead c1ky: boot the store/manager singleton here (a no-op if the entrypoint trigger above
+  // already ran it). This is what lets a plain value-import of this module stay completely inert
+  // while every real caller — prod, dev, and every test/library caller of startServer() — still
+  // gets a fully booted core, in the same order it always booted in.
+  ensureCore();
+
   const enableVite = options.enableVite ?? process.env.NODE_ENV !== "production";
   const shouldListen = options.listen ?? true;
 
@@ -2386,11 +2471,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
 export { startServer };
 
 // Auto-start when run as the entrypoint (`tsx server.ts` in dev or
-// `node dist/server.cjs` in prod). Tests and the offline simulator set
-// JANUS_NO_AUTOSTART=1 before importing so they can own the server lifecycle.
-// (An env flag rather than import.meta/require.main detection because esbuild
-// bundles this to CJS, where import.meta is empty.)
-if (process.env.JANUS_NO_AUTOSTART !== "1") {
+// `node dist/server.cjs` in prod). bead c1ky: gated on isServerEntrypoint() FIRST — a bare
+// value-import (by definition not the entrypoint) can never reach this branch regardless of env,
+// closing the bxpk hole where an importer that forgot to set JANUS_NO_AUTOSTART autostarted a
+// real listener. JANUS_NO_AUTOSTART=1 remains as the explicit opt-out for anything that DOES run
+// as the entrypoint but still wants to own the server lifecycle (e.g. the offline simulator).
+if (isServerEntrypoint() && process.env.JANUS_NO_AUTOSTART !== "1") {
   startServer().catch((e) => {
     console.error("[server] failed to start (is the port already in use?):", e);
     process.exitCode = 1;

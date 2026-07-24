@@ -28,7 +28,8 @@
 import { GoogleGenAI, LiveServerMessage, Modality, type Session } from "@google/genai";
 import type { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
-import { redactSecrets, type OrchestratorManager } from "../terminal";
+import { redactSecrets, normalizePreset, type OrchestratorManager } from "../terminal";
+import { RENDER_PROFILES } from "../exchanges/instructionEnvelope";
 import { formatPaneSignal, type PaneSignal } from "../paneSignals";
 import { parseApprovalIntent } from "../approvalIntent";
 import { parseApprovalIntentShadowed, isApprovalPythonPrimary, resolveApprovalIntent } from "../approvalShadow";
@@ -41,6 +42,7 @@ import { decideProposal, inferKind, type ApprovalKind, type ProposalDecision } f
 import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { mintExchangeForSend } from "../exchanges/deliveryHooks";
+import { withExchangeCorrelationHint } from "../exchanges/resultEnvelope";
 import type { ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
@@ -54,6 +56,7 @@ import {
   isBlankApiKey,
 } from "../voiceResumption";
 import { extractTranscripts, appendThinkingFragment } from "../liveTranscripts";
+import { recordLiveTranscripts } from "../transcripts/sink";
 import { createLiveTraceWriter, wrapOnMessageWithCapture } from "./liveTraceCapture";
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
@@ -1409,6 +1412,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // AgentExchange spine (task C): mint BEFORE the effect switch (spec §5) — a no-op when the
       // flag is off.
       const exchangeId = stampExchangeForDispatch(targetId, instruction, opts.trigger);
+      // neg1: live correlation — append THIS exchange's own id (prose, request mode only) to the
+      // completion-request line so a live agent can echo it back in a result envelope. A no-op
+      // (byte-identical `instruction`) unless JANUS_AGENT_RESULT_ENVELOPE=request and the mint
+      // above actually produced an id. The exchange's persisted `distilled_instruction` stays the
+      // pre-augment `instruction` (already minted inside stampExchangeForDispatch) — this token is
+      // per-delivery framing, not durable operator content.
+      // neg1 (adversarial-review fix): cap the delivered text so the request-mode correlation hint
+      // can never push a rendered instruction past the pane's size ceiling (spec §6.2).
+      const deliveredMaxChars = (RENDER_PROFILES[normalizePreset(term?.toolPreset)] ?? RENDER_PROFILES.Custom).maxChars;
+      const deliveredInstruction = withExchangeCorrelationHint(instruction, exchangeId, undefined, deliveredMaxChars);
 
       const outcome = applyDispatchDecision(
         decision,
@@ -1425,7 +1438,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           getActivePaneId: () => coreState.activePaneId,
           isPaneActiveForWrite,
           targetId,
-          instruction,
+          instruction: deliveredInstruction,
           capability,
           kind,
           trigger: opts.trigger,
@@ -2196,6 +2209,17 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // approval router + dictation + transcript frame all read userUtterance. (The 2026-06 live
             // capture showed every operator utterance on inputTranscription while userUtterance was empty.)
             const { operator: userUtterance, model: modelUtterance, modelThinking } = extractTranscripts(message);
+
+            // Bead 98f2 (durable transcript sink): OPT-IN persistence of BOTH channels — gated
+            // internally by JANUS_TRANSCRIPT_SINK (src/transcripts/flag.ts), so this is a no-op cost
+            // when off (the production default). A single local SQLite insert when enabled; crosses
+            // no Python seam (I/O shell stays in TS, per the 2026-06-19 ADR).
+            recordLiveTranscripts(store, { operator: userUtterance, model: modelUtterance, modelThinking }, {
+              sessionId: state.voiceSessionId,
+              projectId: manager.ledger.activeProjectId,
+              paneId: coreState.activePaneId,
+              interactionId: state.currentInteractionId,
+            });
 
             if (modelThinking) {
               interactionLog.log({ interactionId: turnId(), kind: "gemini_thinking", text: modelThinking, data: { source: "outputTranscription" } });

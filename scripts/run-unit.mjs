@@ -54,6 +54,66 @@ const RUNNER = "tsx";
 const BASE_ARGS = ["--test", "--test-force-exit"];
 const DEFAULT_GLOB = "tests/*.ts";
 
+// BEAD ox1q: node-pty's conpty_console_list_agent races the synchronous pty kill on Windows and
+// intermittently logs "AttachConsole failed" to stderr during test teardown — benign, endemic
+// harness noise (NOT a test failure) that showed up ~42x in a fully green battery and obscured
+// root-causing real stderr in bxpk. This regex is intentionally NARROW (the literal phrase only)
+// so it can never mask a real error line that merely mentions consoles/attaching in passing.
+const BENIGN_TEARDOWN_RE = /AttachConsole failed/;
+
+/**
+ * Pure: filter the known-benign ConPTY teardown noise out of a leg's raw stderr, WITHOUT hiding
+ * any other line. Returns `{ cleaned, sawTeardownCrash, droppedCount }`:
+ *   - `cleaned` — stderr with every line matching BENIGN_TEARDOWN_RE removed, lines rejoined with
+ *     "\n". Real errors (anything not matching the narrow pattern) pass through verbatim.
+ *   - `droppedCount` — how many lines were dropped (surfaced in a breadcrumb so nothing is
+ *     silently hidden).
+ *   - `sawTeardownCrash` — true iff at least one line was dropped; this is the SAME fingerprint
+ *     the retry banner and the conservative-RED unparseable-leg path depend on, now derived from
+ *     the filter itself rather than a raw `.includes()` on the unfiltered blob.
+ */
+export function filterBenignTeardownNoise(stderr) {
+  const text = stderr ?? "";
+  if (!text) return { cleaned: "", sawTeardownCrash: false, droppedCount: 0 };
+  const lines = text.split(/\r?\n/);
+  const kept = [];
+  let droppedCount = 0;
+  for (const line of lines) {
+    if (BENIGN_TEARDOWN_RE.test(line)) {
+      droppedCount += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { cleaned: kept.join("\n"), sawTeardownCrash: droppedCount > 0, droppedCount };
+}
+
+// bead 1p84: repo-root sentinel files a well-behaved battery must never create at process.cwd()
+// (an operator's own dev-time .janus.db/.janus_settings.json are pre-existing and must NOT be
+// flagged — only a NEWLY created one, during THIS run, is a leak).
+const REPO_ROOT_SENTINELS = [".janus.db", ".janus.db-wal", ".janus.db-shm", ".janus_settings.json"];
+
+/**
+ * Pure: given a before/after snapshot of `{ [sentinelName]: boolean }` (existence at
+ * process.cwd()), return the sentinel names that are ABSENT before and PRESENT after — i.e.
+ * genuinely created DURING the run. A sentinel present before the run (an operator's own DB)
+ * is never flagged, even if it's still present after.
+ */
+export function detectRepoRootLeak(before, after) {
+  const leaked = [];
+  for (const name of REPO_ROOT_SENTINELS) {
+    if (!before[name] && after[name]) leaked.push(name);
+  }
+  return leaked;
+}
+
+/** Snapshot `REPO_ROOT_SENTINELS` existence at `cwd` (defaults to process.cwd()). */
+function snapshotRepoRootSentinels(cwd = process.cwd()) {
+  const snap = {};
+  for (const name of REPO_ROOT_SENTINELS) snap[name] = fs.existsSync(path.join(cwd, name));
+  return snap;
+}
+
 /**
  * Pure: extract the set of failing test names from a node:test TAP-reporter file.
  * Matches `not ok <n> - <name>` (TAP13). Returns a Set of names (trimmed). For a genuine
@@ -139,7 +199,18 @@ function runLeg(extraArgs, tapFile) {
     shell: true,
     encoding: "utf8",
   });
-  if (res.stderr) process.stderr.write(res.stderr);
+
+  // BEAD ox1q: filter the known-benign ConPTY "AttachConsole failed" teardown noise before
+  // echoing stderr — real errors pass through untouched; the dropped count is surfaced in a
+  // single breadcrumb rather than silently swallowed.
+  const noise = filterBenignTeardownNoise(res.stderr ?? "");
+  if (noise.cleaned) process.stderr.write(noise.cleaned.endsWith("\n") ? noise.cleaned : `${noise.cleaned}\n`);
+  if (noise.droppedCount > 0) {
+    console.warn(
+      `[run-unit] filtered ${noise.droppedCount} benign ConPTY teardown line(s) ("${TEARDOWN_SIGNATURE}") — ` +
+        `known node-pty console-list-agent noise, not a real error.`,
+    );
+  }
 
   let tapText = "";
   try { tapText = fs.readFileSync(tapFile, "utf8"); } catch { /* file may be absent on a hard crash */ }
@@ -151,7 +222,7 @@ function runLeg(extraArgs, tapFile) {
     // A non-zero leg is "parseable" iff we actually extracted >=1 failing name; a clean leg is
     // trivially parseable (no failures to compute).
     parseable: res.status === 0 || failures.size > 0,
-    sawTeardownCrash: (res.stderr ?? "").includes(TEARDOWN_SIGNATURE),
+    sawTeardownCrash: noise.sawTeardownCrash,
   };
 }
 
@@ -202,16 +273,63 @@ function reportOutcome(outcome, leg1, leg2) {
   return leg2.status ?? 1;
 }
 
+// bead 1p84: the DB sentinels are ENFORCED — a repo-root .janus.db* leak FAILS the battery (DB
+// contamination is the harmful case, and the tree is clean of it today). The .janus_settings.json
+// leak is a broad, PRE-EXISTING gap: ~18 server-booting test files construct an OrchestratorManager
+// without pinning JANUS_SETTINGS_PATH (or chdir'ing first), so it lands at cwd. That full sweep is
+// tracked separately (bead wsm-e2e-pinned-eoef) and is NOT introduced by the work that added this
+// gate; the file is gitignored and harmless, so it is ADVISORY (a loud warn) until the sweep lands —
+// it must not red the battery on leaks this change did not cause.
+const REPO_ROOT_FATAL_SENTINELS = new Set([".janus.db", ".janus.db-wal", ".janus.db-shm"]);
+
+/**
+ * bead 1p84: assert the battery leaves no repo-root sentinel artifact. Snapshot before/after the
+ * WHOLE run (both legs, if a retry happened) so a leak from either leg is caught. Returns the FATAL
+ * leaked sentinels only (a non-empty return fails the battery); advisory settings-file leaks are
+ * warned loudly but never fail the run — see the fatal-set comment above.
+ */
+function assertRepoRootCleanliness(before) {
+  const after = snapshotRepoRootSentinels();
+  const leaked = detectRepoRootLeak(before, after);
+  const fatal = leaked.filter((n) => REPO_ROOT_FATAL_SENTINELS.has(n));
+  const advisory = leaked.filter((n) => !REPO_ROOT_FATAL_SENTINELS.has(n));
+  if (advisory.length > 0) {
+    console.warn(
+      `\n[run-unit] repo-root ADVISORY leak: the battery created ${advisory.join(", ")} at ` +
+        `${process.cwd()} during this run. A server-booting test constructed an ` +
+        `OrchestratorManager/JanusStore without pinning JANUS_SETTINGS_PATH (or chdir'ing into a ` +
+        `tmpdir). Known pre-existing sweep across ~18 files (bead wsm-e2e-pinned-eoef) — gitignored, ` +
+        `harmless, and does NOT fail the battery. Pattern to copy: tests/helpers/mockLive.ts loadMockLive().`,
+    );
+  }
+  if (fatal.length > 0) {
+    console.error(
+      `\n[run-unit] REPO-ROOT LEAK (fatal): the unit battery created ${fatal.join(", ")} at ` +
+        `${process.cwd()} during this run. A test imported server.ts (or otherwise constructed a ` +
+        `JanusStore/OrchestratorManager) without rooting the DB in a tmpdir/scratch dir — fix the ` +
+        `offending test (see tests/helpers/mockLive.ts's loadMockLive() for the pattern) rather ` +
+        `than deleting the file and moving on.`,
+    );
+  }
+  return fatal;
+}
+
 function main() {
   const extra = process.argv.slice(2);
+  const beforeSentinels = snapshotRepoRootSentinels();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-run-unit-"));
   try {
     const leg1 = runLeg(extra, path.join(tmpDir, "leg1.tap"));
-    if (leg1.status === 0) process.exit(0);
+    if (leg1.status === 0) {
+      const fatalLeaks = assertRepoRootCleanliness(beforeSentinels);
+      process.exit(fatalLeaks.length > 0 ? 1 : 0);
+    }
 
     logRetryBanner(leg1);
     const leg2 = runLeg(extra, path.join(tmpDir, "leg2.tap"));
-    process.exit(reportOutcome(decideOutcome(leg1, leg2), leg1, leg2));
+    const outcomeExit = reportOutcome(decideOutcome(leg1, leg2), leg1, leg2);
+    const fatalLeaks = assertRepoRootCleanliness(beforeSentinels);
+    process.exit(outcomeExit !== 0 ? outcomeExit : fatalLeaks.length > 0 ? 1 : 0);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }

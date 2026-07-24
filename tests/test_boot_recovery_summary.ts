@@ -48,6 +48,23 @@ function paneRow(id: string, workspaceId: string, alive: boolean): StoredPane {
 }
 
 describe("res3 — boot-time 'N panes were live before restart' summary (unit)", () => {
+  // bead 1p84: OrchestratorManager resolves its settings file via JANUS_SETTINGS_PATH, else a
+  // cwd-relative ".janus_settings.json". These cases construct a manager directly (no chdir), so
+  // pin the settings file into a tmpdir — otherwise the manager writes .janus_settings.json into
+  // the repo root, which the run-unit cleanliness gate (bead 1p84) now fails the battery on.
+  let settingsDir: string;
+  let prevSettingsPath: string | undefined;
+  before(() => {
+    settingsDir = mkdtempSync(join(tmpdir(), "janus-bootrec-unit-"));
+    prevSettingsPath = process.env.JANUS_SETTINGS_PATH;
+    process.env.JANUS_SETTINGS_PATH = join(settingsDir, ".janus_settings.json");
+  });
+  after(() => {
+    if (prevSettingsPath === undefined) delete process.env.JANUS_SETTINGS_PATH;
+    else process.env.JANUS_SETTINGS_PATH = prevSettingsPath;
+    try { rmSync(settingsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
   it("pushes ONE informational attentionQueue item listing only the panes that were alive", () => {
     const store = new JanusStore(":memory:");
     store.init();
@@ -130,6 +147,9 @@ describe("res3 — boot-time summary surfaces over the REAL server + REST (integ
     setEnv("JANUS_DB", dbPath);
     setEnv("JANUS_NO_AUTOSTART", "1");
     setEnv("NODE_ENV", "test");
+    // bead 1p84: keep the booted server's settings file out of the repo root (else startServer's
+    // OrchestratorManager writes a cwd-relative .janus_settings.json — the cleanliness gate reds).
+    setEnv("JANUS_SETTINGS_PATH", join(tmpDir, ".janus_settings.json"));
 
     const serverMod = await import("../server");
     // This IS the "fresh process boots against the same persisted ledger" restart story — a new

@@ -77,11 +77,23 @@ describe("v11 -> v12 migration: fixture sanity (pre-migration)", () => {
 });
 
 describe("v11 -> v12 migration: applyMigrations upgrades cleanly", () => {
-  it("advances user_version to SCHEMA_VERSION (12) in one step from v11", () => {
+  // NOTE: applyMigrations always runs to the CURRENT SCHEMA_VERSION (13, since bead 98f2's v13
+  // transcripts migration), not just to v12 — so from an v11 fixture it now advances two steps in
+  // one call. The literal "12" pin this test used to assert was stale post-v13; verified below via
+  // MIGRATIONS[11] run in isolation, which is exactly the v12 step this describe block is about.
+  it("MIGRATIONS[11] (the v12 step) taken alone lands on user_version 12", () => {
+    const db = buildV11Fixture();
+    MIGRATIONS[11](db);
+    db.pragma("user_version = 12");
+    assert.equal(db.pragma("user_version", { simple: true }), 12);
+    db.close();
+  });
+
+  it("applyMigrations from v11 lands on the CURRENT SCHEMA_VERSION (now 13, past v12)", () => {
     const db = buildV11Fixture();
     applyMigrations(db);
     assert.equal(db.pragma("user_version", { simple: true }), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 12);
+    assert.equal(SCHEMA_VERSION, 13);
     db.close();
   });
 
@@ -176,15 +188,74 @@ describe("v11 -> v12 migration: applyMigrations upgrades cleanly", () => {
   });
 });
 
-describe("v11 -> v12 migration: fresh boot (no prior data) also lands on v12", () => {
-  it("a brand-new :memory: DB migrates straight to v12 with all tables present", () => {
+describe("v11 -> v12 migration: fresh boot (no prior data) also lands on v12's tables (and beyond)", () => {
+  it("a brand-new :memory: DB migrates straight through v12 (and on to the current SCHEMA_VERSION) with all v12 tables present", () => {
     const db = new Database(":memory:");
     applyMigrations(db);
-    assert.equal(db.pragma("user_version", { simple: true }), 12);
+    assert.equal(db.pragma("user_version", { simple: true }), SCHEMA_VERSION);
     const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
     for (const t of ["agent_exchanges", "exchange_events", "context_deliveries"]) {
       assert.ok(names.includes(t));
     }
+    db.close();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// v12 -> v13 migration: opt-in transcripts table (bead 98f2, durable transcript sink).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+const V12 = 12;
+
+describe("v12 -> v13 migration: opt-in transcripts table", () => {
+  it("bumps SCHEMA_VERSION to 13", () => {
+    assert.equal(SCHEMA_VERSION, 13);
+  });
+
+  it("a v12-only DB (MIGRATIONS[0..11]) has NO transcripts table yet", () => {
+    const db = new Database(":memory:");
+    for (let i = 0; i < V12; i++) MIGRATIONS[i](db);
+    db.pragma(`user_version = ${V12}`);
+    const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
+    assert.ok(!names.includes("transcripts"), "v12 fixture must NOT already have transcripts");
+    db.close();
+  });
+
+  it("applyMigrations from v12 lands on v13 with a usable transcripts table", () => {
+    const db = new Database(":memory:");
+    for (let i = 0; i < V12; i++) MIGRATIONS[i](db);
+    db.pragma(`user_version = ${V12}`);
+
+    applyMigrations(db);
+    assert.equal(db.pragma("user_version", { simple: true }), 13);
+    assert.equal(db.pragma("user_version", { simple: true }), SCHEMA_VERSION);
+
+    const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
+    assert.ok(names.includes("transcripts"));
+
+    const cols = (db.prepare("PRAGMA table_info(transcripts)").all() as any[]).map((c) => c.name);
+    for (const c of ["id", "ts", "channel", "session_id", "project_id", "pane_id", "interaction_id", "text_redacted"]) {
+      assert.ok(cols.includes(c), `transcripts must have column ${c}`);
+    }
+
+    const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='transcripts'").all() as any[]).map((r) => r.name);
+    assert.ok(idxNames.includes("idx_transcripts_ts"));
+    assert.ok(idxNames.includes("idx_transcripts_session_ts"));
+
+    db.prepare(
+      `INSERT INTO transcripts(ts,channel,session_id,project_id,pane_id,interaction_id,text_redacted)
+       VALUES(1,'operator','sess-1','proj-1','pane-1','ixn-1','hello')`
+    ).run();
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM transcripts").get() as any).n, 1);
+    db.close();
+  });
+
+  it("a brand-new :memory: DB migrates straight to v13 with transcripts present", () => {
+    const db = new Database(":memory:");
+    applyMigrations(db);
+    assert.equal(db.pragma("user_version", { simple: true }), 13);
+    const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((r) => r.name);
+    assert.ok(names.includes("transcripts"));
     db.close();
   });
 });
