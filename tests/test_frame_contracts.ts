@@ -58,6 +58,7 @@ const EMITTED_FRAME_TYPES = [
   "handoffs_updated",                // src/actions/defs/handoff.ts (7 sites): 235/295/363/555/651/657/668
   "settings_updated",                // server.ts:1249, src/actions/defs/locks.ts:66/421/776, orient.ts:348, src/actionEffects.ts:289/314, src/applyPaneMode.ts:206, src/dispatch/paneWrite.ts (via applyPaneMode)
   "switch_active_pane",              // src/actions/defs/voice_ux.ts:317, panes_write.ts:75/332, src/voice/focusResolver.ts:164
+  "context_switched",                // BUG-012: src/actions/defs/orient.ts switch_context (project focus follows voice)
   "frozen",                          // src/gating/index.ts:849/917 (stopAll/releaseStopAll)
   "stop_all",                        // src/gating/index.ts:875 (stopAll kill:true)
   "approval_pending",                // src/dispatch/paneWrite.ts:304 (via conn.notifyPending — broadcast on REST, sendFrame on voice)
@@ -66,6 +67,7 @@ const EMITTED_FRAME_TYPES = [
   "action_resolved",                 // src/actions/defs/approvals_rest.ts:142/178, src/voiceApprovalRouting.ts:104/112/121, src/voice/spokenConfirm.ts:116/122, src/gating/index.ts:1374 (sweep)
   "command_auto_executed",           // server.ts:1217, src/dispatch/paneWrite.ts:259, src/gating/index.ts:1108 (WS_EVT.AUTO_EXECUTED)
   "command_blocked",                 // src/dispatch/paneWrite.ts:219/222, src/gating/index.ts:1113/1119/1138 (WS_EVT.BLOCKED)
+  "permission_changed",              // src/applyPaneMode.ts:208 (execute() success block — confirmed applied switch only)
   "proactive_notification",          // src/announcementBus.ts:322/338 (toNotification, flush())
   "proactive_earcon",                // src/announcementBus.ts:269 (deliver())
   "error",                           // src/voice/index.ts:813/2461/2519 (voice-socket-only)

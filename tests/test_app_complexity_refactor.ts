@@ -482,11 +482,39 @@ describe("appHelpers — dispatchWsMessage routing + ordering", () => {
     assert.deepStrictEqual(a.order, ["earcon:execute", "desktop:▶ Command Auto-Approved", "setAutoApprovedNotification", "fetchTerminals"]);
     assert.deepStrictEqual(a.calls.autoApproved, { terminalId: "T", cmd: "go" });
   });
-  it("command_blocked: earcon, desktop, setBlocked (ORDER)", () => {
+  it("command_blocked: earcon, desktop, setBlocked (ORDER) — BUG-018 rings the DISTINCT 'blocked' tone", () => {
     const a = recCtx();
     dispatchWsMessage({ type: "command_blocked", terminalId: "T", cmd: "rm", reason: "ro" }, a.ctx);
-    assert.deepStrictEqual(a.order, ["earcon:alert", "desktop:⛔ Command Blocked (Read-Only)", "setBlockedNotification"]);
+    // BUG-018 classic parity: a held-back command rings "blocked", NOT the generic "alert" —
+    // an eyes-off operator must hear it as distinct from an approval_pending (which stays "alert").
+    assert.deepStrictEqual(a.order, ["earcon:blocked", "desktop:⛔ Command Blocked (Read-Only)", "setBlockedNotification"]);
     assert.deepStrictEqual(a.calls.blocked, { terminalId: "T", cmd: "rm", reason: "ro" });
+  });
+  it("permission_changed: earcon 'permission' + desktop note (from → to) — BUG-018 classic parity", () => {
+    const a = recCtx();
+    dispatchWsMessage({ type: "permission_changed", paneId: "p1", from: "Human-in-the-Loop", to: "Full Auto" }, a.ctx);
+    assert.deepStrictEqual(a.order, ["earcon:permission", "desktop:🔒 Autonomy changed"]);
+    // A malformed frame (missing from/to) still rings the tone but fires no desktop note.
+    const b = recCtx();
+    dispatchWsMessage({ type: "permission_changed", paneId: "p1" }, b.ctx);
+    assert.deepStrictEqual(b.order, ["earcon:permission"]);
+  });
+  it("BUG-018: the classic path rings THREE distinct tones for the attention lifecycle", () => {
+    // approval_pending → alert (a pane needs your OK), command_blocked → blocked (held back),
+    // permission_changed → permission (autonomy changed). Pairwise distinct, eyes-off.
+    const pend = recCtx();
+    dispatchWsMessage({ type: "approval_pending", terminalId: "T", cmd: "ls", messageId: "m" }, pend.ctx);
+    const blocked = recCtx();
+    dispatchWsMessage({ type: "command_blocked", terminalId: "T", cmd: "rm", reason: "ro" }, blocked.ctx);
+    const perm = recCtx();
+    dispatchWsMessage({ type: "permission_changed", paneId: "p", from: "A", to: "B" }, perm.ctx);
+    const pendTone = pend.order.find((s) => s.startsWith("earcon:"));
+    const blockedTone = blocked.order.find((s) => s.startsWith("earcon:"));
+    const permTone = perm.order.find((s) => s.startsWith("earcon:"));
+    assert.strictEqual(pendTone, "earcon:alert");
+    assert.strictEqual(blockedTone, "earcon:blocked");
+    assert.strictEqual(permTone, "earcon:permission");
+    assert.strictEqual(new Set([pendTone, blockedTone, permTone]).size, 3, "the three lifecycle tones must be pairwise distinct");
   });
   it("stdout_chunk -> queueStdoutChunk(terminalId, chunk)", () => {
     const a = recCtx();

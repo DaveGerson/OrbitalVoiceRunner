@@ -23,6 +23,9 @@ function makeFakeManager(termStatus: string, lastCommand = ""): { manager: Orche
       p1: { status: termStatus, runtimeType: "shell", lastCommand },
     },
     attentionQueue,
+    // W5: the observe push sites route through manager.pushAttention now; the structural double
+    // mirrors the real in-memory append so the existing attentionQueue assertions still hold.
+    pushAttention: (item: any) => attentionQueue.push(item),
     settings: { secrets: {} },
     ledger: {
       watchRules: [] as any[],

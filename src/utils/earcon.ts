@@ -3,11 +3,16 @@
 // (UX_BRIEF §4: "Eyes-off ⇒ quiet state changes are forbidden"). Each call spins a transient
 // AudioContext, plays a short tone pair, and is fully try/caught so a blocked/absent audio context
 // (autoplay policy, headless) degrades silently — never throws into the caller.
-export type EarconType = "completion" | "alert" | "success" | "execute" | "chime" | "reconnect";
+export type EarconType =
+  | "completion" | "alert" | "success" | "execute" | "chime" | "reconnect"
+  // BUG-018 differentiation tokens: an eyes-off operator must hear a DISTINCT tone for a held-back
+  // command ("blocked") vs. a pane needing your OK ("alert") vs. an autonomy change ("permission").
+  | "blocked" | "permission" | "note";
 
 /** Runtime guard for untyped WS frames (proactive_earcon carries a free-form string). */
 export function isEarconType(v: unknown): v is EarconType {
-  return v === "completion" || v === "alert" || v === "success" || v === "execute" || v === "chime" || v === "reconnect";
+  return v === "completion" || v === "alert" || v === "success" || v === "execute" || v === "chime" || v === "reconnect"
+    || v === "blocked" || v === "permission" || v === "note";
 }
 
 // [freq, startOffset, duration] triples per earcon — distinct enough to tell apart eyes-off. A
@@ -21,6 +26,14 @@ const TONE_TABLE: Record<EarconType, [number, number, number][]> = {
   // G4→C5→E5 3-note rising figure — sonically distinct from success's 2-note D5→A5; "the radio's back"
   reconnect: [[392, 0, 0.11], [523.25, 0.09, 0.11], [659.25, 0.18, 0.2]],
   chime: [[523.25, 0, 0.18]],                                   // gentle single C5
+  // BUG-018: darker/lower than `alert` (A4→E4) so a refusal reads as "held back", not a summons.
+  blocked: [[330, 0, 0.14], [220, 0.12, 0.22]],                 // E4→A3 low falling — command blocked
+  // A crisp two-note "lock clicked" rise — the operator learns it as "autonomy changed".
+  permission: [[494, 0, 0.10], [622, 0.09, 0.16]],              // B4→D#5 short rising — permission_changed
+  // RESERVED / vocabulary-only (BUG-018): a note-saved tone with NO producer yet — no call site
+  // passes "note" to playEarcon. Kept in the table (and isEarconType) so a future note-save broadcast
+  // can ring it without re-plumbing the vocabulary; delete this entry if that path never materializes.
+  note: [[659.25, 0, 0.12]],                                    // single E5 blip — note saved
 };
 
 export function playEarcon(type: EarconType): void {

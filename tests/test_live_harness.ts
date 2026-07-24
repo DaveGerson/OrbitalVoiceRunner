@@ -141,8 +141,11 @@ describe("ce7 mock-Live harness (headless, no API key, no mic)", () => {
     // confirm_instruction / cancel_instruction / send_instruction (src/actions/defs/voice_ux.ts) —
     // are voice-only, so each adds one voice declaration; draft/revise/retarget/confirm/cancel ride
     // the existing compose_draft capability row and send_instruction rides write_to_pane, so no new
-    // matrix row.
-    assert.strictEqual(decls.length, 71, "exactly 71 voice tools declared");
+    // matrix row,
+    // then 71 -> 73 by BUG-030(b)/BUG-031 (search_pane_output + get_pane_errors, two net-new voice-only
+    // pane reads in src/actions/defs/reads.ts; both ride the existing read_pane capability row, no new
+    // matrix row).
+    assert.strictEqual(decls.length, 73, "exactly 73 voice tools declared");
 
     // The /live handler runs against the exported singleton manager.
     assert.strictEqual(running.manager, session ? running.manager : null);

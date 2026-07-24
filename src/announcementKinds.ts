@@ -10,8 +10,10 @@
  * no second place to update.
  */
 
-/** Status-keyed earcon vocabulary (App.tsx oscillator tones). */
-export type EarconType = "completion" | "alert" | "success" | "execute" | "chime";
+/** Status-keyed earcon vocabulary (App.tsx oscillator tones). BUG-018: "blocked" (command_blocked)
+ *  and "permission" (permission_changed) are DISTINCT hands-free tones so an eyes-off operator can
+ *  tell a held-back command / an autonomy change apart from a plain "alert" (an approval pending). */
+export type EarconType = "completion" | "alert" | "success" | "execute" | "chime" | "blocked" | "permission";
 
 /** The earcon vocabulary as used by the client event bus, which may also yield "no earcon". */
 export type EarconTypeOrNull = EarconType | null;

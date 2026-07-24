@@ -158,6 +158,8 @@ function makeFakeManagerForExit(): { manager: OM; attentionQueue: any[] } {
       p1: { status: "Exited", runtimeType: "shell", lastCommand: "npm test" },
     },
     attentionQueue,
+    // W5: observe push sites route through manager.pushAttention now (mirror the in-memory append).
+    pushAttention: (item: any) => attentionQueue.push(item),
     settings: { secrets: {} },
     ledger: {
       watchRules: [] as any[],

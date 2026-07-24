@@ -1433,6 +1433,9 @@ export function createGating(deps: GatingDeps): Gating {
       pendingApprovals,
       pendingActions,
       broadcast,
+      // BUG-003: read the LIVE global mode at apply time so the Ask→confirm success string carries the
+      // global-override honesty rider (the shared leaf returns "" when it is Inherit).
+      getGlobalPermissionsMode: () => manager.globalPermissionsMode,
       // PERSIST-WINS (sibling of bead gpd): write operator intent to the ledger so a later syncLedger
       // won't revert it. Mirrors the legacy set_pane_permissions persist (ledger pane mode + save).
       // The persist targets the pane's OWNING project (findPaneOwningProject) — the active-project

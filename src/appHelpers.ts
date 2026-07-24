@@ -11,6 +11,7 @@
 import type { Terminal, PaneMeta, Workspace, PendingCommand } from "./types";
 import type { ProjectNote } from "./classic/hooks/useLedgerData";
 import type { EarconType } from "./announcementKinds";
+import { requestNotifyPermission } from "./utils/notify";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status resolution + pane filtering (the `term?.status || (pane.alive ? …)` idiom, repeated
@@ -395,6 +396,11 @@ export interface WsHandlerCtx {
   setPendingCommands: (updater: any) => void;
   setPendingActions: (updater: any) => void;
   setActiveTerminalId: (id: any) => void;
+  /** BUG-012: server-driven PROJECT focus setter, fed by the context_switched frame (voice
+   *  switch_context). Distinct from setActiveTerminalId — moving the project focus must NOT
+   *  clobber the pane focus. OPTIONAL (mirrors setAttentionQueue): the classic App wires it, while
+   *  ctx builders that predate this frame simply omit it and the handler no-ops. */
+  setActiveProjectId?: (id: any) => void;
   setIsBufferFocused: (updater: any) => void;
   setPromptBuffer: (val: any) => void;
   fetchWipDrafts: (projectId?: any) => void;
@@ -429,6 +435,11 @@ export interface WsHandlerCtx {
 type WsHandler = (msg: any, ctx: WsHandlerCtx) => void;
 
 function handleApprovalPending(msg: any, ctx: WsHandlerCtx): void {
+  // BUG-037(b): ask for desktop-notification permission on the first approval_pending. The guarded
+  // helper self-no-ops unless Notification.permission === "default", so this fires the browser prompt
+  // exactly once (the permission leaves "default" after the first decision). triggerDesktopNotification
+  // stays gated on `granted` — this only wires the REQUEST, not the firing.
+  requestNotifyPermission();
   ctx.playEarcon("alert");
   ctx.triggerDesktopNotification("🚨 Approval Pending", `Node ${msg.terminalId} is waiting for execute confirm: ${msg.cmd}`);
   ctx.setPendingCommands((prev: any[]) => {
@@ -511,10 +522,24 @@ function handleCommandAutoExecuted(msg: any, ctx: WsHandlerCtx): void {
 }
 
 function handleCommandBlocked(msg: any, ctx: WsHandlerCtx): void {
-  ctx.playEarcon("alert");
+  // BUG-018: ring the DEDICATED "blocked" tone (darker/lower than "alert") — parity with the kitchen
+  // (src/orbital/useOrbitalData.ts command_blocked → "blocked") so an eyes-off operator hears a
+  // held-back command as distinct from a pane that needs an OK (approval_pending → "alert").
+  ctx.playEarcon("blocked");
   ctx.triggerDesktopNotification("⛔ Command Blocked (Read-Only)", `Node ${msg.terminalId} locked: ${msg.cmd}`);
   ctx.setBlockedNotification({ terminalId: msg.terminalId, cmd: msg.cmd, reason: msg.reason });
   setTimeout(() => ctx.setBlockedNotification(null), 4000);
+}
+
+// BUG-018: an autonomy transition (permission_changed) reaches the classic UI with its own DISTINCT
+// "permission" tone — parity with the kitchen (src/orbital/useOrbitalData.ts permission_changed →
+// "permission") so an eyes-off operator HEARS that a pane's mode actually changed. The frame carries
+// { paneId, from, to }; the desktop note names both sides of the switch (mirrors the kitchen's).
+function handlePermissionChanged(msg: any, ctx: WsHandlerCtx): void {
+  ctx.playEarcon("permission");
+  if (typeof msg.paneId === "string" && typeof msg.from === "string" && typeof msg.to === "string") {
+    ctx.triggerDesktopNotification("🔒 Autonomy changed", `${msg.paneId}: ${msg.from} → ${msg.to}`);
+  }
 }
 
 function handleGrounding(msg: any, ctx: WsHandlerCtx): void {
@@ -571,6 +596,9 @@ export const WS_HANDLERS: Record<string, WsHandler> = {
   action_resolved: (msg, ctx) => ctx.setPendingActions((prev: any[]) => prev.filter((a) => a.actionId !== msg.actionId)),
   approval_resolved: (msg, ctx) => ctx.setPendingCommands((prev: any[]) => prev.filter((item) => item.messageId !== msg.messageId)),
   switch_active_pane: (msg, ctx) => { if (msg.paneId) ctx.setActiveTerminalId(msg.paneId); },
+  // BUG-012: a voice switch_context moves the UI's PROJECT focus (sidebar highlight). Drives ONLY the
+  // project focus — never setActiveTerminalId, which is the pane-level focus (switch_active_pane owns it).
+  context_switched: (msg, ctx) => { if (msg.activeProjectId) ctx.setActiveProjectId?.(msg.activeProjectId); },
   draft_updated: handleDraftUpdated,
   pane_status: (msg, ctx) => ctx.setTerminals((prev: any[]) => prev.map((t) => t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t)),
   pane_quiescing: (msg, ctx) => ctx.setTerminals((prev: any[]) => prev.map((t) => t.id === msg.terminalId ? { ...t, quiescing: true } : t)),
@@ -581,6 +609,7 @@ export const WS_HANDLERS: Record<string, WsHandler> = {
   settings_updated: handleSettingsUpdated,
   command_auto_executed: handleCommandAutoExecuted,
   command_blocked: handleCommandBlocked,
+  permission_changed: handlePermissionChanged,
   stdout_chunk: (msg, ctx) => ctx.queueStdoutChunk(msg.terminalId, msg.chunk),
   transcript_text: (msg, ctx) => ctx.setTranscript((prev: any[]) => [...prev, { sender: msg.sender, text: msg.text, timestamp: new Date() }].slice(-50)),
   grounding: handleGrounding,

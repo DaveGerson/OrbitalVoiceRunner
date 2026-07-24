@@ -1,5 +1,5 @@
 import { WatchRule, Plan, PaneMeta, Workspace, ContextEntry, PaneDraft, PromptTemplate, PaneLayout } from "./types";
-import type { NoteType, StoredNote } from "./store/types";
+import type { NoteType, StoredNote, StoredAttention } from "./store/types";
 import type { Macro } from "./macros";
 
 // PaneMeta and Workspace are defined once in ./types (frontend-safe) and
@@ -82,4 +82,12 @@ export interface LedgerLike {
   listArchived(workspaceId?: string): ArchivedPane[];
   restoreArchivedPane(paneId: string): ArchivedPane | null;
   deleteArchivedPane(paneId: string): boolean;
+  // BUG-013 residual (W5): the durable attention surface. JanusStore already implements all four
+  // (src/store/sqliteStore.ts:455-469) — widening is type-only so OrchestratorManager can dual-write
+  // the attentionQueue through its injected `ledger` (push/dismiss write-through + boot hydration)
+  // without a cast, mirroring how notes/drafts/context are already surfaced here.
+  upsertAttention(a: StoredAttention): void;
+  dismissAttention(id: string): void;
+  clearAttention(): void;
+  getAttention(opts?: { includeDismissed?: boolean }): StoredAttention[];
 }

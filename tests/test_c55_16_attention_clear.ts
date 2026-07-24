@@ -72,7 +72,21 @@ function makeCtx(attentionQueue: Array<{ id: string; dismissed: boolean }>): {
     pruneAttention: (): void => {
       probe.pruneCalls += 1;
     },
-    manager: { attentionQueue },
+    // W5: dismiss now routes through the manager seam (in-memory flip + durable write-through). The
+    // structural double mirrors the old in-memory behavior so these narration/queue assertions hold.
+    manager: {
+      attentionQueue,
+      dismissAttention: (id: string): boolean => {
+        const it = attentionQueue.find((i) => i.id === id);
+        if (it) it.dismissed = true;
+        return !!it;
+      },
+      dismissAllAttention: (): number => {
+        const live = attentionQueue.filter((i) => !i.dismissed);
+        live.forEach((i) => (i.dismissed = true));
+        return live.length;
+      },
+    },
     // PHASE 2: dismiss_attention now Off-vetoes on its veto-class capability; default Auto = no change.
     effectiveCapabilityGateFor: () => "Auto",
   } as unknown as ActionContext;

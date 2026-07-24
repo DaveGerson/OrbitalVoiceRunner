@@ -21,6 +21,22 @@ export interface OutputClass {
 const ERROR_RE =
   /\b(error(?![-./])|build failed|exception|panic|traceback|FAILED|\d+\s+fail(?:ed|ing)|Tests?:\s*\d+\s+failed)\b/i;
 
+// BUG-031 semantic-extraction lane. These REUSE the ERROR_RE above verbatim (do NOT duplicate or
+// perturb it — it also serves the proactive-push classifier). WARN_RE is word-anchored so it fires
+// on `Warning:` / `npm WARN` / `... is deprecated` but not on substrings like `warnings: 0`.
+const WARN_RE = /\b(warning|npm warn|deprecated)\b/i;
+// Matches `process exited with code 1`, `exit code 0`, `Command exited with status 127`. Group 1 =
+// the numeric code (a zero code is a legitimate capture — the caller must NOT treat it as falsy).
+const EXIT_RE = /\b(?:process\s+)?exit(?:ed)?(?:\s+with)?\s+(?:code|status)\s+(\d+)\b/i;
+// Pure-noise pre-filter: progress bars, hex dumps, bare ISO timestamps. Belt-and-suspenders — such
+// lines carry no error/warning word so they never enter the arrays anyway; this just short-circuits.
+const NOISE_RE = /^(\[[#=>\s.-]*\]\s*\d+%|(?:[0-9a-f]{2}\s+){4,}[0-9a-f]{2}|\d{4}-\d\d-\d\dT[\d:.]+Z)\b/i;
+// FC(5): a GREEN test summary ("Tests: 0 failed, 25 passed") matches ERROR_RE via the shared
+// `\d+\s+fail(?:ed|ing)` alternative, so a passing run would narrate as failed. This suppresses a
+// zero-count fail/failing ONLY in the extraction lane below — classifyPaneOutput / the proactive
+// push lane are intentionally untouched (they reuse ERROR_RE verbatim and must not be perturbed).
+const ZERO_FAIL_RE = /\b0\s+fail(?:ed|ing)\b/i;
+
 /** Classify a chunk of ALREADY-ANSI-STRIPPED pane output. Returns the strongest
  *  signal found, or null. Errors win over prompts. `detail` is secret-redacted here
  *  (at the boundary) so the invariant holds regardless of caller — the signal may be
@@ -37,6 +53,30 @@ export function classifyPaneOutput(cleanText: string): OutputClass | null {
   const last = lines[lines.length - 1];
   if (SHELL_PROMPT.test(last)) return { kind: "prompt", detail: redactSecrets(last).slice(0, 80) };
   return null;
+}
+
+/**
+ * BUG-031: structured signal extraction over ALREADY-ANSI-STRIPPED pane output. Pure + deterministic.
+ * REUSES ERROR_RE (errors win over warnings on a line that matches both) and adds WARN_RE / EXIT_RE.
+ * Each captured line is `redactSecrets`'d at the boundary (same convention as classifyPaneOutput), so
+ * the invariant holds regardless of caller. The LAST exit line wins (the most recent termination). A
+ * `code 0` exit yields `exitCode === 0` — the caller must merge with `??`, never `||`.
+ */
+export function extractOutputSignals(cleanText: string): { errors: string[]; warnings: string[]; exitCode?: number } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  let exitCode: number | undefined;
+  for (const raw of cleanText.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || NOISE_RE.test(line)) continue;
+    const m = EXIT_RE.exec(line);
+    if (m) exitCode = Number(m[1]); // LAST match wins; Number("0") === 0 survives (not dropped)
+    // errors win over warnings — but FC(5): a zero-count "0 failed"/"0 failing" line is a PASS, not
+    // a failure, so it must not land in errors[] (extraction lane only).
+    if (ERROR_RE.test(line) && !ZERO_FAIL_RE.test(line)) { errors.push(redactSecrets(line)); continue; }
+    if (WARN_RE.test(line)) warnings.push(redactSecrets(line));
+  }
+  return { errors, warnings, exitCode };
 }
 
 /**

@@ -26,6 +26,7 @@ import { findPaneOwningProject } from "../../paneOwnership";
 import { clampAutonomyMinutes, sanitizeAutonomyCapabilities } from "../../gating/autonomyWindows";
 import { profileLoosens } from "../../gating/postureProfiles";
 import { findPostureProfileByName, normalizeGateMap } from "../../settingsGatesRoundTrip";
+import { globalOverrideRiderForMode } from "../../globalOverrideRider";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_global_permissions — server.ts:2887 (GATED, durable Ask-defer via gateOrDefer)
@@ -117,6 +118,24 @@ const VALID_MODES = ["Full Auto", "Human-in-the-Loop", "Read-Only"] as const;
 type JanusMode = (typeof VALID_MODES)[number];
 
 /**
+ * BUG-003 — the global-override HONESTY rider for the immediate voice handlers. effectiveModeFor
+ * (src/gating/index.ts:534-540) is GLOBAL-FIRST by design: whenever ctx.manager.globalPermissionsMode
+ * !== "Inherit", that global mode DOMINATES the per-pane mode, so a pane-permission change reports
+ * success but has NO gating effect until the global mode returns to Inherit. This wrapper reads the
+ * CURRENT global mode off the ctx and delegates to the shared globalOverrideRiderForMode leaf
+ * (src/globalOverrideRider.ts) — the SINGLE source of the rider wording, so the confirm-time
+ * (applyPaneMode.ts) and post-restart replay (actionEffects.ts) success strings speak the identical
+ * message. When global IS "Inherit" the leaf returns "" so the success string stays byte-for-byte the
+ * clean original. Keeping the ctx read here (not inline in the ok-returns) keeps both handler paths
+ * flat under the complexity gate.
+ */
+function globalOverrideRider(
+  ctx: Parameters<ActionDef<typeof SetPanePermissionsParams>["handler"]>[1],
+): string {
+  return globalOverrideRiderForMode(ctx.manager.globalPermissionsMode);
+}
+
+/**
  * The LEGACY (P0–P3) pane-permission path: gate, then mutate only the NEXT spawn's command string +
  * persist the ledger mode. This is bug B1 — it never reaches the live process. Retained as the
  * fallback when ctx.applyPaneMode is NOT wired (REST/test contexts). The P4 path (ctx.applyPaneMode)
@@ -138,7 +157,7 @@ function legacyApplyPanePerms(
     }
     ctx.broadcastLedgerUpdate();
     ctx.broadcastTerminalsUpdated();
-    return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.`;
+    return `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.${globalOverrideRider(ctx)}`;
   };
   const g = ctx.gateOrDefer(
     "set_pane_permissions",
@@ -186,7 +205,7 @@ async function applyPaneModeDelegate(
   if (!ctx.applyPaneMode) return null;
   const r = await ctx.applyPaneMode(pane_id, permissions_mode, source);
   if (r.ok) {
-    return { kind: "ok", output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.` };
+    return { kind: "ok", output: `Safety permission mode for pane ${pane_id} updated to ${permissions_mode} successfully.${globalOverrideRider(ctx)}` };
   }
   if (r.kind === "deferred") {
     return {
@@ -213,7 +232,7 @@ async function applyPaneModeDelegate(
 export const setPanePermissions: ActionDef<typeof SetPanePermissionsParams> = {
   name: "set_pane_permissions",
   description:
-    "Set the safety permission policy mode for a specific terminal pane. Promotes or reverts autonomy (Full Auto, Human-in-the-Loop, Read-Only).",
+    "Set the safety permission policy mode for a specific terminal pane. Promotes or reverts autonomy (Full Auto, Human-in-the-Loop, Read-Only). Precedence: a non-Inherit GLOBAL autonomy mode OVERRIDES this per-pane setting — while the global mode is anything other than Inherit, the pane change has no gating effect until you set the global mode back to Inherit.",
   params: SetPanePermissionsParams,
   capability: "set_pane_permissions",
   readOnly: false,
@@ -281,7 +300,7 @@ const PromotePaneModeParams = z.object({
 export const promotePaneMode: ActionDef<typeof PromotePaneModeParams> = {
   name: "promote_pane_mode",
   description:
-    "Apply a permission mode to a LIVE terminal pane, reaching the running CLI right now: promote to Full Auto (or revert) so the change takes effect immediately, not just on the next launch. Use to make an agent run unattended.",
+    "Apply a permission mode to a LIVE terminal pane, reaching the running CLI right now: promote to Full Auto (or revert) so the change takes effect immediately, not just on the next launch. Use to make an agent run unattended. Precedence: a non-Inherit GLOBAL autonomy mode OVERRIDES this per-pane setting — while the global mode is anything other than Inherit, the pane change has no gating effect until you set the global mode back to Inherit.",
   params: PromotePaneModeParams,
   capability: "set_pane_permissions", // rides the same lock-change gate (no new matrix row for v1).
   readOnly: false,

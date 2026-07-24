@@ -2,6 +2,7 @@ import { PaneMeta, type LedgerLike } from "./ledger";
 import fs from "fs";
 import path from "path";
 import { SystemSettings, CliPreset, AttentionItem, DEFAULT_CAPABILITY_GATES, DEFAULT_VOICE_UX } from "./types";
+import type { StoredAttention } from "./store/types";
 import { preservePresetGates } from "./settingsGatesRoundTrip";
 import { DEFAULT_ANNOUNCEMENT_TEMPLATES, pruneAttentionQueue } from "./announcementBus";
 import { StatusProbe, ProbeResult, selectProbe, FallbackProbe } from "./statusProbe";
@@ -13,6 +14,9 @@ import {
 } from "./statusMachine";
 import { AgentAdapter, createAdapter } from "./agents";
 import { withPaneLifecycleLock } from "./lifecycleLock";
+// BUG-031: pure structured-signal extractor. Both this import and paneSignals' redactSecrets import
+// from here are used LAZILY (at call time, never at module-eval), so the static cycle is TDZ-safe.
+import { extractOutputSignals } from "./paneSignals";
 
 // Status-machine input to applyStatusEvent and its extracted side-effect helpers.
 type StatusEvent =
@@ -242,6 +246,11 @@ export function appendRawCapped(existing: string, chunk: string, max: number): s
   return combined.length > max ? combined.slice(combined.length - max) : combined;
 }
 
+// W4 (BUG-006 residual): the number of most-recently-rendered lines runProbeTick feeds to the
+// adapter's isLikelyBusy check. Matches the existing getRecentOutput(5) tail window — a live
+// spinner keeps that window "busy" through a silent thinking gap; a finished turn scrolls it away.
+const AGENT_BUSY_TAIL_LINES = 5;
+
 export function stripAnsiSequences(text: string): string {
   // Matches ANSI color/style escape sequences
   const ansiEscape = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
@@ -386,18 +395,34 @@ export function classifySecrets(text: string): SecretScan {
 }
 
 /**
- * Issue B: default gap (ms) between writing a submitted command's BODY and its terminating CR, so a
- * ConPTY-hosted TUI (Claude Code) reads the CR as a DISCRETE Enter keypress rather than absorbing it
- * into a paste burst. A combined `body + "\r"` write submits SHORT prompts fine, but for longer /
- * multi-clause instructions Claude's paste-burst detector treats the whole chunk (incl. the trailing
- * CR) as pasted text, so the CR lands as a literal newline in the composer and the prompt sits
- * staged-but-unsubmitted (reproduced via smoke:claude with a ~280-char prompt). 0 disables the gap
- * (synchronous two-write). Override via JANUS_PTY_SUBMIT_DELAY_MS.
+ * Issue B / BUG-042: default gap (ms) between writing a submitted command's BODY and its terminating
+ * CR, so a ConPTY-hosted TUI (Claude Code) reads the CR as a DISCRETE Enter keypress rather than
+ * absorbing it into a paste burst. A combined `body + "\r"` write submits SHORT prompts fine, but for
+ * longer / multi-clause instructions Claude's paste-burst detector treats the whole chunk (incl. the
+ * trailing CR) as pasted text, so the CR lands as a literal newline in the composer and the prompt
+ * sits staged-but-unsubmitted (reproduced via smoke:claude with a ~280-char prompt).
+ *
+ * BUG-042 fix: the default floor is raised 20 -> 60ms (20ms was too short for a long ConPTY paste
+ * burst to drain before the CR). On the PACED path deliverSubmit further SCALES the pre-CR gap with
+ * body length — effectiveGap = max(submitEnterDelayMs, ceil(command.length / 4)) — so a longer prompt
+ * gets a strictly larger gap (a 280-char body -> 70ms > the 60ms floor). Scaling only ever RAISES the
+ * gap, never lowers it (max, not min); a larger configured floor still wins. 0 disables the gap
+ * (synchronous two-write opt-out; scaling does NOT apply on that branch). Override via
+ * JANUS_PTY_SUBMIT_DELAY_MS (a finite value >= 0 wins; 0 keeps the synchronous opt-out).
  */
-const DEFAULT_PTY_SUBMIT_DELAY_MS = (() => {
-  const n = Number(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
-  return Number.isFinite(n) && n >= 0 ? n : 20;
-})();
+/**
+ * BUG-042: resolve the submit-delay floor from an env value. An empty / whitespace-only string is
+ * UNSET (-> 60ms default), NOT zero — `Number("") === 0` would otherwise pass the `>= 0` guard and
+ * SILENTLY disable pacing (long prompts left staged-but-unsubmitted). An explicit "0" is still
+ * honored as the synchronous two-write opt-out. Any non-finite / negative value also falls to 60.
+ * Exported so the empty-vs-"0" contract is unit-testable without re-evaluating the module const.
+ */
+export function resolveSubmitDelayMs(raw: string | undefined): number {
+  if (raw == null || raw.trim() === "") return 60;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 60;
+}
+const DEFAULT_PTY_SUBMIT_DELAY_MS = resolveSubmitDelayMs(process.env.JANUS_PTY_SUBMIT_DELAY_MS);
 
 // wsm-e2e-pinned-ztd: tagged entry for UniversalTerminal's pre-spawn-ready queue — 'submit' bytes
 // need the deliverSubmit body/CR split, 'raw' bytes must flush verbatim (no CR appended).
@@ -520,6 +545,10 @@ export class UniversalTerminal {
   private killEscalationMs = 1000;
   public lastStatusChangeAt: number = Date.now();
   public lastCommand = "";
+  // BUG-031: the node-pty exit code captured from transport.onExit (undefined until the process
+  // exits). Authoritative — get_pane_errors PREFERS this over any text-scraped code (nullish-merged,
+  // so a genuine exit code of 0 survives).
+  public lastExitCode?: number;
   // runtime_type drives the prompt-regex gating (I4): Custom preset ⇒ "shell";
   // agent CLIs (Claude Code/Codex/Antigravity) ⇒ "interactive_cli".
   public runtimeType: RuntimeType;
@@ -805,11 +834,20 @@ export class UniversalTerminal {
     // P0-1: interactive_cli (agent) panes have no resting-shell signal — an agent
     // at its prompt is process-indistinguishable from an agent mid-turn (both are
     // one blocked process with no foreground child-shell). The busy-biased
-    // authoritative probe would therefore report them "Running" forever and never
-    // fire onIdle. Never run the authoritative probe for them; downgrade to a
-    // fallback probe so output quiescence drives idle (decideStatus fallback path).
+    // authoritative *process* probe would therefore report them "Running" forever and
+    // never fire onIdle. So we NEVER consult this.statusProbe for them (the P0-1 gate).
+    // The busy signal instead comes from the RENDERED tail (BUG-006 residual fix): when
+    // the adapter recognizes a live "working"/"thinking" marker we synthesize an
+    // AUTHORITATIVE busy probe so decideStatus keeps the pane Running across a long
+    // thinking gap; with no marker we emit today's fallback no-child probe so a truly
+    // resting agent still debounces to Idle at the agentIdleTimeoutMs floor (the
+    // decideStatus interactive_cli recovery re-arms the quiescence debounce).
     if (this.runtimeType === "interactive_cli") {
-      this.applyStatusEvent({ kind: "probe", probe: { hasRunningChild: false, confidence: "fallback" } });
+      const tail = stripAnsiSequences(this.getRecentOutput(AGENT_BUSY_TAIL_LINES));
+      const probe: ProbeResult = this.adapter.isLikelyBusy(tail)
+        ? { hasRunningChild: true, confidence: "authoritative" }
+        : { hasRunningChild: false, confidence: "fallback" };
+      this.applyStatusEvent({ kind: "probe", probe });
       return;
     }
     if (this.probeInFlight) return; // 4E.2: previous async probe still running — skip this tick
@@ -930,6 +968,13 @@ export class UniversalTerminal {
       try { orphan.kill("SIGKILL"); } catch { /* already dead */ }
     }
 
+    // BUG-031: this is a FRESH run — clear the PRIOR run's captured exit code. transport.onExit (the
+    // ONLY setter of lastExitCode) will not fire until THIS spawn ends, so without the reset a
+    // just-restarted (now-running) pane would report the previous run's exit code via get_pane_errors.
+    // Reset here, near the transport swap and BEFORE the (possibly degraded) spawn, so even a failed
+    // respawn cannot surface a stale code.
+    this.lastExitCode = undefined;
+
     // WS-C: spawn through the PtyTransport (node-pty preferred, legacy fallback).
     // QW2: pty.spawn throws SYNCHRONOUSLY on native/ENOENT failures and propagates
     // out through createPtyTransport. Guard the single spawn chokepoint so a failed
@@ -1037,13 +1082,17 @@ export class UniversalTerminal {
 
     // Lifecycle (Tier 0, design §3) — kept verbatim in semantics: a real exit
     // maps to status="Exited" and tears down the probe/idle timers.
-    transport.onExit(() => {
+    transport.onExit((info) => {
       // 3P.1 generation guard (same predicate as onData): a REPLACED transport's late exit must
       // not mark the NEW spawn "Exited" or clear the NEW spawn's probe/idle/ready timers. The
       // null case (stopped, not respawned) passes through so a post-stop exit still lands the
       // deterministic "Exited" status.
       if (this.transport !== transport && this.transport !== null) return;
       const ownExit = this.transport === transport;
+      // BUG-031: capture node-pty's authoritative exit code (get_pane_errors prefers it over any
+      // text-scraped code). Set only for a live/own or post-stop exit (the replaced-transport case
+      // already returned above), so a stale spawn can't clobber the current pane's code.
+      this.lastExitCode = info.exitCode;
       this.status = "Exited";
       this.lastStatusChangeAt = Date.now();
       this.clearProbeTimer();
@@ -1186,15 +1235,24 @@ export class UniversalTerminal {
       this.transport.write("\r");
       return;
     }
+    // BUG-042: on the PACED path, scale the pre-CR gap with body length so a longer prompt gives
+    // ConPTY more time to drain the paste burst before the CR arrives as its own discrete read. The
+    // max() ensures scaling only ever RAISES the gap (never clamps a larger configured floor down).
+    const gap = Math.max(this.submitEnterDelayMs, Math.ceil(command.length / 4));
     this.submitChain = this.submitChain.then(
       () =>
         new Promise<void>((resolve) => {
-          if (!this.transport) { resolve(); return; }
-          this.transport.write(command);
+          // BUG-042: capture the transport IDENTITY at body-write time. The gap is length-scaled and
+          // can outlast a restart that swaps in a NEW transport; the deferred CR must fire ONLY if the
+          // SAME transport is still current — a bare `if (this.transport)` check would write a stray
+          // \r into the new pane. Body + CR both target the captured `t`, CR gated on identity.
+          const t = this.transport;
+          if (!t) { resolve(); return; }
+          t.write(command);
           setTimeout(() => {
-            if (this.transport) this.transport.write("\r");
+            if (this.transport === t) t.write("\r");
             resolve();
-          }, this.submitEnterDelayMs);
+          }, gap);
         }),
     );
   }
@@ -1224,8 +1282,36 @@ export class UniversalTerminal {
     this.transport.write(bytes);
   }
 
-  getRecentOutput(linesCount = 10): string {
-    return this.outputBuffer.slice(-linesCount).join('\n');
+  // BUG-030(a): `offset` selects an OLDER window (lines back from the tail). offset=0 is the current
+  // tail — byte-identical to the old slice(-linesCount). window end=len-offset, start=max(0,end-count).
+  getRecentOutput(linesCount = 10, offset = 0): string {
+    const end = this.outputBuffer.length - offset;
+    if (end <= 0) return '';
+    const start = Math.max(0, end - linesCount);
+    return this.outputBuffer.slice(start, end).join('\n');
+  }
+
+  // BUG-030(b): case-insensitive search over this pane's 512KB scrollback FILE (reaching lines beyond
+  // the in-memory ring). The file stores RAW chunks incl. ANSI, so each match is ANSI-stripped THEN
+  // secret-redacted before it leaves the process; results are bounded to `maxMatches`.
+  public searchScrollback(keyword: string, maxMatches = 50): string[] {
+    const file = `.janus_scrollback_${this.terminalId}.log`;
+    try {
+      if (!fs.existsSync(file)) return [];
+      const needle = keyword.toLowerCase();
+      const out: string[] = [];
+      for (const raw of fs.readFileSync(file, 'utf-8').split(/\r?\n/)) {
+        const line = stripAnsiSequences(raw);
+        if (line.trim() === '') continue;
+        if (line.toLowerCase().includes(needle)) {
+          out.push(redactSecrets(line));
+          if (out.length >= maxMatches) break;
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
   }
 
   /** Only-new-since-last-read lines (model lane). Advances the model cursor.
@@ -1328,6 +1414,37 @@ export class UniversalTerminal {
     // written before this stop (the writer is now async/ordered — B2).
     try { await this.scrollbackChain; } catch { /* best-effort */ }
   }
+}
+
+// BUG-013 residual (W5): AttentionItem ⇄ StoredAttention pure mappers. The durable `timestamp` is
+// epoch-ms INTEGER; the in-memory one is an ISO string. An unparseable ISO falls back to now() on
+// the forward write so the `timestamp INTEGER NOT NULL` column and `ORDER BY timestamp DESC` stay
+// well-defined (matches pruneAttentionQueue's NaN-is-infinitely-old handling).
+export function toStoredAttention(item: AttentionItem): StoredAttention {
+  const ms = Date.parse(item.timestamp);
+  return {
+    id: item.id,
+    type: item.type,
+    terminal_id: item.terminalId,
+    project_id: item.projectId,
+    message: item.message,
+    timestamp: Number.isNaN(ms) ? Date.now() : ms,
+    dismissed: item.dismissed,
+    details: item.details ?? null,
+  };
+}
+
+export function fromStoredAttention(row: StoredAttention): AttentionItem {
+  return {
+    id: row.id,
+    type: row.type as AttentionItem["type"],
+    terminalId: row.terminal_id,
+    projectId: row.project_id,
+    message: row.message,
+    timestamp: new Date(row.timestamp).toISOString(),
+    dismissed: row.dismissed,
+    details: row.details,
+  };
 }
 
 export class OrchestratorManager {
@@ -1591,7 +1708,69 @@ export class OrchestratorManager {
     this.ledger.addProject(activeCtx, workspacePath, "Default workspace");
     this.ledger.switchContext(activeCtx);
 
+    // BUG-013 residual (W5): rehydrate un-dismissed attention survivors from the durable table
+    // BEFORE reconcilePanesInert, so a restarted server re-reports prior-session alerts and the
+    // subsequent announceBootRecovery push lands ON TOP through the same pushAttention seam. The
+    // module-scope store.bootMaintenance retention prune (server.ts) already ran before the manager
+    // was constructed, so a stale (>TTL) row is swept before it can be rehydrated here.
+    this.hydrateAttentionFromStore();
+
     this.reconcilePanesInert(activeCtx);
+  }
+
+  /**
+   * BUG-013 residual (W5) — the single write-through choke-point for EVERY attention push (the six
+   * former `attentionQueue.push({...}); pruneAttention()` sites route here): append in-memory, apply
+   * the BUG-035 cap/TTL prune in-memory, then best-effort write-through to the durable attention
+   * table. Durable rows are NOT capped/evicted here — that is retention's job (src/store/retention.ts).
+   */
+  public pushAttention(item: AttentionItem): void {
+    this.attentionQueue.push(item);
+    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, in-memory
+    try {
+      this.ledger.upsertAttention(toStoredAttention(item));
+    } catch { /* durable best-effort — an in-memory item is never lost on a store fault */ }
+  }
+
+  /** Dismiss one attention item: flip the in-memory flag AND write through to the durable table.
+   *  Dismiss ≠ delete (the row lingers, dismissed, until retention reaps it). Returns whether an
+   *  in-memory item was found (the orient.ts single-id path uses this for found/not-found narration). */
+  public dismissAttention(id: string): boolean {
+    const item = this.attentionQueue.find((i) => i.id === id);
+    if (item) item.dismissed = true;
+    try {
+      this.ledger.dismissAttention(id);
+    } catch { /* durable best-effort */ }
+    return !!item;
+  }
+
+  /** Dismiss ALL live items: flip every in-memory item AND write through each dismissal. Returns the
+   *  count that were live before the flip (the orient.ts dismiss-all path uses it for its narration). */
+  public dismissAllAttention(): number {
+    const live = this.attentionQueue.filter((i) => !i.dismissed);
+    for (const i of live) {
+      i.dismissed = true;
+      try {
+        this.ledger.dismissAttention(i.id);
+      } catch { /* durable best-effort */ }
+    }
+    return live.length;
+  }
+
+  /** Boot hydration (constructor-called): load un-dismissed durable survivors into the in-memory
+   *  queue, reverse-mapped, then re-impose the in-memory BUG-035 cap/TTL. Best-effort — an empty
+   *  queue on a store fault is the pre-fix legacy behavior. */
+  private hydrateAttentionFromStore(): void {
+    try {
+      for (const row of this.ledger.getAttention({ includeDismissed: false })) {
+        this.attentionQueue.push(fromStoredAttention(row));
+      }
+      // Re-impose the in-memory CAP only (ttl disabled). The durable table is already TTL-bounded by
+      // retention (bootMaintenance runs before construction), so a survivor row is a legitimately-live
+      // alert — applying the wall-clock TTL here would wrongly evict a durable row whose own timestamp
+      // predates this process (e.g. an alert that outlived a long downtime). Cap still bounds the set.
+      pruneAttentionQueue(this.attentionQueue, Date.now(), { ttlMs: Infinity, dismissedTtlMs: Infinity });
+    } catch { /* durable best-effort; empty queue on failure is the legacy behavior */ }
   }
 
   /**
@@ -1648,7 +1827,9 @@ export class OrchestratorManager {
     const n = wasLive.length;
     const list = wasLive.join(", ");
     console.log(`[boot] ${n} pane${n === 1 ? "" : "s"} were live before this restart, now inert: ${list}`);
-    this.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam so this boot-recovery item is
+    // ALSO persisted durably (write-through + in-memory BUG-035 prune), not just parked in memory.
+    this.pushAttention({
       id: "att_" + Math.random().toString(36).substring(2, 11),
       // "idle" = informational (no failure, no held request) — matches the existing dispatch-join
       // completion idiom in src/observe/index.ts (settleDispatchJoin). Not actionable via
@@ -1663,7 +1844,6 @@ export class OrchestratorManager {
       timestamp: new Date().toISOString(),
       dismissed: false,
     });
-    pruneAttentionQueue(this.attentionQueue); // BUG-035 cap/TTL, same as every other attentionQueue push
   }
 
   addTerminal(
@@ -1675,6 +1855,18 @@ export class OrchestratorManager {
     sessionId = "",
     projectId = ""
   ): string {
+    // FC(2) security: the pane id is caller/model-supplied (create_pane, recipes, layouts) and is
+    // interpolated into the pane's scrollback FILENAME `.janus_scrollback_<id>.log` at THREE sites
+    // (loadScrollback / appendScrollback / searchScrollback). A traversal id (`../../x`, `..\x`) would
+    // — on Windows especially, via lexical `..` normalization — let search_pane_output read OUTSIDE the
+    // workspace. Validate the charset HERE at the single creation choke-point rather than basename-
+    // pinning one call site: it is the source guard, so it neutralizes every derived filename at once
+    // (and every existing pane id — term-1, pane_1, claude_1, recipe/layout ids — already conforms).
+    // The allowed set excludes BOTH separators (`/` `\`) and `:`, so no id can form a path segment,
+    // drive-relative path, or NTFS ADS — traversal is structurally impossible.
+    if (!/^[A-Za-z0-9_.-]+$/.test(terminalId)) {
+      return `Invalid pane id '${terminalId}': only letters, digits, and _ . - are allowed.`;
+    }
     if (this.terminals[terminalId]) {
       return `Terminal '${terminalId}' already exists.`;
     }
@@ -1907,16 +2099,55 @@ export class OrchestratorManager {
     };
   }
 
-  getPaneSummary(paneId: string, limit = 20) {
+  getPaneSummary(paneId: string, limit = 20, offset = 0) {
     if (!this.terminals[paneId]) {
       return `Error: Pane ${paneId} does not exist.`;
     }
-    const recentOut = this.terminals[paneId].getRecentOutput(limit);
+    // BUG-030(a): `offset` pages backward through recent output (older window). offset=0 is the tail,
+    // so the 2-arg HiTL rationale snapshot (getPaneSummary(targetId, 5)) is unaffected.
+    const recentOut = this.terminals[paneId].getRecentOutput(limit, offset);
     // WS-B: redactSecrets runs AFTER ANSI stripping (getRecentOutput already strips ANSI).
     // This covers both the standard get_pane_summary tool response and the HiTL rationale
     // snapshot (server.ts calls manager.getPaneSummary(targetId, 5) for approval rationale).
     const safeOut = redactSecrets(recentOut || "[No new output]");
     return `\`\`\`\n${safeOut}\n\`\`\``;
+  }
+
+  /** BUG-030(b): case-insensitive search over a pane's scrollback FILE (beyond the in-memory ring).
+   *  Returns a fenced block of redacted, ANSI-stripped matches, a clear no-match message, or the
+   *  standard pane-missing string. Mirrors the getPaneSummary/getPaneDelta string-result shape. */
+  searchScrollback(paneId: string, keyword: string): string {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return `Error: Pane ${paneId} does not exist.`;
+    }
+    const matches = term.searchScrollback(keyword);
+    if (matches.length === 0) {
+      return `No lines in pane ${paneId} scrollback match "${keyword}".`;
+    }
+    return "```\n" + matches.join("\n") + "\n```";
+  }
+
+  /** BUG-031: structured problem summary for the narration lane. Runs the whole in-memory ring
+   *  through extractOutputSignals; exit_code prefers the authoritative captured pty code (nullish
+   *  merge, so a captured 0 survives) and falls back to the text-scraped code. last_command redacted. */
+  getPaneErrors(paneId: string) {
+    const term = this.terminals[paneId];
+    if (!term) {
+      return { error: `Pane ${paneId} does not exist.` };
+    }
+    // BUG-031: extractOutputSignals is documented to receive ALREADY-ANSI-STRIPPED text, but
+    // loadScrollback (start()) seeds outputBuffer from the RAW scrollback file (ANSI intact), so the
+    // ring can carry escape bytes after a restart. Strip defensively here (as runProbeTick already
+    // does) so returned error lines are escape-free and an ANSI-split secret can't dodge redaction.
+    const signals = extractOutputSignals(stripAnsiSequences(term.getRecentOutput(term.maxBufferLines)));
+    return {
+      pane_id: paneId,
+      errors: signals.errors,
+      warnings: signals.warnings,
+      exit_code: term.lastExitCode ?? signals.exitCode, // nullish: a captured 0 must survive
+      last_command: redactSecrets(term.lastCommand || ""),
+    };
   }
 
   /** Push-observation pull side: only-new lines since the model last read this pane,

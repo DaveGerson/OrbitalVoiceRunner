@@ -70,4 +70,10 @@ export class CustomAdapter implements AgentAdapter {
   bypassFlag(): null {
     return null;
   }
+
+  // Custom is runtimeType 'shell' — it never reaches the interactive_cli busy-check branch, but
+  // must satisfy the interface. A bare shell has no agent "working" markers, so always false-safe.
+  isLikelyBusy(_recentTail: string): boolean {
+    return false;
+  }
 }

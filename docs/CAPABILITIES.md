@@ -4,7 +4,7 @@ The one-page map of everything this system can do. Every row is **generated** fr
 
 > Regenerate with `npm run catalog`. CI runs `CATALOG_CHECK=1` (or `tsx scripts/catalog.ts --check`) to fail the build if this file drifts from the registry.
 
-**116** actions across **26** gated capabilities, plus the always-allowed group.
+**118** actions across **26** gated capabilities, plus the always-allowed group.
 
 - **Surfaces** — where the action is exposed: `voice` (Gemini Live tool), `rest` (HTTP), `ws` (WebSocket).
 - **Read-only** — `yes` means the result text is secret-redacted before it leaves the process.
@@ -246,9 +246,11 @@ These use the registry's `ALWAYS_ALLOWED` sentinel only to avoid double-gating i
 | `get_dispatch_status` | voice / rest | yes | Check a multi-pane dispatch group |
 | `get_pane_command_history` | voice / rest | yes | Return the list of recently executed commands in this pane with their concise, high-level final responses/outcomes, rather than raw/messy terminal outputs |
 | `get_pane_delta` | voice | yes | Return ONLY the pane output that is new since you last read this pane (true incremental delta; ANSI-stripped, secret-redacted) |
+| `get_pane_errors` | voice | yes | Return a structured summary of a pane's problems instead of raw log noise |
 | `get_pane_summary` | voice / rest | yes | Return the last ~20 lines of one pane's recent terminal output (ANSI-stripped and secret-redacted) |
 | `get_terminal_history` | rest | yes | Return the RAW recorded command history array for one pane (full command + timestamp + output + finalResponse per entry) for the UI history panel |
 | `list_panes` | voice / rest | yes | List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing |
+| `search_pane_output` | voice | yes | Search this pane's full scrollback history (beyond the last ~100 lines held in memory) for a keyword, case-insensitively |
 
 ## Remove an automation rule
 

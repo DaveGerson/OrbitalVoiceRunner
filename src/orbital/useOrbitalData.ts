@@ -898,11 +898,24 @@ export function useOrbitalData(opts?: { voiceCues?: boolean; desktopNotes?: bool
         desktopNote("▶ Fired on its own", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
         refetchPending();
       },
-      // 1B.7: a blocked command names the pane, the command and the server's reason.
+      // 1B.7 + BUG-018: a blocked command names the pane, the command and the server's reason. Ring
+      // the DEDICATED "blocked" tone via playFrameEarcon (FRAME_EARCON: command_blocked → "blocked"),
+      // and pass `null` as showToast's earconOverride so it does NOT also fire the warn→alert default
+      // — a single, DISTINCT tone (blocked ≠ approval_pending's alert) for an eyes-off operator.
       command_blocked: () => {
-        showToast(blockedToastText(msg.terminalId, truncateCmd(msg.cmd), msg.reason), "warn");
+        playFrameEarcon(); // "blocked" — held back (distinct from approval_pending's "alert")
+        showToast(blockedToastText(msg.terminalId, truncateCmd(msg.cmd), msg.reason), "warn", null);
         desktopNote("⛔ Held back", `${msg.terminalId}: ${truncateCmd(msg.cmd)}`); // 2K.6
         refetchPending();
+      },
+      // BUG-018: an autonomy transition (permission_changed) reaches the kitchen with its own DISTINCT
+      // "permission" tone (FRAME_EARCON: permission_changed → "permission") so an eyes-off operator
+      // HEARS that a pane's mode actually changed. The frame carries { paneId, from, to }.
+      permission_changed: () => {
+        playFrameEarcon(); // "permission" — autonomy changed
+        if (typeof msg.paneId === "string" && typeof msg.from === "string" && typeof msg.to === "string") {
+          desktopNote("🔒 Autonomy changed", `${msg.paneId}: ${msg.from} → ${msg.to}`); // 2K.6 — background tab only
+        }
       },
       // 1B.7: the orchestrator's proactive announcements reach the kitchen too. earcon: null — the bus
       // already fired its own proactive_earcon for this event.

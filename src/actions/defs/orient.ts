@@ -151,6 +151,14 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     ctx.manager.settings.projects.localWorkspacePath = wsPath;
     ctx.manager.saveSettings();
     ctx.broadcastLedgerUpdate();
+    // BUG-012 (residual): move the UI's PROJECT focus to follow the voice switch. broadcastLedgerUpdate
+    // above repaints the workspace list first; this context_switched frame then tells the classic client
+    // to re-highlight the now-active project (src/appHelpers.ts WS_HANDLERS -> setActiveProjectId). Placed
+    // AFTER the ledger update (ordering is pinned by tests/test_context_switched_frame.ts) and before the
+    // live refresh/brief, whose side effects are unrelated to the focus move. Optional-chained like the
+    // sibling ctx.injectMemoryBrief?.() below: the real voice/REST ctx always supplies broadcast, while
+    // some pre-existing switch_context unit ctxs (sync/inject suites) omit it — a no-op there is safe.
+    ctx.broadcast?.({ type: "context_switched", activeProjectId: projectId });
     // Phase 1 "ears" (fact [E]): getProjectBriefing reads ws.panes, which is only as fresh as
     // the last syncLedger(). Force a live PTY->ledger sync FIRST so the catch-up briefing
     // reflects each pane's CURRENT status/is_busy (e.g. a pane that just went Running or Idle)
@@ -305,16 +313,14 @@ export const dismissAttention: ActionDef<typeof DismissAttentionParams> = {
     const targetId = args.id;
     let output: string;
     if (targetId) {
-      const item = ctx.manager.attentionQueue.find((i) => i.id === targetId);
-      if (item) {
-        item.dismissed = true;
-        output = `Dismissed attention item ${targetId}.`;
-      } else {
-        output = `No attention item found with id ${targetId}.`;
-      }
+      // W5 (BUG-013 residual): dismiss write-through — the manager seam flips the in-memory flag
+      // AND persists store.dismissAttention (dismiss ≠ delete, so it does not resurrect on restart).
+      const found = ctx.manager.dismissAttention(targetId);
+      output = found
+        ? `Dismissed attention item ${targetId}.`
+        : `No attention item found with id ${targetId}.`;
     } else {
-      const count = ctx.manager.attentionQueue.filter((i) => !i.dismissed).length;
-      ctx.manager.attentionQueue.forEach((i) => (i.dismissed = true));
+      const count = ctx.manager.dismissAllAttention();
       output = `Dismissed all ${count} pending attention item${count === 1 ? "" : "s"}.`;
     }
     ctx.pruneAttention();

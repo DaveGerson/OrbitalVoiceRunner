@@ -40,6 +40,7 @@ import { findPaneOwningProject } from "./paneOwnership";
 import { activateCreatedPane } from "./paneActivation";
 import { getHistoryBridge } from "./historyBridge";
 import { respawnFromLedger } from "./actions/respawnFromLedger";
+import { globalOverrideRiderForMode } from "./globalOverrideRider";
 import type { ActionContext } from "./actions/types";
 
 /**
@@ -325,7 +326,12 @@ function buildApplyPaneModeReplay(p: ApplyPaneModeParams, deps: ActionEffectDeps
       paneId: p.paneId,
       note: `Permission mode for pane ${p.paneId} set to ${p.permissionsMode} after restart — restart the pane (restart-resume) to apply it to a LIVE process.`,
     });
-    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode}. Applied after a restart: the next pane start uses it; restart the pane to switch a live process.`;
+    // BUG-003: append the SAME global-override honesty rider the immediate path carries, computed at
+    // REPLAY time from the rebuilt (fresh-boot) manager's globalPermissionsMode via the shared leaf —
+    // so a confirm-after-restart tells the operator the pane change is gating-inert under a non-Inherit
+    // global mode, byte-clean ("" ) when global is Inherit.
+    const rider = globalOverrideRiderForMode(deps.manager.globalPermissionsMode);
+    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode}. Applied after a restart: the next pane start uses it; restart the pane to switch a live process.${rider}`;
   };
 }
 
@@ -339,8 +345,13 @@ function buildLegacyPanePermissions(p: SetPanePermissionsParams, deps: ActionEff
     }
     deps.broadcastLedgerUpdate();
     deps.broadcast({ type: "terminals_updated" });
-    // Exact confirm string — keep the trailing "successfully." (server.ts:3238 literal).
-    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode} successfully.`;
+    // Exact confirm string — keep the trailing "successfully." (server.ts:3238 literal). BUG-003:
+    // append the SAME global-override rider the immediate legacy path (locks.ts legacyApplyPanePerms)
+    // carries, computed at replay time from the rebuilt manager's globalPermissionsMode via the shared
+    // leaf, so a confirm-after-restart stays in LOCKSTEP with a confirm-in-process (rider when global
+    // is non-Inherit; byte-clean "successfully." when Inherit).
+    const rider = globalOverrideRiderForMode(deps.manager.globalPermissionsMode);
+    return `Safety permission mode for pane ${p.paneId} updated to ${p.permissionsMode} successfully.${rider}`;
   };
 }
 

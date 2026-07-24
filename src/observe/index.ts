@@ -336,6 +336,39 @@ export interface ObserveHandlers {
 // interaction leg stays gated identically without coupling to a server.ts export.
 const VOICE_TRACE = !!process.env.JANUS_DEBUG_VOICE && process.env.JANUS_DEBUG_VOICE !== "0";
 
+// ── BUG-011: leading parallel-group helpers (pure) ────────────────────────────────────────────────
+// A plan advances PAST a leading parallel group only once EVERY member has settled. These two pure
+// scans keep handlePlansTrigger/handlePlanStepEdge group-aware while staying under the CC/cognitive
+// ceilings. A step with no `group` marker is a group of ONE — the byte-identical sequential path.
+
+/** The LEADING group at `startIndex`: the maximal run of consecutive steps sharing
+ *  steps[startIndex].group (a non-undefined marker). A step with no `group` is a group of one. */
+function leadingGroup(steps: any[], startIndex: number): any[] {
+  const first = steps[startIndex];
+  if (!first) return [];
+  if (first.group === undefined) return [first];
+  const group: any[] = [];
+  for (let i = startIndex; i < steps.length; i++) {
+    if (steps[i].group !== first.group) break;
+    group.push(steps[i]);
+  }
+  return group;
+}
+
+/** True once EVERY member of a leading parallel group has SETTLED (completed OR failed). The join
+ *  can make no further progress once this holds — the plan then advances (all completed) or pauses
+ *  (any failed). BUG-011: this must NOT require all-completed, or a member that failed at dispatch
+ *  (gated Off -> "failed", no pane edge ever coming) wedges the join and the plan runs forever. */
+function isGroupSettled(group: any[]): boolean {
+  return group.length > 0 && group.every((s) => s.status === "completed" || s.status === "failed");
+}
+
+/** True when a settled group carries at least one FAILED member (a dispatch-time refusal that never
+ *  ran, or a runtime failure) — the plan cannot proceed past the group, so it pauses. */
+function groupHasFailure(group: any[]): boolean {
+  return group.some((s) => s.status === "failed");
+}
+
 /**
  * attachObserve(manager, deps) — build the `onOutput` / `onIdle` handlers plus their private,
  * per-server observation state. The caller assigns `manager.onOutput = onOutput` /
@@ -394,7 +427,9 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
       const done = g.members.filter((m) => m.status === "done").length;
       const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
       const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
-      manager.attentionQueue.push({
+      // BUG-013 residual (W5): route through the pushAttention seam (in-memory append + BUG-035
+      // prune + durable write-through) instead of the raw array push + redundant pruneAttention().
+      manager.pushAttention({
         id: "att_" + Math.random().toString(36).substring(2, 11),
         // Informational completion item ("idle" — widened onto AttentionItem.type for this).
         type: "idle",
@@ -404,7 +439,6 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
         timestamp: new Date().toISOString(),
         dismissed: false
       });
-      pruneAttention(); // BUG-035 cap/TTL
       broadcast({ type: "attention_updated", queue: manager.attentionQueue });
       broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
       announcementBus.enqueue({ kind: "completion", terminalId, summary });
@@ -667,7 +701,8 @@ ${redact(rawOutput.slice(-3000))}`;
         // cross-pane write happens here. (architecture §5: Remove watch-rule autonomous writes.)
         console.log(`[WATCH RULE NUDGE] Rule ${rule.id} matched: suggesting '${rule.actionCommand}' for '${rule.actionTerminalId}' (not writing).`);
         const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-        manager.attentionQueue.push({
+        // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+        manager.pushAttention({
           id: itemID,
           type: "confirmation",
           terminalId: rule.actionTerminalId,
@@ -682,7 +717,6 @@ ${redact(rawOutput.slice(-3000))}`;
             targetTerminalId: rule.actionTerminalId,
           },
         });
-        pruneAttention(); // BUG-035 cap/TTL
         broadcast({ type: "attention_updated", queue: manager.attentionQueue });
         broadcast({
           type: "watch_rule_suggested",
@@ -717,7 +751,8 @@ ${redact(rawOutput.slice(-3000))}`;
     nextStep.status = "pending";
     plan.status = "paused";
     const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    manager.pushAttention({
       id: itemID,
       type: "confirmation",
       terminalId: nextStep.terminalId,
@@ -733,7 +768,6 @@ ${redact(rawOutput.slice(-3000))}`;
         targetTerminalId: nextStep.terminalId,
       },
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
     announcementBus.enqueue({
       kind: "plan_paused",
@@ -758,22 +792,28 @@ ${redact(rawOutput.slice(-3000))}`;
     });
   }
 
-  /** A failure transition on the running step: fail the step + pause the plan. */
-  function failPlanStep(plan: any, currentStep: any, terminalId: string, transition: Transition): void {
-    currentStep.status = "failed";
+  /**
+   * The SHARED plan-level PAUSE emission (BUG-011): flip the plan paused, surface a redacted
+   * attention item, and emit the plan_paused WS frame + announcement so an eyes-off operator HEARS
+   * the pause. Used by both the sequential/runtime failure edge (failPlanStep) and the parallel-group
+   * settled-with-failure join (pauseGroupOnFailure). The plan_paused frame message is kept identical
+   * to the pre-BUG-011 sequential wording so that path stays byte-identical.
+   */
+  function emitPlanPaused(plan: any, terminalId: string, attnMessage: string, announceSummary: string): void {
     plan.status = "paused";
-    console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
     const itemID = "att_" + Math.random().toString(36).substring(2, 11);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through). A paused
+    // plan's attention item is always the "build-failed" severity class (both the sequential failure
+    // edge and the parallel-group failure join surface it that way).
+    manager.pushAttention({
       id: itemID,
       type: "build-failed",
       terminalId,
       projectId: manager.ledger.activeProjectId || "default_project",
-      message: `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+      message: attnMessage,
       timestamp: new Date().toISOString(),
       dismissed: false
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
     broadcast({
       type: "plan_paused",
@@ -783,34 +823,83 @@ ${redact(rawOutput.slice(-3000))}`;
     announcementBus.enqueue({
       kind: "plan_paused",
       terminalId,
-      summary: `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
+      summary: announceSummary
     });
   }
 
+  /** A failure transition on the running step: fail the step + pause the plan. */
+  function failPlanStep(plan: any, currentStep: any, terminalId: string, transition: Transition): void {
+    currentStep.status = "failed";
+    console.log(`[PLAN PAUSED] Plan '${plan.name}' failed on step ${plan.currentStepIndex + 1} due to ${transition}.`);
+    emitPlanPaused(
+      plan,
+      terminalId,
+      `Plan '${plan.name}' was paused on step ${plan.currentStepIndex + 1}: pane returned ${transition}.`,
+      `Plan '${plan.name}' paused on step ${plan.currentStepIndex + 1}.`
+    );
+  }
+
   /**
-   * Handle a transition edge against ONE plan whose current running step is bound to `terminalId`.
-   * Returns true when the plan changed (the caller then force-persists + re-broadcasts the board).
+   * BUG-011: the leading parallel group SETTLED (every member completed-or-failed) with at least one
+   * FAILED member — a dispatch-time refusal (gated Off) that never produced a pane edge, or a runtime
+   * failure. The tail sequential step is unreachable past a failed member, so PAUSE the plan the SAME
+   * way a sequential step failure does (same plan_paused frame + announcement the operator hears),
+   * rather than leaving it "running" forever. currentStepIndex is deliberately NOT advanced.
    */
-  function handlePlanStepEdge(plan: any, currentStep: any, terminalId: string, transition: Transition): boolean {
-    if (transition === currentStep.expectedTransition) {
-      currentStep.status = "completed";
-      console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
-      broadcast({
-        type: "plan_step_completed",
-        planId: plan.id,
-        stepId: currentStep.id,
-        message: `Plan step completed successfully on '${terminalId}'.`
-      });
-      const nextIndex = plan.currentStepIndex + 1;
-      if (nextIndex < plan.steps.length) {
-        advanceToNextPlanStep(plan, nextIndex);
-      } else {
-        completePlan(plan);
-      }
+  function pauseGroupOnFailure(plan: any, group: any[], terminalId: string): void {
+    const failed = group.filter((s: any) => s.status === "failed").length;
+    console.log(`[PLAN PAUSED] Plan '${plan.name}' paused: ${failed} of ${group.length} parallel step(s) failed.`);
+    emitPlanPaused(
+      plan,
+      terminalId,
+      `Plan '${plan.name}' was paused: ${failed} of ${group.length} parallel step(s) did not complete.`,
+      `Plan '${plan.name}' paused: ${failed} of ${group.length} parallel steps did not complete.`
+    );
+  }
+
+  /**
+   * BUG-011: settle ONE completed member of the leading group. Marks it completed + broadcasts
+   * plan_step_completed; then acts ONLY once the whole group has SETTLED (every member completed OR
+   * failed — never on the first member's edge, and no longer wedged by a member that failed at
+   * dispatch). A settled group with any FAILED member pauses the plan (pauseGroupOnFailure); an
+   * all-completed group advances PAST the group via the existing advance/complete path. group.length===1
+   * (a step with no group marker) settles immediately on its own completion, so the sequential advance
+   * is byte-identical to pre-BUG-011.
+   */
+  function completeGroupMember(plan: any, group: any[], member: any, terminalId: string): void {
+    member.status = "completed";
+    console.log(`[PLAN PROGRESS] Plan '${plan.name}' - a step completed on '${terminalId}'.`);
+    broadcast({
+      type: "plan_step_completed",
+      planId: plan.id,
+      stepId: member.id,
+      message: `Plan step completed successfully on '${terminalId}'.`
+    });
+    if (!isGroupSettled(group)) return; // group still joining — do NOT settle past it yet.
+    if (groupHasFailure(group)) {
+      pauseGroupOnFailure(plan, group, terminalId); // a failed member blocks the tail — pause, don't advance.
+      return;
+    }
+    const nextIndex = plan.currentStepIndex + group.length;
+    if (nextIndex < plan.steps.length) {
+      advanceToNextPlanStep(plan, nextIndex);
+    } else {
+      completePlan(plan);
+    }
+  }
+
+  /**
+   * Handle a transition edge for ONE member of the leading (parallel or single-step) group bound to
+   * `terminalId`. Returns true when the plan changed (the caller then force-persists + re-broadcasts the
+   * board). A failure edge on any member pauses the plan exactly as today.
+   */
+  function handlePlanStepEdge(plan: any, group: any[], member: any, terminalId: string, transition: Transition): boolean {
+    if (transition === member.expectedTransition) {
+      completeGroupMember(plan, group, member, terminalId);
       return true;
     }
     if (transition === "error" || transition === "build-failed" || transition === "exited") {
-      failPlanStep(plan, currentStep, terminalId, transition);
+      failPlanStep(plan, member, terminalId, transition);
       return true;
     }
     return false;
@@ -821,10 +910,12 @@ ${redact(rawOutput.slice(-3000))}`;
     let changed = false;
     for (const plan of plans) {
       if (plan.status !== "running") continue;
-      const currentStep = plan.steps[plan.currentStepIndex];
-      if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
-        if (handlePlanStepEdge(plan, currentStep, terminalId, transition)) changed = true;
-      }
+      // BUG-011: the edge may belong to ANY still-running member of the leading parallel group — not
+      // necessarily steps[currentStepIndex]. For a sequential plan the group is just that one step, so
+      // this is identical to the old steps[currentStepIndex] match.
+      const group = leadingGroup(plan.steps, plan.currentStepIndex);
+      const member = group.find((s: any) => s.status === "running" && s.terminalId === terminalId);
+      if (member && handlePlanStepEdge(plan, group, member, terminalId, transition)) changed = true;
     }
     if (changed) {
       manager.ledger["save"](true);
@@ -841,7 +932,8 @@ ${redact(rawOutput.slice(-3000))}`;
     const id = "att_" + Math.random().toString(36).substring(2, 11);
     // WS-B: scrub the chunk before it becomes a displayed/announced hint.
     const hint = redact(cleanChunk.trim()).slice(-160);
-    manager.attentionQueue.push({
+    // BUG-013 residual (W5): route through the pushAttention seam (durable write-through).
+    manager.pushAttention({
       id,
       type: transition,
       terminalId,
@@ -850,7 +942,6 @@ ${redact(rawOutput.slice(-3000))}`;
       timestamp: new Date().toISOString(),
       dismissed: false
     });
-    pruneAttention(); // BUG-035 cap/TTL
     broadcast({ type: "attention_updated", queue: manager.attentionQueue });
 
     // WS-D (BUG-024): high-severity proactive announcement (reuses the existing lastStates

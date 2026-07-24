@@ -79,7 +79,7 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 *   **History Simplification Engine (`get_pane_command_history` inside `/server.ts`):**
     Instead of passing large, messy and token-expensive stdout streams to the LLM context, it maintains a concise history log containing the precise command executed and its condensed high-level outcome.
 *   **Dynamic System Prompt Reconstruction:**
-    Each time Janus resumes a workspace session, the system instruction is reconstructed with the active project ID, the available workspaces (ID/name), and the live status and CWD of each terminal pane. (Note: project notes and file trees are *not* injected into the system instruction today; notes re-enter context via the `switch_context` briefing — see `docs/review/BUG_LOG.md` BUG-033.)
+    Each time Janus resumes a workspace session, the system instruction is reconstructed with only the active project ID and the available workspaces (ID/name pairs). Live pane status/CWD is deliberately *not* injected — it would go stale — and is read on demand via `list_panes` (see `src/voice/systemPrompt.ts` §5). Project notes and file trees are likewise not injected; notes re-enter context via the `switch_context` briefing — see `docs/review/BUG_LOG.md` BUG-033.
 
 ---
 
@@ -118,7 +118,7 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 
 Journey coverage lives in several layers (not just the journey suite):
 
-*   **Journey suite (`/tests/test_journeys.ts`):** Journeys 1–6 at the noun level (real PTY panes, real ledger). Its J2/J3/J6 verb logic is locally mocked — the real verbs are covered by the purpose-built suites below.
+*   **Journey suite (`/tests/test_journeys.ts`):** Journeys 1–8 at the noun level (real PTY panes, real ledger). Its J2/J3/J6 verb logic is locally mocked — the real verbs are covered by the purpose-built suites below.
 *   **Purpose-built unit/integration suites:** the real approval parser/routing/durability (`test_approvals_wse`, `test_voice_approval_routing`, `test_pendingApprovals_durable`), the real status machine (`test_status_machine`), notes + recall with redaction (`test_notes_recall`, `test_c55_12_notes`), capability gates (`test_capability_gate`, `test_c55_16_set_pane_gates`), and `get_pane_summary` redaction at the real method (`test_redaction`) — covering the J7/J8 components.
 *   **Live e2e lane (`e2e/live_*.spec.ts`, `npm run test:e2e:live`):** real server + real PTYs, no mock harness — pane lifecycle through the capability gate, archive/restore, per-pane gate behavior, keyboard-only operation, draft durability, stop-all.
 *   **Drift guards:** every registry action must be referenced by at least one test (`tests/test_action_test_presence.ts`); voice/REST surface asymmetries are allowlist-gated (`tests/test_action_coverage.ts`).

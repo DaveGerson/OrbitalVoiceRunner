@@ -21,10 +21,11 @@
  */
 
 import { z } from "zod";
-import type { ActionContext, ActionDef, ActionResult } from "../types";
+import type { ActionContext, ActionDef, ActionResult, DispatchOutcome } from "../types";
 import type { OrchestrationRecipe } from "../types";
 import { presetCommand, normalizePreset } from "../../terminal";
 import { planRecipeApply, type RecipeApplyPlan } from "../../recipeApply";
+import { dispatchJoinTracker } from "../../dispatch/joinTracker";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // create_orchestrator_plan — server.ts:2925 (UNGATED pure ledger write)
@@ -42,6 +43,9 @@ const CreateOrchestratorPlanParams = z.object({
       terminalId: z.string(),
       command: z.string(),
       expectedTransition: z.string(),
+      // BUG-011: optional parallel-group marker (consecutive leading steps sharing it run concurrently).
+      // Absent for ordinary sequential plans — copied through ONLY when supplied (byte-identical otherwise).
+      group: z.string().optional(),
     }),
   ),
 });
@@ -73,6 +77,9 @@ export const createOrchestratorPlan: ActionDef<typeof CreateOrchestratorPlanPara
       // "idle"|"prompt" on PlanStep but the legacy branch stores the raw string — keep that.
       expectedTransition: (s.expectedTransition || "idle") as "idle" | "prompt",
       status: "pending" as const,
+      // BUG-011: thread the parallel-group marker through ONLY when supplied, so a plan without groups
+      // is byte-identical to the pre-BUG-011 shape (no spurious `group: undefined` key).
+      ...(s.group !== undefined ? { group: s.group } : {}),
     }));
     const newPlan = {
       id: "plan_" + Math.random().toString(36).substring(2, 11),
@@ -141,6 +148,180 @@ const EXECUTE_PLAN_HTTP_STATUS: Record<ExecutePlanOutcome, number> = {
   plan_not_found: 404,
   clarify:        409,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUG-011: leading parallel-group dispatch. Consecutive LEADING steps that share a non-undefined
+// `group` marker fan out CONCURRENTLY in one execute_plan invocation (one gated ctx.dispatchProposal
+// per member, a DISTINCT synthetic pendingId each), and a dispatchJoinTracker group is registered so
+// the operator gets ONE "all done" join later (settled by the observe layer). A plan with no group
+// marker is a group of ONE — the byte-identical sequential path (dispatchSingleStep below).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The LEADING group at index 0: the maximal run of consecutive steps sharing steps[0].group. A step
+ *  with no `group` marker is a group of one (the sequential path). Pure; mutates nothing. */
+function leadingPlanGroup(steps: any[]): any[] {
+  const first = steps[0];
+  if (!first) return [];
+  if (first.group === undefined) return [first];
+  const group: any[] = [];
+  for (const step of steps) {
+    if (step.group !== first.group) break;
+    group.push(step);
+  }
+  return group;
+}
+
+/** Map a per-member DispatchOutcome to the execute_plan HTTP-outcome vocabulary (blocked = gate Off /
+ *  read-only; pane_offline = inert pane / no live term; clarify = shell re-route; pending = staged
+ *  approval; executed = landed). */
+function memberOutcome(out: DispatchOutcome): ExecutePlanOutcome {
+  if (out.kind === "executed") return "executed";
+  if (out.kind === "pending") return "pending";
+  if (out.kind === "clarify") return "clarify";
+  return out.kind === "blocked" ? "blocked" : "pane_offline";
+}
+
+/** Refusals dominate the group's aggregate outcome (worst-of), which drives execute_plan's REST status. */
+const OUTCOME_SEVERITY: Record<ExecutePlanOutcome, number> = {
+  executed: 0, pending: 1, clarify: 2, pane_offline: 3, blocked: 4, plan_not_found: 5,
+};
+
+/** Reflect ONE member's dispatch outcome onto the plan board + the join tracker. executed/pending keep
+ *  the member RUNNING on the board (the write landed, or is staged for approval); a refusal
+ *  (blocked/clarify/error) FAILS that member's step so the join can't hang on it — but, unlike the
+ *  single-step handler, does NOT pause the whole plan (its siblings keep running). */
+function applyMemberOutcome(joinId: string, index: number, step: any, out: DispatchOutcome): void {
+  if (out.kind === "executed") {
+    step.status = "running";
+    dispatchJoinTracker.recordOutcomeAt(joinId, index, "running");
+  } else if (out.kind === "pending") {
+    step.status = "running";
+    dispatchJoinTracker.recordOutcomeAt(joinId, index, "staged");
+  } else if (out.kind === "blocked") {
+    step.status = "failed";
+    dispatchJoinTracker.recordOutcomeAt(joinId, index, "blocked");
+  } else {
+    step.status = "failed";
+    dispatchJoinTracker.recordOutcomeAt(joinId, index, "error");
+  }
+}
+
+/** The single-step dispatch path — VERBATIM extraction of the pre-BUG-011 handler body (a lone plan
+ *  step routed through ctx.dispatchProposal with the synthetic `${callId}__${planId}__step0` pendingId
+ *  + capability "execute_plan"). Mutates plan/step exactly as before; returns the spoken read-back plus
+ *  the stamped outcome. A group of one (incl. a plan with no group marker) takes this path, so the
+ *  sequential contract is byte-identical. */
+function dispatchSingleStep(ctx: ActionContext, plan: any): { resp: string; outcome: ExecutePlanOutcome } {
+  const currentStep = plan.steps[0];
+  const stepOutcome = ctx.dispatchProposal({
+    sess: ctx.session,
+    callId: ctx.callId ?? "",
+    pendingId: `${ctx.callId ?? ""}__${plan.id}__step0`,
+    targetId: currentStep.terminalId,
+    instruction: currentStep.command,
+    trigger: `Plan '${plan.name}' step 1`,
+    capability: "execute_plan",
+  });
+  if (stepOutcome.kind === "executed") {
+    return { resp: `Started execution of plan '${plan.name}'! Running step 1 on '${currentStep.terminalId}'.`, outcome: "executed" };
+  }
+  if (stepOutcome.kind === "pending") {
+    return { resp: `Plan '${plan.name}' step 1 needs approval: ${stepOutcome.text}`, outcome: "pending" };
+  }
+  if (stepOutcome.kind === "clarify") {
+    plan.status = "paused";
+    currentStep.status = "failed";
+    return { resp: `Plan '${plan.name}' step 1 paused: ${stepOutcome.text}`, outcome: "clarify" };
+  }
+  plan.status = "paused";
+  currentStep.status = "failed";
+  return {
+    resp: `Could not start plan '${plan.name}': ${stepOutcome.text}`,
+    // §6: "blocked" (gate Off / read-only) -> 403; "error" (no live term / inert pane) -> 400.
+    outcome: stepOutcome.kind === "blocked" ? "blocked" : "pane_offline",
+  };
+}
+
+/** Per-member dispatch tally for the HONEST parallel-group read-back (BUG-011): how many members
+ *  actually started (executed -> running), how many are staged awaiting approval (pending), and how
+ *  many were refused at the gate (blocked / clarify / error). Mirrors narrateDispatch's
+ *  staged-vs-refused split so an eyes-off operator hears what really got off the ground. */
+interface GroupDispatchTally {
+  running: number;
+  staged: number;
+  refused: number;
+}
+
+/** Fold ONE member's dispatch outcome into the tally (executed=running, pending=staged, everything
+ *  else — blocked/clarify/error — refused, matching applyMemberOutcome's failed-step mapping). */
+function tallyMember(tally: GroupDispatchTally, out: DispatchOutcome): void {
+  if (out.kind === "executed") tally.running++;
+  else if (out.kind === "pending") tally.staged++;
+  else tally.refused++;
+}
+
+/** Honest spoken read-back for a fanned-out parallel group — reflects the ACTUAL dispatch outcomes
+ *  (started / awaiting approval / blocked) instead of blindly claiming every member is "running
+ *  concurrently". When nothing got off the ground it mirrors the single-step path's "Could not start
+ *  plan" refusal wording; a clean fan-out keeps the original happy-path sentence byte-identical. */
+function narrateParallelGroup(planName: string, total: number, tally: GroupDispatchTally): string {
+  const started = tally.running + tally.staged;
+  if (started === 0) {
+    return `Could not start plan '${planName}': all ${total} parallel steps were blocked.`;
+  }
+  if (tally.staged === 0 && tally.refused === 0) {
+    return `Started parallel execution of plan '${planName}': ${total} steps running concurrently.`;
+  }
+  const parts = [`Started ${started} of ${total} steps of plan '${planName}'`];
+  if (tally.staged > 0) parts.push(`${tally.staged} awaiting approval`);
+  if (tally.refused > 0) parts.push(`${tally.refused} blocked`);
+  return parts.join("; ") + ".";
+}
+
+/** Fan a LEADING parallel group out through the SAME gated pane-write choke-point — one
+ *  ctx.dispatchProposal per member (each gating exactly as a lone plan step: capability "execute_plan",
+ *  a DISTINCT synthetic pendingId), registering a dispatchJoinTracker group for the later "all done"
+ *  join. Deliberately NOT stageDispatchGroup: its forceStage would turn every member into a pending
+ *  approval even under Full Auto, diverging from the single-step gating contract. Plan advancement stays
+ *  the observe layer's job (currentStepIndex is NOT touched here) — EXCEPT the all-refused case, which
+ *  settled at dispatch (no pane edge is coming to settle the join), so it pauses here for parity with
+ *  dispatchSingleStep's blocked branch. */
+function dispatchParallelGroup(ctx: ActionContext, plan: any, group: any[]): { resp: string; outcome: ExecutePlanOutcome } {
+  // The join name is wrapped by the completion narration as `Dispatch '<name>' complete`
+  // (src/observe/index.ts), so keep the label unquoted here — `Plan '<name>'` would read back as the
+  // doubled-quote "Dispatch 'Plan 'X'' complete". `Plan <name>` narrates cleanly as "Dispatch 'Plan X' complete".
+  const join = dispatchJoinTracker.create(`Plan ${plan.name}`, group[0].command, group.map((s) => s.terminalId));
+  let worst: ExecutePlanOutcome = "executed";
+  const tally: GroupDispatchTally = { running: 0, staged: 0, refused: 0 };
+  group.forEach((step, i) => {
+    const stepOutcome = ctx.dispatchProposal({
+      sess: ctx.session,
+      callId: ctx.callId ?? "",
+      // DISTINCT synthetic pendingId per member (no functionCall-id / step collision).
+      pendingId: `${ctx.callId ?? ""}__${plan.id}__step${i}`,
+      targetId: step.terminalId,
+      instruction: step.command,
+      trigger: `Plan '${plan.name}' step ${i + 1}`,
+      capability: "execute_plan",
+    });
+    applyMemberOutcome(join.id, i, step, stepOutcome);
+    tallyMember(tally, stepOutcome);
+    const mo = memberOutcome(stepOutcome);
+    if (OUTCOME_SEVERITY[mo] > OUTCOME_SEVERITY[worst]) worst = mo;
+  });
+  ctx.broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
+  // BUG-011: when NOTHING got off the ground (every member refused at the gate), the group settled at
+  // dispatch — there is no pane edge coming to settle the join, so the plan would sit "running" forever
+  // (a zombie). Pause it right here, mirroring dispatchSingleStep's blocked branch. A group with any
+  // member running/staged stays "running" and settles later in the observe layer (isGroupSettled),
+  // which pauses the plan if any member ended up failed.
+  if (tally.running === 0 && tally.staged === 0) plan.status = "paused";
+  return {
+    resp: narrateParallelGroup(plan.name, group.length, tally),
+    outcome: worst,
+  };
+}
+
 export const executePlan: ActionDef<typeof ExecutePlanParams> = {
   name: "execute_plan",
   description: "Starts running a synthesized multi-step plan recipe.",
@@ -179,41 +360,18 @@ export const executePlan: ActionDef<typeof ExecutePlanParams> = {
     if (plan) {
       plan.status = "running";
       plan.currentStepIndex = 0;
-      plan.steps.forEach((s, idx) => (s.status = idx === 0 ? "running" : "pending"));
-      const currentStep = plan.steps[0];
-
-      // R4: route step 1's pane write through the SAME effective-mode gate + pending-approval path.
-      // The gate is applied INSIDE dispatchProposal (capability "execute_plan"); no central gate.
-      const stepOutcome = ctx.dispatchProposal({
-        sess: ctx.session,
-        callId: ctx.callId ?? "",
-        pendingId: `${ctx.callId ?? ""}__${plan.id}__step0`,
-        targetId: currentStep.terminalId,
-        instruction: currentStep.command,
-        trigger: `Plan '${plan.name}' step 1`,
-        // Ride the execute_plan capability (not the default write_to_pane) so
-        // capabilityGates.execute_plan is actually enforced.
-        capability: "execute_plan",
-      });
-      if (stepOutcome.kind === "executed") {
-        resp = `Started execution of plan '${plan.name}'! Running step 1 on '${currentStep.terminalId}'.`;
-        outcome = "executed";
-      } else if (stepOutcome.kind === "pending") {
-        resp = `Plan '${plan.name}' step 1 needs approval: ${stepOutcome.text}`;
-        outcome = "pending";
-      } else if (stepOutcome.kind === "clarify") {
-        plan.status = "paused";
-        currentStep.status = "failed";
-        resp = `Plan '${plan.name}' step 1 paused: ${stepOutcome.text}`;
-        outcome = "clarify";
-      } else {
-        plan.status = "paused";
-        currentStep.status = "failed";
-        resp = `Could not start plan '${plan.name}': ${stepOutcome.text}`;
-        // §6: a "blocked" dispatch (gate Off / read-only) -> 403; an "error" dispatch is the no-live-
-        // term / inert-pane case -> 400 (preserves the inline route's "node offline" status).
-        outcome = stepOutcome.kind === "blocked" ? "blocked" : "pane_offline";
-      }
+      // BUG-011: a LEADING parallel group (consecutive steps sharing a group marker) fans out together;
+      // a plan with no group marker is a group of ONE (the byte-identical sequential path). Mark every
+      // group member running and everything AFTER the group pending (identical to the old idx===0 rule
+      // when the group is a single step).
+      const group = leadingPlanGroup(plan.steps);
+      plan.steps.forEach((s, idx) => (s.status = idx < group.length ? "running" : "pending"));
+      // R4: route each member's pane write through the SAME effective-mode gate + pending-approval path
+      // (INSIDE dispatchProposal, capability "execute_plan"; no central gate). A single step keeps the
+      // exact pre-BUG-011 path; a group fans out + registers a join.
+      const dispatched = group.length > 1 ? dispatchParallelGroup(ctx, plan, group) : dispatchSingleStep(ctx, plan);
+      resp = dispatched.resp;
+      outcome = dispatched.outcome;
       // Persist + broadcast ONCE, inside the plan-found block only (server.ts:2984-2985).
       ctx.manager.ledger["save"](true);
       ctx.broadcast({ type: "plans_updated", plans: ctx.manager.ledger.plans });

@@ -2210,6 +2210,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
         return "rest:" + crypto.createHash("sha256").update(material).digest("hex").slice(0, 32);
       } catch { return null; }
     };
+    // BUG-017: the REST caller's workspace scope, read once from the request (GET query / POST body)
+    // and threaded onto the ActionContext so the approve/reject + list handlers can refuse / omit
+    // foreign-workspace pendings. Undefined (no field supplied) preserves today's unscoped behavior.
+    const callerWorkspaceId =
+      (typeof req.query?.workspaceId === "string" ? req.query.workspaceId : undefined) ??
+      (typeof req.body?.workspaceId === "string" ? req.body.workspaceId : undefined);
     return {
       manager,
       session: null,
@@ -2217,6 +2223,8 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       trigger: "rest",
       surface: "rest",                          // explicit dispatch-surface token (action_log)
       userUtterance: "",
+      callerWorkspaceId,                        // BUG-017: cross-workspace scope for approve/list
+
       broadcast,
       broadcastLedgerUpdate,
       gateOrDefer,

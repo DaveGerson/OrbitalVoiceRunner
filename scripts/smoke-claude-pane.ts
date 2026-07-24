@@ -14,15 +14,19 @@
  * Requires Claude Code installed + authenticated (OAuth keychain is fine; no API
  * key in env needed). Launches the bare `claude` binary, exactly like a pane.
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { UniversalTerminal } from "../src/terminal";
+import { resolveSmokeTimeouts, waitForReady } from "./smoke-claude-helpers";
 
 // Default is a short prompt; override with JANUS_SMOKE_PROMPT to probe the paste-burst/submit
 // behavior with longer, multi-clause instructions (Issue B: the live failure used ~74-char
 // instructions). Whatever the prompt, it must still direct the model to answer "PONG" so the
 // content assertion below holds.
 const PROMPT = process.env.JANUS_SMOKE_PROMPT || "Reply with exactly the word PONG and nothing else.";
-const STARTUP_MS = 6000;   // let the TUI come up
-const RESPONSE_MS = 25000; // allow for the model round-trip
+// BUG-043: startup/response windows are env-overridable with raised defaults (a plugin-heavy Claude
+// can init well past the old hardcoded 6s). JANUS_SMOKE_STARTUP_MS / JANUS_SMOKE_RESPONSE_MS win.
+const { startupMs, responseMs } = resolveSmokeTimeouts(process.env);
 
 function log(...a: any[]) { console.log("[smoke]", ...a); }
 
@@ -55,14 +59,16 @@ async function main() {
   const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
 
   log("starting pane (claude)...");
+  // BUG-043: gate the submit on a REAL readiness signal instead of a blind fixed-6s sleep. Install
+  // the gate BEFORE start() so we never miss the onReady edge; it composes term.onOutput above so
+  // startup bytes keep accumulating. It waits for onReady + an output-quiescence window, hard-capped
+  // at startupMs so a silent/degraded child can't hang the smoke.
+  const readyP = waitForReady(term, { startupMs, quietMs: 1500 });
   term.start();
   log(`spawned: usingNodePty=${(term as any).usingNodePty} pid=${(term as any).shellPid}`);
 
-  // Instrument: report status each second through startup.
-  for (let i = 0; i < STARTUP_MS / 1000; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    log(`t+${i + 1}s status=${term.status} bytes=${bytesBefore}`);
-  }
+  const ready = await readyP;
+  log(`readiness: ready=${ready.ready} reason=${ready.reason} status=${term.status} bytes=${bytesBefore}`);
 
   if (term.status === "Exited") {
     log("FAIL: pane exited during startup - not a live session.");
@@ -74,13 +80,13 @@ async function main() {
     await term.stop();
     process.exit(1);
   }
-  log(`startup OK - status=${term.status}, ${bytesBefore} bytes of TUI output.`);
+  log(`startup OK - reason=${ready.reason}, status=${term.status}, ${bytesBefore} bytes of TUI output.`);
 
   phase = "post-input";
   log(`submitting prompt via writeInput(): "${PROMPT}"`);
   term.writeInput(PROMPT);
 
-  await new Promise((r) => setTimeout(r, RESPONSE_MS));
+  await new Promise((r) => setTimeout(r, responseMs));
 
   await term.stop();
 
@@ -104,7 +110,12 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((e) => {
-  console.error("[smoke] ERROR:", e);
-  process.exit(1);
-});
+// Run only when executed directly (not when imported). Belt-and-suspenders: the two helpers now
+// live in a pure module (scripts/smoke-claude-helpers.ts), but keep this guard so importing this
+// script never spawns a live `claude` pane or calls process.exit().
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    console.error("[smoke] ERROR:", e);
+    process.exit(1);
+  });
+}
