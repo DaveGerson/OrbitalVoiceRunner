@@ -595,6 +595,7 @@ function AppRaw() {
       setPendingCommands,
       setPendingActions,
       setActiveTerminalId,
+      setActiveProjectId,
       setIsBufferFocused,
       setPromptBuffer,
       fetchWipDrafts,

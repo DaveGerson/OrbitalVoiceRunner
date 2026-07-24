@@ -182,6 +182,14 @@ const SwitchActivePaneFrame = z.object({
   paneId: z.string().optional(),
 }).passthrough();
 
+/** BUG-012 — src/actions/defs/orient.ts switch_context — `{activeProjectId}`. The PROJECT-level twin of
+ *  switch_active_pane (which is pane-level): tells the classic UI to re-highlight the now-active project
+ *  after a voice-driven context switch (consumed via appHelpers.ts WS_HANDLERS -> setActiveProjectId). */
+const ContextSwitchedFrame = z.object({
+  type: z.literal("context_switched"),
+  activeProjectId: z.string().optional(),
+}).passthrough();
+
 /** src/gating/index.ts stopAll — `{frozen:true, running: stillRunning}` on freeze,
  *  `{frozen:false}` (no `running`) on release. */
 const FrozenFrame = z.object({
@@ -479,6 +487,7 @@ export const FRAME_SCHEMAS = {
   handoffs_updated: HandoffsUpdatedFrame,
   settings_updated: SettingsUpdatedFrame,
   switch_active_pane: SwitchActivePaneFrame,
+  context_switched: ContextSwitchedFrame,
   frozen: FrozenFrame,
   stop_all: StopAllFrame,
   approval_pending: ApprovalPendingFrame,

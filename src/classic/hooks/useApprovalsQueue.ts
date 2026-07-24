@@ -103,7 +103,11 @@ export function useApprovalsQueue(params: ApprovalsQueueParams) {
               ...t,
               status: "Running",
               command: pendingCmd.cmd,
-              output: t.output + `\n\n> ${pendingCmd.cmd}\n` + (pendingCmd.cmd.includes("tailwindcss") ? "added 1 package, and audited 2 packages in 3s" : "Successfully installed pandas 2.1.0\nDONE"),
+              // BUG-038 (residual): mock mode has NO backend and never actually runs the command, so it
+              // must NOT fabricate a plausible-looking success (the old hardcoded "Successfully installed
+              // pandas…" / "added 1 package…" stdout trained operators/e2e viewers on a fake result).
+              // Inject an UNMISTAKABLE placeholder instead — honest about the no-op.
+              output: t.output + `\n\n> ${pendingCmd.cmd}\n[MOCK — no command was actually run]`,
             };
           }
           return t;

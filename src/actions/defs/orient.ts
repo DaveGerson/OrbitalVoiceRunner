@@ -151,6 +151,14 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     ctx.manager.settings.projects.localWorkspacePath = wsPath;
     ctx.manager.saveSettings();
     ctx.broadcastLedgerUpdate();
+    // BUG-012 (residual): move the UI's PROJECT focus to follow the voice switch. broadcastLedgerUpdate
+    // above repaints the workspace list first; this context_switched frame then tells the classic client
+    // to re-highlight the now-active project (src/appHelpers.ts WS_HANDLERS -> setActiveProjectId). Placed
+    // AFTER the ledger update (ordering is pinned by tests/test_context_switched_frame.ts) and before the
+    // live refresh/brief, whose side effects are unrelated to the focus move. Optional-chained like the
+    // sibling ctx.injectMemoryBrief?.() below: the real voice/REST ctx always supplies broadcast, while
+    // some pre-existing switch_context unit ctxs (sync/inject suites) omit it — a no-op there is safe.
+    ctx.broadcast?.({ type: "context_switched", activeProjectId: projectId });
     // Phase 1 "ears" (fact [E]): getProjectBriefing reads ws.panes, which is only as fresh as
     // the last syncLedger(). Force a live PTY->ledger sync FIRST so the catch-up briefing
     // reflects each pane's CURRENT status/is_busy (e.g. a pane that just went Running or Idle)

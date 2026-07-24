@@ -336,6 +336,30 @@ export interface ObserveHandlers {
 // interaction leg stays gated identically without coupling to a server.ts export.
 const VOICE_TRACE = !!process.env.JANUS_DEBUG_VOICE && process.env.JANUS_DEBUG_VOICE !== "0";
 
+// ── BUG-011: leading parallel-group helpers (pure) ────────────────────────────────────────────────
+// A plan advances PAST a leading parallel group only once EVERY member has settled. These two pure
+// scans keep handlePlansTrigger/handlePlanStepEdge group-aware while staying under the CC/cognitive
+// ceilings. A step with no `group` marker is a group of ONE — the byte-identical sequential path.
+
+/** The LEADING group at `startIndex`: the maximal run of consecutive steps sharing
+ *  steps[startIndex].group (a non-undefined marker). A step with no `group` is a group of one. */
+function leadingGroup(steps: any[], startIndex: number): any[] {
+  const first = steps[startIndex];
+  if (!first) return [];
+  if (first.group === undefined) return [first];
+  const group: any[] = [];
+  for (let i = startIndex; i < steps.length; i++) {
+    if (steps[i].group !== first.group) break;
+    group.push(steps[i]);
+  }
+  return group;
+}
+
+/** True once EVERY member of a leading parallel group has completed (its join is satisfied). */
+function isGroupComplete(group: any[]): boolean {
+  return group.length > 0 && group.every((s) => s.status === "completed");
+}
+
 /**
  * attachObserve(manager, deps) — build the `onOutput` / `onIdle` handlers plus their private,
  * per-server observation state. The caller assigns `manager.onOutput = onOutput` /
@@ -788,29 +812,42 @@ ${redact(rawOutput.slice(-3000))}`;
   }
 
   /**
-   * Handle a transition edge against ONE plan whose current running step is bound to `terminalId`.
-   * Returns true when the plan changed (the caller then force-persists + re-broadcasts the board).
+   * BUG-011: settle ONE completed member of the leading group. Marks it completed + broadcasts
+   * plan_step_completed; the plan advances PAST the whole group (to the first post-group step, via the
+   * existing advance/complete path) ONLY once EVERY member has completed — never on the first member's
+   * edge. group.length===1 (a step with no group marker) satisfies isGroupComplete immediately, so the
+   * sequential advance is byte-identical to pre-BUG-011.
    */
-  function handlePlanStepEdge(plan: any, currentStep: any, terminalId: string, transition: Transition): boolean {
-    if (transition === currentStep.expectedTransition) {
-      currentStep.status = "completed";
-      console.log(`[PLAN PROGRESS] Plan '${plan.name}' - Step ${plan.currentStepIndex + 1} completed!`);
-      broadcast({
-        type: "plan_step_completed",
-        planId: plan.id,
-        stepId: currentStep.id,
-        message: `Plan step completed successfully on '${terminalId}'.`
-      });
-      const nextIndex = plan.currentStepIndex + 1;
-      if (nextIndex < plan.steps.length) {
-        advanceToNextPlanStep(plan, nextIndex);
-      } else {
-        completePlan(plan);
-      }
+  function completeGroupMember(plan: any, group: any[], member: any, terminalId: string): void {
+    member.status = "completed";
+    console.log(`[PLAN PROGRESS] Plan '${plan.name}' - a step completed on '${terminalId}'.`);
+    broadcast({
+      type: "plan_step_completed",
+      planId: plan.id,
+      stepId: member.id,
+      message: `Plan step completed successfully on '${terminalId}'.`
+    });
+    if (!isGroupComplete(group)) return; // group still joining — do NOT advance past it yet.
+    const nextIndex = plan.currentStepIndex + group.length;
+    if (nextIndex < plan.steps.length) {
+      advanceToNextPlanStep(plan, nextIndex);
+    } else {
+      completePlan(plan);
+    }
+  }
+
+  /**
+   * Handle a transition edge for ONE member of the leading (parallel or single-step) group bound to
+   * `terminalId`. Returns true when the plan changed (the caller then force-persists + re-broadcasts the
+   * board). A failure edge on any member pauses the plan exactly as today.
+   */
+  function handlePlanStepEdge(plan: any, group: any[], member: any, terminalId: string, transition: Transition): boolean {
+    if (transition === member.expectedTransition) {
+      completeGroupMember(plan, group, member, terminalId);
       return true;
     }
     if (transition === "error" || transition === "build-failed" || transition === "exited") {
-      failPlanStep(plan, currentStep, terminalId, transition);
+      failPlanStep(plan, member, terminalId, transition);
       return true;
     }
     return false;
@@ -821,10 +858,12 @@ ${redact(rawOutput.slice(-3000))}`;
     let changed = false;
     for (const plan of plans) {
       if (plan.status !== "running") continue;
-      const currentStep = plan.steps[plan.currentStepIndex];
-      if (currentStep && currentStep.status === "running" && currentStep.terminalId === terminalId) {
-        if (handlePlanStepEdge(plan, currentStep, terminalId, transition)) changed = true;
-      }
+      // BUG-011: the edge may belong to ANY still-running member of the leading parallel group — not
+      // necessarily steps[currentStepIndex]. For a sequential plan the group is just that one step, so
+      // this is identical to the old steps[currentStepIndex] match.
+      const group = leadingGroup(plan.steps, plan.currentStepIndex);
+      const member = group.find((s: any) => s.status === "running" && s.terminalId === terminalId);
+      if (member && handlePlanStepEdge(plan, group, member, terminalId, transition)) changed = true;
     }
     if (changed) {
       manager.ledger["save"](true);

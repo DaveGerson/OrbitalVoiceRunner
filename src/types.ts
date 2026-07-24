@@ -585,6 +585,13 @@ export interface PlanStep {
   command: string;
   expectedTransition: "idle" | "prompt";
   status: "pending" | "running" | "completed" | "failed";
+  /**
+   * BUG-011: parallel-group marker. Consecutive LEADING steps that share the same non-undefined
+   * `group` value form ONE parallel group — execute_plan dispatches every member together and the
+   * observe layer advances past the group only once every member reaches its expectedTransition.
+   * Undefined = an ordinary sequential step (byte-identical to the pre-BUG-011 behavior).
+   */
+  group?: string;
 }
 
 export interface Plan {
