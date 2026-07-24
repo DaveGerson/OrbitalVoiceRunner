@@ -738,7 +738,7 @@ export function SettingsDialog({
                 />
                 <div>
                   <span className="text-xs text-zinc-300 font-bold block bg-transparent">Restore Session Frame</span>
-                  <span className="text-xs text-zinc-500 block -mt-0.5">--resume-previous-session</span>
+                  <span className="text-xs text-zinc-500 block -mt-0.5">--resume / --session-id</span>
                 </div>
               </label>
             </div>
