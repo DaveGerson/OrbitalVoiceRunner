@@ -398,8 +398,9 @@ export interface WsHandlerCtx {
   setActiveTerminalId: (id: any) => void;
   /** BUG-012: server-driven PROJECT focus setter, fed by the context_switched frame (voice
    *  switch_context). Distinct from setActiveTerminalId — moving the project focus must NOT
-   *  clobber the pane focus. */
-  setActiveProjectId: (id: any) => void;
+   *  clobber the pane focus. OPTIONAL (mirrors setAttentionQueue): the classic App wires it, while
+   *  ctx builders that predate this frame simply omit it and the handler no-ops. */
+  setActiveProjectId?: (id: any) => void;
   setIsBufferFocused: (updater: any) => void;
   setPromptBuffer: (val: any) => void;
   fetchWipDrafts: (projectId?: any) => void;
@@ -583,7 +584,7 @@ export const WS_HANDLERS: Record<string, WsHandler> = {
   switch_active_pane: (msg, ctx) => { if (msg.paneId) ctx.setActiveTerminalId(msg.paneId); },
   // BUG-012: a voice switch_context moves the UI's PROJECT focus (sidebar highlight). Drives ONLY the
   // project focus — never setActiveTerminalId, which is the pane-level focus (switch_active_pane owns it).
-  context_switched: (msg, ctx) => { if (msg.activeProjectId) ctx.setActiveProjectId(msg.activeProjectId); },
+  context_switched: (msg, ctx) => { if (msg.activeProjectId) ctx.setActiveProjectId?.(msg.activeProjectId); },
   draft_updated: handleDraftUpdated,
   pane_status: (msg, ctx) => ctx.setTerminals((prev: any[]) => prev.map((t) => t.id === msg.terminalId ? { ...t, status: msg.status, quiescing: false } : t)),
   pane_quiescing: (msg, ctx) => ctx.setTerminals((prev: any[]) => prev.map((t) => t.id === msg.terminalId ? { ...t, quiescing: true } : t)),
