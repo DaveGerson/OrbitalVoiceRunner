@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -70,7 +71,14 @@ test("loadMockLive() is idempotent: a second call leaves JANUS_DB unchanged (sin
 // that choice — the loader must not clobber it. This mutates process env in a way that could
 // pollute other tests in this same file/process, so it runs in an isolated child process.
 test("loadMockLive() respects an explicitly pre-set JANUS_DB (subprocess)", () => {
-  const script = `
+  // Write the probe to a temp .mjs FILE rather than passing it inline via `tsx -e`. An inline
+  // multi-line script + shell:true is parsed BY THE SHELL: on POSIX (/bin/sh) the JS is read as
+  // shell syntax and dies ("process.env.JANUS_DB: not found", `Syntax error: "(" unexpected`),
+  // which greened on Windows cmd.exe but failed Linux CI. A file path is a single clean arg on
+  // every platform. Mirrors the sibling pattern in tests/test_server_import_side_effects.ts.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-mocklive-explicit-db-"));
+  const scriptPath = path.join(tmpDir, "probe.mjs");
+  const probeSrc = `
     process.env.JANUS_DB = "explicit-marker.db";
     const { loadMockLive } = await import(${JSON.stringify(mockLiveUrl)});
     await loadMockLive();
@@ -80,14 +88,20 @@ test("loadMockLive() respects an explicitly pre-set JANUS_DB (subprocess)", () =
     }
     process.exit(0);
   `;
-  const res = spawnSync("npx", ["tsx", "-e", script], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    shell: true,
-  });
-  assert.equal(
-    res.status,
-    0,
-    `child exited ${res.status}; stdout=${res.stdout}\nstderr=${res.stderr}`,
-  );
+  fs.writeFileSync(scriptPath, probeSrc, "utf8");
+  try {
+    const res = spawnSync("npx", ["tsx", scriptPath], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      shell: true,
+      timeout: 30000,
+    });
+    assert.equal(
+      res.status,
+      0,
+      `child exited ${res.status}; stdout=${res.stdout}\nstderr=${res.stderr}`,
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
