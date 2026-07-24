@@ -42,9 +42,12 @@ import * as path from "path";
 
 import { JanusStore } from "../src/store/sqliteStore";
 import { OrchestratorManager } from "../src/terminal";
-import { ATTENTION_QUEUE_CAP } from "../src/announcementBus";
+import { ATTENTION_QUEUE_CAP, AnnouncementBus, DEFAULT_ANNOUNCEMENT_TEMPLATES } from "../src/announcementBus";
+import { attachObserve } from "../src/observe";
+import { PaneSignalBus } from "../src/paneSignalBus";
+import { InteractionLogger } from "../src/interactionLog";
 import type { AttentionItem } from "../src/types";
-import type { StoredAttention } from "../src/store/types";
+import type { StoredAttention, StoredPane } from "../src/store/types";
 
 // ── hermetic temp cwd (mirrors test_us_epic06_durability.ts mkcwd/restore) ──────────────────────────
 function mkcwd(tag: string): { dir: string; prev: string } {
