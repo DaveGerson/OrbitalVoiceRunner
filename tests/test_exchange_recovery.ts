@@ -304,7 +304,7 @@ describe("AgentExchange spine: boot recovery wired into the REAL server boot seq
     // JanusStore/recoverExchangesOnBoot/lifecycle types, none of which touch the flag module, so
     // this is genuinely the first read. `node --test` runs each test FILE as its own process, so
     // this frozen value cannot leak into any other test file either.
-    setEnv("JANUS_EXCHANGE_SPINE", "primary");
+    setEnv("JANUS_EXCHANGE_SPINE", "authoritative"); // post-collapse rename of the old "primary" spelling
     setEnv("JANUS_DB", dbPath);
     setEnv("JANUS_NO_AUTOSTART", "1");
     setEnv("NODE_ENV", "test");

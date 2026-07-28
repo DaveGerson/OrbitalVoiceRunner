@@ -144,13 +144,19 @@ function resolveReportPath(): string {
 }
 const REPORT_PATH = resolveReportPath();
 
-// JANUS_EXCHANGE_SPINE / JANUS_INSTRUCTION_ENVELOPE / JANUS_AGENT_RESULT_ENVELOPE must be set
-// BEFORE the first import of anything touching those flag modules in THIS process (the documented
-// idiom in every sibling journey suite — each cache their mode at module load, and `node --test`/
-// plain `node` runs this file as its own process, so this can never leak elsewhere).
-process.env.JANUS_EXCHANGE_SPINE = "shadow"; // active (writes + reads via ExchangeService) — sufficient here, mirrors test_return_channel_journeys.ts's own choice.
-process.env.JANUS_INSTRUCTION_ENVELOPE = "primary"; // the rendered envelope IS the delivered instruction — needed for the FOCUSED journey's distill assertions.
-process.env.JANUS_AGENT_RESULT_ENVELOPE = "accept";
+// JANUS_EXCHANGE_SPINE must be set BEFORE the first import of anything touching src/exchanges/
+// flag.ts (or a module that transitively imports it) in THIS process (the documented idiom in
+// every sibling journey suite — it caches its mode at module load, and `node --test`/plain `node`
+// runs this file as its own process, so this can never leak elsewhere).
+//
+// FLAG COLLAPSE (2026-07): this suite used to ALSO set JANUS_INSTRUCTION_ENVELOPE=primary (the
+// FOCUSED journey's distill assertions need the rendered envelope to BE the delivered instruction)
+// and JANUS_AGENT_RESULT_ENVELOPE=accept. Both are retired: instruction-envelope mode is now 1:1
+// derived from the spine's own mode, so "primary"-equivalent behavior now requires
+// JANUS_EXCHANGE_SPINE="authoritative" (not just "record" — record only gets the old
+// shadow-equivalent, envelopes built/stored but NOT yet the delivered instruction); the old
+// "accept" rung is automatic whenever the spine is non-off, so no separate var is needed for it.
+process.env.JANUS_EXCHANGE_SPINE = "authoritative";
 
 // Pure modules, safe to import at top level (none transitively import `../server` — same
 // verification every sibling suite documents for its own top-level dynamic imports).

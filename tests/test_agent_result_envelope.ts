@@ -8,15 +8,23 @@
 // acceptance, wrong-id ignored, stale-after-retry ignored, forged-id-for-other-pane ignored,
 // redaction of summary/evidence (a planted secret), detection-contract cases (embedded in noisy
 // output, truncated JSON, multiple envelopes -> last valid wins), and flag-off -> no parsing.
+//
+// FLAG COLLAPSE (2026-07, refactor/collapse-exchange-flags): this suite used to exercise the
+// independent JANUS_AGENT_RESULT_ENVELOPE off|accept|request flag directly. That flag is retired:
+// scanning ("accept") is now derived from JANUS_EXCHANGE_SPINE (`resultEnvelopeActive`, taking the
+// spine's own `ExchangeSpineMode`), and the completion-prompt hint ("request") is now the
+// independent `JANUS_AGENT_COMPLETION_PROMPT=on` flag (a plain boolean at the call site,
+// `withExchangeCorrelationHint`'s 3rd arg). The tests below are updated intentionally to match.
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
 
 import {
   scanForResultEnvelope,
-  readResultEnvelopeMode,
   resultEnvelopeActive,
-  RESULT_ENVELOPE_MODE,
+  readAgentCompletionPromptMode,
+  AGENT_COMPLETION_PROMPT_MODE,
+  agentCompletionPromptActive,
   COMPLETION_REQUEST_LINE,
   withExchangeCorrelationHint,
 } from "../src/exchanges/resultEnvelope";
@@ -39,31 +47,40 @@ function delivered(svc: InstanceType<typeof ExchangeService>, paneId: string, in
   return snap.exchangeId;
 }
 
-const ACCEPT = { mode: "accept" as const };
+/** Scanning active — spine "record" is sufficient (any non-off mode activates scanning; see
+ *  `resultEnvelopeActive`'s doc comment — "authoritative" carries no extra scanning behavior). */
+const SCAN_ON = { mode: "record" as const };
 
 // ── flag ─────────────────────────────────────────────────────────────────────────────────────
 
-describe("resultEnvelope: flag semantics", () => {
-  it("defaults to off when unset/unrecognized", () => {
-    assert.equal(readResultEnvelopeMode({}), "off");
-    assert.equal(readResultEnvelopeMode({ JANUS_AGENT_RESULT_ENVELOPE: "bogus" }), "off");
+describe("resultEnvelope: flag semantics (post-collapse)", () => {
+  it("resultEnvelopeActive: off for spine off, active for record AND authoritative", () => {
     assert.equal(resultEnvelopeActive("off"), false);
+    assert.ok(resultEnvelopeActive("record"));
+    assert.ok(resultEnvelopeActive("authoritative"));
   });
 
-  it("accept and request are both active modes", () => {
-    assert.equal(readResultEnvelopeMode({ JANUS_AGENT_RESULT_ENVELOPE: "accept" }), "accept");
-    assert.equal(readResultEnvelopeMode({ JANUS_AGENT_RESULT_ENVELOPE: "REQUEST" }), "request");
-    assert.ok(resultEnvelopeActive("accept"));
-    assert.ok(resultEnvelopeActive("request"));
+  it("readAgentCompletionPromptMode: defaults to off when unset/unrecognized, 'on' recognized case-insensitively", () => {
+    assert.equal(readAgentCompletionPromptMode({}), "off");
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "bogus" }), "off");
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "on" }), "on");
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "ON" }), "on");
   });
 
-  it("module default mode is off (no env var set in this test run's expectation)", () => {
+  it("module default AGENT_COMPLETION_PROMPT_MODE is one of the two valid modes (no env var set in this test run's expectation)", () => {
     // Not asserting process.env directly (CI may set it) — just that the cached constant is one
-    // of the three valid modes and the reader is total.
-    assert.ok(["off", "accept", "request"].includes(RESULT_ENVELOPE_MODE));
+    // of the two valid modes and the reader is total.
+    assert.ok(["off", "on"].includes(AGENT_COMPLETION_PROMPT_MODE));
   });
 
-  it("request mode reuses the ALREADY-EXISTING COMPLETION_REQUEST_LINE — no second prompt string", () => {
+  it("agentCompletionPromptActive: inert-without-spine — 'on' + spine off is still false (FLAG LATTICE)", () => {
+    assert.equal(agentCompletionPromptActive("off", "on"), false, "spine off => inert no-op, regardless of the prompt flag");
+    assert.equal(agentCompletionPromptActive("record", "off"), false, "prompt flag off => no hint even with the spine on");
+    assert.ok(agentCompletionPromptActive("record", "on"), "both on => active");
+    assert.ok(agentCompletionPromptActive("authoritative", "on"), "authoritative + on => active");
+  });
+
+  it("the completion-prompt hint reuses the ALREADY-EXISTING COMPLETION_REQUEST_LINE — no second prompt string", () => {
     // Coherence check (task A): resultEnvelope.ts re-exports the one existing invitation string
     // rather than minting a competing one.
     assert.match(COMPLETION_REQUEST_LINE, /done or blocked/i);
@@ -82,7 +99,7 @@ describe("resultEnvelope: flag semantics", () => {
 describe("resultEnvelope: schema validation", () => {
   it("accepts a well-formed minimal envelope", () => {
     const text = JSON.stringify({ exchange_id: "exch_abc", status: "complete" });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.envelope!.exchangeId, "exch_abc");
     assert.equal(scan.envelope!.status, "complete");
@@ -99,7 +116,7 @@ describe("resultEnvelope: schema validation", () => {
       evidence: ["line one", "line two"],
       needs_operator: true,
     });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.envelope!.status, "needs_input");
     assert.equal(scan.envelope!.needsOperator, true);
@@ -108,20 +125,20 @@ describe("resultEnvelope: schema validation", () => {
 
   it("rejects missing exchange_id", () => {
     const text = JSON.stringify({ status: "complete", summary: "ok" });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
     assert.equal(scan.candidatesValid, 0);
   });
 
   it("rejects an unrecognized status value", () => {
     const text = JSON.stringify({ exchange_id: "exch_abc", status: "done" }); // not in the enum
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
   });
 
   it("rejects malformed JSON", () => {
     const text = '{"exchange_id":"exch_abc","status":"complete"'; // missing closing brace
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
   });
 
@@ -131,13 +148,13 @@ describe("resultEnvelope: schema validation", () => {
       status: "complete",
       extra_field: "should not be here",
     });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
   });
 
   it("rejects an oversize summary field", () => {
     const text = JSON.stringify({ exchange_id: "exch_abc", status: "complete", summary: "x".repeat(5000) });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
   });
 
@@ -149,13 +166,13 @@ describe("resultEnvelope: schema validation", () => {
       evidence: Array.from({ length: 1 }, () => "y".repeat(9000)),
     });
     assert.ok(bloat.length > 8192, "fixture must exceed MAX_CANDIDATE_CHARS to test the cap");
-    const scan = scanForResultEnvelope(bloat, ACCEPT);
+    const scan = scanForResultEnvelope(bloat, SCAN_ON);
     assert.equal(scan.found, false);
   });
 
   it("wrong TYPE for a field (needs_operator as a string) is rejected", () => {
     const text = JSON.stringify({ exchange_id: "exch_abc", status: "complete", needs_operator: "true" });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false);
   });
 });
@@ -171,7 +188,7 @@ describe("resultEnvelope: redaction of summary/evidence", () => {
       summary: `done, but leaked ${plantedSecret} in the log`,
       evidence: [`export AWS_KEY=${plantedSecret}`],
     });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
     assert.ok(!scan.envelope!.summary.includes(plantedSecret), "summary must not carry the raw secret");
     assert.ok(!scan.envelope!.evidence[0].includes(plantedSecret), "evidence must not carry the raw secret");
@@ -182,7 +199,7 @@ describe("resultEnvelope: redaction of summary/evidence", () => {
 
   it("an injectable redact function is honored (test double)", () => {
     const text = JSON.stringify({ exchange_id: "exch_abc", status: "complete", summary: "secret-token-xyz" });
-    const scan = scanForResultEnvelope(text, { mode: "accept", redact: (s) => s.replace("secret-token-xyz", "<gone>") });
+    const scan = scanForResultEnvelope(text, { mode: "record", redact: (s) => s.replace("secret-token-xyz", "<gone>") });
     assert.equal(scan.envelope!.summary, "<gone>");
   });
 });
@@ -199,14 +216,14 @@ describe("resultEnvelope: detection contract", () => {
       JSON.stringify(envelope),
       "$ ",
     ].join("\n");
-    const scan = scanForResultEnvelope(noisy, ACCEPT);
+    const scan = scanForResultEnvelope(noisy, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.envelope!.exchangeId, "exch_abc");
   });
 
   it("a truncated/unbalanced trailing JSON object is never partially parsed", () => {
     const text = `some preamble ${JSON.stringify({ exchange_id: "exch_abc", status: "complete" }).slice(0, -5)}`;
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.equal(scan.found, false, "an unbalanced object must fail safe, never guess-close");
   });
 
@@ -214,7 +231,7 @@ describe("resultEnvelope: detection contract", () => {
     const first = { exchange_id: "exch_abc", status: "needs_input", summary: "first, superseded" };
     const second = { exchange_id: "exch_abc", status: "complete", summary: "second, corrected" };
     const text = `${JSON.stringify(first)}\n...\n${JSON.stringify(second)}`;
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.candidatesValid, 2);
     assert.equal(scan.envelope!.status, "complete");
@@ -224,13 +241,13 @@ describe("resultEnvelope: detection contract", () => {
   it("a later INVALID fragment never overrides an earlier valid envelope", () => {
     const valid = { exchange_id: "exch_abc", status: "complete", summary: "the real one" };
     const text = `${JSON.stringify(valid)}\n{"exchange_id":"exch_abc","status":"bogus-status"}`;
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.envelope!.summary, "the real one");
   });
 
   it("plain output with no JSON at all is a clean, silent 'not found'", () => {
-    const scan = scanForResultEnvelope("just a normal shell prompt\n$ ", ACCEPT);
+    const scan = scanForResultEnvelope("just a normal shell prompt\n$ ", SCAN_ON);
     assert.equal(scan.found, false);
     assert.equal(scan.candidatesSeen, 0);
   });
@@ -239,7 +256,7 @@ describe("resultEnvelope: detection contract", () => {
     const envelope = { exchange_id: "exch_abc", status: "complete", summary: "found me" };
     // Put the valid envelope WAY outside a tiny scan window, padded by filler after it.
     const text = JSON.stringify(envelope) + "z".repeat(200);
-    const scan = scanForResultEnvelope(text, { mode: "accept", maxScanChars: 50 });
+    const scan = scanForResultEnvelope(text, { mode: "record", maxScanChars: 50 });
     assert.equal(scan.found, false, "the envelope fell outside the tail window and must not be found");
   });
 });
@@ -253,7 +270,7 @@ describe("resultEnvelope + ExchangeService: trust-boundary correlation", () => {
     svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
 
     const text = JSON.stringify({ exchange_id: id, status: "complete", summary: "build green" });
-    const scan = scanForResultEnvelope(text, ACCEPT);
+    const scan = scanForResultEnvelope(text, SCAN_ON);
     assert.ok(scan.found);
 
     const outcome = svc.recordReportedOutcome("pane-1", scan.envelope!.exchangeId, scan.envelope!.status, scan.envelope!.summary, scan.envelope!.redactedEnvelopeJson);
@@ -325,74 +342,69 @@ function renderedWithCompletionLine(): string {
   return rendered;
 }
 
-describe("resultEnvelope: withExchangeCorrelationHint (neg1 — live correlation)", () => {
-  it("request mode + non-empty exchangeId: the delivered completion line carries the exchange_id", () => {
+describe("resultEnvelope: withExchangeCorrelationHint (neg1 — live correlation; post-collapse boolean 3rd arg)", () => {
+  it("hintActive=true + non-empty exchangeId: the delivered completion line carries the exchange_id", () => {
     const rendered = renderedWithCompletionLine();
-    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", true);
     assert.ok(out.includes(COMPLETION_REQUEST_LINE));
     assert.ok(out.includes("exch_test_123"), "the rendered line must carry the exchange id");
   });
 
-  it("request mode: the appended hint is prose, never a parseable JSON key — and never self-settles", () => {
+  it("hintActive=true: the appended hint is prose, never a parseable JSON key — and never self-settles", () => {
     const rendered = renderedWithCompletionLine();
-    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", true);
     assert.ok(!out.includes('"exchange_id"'), "must never spell the literal JSON key");
-    const scan = scanForResultEnvelope(out, ACCEPT);
+    const scan = scanForResultEnvelope(out, SCAN_ON);
     assert.equal(scan.found, false, "the delivered instruction text itself must never self-settle");
   });
 
-  it("mode 'accept': byte-identical — request-only behavior", () => {
+  it("hintActive=false: byte-identical (covers both the old 'accept' and 'off' modes — neither ever hinted)", () => {
     const rendered = renderedWithCompletionLine();
-    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "accept"), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", false), rendered);
   });
 
-  it("mode 'off': byte-identical", () => {
+  it("hintActive=true + undefined/null/'' exchangeId: no dangling hint", () => {
     const rendered = renderedWithCompletionLine();
-    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "off"), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, undefined, true), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, null, true), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, "", true), rendered);
   });
 
-  it("request mode + undefined/null/'' exchangeId: no dangling hint", () => {
-    const rendered = renderedWithCompletionLine();
-    assert.equal(withExchangeCorrelationHint(rendered, undefined, "request"), rendered);
-    assert.equal(withExchangeCorrelationHint(rendered, null, "request"), rendered);
-    assert.equal(withExchangeCorrelationHint(rendered, "", "request"), rendered);
-  });
-
-  it("request mode but rendered has NO completion line: a bare shell pane never gets a hint", () => {
+  it("hintActive=true but rendered has NO completion line: a bare shell pane never gets a hint", () => {
     const rendered = renderEnvelope(RICH_ENVELOPE, RENDER_PROFILES.Custom);
     assert.ok(!rendered.includes(COMPLETION_REQUEST_LINE));
-    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", "request"), rendered);
+    assert.equal(withExchangeCorrelationHint(rendered, "exch_test_123", true), rendered);
   });
 
-  it("default mode arg omitted resolves to the module-cached RESULT_ENVELOPE_MODE", () => {
+  it("default hintActive arg omitted resolves to agentCompletionPromptActive() (the module-cached constants)", () => {
     const rendered = renderedWithCompletionLine();
     const withDefault = withExchangeCorrelationHint(rendered, "exch_test_123");
-    const withExplicit = withExchangeCorrelationHint(rendered, "exch_test_123", RESULT_ENVELOPE_MODE);
+    const withExplicit = withExchangeCorrelationHint(rendered, "exch_test_123", agentCompletionPromptActive());
     assert.equal(withDefault, withExplicit);
   });
 
   // neg1 (adversarial-review fix): the hint must never push the DELIVERED text past the pane's size
   // ceiling — the guard at the send seams measured only the PRE-hint text.
-  it("request mode + maxChars: the hint is DROPPED (un-hinted text delivered) when it would exceed the cap", () => {
+  it("hintActive=true + maxChars: the hint is DROPPED (un-hinted text delivered) when it would exceed the cap", () => {
     const rendered = renderedWithCompletionLine();
-    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", true);
     assert.ok(hinted.length > rendered.length, "sanity: the hint grows the text");
     const cap = hinted.length - 1; // the un-hinted text fits, the hinted text does not
-    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request", cap);
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", true, cap);
     assert.equal(out, rendered, "best-effort correlation is dropped rather than overflow the size ceiling");
   });
 
-  it("request mode + maxChars: the hint is KEPT when it fits exactly within the cap", () => {
+  it("hintActive=true + maxChars: the hint is KEPT when it fits exactly within the cap", () => {
     const rendered = renderedWithCompletionLine();
-    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
-    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request", hinted.length);
+    const hinted = withExchangeCorrelationHint(rendered, "exch_test_123", true);
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", true, hinted.length);
     assert.equal(out, hinted, "a hint that fits exactly at the cap is delivered");
     assert.ok(out.includes("exch_test_123"));
   });
 
   it("maxChars omitted: unbounded (prior behavior) — the hint is applied regardless of length", () => {
     const rendered = renderedWithCompletionLine();
-    const out = withExchangeCorrelationHint(rendered, "exch_test_123", "request");
+    const out = withExchangeCorrelationHint(rendered, "exch_test_123", true);
     assert.ok(out.includes("exch_test_123"), "no cap supplied → hint applied");
   });
 });
@@ -404,11 +416,11 @@ describe("resultEnvelope + ExchangeService: live correlation settlement (neg1)",
     svc.onPaneSignal({ paneId: "pane-1", kind: "running" });
 
     const rendered = renderedWithCompletionLine();
-    const deliveredLine = withExchangeCorrelationHint(rendered, id, "request");
+    const deliveredLine = withExchangeCorrelationHint(rendered, id, true);
     assert.ok(deliveredLine.includes(id), "the delivered line must carry the live agent's own exchange id");
 
     const echo = JSON.stringify({ exchange_id: id, status: "complete", summary: "done" });
-    const scan = scanForResultEnvelope(echo, ACCEPT);
+    const scan = scanForResultEnvelope(echo, SCAN_ON);
     assert.ok(scan.found);
     assert.equal(scan.envelope!.exchangeId, id);
 
@@ -453,7 +465,7 @@ describe("resultEnvelope + ExchangeService: live correlation settlement (neg1)",
 
     const plantedSecret = "AKIAIOSFODNN7EXAMPLE";
     const echo = JSON.stringify({ exchange_id: id, status: "complete", summary: `done, leaked ${plantedSecret}` });
-    const scan = scanForResultEnvelope(echo, ACCEPT);
+    const scan = scanForResultEnvelope(echo, SCAN_ON);
     assert.ok(scan.found);
     assert.ok(!scan.envelope!.summary.includes(plantedSecret));
 

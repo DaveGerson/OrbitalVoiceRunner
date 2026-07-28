@@ -18,7 +18,7 @@ import path from "path";
 // Must be set BEFORE the first import of anything touching src/exchanges/flag.ts in THIS process —
 // the flag caches its mode at module load (tests/test_return_channel_journeys.ts's documented
 // idiom). `node --test` runs each test FILE as its own process, so this cannot leak elsewhere.
-process.env.JANUS_EXCHANGE_SPINE = "shadow";
+process.env.JANUS_EXCHANGE_SPINE = "record"; // post-collapse rename of the old "shadow" spelling
 
 const { REGISTRY } = await import("../src/actions/registry");
 const { runAction } = await import("../src/actions/gemini");

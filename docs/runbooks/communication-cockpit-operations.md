@@ -36,31 +36,40 @@ pre-existing explicit-column INSERT/UPSERT is unaffected.
   rows are **never** pruned — `interrupted` is the operator's recovery backlog. Step 5.5 also
   closed the pre-existing gap: `context_injections` (v10 telemetry) now has the same 30d TTL.
 
-## 2. The four flags — states, defaults, escape hatches
+## 2. The three knobs — states, defaults, escape hatches
 
-All three env flags are read **once at boot** (module-load cache); changing one requires a server
-restart. The fourth knob is a settings field read at connection time.
+> **FLAG COLLAPSE (2026-07).** This section previously documented FOUR knobs across three env
+> flags (`JANUS_EXCHANGE_SPINE` · `JANUS_INSTRUCTION_ENVELOPE` · `JANUS_AGENT_RESULT_ENVELOPE`),
+> a 27-combination lattice in which most combinations were inert no-ops. They are now **two** env
+> flags. `JANUS_INSTRUCTION_ENVELOPE` and `JANUS_AGENT_RESULT_ENVELOPE` are **RETIRED**: if either
+> is still set, the server logs a one-line warning at boot and otherwise ignores it — it does not
+> crash, and it does not do anything. Remove them from your `.env`.
+
+Both env flags are read **once at boot** (module-load cache); changing one requires a server
+restart. The third knob is a settings field read at connection time.
 
 | Flag | Values (default first) | What each state does |
 |---|---|---|
-| `JANUS_EXCHANGE_SPINE` | **`off`** · `shadow` · `primary` | `off`: no exchange rows written or read — zero behavior delta. `shadow`: the spine observes the dispatch/approval/observation seams and writes `agent_exchanges`/`exchange_events` rows; illegal transitions are logged, never thrown; nothing reads exchange state to decide anything. `primary`: the exchange row is the authoritative "what's in flight" — run-correlated dispatch join, boot-recovery quarantine surfacing, exchange-aware narration/SITREP/fleet all live. |
-| `JANUS_INSTRUCTION_ENVELOPE` | **`off`** · `shadow` · `primary` | `off`: legacy raw-text drafting/sending, byte-identical. `shadow`: envelopes are built and stored on exchanges, renderer output computed for fidelity comparison; deliveries still go out on the legacy path; the target resolver logs decisions without steering. `primary`: the rendered envelope IS the delivered instruction; resolver decisions govern routing (bind/confirm/clarify); the Workbench draft bridge (one versioned draft per pane, voice+typed convergence, over-limit send refusal) is live. |
-| `JANUS_AGENT_RESULT_ENVELOPE` | **`off`** · `accept` · `request` | `off`: no output scanning at all. `accept`: scan pane output tails (bounded: 8 KiB window / 25 candidates / strict zod / redaction+caps) for a self-reported result envelope the agent printed on its own. `request`: same scanning, plus render profiles append the one fixed completion-request line inviting a clear report. Validation and settlement are identical in both active modes. |
+| `JANUS_EXCHANGE_SPINE` | **`off`** · `record` · `authoritative` | `off`: no exchange rows written or read — zero behavior delta. `record`: the spine observes the dispatch/approval/observation seams and writes `agent_exchanges`/`exchange_events` rows; illegal transitions are logged, never thrown; **nothing reads exchange state to decide anything**. Also builds/stores instruction envelopes and scans pane output tails for a self-reported result envelope the agent printed on its own initiative (bounded: 8 KiB window / 25 candidates / strict zod / redaction+caps) — both observe-only. `authoritative`: the exchange row is the authoritative "what's in flight" — run-correlated dispatch join, boot-recovery quarantine surfacing, exchange-aware narration/SITREP/fleet; the rendered envelope IS the delivered instruction and resolver decisions govern routing (bind/confirm/clarify); the Workbench draft bridge is live. **Back-compat:** the pre-collapse spellings `shadow` and `primary` are still accepted and map to `record` / `authoritative` respectively. Any unrecognized value fails **closed** to `off`. |
+| `JANUS_AGENT_COMPLETION_PROMPT` | **`off`** · `on` | The **only** knob in this subsystem that mutates outgoing agent-facing text — split out into its own clearly-named flag precisely so it cannot be enabled as a side effect of turning something else up. `off`: delivered instructions are byte-identical. `on`: render profiles append the one fixed completion-request line, carrying the live exchange's own id in prose, so an agent that reports back has an id to echo (settlement becomes correlated rather than inferred from the legacy prose heuristic). Requires the spine to be on — **inert, never an error, when `JANUS_EXCHANGE_SPINE=off`**. Validation and settlement paths are identical whether or not the hint was sent. |
 | `voiceUx.sessionPoolHotSlots` | **`1`** (clamped 0–3) | Settings surface (`PUT /api/settings`), read at connect time — applies to the *next* voice session, not mid-session. `0` = handle-tier only. Governs the session-pool **decision layer** (`pool.plan` hot-slot budget). NOTE: physical hot-warm sockets are deferred (z5c slice 3 status, §6 of the release-validation doc) — today exactly one physical Gemini socket exists, so values >1 shape planning decisions only. |
 
 **Escape hatches:** every flag rolls back independently by flipping it and restarting; the durable
 tables are inert under `off`. `JANUS_CORTEX_PRIMARY=0` (pre-program) independently drops the
 Python cortex back to the TS floor without touching the exchange spine.
 
-**Rollout order** (per the program spec's staged-rollout section; each stage soaks before the next):
+**Rollout order** (each stage soaks before the next):
 
-1. `JANUS_EXCHANGE_SPINE=shadow` — collect lifecycle fidelity, zero behavior change.
-2. `JANUS_EXCHANGE_SPINE=primary` — exchange-aware notifications, recovery, fleet, replay/metrics.
-3. `JANUS_INSTRUCTION_ENVELOPE=shadow` → `primary` — requires the spine active (envelopes bind to
-   exchanges); primary flips delivery to rendered envelopes + resolver-governed routing.
-4. `JANUS_AGENT_RESULT_ENVELOPE=accept` → `request` — additive settlement precision on top of the
-   always-available conservative legacy heuristic.
-5. Tune `voiceUx.sessionPoolHotSlots` last — independent of the other three.
+1. `JANUS_EXCHANGE_SPINE=record` — collect lifecycle fidelity and populate the metrics/replay
+   tables. No existing code path reads exchange state to make a decision in this mode, so behavior
+   is unchanged; what you gain is the audit trail (and the evidence needed to justify stage 2).
+2. `JANUS_EXCHANGE_SPINE=authoritative` — exchange-aware notifications, recovery, fleet,
+   replay/metrics, rendered-envelope delivery and resolver-governed routing. This is where the
+   exchange ledger starts governing real behavior; do not skip stage 1's soak.
+3. `JANUS_AGENT_COMPLETION_PROMPT=on` — additive settlement precision on top of the always-available
+   conservative legacy heuristic. Changes what every agent receives on every dispatch, so soak it
+   last and independently.
+4. Tune `voiceUx.sessionPoolHotSlots` — independent of the other two.
 
 ## 3. Metrics & replay
 

@@ -752,8 +752,9 @@ export function ensureCore(): void {
     console.log(
       `[exchange-spine] boot recovery: kept=${exchangeRecovery.kept.length} interrupted=${exchangeRecovery.interrupted.length} reverted=${exchangeRecovery.reverted.length}`
     );
-    // Phase 4, Step 4.3: draft-registry rehydration (only present when JANUS_INSTRUCTION_ENVELOPE
-    // is active) — the count of open Workbench/voice drafts + outstanding-approval bindings this
+    // Phase 4, Step 4.3: draft-registry rehydration (only present when instruction-envelope mode is
+    // active — derived from JANUS_EXCHANGE_SPINE, post-2026-07-collapse) — the count of open
+    // Workbench/voice drafts + outstanding-approval bindings this
     // boot rebuilt from durable agent_exchanges rows, so a restart's effect on in-flight
     // communication is visible in the same boot log line boot recovery already uses.
     if (exchangeRecovery.draftRegistry) {
@@ -1221,9 +1222,10 @@ function operatorSendOverflow(paneId: string, text: string): number {
 }
 
 /** neg1 (adversarial-review fix): the rendered-instruction size ceiling for a pane's tool preset,
- *  passed to withExchangeCorrelationHint so the request-mode correlation hint can never push a
- *  delivered instruction past the cap the operator draft was already validated against. Custom
- *  profile for an unknown/missing preset. */
+ *  passed to withExchangeCorrelationHint so the correlation hint (JANUS_AGENT_COMPLETION_PROMPT=on
+ *  — the 2026-07 flag collapse's replacement for the old JANUS_AGENT_RESULT_ENVELOPE "request"
+ *  rung) can never push a delivered instruction past the cap the operator draft was already
+ *  validated against. Custom profile for an unknown/missing preset. */
 function paneRenderMaxChars(paneId: string): number {
   const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
   return (RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom).maxChars;
@@ -1237,10 +1239,10 @@ function paneRenderMaxChars(paneId: string): number {
  * mints one, mirroring src/voice/index.ts's `stampExchangeForDispatch` (the only other envelope-
  * draft exchange mint site) byte-for-byte in spirit: same createExchange call, same
  * instruction_envelope_json stamp from the pane's open draft when one exists. Best-effort; a
- * no-op (returns undefined) unless BOTH flags are active — `JANUS_EXCHANGE_SPINE` off means there
- * is no spine to correlate against, and `JANUS_INSTRUCTION_ENVELOPE` not primary means this route
- * is sending the LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before
- * this existed in that case).
+ * no-op (returns undefined) unless `JANUS_EXCHANGE_SPINE=authoritative` — off means there is no
+ * spine to correlate against, and record/off (not authoritative) means this route is sending the
+ * LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before this existed
+ * in that case).
  */
 function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: string): string | undefined {
   if (!instructionEnvelopeIsPrimary()) return undefined;
@@ -1344,7 +1346,8 @@ function registerDraftAndSettingsRoutes(
     // flags are active.
     const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
     beginExchangeDeliveryForWorkbenchSend(exchangeId);
-    // neg1: live correlation — append this exchange's own id (prose, request mode only) to the
+    // neg1: live correlation — append this exchange's own id (prose, only when
+    // JANUS_AGENT_COMPLETION_PROMPT=on — post-collapse name for the old "request" rung) to the
     // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on
     // the ORIGINAL `text` (the echo-veto in legacyCompletionEligible compares the pane's echo
     // against the operator's own recorded command); only the actual pane write is augmented.
@@ -1701,7 +1704,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
     // Phase 3, Step 3.3 (instruction-routing spec §5): additive field only — a client that doesn't
     // know about `exchange` ignores it; the draft text/shape are byte-identical either way. Omitted
-    // to plain `null` unless the flag is shadow/primary, so the OFF-default path never changes.
+    // to plain `null` unless the flag is record/authoritative, so the OFF-default path never changes.
     const exchange = instructionEnvelopeActive() ? viewOpenDraft(projectId, paneId) : null;
     broadcast({ type: "draft_updated", projectId, paneId, draft, exchange });
   }

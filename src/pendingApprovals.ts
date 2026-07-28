@@ -99,7 +99,7 @@ export interface PendingApproval {
   /**
    * AgentExchange spine correlation (docs/superpowers/specs/2026-07-09-agent-exchange-spine.md
    * §5, flag JANUS_EXCHANGE_SPINE). Set ONLY when this approval was requested by the exchange
-   * service on behalf of a tracked exchange (shadow/primary mode) — legacy/uncorrelated
+   * service on behalf of a tracked exchange (record/authoritative mode) — legacy/uncorrelated
    * approvals leave this undefined forever (never adopted heuristically). The bound
    * `draft_version` itself is NOT duplicated here: it lives on the exchange row
    * (`approval_draft_version`), addressed by `exchangeId`, so there is a single source of truth

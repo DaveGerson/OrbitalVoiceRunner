@@ -96,7 +96,7 @@ export interface DispatchDeps {
   /**
    * AgentExchange spine correlation (step 1.4, spec §2b / §5): the exchange bound to THIS write,
    * if the caller resolved one before calling applyDispatchDecision (mints happen upstream — this
-   * module never creates an exchange). When set AND the flag is shadow/primary, the auto_execute
+   * module never creates an exchange). When set AND the flag is record/authoritative, the auto_execute
    * arm below performs the SAME two-phase durable-intent ordering renderApproved already does for
    * the approved-write path (src/gating/index.ts): `beginDeliveryAttempt` genuinely precedes the
    * pane write, `completeDelivery` genuinely follows it, and the two certain-failure pre-write

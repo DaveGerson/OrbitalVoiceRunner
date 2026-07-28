@@ -68,7 +68,8 @@ export interface Composer {
   /** Phase 3, Step 3.3 (additive, PRESERVES all WIP-draft behavior above unchanged): the open
    *  instruction-envelope exchange draft for the active pane, mirrored from the SAME GET response
    *  fetchActiveDraft already reads (its additive `exchange` field — server.ts, gated on
-   *  JANUS_INSTRUCTION_ENVELOPE). null when the flag is off, the pane has no open draft, or no
+   *  instruction-envelope mode, derived from JANUS_EXCHANGE_SPINE post-2026-07-collapse). null
+   *  when the mode is off, the pane has no open draft, or no
    *  pane is open. Refreshed only on fetchActiveDraft — this hook does not itself own a live WS
    *  subscription (see useComposer.ts's header comment); a caller wanting live pushes threads its
    *  own draft_updated handling the same way it already threads promptBuffer today. */
@@ -103,7 +104,7 @@ export function useComposer(params: ComposerParams): Composer {
         const data = await res.json();
         setPromptBuffer(data.draft?.text ?? "");
         // Additive field (server.ts) — absent/undefined on any server that predates this step, and
-        // always null while JANUS_INSTRUCTION_ENVELOPE is "off" (default). Either way: no behavior
+        // always null while JANUS_EXCHANGE_SPINE is "off" (default). Either way: no behavior
         // change to promptBuffer above.
         setExchangeDraft((data.exchange as ExchangeDraftView | undefined) ?? null);
       }

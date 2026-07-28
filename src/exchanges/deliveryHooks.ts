@@ -16,10 +16,6 @@
 // `instructionEnvelopeIsPrimary()` check) — this only folds the shared core.
 
 import { getExchangeService, exchangeSpineActive } from "./spine";
-// No new flag-freeze hazard: draftRegistry (imported below) already transitively imports
-// instructionEnvelope.ts, so its INSTRUCTION_ENVELOPE_MODE constant is frozen at the same point
-// with or without this direct import.
-import { instructionEnvelopeActive } from "./instructionEnvelope";
 import { getOpenDraft, serializeDraftEnvelope } from "./draftRegistry";
 
 /** Phase 1, Step 1.4 / Phase 3 Step 3.5: durable pre-write intent — legal only from `staged`,
@@ -72,21 +68,36 @@ export interface MintExchangeForSendInput {
 }
 
 /**
- * Shared "mint an exchange for a fresh send" core: `createExchange` plus — when the
- * instruction-envelope flag is active AND this pane has an OPEN envelope draft
- * (src/exchanges/draftRegistry.ts) — serializing it into `instructionEnvelopeJson` (the durable
- * source `rehydrateDraftRegistryOnBoot` reads back after a restart). The `instructionEnvelopeActive()`
- * gate is load-bearing, not redundant: the compose_draft voice actions (src/actions/defs/
- * voice_ux.ts) can register an open draft regardless of the envelope flag, so "flag off ⇒ registry
- * empty" does NOT hold — with the flag off the column must stay at its schema default (exactly what
- * the pre-consolidation voice lane's `draftEnvelopeJsonForDispatch` guaranteed). A pane with no
- * open draft (the plain, non-envelope dispatch case) likewise gets `undefined`. No-op (returns
- * `undefined`) unless the spine flag is active; never throws.
+ * Shared "mint an exchange for a fresh send" core: `createExchange` plus — when this pane has an
+ * OPEN envelope draft (src/exchanges/draftRegistry.ts) — serializing it into
+ * `instructionEnvelopeJson` (the durable source `rehydrateDraftRegistryOnBoot` reads back after a
+ * restart). A pane with no open draft (the plain, non-envelope dispatch case) gets `undefined`.
+ * No-op (returns `undefined`) unless the spine flag is active; never throws.
+ *
+ * FLAG COLLAPSE (2026-07): this used to ALSO gate on `instructionEnvelopeActive()` — load-bearing
+ * under the pre-collapse THREE-flag design, because the compose_draft voice actions (src/actions/
+ * defs/voice_ux.ts) can register an open draft regardless of the (then-independent) envelope
+ * flag's own value, so "spine on ⇒ envelope on" did NOT hold. Post-collapse it DOES hold by
+ * construction — instruction-envelope mode is now 1:1 derived from the spine's own mode (flag.ts's
+ * FLAG LATTICE), so `instructionEnvelopeActive()` is always true by the time this line runs: we
+ * already returned above unless `exchangeSpineActive()`, and both predicates derive from the same
+ * `JANUS_EXCHANGE_SPINE` value.
+ *
+ * PRECISION (adversarial-review correction, 2026-07): they derive from the same ENV VAR, not from
+ * the same in-memory constant. flag.ts, instructionEnvelope.ts and resultEnvelope.ts each freeze
+ * their OWN copy of the spine mode at first import — deliberately, see flagReader.ts's header (a
+ * shared eager constant is what silently froze the mode to "off" mid-refactor). The always-true
+ * conclusion therefore rests on all copies freezing under the SAME env snapshot, which production
+ * guarantees: server.ts resolves these imports in one synchronous phase, and panes boot INERT, so
+ * no env mutation can interleave. A test process that imports the pure helpers BEFORE setting
+ * JANUS_EXCHANGE_SPINE can violate it — that is the documented hazard in flagReader.ts, not a
+ * production path. The now-redundant check was removed rather than kept as dead weight;
+ * `serializeDraftEnvelope`'s own `?? undefined` still covers a genuinely empty/expired draft.
  */
 export function mintExchangeForSend(input: MintExchangeForSendInput): string | undefined {
   if (!exchangeSpineActive()) return undefined;
   try {
-    const openDraft = instructionEnvelopeActive() ? getOpenDraft(input.projectId, input.paneId) : undefined;
+    const openDraft = getOpenDraft(input.projectId, input.paneId);
     return getExchangeService().createExchange({
       projectId: input.projectId,
       paneId: input.paneId,

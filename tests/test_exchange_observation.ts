@@ -4,12 +4,16 @@
 // exercised through the REAL src/observe/index.ts pipeline (not just the pure ExchangeService),
 // with the exchange spine and result-envelope flags genuinely ACTIVE.
 //
-// JANUS_EXCHANGE_SPINE / JANUS_AGENT_RESULT_ENVELOPE must be set BEFORE the first import of
-// anything touching src/exchanges/flag.ts / src/exchanges/resultEnvelope.ts in THIS process — both
-// cache their mode at module load (the established env-flag idiom). `node --test` runs each test
-// FILE as its own process (see tests/test_exchange_recovery.ts's identical note for its real-boot
-// suite), so this cannot leak into any sibling test file. Every module that needs to see the flags
-// active is therefore imported DYNAMICALLY, inside `before()`, after `process.env` is set.
+// JANUS_EXCHANGE_SPINE must be set BEFORE the first import of anything touching src/exchanges/
+// flag.ts / src/exchanges/resultEnvelope.ts in THIS process — it caches its mode at module load
+// (the established env-flag idiom). `node --test` runs each test FILE as its own process (see
+// tests/test_exchange_recovery.ts's identical note for its real-boot suite), so this cannot leak
+// into any sibling test file. Every module that needs to see the flag active is therefore imported
+// DYNAMICALLY, inside `before()`, after `process.env` is set.
+//
+// FLAG COLLAPSE (2026-07): JANUS_AGENT_RESULT_ENVELOPE is retired — result-envelope scanning (the
+// old "accept" rung) is now automatic whenever JANUS_EXCHANGE_SPINE is non-off, so this suite no
+// longer sets it separately.
 //
 // Covers: each terminal edge -> the correct exchange transition against the ACTIVE delivery
 // marker; unrelated/unknown-pane edges are a no-op; idle-alone never means agent_complete (pinned);
@@ -44,8 +48,7 @@ function setEnv(k: string, v: string): void {
 }
 
 before(async () => {
-  setEnv("JANUS_EXCHANGE_SPINE", "shadow"); // active (writes), not authoritative — sufficient here.
-  setEnv("JANUS_AGENT_RESULT_ENVELOPE", "accept");
+  setEnv("JANUS_EXCHANGE_SPINE", "record"); // active (writes), not authoritative — sufficient here; post-collapse rename of "shadow". Also activates result-envelope scanning (subsumes the old JANUS_AGENT_RESULT_ENVELOPE=accept).
 
   ({ attachObserve, legacyCompletionEligible } = await import("../src/observe"));
   ({ AnnouncementBus, DEFAULT_ANNOUNCEMENT_TEMPLATES } = await import("../src/announcementBus"));
