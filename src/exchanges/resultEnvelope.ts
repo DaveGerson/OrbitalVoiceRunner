@@ -86,7 +86,7 @@ import { COMPLETION_REQUEST_LINE } from "./instructionEnvelope";
 const SPINE_MODE_AT_LOAD: ExchangeSpineMode = readExchangeSpineMode();
 
 // Re-exported purely for callers that want the ONE existing "please report completion" prompt
-// string without a second import path — see the "request mode coherence" note below.
+// string without a second import path — see the JANUS_AGENT_COMPLETION_PROMPT flag note below.
 export { COMPLETION_REQUEST_LINE };
 
 // ── scanning activation — DERIVED from JANUS_EXCHANGE_SPINE (flag collapse, 2026-07) ────────────

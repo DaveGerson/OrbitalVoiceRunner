@@ -39,6 +39,25 @@ describe("flag.ts: JANUS_EXCHANGE_SPINE — off | record | authoritative (defaul
     assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "PRIMARY" }), "authoritative", "case-insensitive alias");
   });
 
+  // Adversarial-review finding (2026-07): the alias table was a plain object literal, so its string
+  // lookup walked Object.prototype — `JANUS_EXCHANGE_SPINE=constructor` / `__proto__` returned a
+  // truthy INHERITED member that passed the `if (aliased)` guard and became the "mode". Since every
+  // production gate is `mode !== "off"`, those values silently ACTIVATED the whole subsystem (spine
+  // writes, envelope recording, boot rehydration, untrusted-output scanning) — fail-OPEN, where the
+  // pre-collapse reader validated with includes() and correctly defaulted closed. Fixed by making
+  // the table a Map (no prototype chain for string keys). This test pins the fail-CLOSED contract.
+  it("FAIL-CLOSED: Object.prototype keys are not aliases — they default to off, never activate", () => {
+    for (const attack of ["constructor", "__proto__", "toString", "valueOf", "hasOwnProperty"]) {
+      const mode = readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: attack });
+      assert.equal(mode, "off", `${attack} must default to off, got ${String(mode)}`);
+      assert.equal(
+        exchangeSpineWrites(mode),
+        false,
+        `${attack} must NOT activate the spine (fail-closed)`,
+      );
+    }
+  });
+
   it("the module-cached EXCHANGE_SPINE_MODE is one of the three valid modes (read once at load)", () => {
     const valid: readonly ExchangeSpineMode[] = ["off", "record", "authoritative"];
     assert.ok(valid.includes(EXCHANGE_SPINE_MODE));

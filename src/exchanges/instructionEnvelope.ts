@@ -230,7 +230,7 @@ export interface RenderProfile {
  *  src/observe/index.ts) or with a structured result envelope (picked up by
  *  resultEnvelope.ts's scanner) — both funnel into the same trust boundary and settlement path
  *  (`ExchangeService.recordReportedOutcome`). Keep it that way: do not add a JSON-specific request
- *  line here without updating that module's "request mode coherence" doc comment to match. */
+ *  line here without updating that module's JANUS_AGENT_COMPLETION_PROMPT flag note to match. */
 export const COMPLETION_REQUEST_LINE: string =
   "When you finish, report completion clearly (e.g. a final line stating done or blocked, and why).";
 

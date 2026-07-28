@@ -1222,9 +1222,10 @@ function operatorSendOverflow(paneId: string, text: string): number {
 }
 
 /** neg1 (adversarial-review fix): the rendered-instruction size ceiling for a pane's tool preset,
- *  passed to withExchangeCorrelationHint so the request-mode correlation hint can never push a
- *  delivered instruction past the cap the operator draft was already validated against. Custom
- *  profile for an unknown/missing preset. */
+ *  passed to withExchangeCorrelationHint so the correlation hint (JANUS_AGENT_COMPLETION_PROMPT=on
+ *  — the 2026-07 flag collapse's replacement for the old JANUS_AGENT_RESULT_ENVELOPE "request"
+ *  rung) can never push a delivered instruction past the cap the operator draft was already
+ *  validated against. Custom profile for an unknown/missing preset. */
 function paneRenderMaxChars(paneId: string): number {
   const preset = normalizePreset(manager.terminals[paneId]?.toolPreset);
   return (RENDER_PROFILES[preset] ?? RENDER_PROFILES.Custom).maxChars;
@@ -1345,7 +1346,8 @@ function registerDraftAndSettingsRoutes(
     // flags are active.
     const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
     beginExchangeDeliveryForWorkbenchSend(exchangeId);
-    // neg1: live correlation — append this exchange's own id (prose, request mode only) to the
+    // neg1: live correlation — append this exchange's own id (prose, only when
+    // JANUS_AGENT_COMPLETION_PROMPT=on — post-collapse name for the old "request" rung) to the
     // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on
     // the ORIGINAL `text` (the echo-veto in legacyCompletionEligible compares the pane's echo
     // against the operator's own recorded command); only the actual pane write is augmented.

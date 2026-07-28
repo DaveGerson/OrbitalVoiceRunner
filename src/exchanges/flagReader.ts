@@ -53,11 +53,20 @@ const EXCHANGE_SPINE_MODES: readonly ExchangeSpineMode[] = ["off", "record", "au
 /** Pre-collapse spellings, still accepted (BACK-COMPAT — src/exchanges/flag.ts's file header) —
  *  mapped to their post-collapse equivalent BEFORE validation, so an operator's existing
  *  `shadow`/`primary` env value keeps working unchanged, case-insensitively, exactly like every
- *  canonical spelling. */
-const LEGACY_EXCHANGE_SPINE_ALIASES: Readonly<Record<string, ExchangeSpineMode>> = {
-  shadow: "record",
-  primary: "authoritative",
-};
+ *  canonical spelling.
+ *
+ *  A `Map` — NOT an object literal — on purpose (adversarial-review finding, 2026-07). A plain
+ *  object's string lookup walks `Object.prototype`, so `JANUS_EXCHANGE_SPINE=constructor` (or
+ *  `__proto__`) returned a truthy inherited member, which then sailed past the `if (aliased)` guard
+ *  as the "mode". Every production gate is `mode !== "off"`, so those two magic values silently
+ *  ACTIVATED the whole subsystem — a fail-OPEN regression against the pre-collapse reader, whose
+ *  `readEnumFlag` validation correctly sent any unrecognized value to `off`. `Map.get` has no
+ *  prototype chain for string keys, so unrecognized input falls through to validation and defaults
+ *  closed, as the doc below promises. Pinned by tests/test_exchange_flag.ts. */
+const LEGACY_EXCHANGE_SPINE_ALIASES: ReadonlyMap<string, ExchangeSpineMode> = new Map([
+  ["shadow", "record"],
+  ["primary", "authoritative"],
+] as const);
 
 /**
  * Default mode when the env var is unset/empty/unrecognized: **off** (src/exchanges/flag.ts's own
@@ -65,7 +74,7 @@ const LEGACY_EXCHANGE_SPINE_ALIASES: Readonly<Record<string, ExchangeSpineMode>>
  */
 export function readExchangeSpineMode(env: NodeJS.ProcessEnv = process.env): ExchangeSpineMode {
   const raw = (env.JANUS_EXCHANGE_SPINE ?? "").trim().toLowerCase();
-  const aliased = LEGACY_EXCHANGE_SPINE_ALIASES[raw];
+  const aliased = LEGACY_EXCHANGE_SPINE_ALIASES.get(raw);
   if (aliased) return aliased;
   return readEnumFlag("JANUS_EXCHANGE_SPINE", EXCHANGE_SPINE_MODES, "off", env);
 }

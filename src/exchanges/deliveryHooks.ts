@@ -79,9 +79,19 @@ export interface MintExchangeForSendInput {
  * defs/voice_ux.ts) can register an open draft regardless of the (then-independent) envelope
  * flag's own value, so "spine on ⇒ envelope on" did NOT hold. Post-collapse it DOES hold by
  * construction — instruction-envelope mode is now 1:1 derived from the spine's own mode (flag.ts's
- * FLAG LATTICE), so `instructionEnvelopeActive()` is always true by the time this line runs (we
- * already returned above unless `exchangeSpineActive()`, and both read the SAME
- * `EXCHANGE_SPINE_MODE`). The now-redundant check was removed rather than kept as dead weight;
+ * FLAG LATTICE), so `instructionEnvelopeActive()` is always true by the time this line runs: we
+ * already returned above unless `exchangeSpineActive()`, and both predicates derive from the same
+ * `JANUS_EXCHANGE_SPINE` value.
+ *
+ * PRECISION (adversarial-review correction, 2026-07): they derive from the same ENV VAR, not from
+ * the same in-memory constant. flag.ts, instructionEnvelope.ts and resultEnvelope.ts each freeze
+ * their OWN copy of the spine mode at first import — deliberately, see flagReader.ts's header (a
+ * shared eager constant is what silently froze the mode to "off" mid-refactor). The always-true
+ * conclusion therefore rests on all copies freezing under the SAME env snapshot, which production
+ * guarantees: server.ts resolves these imports in one synchronous phase, and panes boot INERT, so
+ * no env mutation can interleave. A test process that imports the pure helpers BEFORE setting
+ * JANUS_EXCHANGE_SPINE can violate it — that is the documented hazard in flagReader.ts, not a
+ * production path. The now-redundant check was removed rather than kept as dead weight;
  * `serializeDraftEnvelope`'s own `?? undefined` still covers a genuinely empty/expired draft.
  */
 export function mintExchangeForSend(input: MintExchangeForSendInput): string | undefined {
