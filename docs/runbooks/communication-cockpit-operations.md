@@ -75,6 +75,15 @@ Python cortex back to the TS floor without touching the exchange spine.
 3. `JANUS_AGENT_COMPLETION_PROMPT=on` — additive settlement precision on top of the always-available
    conservative legacy heuristic. Changes what every agent receives on every dispatch, so soak it
    last and independently.
+   **Verified end to end 2026-07-28** (bead o2mf, `npm run smoke:completion-prompt`): on a real
+   running server (spine=`record`) with a real Claude pane, the voice-side dispatch rendered the
+   completion-request line, appended the live exchange id hint, the agent echoed a structured
+   result envelope with that exact id, and the exchange settled `agent_complete` CORRELATED
+   (`agent_completion_reported`, `has_envelope: true`). Two caveats the smoke surfaced:
+   (a) settlement REQUIRES the pane's idle edge — dead on the 2026 Claude CLI until the bead-q1kp
+   busy-marker/screen-bottom fix (shipped with the smoke); (b) under `record` only the VOICE
+   dispatch path mints an exchange, so the workbench draft/send lane gets no hint until
+   `authoritative`.
 4. Tune `voiceUx.sessionPoolHotSlots` — independent of the other two.
 
 ## 3. Metrics & replay
