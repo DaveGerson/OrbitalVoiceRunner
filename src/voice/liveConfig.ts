@@ -27,6 +27,13 @@
  * unevenly in later previews). The off-by-default + gated design makes this safe regardless: the
  * off-path is untouched until an explicit enable, at which point model acceptance is observable before
  * any default flips.
+ *
+ * VERIFIED LIVE 2026-07-28 (bead qkyr, `npm run verify:grounding` via the Credential Manager key
+ * loader): gemini-3.1-flash-live-preview ACCEPTED the combo — full 73-declaration registry set +
+ * googleSearch — at connect AND across a mid-turn search-inviting exchange (session stayed open,
+ * topical current-events answer returned). No `groundingMetadata` was observed on the response
+ * frames, so citation surfacing cannot be assumed; re-verify with the same script on any model
+ * bump before relying on this.
  */
 
 import type { GeminiFunctionDeclaration } from "../actions/gemini";

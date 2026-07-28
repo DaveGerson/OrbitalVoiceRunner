@@ -13,6 +13,12 @@
 // PERSIST-WINS contract: when reconciling, the PERSISTED ledger values for
 // permissions_mode and capabilityGates must SURVIVE a sync with a divergent live
 // term value. Operator intent recorded to the ledger is authoritative.
+// bead eoef: pin the settings file into a tmpdir for this whole file — constructing an
+// OrchestratorManager (directly or via startServer) without this writes a cwd-relative
+// .janus_settings.json into the repo root, which the run-unit cleanliness gate fails on.
+import { pinSettingsPathToTmpdir } from "./helpers/settingsPath";
+pinSettingsPathToTmpdir();
+
 import { test } from "node:test";
 import assert from "node:assert";
 import { OrchestratorManager, UniversalTerminal } from "../src/terminal";

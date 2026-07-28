@@ -109,10 +109,16 @@ export function resultEnvelopeActive(mode: ExchangeSpineMode = SPINE_MODE_AT_LOA
 // live exchange id to the outgoing instruction — `withExchangeCorrelationHint` below) deserves its
 // own clearly-named switch rather than being a third rung of a flag that otherwise only gated
 // scanning. Same env-flag idiom as every other flag in this subsystem: a plain module-level read,
-// default "off", exported as a function so tests can pass an explicit env map.
+// default "on" (GRADUATED from "off" 2026-07-28; evidence gate: the bead-o2mf end-to-end smoke,
+// `npm run smoke:completion-prompt` — real server, real Claude pane, hint delivered, envelope
+// echoed with the exact id, correlated `agent_complete` settlement). Unrecognized input lands on
+// the default — standard readEnumFlag behavior, the same convention as the spine's graduation:
+// a typo costs one benign prose hint line, never a behavior gate; the recognized "off" escape
+// hatch is unaffected. Exported as a function so tests can pass an explicit env map.
 //
-//   off (default) — `withExchangeCorrelationHint` is byte-identical (no hint ever appended).
-//   on            — coherence-only, mirrors the old "request" rung's ONE behavior exactly:
+//   off           — `withExchangeCorrelationHint` is byte-identical (no hint ever appended) —
+//                    the independent opt-out, orthogonal to the spine's own escape hatch.
+//   on (default)  — coherence-only, mirrors the old "request" rung's ONE behavior exactly:
 //                    `withExchangeCorrelationHint` (below) appends the live delivery's OWN
 //                    exchange_id to the ALREADY-EXISTING, already-wired `COMPLETION_REQUEST_LINE`
 //                    ("When you finish, report completion clearly (e.g. a final line stating done
@@ -135,7 +141,7 @@ export type AgentCompletionPromptMode = "off" | "on";
 const AGENT_COMPLETION_PROMPT_MODES: readonly AgentCompletionPromptMode[] = ["off", "on"];
 
 export function readAgentCompletionPromptMode(env: NodeJS.ProcessEnv = process.env): AgentCompletionPromptMode {
-  return readEnumFlag("JANUS_AGENT_COMPLETION_PROMPT", AGENT_COMPLETION_PROMPT_MODES, "off", env);
+  return readEnumFlag("JANUS_AGENT_COMPLETION_PROMPT", AGENT_COMPLETION_PROMPT_MODES, "on", env);
 }
 
 /** Cached at module load (the established env-flag idiom) — one process, one mode. */

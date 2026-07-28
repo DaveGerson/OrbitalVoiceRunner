@@ -338,7 +338,7 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
     // arms no timers, so there is nothing to stop (stop() would be an immediate no-op).
   });
 
-  it("US-1.2: quiescing is reversible — a fresh output burst returns the pane to Running and the eventual idle fires exactly once", async () => {
+  it("US-1.2: quiescing is reversible — a fresh output burst returns the pane to Running and each Running edge resolves to exactly one idle", async () => {
     // Use a real spawn-free terminal + its status machine via writeInput/onData seams would require a
     // PTY; instead exercise the documented invariant through a real PTY pane that tapers then bursts.
     const prevCwd = process.cwd();
@@ -349,9 +349,9 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
     monitoringStore.init();
     const mgr = new OrchestratorManager({ ledger: monitoringStore });
     let idleCount = 0;
-    let sawRunning = false;
+    let runningCount = 0;
     let sawQuiescing = false;
-    mgr.onRunning = () => { sawRunning = true; };
+    mgr.onRunning = () => { runningCount++; };
     mgr.onQuiescing = () => { sawQuiescing = true; };
     mgr.onIdle = () => { idleCount++; };
     try {
@@ -373,7 +373,7 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
       // The spawn-settle itself is a Running->Idle edge (the shell banner is output-driven work in
       // fallback mode), so it may have fired onRunning/onIdle once already. Zero the counters here so
       // the asserts below measure ONLY the burst->finish sequence this story is about.
-      sawRunning = false;
+      runningCount = 0;
       idleCount = 0;
       // WHY A SINGLE BURST WITH NO LONG INTERNAL SLEEP: idle detection here is output-silence-based
       // (fallback mode — no node-pty process-tree probe), so it fires after `idleTimeoutMs` (200ms) of
@@ -388,18 +388,32 @@ describe("US-1.2 \"Still cooking\" quiescing (P1)", () => {
 
       await waitFor(() => A.status === "Running", 4000);
       await waitFor(() => A.status === "Idle", 8000);
-      // Fixed wait kept on purpose: this proves the ABSENCE of a second idle edge, so there is no
-      // positive condition to poll toward — the window must fully elapse to give a (buggy) extra
-      // onIdle a chance to register before we assert idleCount === 1.
+      // Fixed wait kept on purpose: this proves the ABSENCE of a spurious extra idle edge, so there
+      // is no positive condition to poll toward — the window must fully elapse to give a (buggy)
+      // extra onIdle a chance to register before the pairing assert below.
       await new Promise((r) => setTimeout(r, 400));
+      // bead k20s: under full-battery CPU load the loaded scheduler can starve the shell mid-burst
+      // for >idleTimeoutMs, manufacturing a GENUINE extra silence window — i.e. a second REAL
+      // Idle->Running->Idle cycle (idleCount=2 with a matching second Running edge). That is
+      // legitimate behavior, not the double-fire bug this story guards, so the invariant is
+      // PAIRING, not an absolute count: every Running edge resolves to EXACTLY one idle edge. The
+      // real bug (one silence window emitting two idle edges) still fails deterministically as
+      // idleCount > runningCount. Re-settle first so a load-manufactured cycle that STARTED inside
+      // the grace window is fully resolved before counting.
+      await waitFor(() => A.status === "Idle", 8000);
 
-      assert.ok(sawRunning, "the pane reached a genuine Running edge after the burst");
+      assert.ok(runningCount >= 1, "the pane reached a genuine Running edge after the burst");
       // The quiescing pre-idle arm is best-effort in fallback mode (a single tight burst may not leave a
       // tapering window for onQuiescing to fire), so we treat the quiescing observation as informational
-      // and assert the load-bearing invariants: a genuine Running edge occurred, and the eventual idle
-      // fires EXACTLY once across the burst->finish sequence (reversibility back to Running, then one idle).
+      // and assert the load-bearing invariants: a genuine Running edge occurred, and every
+      // Running edge resolved to exactly one idle edge (reversibility back to Running, then one idle
+      // per cycle — never a double-fired idle).
       void sawQuiescing;
-      assert.strictEqual(idleCount, 1, "the eventual idle edge fires EXACTLY once across the burst→finish sequence");
+      assert.strictEqual(
+        idleCount,
+        runningCount,
+        "each Running edge resolves to EXACTLY one idle edge across the burst→finish sequence (no double-fired idle)",
+      );
     } finally {
       await Promise.all(Object.values(mgr.terminals).map((t: any) => t.stop?.()));
       monitoringStore.close();

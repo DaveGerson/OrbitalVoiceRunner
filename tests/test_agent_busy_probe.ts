@@ -60,6 +60,22 @@ const CODEX_BUSY_WORKING = "⠴ Working (8s • Esc to interrupt)";
 const CODEX_BUSY_THINKING = "• Thinking…  Esc to interrupt";
 const CODEX_IDLE_PROMPT = "Done. Applied the patch.\n› ";
 
+// Claude Code (2026 CLI, bead q1kp — captured LIVE by scripts/smoke-completion-prompt.ts):
+// the REST screen RETAINS a star glyph in the past-tense completion line, and the footer
+// truncates long paths with an ellipsis. A bare star-glyph busy class therefore pins a rested
+// pane Running forever (no idle edge ⇒ no idle-time exchange settlement). These frames pin the
+// distinction: an ACTIVE verb frame ("✻ Ideating…", "thinking with xhigh effort") is busy; the
+// past-tense rest line ("✻Cogitated for 7s") is NOT, even with its star and an ellipsis-truncated
+// footer in the same tail window.
+const CLAUDE_2026_BUSY_IDEATING = "✻ Ideating… (3s · thinking with xhigh effort)";
+const CLAUDE_2026_BUSY_EFFORT = "✶ thinking with xhigh effort";
+const CLAUDE_2026_IDLE_COGITATED =
+  "✻Cogitated for 7s\n" +
+  "────────────────────────\n" +
+  "❯ \n" +
+  "────────────────────────\n" +
+  "⚠ Transcript saving is off — inherited marker · res…completion-smoke… ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
 describe("W4(a): AgentAdapter.isLikelyBusy — per-CLI working-marker tables", () => {
   it("ClaudeAdapter: spinner + 'esc to interrupt' tail reads BUSY", () => {
     const a = busyOf(createAdapter("Claude Code"));
@@ -103,6 +119,50 @@ describe("W4(a): AgentAdapter.isLikelyBusy — per-CLI working-marker tables", (
     const a = busyOf(createAdapter("Claude Code"));
     assert.strictEqual(a.isLikelyBusy!(CLAUDE_BUSY_SPINNER), a.isLikelyBusy!(CLAUDE_BUSY_SPINNER));
     assert.strictEqual(a.isLikelyBusy!(CLAUDE_IDLE_PROMPT), a.isLikelyBusy!(CLAUDE_IDLE_PROMPT));
+  });
+
+  it("ClaudeAdapter (2026 CLI, bead q1kp): active working frames read BUSY", () => {
+    const a = busyOf(createAdapter("Claude Code"));
+    assert.strictEqual(a.isLikelyBusy!(CLAUDE_2026_BUSY_IDEATING), true, "star glyph + active verb ellipsis is busy");
+    assert.strictEqual(a.isLikelyBusy!(CLAUDE_2026_BUSY_EFFORT), true, "an effort-display thinking frame is busy");
+    // Adversarial-review Finding 2: the spinner cycles through NON-star phase glyphs too
+    // (observed live: "·✢*✶✻✽" frames). A frozen mid-gap frame led by one of them must still
+    // read busy, or the 2-line bottom window idles the pane mid-turn.
+    assert.strictEqual(a.isLikelyBusy!("·Architecting…101 tokens · "), true, "a '·'-phase spinner frame is busy");
+    assert.strictEqual(a.isLikelyBusy!("✢Ideating…"), true, "a '✢'-phase spinner frame is busy");
+  });
+
+  it("ClaudeAdapter (bead q1kp, adversarial-review Finding 1): prose containing 'thinking' at the screen bottom reads NOT busy", () => {
+    // The effort marker must match the CLI's frame shape ("thinking with <level> effort"), never
+    // the common English word — response prose or a drafted composer line at rest would
+    // otherwise re-pin the pane Running forever (the exact defect this bead kills).
+    const a = busyOf(createAdapter("Claude Code"));
+    assert.strictEqual(a.isLikelyBusy!("That is what I was thinking about.\n> "), false, "response prose mentioning 'thinking' is not busy");
+    assert.strictEqual(a.isLikelyBusy!("❯ what were you thinking there"), false, "a drafted-but-unsent composer line is not busy");
+  });
+
+  it("ClaudeAdapter (bead q1kp, adversarial-review Findings 2+3): rest-shaped lines never match the phase-glyph rule", () => {
+    const a = busyOf(createAdapter("Claude Code"));
+    // '*' stays OUT of the phase class: a truncated markdown bullet at a rest bottom would
+    // otherwise pin the pane (permanent-pin beats a rare missed '*' phase frame, which only
+    // costs a self-correcting early idle).
+    assert.strictEqual(a.isLikelyBusy!("* Updated tests and docs…\n❯ "), false, "a truncated markdown bullet is not busy");
+    // Finding 3 (row-merge hardening): stripAnsiSequences can merge two visual rows into one
+    // buffer line. A merged rest line ("✻Cogitated for 7s" + ellipsis-truncated footer) must not
+    // resurrect the rest-screen pin — the ellipsis budget after the verb is deliberately short.
+    assert.strictEqual(a.isLikelyBusy!("✻Cogitated for 7s · res…completion-smoke…"), false, "a merged rest+footer row is not busy");
+  });
+
+  it("ClaudeAdapter (2026 CLI, bead q1kp): the rest screen's retained star glyph reads NOT busy", () => {
+    // The live-observed defect: '✻Cogitated for 7s' sits on the rest screen forever. If this
+    // reads busy, the pane never idles, and the exchange spine's idle-time settlement is dead
+    // for every real Claude pane.
+    const a = busyOf(createAdapter("Claude Code"));
+    assert.strictEqual(
+      a.isLikelyBusy!(CLAUDE_2026_IDLE_COGITATED),
+      false,
+      "a past-tense rest line (star glyph, no active verb ellipsis) must NOT read busy",
+    );
   });
 });
 
@@ -306,6 +366,29 @@ describe("W4(c): interactive_cli busy truth across a >3500ms thinking gap", () =
     assert.strictEqual(r.onIdleCount, 1);
   });
 
+  it("2026 CLI (bead q1kp): a turn that ends on the star-retaining rest screen still reaches Idle exactly once", () => {
+    // The live-observed end-to-end failure shape: busy frame during the turn, then the pane
+    // rests on '✻Cogitated for 7s' + prompt. Pre-fix the bare star class keeps every probe
+    // authoritative-busy at rest, so the pane NEVER idles (observed: paneStatus=Running for a
+    // full 120s window while an exchange sat at 'delivered').
+    const adapter = createAdapter("Claude Code");
+    const events: TimedEvent[] = [
+      { t: 0, event: { kind: "input" } },
+      { t: 100, event: { kind: "output", text: CLAUDE_2026_BUSY_IDEATING } },
+      { t: 5100, event: { kind: "output", text: CLAUDE_2026_IDLE_COGITATED } }, // turn done, star retained
+    ];
+    for (let t = 500; t <= 15000; t += 500) events.push({ t, event: { kind: "probeTick" } });
+
+    const r = replayAgent(events, AGENT_OPTS(adapter));
+    for (const { t, status } of r.timeline) {
+      if (t >= 100 && t < 5100) {
+        assert.notStrictEqual(status, "Idle", `false Idle at t=${t} while the agent was thinking`);
+      }
+    }
+    assert.strictEqual(r.finalStatus, "Idle", "the star-retaining rest screen must still debounce to Idle (bead q1kp)");
+    assert.strictEqual(r.onIdleCount, 1, "exactly one Running->Idle edge for the finished turn");
+  });
+
   it("the SAME pane with a quiet, prompt-like tail still goes Idle at the agentIdleTimeoutMs floor", () => {
     // A truly-idle agent: it answers, then rests at its prompt with NO working
     // marker. It must still debounce to Idle — and the debounce floor must stay
@@ -397,6 +480,53 @@ describe("W4(b): real UniversalTerminal.runProbeTick busy-check (integration)", 
     );
     assert.strictEqual(term.status, "Running", "authoritative busy keeps the pane Running");
     assert.strictEqual((term as any).idleTimer, null, "an authoritative busy tick clears any pending idle timer");
+    await term.stop();
+  });
+
+  it("2026 CLI (bead q1kp): a rested pane whose buffer RETAINS end-of-turn froth reads NOT busy at the seam", async () => {
+    // Captured LIVE (scripts/smoke-completion-prompt.ts + debug probe): outputBuffer is
+    // chunk-granular, and a rested pane appends NOTHING — so the busy window freezes on the last
+    // turn's animation froth ("thinking with xhigh effort") and an OSC title chunk carrying a
+    // star glyph, while the true screen bottom is the past-tense rest line + prompt. The seam
+    // must judge the RENDERED SCREEN BOTTOM (last non-empty lines), not frozen froth chunks —
+    // otherwise every real Claude pane is pinned Running forever after its first turn.
+    const term = makeAgentTerminal("Claude Code");
+    term.outputBuffer = [
+      "·Architecting…101 tokens · ",
+      "thinking with xhigh effort",
+      "]0;✳ Respond with PONG",
+      "✻Cogitated for 3s",
+      "❯ ",
+    ];
+
+    (term as any).runProbeTick();
+
+    assert.strictEqual(
+      (term as any).lastConfidence,
+      "fallback",
+      "a rested pane (past-tense line + prompt at the screen bottom) must emit the fallback no-child probe even with frozen froth higher in the buffer",
+    );
+    await term.stop();
+  });
+
+  it("2026 CLI (bead q1kp): a frozen mid-gap thinking frame at the screen bottom still reads BUSY", async () => {
+    // The converse guard: during a long silent thinking gap the NEWEST content is the frozen
+    // effort frame itself — the screen bottom carries the working marker, and the pane must stay
+    // authoritative-busy (the original BUG-006 protection).
+    const term = makeAgentTerminal("Claude Code");
+    term.outputBuffer = [
+      "]0;✳ Respond with PONG",
+      "✻ Ideating… (3s · thinking with xhigh effort)",
+    ];
+
+    (term as any).runProbeTick();
+
+    assert.strictEqual(
+      (term as any).lastConfidence,
+      "authoritative",
+      "a working frame at the screen bottom must keep the authoritative busy probe",
+    );
+    assert.strictEqual(term.status, "Running");
     await term.stop();
   });
 

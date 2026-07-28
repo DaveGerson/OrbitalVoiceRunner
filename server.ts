@@ -1,3 +1,9 @@
+// MUST stay the very first import (bead ih56): many flag modules in the import graph below cache
+// their env var at first evaluation (src/exchanges/flag.ts, resultEnvelope.ts, transcripts/flag.ts,
+// …), so .env must be loaded into process.env before ANY of them evaluates. A later dotenv.config()
+// call runs after the whole import block and reads .env-only flags as their defaults. esbuild
+// preserves import order in the CJS bundle, so this holds in dist/server.cjs too.
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import fs from "fs";
@@ -6,7 +12,6 @@ import { GoogleGenAI, Type } from "@google/genai";
 import type { LiveConnectParameters, Session } from "@google/genai";
 import { WebSocketServer } from "ws";
 import http from "http";
-import dotenv from "dotenv";
 import crypto from "crypto";
 import { OrchestratorManager, UniversalTerminal, stripAnsiSequences, redactSecrets, classifySecrets, normalizePreset, presetCommand } from "./src/terminal";
 import { registerHistoryBridge } from "./src/historyBridge";
@@ -74,8 +79,6 @@ import {
   closeScriptedSession,
 } from "./src/voice/scriptedLiveConnector";
 import { isLoopbackAddress, isOriginAllowed, parseAllowedOrigins, timingSafeEqualString } from "./src/security/perimeter";
-
-dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
 

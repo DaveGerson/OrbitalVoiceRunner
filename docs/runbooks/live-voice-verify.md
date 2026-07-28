@@ -120,3 +120,19 @@ All criteria must pass to declare hands-free Gemini Live voice verified in a rea
   covered by `tests/test_approvals_wse.ts`.
 - Do not skip the manual section because the script passed — the script is scoped to exclude
   exactly the mic/speaker/UI pieces this section covers.
+
+## googleSearch grounding acceptance (bead qkyr — verified 2026-07-28)
+
+`voiceAi.groundingEnabled` appends the built-in `{ googleSearch: {} }` Tool beside the full
+registry-derived `functionDeclarations` (src/voice/liveConfig.ts). Whether the live model accepts
+that combo is a server-side rule the SDK types do not encode. Observed live via
+`node scripts/local/with-secrets.mjs npm run verify:grounding` (key from the Windows Credential
+Manager, `docs/process/LOCAL_SECRETS.md`):
+
+- **gemini-3.1-flash-live-preview ACCEPTED the combo** (73 function declarations + googleSearch):
+  clean connect, and a mid-turn search-inviting exchange completed with a topical current-events
+  answer — no error, no close, session stayed healthy.
+- **No `groundingMetadata` appeared on the response frames**, so do not assume citations/sources
+  are surfaced to the client; the answer content itself was consistent with live search.
+- Re-run the same probe on any `voiceAi.model` bump before trusting `groundingEnabled` there —
+  historical Live API behavior rejected this combo unevenly across model generations.
