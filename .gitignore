@@ -55,3 +55,9 @@ e2e/*-snapshots/
 
 # beads issue tracker — local Dolt DB; sync is via refs/dolt/data, not the working tree
 .beads/
+
+# Local-only developer tooling (secret loaders, scratch probes). NEVER committed: this is the
+# sanctioned home for machine-specific integrations that must not enter the repo — notably the
+# Windows Credential Manager secret loader that keeps GEMINI_API_KEY out of .env entirely.
+# Setup + rationale: docs/process/LOCAL_SECRETS.md
+scripts/local/
