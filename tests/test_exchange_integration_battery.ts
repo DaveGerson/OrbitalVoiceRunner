@@ -532,17 +532,27 @@ describe("scenario 8: repeated terminal edge", () => {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 describe("scenario 9: uncorrelated legacy command", () => {
   it("flag=off end-to-end journey writes NO exchange rows; the pending-approval row and dispatch member stay uncorrelated (exchange_id NULL everywhere)", () => {
-    // This test PROCESS never sets JANUS_EXCHANGE_SPINE, so the real frozen EXCHANGE_SPINE_MODE
-    // the whole app boots with is "off" here — the production default (spec §8). We reproduce the
+    // This test PINS the mode it is testing rather than inheriting the ambient default. It used to
+    // assert `exchangeSpineActive() === false` "matching the production default" — but the default
+    // graduated off -> record (2026-07, bead wsm-e2e-pinned-d71d), which broke the premise while
+    // the off-leg behavior it actually covers was unchanged. A test named "flag=off" must pin
+    // "off"; reading it from the ambient default made it a default-detector, not an off-leg test.
+    //
+    // Pinned the same way the record-leg test below does it: EXCHANGE_SPINE_MODE is a
+    // MODULE-LOAD-TIME constant, so the frozen singleton view cannot be flipped mid-process — we
+    // use the flag module's own PARAMETERIZED (non-frozen) reader, the seam its module doc says
+    // exists "so tests can pass an explicit env map without mutating process.env". We reproduce the
     // SAME branch shape src/voice/index.ts's stampExchangeForDispatch uses (voice/index.ts:956-973):
-    // `if (!exchangeSpineActive()) return undefined;` — using the REAL exported flag function.
-    assert.equal(exchangeSpineActive(), false, "sanity: this test process's frozen flag is off, matching the production default");
+    // `if (!exchangeSpineActive()) return undefined;`.
+    const offMode = readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "off" });
+    assert.equal(offMode, "off", "explicit `off` is the escape hatch and must stay honored");
+    assert.equal(exchangeSpineWrites(offMode), false, "off mode writes no exchange rows");
 
     const store = freshStore();
     const tracker = new DispatchJoinTracker();
     const approvals = new PendingApprovalStore(store);
 
-    const exchangeId = exchangeSpineActive() ? "unreachable" : undefined; // the real off-mode gate
+    const exchangeId = exchangeSpineWrites(offMode) ? "unreachable" : undefined; // the real off-mode gate
     const group = tracker.create("legacy-macro", "run the linter", ["pane-1"]);
     approvals.add(
       { messageId: "appr-legacy-1", instruction: "npm run lint", kind: "agent_instruction", terminalId: "pane-1", callId: "call-1", timestamp: Date.now(), exchangeId },
@@ -565,9 +575,10 @@ describe("scenario 9: uncorrelated legacy command", () => {
 
   it("flag=record: a non-exchange action path leaves agent_exchanges/exchange_events completely untouched and stays uncorrelated", () => {
     // EXCHANGE_SPINE_MODE (src/exchanges/flag.ts) is a MODULE-LOAD-TIME constant read once from
-    // process.env, so this test process's `exchangeSpineActive()` view is permanently frozen to
-    // "off" (pinned above) — it cannot be flipped to "record" mid-process to exercise the real
-    // singleton. To exercise the "record" leg of this scenario we use the flag module's own
+    // process.env, so this test process's frozen singleton view cannot be flipped mid-process to
+    // exercise a specific mode — whatever it froze to at import time is what it stays. Every mode
+    // assertion in this scenario therefore pins its own mode explicitly (the off-leg test above
+    // does the same). To exercise the "record" leg of this scenario we use the flag module's own
     // PARAMETERIZED (non-frozen) functions instead — `readExchangeSpineMode`/`exchangeSpineWrites`
     // — the exact seam its module doc says exists "so tests can pass an explicit env map without
     // mutating process.env". A directly-constructed `ExchangeService` stands in for what

@@ -18,11 +18,20 @@ import assert from "node:assert";
 import { readExchangeSpineMode, exchangeSpineWrites, EXCHANGE_SPINE_MODE, type ExchangeSpineMode } from "../src/exchanges/flag";
 import { legacyFlagRetirementWarning } from "../src/exchanges/flagReader";
 
-describe("flag.ts: JANUS_EXCHANGE_SPINE — off | record | authoritative (default off)", () => {
-  it("defaults to off when unset/empty/unrecognized", () => {
-    assert.equal(readExchangeSpineMode({}), "off");
-    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "" }), "off");
-    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "bogus" }), "off");
+describe("flag.ts: JANUS_EXCHANGE_SPINE — off | record | authoritative (default record)", () => {
+  // Graduated off -> record 2026-07 (bead wsm-e2e-pinned-d71d). `record` is observe-only: it
+  // writes the ledger and dry-runs the target resolver without steering delivery, so a fresh
+  // install collects the metrics that gate promotion to `authoritative` at no behavioral cost.
+  it("defaults to record when unset/empty/unrecognized", () => {
+    assert.equal(readExchangeSpineMode({}), "record");
+    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "" }), "record");
+    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "bogus" }), "record");
+  });
+
+  it("ESCAPE HATCH: an explicit `off` still fully disables the subsystem", () => {
+    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "off" }), "off");
+    assert.equal(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "OFF" }), "off");
+    assert.equal(exchangeSpineWrites(readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "off" })), false);
   });
 
   it("accepts the canonical record/authoritative spellings, case-insensitively", () => {
@@ -46,15 +55,21 @@ describe("flag.ts: JANUS_EXCHANGE_SPINE — off | record | authoritative (defaul
   // writes, envelope recording, boot rehydration, untrusted-output scanning) — fail-OPEN, where the
   // pre-collapse reader validated with includes() and correctly defaulted closed. Fixed by making
   // the table a Map (no prototype chain for string keys). This test pins the fail-CLOSED contract.
-  it("FAIL-CLOSED: Object.prototype keys are not aliases — they default to off, never activate", () => {
+  it("Object.prototype keys are not aliases — they yield a real mode, never `authoritative`", () => {
+    const valid: readonly ExchangeSpineMode[] = ["off", "record", "authoritative"];
     for (const attack of ["constructor", "__proto__", "toString", "valueOf", "hasOwnProperty"]) {
       const mode = readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: attack });
-      assert.equal(mode, "off", `${attack} must default to off, got ${String(mode)}`);
-      assert.equal(
-        exchangeSpineWrites(mode),
-        false,
-        `${attack} must NOT activate the spine (fail-closed)`,
+      // The defect this pins: the alias table was once a plain object literal, so these keys
+      // returned a truthy INHERITED member (a Function / Object) straight out as the "mode".
+      assert.ok(
+        valid.includes(mode),
+        `${attack} must yield a valid mode, got ${typeof mode} ${String(mode)}`,
       );
+      // The safety property, stated independently of what the default happens to be: garbage may
+      // never reach the rung where the ledger GOVERNS dispatch. `record` is observe-only, so
+      // landing there is a harmless misconfiguration; `authoritative` would not be.
+      assert.notEqual(mode, "authoritative", `${attack} must never reach the authoritative rung`);
+      assert.equal(mode, "record", `${attack} falls through to the default (record)`);
     }
   });
 
