@@ -250,6 +250,10 @@ export function appendRawCapped(existing: string, chunk: string, max: number): s
 // adapter's isLikelyBusy check. Matches the existing getRecentOutput(5) tail window — a live
 // spinner keeps that window "busy" through a silent thinking gap; a finished turn scrolls it away.
 const AGENT_BUSY_TAIL_LINES = 5;
+// bead q1kp: of that chunk window, only the last few NON-EMPTY rendered lines are judged for
+// busy-ness — the screen bottom is the live state; anything above it can be frozen froth from the
+// end of the previous turn (see the runProbeTick comment).
+const AGENT_BUSY_BOTTOM_LINES = 2;
 
 export function stripAnsiSequences(text: string): string {
   // Matches ANSI color/style escape sequences
@@ -843,7 +847,15 @@ export class UniversalTerminal {
     // resting agent still debounces to Idle at the agentIdleTimeoutMs floor (the
     // decideStatus interactive_cli recovery re-arms the quiescence debounce).
     if (this.runtimeType === "interactive_cli") {
-      const tail = stripAnsiSequences(this.getRecentOutput(AGENT_BUSY_TAIL_LINES));
+      // bead q1kp: outputBuffer is CHUNK-granular and a rested pane appends nothing, so the raw
+      // AGENT_BUSY_TAIL_LINES window freezes on the last turn's animation froth ("thinking with
+      // xhigh effort", spinner fragments) forever — pinning the pane Running and killing the idle
+      // edge (observed live: exchange settlement dead for real Claude panes). Judge only the
+      // RENDERED SCREEN BOTTOM: the last few non-empty LINES of the stripped window. A frozen
+      // mid-gap thinking frame IS the bottom during a genuine silent gap, so BUG-006 protection
+      // is preserved; a rest screen ends with the past-tense line + prompt, which reads quiet.
+      const window = stripAnsiSequences(this.getRecentOutput(AGENT_BUSY_TAIL_LINES));
+      const tail = window.split(/\r?\n/).filter((l) => l.trim().length > 0).slice(-AGENT_BUSY_BOTTOM_LINES).join("\n");
       const probe: ProbeResult = this.adapter.isLikelyBusy(tail)
         ? { hasRunningChild: true, confidence: "authoritative" }
         : { hasRunningChild: false, confidence: "fallback" };

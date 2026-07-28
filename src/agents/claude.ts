@@ -30,10 +30,28 @@ const PERMISSION_MODE: Record<Mode, string> = {
 // The braille range (U+2800–U+28FF) is the animated spinner; the star glyphs are Claude's own
 // working glyphs. Deliberately EXCLUDES the mode pill "⏵⏵" (U+23F5) so a settled accept-edits pill
 // reads NOT busy. This adapter OWNS this list (per-CLI, not one global regex).
+//
+// bead q1kp (2026 CLI, observed live): the REST screen retains a star glyph in the past-tense
+// completion line ("✻Cogitated for 7s"), so a BARE star-glyph class pins a rested pane Running
+// forever — no idle edge, no idle-time exchange settlement. The glyph class therefore requires an
+// ACTIVE verb frame: a spinner-phase glyph LEADING the line ("·✢✶✻✽…" phases, observed live),
+// followed by a word carrying the working ellipsis within a SHORT budget ("✻ Ideating…",
+// "·Architecting…"). Three deliberate narrowings (adversarial review, 2026-07-28):
+//   - line-anchored: a mid-line glyph (OSC title residue "]0;✳ …", footer "· res…") never counts;
+//   - '*' stays OUT of the phase class even though the spinner cycles through it — a truncated
+//     markdown bullet at a rest bottom ("* Updated tests…") would permanently pin the pane,
+//     which is strictly worse than the rare missed '*' frame (a self-correcting early idle);
+//   - the {0,16} ellipsis budget keeps a stripAnsiSequences ROW-MERGE ("✻Cogitated for 7s · res…"
+//     — two visual rows fused into one buffer line) from resurrecting the rest-screen pin, while
+//     covering every observed working verb (longest: "Orchestrating…" = 13).
+// Long effort-display thinking gaps show "thinking with <level> effort" (no ellipsis) — matched
+// as that exact frame shape, NEVER the bare word "thinking" (response prose / a drafted composer
+// line at rest would re-pin the pane).
 const CLAUDE_BUSY_MARKERS: RegExp[] = [
   /esc to interrupt/i,
   /[⠀-⣿]/, // braille spinner
-  /[✳✱✶✷✴✽✻✹]/, // Claude working-glyph spinners
+  /^[✳✱✶✷✴✽✻✹·✢][^\S\n]*[A-Za-z][^\n]{0,16}(…|\.{3})/m, // line-leading spinner-phase glyph + active verb ellipsis
+  /\bthinking with \w+ effort\b/i, // the effort-display frame shape, not the common word
 ];
 
 export class ClaudeAdapter implements AgentAdapter {
