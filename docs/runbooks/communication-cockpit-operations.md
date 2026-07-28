@@ -150,8 +150,8 @@ more plain-text leak) and surface on that project's own catch-up/SITREP, plus th
 
 | Symptom | Likely cause / check |
 |---|---|
-| No exchange rows appearing | `JANUS_EXCHANGE_SPINE` unset (default `off`). Flags are boot-time — restart after export. |
-| Workbench send returns 400 "over this pane's size limit" | Envelope `primary` refuses over-limit sends rather than silently truncating — shorten the draft. |
+| No exchange rows appearing | `JANUS_EXCHANGE_SPINE=off` set explicitly (the default is `record` since the 2026-07 graduation — unset means rows SHOULD appear). Flags are boot-time — restart after changing. |
+| Workbench send returns 400 "over this pane's size limit" | Spine `authoritative` (the pre-collapse "envelope primary") refuses over-limit sends rather than silently truncating — shorten the draft. |
 | Retry button missing on a failed fleet card | Terminal `agent_failed` is never retryable (5.5 fix — the card no longer offers guaranteed-refused actions). Retry appears for `interrupted` rows. Draft-after-delivery-failure retry is REST-only. |
 | A completion narrates once then never again | Intended: exactly-once narration gate + (5.5) windowed SITREP tier-3 (30 min) and mint-once attention for completions. The durable record remains in replay/metrics. |
 | `speechToDraftLatency` ≈ 0 in metrics | Known consequence of resolution being synchronous with exchange minting — meaningful for fixture data only until minting moves earlier (documented in `src/exchanges/service.ts`). |
