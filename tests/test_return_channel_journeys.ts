@@ -68,13 +68,14 @@ import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 
-// JANUS_EXCHANGE_SPINE / JANUS_AGENT_RESULT_ENVELOPE must be set BEFORE the first import of
-// anything touching src/exchanges/flag.ts / src/exchanges/resultEnvelope.ts in THIS process — both
-// cache their mode at module load (tests/test_exchange_observation.ts's / tests/test_exchange_
-// recovery.ts's documented idiom). `node --test` runs each test FILE as its own process, so this
-// cannot leak into any other test file.
-process.env.JANUS_EXCHANGE_SPINE = "shadow"; // active (writes + reads via ExchangeService), not authoritative-only — sufficient here (matches test_exchange_observation.ts's own choice).
-process.env.JANUS_AGENT_RESULT_ENVELOPE = "accept";
+// JANUS_EXCHANGE_SPINE must be set BEFORE the first import of anything touching src/exchanges/
+// flag.ts / src/exchanges/resultEnvelope.ts in THIS process — it caches its mode at module load
+// (tests/test_exchange_observation.ts's / tests/test_exchange_recovery.ts's documented idiom).
+// `node --test` runs each test FILE as its own process, so this cannot leak into any other test file.
+//
+// FLAG COLLAPSE (2026-07): this suite used to ALSO set JANUS_AGENT_RESULT_ENVELOPE=accept — retired;
+// result-envelope scanning is now automatic whenever the spine is non-off, so no separate var is needed.
+process.env.JANUS_EXCHANGE_SPINE = "record"; // active (writes + reads via ExchangeService), not authoritative-only — sufficient here (matches test_exchange_observation.ts's own choice); post-collapse rename of "shadow".
 
 // These are pure logic modules — none of them transitively import `../server` (verified: no
 // `from "../server"` anywhere in their own import graphs), so loading them at module top level,

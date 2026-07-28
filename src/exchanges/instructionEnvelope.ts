@@ -12,10 +12,20 @@
 // Missing content is reported (assessReadiness's clarification), never guessed.
 
 import { z } from "zod";
-// NOTE: imports the side-effect-free src/exchanges/flagReader.ts, NOT src/exchanges/flag.ts — see
-// that file's doc comment. Importing flag.ts itself here would transitively trigger ITS eager
-// `EXCHANGE_SPINE_MODE` read (module-load-order-sensitive; a real regression this avoided).
-import { readEnumFlag } from "./flagReader";
+// FLAG COLLAPSE (2026-07, refactor/collapse-exchange-flags): this module used to read its OWN
+// independent env var (JANUS_INSTRUCTION_ENVELOPE, off/shadow/primary). That independent var is
+// GONE — instruction-envelope mode is now ENTIRELY DERIVED from the exchange spine's own mode
+// (src/exchanges/flag.ts's FLAG LATTICE doc comment). Importing that VALUE from src/exchanges/
+// flag.ts directly (rather than from the side-effect-free src/exchanges/flagReader.ts) is still a
+// real hazard, though — see flagReader.ts's doc comment for the regression this caught: this
+// module is imported all over the codebase/tests for PURE, flag-agnostic reasons (buildEnvelope,
+// createDraft, renderEnvelope, …), so importing flag.ts here would transitively freeze ITS eager
+// `EXCHANGE_SPINE_MODE` the moment anything imports so much as `buildEnvelope` for an unrelated
+// pure-logic assertion — well before a test's own deliberate env-var setup. `readExchangeSpineMode`/
+// `legacyFlagRetirementWarning` therefore both come from flagReader.ts, and this module computes
+// its OWN independently-frozen copy of the spine mode below (`SPINE_MODE_AT_LOAD`), exactly
+// mirroring flag.ts's own "read once at module load" idiom rather than sharing its freeze point.
+import { legacyFlagRetirementWarning, readExchangeSpineMode, type ExchangeSpineMode } from "./flagReader";
 import { mintSeqId } from "./types";
 
 // ── schema (zod, matching the repo's zod usage — src/voice/policyClient.ts's op-local pattern) ──
@@ -212,9 +222,10 @@ export interface RenderProfile {
 /** The ONE fixed protocol line requestCompletionEnvelope may append — communication framing, not
  *  a technical requirement (spec §6.2). The only non-operator content the renderer ever adds.
  *
- *  Coherence with `JANUS_AGENT_RESULT_ENVELOPE` (Phase 4, Step 4.1, src/exchanges/resultEnvelope.ts):
- *  that flag's "request" mode does NOT introduce a second, competing "please answer in JSON" prompt
- *  string. This line is the ONE invitation an adapter ever appends; a terminal agent may answer it
+ *  Coherence with `JANUS_AGENT_COMPLETION_PROMPT` (Phase 4, Step 4.1, src/exchanges/resultEnvelope.ts;
+ *  post-2026-07-collapse name for the old JANUS_AGENT_RESULT_ENVELOPE "request" rung): that flag does
+ *  NOT introduce a second, competing "please answer in JSON" prompt string. This line is the ONE
+ *  invitation an adapter ever appends; a terminal agent may answer it
  *  either in plain prose (picked up by the conservative legacy finalResponse heuristic,
  *  src/observe/index.ts) or with a structured result envelope (picked up by
  *  resultEnvelope.ts's scanner) — both funnel into the same trust boundary and settlement path
@@ -345,35 +356,43 @@ export function renderedOverflow(rendered: string, profile: RenderProfile): numb
   return Math.max(0, rendered.length - profile.maxChars);
 }
 
-// ── §7 feature flag — JANUS_INSTRUCTION_ENVELOPE: off | shadow | primary ───────────────────────
+// ── §7 feature flag — DERIVED from JANUS_EXCHANGE_SPINE (flag collapse, 2026-07) ───────────────
 //
-// Exactly the src/exchanges/flag.ts idiom: a plain module-level env read (no config framework),
-// default "off", exported as a function so tests can pass an explicit env map.
+// This module no longer reads an env var of its own. Instruction-envelope mode used to be the
+// independent JANUS_INSTRUCTION_ENVELOPE off|shadow|primary flag; per src/exchanges/flag.ts's FLAG
+// LATTICE it is now DERIVED 1:1 from the exchange spine's own mode (off -> off, `record` -> the old
+// shadow-equivalent, `authoritative` -> the old primary-equivalent):
 //
-//   off (default) — no envelope structures are built; target resolution, drafts, and sends run
-//                    today's paths byte-identically.
-//   shadow        — envelopes are built and stored, the renderer's output is computed for fidelity
-//                    telemetry; deliveries still go out on today's raw distilled_instruction path.
-//   primary       — the rendered envelope IS the delivered instruction; the target-resolver
-//                    decision governs routing; the Workbench bridge (spec §5.2) is live.
+//   spine off (default)   — no envelope structures are built; target resolution, drafts, and sends
+//                            run today's paths byte-identically.
+//   spine "record"        — envelopes are built and stored, the renderer's output is computed for
+//                            fidelity telemetry; deliveries still go out on today's raw
+//                            distilled_instruction path.
+//   spine "authoritative" — the rendered envelope IS the delivered instruction; the target-resolver
+//                            decision governs routing; the Workbench bridge (spec §5.2) is live.
+//
+// `instructionEnvelopeActive`/`instructionEnvelopeIsPrimary` keep their pre-collapse NAMES and
+// zero-arg call shape (every real call site in this codebase calls them with no args) — only what
+// feeds them changed, from an independent cached constant to a copy of the spine's mode. That copy
+// is THIS module's own (`SPINE_MODE_AT_LOAD` below), frozen at ITS OWN first import — NOT
+// src/exchanges/flag.ts's `EXCHANGE_SPINE_MODE` (see this file's import comment for why importing
+// that constant directly is a real freeze-order hazard, not merely a style preference).
+const SPINE_MODE_AT_LOAD: ExchangeSpineMode = readExchangeSpineMode();
 
-export type InstructionEnvelopeMode = "off" | "shadow" | "primary";
+// LEGACY VAR (back-compat, never an error): an operator who still has JANUS_INSTRUCTION_ENVELOPE
+// set gets a one-line startup warning (via the shared, pure `legacyFlagRetirementWarning`,
+// src/exchanges/flagReader.ts) that the var is now ignored — never a crash, never a behavior
+// change from what JANUS_EXCHANGE_SPINE alone dictates.
+const legacyInstructionEnvelopeWarning = legacyFlagRetirementWarning(
+  "JANUS_INSTRUCTION_ENVELOPE",
+  "it has been subsumed into JANUS_EXCHANGE_SPINE — record/authoritative now imply the old shadow/primary instruction-envelope behavior automatically.",
+);
+if (legacyInstructionEnvelopeWarning) console.warn(legacyInstructionEnvelopeWarning);
 
-const INSTRUCTION_ENVELOPE_MODES: readonly InstructionEnvelopeMode[] = ["off", "shadow", "primary"];
-
-/** Shared reader (src/exchanges/flag.ts's `readEnumFlag`) — see that module's "FLAG LATTICE" doc
- *  comment for how this flag relates to `JANUS_EXCHANGE_SPINE`. */
-export function readInstructionEnvelopeMode(env: NodeJS.ProcessEnv = process.env): InstructionEnvelopeMode {
-  return readEnumFlag("JANUS_INSTRUCTION_ENVELOPE", INSTRUCTION_ENVELOPE_MODES, "off", env);
+export function instructionEnvelopeActive(mode: ExchangeSpineMode = SPINE_MODE_AT_LOAD): boolean {
+  return mode !== "off";
 }
 
-/** Cached at module load (the established env-flag idiom) — one process, one mode. */
-export const INSTRUCTION_ENVELOPE_MODE: InstructionEnvelopeMode = readInstructionEnvelopeMode();
-
-export function instructionEnvelopeActive(mode: InstructionEnvelopeMode = INSTRUCTION_ENVELOPE_MODE): boolean {
-  return mode === "shadow" || mode === "primary";
-}
-
-export function instructionEnvelopeIsPrimary(mode: InstructionEnvelopeMode = INSTRUCTION_ENVELOPE_MODE): boolean {
-  return mode === "primary";
+export function instructionEnvelopeIsPrimary(mode: ExchangeSpineMode = SPINE_MODE_AT_LOAD): boolean {
+  return mode === "authoritative";
 }

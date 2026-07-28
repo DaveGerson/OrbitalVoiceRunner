@@ -122,7 +122,7 @@ export function invalidateOutstandingApproval(
 
 /**
  * Shared instruction-envelope convergence bridge (spec docs/superpowers/specs/2026-07-09-
- * instruction-routing.md §5.2), JANUS_INSTRUCTION_ENVELOPE=primary only: a typed `draft_edit` (the
+ * instruction-routing.md §5.2), JANUS_EXCHANGE_SPINE=authoritative only: a typed `draft_edit` (the
  * WS frame, src/voice/index.ts, and its REST twin — the PUT /api/panes/:projectId/:paneId/draft
  * route, server.ts) ALSO revises the pane's OPEN envelope draft, if one exists, and marks
  * prose-override so the operator's hand-edited text is never clobbered by a subsequent re-render —

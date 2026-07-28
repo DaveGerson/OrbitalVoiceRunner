@@ -28,7 +28,7 @@ export interface DispatchMember {
   /**
    * AgentExchange spine correlation (step 1.4, docs/superpowers/specs/2026-07-09-agent-exchange-
    * spine.md §5). Set ONLY when this member's write was exchange-correlated at staging time (flag
-   * shadow/primary AND the approval store bound an exchange to the member's synthetic pendingId —
+   * record/authoritative AND the approval store bound an exchange to the member's synthetic pendingId —
    * src/actions/defs/dispatch_group.ts's recordDispatchOutcome). Undefined for legacy/flag-off
    * members, which keep the original pane-scoped (paneId-only) matching FOREVER — never adopted
    * retroactively. When set, `noteRunning`/`noteTransition` below only advance this member on the

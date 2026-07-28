@@ -752,8 +752,9 @@ export function ensureCore(): void {
     console.log(
       `[exchange-spine] boot recovery: kept=${exchangeRecovery.kept.length} interrupted=${exchangeRecovery.interrupted.length} reverted=${exchangeRecovery.reverted.length}`
     );
-    // Phase 4, Step 4.3: draft-registry rehydration (only present when JANUS_INSTRUCTION_ENVELOPE
-    // is active) — the count of open Workbench/voice drafts + outstanding-approval bindings this
+    // Phase 4, Step 4.3: draft-registry rehydration (only present when instruction-envelope mode is
+    // active — derived from JANUS_EXCHANGE_SPINE, post-2026-07-collapse) — the count of open
+    // Workbench/voice drafts + outstanding-approval bindings this
     // boot rebuilt from durable agent_exchanges rows, so a restart's effect on in-flight
     // communication is visible in the same boot log line boot recovery already uses.
     if (exchangeRecovery.draftRegistry) {
@@ -1237,10 +1238,10 @@ function paneRenderMaxChars(paneId: string): number {
  * mints one, mirroring src/voice/index.ts's `stampExchangeForDispatch` (the only other envelope-
  * draft exchange mint site) byte-for-byte in spirit: same createExchange call, same
  * instruction_envelope_json stamp from the pane's open draft when one exists. Best-effort; a
- * no-op (returns undefined) unless BOTH flags are active — `JANUS_EXCHANGE_SPINE` off means there
- * is no spine to correlate against, and `JANUS_INSTRUCTION_ENVELOPE` not primary means this route
- * is sending the LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before
- * this existed in that case).
+ * no-op (returns undefined) unless `JANUS_EXCHANGE_SPINE=authoritative` — off means there is no
+ * spine to correlate against, and record/off (not authoritative) means this route is sending the
+ * LEGACY raw ledger draft, not an envelope-draft delivery (byte-identical to before this existed
+ * in that case).
  */
 function stampExchangeForWorkbenchSend(projectId: string, paneId: string, text: string): string | undefined {
   if (!instructionEnvelopeIsPrimary()) return undefined;
@@ -1701,7 +1702,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     const draft = manager.ledger.getDraft(projectId, paneId) ?? { text: "", updatedAt: new Date().toISOString() };
     // Phase 3, Step 3.3 (instruction-routing spec §5): additive field only — a client that doesn't
     // know about `exchange` ignores it; the draft text/shape are byte-identical either way. Omitted
-    // to plain `null` unless the flag is shadow/primary, so the OFF-default path never changes.
+    // to plain `null` unless the flag is record/authoritative, so the OFF-default path never changes.
     const exchange = instructionEnvelopeActive() ? viewOpenDraft(projectId, paneId) : null;
     broadcast({ type: "draft_updated", projectId, paneId, draft, exchange });
   }

@@ -1412,14 +1412,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       // AgentExchange spine (task C): mint BEFORE the effect switch (spec §5) — a no-op when the
       // flag is off.
       const exchangeId = stampExchangeForDispatch(targetId, instruction, opts.trigger);
-      // neg1: live correlation — append THIS exchange's own id (prose, request mode only) to the
-      // completion-request line so a live agent can echo it back in a result envelope. A no-op
-      // (byte-identical `instruction`) unless JANUS_AGENT_RESULT_ENVELOPE=request and the mint
-      // above actually produced an id. The exchange's persisted `distilled_instruction` stays the
-      // pre-augment `instruction` (already minted inside stampExchangeForDispatch) — this token is
-      // per-delivery framing, not durable operator content.
-      // neg1 (adversarial-review fix): cap the delivered text so the request-mode correlation hint
-      // can never push a rendered instruction past the pane's size ceiling (spec §6.2).
+      // neg1: live correlation — append THIS exchange's own id (prose, completion-prompt only) to
+      // the completion-request line so a live agent can echo it back in a result envelope. A no-op
+      // (byte-identical `instruction`) unless JANUS_AGENT_COMPLETION_PROMPT=on (and the spine is
+      // on) and the mint above actually produced an id. The exchange's persisted
+      // `distilled_instruction` stays the pre-augment `instruction` (already minted inside
+      // stampExchangeForDispatch) — this token is per-delivery framing, not durable operator content.
+      // neg1 (adversarial-review fix): cap the delivered text so the completion-prompt correlation
+      // hint can never push a rendered instruction past the pane's size ceiling (spec §6.2).
       const deliveredMaxChars = (RENDER_PROFILES[normalizePreset(term?.toolPreset)] ?? RENDER_PROFILES.Custom).maxChars;
       const deliveredInstruction = withExchangeCorrelationHint(instruction, exchangeId, undefined, deliveredMaxChars);
 

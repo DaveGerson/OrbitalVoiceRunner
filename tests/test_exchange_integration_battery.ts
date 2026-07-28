@@ -528,7 +528,7 @@ describe("scenario 8: repeated terminal edge", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// 9. Uncorrelated legacy command — flag off / shadow-but-uncorrelated.
+// 9. Uncorrelated legacy command — flag off / record-but-uncorrelated.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 describe("scenario 9: uncorrelated legacy command", () => {
   it("flag=off end-to-end journey writes NO exchange rows; the pending-approval row and dispatch member stay uncorrelated (exchange_id NULL everywhere)", () => {
@@ -563,22 +563,24 @@ describe("scenario 9: uncorrelated legacy command", () => {
     store.close();
   });
 
-  it("flag=shadow: a non-exchange action path leaves agent_exchanges/exchange_events completely untouched and stays uncorrelated", () => {
+  it("flag=record: a non-exchange action path leaves agent_exchanges/exchange_events completely untouched and stays uncorrelated", () => {
     // EXCHANGE_SPINE_MODE (src/exchanges/flag.ts) is a MODULE-LOAD-TIME constant read once from
     // process.env, so this test process's `exchangeSpineActive()` view is permanently frozen to
-    // "off" (pinned above) — it cannot be flipped to "shadow" mid-process to exercise the real
-    // singleton. To exercise the "shadow" leg of this scenario we use the flag module's own
+    // "off" (pinned above) — it cannot be flipped to "record" mid-process to exercise the real
+    // singleton. To exercise the "record" leg of this scenario we use the flag module's own
     // PARAMETERIZED (non-frozen) functions instead — `readExchangeSpineMode`/`exchangeSpineWrites`
     // — the exact seam its module doc says exists "so tests can pass an explicit env map without
     // mutating process.env". A directly-constructed `ExchangeService` stands in for what
-    // `getExchangeService()` would return if the singleton really were in shadow mode (constructing
+    // `getExchangeService()` would return if the singleton really were in record mode (constructing
     // one directly is the identical class production uses; it just isn't the frozen singleton).
-    const shadowMode = readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "shadow" });
-    assert.equal(shadowMode, "shadow");
-    assert.equal(exchangeSpineWrites(shadowMode), true, "shadow mode DOES write exchange rows for exchange-aware actions");
+    // (This also proves the BACK-COMPAT alias: the pre-collapse "shadow" spelling still resolves
+    // to "record" — see tests/test_exchange_flag.ts for the dedicated alias coverage.)
+    const recordMode = readExchangeSpineMode({ JANUS_EXCHANGE_SPINE: "shadow" });
+    assert.equal(recordMode, "record", "back-compat: the legacy 'shadow' spelling aliases to 'record'");
+    assert.equal(exchangeSpineWrites(recordMode), true, "record mode DOES write exchange rows for exchange-aware actions");
 
     const store = freshStore();
-    const svcForShadow = new ExchangeService(); // stands in for a hypothetically shadow-mode singleton
+    const svcForShadow = new ExchangeService(); // stands in for a hypothetically record-mode singleton
 
     // The scenario: a NON-exchange action — the raw WS input path (spec §5's correlation table:
     // "server.ts:1043 ... the raw WS input path... never [stamps exchange_id]") or any legacy
@@ -594,8 +596,8 @@ describe("scenario 9: uncorrelated legacy command", () => {
     assert.equal(store.listExchangesByState("draft").length, 0);
     assert.equal(store.listExchangesByState("awaiting_approval").length, 0);
     const [row] = store.getExpiredApprovals(Number.MAX_SAFE_INTEGER);
-    assert.equal(row.exchange_id, null, "the raw/legacy action's pending-approval row stays uncorrelated even in shadow mode");
-    assert.equal(svcForShadow.commandLog("pane-1").length, 0, "the shadow-capable ExchangeService was never invoked for this action — it has no record of it either");
+    assert.equal(row.exchange_id, null, "the raw/legacy action's pending-approval row stays uncorrelated even in record mode");
+    assert.equal(svcForShadow.commandLog("pane-1").length, 0, "the record-capable ExchangeService was never invoked for this action — it has no record of it either");
 
     store.close();
   });

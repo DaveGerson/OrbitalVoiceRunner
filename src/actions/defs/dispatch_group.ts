@@ -99,7 +99,7 @@ function resolveDispatchText(
 /**
  * The exchange bound to this member's synthetic pendingId, if any (AgentExchange spine, step 1.4,
  * spec §5). `ctx.dispatchProposal` (the injected pane-write choke-point) mints + binds the
- * exchange internally when JANUS_EXCHANGE_SPINE is shadow/primary — this reads that binding back
+ * exchange internally when JANUS_EXCHANGE_SPINE is record/authoritative — this reads that binding back
  * via the SAME pending-approval record the write staged, so the join tracker can attach it to the
  * matching member (recordOutcomeAt). Best-effort: `ctx.pendingApprovals` is optional on hand-built
  * test contexts, and the flag-off / defensive 'executed' path never bound anything — both degrade

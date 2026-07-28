@@ -225,7 +225,7 @@ export interface OrbitalData {
   archived: ArchivedPane[];
   /** 2K.3: latest server-pushed draft per pane (draft_updated frames), for the Order Pad mirror.
    *  Phase 3, Step 3.3 (additive): `exchange` carries the pane's open instruction-envelope draft
-   *  when JANUS_INSTRUCTION_ENVELOPE is shadow/primary and one exists; null/absent otherwise. */
+   *  when JANUS_EXCHANGE_SPINE is record/authoritative and one exists; null/absent otherwise. */
   paneDrafts: Record<string, { text: string; at: number; exchange?: ExchangeDraftView | null }>;
   /** 4U.2: latest server-pushed history per pane (history_updated frames; entries null = refetch). */
   paneHistories: Record<string, { entries: PaneHistoryEntry[] | null; at: number }>;

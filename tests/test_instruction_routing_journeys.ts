@@ -70,16 +70,25 @@ import { teardownServerSuite } from "./helpers/teardown";
 import type { RunningServer } from "../server";
 import type { RenderPreset } from "../src/exchanges/instructionEnvelope";
 
-// JANUS_INSTRUCTION_ENVELOPE must be set BEFORE the FIRST import (anywhere in this process) of
-// anything that touches src/exchanges/instructionEnvelope.ts — its INSTRUCTION_ENVELOPE_MODE
-// constant is frozen at module load (mirrors tests/test_exchange_recovery.ts's documented
-// JANUS_EXCHANGE_SPINE pattern). Because ES module `import` statements are hoisted above ALL
-// other top-level code (regardless of source order), the only static imports above are
-// type-only (erased at compile time, no runtime module load) — everything that touches the
-// REAL module (including the "pure" journey-11 helpers below, which run in the SAME process as
-// the server-backed journeys and must see the same cached mode) is loaded dynamically, via
-// top-level await, AFTER this assignment.
-process.env.JANUS_INSTRUCTION_ENVELOPE = "primary";
+// JANUS_EXCHANGE_SPINE must be set BEFORE the FIRST import (anywhere in this process) of anything
+// that touches src/exchanges/instructionEnvelope.ts / src/exchanges/flag.ts — the mode each of
+// those caches at module load is frozen at that point (mirrors tests/test_exchange_recovery.ts's
+// documented pattern). Because ES module `import` statements are hoisted above ALL other top-level
+// code (regardless of source order), the only static imports above are type-only (erased at
+// compile time, no runtime module load) — everything that touches the REAL module (including the
+// "pure" journey-11 helpers below, which run in the SAME process as the server-backed journeys and
+// must see the same cached mode) is loaded dynamically, via top-level await, AFTER this assignment.
+//
+// FLAG COLLAPSE (2026-07): this suite used to set JANUS_INSTRUCTION_ENVELOPE=primary alone (spine
+// left at its "off" default) — under the pre-collapse design, "envelope primary" was reachable
+// with the spine off (a decoupled combination the old FLAG LATTICE explicitly allowed for the
+// envelope layer's OWN target-resolution/draft/routing behavior, distinct from spine bookkeeping).
+// Post-collapse, instruction-envelope mode is derived 1:1 from the spine's own mode, so that
+// specific decoupled combination no longer exists: reaching "primary"-equivalent behavior now
+// requires JANUS_EXCHANGE_SPINE="authoritative" directly, which ALSO turns on real spine
+// bookkeeping (agent_exchanges/exchange_events writes) for this process — verified via a full run
+// of this suite that every journey below still passes with that bookkeeping now genuinely active.
+process.env.JANUS_EXCHANGE_SPINE = "authoritative";
 
 const {
   buildEnvelope,
@@ -300,7 +309,7 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
   before(async () => {
     process.env.NODE_ENV = "test";
     process.env.JANUS_NO_AUTOSTART = "1";
-    // JANUS_INSTRUCTION_ENVELOPE was already set (module top-level, before any dynamic import of
+    // JANUS_EXCHANGE_SPINE was already set (module top-level, before any dynamic import of
     // ../server) — see the file-header note.
 
     prevCwd = process.cwd();

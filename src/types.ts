@@ -279,7 +279,7 @@ export interface PaneDraft {
 // WS frame and the GET /api/panes/:projectId/:paneId/draft response — src/exchanges/draftRegistry.ts's
 // `viewOpenDraft` is the server-side serializer this shape mirrors structurally (kept as an
 // independent declaration so the client bundle never imports the zod-backed exchanges module).
-// `null`/absent whenever JANUS_INSTRUCTION_ENVELOPE is "off" (default) or the pane has no open
+// `null`/absent whenever JANUS_EXCHANGE_SPINE is "off" (default) or the pane has no open
 // draft — every existing PaneDraft-only surface is unaffected either way.
 export type ExchangeReadiness =
   | { ready: true }
