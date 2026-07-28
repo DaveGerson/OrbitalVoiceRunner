@@ -27,6 +27,12 @@
 // every manager test uses a JanusStore(":memory:") ledger, so no PTY, no API key, no disk settings.
 // Tests that touch the settings file isolate cwd to a tmp dir first (loadSettings reads from cwd).
 
+// bead eoef: pin the settings file into a tmpdir for this whole file — constructing an
+// OrchestratorManager (directly or via startServer) without this writes a cwd-relative
+// .janus_settings.json into the repo root, which the run-unit cleanliness gate fails on.
+import { pinSettingsPathToTmpdir } from "./helpers/settingsPath";
+pinSettingsPathToTmpdir();
+
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
 import fs from "fs";
