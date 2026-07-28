@@ -60,11 +60,15 @@ describe("resultEnvelope: flag semantics (post-collapse)", () => {
     assert.ok(resultEnvelopeActive("authoritative"));
   });
 
-  it("readAgentCompletionPromptMode: defaults to off when unset/unrecognized, 'on' recognized case-insensitively", () => {
-    assert.equal(readAgentCompletionPromptMode({}), "off");
-    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "bogus" }), "off");
+  it("readAgentCompletionPromptMode: defaults to on when unset/unrecognized (graduated 2026-07-28); explicit 'off' escape hatch recognized case-insensitively", () => {
+    assert.equal(readAgentCompletionPromptMode({}), "on");
+    // Unrecognized input lands on the default (standard readEnumFlag behavior, same convention as
+    // the spine's graduation): a typo costs one benign prose hint line, never a behavior gate —
+    // and the recognized "off" escape hatch below is unaffected.
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "bogus" }), "on");
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "off" }), "off");
+    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "OFF" }), "off");
     assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "on" }), "on");
-    assert.equal(readAgentCompletionPromptMode({ JANUS_AGENT_COMPLETION_PROMPT: "ON" }), "on");
   });
 
   it("module default AGENT_COMPLETION_PROMPT_MODE is one of the two valid modes (no env var set in this test run's expectation)", () => {

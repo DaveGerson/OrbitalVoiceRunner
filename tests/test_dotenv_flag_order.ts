@@ -14,8 +14,11 @@
 // a temp .mjs file run via `npx tsx <path>` (inline `-e` scripts die on POSIX /bin/sh — see
 // tests/test_mocklive_loader.ts).
 //
-// THE TWO PROBED FLAGS cover both directions of the failure:
-//   - JANUS_AGENT_COMPLETION_PROMPT=on  (.env turns a default-off flag ON)
+// THE TWO PROBED FLAGS both engage a non-default ESCAPE HATCH (each probe value MUST stay
+// non-default or the test degrades into a default-detector that passes even when dotenv ordering
+// is broken — re-pick the value on any future default graduation):
+//   - JANUS_AGENT_COMPLETION_PROMPT=off (default `on` since the 2026-07-28 graduation — an
+//     operator opting the hint OFF via .env must not silently keep receiving it)
 //   - JANUS_EXCHANGE_SPINE=off          (.env engages the default-record ESCAPE HATCH — the
 //     safety-relevant direction: an operator disabling the subsystem via .env must not silently
 //     keep it running)
@@ -43,7 +46,7 @@ test("flags set only in a cwd .env are honored by the module-load flag readers (
   try {
     fs.writeFileSync(
       path.join(tmpDir, ".env"),
-      "JANUS_AGENT_COMPLETION_PROMPT=on\nJANUS_EXCHANGE_SPINE=off\n",
+      "JANUS_AGENT_COMPLETION_PROMPT=off\nJANUS_EXCHANGE_SPINE=off\n",
       "utf8",
     );
     // Value-import server.ts FIRST (evaluating its whole import graph, freezing every flag
@@ -85,8 +88,8 @@ test("flags set only in a cwd .env are honored by the module-load flag readers (
     const flags = JSON.parse(line.slice("FLAGS ".length));
     assert.equal(
       flags.completionPrompt,
-      "on",
-      ".env-only JANUS_AGENT_COMPLETION_PROMPT=on must be read as 'on', not the cached default",
+      "off",
+      ".env-only JANUS_AGENT_COMPLETION_PROMPT=off (the escape hatch) must be read as 'off', not the cached default",
     );
     assert.equal(
       flags.spine,

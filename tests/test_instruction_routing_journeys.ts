@@ -89,6 +89,13 @@ import type { RenderPreset } from "../src/exchanges/instructionEnvelope";
 // bookkeeping (agent_exchanges/exchange_events writes) for this process — verified via a full run
 // of this suite that every journey below still passes with that bookkeeping now genuinely active.
 process.env.JANUS_EXCHANGE_SPINE = "authoritative";
+// Pin the completion prompt too (default-on since the 2026-07-28 graduation): journey 1 asserts
+// the delivered text carries exactly one correlation hint, which reads the ambient flag at module
+// freeze — an inherited shell export of the documented `off` escape hatch (or a stray cwd .env,
+// which server.ts loads before the freeze) must not turn that journey into a red herring. The
+// default-graduation itself is pinned environment-proof in tests/test_agent_result_envelope.ts
+// via readAgentCompletionPromptMode({}).
+process.env.JANUS_AGENT_COMPLETION_PROMPT = "on";
 
 const {
   buildEnvelope,
@@ -360,7 +367,7 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
 
   // ═════════════════════════════════════════════════════════════════════════════════════════════
   describe("journey 1: exact target binds silently; draft created; send delivers byte-exact rendered text", () => {
-    it("focus_pane(exact name) binds silently, draft_instruction composes on it, send_instruction writes the EXACT renderEnvelope() output to the pane", async () => {
+    it("focus_pane(exact name) binds silently, draft_instruction composes on it, send_instruction writes the EXACT renderEnvelope() output plus exactly one correlation hint (default-on completion prompt) to the pane", async () => {
       resetDraftRegistryForTests();
       clearPanes();
       const PJ = "ir_proj_j1";
@@ -386,7 +393,14 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const term = running.manager.terminals["codex-run-1"] as unknown as StubTerminal;
       assert.strictEqual(term.writeInputCount, 1);
       const expected = renderEnvelope(buildEnvelope({ objective: "run the tests" }), RENDER_PROFILES.Codex);
-      assert.strictEqual(term.lastCommand, expected, "byte-exact rendered instruction at the pane-write seam");
+      // JANUS_AGENT_COMPLETION_PROMPT graduated to default-on (2026-07-28): the voice dispatch
+      // lane (spine on — this suite pins `authoritative`) mints an exchange and appends its id as
+      // the ONE prose correlation hint. Pin the whole delivered string: byte-exact rendered envelope, then
+      // exactly one hint, then nothing — pre-graduation this asserted `expected` alone, which
+      // made it a default-detector for the old default rather than a pin of the shipped journey.
+      const m = term.lastCommand.match(/^([\s\S]*) \(this exchange id: (exch_[A-Za-z0-9_]+)\)$/);
+      assert.ok(m, `delivered text must be renderEnvelope() output + one correlation hint, got: ${term.lastCommand}`);
+      assert.strictEqual(m[1], expected, "byte-exact rendered instruction at the pane-write seam (hint is the ONLY augment)");
     });
   });
 
