@@ -69,14 +69,31 @@ const LEGACY_EXCHANGE_SPINE_ALIASES: ReadonlyMap<string, ExchangeSpineMode> = ne
 ] as const);
 
 /**
- * Default mode when the env var is unset/empty/unrecognized: **off** (src/exchanges/flag.ts's own
- * doc comment carries the full spec-vs-brief discrepancy rationale for this default).
+ * Default mode when the env var is unset/empty/unrecognized: **`record`** (graduated from `off`
+ * 2026-07; bead wsm-e2e-pinned-d71d).
+ *
+ * WHY `record` AND NOT `authoritative`: `record` writes the exchange ledger and runs the target
+ * resolver in DRY RUN — it logs what it *would* have routed without steering delivery, and no
+ * existing code path reads exchange state to make a decision. So it is behavior-neutral by
+ * construction while populating `wrongTargetDeliveries` (the resolver tripwire in
+ * `GET /api/exchange-metrics`, where non-zero means a resolver bug). That measurement is the
+ * evidence gate for promoting to `authoritative`, which is where the ledger starts *governing*
+ * dispatch. Shipping `record` by default is what generates the data; shipping `authoritative`
+ * by default would be assuming the answer.
+ *
+ * ESCAPE HATCH: `JANUS_EXCHANGE_SPINE=off` still fully disables the subsystem, and the durable
+ * tables are inert under `off`.
+ *
+ * UNRECOGNIZED INPUT lands on this default (standard `readEnumFlag` behavior). That is safe here
+ * precisely because the default is the observe-only rung: a typo can cost you bookkeeping you
+ * didn't ask for, never a behavior change, and never `authoritative` — pinned in
+ * tests/test_exchange_flag.ts.
  */
 export function readExchangeSpineMode(env: NodeJS.ProcessEnv = process.env): ExchangeSpineMode {
   const raw = (env.JANUS_EXCHANGE_SPINE ?? "").trim().toLowerCase();
   const aliased = LEGACY_EXCHANGE_SPINE_ALIASES.get(raw);
   if (aliased) return aliased;
-  return readEnumFlag("JANUS_EXCHANGE_SPINE", EXCHANGE_SPINE_MODES, "off", env);
+  return readEnumFlag("JANUS_EXCHANGE_SPINE", EXCHANGE_SPINE_MODES, "record", env);
 }
 
 /**
