@@ -149,13 +149,23 @@ function maxVersion(rows: ContextDelivery[]): number {
   return rows.reduce((m, r) => Math.max(m, Number(r.context_version)), 0);
 }
 
+/** WS2 (wsm-e2e-pinned-fikj.8): the memory-brief send is a passive injection, so it now carries a
+ *  ONE-LINE "BACKGROUND — ..." preamble (src/voice/index.ts applyBackgroundFraming; shape pinned by
+ *  tests/test_answer_first_ordering.ts). It is transport framing, not brief content — unwrap it so
+ *  the "CONTEXT (situational...)" shape filters below keep matching the same payload they always did. */
+function unwrapBackgroundFraming(text: string): string {
+  return text.replace(/^BACKGROUND\b[^\n]*\n/, "");
+}
+
 /** The rendered "CONTEXT (situational...)" payload texts pushed to Gemini, in order, from a given
- *  index onward in the mock session's own `clientContents` log. */
+ *  index onward in the mock session's own `clientContents` log (BACKGROUND framing unwrapped). */
 function contextTextsSince(session: MockLiveSession, fromIdx: number): string[] {
   return session.clientContents
     .slice(fromIdx)
-    .filter((c: any) => c?.turns?.[0]?.parts?.[0]?.text?.startsWith("CONTEXT (situational, do not read aloud):"))
-    .map((c: any) => String(c.turns[0].parts[0].text));
+    .map((c: any) => c?.turns?.[0]?.parts?.[0]?.text)
+    .filter((t: unknown): t is string => typeof t === "string")
+    .map(unwrapBackgroundFraming)
+    .filter((t) => t.startsWith("CONTEXT (situational, do not read aloud):"));
 }
 
 /** Like execProbe, but with a short built-in delay so the command is still RUNNING at the moment
@@ -457,12 +467,11 @@ describe("cortex cutover journey — brief redaction-clean under cortex composit
     assert.strictEqual(row.source, "cortex-primary", "the cortex composed this brief (the adversarial case)");
 
     // The ACTUAL payload sent to Gemini (sess.sendClientContent) — not a re-derivation — is clean.
+    // (contextTextsSince unwraps the WS2 BACKGROUND framing before matching the CONTEXT shape.)
     const session = live1(running) as MockLiveSession;
-    const contextPushes = session.clientContents.filter((c: any) =>
-      c?.turns?.[0]?.parts?.[0]?.text?.startsWith("CONTEXT (situational, do not read aloud):")
-    );
+    const contextPushes = contextTextsSince(session, 0);
     assert.ok(contextPushes.length >= 1, "at least one CONTEXT payload was sent");
-    const sentText = String(contextPushes[contextPushes.length - 1].turns[0].parts[0].text);
+    const sentText = contextPushes[contextPushes.length - 1];
     assert.ok(!sentText.includes(SECRET), "the raw secret never reached the wire");
     assert.ok(sentText.includes("[REDACTED:aws-key]"), "the redaction token is present instead");
   });

@@ -375,11 +375,15 @@ export function createGating(deps: GatingDeps): Gating {
   }
 
   // 4D.1 production writer: the announcement bus already sees every genuine pane lifecycle edge
-  // (completion / error / build-failed / exited), session or no session — record those edges as
-  // durable `status_transition` events so the away digest can replay them. Registered defensively
-  // (test fakes inject `{ enqueue, stop }` stubs without onEnqueue). Summaries are NOT persisted
-  // here — only the kind — so nothing un-redacted can leak into the events table from this path.
-  const AWAY_RECORDED_KINDS = new Set(["completion", "error", "build-failed", "exited"]);
+  // (completion / completion_failed / error / build-failed / exited), session or no session —
+  // record those edges as durable `status_transition` events so the away digest can replay them.
+  // Registered defensively (test fakes inject `{ enqueue, stop }` stubs without onEnqueue).
+  // Summaries are NOT persisted here — only the kind — so nothing un-redacted can leak into the
+  // events table from this path. WS1: "completion_failed" (the outcome-keyed failed-run edge) is
+  // recorded too — before the kind split, that edge arrived as plain "completion"; omitting it
+  // here would silently drop failed runs from the away digest (forbidden: told-more beats
+  // silently-missed).
+  const AWAY_RECORDED_KINDS = new Set(["completion", "completion_failed", "error", "build-failed", "exited"]);
   if (store && typeof (announcementBus as any).onEnqueue === "function") {
     announcementBus.onEnqueue((item) => {
       if (!AWAY_RECORDED_KINDS.has(item.kind)) return;
@@ -424,10 +428,13 @@ export function createGating(deps: GatingDeps): Gating {
   }
 
   // 4D.1: a "status_transition" row -> errors|exits|finished by its transition text (verbatim).
+  // WS1: "completion_failed" must land in the ERRORS bucket, and its test must run BEFORE the
+  // finished-bucket regex (whose /completion/ would otherwise swallow it) — a run that failed while
+  // the operator was away must never be replayed as a plain "finished".
   function classifyStatusTransition(b: AwayBuckets, e: ReturnType<JanusStore["getEvents"]>[number]): void {
     const t = String((e.payload as { transition?: unknown } | null)?.transition ?? e.summary ?? "");
     const pane = e.pane_id ?? "a pane";
-    if (/error|build-failed/i.test(t)) b.errors.add(pane);
+    if (/error|build-failed|completion_failed/i.test(t)) b.errors.add(pane);
     else if (/exit/i.test(t)) b.exits.add(pane);
     else if (/completion|finished|idle/i.test(t)) b.finished.add(pane);
   }

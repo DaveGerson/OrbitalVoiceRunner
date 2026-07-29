@@ -49,6 +49,11 @@ describe("switch_context — emits context_switched (BUG-012)", () => {
       },
       effectiveCapabilityGateFor: () => "Auto",
       injectMemoryBrief: () => {},
+      // WS3 (voice-followups-tdd): switch_context now consults the focused-pane seam to detect a
+      // stale focus (src/actions/defs/orient.ts resolveSwitchContextHonesty). This fixture has no
+      // focused pane to begin with, so `null` keeps this suite's assertions (which predate WS3 and
+      // don't exercise the honesty branch) unaffected.
+      getActivePaneId: () => null,
     } as unknown as ActionContext;
   }
 

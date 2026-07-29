@@ -258,4 +258,32 @@ describe("4D.1 — 'While you were away' digest on reconnect", () => {
     assert.match(away!, /pane_dead/);
     assert.match(away!, /exited/i);
   });
+
+  // WS1 regression (adversarial-review fix): before the outcome-keyed kind split, a failed run's
+  // idle edge arrived here as plain "completion" and WAS recorded. The new "completion_failed"
+  // kind must not fall out of the away record (silent drop — forbidden), and it must replay in the
+  // ERRORS bucket, never as a plain "finished" (the finished-bucket /completion/ regex would
+  // otherwise swallow it).
+  it("WS1: a completion_failed edge is recorded while away and replays as an error, not a plain finish", () => {
+    const store = mkStore();
+    const bus = mkBus();
+    const narrations: string[] = [];
+    const gating = createGating(makeDeps(store, narrations, bus));
+
+    gating.noteSessionDetached(Date.now() - 5_000);
+    bus.enqueue({ kind: "completion_failed", terminalId: "pane_ff", summary: "3 failing" });
+
+    const rows = store.getEvents({ type: "status_transition" });
+    assert.ok(
+      rows.some((r) => r.pane_id === "pane_ff" && r.payload?.transition === "completion_failed"),
+      "the completion_failed lifecycle edge must be durably recorded (told-more beats silently-missed)",
+    );
+
+    gating.reannounceSurvivors({ sendClientContent: () => {} });
+    const away = narrations.find((t) => /while you were away/i.test(t));
+    assert.ok(away, "a failed run while away must surface in the reconnect digest");
+    assert.match(away!, /pane_ff/, "names the failed pane");
+    assert.match(away!, /error/i, "replayed in the errors bucket");
+    assert.ok(!/pane_ff finished/i.test(away!), "must NOT be replayed as a plain 'finished'");
+  });
 });

@@ -170,12 +170,24 @@ function seedHistory(paneId: string, command: string, output: string, finalRespo
   ]);
 }
 
-/** The text of every `sendClientContent` push since index `fromIdx`, in order. */
+/** WS2 (wsm-e2e-pinned-fikj.8): passive injections (pane-signal sends, memory briefs) are prefixed
+ *  with a ONE-LINE "BACKGROUND — ..." preamble by src/voice/index.ts applyBackgroundFraming (its
+ *  shape is pinned by tests/test_answer_first_ordering.ts). The preamble is transport FRAMING, not
+ *  narration content — unwrap exactly one leading preamble line so every shape/count/leak assertion
+ *  below (enriched narrations AND the plain "PANE STATUS UPDATE" positive/negative checks) keeps
+ *  reading the same body text it always did, instead of going vacuously green/red on the prefix. */
+function unwrapBackgroundFraming(text: string): string {
+  return text.replace(/^BACKGROUND\b[^\n]*\n/, "");
+}
+
+/** The text of every `sendClientContent` push since index `fromIdx`, in order (BACKGROUND framing
+ *  unwrapped — see unwrapBackgroundFraming). */
 function clientTextsSince(session: MockLiveSession, fromIdx: number): string[] {
   return session.clientContents
     .slice(fromIdx)
     .map((c: any) => c?.turns?.[0]?.parts?.[0]?.text)
-    .filter((t: unknown): t is string => typeof t === "string");
+    .filter((t: unknown): t is string => typeof t === "string")
+    .map(unwrapBackgroundFraming);
 }
 
 /** True for an EXCHANGE-AWARE enriched narration line (src/voice/sitrep.ts terseExchangeOutcomeLine

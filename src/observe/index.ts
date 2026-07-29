@@ -427,6 +427,9 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
       const done = g.members.filter((m) => m.status === "done").length;
       const failed = g.members.filter((m) => m.status === "error" || m.status === "blocked").length;
       const summary = `Dispatch '${g.name}' complete: ${done}/${total} done${failed > 0 ? `, ${failed} failed` : ""}`;
+      // WS1: a group with ANY failed member must never ring the plain success chime — it
+      // outranks approval kinds but stays below the process-level error/build-failed/exited kinds.
+      const kind = failed > 0 ? "completion_failed" : "completion";
       // BUG-013 residual (W5): route through the pushAttention seam (in-memory append + BUG-035
       // prune + durable write-through) instead of the raw array push + redundant pruneAttention().
       manager.pushAttention({
@@ -441,7 +444,7 @@ export function attachObserve(manager: OrchestratorManager, deps: ObserveDeps): 
       });
       broadcast({ type: "attention_updated", queue: manager.attentionQueue });
       broadcast({ type: "dispatch_updated", dispatches: dispatchJoinTracker.list() });
-      announcementBus.enqueue({ kind: "completion", terminalId, summary });
+      announcementBus.enqueue({ kind, terminalId, summary });
     }
   }
 
@@ -595,6 +598,38 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   }
 
+  /**
+   * WS1 — the outcome-keyed completion kind for the genuine Running->Idle announcement. Reads the
+   * pane's SETTLED exchange state via the SAME `paneActive` binding `settleTerminalOutcome` just
+   * fed (it is a delivery-marker binding, not cleared on settle — the id is still resolvable after
+   * the exchange lands in a terminal state), never the idle-time output/summary text. No
+   * correlated exchange at all (spine off, or this pane was never delivered one) or an
+   * outcome that is still unknown/clean keeps the plain "completion" kind — a failure is ONLY ever
+   * announced when the exchange machine itself recorded `agent_failed`, and the announcement
+   * itself is never suppressed either way (design through-line: told-more beats silently-missed).
+   *
+   * STALENESS GUARD: because `paneActive` keeps pointing at a settled exchange until the next
+   * delivery supersedes it, a parked `agent_failed` would otherwise relabel every LATER, unrelated
+   * run on the same pane (e.g. a manual command that completed cleanly) as a failure, forever.
+   * Failure is attributable to THIS idle edge only when the pane's last command was the active
+   * exchange's own delivery — the same `lastCommandBelongsToActiveExchange` correlation signal the
+   * legacy settle heuristic in settleTerminalOutcome already trusts (neg1). Ambiguity (a manual
+   * command interleaved mid-run) deliberately fails toward plain "completion", never toward a
+   * speculative failure.
+   */
+  function completionKindFor(terminalId: string): "completion" | "completion_failed" {
+    const activeId = activeExchangeForPane(terminalId);
+    if (!activeId) return "completion";
+    try {
+      const svc = getExchangeService();
+      if (!svc.lastCommandBelongsToActiveExchange(terminalId)) return "completion";
+      return svc.get(activeId)?.state === "agent_failed" ? "completion_failed" : "completion";
+    } catch (e) {
+      console.error(`[exchange-spine] completionKindFor failed for ${terminalId}:`, e);
+      return "completion";
+    }
+  }
+
   const onIdle = async (terminalId: string): Promise<void> => {
     // AgentExchange spine (step 1.4): the genuine Running→Idle completion edge also settles the
     // pane's active exchange (delivered/running/needs_input -> terminal_idle). Best-effort/no-op
@@ -627,7 +662,7 @@ ${redact(rawOutput.slice(-3000))}`;
     // idle inference. Fires regardless of whether there was substantive output / an existing
     // finalResponse, with the redacted summary above as the message. The bus owns the
     // per-pane debounce / coalescing / rate limit, so a trivial completion is still safe.
-    announcementBus.enqueue({ kind: "completion", terminalId, summary: summaryText });
+    announcementBus.enqueue({ kind: completionKindFor(terminalId), terminalId, summary: summaryText });
     paneSignalBus.publish({ paneId: terminalId, kind: "idle", detail: summaryText.slice(0, 160) });
     // P0a memory: drop a redacted one-liner breadcrumb on the genuine Running->Idle "finished" edge.
     if (onBreadcrumb) {

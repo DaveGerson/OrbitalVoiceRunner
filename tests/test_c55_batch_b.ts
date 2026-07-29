@@ -193,6 +193,11 @@ function makeCtx(opts?: {
       // method (src/terminal.ts); stub as a no-op so the def-level contract test exercises the path.
       refreshLedger: (): void => {},
     },
+    // WS3 (voice-followups-tdd): switch_context now consults the focused-pane seam to detect a
+    // stale focus (src/actions/defs/orient.ts resolveSwitchContextHonesty). None of this file's
+    // scenarios seed a focused pane, so `null` keeps every existing assertion (byte-compatible
+    // briefing) unaffected.
+    getActivePaneId: () => null,
   } as unknown as ActionContext;
   // switch_context calls ctx.manager.saveSettings(); rename/switch call ctx.broadcastLedgerUpdate();
   // the manager.saveSettings closure above shares the same probe counter as ctx.saveSettings.

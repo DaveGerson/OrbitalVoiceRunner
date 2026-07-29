@@ -21,6 +21,7 @@
 import { z } from "zod";
 import type { ActionDef, ActionContext, ActionResult } from "../types";
 import { isBadProjectDir, resolveProjectDir } from "../../projectDir";
+import { findPaneOwningProject } from "../../paneOwnership";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // rename_project — FAITHFUL PORT of server.ts:2750-2755 (UNGATED).
@@ -121,10 +122,73 @@ export const renamePane: ActionDef<typeof RenamePaneParams> = {
 // unknown id (ASYMMETRY HAZARD — preserved exactly, do NOT "fix"). getProjectBriefing
 // returns null for an unknown id, so the inline { error: "Project not found" } fallback
 // is the OK output payload (still kind:"ok" on the wire — NOT an ActionResult error).
+//
+// WS3 (director decision: Option C + breadcrumbs — honesty over auto-targeting; Option B,
+// silently retargeting coreState.activePaneId, is REJECTED for v1). switch_context alone never
+// moves the operator's focused pane (only switch_active_pane does) — so a voice "that pane"
+// issued right after a project switch can silently resolve against a pane owned by the OLD
+// project. Rather than guess, the response tells the truth: see resolveSwitchContextHonesty below.
 // ─────────────────────────────────────────────────────────────────────────────
 const SwitchContextParams = z.object({
   project_id: z.string(),
 });
+
+/**
+ * WS3 honesty math, pure + exported so it's unit-testable on its own and keeps the handler's
+ * cyclomatic count low. Decides whether the pane the operator was focused on BEFORE this
+ * switch_context call is now "orphaned" — owned by a project other than the one just switched
+ * to — and if so, assembles the re-orientation breadcrumb (which project we switched FROM, and
+ * that the stale pane belongs to it). Ownership is resolved via `findPaneOwningProject`, the SAME
+ * predicate `resolveBriefPane` (src/voice/index.ts) already uses — not a reimplementation.
+ *
+ * No orphan is ever reported when: there was no focused pane to begin with; the target project
+ * doesn't exist (the switch itself failed — nothing to be honest ABOUT, and the ledger no-oped
+ * so the old focus was never actually invalidated); or the focused pane's owner IS the new
+ * project (the normal, non-stale case).
+ *
+ * An UNRESOLVABLE owner (a ghost focus: the pane closed and was evicted from every workspace
+ * while coreState.activePaneId still names it) is treated as ORPHANED — resolveBriefPane's pinned
+ * semantics for the same predicate ("fail toward isolation — we cannot confirm affinity"), never
+ * silently blessed as belonging. The breadcrumb degrades honestly: no owning project is ever
+ * invented, and the pane can only be named by its id (no pane record exists to read a name from).
+ */
+export function resolveSwitchContextHonesty(
+  manager: Pick<ActionContext["manager"], "terminals" | "ledger">,
+  priorActivePaneId: string | null,
+  newProjectId: string,
+): {
+  activePaneOrphaned: boolean;
+  notice?: string;
+  previousProject?: { project_id: string; name: string };
+  previousFocusPane?: { pane_id: string; name: string };
+  switchBreadcrumb?: string;
+} {
+  if (!priorActivePaneId) return { activePaneOrphaned: false };
+  if (!manager.ledger.getProject?.(newProjectId)) return { activePaneOrphaned: false };
+  const owner = findPaneOwningProject(manager, priorActivePaneId);
+  if (owner?.projectId === newProjectId) return { activePaneOrphaned: false };
+  const notice = "No active pane selected for this project — say which pane you want to target.";
+  if (!owner) {
+    return {
+      activePaneOrphaned: true,
+      notice,
+      previousFocusPane: { pane_id: priorActivePaneId, name: priorActivePaneId },
+      switchBreadcrumb:
+        `Previous focus pane ${priorActivePaneId} does not belong to the switched-to project and ` +
+        `its owning project could not be resolved — treat no pane as selected.`,
+    };
+  }
+  const previousProjectName = manager.ledger.getProject?.(owner.projectId)?.name ?? owner.projectId;
+  return {
+    activePaneOrphaned: true,
+    notice,
+    previousProject: { project_id: owner.projectId, name: previousProjectName },
+    previousFocusPane: { pane_id: priorActivePaneId, name: owner.pane.name },
+    switchBreadcrumb:
+      `Switched from ${previousProjectName} (${owner.projectId}); previous focus pane ` +
+      `${owner.pane.name} (${priorActivePaneId}) belongs to ${previousProjectName}, not the new project.`,
+  };
+}
 
 export const switchContext: ActionDef<typeof SwitchContextParams> = {
   name: "switch_context",
@@ -151,6 +215,13 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     ctx.manager.settings.projects.localWorkspacePath = wsPath;
     ctx.manager.saveSettings();
     ctx.broadcastLedgerUpdate();
+    // WS3: read the CURRENT focused pane (the seam this workstream wires in — switch_context never
+    // consulted it before) and resolve the honesty verdict BEFORE the context_switched frame goes
+    // out, so the frame's additive activePaneOrphaned flag reflects the same verdict the briefing
+    // payload below will carry. Never mutates focus (ctx.setActivePane is never called here —
+    // Option B, auto-retargeting, stays rejected).
+    const priorActivePaneId = ctx.getActivePaneId();
+    const honesty = resolveSwitchContextHonesty(ctx.manager, priorActivePaneId, projectId);
     // BUG-012 (residual): move the UI's PROJECT focus to follow the voice switch. broadcastLedgerUpdate
     // above repaints the workspace list first; this context_switched frame then tells the classic client
     // to re-highlight the now-active project (src/appHelpers.ts WS_HANDLERS -> setActiveProjectId). Placed
@@ -158,7 +229,14 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     // live refresh/brief, whose side effects are unrelated to the focus move. Optional-chained like the
     // sibling ctx.injectMemoryBrief?.() below: the real voice/REST ctx always supplies broadcast, while
     // some pre-existing switch_context unit ctxs (sync/inject suites) omit it — a no-op there is safe.
-    ctx.broadcast?.({ type: "context_switched", activeProjectId: projectId });
+    // The activePaneOrphaned key is ADDITIVE-ONLY (tests/test_context_switched_frame.ts /
+    // tests/test_frame_contracts.ts pin the base frame shape unchanged) — omitted entirely rather
+    // than sent as `false` when the pane is not stale.
+    ctx.broadcast?.({
+      type: "context_switched",
+      activeProjectId: projectId,
+      ...(honesty.activePaneOrphaned ? { activePaneOrphaned: true as const } : {}),
+    });
     // Phase 1 "ears" (fact [E]): getProjectBriefing reads ws.panes, which is only as fresh as
     // the last syncLedger(). Force a live PTY->ledger sync FIRST so the catch-up briefing
     // reflects each pane's CURRENT status/is_busy (e.g. a pane that just went Running or Idle)
@@ -173,8 +251,24 @@ export const switchContext: ActionDef<typeof SwitchContextParams> = {
     // server wires injectMemoryBrief on the voice ctx; absent on REST/test paths (safe no-op). The
     // injector owns its own try/catch, so this never throws into the action path.
     ctx.injectMemoryBrief?.("project_switch");
-    const briefing = ctx.manager.ledger.getProjectBriefing(projectId) || { error: "Project not found" };
-    return { kind: "ok", output: briefing };
+    const briefing = ctx.manager.ledger.getProjectBriefing(projectId);
+    if (!briefing) return { kind: "ok", output: { error: "Project not found" } };
+    // WS3: additive-only. The honesty fields (notice/panes-already-present/previousProject/
+    // previousFocusPane/switchBreadcrumb/activePaneOrphaned) attach ONLY on the orphaned branch;
+    // every other case (pane owned by the new project, no focused pane, unknown project above)
+    // returns the plain briefing byte-identical to before this workstream.
+    if (!honesty.activePaneOrphaned) return { kind: "ok", output: briefing };
+    return {
+      kind: "ok",
+      output: {
+        ...briefing,
+        activePaneOrphaned: true,
+        notice: honesty.notice,
+        previousProject: honesty.previousProject,
+        previousFocusPane: honesty.previousFocusPane,
+        switchBreadcrumb: honesty.switchBreadcrumb,
+      },
+    };
   },
 };
 
