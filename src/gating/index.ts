@@ -98,6 +98,11 @@ import type { CoreState } from "../core/coreState";
  *  - sanitizeSettingsForClient: passed through to buildActionRun's deps for the rehydrated set_*_permissions effects.
  *  - addCommand:                the HistoryManager singleton's addCommand (server.ts HistoryManager is not importable);
  *                               the approved-write path records the command in command history exactly as before.
+ *  - turnArbiter:                OPTIONAL (turn-arbiter program, Wave 2, spec section 3.3 row 1): when injected,
+ *                               the FIVE timer-driven narration call-sites submit class-2 `deadline` items into
+ *                               it instead of forcing an immediate spoken turn through pushApprovalNarration; the
+ *                               sweep consults `floorPausedMs` before rejecting (D1 -- the deadline waits for the
+ *                               operator's floor). Absent (legacy harnesses) -> byte-identical pre-Wave-2 behavior.
  */
 export interface GatingDeps {
   manager: OrchestratorManager;
@@ -114,6 +119,17 @@ export interface GatingDeps {
    *  HistoryManager.addCommand accepts (and ignores when absent) the same optional param, so a
    *  legacy caller passing 2 args is byte-identical. */
   addCommand: (terminalId: string, command: string, exchangeId?: string) => void;
+  turnArbiter?: {
+    submit(item: {
+      facts: string;
+      cls: 0 | 1 | 2 | 3 | 4 | 5;
+      paneId?: string;
+      coalesceKey?: string;
+      deadline?: { expiresAt: number; onExpirySwap: string };
+    }): void;
+    /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
+    floorPausedMs(coalesceKey: string): number;
+  };
 }
 
 /** The cohesive seam createGating returns. The pending stores + the constants are exposed so the
@@ -163,7 +179,7 @@ export interface Gating {
     targetMode: "Full Auto" | "Human-in-the-Loop" | "Read-Only",
     source: "voice" | "ui" | "promote_pane_mode"
   ) => Promise<PaneModeResult>;
-  reannounceSurvivors: (session: any) => void;
+  reannounceSurvivors: (session: any, now?: number) => void;
   pendingApprovals: PendingApprovalStore;
   pendingActions: PendingActionStore;
   sweepExpiredApprovals: (now?: number) => void;
@@ -185,6 +201,12 @@ export interface Gating {
  */
 export { findPaneOwningProject } from "../paneOwnership";
 
+/** yg1w (turn-arbiter program, Wave 3, spec §3.3 row 7; audit §2.4 "the reconnect burst"): the
+ *  reconnect CEREMONY threshold. A gap since the last detach under this many ms is a transient blip
+ *  (silent re-attach, window preserved); at/above it, the absence is genuine (the ceremony runs). A
+ *  4-second socket hiccup and a 4-hour absence must not replay identically. */
+export const RECONNECT_QUIET_MS = 30_000;
+
 /**
  * createGating(deps) — build the shared gating/safety core plus its private, per-server pending state.
  * The pending stores are constructed here (and exposed) so EVERY surface (REST + voice) injects the
@@ -203,6 +225,7 @@ export function createGating(deps: GatingDeps): Gating {
     pushApprovalNarration,
     sanitizeSettingsForClient,
     addCommand,
+    turnArbiter,
   } = deps;
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
@@ -767,10 +790,27 @@ export function createGating(deps: GatingDeps): Gating {
   // HERE (remove + persist + audit + broadcast) AND lazily in resolution — so a swallowed sweep
   // exception can never leave a pane hot past its clock. The warning goes through the SAME injected
   // narration seam the approval last-call uses, redacted before it leaves the process.
+  // Wave-2 (turn-arbiter site 3, spec section 3.3 row 1): with an injected arbiter the T-minus
+  // warning is a class-2 `submit` keyed to the window's REAL expiry -- never an immediate forced
+  // turn -- so the sweep no longer needs a live session to queue it (the arbiter is never-drop;
+  // submission itself is "heard"). Legacy (no arbiter): byte-identical immediate narration.
   function warnAutonomyWindow(w: AutonomyWindow, now: number): void {
+    const mins = Math.max(1, Math.round((w.expires_at - now) / 60_000));
+    const endedFacts = redactSecrets(`The autonomy window on pane ${w.pane_id} has ended — back to asking first.`);
+    if (turnArbiter) {
+      turnArbiter.submit({
+        facts: redactSecrets(`Heads up — the autonomy window on pane ${w.pane_id} ends in about ${mins} minute${mins === 1 ? "" : "s"}.`),
+        cls: 2,
+        paneId: w.pane_id,
+        coalesceKey: `autonomy-warn:${w.pane_id}`,
+        deadline: { expiresAt: w.expires_at, onExpirySwap: endedFacts },
+      });
+      w.warned_at = now; // stamp on submit -- the arbiter never drops, so submission == heard.
+      persistAutonomyWindows();
+      return;
+    }
     const session = coreState.activeLiveSession;
     if (session === null) return; // cannot speak a last-call into no session; retry next tick.
-    const mins = Math.max(1, Math.round((w.expires_at - now) / 60_000));
     const line = redactSecrets(`Heads up — the autonomy window on pane ${w.pane_id} ends in about ${mins} minute${mins === 1 ? "" : "s"}.`);
     if (pushApprovalNarration(session, line) !== false) {
       w.warned_at = now; // stamp only on a HEARD warning so it fires exactly once.
@@ -785,8 +825,12 @@ export function createGating(deps: GatingDeps): Gating {
       summary: `EXPIRED autonomy window on pane ${w.pane_id} — reverted to the prior posture`,
       payload: { action: "autonomy_window_expired", window_id: w.id, capabilities: w.capabilities },
     });
-    if (coreState.activeLiveSession) {
-      pushApprovalNarration(coreState.activeLiveSession, redactSecrets(`The autonomy window on pane ${w.pane_id} has ended — back to asking first.`));
+    const endedFacts = redactSecrets(`The autonomy window on pane ${w.pane_id} has ended — back to asking first.`);
+    if (turnArbiter) {
+      // Wave-2 site 4: the posture-reversion notice is a class-2 fact, not a forced immediate turn.
+      turnArbiter.submit({ facts: endedFacts, cls: 2, paneId: w.pane_id, coalesceKey: `autonomy-warn:${w.pane_id}` });
+    } else if (coreState.activeLiveSession) {
+      pushApprovalNarration(coreState.activeLiveSession, endedFacts);
     }
     broadcastTerminalsUpdated();
   }
@@ -935,19 +979,51 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  // Wave-3 (spec §3.3 row 7): route ONE non-deadline reconnect narration through the injected
+  // arbiter when present (a class `cls` submit, never a forced turn); legacy (no arbiter) speaks it
+  // immediately through the injected pushApprovalNarration slot instead — byte-identical to
+  // pre-Wave-3 behavior. Extracted so reannounceSurvivors' own branch count stays flat.
+  function narrateReconnect(facts: string, cls: 2 | 5, coalesceKey: string, session: any): void {
+    if (turnArbiter) {
+      turnArbiter.submit({ facts, cls, coalesceKey });
+    } else {
+      pushApprovalNarration(session, facts);
+    }
+  }
+
+  // Pure digest-text composition (spec §7: most-recent-first, speak up to 3, summarize the rest).
+  // Extracted verbatim from reannounceSurvivors so its own branch count stays flat.
+  function renderSurvivorsDigest(total: number, shown: string[]): string {
+    if (total === 1) return `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
+    if (total <= 3) return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
+    return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+  }
+
   // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
   // After a fresh live session is established, re-attach every orphaned approval (a survivor whose
   // handle was nulled by detachSession on the prior disconnect, OR a restart-hydrated row) to THIS
   // session — opening a fresh TTL window — then speak ONE batched digest across approvals + pending
   // actions and broadcast so the UI chips repopulate the FULL list. Survivors stay UN-APPROVED
   // (re-require approval): the digest only re-surfaces them for a conscious yes; nothing auto-fires.
-  function reannounceSurvivors(session: any) {
-    const now = Date.now();
+  // yg1w (turn-arbiter program, Wave 3, spec §3.3 row 7): `now` is caller-supplied (default
+  // Date.now()) so the quiet-threshold gate below is deterministically testable.
+  function reannounceSurvivors(session: any, now: number = Date.now()) {
     // (1) Re-attach every orphan approval to the freshly-connected session (fresh TTL window,
     // lastCallAt cleared). pendingActions have no session binding — they survive in-process untouched.
+    // Mechanics ALWAYS run, quiet blip or genuine absence — the UI chips must never lag.
     for (const orphan of pendingApprovals.orphans()) {
       pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
     }
+
+    // yg1w: lastDetachAt === null means a FIRST connect (never quiet — the operator has never left
+    // this ceremony behind). Otherwise a gap under RECONNECT_QUIET_MS is a transient blip: skip the
+    // spoken ceremony entirely and leave the away window OPEN (never consumed) — the events land in
+    // the next catch-up / next genuine-absence digest instead (told-more beats silently-missed).
+    if (lastDetachAt !== null && now - lastDetachAt < RECONNECT_QUIET_MS) {
+      broadcastTerminalsUpdated(); // chips still repopulate — the UI is not the spoken channel.
+      return;
+    }
+
     // (2) Collect the survivors: re-attached approvals (now bound to this session) + ALL pending
     // actions (not session-bound, spec §6.2 includes them all). Build ONE digest line per item.
     const approvals = pendingApprovals.forSession(session);
@@ -962,17 +1038,11 @@ export function createGating(deps: GatingDeps): Gating {
     if (survivors.length > 0) {
       // (3) Most-recent first; speak up to 3, summarize the rest (spec §7). UI shows the full list.
       survivors.sort((x, y) => y.ts - x.ts);
-      const total = survivors.length;
-      const shown = survivors.slice(0, 3).map((s) => s.line);
-      let digest: string;
-      if (total === 1) {
-        digest = `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
-      } else if (total <= 3) {
-        digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
-      } else {
-        digest = `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
-      }
-      pushApprovalNarration(session, digest);
+      const digest = renderSurvivorsDigest(survivors.length, survivors.slice(0, 3).map((s) => s.line));
+      // Wave-3 site (spec §3.3 row 7): with an injected arbiter the survivors digest is a class-2
+      // submit — actionable, deadline-carrying truth (a fresh TTL window just reopened) — never an
+      // immediate forced turn. Legacy (no arbiter): byte-identical immediate narration.
+      narrateReconnect(digest, 2, "reconnect-survivors", session);
       // (4) Repopulate the UI chips for the FULL list (the spoken cap is 3; the UI is not capped).
       broadcastTerminalsUpdated();
     }
@@ -988,7 +1058,8 @@ export function createGating(deps: GatingDeps): Gating {
     }
     if (since !== null) {
       const away = composeAwayDigest(since, now);
-      if (away) pushApprovalNarration(session, away);
+      // Wave-3 site: the away digest is passive context (class 5) — it never forces a turn.
+      if (away) narrateReconnect(away, 5, "reconnect-away-digest", session);
     }
   }
 
@@ -1134,7 +1205,17 @@ export function createGating(deps: GatingDeps): Gating {
   }
 
   function renderExpired(record: ResolvedRecord, safeInstr: string, session: any): void {
-    if (session) pushApprovalNarration(session, `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`);
+    // Wave-2 site 5: the honest expiry notice submits under the SAME coalesceKey the last-call used
+    // (spec section 3.3 row 1) so a stale queued last-call COLLAPSES into this truth rather than
+    // draining later as a still-actionable "approve now". This fires regardless of the CALLER
+    // (the sweep's reject leg OR the emergency brake's cancel-everything loop) — either way the
+    // operator must never hear a dropped/cancelled approval described as still live.
+    const expiryFacts = `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`;
+    if (turnArbiter) {
+      turnArbiter.submit({ facts: expiryFacts, cls: 2, paneId: record.terminalId, coalesceKey: `last-call:${record.messageId}` });
+    } else if (session) {
+      pushApprovalNarration(session, expiryFacts);
+    }
     // 1C.1: the REAL approval_expired kind — this used to borrow kind:"exited" for its severity,
     // which rendered "Pane 'x' exited." for a pane that merely lost an approval.
     // AgentExchange spine (task C, spec §5 "attention rows"): carry exchange_id in the item's
@@ -1327,10 +1408,33 @@ export function createGating(deps: GatingDeps): Gating {
   // Connectivity is per-record (sessionFor !== undefined — the detach/re-attach seam).
   function sweepApprovalItem(pending: ReturnType<PendingApprovalStore["expired"]>[number], now: number): void {
     const isConnected = pendingApprovals.sessionFor(pending.messageId) !== undefined;
-    const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected);
-    if (decision.action === "none") return; // not due, clock paused, or inside grace.
+    // Wave-2 site 1 (D1): the reject leg widens its grace by however long THIS deadline has been
+    // floor-paused in the arbiter — a last-call the operator was mid-floor for cannot expire under them.
+    const coalesceKey = `last-call:${pending.messageId}`;
+    const extraGraceMs = turnArbiter ? turnArbiter.floorPausedMs(coalesceKey) : 0;
+    const decision = decideSweepAction(pending, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, isConnected, extraGraceMs);
+    if (decision.action === "none") return; // not due, clock paused, or inside (possibly extended) grace.
     if (decision.action === "lastcall") {
-      // First crossing while connected: SPEAK the last-call (no reject), THEN stamp the transient —
+      if (turnArbiter) {
+        // Wave-2: a class-2 deadline submission, never a forced immediate turn (spec section 3.3
+        // row 1). The arbiter is never-drop, so submission itself is "heard" (3V.3 semantics carry
+        // over unconditionally — no live-session gate needed here).
+        turnArbiter.submit({
+          facts: `${renderResumptionLine(pending, now)} — approve now or I'll drop it.`,
+          cls: 2,
+          paneId: pending.terminalId,
+          coalesceKey,
+          deadline: {
+            expiresAt: now + APPROVAL_GRACE_MS,
+            onExpirySwap: `The command on pane ${pending.terminalId} expired; I cancelled it.`,
+          },
+        });
+        pending.lastCallAt = now;
+        pending.lastCallFailures = undefined;
+        broadcastTerminalsUpdated();
+        return;
+      }
+      // Legacy (no arbiter injected): SPEAK the last-call (no reject), THEN stamp the transient —
       // only a push that actually went out starts the grace clock (3V.3).
       const session = pendingApprovals.sessionFor(pending.messageId);
       const spoken = session !== undefined
@@ -1359,9 +1463,27 @@ export function createGating(deps: GatingDeps): Gating {
   // Connectivity is the SAME ref used to narrate (`coreState.activeLiveSession`), resolved ONCE by the
   // caller and passed in (see the long-form rationale at the call site).
   function sweepActionItem(act: ReturnType<PendingActionStore["expired"]>[number], now: number, actionsConnected: boolean): void {
-    const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected);
+    const coalesceKey = `last-call:${act.id}`;
+    const extraGraceMs = turnArbiter ? turnArbiter.floorPausedMs(coalesceKey) : 0;
+    const decision = decideSweepAction(act, now, APPROVAL_TTL_MS, APPROVAL_GRACE_MS, actionsConnected, extraGraceMs);
     if (decision.action === "none") return;
     if (decision.action === "lastcall") {
+      // Wave-2 site 2: same class-2 deadline submission as the approvals leg — never a forced turn.
+      if (turnArbiter) {
+        turnArbiter.submit({
+          facts: `${act.capability}: ${redactSecrets(act.summary)} — approve now or I'll drop it.`,
+          cls: 2,
+          coalesceKey,
+          deadline: {
+            expiresAt: now + APPROVAL_GRACE_MS,
+            onExpirySwap: `${act.capability}: ${redactSecrets(act.summary)} — this expired; I cancelled it.`,
+          },
+        });
+        act.lastCallAt = now;
+        (act as { lastCallFailures?: number }).lastCallFailures = undefined;
+        broadcast({ type: "action_pending", actionId: act.id, capability: act.capability, summary: act.summary });
+        return;
+      }
       // 3V.3: same speak-then-stamp ordering as the approvals leg. The retry counter lives on the
       // in-memory record via a structural widening (PendingAction's serialized shape is owned by
       // pendingActions.ts; the counter is a sweep-private transient, deliberately never persisted).

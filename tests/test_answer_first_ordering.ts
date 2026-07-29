@@ -178,8 +178,13 @@ function sliceBetween(content: string, startMarker: string, endMarker: string): 
 }
 
 // Anchors verified against src/voice/index.ts at commit e595db2 (re-verified this session).
+// PUSH_SIGNAL_END updated for the turn-arbiter program Wave 4 (spec §3.3/§4-W4): the private
+// per-connection `paneAckArbiter` this used to anchor on is promoted to the SHARED arbiter server.ts
+// injects (audit §2.5 "producer proliferation") — `sharedArbiter` right after pushSignal's own
+// closing brace is the new stable anchor. Anchor moved only; the substance under test (pushSignal's
+// own body, between PUSH_SIGNAL_START and this line) is unchanged.
 const PUSH_SIGNAL_START = "const pushSignal = (sig: PaneSignal) => {";
-const PUSH_SIGNAL_END = "const armReadyDrain = () => {";
+const PUSH_SIGNAL_END = "const sharedArbiter: TurnArbiter = turnArbiter ?? createTurnArbiter();";
 
 const MEMORY_BRIEF_START = "brief = await memory.service.synthesizeAsync(";
 const MEMORY_BRIEF_END = "// PLM4 (2): AUTO-RECONNECT";
@@ -213,17 +218,17 @@ test("pushSignal (pane-signal passive send, :2384-2396, turnComplete:false) appl
 });
 
 test("the memory-brief send (downstream of synthesizeAsync, ~:1172) applies the BACKGROUND framing helper", () => {
+  // Turn-arbiter program, Wave 3 (co-design spec A): the send site no longer calls
+  // applyBackgroundFraming(...) directly — it routes through composeBriefEnvelope(...), which
+  // reuses applyBackgroundFraming VERBATIM internally (src/voice/index.ts) once the live ack state
+  // and the class-5 delivery-matrix mode decide the brief stays passive. The hardcoded
+  // turnComplete:true literal this test used to also implicitly guard against is gone with it —
+  // composeBriefEnvelope's own unit suite (tests/test_turn_arbiter_briefs.ts) pins that contract.
   const slice = sliceBetween(voiceIndexSource, MEMORY_BRIEF_START, MEMORY_BRIEF_END);
   assert.ok(
-    slice.includes("applyBackgroundFraming("),
-    "the synthesized memory-brief's sendClientContent call must run brief.text through " +
-      "applyBackgroundFraming(...) before it reaches Gemini",
-  );
-  assert.ok(
-    !NOOP_FRAMING_CALL_RE.test(slice),
-    "the memory-brief send must not call applyBackgroundFraming(..., true) — that is the helper's " +
-      "no-op branch; the brief is a PASSIVE background injection and must classify itself passive " +
-      "regardless of the protocol-level turnComplete literal the site sends to Gemini",
+    slice.includes("composeBriefEnvelope("),
+    "the synthesized memory-brief's sendClientContent call must route through composeBriefEnvelope(...) " +
+      "— which internally reuses applyBackgroundFraming(...) — before it reaches Gemini",
   );
 });
 

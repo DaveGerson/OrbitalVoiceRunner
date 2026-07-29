@@ -6,8 +6,10 @@
 //
 //   (a) BOUNDED backoff — a connector that ALWAYS fails stops after a capped number of attempts
 //       (no retry-forever / no storm) and broadcasts a final "could not reconnect" frame.
-//   (b) EVENTUAL reconnect RE-ANNOUNCES survivors — a drop, then a reconnect that succeeds after k
-//       failures, re-attaches the staged approval survivor and speaks the resumption digest.
+//   (b) EVENTUAL reconnect re-attaches survivors SILENTLY — a drop, then a reconnect that succeeds
+//       after k failures (well under RECONNECT_QUIET_MS), re-attaches the staged approval survivor
+//       but does NOT speak the resumption digest (turn-arbiter program, Wave 3, yg1w — a transient
+//       blip the operator never perceived must not replay "Welcome back" mid-conversation).
 //   (c) NO reconnect AFTER the operator's WS closes — a drop whose WS then closes must NOT reconnect.
 //   (d) PER-DISPATCH IDEMPOTENCY — a re-delivered NON-readOnly tool call (same idempotency_key) is
 //       short-circuited (NOT double-applied), while a re-delivered READ (readOnly) is allowed to run.
@@ -266,7 +268,7 @@ describe("PLM4 (b): an eventual reconnect re-announces the surviving approvals",
     await teardownServerSuite(running);
   });
 
-  it("re-attaches + speaks the resumption digest on the reconnect that finally succeeds", async () => {
+  it("re-attaches SILENTLY on the reconnect that finally succeeds — a sub-threshold blip stays quiet", async () => {
     const approvals = running._testPendingApprovals!();
     const session0 = running._testActiveLiveSession!();
 
@@ -295,10 +297,16 @@ describe("PLM4 (b): an eventual reconnect re-announces the surviving approvals",
 
     // PLM4 (4): reannounceSurvivors ran on the reconnect — the survivor re-attached to session1...
     assert.strictEqual(approvals.sessionFor(messageId), session1, "survivor re-attached to the reconnected session");
-    // ...and the resumption digest was SPOKEN into the new session (sendClientContent narration).
+    // ...but turn-arbiter program Wave 3 (yg1w, spec §3.3 row 7): this bounded reconnect (one
+    // scripted failure, 20/60ms backoff) re-establishes well under RECONNECT_QUIET_MS after the
+    // drop — EXACTLY the transient-blip scenario audit §2.4 names (a network hiccup the operator
+    // never perceived must not replay "Welcome back" mid-conversation). A short settle window (not
+    // a slow waitFor-timeout) confirms the resumption digest never arrives.
+    await new Promise((resolve) => setTimeout(resolve, 250));
     const spokeDigest = session1.clientContents.some((c) =>
       JSON.stringify(c).includes("run the full test suite"));
-    assert.ok(spokeDigest, "the reconnect spoke the resumption digest naming the survivor");
+    assert.strictEqual(spokeDigest, false,
+      "yg1w: a sub-threshold reconnect blip must NOT replay the resumption digest into the new session");
 
     approvals.delete(messageId);
   });

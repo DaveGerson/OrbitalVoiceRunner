@@ -249,7 +249,10 @@ describe("4D.1 — 'While you were away' digest on reconnect", () => {
     const narrations: string[] = [];
     const gating = createGating(makeDeps(store, narrations, bus));
 
-    gating.noteSessionDetached(Date.now() - 5_000);
+    // turn-arbiter program, Wave 3 (yg1w): the gap must clear RECONNECT_QUIET_MS (30s) so this
+    // reconnect is a GENUINE absence, not a silent blip — this test is about digest CONTENT, which
+    // tests/test_reconnect_quiet_threshold.ts covers separately.
+    gating.noteSessionDetached(Date.now() - 31_000);
     bus.enqueue({ kind: "exited", terminalId: "pane_dead", summary: "code 1" });
 
     gating.reannounceSurvivors({ sendClientContent: () => {} });
@@ -270,7 +273,9 @@ describe("4D.1 — 'While you were away' digest on reconnect", () => {
     const narrations: string[] = [];
     const gating = createGating(makeDeps(store, narrations, bus));
 
-    gating.noteSessionDetached(Date.now() - 5_000);
+    // turn-arbiter program, Wave 3 (yg1w): keep the gap >= RECONNECT_QUIET_MS so this reconnect is
+    // a genuine absence (see the note on the sibling test above).
+    gating.noteSessionDetached(Date.now() - 31_000);
     bus.enqueue({ kind: "completion_failed", terminalId: "pane_ff", summary: "3 failing" });
 
     const rows = store.getEvents({ type: "status_transition" });

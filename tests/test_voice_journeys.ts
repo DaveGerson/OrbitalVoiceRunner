@@ -33,9 +33,10 @@
 //      the foreground) + a REAL idle pane; list_panes reports honest busy/idle derived from the
 //      genuine status machine (authoritative process-tree probe) — no manual term.status writes.
 //   5. DROP-AND-RESUME — with an approval pending, the Gemini socket dies (emitClose 1006); the
-//      bounded reconnect mints a fresh session, the survivor re-attaches, the resumption digest
-//      ("Welcome back…", gating.reannounceSurvivors) names it, and the approval is still
-//      resolvable by voice through the NEW session.
+//      bounded reconnect mints a fresh session and the survivor re-attaches SILENTLY (turn-arbiter
+//      program, Wave 3, yg1w: this reconnect lands well under RECONNECT_QUIET_MS, the exact
+//      transient-blip scenario audit §2.4 names — no "Welcome back…" replay), and the approval is
+//      still resolvable by voice through the NEW session.
 //
 // Runner: npx tsx --test --test-force-exit tests/test_voice_journeys.ts
 
@@ -457,16 +458,17 @@ describe("voice journeys (real server, real gating, real PTY panes; no API key, 
     await waitFor(() => clientMessages.filter((m) => m.type === "voice_channel_lost").length > lostBefore);
     await waitFor(() => clientMessages.some((m) => m.type === "voice_channel_restored"));
 
-    // The surviving approval re-attached to the NEW session and the resumption digest names it.
+    // The surviving approval re-attached to the NEW session — SILENTLY. turn-arbiter program,
+    // Wave 3 (yg1w, spec §3.3 row 7): this bounded reconnect re-establishes well under
+    // RECONNECT_QUIET_MS after the drop — EXACTLY the transient-blip scenario audit §2.4 names (a
+    // network hiccup the operator never perceived must not replay "Welcome back" mid-conversation).
+    // A short settle window (not a slow waitFor-timeout) confirms the digest never arrives.
     assert.ok(approvals().has(callId), "the approval survived the drop");
     assert.strictEqual(approvals().sessionFor(callId), session2, "survivor re-attached to the new session");
-    const digest = await waitFor(() => {
-      const n = narrationText(session2 as MockLiveSession);
-      return n.includes("Welcome back") ? n : undefined;
-    }, 5000);
-    assert.ok(digest.includes(paneId), `resumption digest names the pane: ${digest}`);
-    assert.ok(digest.includes("echo resumed_"), `resumption digest names the command: ${digest}`);
-    assert.match(digest, /still waiting|actions waiting/i, "digest frames it as awaiting the operator");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const quietNarration = narrationText(session2 as MockLiveSession);
+    assert.ok(!quietNarration.includes("Welcome back"),
+      `yg1w: a sub-threshold reconnect blip must NOT replay the resumption digest, got: ${quietNarration}`);
 
     // The survivor is STILL RESOLVABLE — spoken approve through the NEW session's real intercept
     // path executes the original command on the original (still-live) pane.

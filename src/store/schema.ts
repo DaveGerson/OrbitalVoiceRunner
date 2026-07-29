@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn.
  *  Exported (not just `applyMigrations`) so tests can build a pre-migration fixture DB by
@@ -479,6 +479,37 @@ export const MIGRATIONS: ((db: Database.Database) => void)[] = [
       );
       CREATE INDEX idx_transcripts_ts ON transcripts(ts);
       CREATE INDEX idx_transcripts_session_ts ON transcripts(session_id, ts);
+    `);
+  },
+  // v14 (turn-arbiter program, Wave 4 — spec docs/superpowers/specs/2026-07-29-turn-arbiter-
+  // design.md §5-T4): two append-only observability tables proving the arbiter's own steady-state
+  // invariant. `jump_over` records ANY forced turn (turnComplete:true) landing mid-answer/mid-
+  // utterance — post-arbiter this should be STRUCTURALLY ZERO; the row exists so the +14d watch
+  // bead (mute-rate precedent) has real rows to read. `arbiter_drain` records every drain's shape
+  // (`drain_size` === `1 + tail_count`) for the D2 headline+counted-tail distribution. Purely
+  // additive (new tables + ts indexes only), same v9 gemini_turn_usage naming idiom.
+  (db) => {
+    db.exec(`
+      CREATE TABLE jump_over (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        session_id TEXT,
+        producer TEXT,
+        cls INTEGER,
+        detail TEXT
+      );
+      CREATE INDEX idx_jump_over_ts ON jump_over(ts);
+
+      CREATE TABLE arbiter_drain (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        session_id TEXT,
+        mode TEXT,
+        headline_cls INTEGER,
+        drain_size INTEGER NOT NULL,
+        tail_count INTEGER NOT NULL
+      );
+      CREATE INDEX idx_arbiter_drain_ts ON arbiter_drain(ts);
     `);
   },
 ];

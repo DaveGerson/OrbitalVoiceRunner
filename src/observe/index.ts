@@ -330,6 +330,11 @@ export interface ObserveHandlers {
   // through the same lastStates edge tracking (a chunk that already classified this exit, or a
   // later one, can never double-fire it).
   onExit: (terminalId: string) => void;
+  /** Wave 3 (turn-arbiter program, spec §3.3 row 4): the ONE settled-outcome resolver, shared with
+   *  the fikj.7 earcon enqueue below -- exposed so the voice layer keys vc-C's class-3 completion
+   *  facts off the SAME seam (reuse, never a second implementation of the agent_failed/staleness
+   *  guard). Fail-open "completion" for an unknown/uncorrelated pane. */
+  completionKindFor: (terminalId: string) => "completion" | "completion_failed";
 }
 
 // VOICE_TRACE is recomputed here from the same env signal server.ts uses, so the high-volume PTY
@@ -1171,7 +1176,7 @@ ${redact(rawOutput.slice(-3000))}`;
     }
   };
 
-  return { onOutput, onIdle, onRunning, onQuiescing, onExit };
+  return { onOutput, onIdle, onRunning, onQuiescing, onExit, completionKindFor };
 }
 
 // Re-export the secret redactor's identity for callers that want the same default `redact` the

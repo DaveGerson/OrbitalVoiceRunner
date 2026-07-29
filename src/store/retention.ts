@@ -59,6 +59,11 @@ export interface PruneOpts {
    *  append-only, bounded-at-rest posture as exchange_events: transcripts hold the longest-lived
    *  at-rest copies of operator ASR / Janus narration text, so they get the same bounded retention. */
   transcriptsTtlDays?: number;
+  /** jump_over TTL in days (schema v14, turn-arbiter program T4 telemetry). Default 30 — same
+   *  append-only observability posture as gemini_turn_usage/cortex_decision. */
+  jumpOverTtlDays?: number;
+  /** arbiter_drain TTL in days (schema v14, turn-arbiter program T4 telemetry). Default 30. */
+  arbiterDrainTtlDays?: number;
 }
 
 /**
@@ -103,6 +108,8 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
   const exCutoff = ttlCutoffMs(opts.now, opts.exchangesTtlDays);
   const cdelCutoff = ttlCutoffMs(opts.now, opts.contextDeliveriesTtlDays);
   const trCutoff = ttlCutoffMs(opts.now, opts.transcriptsTtlDays);
+  const joCutoff = ttlCutoffMs(opts.now, opts.jumpOverTtlDays);
+  const adCutoff = ttlCutoffMs(opts.now, opts.arbiterDrainTtlDays);
   // W5 attention (minute-scale, ms-based — not the day-scale ttlCutoffMs helper).
   const attnActiveCutoff = opts.now - (opts.attentionTtlMs ?? ATTENTION_ACTIVE_TTL_MS);
   const attnDismissedCutoff = opts.now - (opts.attentionDismissedTtlMs ?? ATTENTION_DISMISSED_TTL_MS);
@@ -159,6 +166,12 @@ export function pruneOnBoot(db: Database.Database, opts: PruneOpts): void {
     try {
       db.prepare("DELETE FROM transcripts WHERE ts < ?").run(trCutoff);
     } catch { /* pre-v13 DB: table absent, skip */ }
+    // Turn-arbiter program T4 telemetry (schema v14): same append-only, 30d-default posture as the
+    // v9 pair. Guarded — a pre-v14 DB (tables absent) must not fail the whole boot-prune transaction.
+    try {
+      db.prepare("DELETE FROM jump_over WHERE ts < ?").run(joCutoff);
+      db.prepare("DELETE FROM arbiter_drain WHERE ts < ?").run(adCutoff);
+    } catch { /* pre-v14 DB: tables absent, skip */ }
     // W5 (BUG-013 residual): DURABLE attention retention. Two-tier TTL (active vs shorter dismissed),
     // then cap-eviction keeping the newest attnCap rows (drop dismissed first, then oldest — the
     // dismissed-ASC/timestamp-DESC keep order). Own try/catch so a pre-attention-table DB skips it.
@@ -225,6 +238,10 @@ export interface SweepOpts {
   batchLimit?: number;
   /** transcripts TTL in days (schema v13, bead 98f2). Default 30 — see PruneOpts. */
   transcriptsTtlDays?: number;
+  /** jump_over TTL in days (schema v14, turn-arbiter program T4 telemetry). Default 30. */
+  jumpOverTtlDays?: number;
+  /** arbiter_drain TTL in days (schema v14, turn-arbiter program T4 telemetry). Default 30. */
+  arbiterDrainTtlDays?: number;
 }
 
 export interface SweepResult {
@@ -239,6 +256,23 @@ export interface SweepResult {
  *  `pruneIncremental` (complexity gate). */
 function ttlCutoffMs(now: number, ttlDays: number | undefined): number {
   return now - (ttlDays ?? ACTION_LOG_TTL_DAYS) * 86_400_000;
+}
+
+/** Turn-arbiter program T4 telemetry (schema v14): its own try/catch-wrapped step pair, EXTRACTED
+ *  (not inlined) so `pruneIncremental`'s own branch count stays under the CC-10 gate as tables
+ *  accrue — the SAME reason `ttlCutoffMs` above is hoisted out of the tx body. */
+function pruneJumpOverAndArbiterDrain(
+  opts: SweepOpts,
+  step: (label: string, sql: string, args: unknown[]) => void,
+): void {
+  try {
+    step("jump_over",
+      "DELETE FROM jump_over WHERE id IN (SELECT id FROM jump_over WHERE ts < ? ORDER BY id LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.jumpOverTtlDays)]);
+    step("arbiter_drain",
+      "DELETE FROM arbiter_drain WHERE id IN (SELECT id FROM arbiter_drain WHERE ts < ? ORDER BY id LIMIT ?)",
+      [ttlCutoffMs(opts.now, opts.arbiterDrainTtlDays)]);
+  } catch { /* pre-v14 DB: tables absent, skip */ }
 }
 
 export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepResult {
@@ -328,6 +362,10 @@ export function pruneIncremental(db: Database.Database, opts: SweepOpts): SweepR
       "DELETE FROM transcripts WHERE id IN (SELECT id FROM transcripts WHERE ts < ? ORDER BY id LIMIT ?)",
       [ttlCutoffMs(opts.now, opts.transcriptsTtlDays)]);
   } catch { /* pre-v13 DB: table absent, skip */ }
+  // Turn-arbiter program T4 telemetry (schema v14): same batched, 30d-default pattern as its v9
+  // siblings — extracted (see pruneJumpOverAndArbiterDrain's own doc) so its try/catch doesn't add
+  // to this function's own branch count.
+  pruneJumpOverAndArbiterDrain(opts, step);
   // W5 (BUG-013 residual): the batched TTL twin of the boot attention prune — two-tier (active vs
   // shorter dismissed) so SweepResult.deleted reports an "attention" category. Own try/catch so a
   // pre-attention-table DB skips it. (Cap-eviction is boot-only, design §6 — the sweep is TTL-only.)

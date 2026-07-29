@@ -56,3 +56,16 @@ export function shouldSpeakReadyAck(s: AckTurnState): AckDecision {
   if (s.now - s.lastOperatorSpeechAt < (s.holdMs ?? OPERATOR_HOLD_MS)) return "defer";
   return "speak";
 }
+
+/**
+ * co-design spec A's turn-aware boolean (turn-arbiter program, Wave 3): === (shouldSpeakReadyAck(s)
+ * === "speak"). A memory brief is never SPOKEN aloud (it's injected as `CONTEXT ... do not read
+ * aloud`), so both non-clear arms of the trichotomy (defer AND suppress) collapse to the SAME
+ * answer here -- "commit the context, don't invite a turn" -- unlike the ready-ack's own defer/
+ * suppress split, a barge-in must NOT drop the brief (see composeBriefEnvelope in
+ * src/voice/index.ts, which frames it as passive context instead). DERIVED from the existing
+ * trichotomy, not a parallel clock -- the two can never drift apart.
+ */
+export function briefTurnComplete(s: AckTurnState): boolean {
+  return shouldSpeakReadyAck(s) === "speak";
+}

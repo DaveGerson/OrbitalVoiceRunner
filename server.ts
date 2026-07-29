@@ -68,6 +68,7 @@ import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow,
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
+import { createTurnArbiter } from "./src/voice/turnArbiter";
 // BEAD wsm-e2e-pinned-s1ap: the scripted Gemini Live connector + its control-channel business logic.
 // Gated at every layer on isScriptedLiveModeEnabled() — see the boot call site inside startServer()
 // and registerScriptedLiveControlRoutes below.
@@ -1781,7 +1782,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // returned handlers are bound onto the manager, exactly mirroring the inline `manager.onOutput = ...`
   // / `manager.onIdle = ...` assignments this replaced. The pipeline's private state (lastStates,
   // outputBuffers, flushTimeout) lives as locals inside attachObserve, scoped to this server instance.
-  const { onOutput, onIdle, onRunning, onQuiescing, onExit } = attachObserve(manager, {
+  const { onOutput, onIdle, onRunning, onQuiescing, onExit, completionKindFor } = attachObserve(manager, {
     broadcast,
     announcementBus,
     paneSignalBus,
@@ -1828,6 +1829,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // sweep — moved to src/gating/index.ts. Constructed HERE (before the REST mount + the WS/voice block)
   // so every surface injects the SAME pending stores. pushApprovalNarration is an INJECTED slot so
   // gating never imports voice. See src/gating/index.ts.
+  //
+  // Turn-arbiter program, Wave 4 (spec §3.3/§4-W4; audit §2.5 "producer proliferation"): the ONE
+  // shared arbiter every model-bound producer submits into — gating's five timer call-sites AND the
+  // voice layer's completions/acks/passive-context join the SAME queue, so a single turn-clear
+  // drains ONE severity-ordered digest instead of a wall-clock accident across private queues.
+  // Constructed HERE (before either deps bag) so both surfaces inject the SAME instance.
+  const turnArbiter = createTurnArbiter();
   const gating = createGating({
     manager,
     store,
@@ -1839,6 +1847,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     pushApprovalNarration,
     sanitizeSettingsForClient,
     addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
+    turnArbiter,
   });
   // Destructure the gating seam so the existing inline call sites across the REST + WS surfaces keep
   // referencing these by name. ONE shared object by reference — the pending stores + the posture
@@ -2210,6 +2219,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     memory,
     setLastInteractionId: (v) => { lastInteractionId = v; },
     pushApprovalNarration,
+    // Turn-arbiter program, Wave 3 (spec §3.3 row 4): the SAME settled-outcome resolver the fikj.7
+    // earcon enqueue uses, so vc-C's class-3 completion facts can never disagree with it.
+    completionKindFor,
+    // Turn-arbiter program, Wave 4 (spec §3.3/§4-W4): the SAME shared instance injected into
+    // createGating above — one queue, one drain, across both surfaces.
+    turnArbiter,
     REGISTRY,
     runAction,
     resultToToolResponse,
