@@ -56,3 +56,44 @@ export function respawnFromLedger(
   ctx.broadcastTerminalsUpdated();
   return message;
 }
+
+/** fikj.11 (vc-D): the restart-claim seam shared by the LIVE handler (panes_rest.ts) and the
+ *  replay builder (actionEffects.ts) — kept in the respawn home both already import so the two
+ *  mirrored restart paths cannot drift. Best-effort: a correction fault never breaks the restart. */
+export type RestartClaimLedger = {
+  record(claim: {
+    claimId: string; paneId: string;
+    kind: "dispatch" | "restart" | "completion" | "readiness";
+    assertedText: string; assertedAt: number; spoken: boolean;
+  }): void;
+  invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): unknown;
+};
+
+/** Record the ACK-before-readiness claim at ack time. Returns the claimId the async arms retract
+ *  by. Time-suffixed: a repeat restart supersedes its predecessor through the ledger's own
+ *  (pane, kind) supersession — never a duplicate correction. */
+export function recordRestartClaim(ledger: RestartClaimLedger | undefined, paneId: string, assertedText: string): string {
+  const claimId = `restart:${paneId}:${Date.now()}`;
+  if (!ledger) return claimId;
+  try {
+    ledger.record({ claimId, paneId, kind: "restart", assertedText, assertedAt: Date.now(), spoken: true });
+  } catch (e) {
+    console.error(`[vc-d] restart claim record failed for ${paneId}:`, e);
+  }
+  return claimId;
+}
+
+/** Retract a restart-ack claim (exception severity — a not-up pane is the worst kind of news). */
+export function invalidateRestartClaim(
+  ledger: RestartClaimLedger | undefined,
+  claimId: string,
+  paneId: string,
+  groundTruth: string,
+): void {
+  if (!ledger) return;
+  try {
+    ledger.invalidate(claimId, `pane ${paneId}: ${groundTruth}`, { severity: "exception" });
+  } catch (e) {
+    console.error(`[vc-d] restart claim invalidate failed for ${paneId}:`, e);
+  }
+}

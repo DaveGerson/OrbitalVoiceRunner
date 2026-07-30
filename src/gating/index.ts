@@ -348,6 +348,7 @@ export function createGating(deps: GatingDeps): Gating {
           broadcast,
           broadcastLedgerUpdate,
           sanitizeSettingsForClient,
+          correctionLedger: deps.correctionLedger,
           setActivePane: (id) => { coreState.activePaneId = id; },
         },
       );
@@ -1197,10 +1198,16 @@ export function createGating(deps: GatingDeps): Gating {
   function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
     // Claim already won inside resolveDecision — this is the single write path.
     // fikj.11 / co-design §D (a2tp ships-now ordering): an Exited-but-present pane CANNOT receive a
-    // dispatch — writeInput would silently buffer into pendingInput (src/terminal.ts:1216) and even
-    // optimistically flip status to Running, making "Dispatching now" a FALSE claim. Same check the
-    // Full-Auto arm already applies (src/dispatch/paneWrite.ts). Narrate the honest failure as the
-    // FIRST claim (renderDeadPane) instead of an optimistic claim that needs retracting.
+    // dispatch — writeInput never runs it (applyStatusEvent early-returns on Exited, so the status
+    // does not even flip). Two real failure modes, both making "Dispatching now" a FALSE claim:
+    //   (a) a crash-in-place Exited pane keeps its DEAD transport (self-exit does not null it), so
+    //       the write is silently DISCARDED into the corpse;
+    //   (b) a STOPPED pane (transport nulled) buffers the write into pendingInput
+    //       (src/terminal.ts:1216) — which start() preserves across a stop→start gap
+    //       (src/terminal.ts:1123-1124), so it would REPLAY on a later restart: a
+    //       surprise-later-execution hazard, not a dispatch.
+    // Same check the Full-Auto arm already applies (src/dispatch/paneWrite.ts). Narrate the honest
+    // failure as the FIRST claim (renderDeadPane) instead of an optimistic claim that needs retracting.
     const term = manager.terminals[record.terminalId];
     if (!term || term.status === "Exited") {
       renderDeadPane(record, safeInstr, session);
