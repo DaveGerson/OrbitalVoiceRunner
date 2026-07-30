@@ -590,6 +590,91 @@ export function isJumpOverSend(opts: { turnComplete: boolean; cls?: 0 | 1 | 2 | 
   return shouldSpeakReadyAck(opts.ack) !== "speak";
 }
 
+/** fikj.11 (vc-D producer 3): the voice layer's structural view of src/voice/correctionLedger.ts.
+ *  Kept structural (not the factory's inferred type) so test fakes stay trivially satisfiable. */
+export interface CorrectionLedgerSeam {
+  record(claim: {
+    claimId: string; paneId: string;
+    kind: "dispatch" | "restart" | "completion" | "readiness";
+    assertedText: string; assertedAt: number; spoken: boolean;
+  }): void;
+  invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): { corrected: boolean; reason?: string };
+  latestSpokenClaim(paneId: string): { claimId: string; kind: string; assertedAt: number } | undefined;
+}
+
+/**
+ * recordSpokenCompletionClaims -- fikj.11: vc-C completion claims are recorded AT THE DRAIN SINK,
+ * the only place spokenness is ground truth: a class-3 item drained under a passive-context dial
+ * (D4) never completes a turn, so it records spoken:false and a later invalidate correctly skips
+ * it (never-spoken rule) instead of retracting words nobody heard. Tail items ARE audible — the
+ * rendered digest carries their facts verbatim (renderArbiterDigest) — so they record too. Pure
+ * over its inputs; the caller supplies `now` and whether the send genuinely landed as a turn.
+ */
+export function recordSpokenCompletionClaims(
+  digest: Digest,
+  spokenTurn: boolean,
+  ledger: Pick<CorrectionLedgerSeam, "record"> | undefined,
+  now: number,
+): void {
+  if (!ledger) return;
+  [digest.headline, ...digest.tail].forEach((it, i) => {
+    if (it.cls !== 3 || !it.paneId) return;
+    ledger.record({
+      claimId: `completion:${it.paneId}:${now}:${i}`,
+      paneId: it.paneId,
+      kind: "completion",
+      assertedText: it.facts,
+      assertedAt: now,
+      spoken: spokenTurn,
+    });
+  });
+}
+
+/** fikj.11: the false-done residue guard's recency bound (co-design §D: "idle/error/exited signals
+ *  contradicting a RECENT Change-C completion claim"). PRODUCER-side — this is NOT a ledger
+ *  staleness clock: a pending correction still never decays anywhere. It only decides whether a
+ *  fresh bus signal genuinely contradicts the last spoken claim. */
+export const COMPLETION_CONTRADICTION_WINDOW_MS = 15_000;
+
+/**
+ * completionContradiction -- elects a retraction plan (claimId + ground truth) when an error/exited
+ * pane signal contradicts a JUST-SPOKEN completion claim on the same pane. Every other case is
+ * null: wrong signal kind, no ledger, no spoken claim, claim of a DIFFERENT kind (a pane exiting
+ * after a dispatch claim is NOT evidence the dispatch never happened — that would be a FALSE
+ * correction, the one thing worse than a missing one), or outside the recency window. Consumes the
+ * EXISTING pane-signal bus — no new liveness check is implemented here.
+ */
+export function completionContradiction(
+  sig: { paneId: string; kind: string },
+  ledger: Pick<CorrectionLedgerSeam, "latestSpokenClaim"> | undefined,
+  now: number,
+): { claimId: string; groundTruth: string } | null {
+  if (!ledger || (sig.kind !== "error" && sig.kind !== "exited")) return null;
+  const claim = ledger.latestSpokenClaim(sig.paneId);
+  if (!claim || claim.kind !== "completion") return null;
+  if (now - claim.assertedAt > COMPLETION_CONTRADICTION_WINDOW_MS) return null;
+  const what = sig.kind === "error" ? "reported an error" : "exited";
+  return {
+    claimId: claim.claimId,
+    groundTruth: `pane ${sig.paneId} ${what} right after the completion was announced — it did not finish cleanly`,
+  };
+}
+
+/** fikj.11: the pane-signal subscriber's contradiction arm, extracted whole (election + invalidate
+ *  + the fail-soft catch) so the subscriber callback stays under the complexity gates. A ledger
+ *  fault never blocks the signal path; the ledger itself submits the class-0 retraction (there is
+ *  NO new model-bound send here). */
+function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): void {
+  try {
+    const contradiction = completionContradiction(sig, ledger, Date.now());
+    if (contradiction && ledger) {
+      ledger.invalidate(contradiction.claimId, contradiction.groundTruth, { severity: "exception" });
+    }
+  } catch (e) {
+    console.error("[vc-d] completion contradiction check failed:", e);
+  }
+}
+
 /**
  * sendArbiterDigest -- the ONE choke point (spec §3.3: "one module owns every model-bound send")
  * where a drained Digest becomes an actual injection: render (renderArbiterDigest), send, and
@@ -605,12 +690,22 @@ function sendArbiterDigest(
   ack: AckTurnState,
   digest: Digest,
   mode: DeliveryMode,
+  ledger?: CorrectionLedgerSeam,
 ): void {
   const rendered = renderArbiterDigest(digest, mode);
+  let sent = true;
   try {
     session.sendClientContent({ turns: [{ role: "user", parts: [{ text: rendered.text }] }], turnComplete: rendered.turnComplete });
   } catch (e) {
+    sent = false;
     console.error("[turn-arbiter] drain send failed:", e);
+  }
+  // fikj.11: record vc-C completion claims HERE, where spokenness is ground truth (a failed send
+  // or a passive-context turn is NOT a spoken claim). Best-effort — never breaks the drain.
+  try {
+    recordSpokenCompletionClaims(digest, sent && rendered.turnComplete, ledger, Date.now());
+  } catch (e) {
+    console.error("[vc-d] completion claim record failed:", e);
   }
   if (!store) return;
   const headlineCls = digest.headline.cls as 0 | 1 | 2 | 3 | 4 | 5;
@@ -759,6 +854,11 @@ export interface VoiceDeps {
    *  instance (see the connection-scoped `sharedArbiter` below) — never a throw, never a second
    *  implementation of the decision core. */
   turnArbiter?: TurnArbiter;
+  /** fikj.11 (vc-D): the ONE server-constructed correction ledger (same instance gating + the REST
+   *  ActionContext receive). The drain sink records spoken class-3 completion claims into it; the
+   *  pane-signal subscriber retracts them on a contradicting error/exited signal. Optional — a
+   *  hand-built harness that injects none simply produces no completion claims. */
+  correctionLedger?: CorrectionLedgerSeam;
 }
 
 /**
@@ -862,6 +962,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     policies,
     completionKindFor,
     turnArbiter,
+    correctionLedger,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -2608,7 +2709,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // settle cadence, so the forced-turn interrupt send IS the phrase-boundary delivery.
           const plan = digestSendPlan(decision);
           if (!plan.send) return;
-          sendArbiterDigest(justConnected, store, state.voiceSessionId, ackState(), plan.digest, plan.mode);
+          sendArbiterDigest(justConnected, store, state.voiceSessionId, ackState(), plan.digest, plan.mode, correctionLedger);
         };
 
         const armArbiterDrain = () => {
@@ -2629,6 +2730,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         armArbiterDrain();
 
         const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
+          // fikj.11 (vc-D): a fresh error/exited signal contradicting a JUST-SPOKEN completion
+          // claim retracts it (closes vc-C's false-done residue — co-design §D). Kind- and
+          // recency-scoped inside completionContradiction so a dispatch/restart claim, an old
+          // completion, or an unspoken one can NEVER yield a false correction.
+          retractContradictedCompletion(sig, correctionLedger);
           // W3 fold: paneSignalClass is the ONE classifier deciding which arbiter class a pane
           // signal submits as — class 4 (created/closed, the operator-facing acks the old ready-defer
           // trichotomy gated) defers through the shared arbiter above; class 5 (idle/error/prompt/
