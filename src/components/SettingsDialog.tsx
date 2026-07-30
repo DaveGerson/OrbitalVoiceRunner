@@ -23,6 +23,12 @@ import {
   jsonAdvancedPatch,
   jsonHasAdvancedGates,
   mergeAnnouncements,
+  deriveDialFields,
+  dialModeOptions,
+  DIAL_CLASS_LABELS,
+  type DialClass,
+  type DialMode,
+  type CompletionAnnounceTier,
   terminalMatchesPreset,
   derivePresetStatus,
   formatContextFootprint,
@@ -126,6 +132,9 @@ export function SettingsDialog({
   const [groundingEnabled, setGroundingEnabled] = useState<boolean>(false);
   // tkd: should-I-speak (silence) gate toggle. Off by default; config (not a secret). Experimental.
   const [silenceGate, setSilenceGate] = useState<boolean>(false);
+  // fikj.12: the D4 delivery dial (per-class narration delivery) + vc-C completionAnnounce tier.
+  const [deliveryMatrix, setDeliveryMatrix] = useState<Record<DialClass, DialMode>>(deriveDialFields(null).deliveryMatrix);
+  const [completionAnnounce, setCompletionAnnounce] = useState<CompletionAnnounceTier>("dispatched");
 
   // P0b memory synthesizer settings. Surfaces the existing backend-only keys.
   const [memoryPythonEnabled, setMemoryPythonEnabled] = useState<boolean>(true);
@@ -212,6 +221,8 @@ export function SettingsDialog({
     setSystemPrompt(v.systemPrompt);
     setGroundingEnabled(v.groundingEnabled);
     setSilenceGate(v.silenceGate);
+    setDeliveryMatrix(v.deliveryMatrix);
+    setCompletionAnnounce(v.completionAnnounce);
 
     const pr = deriveProjectFields(s);
     setActiveContext(pr.activeContext);
@@ -271,7 +282,11 @@ export function SettingsDialog({
         // aqx (build-out): persist undefined when off so "off" stays the implicit default in settings files.
         groundingEnabled: groundingEnabled || undefined,
         // tkd: persist undefined when off so "off" stays the implicit default in settings files.
-        silenceGate: silenceGate || undefined
+        silenceGate: silenceGate || undefined,
+        // fikj.12: ALWAYS compiled in — omitting these here would erase them on every save (the
+        // 8sq drop-on-save data-loss class the capabilityGates round-trip guard pins).
+        deliveryMatrix,
+        completionAnnounce
       },
       projects: {
         activeContext,
@@ -313,7 +328,7 @@ export function SettingsDialog({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- getCompiledSettings is an unstable body fn; the explicit dep list below already enumerates every form-state input it reads.
   }, [
-    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate,
+    activeTab, port, host, appUrl, voice, voiceStyle, volume, isMicMuted, model, systemPrompt, groundingEnabled, silenceGate, deliveryMatrix, completionAnnounce,
     activeContext, localWorkspacePath, presets, maxBufferLines,
     idleTimeoutMs, agentIdleTimeoutMs, defaultShellCommand, globalPermissionsMode, historyMaxCommands, historyMaxOutputLength, geminiApiKey,
     announcements, capabilityGates, postureProfiles, memoryPythonEnabled, memorySynthTimeoutMs
@@ -355,6 +370,7 @@ export function SettingsDialog({
     applyPatch(jsonVoicePatch(parsed), {
       voice: setVoice, voiceStyle: setVoiceStyle, volume: setVolume, isMicMuted: setIsMicMuted,
       model: setModel, systemPrompt: setSystemPrompt, groundingEnabled: setGroundingEnabled, silenceGate: setSilenceGate,
+      deliveryMatrix: setDeliveryMatrix, completionAnnounce: setCompletionAnnounce,
     });
     applyPatch(jsonProjectsPatch(parsed), { activeContext: setActiveContext, localWorkspacePath: setLocalWorkspacePath });
 
@@ -997,6 +1013,51 @@ export function SettingsDialog({
           </span>
         </span>
       </label>
+
+      {/* fikj.12 (turn-arbiter D4): the per-class narration delivery dial. Classes 0/2 structurally
+          exclude passive-context (the never-silent floor); the server boundary clamps hand-edited
+          files the same way. Applies LIVE on save — no reconnect. */}
+      <div className="p-3 bg-black/30 border border-white/10 rounded-lg">
+        <span className="text-zinc-300 font-bold block text-xs mb-1">Narration delivery (per class)</span>
+        <span className="text-xs text-zinc-500 leading-relaxed block mb-2">
+          How each narration class reaches you: forced turn (always spoken at the next turn-clear),
+          steered digest (spoken when it warrants speech), or passive context (context only, never a
+          spoken turn). Corrections and deadline narrations can never be passive. Applies on save.
+        </span>
+        {(Object.keys(DIAL_CLASS_LABELS) as DialClass[]).map(cls => (
+          <div key={cls} className="flex items-center justify-between gap-3 py-1">
+            <span className="min-w-0">
+              <span className="text-zinc-300 block text-xs">{`Class ${cls} — ${DIAL_CLASS_LABELS[cls].label}`}</span>
+              <span className="text-xs text-zinc-600 block">{DIAL_CLASS_LABELS[cls].hint}</span>
+            </span>
+            <select
+              data-testid={`settings-dial-class-${cls}`}
+              value={deliveryMatrix[cls]}
+              onChange={e => setDeliveryMatrix(prev => ({ ...prev, [cls]: e.target.value as DialMode }))}
+              className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
+            >
+              {dialModeOptions(cls).map(m => (<option key={m} value={m}>{m}</option>))}
+            </select>
+          </div>
+        ))}
+        <div className="flex items-center justify-between gap-3 py-1 mt-2 border-t border-white/5 pt-2">
+          <span className="min-w-0">
+            <span className="text-zinc-300 block text-xs">Completion announcements</span>
+            <span className="text-xs text-zinc-600 block">
+              off = earcon only · exceptions = failures/questions · dispatched = anything you started
+              (default) · all = every idle
+            </span>
+          </span>
+          <select
+            data-testid="settings-completion-announce"
+            value={completionAnnounce}
+            onChange={e => setCompletionAnnounce(e.target.value as CompletionAnnounceTier)}
+            className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
+          >
+            {(["off", "exceptions", "dispatched", "all"] as const).map(t => (<option key={t} value={t}>{t}</option>))}
+          </select>
+        </div>
+      </div>
 
       {/* Reconnect button for voice/model/API key changes */}
       <div className="p-3 bg-cyan-950/20 border border-cyan-500/20 rounded-lg flex items-center justify-between gap-3">

@@ -10,6 +10,8 @@
  * booting the browser bundle (tests/test_settingsdialog_complexity_refactor.ts).
  */
 import type { CliPreset, SystemSettings } from "../types";
+import { normalizeDeliveryMatrix } from "../voice/turnArbiter";
+import { normalizeCompletionAnnounce } from "../voice/completionPolicy";
 
 // ─── Coercion primitives ─────────────────────────────────────────────────────
 // Tiny, single-decision helpers that absorb the per-field `||` / `??` / `!== undefined` branches so
@@ -114,6 +116,42 @@ export function deriveServerFields(s: SystemSettings | null): ServerFields {
   };
 }
 
+// ─── fikj.12: the D4 delivery dial (per-class narration delivery + completionAnnounce) ─────────
+
+export type DialClass = "0" | "2" | "3" | "4" | "5";
+export type DialMode = "forced-turn" | "steered-digest" | "passive-context";
+export type CompletionAnnounceTier = "off" | "exceptions" | "dispatched" | "all";
+
+export const DIAL_CLASS_LABELS: Record<DialClass, { label: string; hint: string }> = {
+  "0": { label: "Corrections", hint: "Retractions of narrated claims. Floor: never passive." },
+  "2": { label: "Deadline narrations", hint: "Approval last-calls, autonomy warnings/expiry. Floor: never passive." },
+  "3": { label: "Completions", hint: "Deterministic pane-finished narration." },
+  "4": { label: "Acks", hint: "Pane created/closed acknowledgements." },
+  "5": { label: "Background context", hint: "Memory briefs + passive pane signals." },
+};
+
+/** The floor, structurally: classes 0/2 never OFFER passive-context, so the dialog cannot even
+ *  express an under-floor value (the server boundary clamp is the backstop for hand-edited files). */
+export function dialModeOptions(cls: DialClass): DialMode[] {
+  return cls === "0" || cls === "2"
+    ? ["forced-turn", "steered-digest"]
+    : ["forced-turn", "steered-digest", "passive-context"];
+}
+
+export interface DialFields {
+  deliveryMatrix: Record<DialClass, DialMode>;
+  completionAnnounce: CompletionAnnounceTier;
+}
+
+/** Normalized (clamped) dial fields for display — the dialog never shows an under-floor value. */
+export function deriveDialFields(s: SystemSettings | null): DialFields {
+  const { matrix } = normalizeDeliveryMatrix(s?.voiceAi?.deliveryMatrix);
+  return {
+    deliveryMatrix: { "0": matrix[0], "2": matrix[2], "3": matrix[3], "4": matrix[4], "5": matrix[5] },
+    completionAnnounce: normalizeCompletionAnnounce(s?.voiceAi?.completionAnnounce),
+  };
+}
+
 export interface VoiceFields {
   voice: string;
   voiceStyle: "Direct" | "Creative" | "Concise" | "Explanatory";
@@ -123,6 +161,9 @@ export interface VoiceFields {
   systemPrompt: string;
   groundingEnabled: boolean;
   silenceGate: boolean;
+  // fikj.12: the D4 dial rides the same voice-tab field group.
+  deliveryMatrix: Record<DialClass, DialMode>;
+  completionAnnounce: CompletionAnnounceTier;
 }
 export function deriveVoiceFields(s: SystemSettings | null): VoiceFields {
   const v = s?.voiceAi;
@@ -135,6 +176,7 @@ export function deriveVoiceFields(s: SystemSettings | null): VoiceFields {
     systemPrompt: nn(v?.systemPrompt, ""),
     groundingEnabled: nn(v?.groundingEnabled, false),
     silenceGate: nn(v?.silenceGate, false),
+    ...deriveDialFields(s),
   };
 }
 
@@ -203,6 +245,10 @@ export function jsonVoicePatch(parsed: any): Partial<VoiceFields> {
   if (v.systemPrompt !== undefined) out.systemPrompt = v.systemPrompt ?? "";
   if (v.groundingEnabled !== undefined) out.groundingEnabled = !!v.groundingEnabled;
   if (v.silenceGate !== undefined) out.silenceGate = !!v.silenceGate;
+  if (v.deliveryMatrix !== undefined) {
+    out.deliveryMatrix = deriveDialFields({ voiceAi: { deliveryMatrix: v.deliveryMatrix } } as SystemSettings).deliveryMatrix;
+  }
+  if (v.completionAnnounce !== undefined) out.completionAnnounce = normalizeCompletionAnnounce(v.completionAnnounce);
   return out;
 }
 
