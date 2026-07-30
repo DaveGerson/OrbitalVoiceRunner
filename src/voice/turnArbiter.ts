@@ -144,9 +144,10 @@ export interface TurnArbiter {
   /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
   floorPausedMs(coalesceKey: string): number;
   /** D4 (fikj.12): live re-dial. Re-normalizes `raw` (the SAME floor clamp + fallback as
-   *  construction — defense in depth) and swaps the ACTIVE matrix in place: already-queued items
+   *  construction -- defense in depth) and swaps the ACTIVE matrix in place: already-queued items
    *  drain under the new modes, nothing is dropped or reconstructed. Violations are returned for
-   *  the settings boundary to surface. */
+   *  the settings boundary to surface. FULL REPLACE -- classes absent from `raw` revert to their
+   *  defaults; always pass the complete persisted matrix, never a delta. */
   updateMatrix(raw: unknown): NormalizeMatrixResult;
 }
 

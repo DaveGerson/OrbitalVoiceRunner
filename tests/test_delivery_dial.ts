@@ -57,3 +57,76 @@ test("updateMatrix falls back to per-class defaults on garbage and reports class
   assert.ok(result.violations.some((v: string) => v.includes("class 1")), "class 1 has no dial — reported, ignored");
   assert.strictEqual(result.matrix[3], DEFAULT_DELIVERY_MATRIX[3], "garbage falls back to the class default, never a throw");
 });
+
+test("updateMatrix is a FULL REPLACE: classes absent from a later call revert to their defaults (never pass a delta)", () => {
+  const arb: AnyRec = createTurnArbiter();
+  arb.updateMatrix({ "4": "forced-turn" });
+  const second = arb.updateMatrix({ "3": "passive-context" });
+  assert.strictEqual(second.matrix[4], DEFAULT_DELIVERY_MATRIX[4],
+    "class 4 reverted to its default -- a delta call un-dials every unspecified class");
+  arb.submit({ facts: "pane p1 acked", cls: 4, paneId: "p1" });
+  const d = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  assert.strictEqual(d.mode, DEFAULT_DELIVERY_MATRIX[4],
+    "the live drain uses the reverted default, not the stale earlier dial");
+});
+
+test("class 1 (operator-response) is dial-immune: the immediate path drains forced-turn regardless of the matrix", () => {
+  const arb: AnyRec = createTurnArbiter();
+  arb.updateMatrix({ "0": "steered-digest", "2": "steered-digest", "3": "passive-context", "4": "passive-context", "5": "passive-context" });
+  arb.submit({ facts: "answering the operator", cls: 1 });
+  const d = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  assert.strictEqual(d.mode, "forced-turn", "the class-1 immediate path is not dialable");
+});
+
+// ── Task 2: the settings boundary (server.ts validateSettingsPutBody) ──────────────────────────
+// server.ts is imported DEFERRED (env guards at module top of this file) — the same preamble
+// tests/helpers/mockLive.ts uses, so no real listener boots.
+
+const { validateSettingsPutBody } = await import("../server");
+
+test("PUT boundary: an under-floor deliveryMatrix CLAMPS in place and surfaces dialViolations (never a 400)", () => {
+  const body: AnyRec = { voiceAi: { deliveryMatrix: { "0": "passive-context", "3": "passive-context" } } };
+  const v: AnyRec = validateSettingsPutBody(body);
+  assert.strictEqual(v.ok, true, "an under-floor value is a policy clamp, not a rejection");
+  assert.ok(Array.isArray(v.dialViolations), "fikj.12 feature absent: validateSettingsPutBody must return dialViolations");
+  assert.strictEqual(v.dialViolations.length, 1, "exactly the class-0 clamp is reported");
+  assert.strictEqual(body.voiceAi.deliveryMatrix["0"], "steered-digest", "clamped IN PLACE — the persisted value is the clamped truth");
+  assert.strictEqual(body.voiceAi.deliveryMatrix["3"], "passive-context", "class 3 has no floor — passes through");
+});
+
+test("PUT boundary: unknown matrix class keys are dropped by normalization; garbage values fall back + report", () => {
+  const body: AnyRec = { voiceAi: { deliveryMatrix: { "7": "forced-turn", "4": "loud" } } };
+  const v: AnyRec = validateSettingsPutBody(body);
+  assert.strictEqual(v.ok, true);
+  assert.strictEqual(body.voiceAi.deliveryMatrix["7"], undefined, "unknown class stripped (the full normalized matrix replaces the raw map)");
+  assert.strictEqual(body.voiceAi.deliveryMatrix["4"], DEFAULT_DELIVERY_MATRIX[4], "garbage value -> the class default");
+  assert.ok(v.dialViolations.some((s: string) => s.includes("class 4")), "the fallback is reported");
+});
+
+test("PUT boundary: a non-enum completionAnnounce is a 400 naming the field (retired 'focused' included)", () => {
+  const v: AnyRec = validateSettingsPutBody({ voiceAi: { completionAnnounce: "focused" } });
+  assert.strictEqual(v.ok, false, "strict-when-present, same as voiceUx.sitrepShape");
+  assert.ok(String(v.error).includes("voiceAi.completionAnnounce"), `error names the field, got: ${v.error}`);
+  const ok: AnyRec = validateSettingsPutBody({ voiceAi: { completionAnnounce: "exceptions" } });
+  assert.strictEqual(ok.ok, true);
+});
+
+test("PUT boundary: absent voiceAi / absent dial fields are untouched (back-compat)", () => {
+  const v1: AnyRec = validateSettingsPutBody({ advanced: { globalPermissionsMode: "Inherit" } });
+  assert.strictEqual(v1.ok, true);
+  assert.deepStrictEqual(v1.dialViolations ?? [], [], "no dial fields -> no violations");
+  const v2: AnyRec = validateSettingsPutBody({ voiceAi: { voice: "Zephyr" } });
+  assert.strictEqual(v2.ok, true, "a voiceAi block without dial fields validates exactly as before");
+});
+
+test("server.ts constructs the boot arbiter FROM settings and wires the PUT re-dial (source conformance)", () => {
+  const src = fs.readFileSync(path.resolve(repoRoot, "server.ts"), "utf-8");
+  assert.ok(src.includes("createTurnArbiter({ matrix: manager.settings.voiceAi?.deliveryMatrix })"),
+    "fikj.12 feature absent: the boot arbiter must be constructed from the persisted deliveryMatrix");
+  assert.ok(src.includes("applyDeliveryDial"),
+    "fikj.12 feature absent: the settings PUT must re-dial the LIVE arbiter (applyDeliveryDial dep)");
+  assert.ok(src.includes("turnArbiter.updateMatrix(manager.settings.voiceAi?.deliveryMatrix)"),
+    "the re-dial must read the (already clamped + persisted) settings value");
+});
