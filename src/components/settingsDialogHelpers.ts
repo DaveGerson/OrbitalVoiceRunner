@@ -10,8 +10,8 @@
  * booting the browser bundle (tests/test_settingsdialog_complexity_refactor.ts).
  */
 import type { CliPreset, SystemSettings } from "../types";
-import { normalizeDeliveryMatrix } from "../voice/turnArbiter";
-import { normalizeCompletionAnnounce } from "../voice/completionPolicy";
+import { normalizeDeliveryMatrix, type DeliveryMode } from "../voice/turnArbiter";
+import { normalizeCompletionAnnounce, type CompletionAnnounce } from "../voice/completionPolicy";
 
 // ─── Coercion primitives ─────────────────────────────────────────────────────
 // Tiny, single-decision helpers that absorb the per-field `||` / `??` / `!== undefined` branches so
@@ -119,8 +119,8 @@ export function deriveServerFields(s: SystemSettings | null): ServerFields {
 // ─── fikj.12: the D4 delivery dial (per-class narration delivery + completionAnnounce) ─────────
 
 export type DialClass = "0" | "2" | "3" | "4" | "5";
-export type DialMode = "forced-turn" | "steered-digest" | "passive-context";
-export type CompletionAnnounceTier = "off" | "exceptions" | "dispatched" | "all";
+export type DialMode = DeliveryMode;
+export type CompletionAnnounceTier = CompletionAnnounce;
 
 export const DIAL_CLASS_LABELS: Record<DialClass, { label: string; hint: string }> = {
   "0": { label: "Corrections", hint: "Retractions of narrated claims. Floor: never passive." },

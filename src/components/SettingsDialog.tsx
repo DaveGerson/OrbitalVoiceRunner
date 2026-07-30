@@ -62,6 +62,11 @@ import {
   Shield
 } from "lucide-react";
 
+// fikj.12 review rider: hoisted so both the deliveryMatrix and completionAnnounce useState
+// initializers share ONE derivation of the D4 defaults instead of one calling deriveDialFields(null)
+// and the other hardcoding the literal "dispatched" tier (drift risk if the default ever changes).
+const DIAL_DEFAULTS = deriveDialFields(null);
+
 function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
     // bead 8sq: carry per-preset capabilityGates through the rebuild (was being dropped on save).
@@ -133,8 +138,8 @@ export function SettingsDialog({
   // tkd: should-I-speak (silence) gate toggle. Off by default; config (not a secret). Experimental.
   const [silenceGate, setSilenceGate] = useState<boolean>(false);
   // fikj.12: the D4 delivery dial (per-class narration delivery) + vc-C completionAnnounce tier.
-  const [deliveryMatrix, setDeliveryMatrix] = useState<Record<DialClass, DialMode>>(deriveDialFields(null).deliveryMatrix);
-  const [completionAnnounce, setCompletionAnnounce] = useState<CompletionAnnounceTier>("dispatched");
+  const [deliveryMatrix, setDeliveryMatrix] = useState<Record<DialClass, DialMode>>(DIAL_DEFAULTS.deliveryMatrix);
+  const [completionAnnounce, setCompletionAnnounce] = useState<CompletionAnnounceTier>(DIAL_DEFAULTS.completionAnnounce);
 
   // P0b memory synthesizer settings. Surfaces the existing backend-only keys.
   const [memoryPythonEnabled, setMemoryPythonEnabled] = useState<boolean>(true);
@@ -1032,9 +1037,10 @@ export function SettingsDialog({
             </span>
             <select
               data-testid={`settings-dial-class-${cls}`}
+              aria-label={`Class ${cls} delivery`}
               value={deliveryMatrix[cls]}
               onChange={e => setDeliveryMatrix(prev => ({ ...prev, [cls]: e.target.value as DialMode }))}
-              className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
+              className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500 cursor-pointer"
             >
               {dialModeOptions(cls).map(m => (<option key={m} value={m}>{m}</option>))}
             </select>
@@ -1050,9 +1056,10 @@ export function SettingsDialog({
           </span>
           <select
             data-testid="settings-completion-announce"
+            aria-label="Completion announcements"
             value={completionAnnounce}
             onChange={e => setCompletionAnnounce(e.target.value as CompletionAnnounceTier)}
-            className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500"
+            className="bg-black border border-white/10 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-cyan-500 cursor-pointer"
           >
             {(["off", "exceptions", "dispatched", "all"] as const).map(t => (<option key={t} value={t}>{t}</option>))}
           </select>

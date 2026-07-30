@@ -478,9 +478,13 @@ export interface SystemSettings {
     // delivery matrix. Keys are arbiter classes ("0" corrections, "2" deadline narrations,
     // "3" completions, "4" acks, "5" passive context); class 1 (operator-response) has no dial.
     // ABSENT by default (the voiceUx.sessionPoolHotSlots idiom): normalizeDeliveryMatrix treats
-    // absent as the spec defaults, so a pristine settings file's shape is unchanged. Under-floor
-    // persisted values (passive-context on classes 0/2) CLAMP at every boundary and surface a
-    // violation — no silent value exists in the type. CONFIG (persists to disk), NOT a secret.
+    // absent as the spec defaults, so a pristine settings file's shape is unchanged. NOTE: once the
+    // operator saves through SettingsDialog, getCompiledSettings materializes the FULL matrix (every
+    // class) + the completionAnnounce tier to disk (deliberate anti-erasure design, byte-faithful
+    // to the fikj.12 dial UI) — defaults are frozen at save time, and the boundary re-clamps on every
+    // read regardless. Under-floor persisted values (passive-context on classes 0/2) CLAMP at every
+    // boundary and surface a violation — no silent value exists in the type. CONFIG (persists to
+    // disk), NOT a secret.
     deliveryMatrix?: Partial<Record<"0" | "2" | "3" | "4" | "5", "forced-turn" | "steered-digest" | "passive-context">>;
     // fikj.12: vc-C's completionAnnounce tier (co-design §C). ABSENT => `dispatched` (the LOCKED
     // epic default, hasExchange-keyed). Read LIVE at the idle edge (src/voice/index.ts) — a PUT
