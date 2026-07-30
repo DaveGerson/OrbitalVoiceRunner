@@ -107,5 +107,18 @@ export function createCorrectionLedger(deps: { arbiter: { submit(item: SubmitIte
     return { corrected: true };
   }
 
-  return { record, invalidate };
+  /** fikj.11 (additive): the producer-side read behind contradiction guards. Returns the newest
+   *  SPOKEN claim on a pane so a producer can check KIND and RECENCY before electing an
+   *  invalidation (e.g. an `exited` signal only contradicts a *completion* claim, and only a
+   *  recent one). Policy stays in the producer — this module remains clock-free, and there is
+   *  still no staleness path inside the ledger. */
+  function latestSpokenClaim(
+    paneId: string,
+  ): { claimId: string; kind: CorrectionClaim["kind"]; assertedAt: number } | undefined {
+    const id = latestSpokenByPane.get(paneId);
+    const claim = id ? claims.get(id) : undefined;
+    return claim ? { claimId: claim.claimId, kind: claim.kind, assertedAt: claim.assertedAt } : undefined;
+  }
+
+  return { record, invalidate, latestSpokenClaim };
 }
