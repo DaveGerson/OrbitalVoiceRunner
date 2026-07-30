@@ -125,8 +125,18 @@ test("server.ts constructs the boot arbiter FROM settings and wires the PUT re-d
   const src = fs.readFileSync(path.resolve(repoRoot, "server.ts"), "utf-8");
   assert.ok(src.includes("createTurnArbiter({ matrix: manager.settings.voiceAi?.deliveryMatrix })"),
     "fikj.12 feature absent: the boot arbiter must be constructed from the persisted deliveryMatrix");
-  assert.ok(src.includes("applyDeliveryDial"),
+  assert.ok(src.includes("applyDialAndCollectFragment(validated.dialViolations, applyDeliveryDial)"),
     "fikj.12 feature absent: the settings PUT must re-dial the LIVE arbiter (applyDeliveryDial dep)");
   assert.ok(src.includes("turnArbiter.updateMatrix(manager.settings.voiceAi?.deliveryMatrix)"),
     "the re-dial must read the (already clamped + persisted) settings value");
+});
+
+// ── Task 3: the idle-edge completion policy reads LIVE settings ────────────────────────────────
+
+test("the idle-edge completionNarration site reads voiceAi.completionAnnounce, not the hardcoded default", () => {
+  const src = fs.readFileSync(path.resolve(repoRoot, "src/voice/index.ts"), "utf-8");
+  assert.ok(src.includes("normalizeCompletionAnnounce(manager.settings.voiceAi?.completionAnnounce)"),
+    "fikj.12 feature absent: the production completionNarration call site must read the live setting");
+  assert.ok(!src.includes("policy: DEFAULT_COMPLETION_ANNOUNCE"),
+    "the hardcoded spec default must not remain at the production call site");
 });

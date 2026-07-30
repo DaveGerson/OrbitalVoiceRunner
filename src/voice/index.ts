@@ -66,7 +66,7 @@ import {
   createTurnArbiter, DEFAULT_DELIVERY_MATRIX,
   type DeliveryMode, type Digest, type DrainDecision, type TurnArbiter,
 } from "./turnArbiter";
-import { completionNarration, DEFAULT_COMPLETION_ANNOUNCE } from "./completionPolicy";
+import { completionNarration, normalizeCompletionAnnounce } from "./completionPolicy";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
@@ -2654,7 +2654,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           if (sig.kind === "idle") {
             const outcomeKind = completionKindFor ? completionKindFor(sig.paneId) : "completion";
             const decision = completionNarration({
-              sig, outcomeKind, hasExchange: hasActiveExchange(sig.paneId), policy: DEFAULT_COMPLETION_ANNOUNCE,
+              sig, outcomeKind, hasExchange: hasActiveExchange(sig.paneId),
+              // fikj.12: the operator's LIVE completionAnnounce tier. normalize guards retired
+              // ("focused") / garbage persisted values; absent -> the LOCKED `dispatched` default.
+              // Read per idle edge (pure, cheap) so a settings PUT applies immediately.
+              policy: normalizeCompletionAnnounce(manager.settings.voiceAi?.completionAnnounce),
             });
             if (decision.speak) {
               try { sharedArbiter.submit(decision.item); }

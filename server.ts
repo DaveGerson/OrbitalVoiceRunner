@@ -315,7 +315,7 @@ function clampVoiceAiDialFields(body: Record<string, unknown>): { error: string 
  *  PUT's success shape stays byte-identical. Merges the boundary clamp's violations with the live
  *  re-dial's (normally [] — the boundary already clamped the body in place). Extracted so the PUT
  *  handler stays under the CC gate. */
-function dialViolationsFragment(boundary: string[] | undefined, applyDeliveryDial?: () => string[]): { dialViolations?: string[] } {
+function applyDialAndCollectFragment(boundary: string[] | undefined, applyDeliveryDial?: () => string[]): { dialViolations?: string[] } {
   const dialViolations = [...(boundary ?? []), ...(applyDeliveryDial?.() ?? [])];
   return dialViolations.length ? { dialViolations } : {};
 }
@@ -1455,7 +1455,7 @@ function registerDraftAndSettingsRoutes(
     // fikj.12: apply the (already-clamped) delivery dial to the LIVE arbiter — queued items drain
     // under the new modes immediately; no reconnect, no reconstruction. Violations from the live
     // apply are normally [] (the boundary clamped the body in place above).
-    const dialFragment = dialViolationsFragment(validated.dialViolations, applyDeliveryDial);
+    const dialFragment = applyDialAndCollectFragment(validated.dialViolations, applyDeliveryDial);
     broadcast({
       type: "settings_updated",
       globalPermissionsMode: manager.globalPermissionsMode,
