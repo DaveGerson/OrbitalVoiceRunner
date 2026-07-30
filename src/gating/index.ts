@@ -130,6 +130,19 @@ export interface GatingDeps {
     /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
     floorPausedMs(coalesceKey: string): number;
   };
+  /** fikj.11 (vc-D wiring): the correction-ledger seam. renderApproved records the spoken
+   *  "Dispatching now" DISPATCH claim so ground-truth flips (a2tp commit-time revalidation, qj6s
+   *  launch plans — the named future consumers) can retract it via invalidate; the boot-hydration
+   *  effect builders thread it through to the restart replay (Task 7). OPTIONAL: absent (legacy
+   *  harnesses) => byte-identical behavior. Structural — gating never imports src/voice. */
+  correctionLedger?: {
+    record(claim: {
+      claimId: string; paneId: string;
+      kind: "dispatch" | "restart" | "completion" | "readiness";
+      assertedText: string; assertedAt: number; spoken: boolean;
+    }): void;
+    invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): { corrected: boolean; reason?: string };
+  };
 }
 
 /** The cohesive seam createGating returns. The pending stores + the constants are exposed so the
@@ -226,6 +239,7 @@ export function createGating(deps: GatingDeps): Gating {
     sanitizeSettingsForClient,
     addCommand,
     turnArbiter,
+    correctionLedger,
   } = deps;
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
@@ -1182,14 +1196,47 @@ export function createGating(deps: GatingDeps): Gating {
 
   function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
     // Claim already won inside resolveDecision — this is the single write path.
+    // fikj.11 / co-design §D (a2tp ships-now ordering): an Exited-but-present pane CANNOT receive a
+    // dispatch — writeInput would silently buffer into pendingInput (src/terminal.ts:1216) and even
+    // optimistically flip status to Running, making "Dispatching now" a FALSE claim. Same check the
+    // Full-Auto arm already applies (src/dispatch/paneWrite.ts). Narrate the honest failure as the
+    // FIRST claim (renderDeadPane) instead of an optimistic claim that needs retracting.
+    const term = manager.terminals[record.terminalId];
+    if (!term || term.status === "Exited") {
+      renderDeadPane(record, safeInstr, session);
+      return;
+    }
     beginExchangeDeliveryOnApprove(record);
     addCommand(record.terminalId, record.instruction, record.exchangeId);
-    manager.terminals[record.terminalId]!.writeInput(record.instruction);
+    term.writeInput(record.instruction);
     completeExchangeDeliveryOnApprove(record);
     clearMatchingDraftOnApprove(record);
-    if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+    // Narration stays POST-dispatch (it already was — the write above precedes it). The push result
+    // is the claim's `spoken` flag: 3V.3 semantics — only a strict `false` (or no session) is unheard.
+    const narration = `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`;
+    const spoken = session ? pushApprovalNarration(session, narration) !== false : false;
+    recordDispatchClaim(record, narration, spoken);
     // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
     broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+  }
+
+  /** fikj.11: best-effort dispatch-claim record — a ledger fault must never break the resolution.
+   *  claimId == `dispatch:<messageId>` so a2tp/qj6s can invalidate by approval identity; the
+   *  ledger's (pane, kind) supersession handles repeat dispatches on one pane. */
+  function recordDispatchClaim(record: ResolvedRecord, assertedText: string, spoken: boolean): void {
+    if (!correctionLedger) return;
+    try {
+      correctionLedger.record({
+        claimId: `dispatch:${record.messageId}`,
+        paneId: record.terminalId,
+        kind: "dispatch",
+        assertedText,
+        assertedAt: Date.now(),
+        spoken,
+      });
+    } catch (e) {
+      console.error("[vc-d] dispatch claim record failed:", e);
+    }
   }
 
   function renderDeadPane(record: ResolvedRecord, safeInstr: string, session: any): void {
