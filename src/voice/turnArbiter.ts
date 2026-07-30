@@ -143,6 +143,11 @@ export interface TurnArbiter {
   evaluate(ctx: EvaluateCtx): DrainDecision;
   /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
   floorPausedMs(coalesceKey: string): number;
+  /** D4 (fikj.12): live re-dial. Re-normalizes `raw` (the SAME floor clamp + fallback as
+   *  construction — defense in depth) and swaps the ACTIVE matrix in place: already-queued items
+   *  drain under the new modes, nothing is dropped or reconstructed. Violations are returned for
+   *  the settings boundary to surface. */
+  updateMatrix(raw: unknown): NormalizeMatrixResult;
 }
 
 /** Internal queued representation. Class-1 items never reach here (see submit()). */
@@ -329,5 +334,13 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return lastKnownPausedMs.get(coalesceKey) ?? 0;
   }
 
-  return { submit, evaluate, floorPausedMs };
+  function updateMatrix(raw: unknown): NormalizeMatrixResult {
+    const result = normalizeDeliveryMatrix(raw);
+    // Swap IN PLACE: buildQueueDrain closed over `matrix` by reference, so mutating the same
+    // object re-dials every future drain without touching the queue (never-drop invariant).
+    Object.assign(matrix, result.matrix);
+    return result;
+  }
+
+  return { submit, evaluate, floorPausedMs, updateMatrix };
 }
