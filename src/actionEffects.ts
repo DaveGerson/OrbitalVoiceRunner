@@ -40,6 +40,7 @@ import { findPaneOwningProject } from "./paneOwnership";
 import { activateCreatedPane } from "./paneActivation";
 import { getHistoryBridge } from "./historyBridge";
 import { respawnFromLedger, recordRestartClaim, invalidateRestartClaim } from "./actions/respawnFromLedger";
+import { withPaneLifecycleLock } from "./lifecycleLock";
 import { globalOverrideRiderForMode } from "./globalOverrideRider";
 import type { ActionContext } from "./actions/types";
 
@@ -596,7 +597,11 @@ function buildRespawnPane(intent: ActionIntent, deps: ActionEffectDeps): () => s
     if (term) {
       // fikj.11: same ACK-before-readiness claim + retraction arms as the live handler (lockstep).
       const claimId = recordRestartClaim(deps.correctionLedger, id, `Terminal ${id} restarted.`);
-      void (async () => {
+      // kcc0 lockstep: the SAME per-pane serialization as the live handler (panes_rest.ts) — a
+      // replayed restart queues behind any overlapping lifecycle op on this pane instead of racing
+      // term.stop()/term.start(). Uncontended (every existing replay test), the lock invokes the
+      // closure IMMEDIATELY in the same tick — behavior unchanged.
+      void withPaneLifecycleLock(id, async () => {
         await term.stop();
         // Same synchronous-tick guard as the live handler (kdtu): no await between the checks and
         // term.start() re-opens the 86-during-restart window.
@@ -607,7 +612,7 @@ function buildRespawnPane(intent: ActionIntent, deps: ActionEffectDeps): () => s
         term.start();
         deps.broadcastLedgerUpdate();
         deps.broadcast({ type: "terminals_updated" });
-      })().catch((e: unknown) => {
+      }).catch((e: unknown) => {
         console.error(`[restart_pane replay] deferred restart failed for ${id}:`, e);
         invalidateRestartClaim(deps.correctionLedger, claimId, id, "the restart actually failed — the pane is not up");
       });

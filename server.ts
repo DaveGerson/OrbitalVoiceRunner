@@ -69,6 +69,7 @@ import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexSha
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
 import { createTurnArbiter, normalizeDeliveryMatrix } from "./src/voice/turnArbiter";
+import { createCorrectionLedger } from "./src/voice/correctionLedger";
 // BEAD wsm-e2e-pinned-s1ap: the scripted Gemini Live connector + its control-channel business logic.
 // Gated at every layer on isScriptedLiveModeEnabled() — see the boot call site inside startServer()
 // and registerScriptedLiveControlRoutes below.
@@ -1454,7 +1455,8 @@ function registerDraftAndSettingsRoutes(
     manager.updateSettings(newSettings);
     // fikj.12: apply the (already-clamped) delivery dial to the LIVE arbiter — queued items drain
     // under the new modes immediately; no reconnect, no reconstruction. Violations from the live
-    // apply are normally [] (the boundary clamped the body in place above).
+    // apply are normally [] (the boundary clamped the body in place above). MUST run after
+    // updateSettings — the re-dial reads persisted state.
     const dialFragment = applyDialAndCollectFragment(validated.dialViolations, applyDeliveryDial);
     broadcast({
       type: "settings_updated",
@@ -1906,6 +1908,13 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // are surfaced (warnBootDialViolations) so the clamp is never silent.
   warnBootDialViolations();
   const turnArbiter = createTurnArbiter({ matrix: manager.settings.voiceAi?.deliveryMatrix });
+  // fikj.11 (vc-D wiring): the ONE correction ledger, bound to the ONE shared arbiter. Every
+  // producer records into the SAME bookkeeping — renderApproved dispatch claims (gating), restart
+  // acks (REST ActionContext + the gating replay builders), vc-C completion claims (the voice
+  // drain sink) — so pane-ref resolution and (pane, kind) supersession see the whole truth plane.
+  // Corrections leave this object ONLY as class-0 submissions into `turnArbiter`: no new
+  // model-bound send site exists (the T1 send-site ratchet is untouched by design).
+  const correctionLedger = createCorrectionLedger({ arbiter: turnArbiter });
   const gating = createGating({
     manager,
     store,
@@ -1918,6 +1927,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     sanitizeSettingsForClient,
     addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
     turnArbiter,
+    correctionLedger,
   });
   // Destructure the gating seam so the existing inline call sites across the REST + WS surfaces keep
   // referencing these by name. ONE shared object by reference — the pending stores + the posture
@@ -2300,6 +2310,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // Turn-arbiter program, Wave 4 (spec §3.3/§4-W4): the SAME shared instance injected into
     // createGating above — one queue, one drain, across both surfaces.
     turnArbiter,
+    correctionLedger,
     REGISTRY,
     runAction,
     resultToToolResponse,
@@ -2423,6 +2434,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       pendingActions,                           // c55.15: the converged approvals/pending REST defs read it
       applyResolution,
       applyPaneMode,
+      correctionLedger,
       store,
       sanitizeSettingsForClient,
       recipes: recipes as ActionContext["recipes"],
