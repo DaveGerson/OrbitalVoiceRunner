@@ -11,12 +11,15 @@ import { createGating } from "../src/gating";
 type AnyRec = Record<string, any>;
 const T0 = 1_700_000_000_000;
 
-function captureLedger() {
+/** `events` (optional, shared with makeHarness): merged write/record ordering log — the harness
+ *  pushes "write" on writeInput, this ledger pushes "record", so a test can pin the claim records
+ *  AFTER the write lands (never an optimistic pre-write claim). */
+function captureLedger(events?: string[]) {
   const records: AnyRec[] = [];
   const invalidations: AnyRec[] = [];
   return {
     records, invalidations,
-    record: (c: AnyRec) => { records.push(c); },
+    record: (c: AnyRec) => { records.push(c); events?.push("record"); },
     invalidate: (ref: string, groundTruth: string, opts?: AnyRec) => {
       invalidations.push({ ref, groundTruth, opts });
       return { corrected: true };
@@ -25,17 +28,18 @@ function captureLedger() {
   };
 }
 
-function makeHarness(opts: { ledger?: AnyRec; paneStatus?: string; pushOk?: boolean } = {}) {
+function makeHarness(opts: { ledger?: AnyRec; paneStatus?: string; pushOk?: boolean; events?: string[] } = {}) {
   const narrations: string[] = [];
   const broadcasts: AnyRec[] = [];
   const writes: string[] = [];
+  const addCommands: AnyRec[] = [];
   const session = { sendClientContent: () => {} };
   const manager: AnyRec = {
     globalPermissionsMode: "Inherit",
     terminals: {
       t1: {
         status: opts.paneStatus ?? "Running",
-        writeInput: (cmd: string) => { writes.push(cmd); },
+        writeInput: (cmd: string) => { writes.push(cmd); opts.events?.push("write"); },
         stop: async () => {},
       },
     },
@@ -60,11 +64,13 @@ function makeHarness(opts: { ledger?: AnyRec; paneStatus?: string; pushOk?: bool
     announcementBus: { enqueue: () => true, stop: () => {} },
     pushApprovalNarration: (_s: any, text: string) => { narrations.push(text); return opts.pushOk ?? true; },
     sanitizeSettingsForClient: (s: any) => s,
-    addCommand: () => {},
+    addCommand: (terminalId: string, command: string, exchangeId?: string) => {
+      addCommands.push({ terminalId, command, exchangeId });
+    },
     ...(opts.ledger ? { correctionLedger: opts.ledger } : {}),
   };
   const gating: AnyRec = createGating(deps);
-  return { gating, narrations, broadcasts, writes, session, manager };
+  return { gating, narrations, broadcasts, writes, addCommands, session, manager };
 }
 
 function addApproval(h: AnyRec, id = "d1", session: AnyRec | null = h.session): void {
@@ -75,11 +81,18 @@ function addApproval(h: AnyRec, id = "d1", session: AnyRec | null = h.session): 
 }
 
 test("AC1: an approved dispatch records ONE spoken dispatch claim after the write + narration", () => {
-  const led = captureLedger();
-  const h = makeHarness({ ledger: led });
+  const events: string[] = [];
+  const led = captureLedger(events);
+  const h = makeHarness({ ledger: led, events });
   addApproval(h);
   h.gating.applyResolution("d1", "approve");
   assert.deepStrictEqual(h.writes, ["npm run deploy"], "the write landed");
+  assert.strictEqual(h.addCommands.length, 1, "exactly ONE history entry for the one approved write");
+  assert.strictEqual(h.addCommands[0].terminalId, "t1");
+  assert.strictEqual(h.addCommands[0].command, "npm run deploy");
+  // Ordering pin: the claim records AFTER the write lands — a post-hoc record of a real dispatch,
+  // never an optimistic pre-write claim that could need retraction if writeInput threw.
+  assert.deepStrictEqual(events, ["write", "record"], "write-before-record ordering");
   assert.ok(h.narrations.some(n => n.includes("Dispatching now")), "the post-dispatch narration fired");
   assert.strictEqual(led.records.length, 1, "fikj.11 feature absent: renderApproved must record the dispatch claim");
   const claim = led.records[0];
@@ -116,6 +129,9 @@ test("ships-now ordering: an Exited-but-present pane renders the DEAD-PANE truth
   addApproval(h);
   h.gating.applyResolution("d1", "approve");
   assert.deepStrictEqual(h.writes, [], "writeInput must NOT buffer into a dead pane");
+  assert.deepStrictEqual(h.addCommands, [], "no history entry for a write that never happened");
+  assert.ok(!h.broadcasts.some(b => b.type === "command_auto_executed"),
+    "no auto-executed broadcast for a blocked dispatch");
   assert.ok(h.narrations.some(n => n.includes("could not dispatch")),
     "the honest failure is the FIRST claim (renderDeadPane), not a retraction-needing 'Dispatching now'");
   assert.ok(!h.narrations.some(n => n.includes("Dispatching now")));

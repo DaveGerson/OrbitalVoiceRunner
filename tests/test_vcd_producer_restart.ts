@@ -108,3 +108,21 @@ test("the buildActionRun replay twin mirrors record + failure invalidate", async
   await tick();
   assert.strictEqual(ledger.invalidations.length, 1, "the replay's failure arm retracts too");
 });
+
+test("the buildActionRun replay twin mirrors the CANCEL arm (86-during-restart -> cancelled retraction, no ghost PTY)", async () => {
+  const { ctx, ledger, term } = makeCtx({ archiveDuringStop: true });
+  const deps: AnyRec = {
+    manager: ctx.manager,
+    broadcast: () => {},
+    broadcastLedgerUpdate: () => {},
+    sanitizeSettingsForClient: (s: AnyRec) => s,
+    correctionLedger: ledger,
+  };
+  const out = buildActionRun({ capability: "restart_pane", params: { paneId: "t1" } } as any, deps as any)();
+  assert.strictEqual(out, "Terminal t1 restarted.");
+  await tick();
+  assert.strictEqual(term.started, false, "the replayed guard held — no ghost PTY");
+  assert.strictEqual(ledger.invalidations.length, 1, "the replay's cancel arm retracts too");
+  assert.strictEqual(ledger.invalidations[0].ref, ledger.records[0].claimId, "retracts by the SAME claim identity");
+  assert.ok(ledger.invalidations[0].groundTruth.includes("cancelled"), "the ground truth says cancelled, not failed");
+});
