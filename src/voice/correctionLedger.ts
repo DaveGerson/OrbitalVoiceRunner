@@ -25,6 +25,11 @@ export interface CorrectionClaim {
   assertedAt: number;
   /** false == the claim never reached the operator (a suppressed ack) -- nothing to retract. */
   spoken: boolean;
+  /** OPTIONAL + additive (final-review fix 2, completion claims): did the claim assert a CLEAN
+   *  success? A completion_failed digest records `false` -- it still shadows older success claims
+   *  in latestSpokenByPane, but the contradiction guard must never "retract" truthful bad news.
+   *  Absent on producers that predate the field (dispatch/restart/readiness claims). */
+  assertedSuccess?: boolean;
 }
 
 export interface InvalidateResult {
@@ -114,10 +119,18 @@ export function createCorrectionLedger(deps: { arbiter: { submit(item: SubmitIte
    *  still no staleness path inside the ledger. */
   function latestSpokenClaim(
     paneId: string,
-  ): { claimId: string; kind: CorrectionClaim["kind"]; assertedAt: number } | undefined {
+  ): { claimId: string; kind: CorrectionClaim["kind"]; assertedAt: number; assertedSuccess?: boolean } | undefined {
     const id = latestSpokenByPane.get(paneId);
     const claim = id ? claims.get(id) : undefined;
-    return claim ? { claimId: claim.claimId, kind: claim.kind, assertedAt: claim.assertedAt } : undefined;
+    if (!claim) return undefined;
+    return {
+      claimId: claim.claimId,
+      kind: claim.kind,
+      assertedAt: claim.assertedAt,
+      // Conditional (fix 2): claims recorded without the flag keep their exact pre-fix projection
+      // shape (pinned by tests/test_correction_ledger_query.ts's deepStrictEqual).
+      ...(claim.assertedSuccess !== undefined ? { assertedSuccess: claim.assertedSuccess } : {}),
+    };
   }
 
   return { record, invalidate, latestSpokenClaim };

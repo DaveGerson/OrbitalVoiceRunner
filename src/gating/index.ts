@@ -1336,7 +1336,17 @@ export function createGating(deps: GatingDeps): Gating {
       pendingApprovals,
       messageId,
       envelopeCasMode(messageId, mode),
-      (terminalId) => !!manager.terminals[terminalId]
+      // izvq (final-review blocker): LIVENESS, not mere presence. An Exited-but-present pane can
+      // never receive a dispatch (renderApproved's ships-now guard, kept below as defense in
+      // depth), so the whole choke point must resolve `dead_pane` coherently: the envelope draft
+      // stays open + revisable (settleEnvelopeBindingOnResolve's own dead-pane contract), a linked
+      // handoff flips to its dead-pane outcome (expired), and the UI hears ONE honest
+      // APPROVAL_RESOLVED outcome instead of "approved" alongside a contradictory command_blocked.
+      // Trips ONLY on the literal "Exited" status — a status-less test fake stays alive.
+      (terminalId) => {
+        const t = manager.terminals[terminalId];
+        return !!t && t.status !== "Exited";
+      }
     );
     const { reason, record } = action;
     if (!record) return action; // not_found: idempotent no-op

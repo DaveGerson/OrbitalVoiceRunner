@@ -84,6 +84,12 @@ function buildItem(input: CompletionNarrationInput, exception: boolean): Complet
       coalesceKey: COALESCE_KEY,
       // Exceptions headline over clean successes within class 3 even when submitted later (D2).
       severityRank: exception ? 0 : 1,
+      // Final-review fix 2: the asserted outcome, EXPLICIT on every completion item. True exactly
+      // when the facts assert a clean finish ("pane X finished"); every exception arm (failed
+      // settled outcome, error, prompt) asserts NON-success, so a later error/exited signal
+      // CONFIRMS rather than contradicts it -- the drain sink threads this into the claim and
+      // completionContradiction elects only on asserted success.
+      completionSuccess: !exception,
     },
   };
 }

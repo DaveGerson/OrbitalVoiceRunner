@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTurnArbiter } from "../src/voice/turnArbiter";
 import { createCorrectionLedger } from "../src/voice/correctionLedger";
+import { completionNarration } from "../src/voice/completionPolicy";
 import * as voiceIndexModule from "../src/voice/index";
 
 type AnyRec = Record<string, any>;
@@ -53,7 +54,9 @@ test("completionContradiction: error/exited within the window against a COMPLETI
   assert.strictEqual(typeof fn, "function", "fikj.11 feature absent: completionContradiction export");
   const WINDOW = voiceIndex.COMPLETION_CONTRADICTION_WINDOW_MS;
   assert.strictEqual(typeof WINDOW, "number");
-  const claim = { claimId: "c1", kind: "completion", assertedAt: T0 };
+  // assertedSuccess: true — post-fix-2 the guard elects ONLY asserted-success completion claims
+  // (the FAILED-claim negative lives in its own test below).
+  const claim = { claimId: "c1", kind: "completion", assertedAt: T0, assertedSuccess: true };
   const ledger = { latestSpokenClaim: (_p: string) => claim };
   const hit = fn({ paneId: "p1", kind: "error" }, ledger, T0 + 1_000);
   assert.ok(hit, "a fresh error contradicts the just-spoken completion");
@@ -74,7 +77,9 @@ test("end to end: spoken completion -> error signal -> ONE class-0 retraction th
   const arb = createTurnArbiter();
   const led: AnyRec = createCorrectionLedger({ arbiter: arb });
   voiceIndex.recordSpokenCompletionClaims(
-    digestWith([{ facts: "pane p1 finished", cls: 3, paneId: "p1", forVisualStack: false }]), true, led, T0,
+    // completionSuccess: true — the REAL producer (completionPolicy buildItem) stamps the asserted
+    // outcome on every cls-3 item post-fix-2; the sink derives the claim's electability from it.
+    digestWith([{ facts: "pane p1 finished", cls: 3, paneId: "p1", forVisualStack: false, completionSuccess: true }]), true, led, T0,
   );
   const hit = voiceIndex.completionContradiction({ paneId: "p1", kind: "error" }, led, T0 + 2_000);
   assert.ok(hit);
@@ -112,23 +117,116 @@ test("an UNSPOKEN (passive-drained) completion claim never yields a correction (
 test("superseded-unspoken semantics: a later unspoken completion supersedes the spoken one -> silent no-op", () => {
   const arb = createTurnArbiter();
   const led: AnyRec = createCorrectionLedger({ arbiter: arb });
-  // c1: spoken completion on p1 (claimId completion:p1:T0:0 by construction).
+  // c1: spoken completion on p1. The claimId is time+monotonic-seq minted (same-ms collision
+  // rider, mirroring restart claims) so capture it instead of pinning the seq literal.
   voiceIndex.recordSpokenCompletionClaims(
     digestWith([{ facts: "pane p1 finished", cls: 3, paneId: "p1", forVisualStack: false }]), true, led, T0,
   );
+  const c1 = led.latestSpokenClaim("p1");
+  assert.ok(c1, "c1 recorded spoken");
+  assert.match(c1.claimId, new RegExp(`^completion:p1:${T0}:\\d+$`),
+    "claimId = completion:<pane>:<now>:<monotonic seq> (same-ms collision rider)");
   // c2: UNSPOKEN completion on the same pane (a passive-context drain 500ms later).
   voiceIndex.recordSpokenCompletionClaims(
     digestWith([{ facts: "pane p1 finished again", cls: 3, paneId: "p1", forVisualStack: false }]), false, led, T0 + 500,
   );
   const spoken = led.latestSpokenClaim("p1");
   assert.ok(spoken, "the spoken index still resolves");
-  assert.strictEqual(spoken.claimId, `completion:p1:${T0}:0`,
+  assert.strictEqual(spoken.claimId, c1.claimId,
     "the unspoken record never touches the spoken index — c1 is still the latest SPOKEN claim");
   const res = led.invalidate(spoken.claimId, "pane p1 errored right after", { severity: "exception" });
   assert.strictEqual(res.corrected, false, "the superseded spoken claim is never retracted aloud");
   assert.strictEqual(res.reason, "superseded", "the newer same-(pane,kind) claim superseded it");
   assert.strictEqual(arb.evaluate({ now: T0 + 2_000, floorHeld: false, turnClear: true }).action, "hold",
     "nothing was submitted to the arbiter — the whole scenario is a silent no-op");
+});
+
+// ── final-review blocker (fix 2): asserted-outcome gating ──────────────────────────────────────
+// recordSpokenCompletionClaims records ALL cls-3 items as kind "completion" — including
+// completion_failed digests ("pane X completion FAILED…"). completionContradiction elected on
+// kind+recency alone, so a spoken FAILED claim followed within the window by an error/exited
+// signal (LIKELY after a failure!) fired a class-0 "retraction" of truthful bad news.
+
+test("a spoken FAILED completion claim never elects a retraction — election is asserted-success gated", () => {
+  const arb = createTurnArbiter();
+  const led: AnyRec = createCorrectionLedger({ arbiter: arb });
+  // The REAL producer chain: a completion_failed idle edge -> arbiter -> drain -> sink.
+  const failed: AnyRec = completionNarration({
+    sig: { paneId: "p1", kind: "idle" }, outcomeKind: "completion_failed",
+    hasExchange: true, policy: "dispatched",
+  });
+  assert.strictEqual(failed.speak, true, "precondition: a failed settled outcome always speaks");
+  arb.submit(failed.item);
+  const d: AnyRec = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  voiceIndex.recordSpokenCompletionClaims(d.digest, true, led, T0);
+  // The error signal lands right after — CONFIRMING the spoken bad news, not contradicting it.
+  assert.strictEqual(voiceIndex.completionContradiction({ paneId: "p1", kind: "error" }, led, T0 + 1_000), null,
+    "a claim that asserted FAILURE is never 'retracted' by a confirming error signal");
+});
+
+test("positive control: a spoken SUCCESS completion claim still elects through the same real chain", () => {
+  const arb = createTurnArbiter();
+  const led: AnyRec = createCorrectionLedger({ arbiter: arb });
+  const ok: AnyRec = completionNarration({
+    sig: { paneId: "p1", kind: "idle" }, outcomeKind: "completion",
+    hasExchange: true, policy: "dispatched",
+  });
+  assert.strictEqual(ok.speak, true, "precondition: a dispatched success speaks");
+  arb.submit(ok.item);
+  const d: AnyRec = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  voiceIndex.recordSpokenCompletionClaims(d.digest, true, led, T0);
+  const hit = voiceIndex.completionContradiction({ paneId: "p1", kind: "error" }, led, T0 + 1_000);
+  assert.ok(hit, "the asserted-success gate must NOT disable the guard's real job (false-done retraction)");
+  assert.ok(hit.groundTruth.includes("p1"));
+});
+
+// ── final-review blocker (fix 3): never-drop at the send boundary ─────────────────────────────
+// buildQueueDrain clears the queue pre-send; a sendClientContent throw in sendArbiterDigest lost
+// the digest — including class-0 corrections, whose claims the ledger had already marked
+// corrected, so re-invalidate refused: the correction was unrecoverable.
+
+test("never-drop: a failed drain send resubmits the digest — the class-0 correction drains on the next attempt", () => {
+  const send = voiceIndex.sendArbiterDigest;
+  const resubmit = voiceIndex.resubmitUndeliveredDigest;
+  assert.strictEqual(typeof send, "function",
+    "fix-3 feature absent: src/voice/index.ts must export sendArbiterDigest (returning `sent`)");
+  assert.strictEqual(typeof resubmit, "function",
+    "fix-3 feature absent: src/voice/index.ts must export resubmitUndeliveredDigest(arbiter, digest)");
+  const arb = createTurnArbiter();
+  const led: AnyRec = createCorrectionLedger({ arbiter: arb });
+  led.record({ claimId: "c1", paneId: "p1", kind: "completion", assertedText: "pane p1 finished", assertedAt: T0, spoken: true, assertedSuccess: true });
+  assert.strictEqual(led.invalidate("c1", "it did not finish", { severity: "exception" }).corrected, true);
+  const d1: AnyRec = arb.evaluate({ now: T0 + 1_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d1.action, "drain");
+  assert.strictEqual(d1.digest.headline.cls, 0, "precondition: the correction is the drained headline");
+  // A session that throws once (socket died mid-send) then succeeds; a store capturing T4 rows.
+  const drains: AnyRec[] = [];
+  const store = { recordArbiterDrain: (r: AnyRec) => drains.push(r), recordJumpOver: () => {} };
+  const contents: AnyRec[] = [];
+  let calls = 0;
+  const session = { sendClientContent: (c: AnyRec) => { calls += 1; if (calls === 1) throw new Error("socket died"); contents.push(c); } };
+  const ack = { lastOperatorSpeechAt: 0, interrupted: false, now: T0 };
+  const sent1 = send(session, store, null, ack, d1.digest, d1.mode, led);
+  assert.strictEqual(sent1, false, "a throwing send must REPORT failure — the drain tick resubmits on false");
+  resubmit(arb, d1.digest);
+  const d2: AnyRec = arb.evaluate({ now: T0 + 2_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d2.action, "drain", "the resubmitted correction re-drains on the next tick");
+  assert.strictEqual(d2.digest.headline.cls, 0, "the class survives resubmission");
+  assert.match(d2.digest.headline.facts, /correct|retract/i, "the retraction facts survive verbatim");
+  const sent2 = send(session, store, null, ack, d2.digest, d2.mode, led);
+  assert.strictEqual(sent2, true);
+  assert.strictEqual(contents.length, 1, "the correction reached the model on the second attempt — never dropped");
+  assert.match(String(contents[0]?.turns?.[0]?.parts?.[0]?.text ?? ""), /correct|retract/i);
+  assert.strictEqual(drains.length, 2, "T4 telemetry recorded BOTH drain attempts (the failed one included)");
+});
+
+test("production wiring conformance: the drain tick consumes the send verdict and resubmits on failure", () => {
+  const src = fs.readFileSync(path.resolve(repoRoot, "src/voice/index.ts"), "utf-8");
+  const resubmitCalls = (src.match(/resubmitUndeliveredDigest\(/g) ?? []).length;
+  assert.ok(resubmitCalls >= 2,
+    `resubmitUndeliveredDigest needs a definition AND a drain-tick call site (found ${resubmitCalls})`);
 });
 
 test("production wiring conformance: the sink records, the subscriber checks contradictions", () => {

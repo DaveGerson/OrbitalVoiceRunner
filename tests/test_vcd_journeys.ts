@@ -91,9 +91,11 @@ test("journey: dispatch + completion + failed restart against ONE ledger -> exac
   h.gating.applyResolution("d1", "approve");
   assert.ok(h.narrations.some((n: string) => n.includes("Dispatching now")));
 
-  // Producer 3 (drain-sink helper, as wired): a spoken completion claim on pane p9.
+  // Producer 3 (drain-sink helper, as wired): a spoken SUCCESS completion claim on pane p9
+  // (completionSuccess: true mirrors the real producer's post-fix-2 item stamp — only
+  // asserted-success claims are electable by the contradiction guard).
   voiceIndex.recordSpokenCompletionClaims(
-    { headline: { facts: "pane p9 finished", cls: 3, paneId: "p9", forVisualStack: false }, tail: [], tailCount: 0, tailGroups: [] },
+    { headline: { facts: "pane p9 finished", cls: 3, paneId: "p9", forVisualStack: false, completionSuccess: true }, tail: [], tailCount: 0, tailGroups: [] },
     true, led, T0,
   );
 

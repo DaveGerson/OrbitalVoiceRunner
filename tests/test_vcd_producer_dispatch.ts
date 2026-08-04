@@ -127,7 +127,18 @@ test("ships-now ordering: an Exited-but-present pane renders the DEAD-PANE truth
   const led = captureLedger();
   const h = makeHarness({ ledger: led, paneStatus: "Exited" });
   addApproval(h);
-  h.gating.applyResolution("d1", "approve");
+  const r = h.gating.applyResolution("d1", "approve");
+  // izvq (final-review blocker): the CHOKE POINT itself must resolve dead_pane — not just the
+  // renderer. resolveDecision's liveness predicate previously checked PRESENCE only, so an
+  // Exited-but-present pane resolved "approved": the envelope draft settled as delivered (its own
+  // dead-pane contract violated), a linked handoff flipped delivered, and the UI heard
+  // APPROVAL_RESOLVED outcome:"approved" alongside a contradictory command_blocked.
+  assert.strictEqual(r.reason, "dead_pane",
+    "an Exited-but-present pane must resolve dead_pane at the choke point (izvq), never 'approved'");
+  assert.ok(h.broadcasts.some(b => b.type === "approval_resolved" && b.outcome === "dead_pane"),
+    "the UI hears the COHERENT resolution outcome — dead_pane, matching the blocked broadcast");
+  assert.ok(!h.broadcasts.some(b => b.type === "approval_resolved" && b.outcome === "approved"),
+    "no contradictory outcome:'approved' rides alongside command_blocked");
   assert.deepStrictEqual(h.writes, [], "writeInput must NOT buffer into a dead pane");
   assert.deepStrictEqual(h.addCommands, [], "no history entry for a write that never happened");
   assert.ok(!h.broadcasts.some(b => b.type === "command_auto_executed"),

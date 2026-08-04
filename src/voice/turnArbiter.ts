@@ -101,6 +101,12 @@ export interface SubmitItem {
    *  item in the class ties, so insertion order (FIFO) stays the sole tiebreaker -- an additive
    *  refinement that never changes behavior for a producer that doesn't set it. */
   severityRank?: number;
+  /** Class-3 only (vc-D final-review fix 2): did this completion item assert a CLEAN success
+   *  ("pane X finished") -- as opposed to a failure/error/prompt exception? Carried through to the
+   *  DigestItem so the drain sink can record an asserted-outcome-aware completion claim (a spoken
+   *  FAILED claim must never be "retracted" by the very error signal that confirms it). Optional +
+   *  additive: absent on every other producer's items. */
+  completionSuccess?: boolean;
 }
 
 export interface DigestItem {
@@ -110,6 +116,9 @@ export interface DigestItem {
   coalesceKey?: string;
   /** D2 told-more floor: every TAIL item is flagged so the visual stack/catch-up never misses it. */
   forVisualStack: boolean;
+  /** Class-3 only (see SubmitItem.completionSuccess). Present ONLY when the submitted item carried
+   *  it -- conditional so digests of other producers keep their exact pre-fix shape. */
+  completionSuccess?: boolean;
 }
 
 export interface TailGroup {
@@ -160,6 +169,7 @@ interface QueuedItem {
   coalesceKey?: string;
   deadline?: { expiresAt: number; onExpirySwap: string };
   severityRank?: number;
+  completionSuccess?: boolean;
   insertionOrder: number;
   /** Accumulated floor-held pause for this item's deadline, capped at TTL_FLOOR_EXTENSION_CAP_MS. */
   pausedMs: number;
@@ -168,7 +178,11 @@ interface QueuedItem {
 }
 
 function toDigestItem(it: QueuedItem, forVisualStack: boolean): DigestItem {
-  return { facts: it.facts, cls: it.cls, paneId: it.paneId, coalesceKey: it.coalesceKey, forVisualStack };
+  return {
+    facts: it.facts, cls: it.cls, paneId: it.paneId, coalesceKey: it.coalesceKey, forVisualStack,
+    // Conditional so items without the class-3 marker keep their exact pre-fix digest shape.
+    ...(it.completionSuccess !== undefined ? { completionSuccess: it.completionSuccess } : {}),
+  };
 }
 
 /** Groups the tail by coalesceKey; an item without one is its own solo group. Always partitions tail. */
@@ -246,6 +260,7 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
       coalesceKey: item.coalesceKey,
       deadline: item.deadline,
       severityRank: item.severityRank,
+      completionSuccess: item.completionSuccess,
       insertionOrder,
       pausedMs,
       lastTick,
