@@ -1,5 +1,14 @@
 # Journey 3: Review & Approve Code Across Panes — Deep Dive
 
+> ⚠️ **HISTORICAL — audited 2026-05-30, NOT maintained.** This deep-dive describes the code as it
+> stood in May 2026. The voice/approval stack has since been rewritten: approval routing now lives
+> in `src/voiceApprovalRouting.ts` + `src/gating/index.ts` (TTL → last-call → grace → expire,
+> defer/hold, stop-all brake) behind the turn arbiter, and persistence is the SQLite `JanusStore`
+> — **not** the `.janus_ledger.json` `Ledger`. **Verify every `file:line` citation against current
+> code before acting on it.** The companion per-journey gap register (`gaps.md`) was retired on
+> 2026-08-05; live defects are tracked in beads (`bd ready`). Context and retrieval instructions:
+> [`docs/journeys/README.md`](../README.md).
+
 **Journey statement:** "Move between panes and approve or reject agent-proposed commands by voice, without leaving the conversation."
 
 ---

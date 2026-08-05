@@ -29,7 +29,8 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 
 *   **Audio Input Channel:** The browser grabs 16kHz PCM audio frames using the device microphone. Prior to transmission, if Janus is actively speaking, a half-duplex barge-in gate in `App.tsx` suspends frame delivery to prevent audio loopbacks/echo.
 *   **Audio and Tool Output Conduit:** The Node.js server acts as an authenticated proxy websocket channel communicating directly with the Gemini Live API. Prompt/responses travel as dual-medium frames (synthesized voice output + structured JSON tool calls).
-*   **System State Persistence:** The `Ledger` class processes, saves, and reloads user configurations, workspaces, pane hierarchies, active settings, watch automation rules, and notes atomically into `.janus_ledger.json`.
+*   **System State Persistence:** State lives in a **SQLite ledger** — `JanusStore` (`src/store/`), backed by `.janus.db` (override via `JANUS_DB`) — holding user configurations, workspaces, pane hierarchies, active settings, watch automation rules, and notes. Since **dbt3** (2026-07-02) SQLite is the *only* backend: `src/ledger.ts` now defines just the `LedgerLike` surface that `JanusStore` implements and `OrchestratorManager` consumes, the `JANUS_LEDGER_BACKEND=legacy` escape hatch is retired, and a store-init failure is a **fatal boot error** with no fallback. The one-way JSON→SQLite boot migration still runs for operators upgrading from pre-WS-M on-disk data.
+*   **Conversational Coherence Substrate:** every journey below rides on a shared turn-taking and truthfulness layer — see [§4](#4-cross-cutting-layer-conversational-coherence-j0).
 
 ---
 
@@ -38,9 +39,9 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 ### Journey 1: Fan-out / Delegate in Parallel
 *Start multiple agent panes on independent tasks, switching attention dynamically.*
 
-*   **Workspace Ledger Partitioning (`Ledger` inside `/src/ledger.ts`):** Workspaces are segmented via distinct project configurations containing directories, notes, and specific terminal panes.
+*   **Workspace Ledger Partitioning (the `LedgerLike` surface in `/src/ledger.ts`, implemented by `JanusStore`):** Workspaces are segmented via distinct project configurations containing directories, notes, and specific terminal panes.
 *   **Virtual Dynamic PTY Panes (`OrchestratorManager` inside `/src/terminal.ts`):** Supports launching and executing multiple non-blocking sub-processes using instances of `UniversalTerminal`. PTY processes run concurrently to complete tasks independently (e.g., launching an API compiler and testing script in separate panes).
-*   **Context Switching Mechanism (`switch_context` inside `/server.ts`):** 
+*   **Context Switching Mechanism (`switch_context` in `/src/actions/defs/orient.ts`):**
     Janus triggers the `switch_context` function. This backgrounds the current workspace, loads the target project's path as the system CWD, and dynamically generates a rich **Project Briefing** incorporating the project summary, files, historical project notes, and absolute states of related active panes.
 
 ---
@@ -48,12 +49,12 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 ### Journey 2: Supervisor / "Air-Traffic Control" (ATC)
 *Keep agents in Human-in-the-Loop; approve or redirect commands as they surface.*
 
-*   **Graduated Safety Gating Model (`propose_command` inside `/server.ts`):**
+*   **Graduated Safety Gating Model (`propose_command`, registered in `/src/actions/registry.ts`, enforced at the capability gate in `/src/gating/index.ts`):**
     Each project pane has an assigned `permissionsMode` attribute defined in `/src/types.ts`:
     *   `Full Auto`: Commands run immediately inside the active terminal process.
     *   `Human-in-the-Loop`: Commands are intercepted, a unique `call.id` is allocated, and the execution is paused pending operator sign-off.
     *   `Read-Only`: Writing commands is strictly prevented; a clear write block exception is returned.
-*   **State-Preserved Pending Map (`pendingApprovals` inside `/server.ts`):**
+*   **State-Preserved Pending Map (`pendingApprovals` in `/src/pendingApprovals.ts`, consumed by `/server.ts`):**
     Holds intercepted commands along with their session context, target destination pane, and triggering human rationale.
 
 ---
@@ -61,11 +62,14 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 ### Journey 3: Review & Approve Code Across Panes
 *Move between panes and approve/reject commands by voice or visual dialog.*
 
-*   **Voice Interception Parser (Intercept in `/server.ts` on websocket audio feed):**
-    When Janus transcribes a human utterance, a regex voice parser checks for active commands containing natural trigger keywords:
-    *   *Approvals:* `["approve", "go ahead", "execute", "run it", "yes run", "approve command"]`
-    *   *Rejections:* `["reject", "cancel", "deny", "don't run", "reject command"]`
-    If a pending approval matches a voice trigger, the server automatically dispatches the earliest corresponding command to the target pane or cancels it, sending the correct function response feedback to the Gemini model and rendering it on the web interface.
+*   **Intent Parsing (`parseApprovalIntent` in `/src/approvalIntent.ts`):**
+    A transcribed operator utterance is classified into one of four actionable intents — **approve**, **reject**, **defer** ("later", "not now", "hold that"), or **clarify** — rather than substring-matched against a flat keyword list. (Ambient speech returns `none` and resolves nothing; `ApprovalIntent` is the five-valued union in `src/approvalIntent.ts`.) Negation and approve/reject collisions resolve to `clarify` instead of silently firing: the operator is asked *"I heard both approve and reject — which of the N did you mean?"*
+*   **Target Selection (`selectApprovalTarget` / `selectPendingAction`, same module):**
+    Resolution is **targeted, not blind-FIFO**. When more than one item is staged and nothing disambiguates, `narrateAmbiguous` reads back the redacted summaries and asks which one — it does not silently resolve the oldest entry.
+*   **Resolution Routing (`/src/voiceApprovalRouting.ts`):**
+    `handleApprove` (`confirm()` → run side effect → broadcast `action_resolved`), `handleReject` (`cancel()` claims and removes without running), and `handleDefer` (re-arms the TTL window in place, capped at `MAX_DEFERRALS` so an item cannot be parked forever).
+*   **Lifecycle & Gate Enforcement (`/src/gating/index.ts`):**
+    The staged-item clock — **TTL → last-call → grace → expire** — plus the stop-all brake, running through the capability-gate choke point.
 *   **The Approval Dialog Component (`/src/components/ApprovalDialog.tsx`):**
     A polished, animated modal overlays on top of the screen when a command is queued, presenting the exact proposed command string, its target pane, and AI rationale.
 
@@ -74,9 +78,9 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 ### Journey 4: Knowledge Capture & Continuity
 *Log decisions, rationale, and notes securely; re-brief Janus when returning to workspaces.*
 
-*   **Durable Note Capture (`add_project_note` / `add_pane_note` inside `/server.ts`):**
+*   **Durable Note Capture (`add_project_note` / `add_pane_note` in `/src/actions/defs/notes.ts`):**
     Captures unstructured spoken notes or Walkthrough narrations and appends them to the persistent configuration ledger.
-*   **History Simplification Engine (`get_pane_command_history` inside `/server.ts`):**
+*   **History Simplification Engine (`get_pane_command_history` in `/src/actions/defs/reads.ts`):**
     Instead of passing large, messy and token-expensive stdout streams to the LLM context, it maintains a concise history log containing the precise command executed and its condensed high-level outcome.
 *   **Dynamic System Prompt Reconstruction:**
     Each time Janus resumes a workspace session, the system instruction is reconstructed with only the active project ID and the available workspaces (ID/name pairs). Live pane status/CWD is deliberately *not* injected — it would go stale — and is read on demand via `list_panes` (see `src/voice/systemPrompt.ts` §5). Project notes and file trees are likewise not injected; notes re-enter context via the `switch_context` briefing — see `docs/review/BUG_LOG.md` BUG-033.
@@ -86,9 +90,9 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
 ### Journey 5: Adjust Autonomy Mid-Session
 *Verbally promote or demote pane safety permissions dynamically on-the-fly.*
 
-*   **Autonomy Transition Hook (`set_pane_permissions` inside `/server.ts`):**
+*   **Autonomy Transition Hook (`set_pane_permissions` in `/src/actions/defs/locks.ts`):**
     Modifies the active permissions mode of an ongoing terminal pane instance.
-*   **State Alignment Logging (`Ledger.updatePane`):**
+*   **State Alignment Logging (`LedgerLike.updatePane`, implemented by `JanusStore.updatePane`):**
     Once an autonomy update is triggered via voice, the permissions value is saved directly to the database file. If the process is rebooted or cloned, it preserves the defined autonomy scope.
 
 ---
@@ -100,27 +104,75 @@ Janus operates under a **hands-free, voice-mediated, and eyes-off execution mode
     Aggregates active values from live operating processes. Map parameters include:
     *   `is_busy`: Set to `true` if the shell process is executing a command.
     *   `alive`: Set to `false` if the background terminal process has exited.
-*   **Orientation Index (`list_panes` in `/server.ts`):**
+*   **Orientation Index (`list_panes`, registered in `/src/actions/registry.ts`):**
     Retrieves all organized workspaces and active terminal pane entities, enabling Janus to provide spoken summaries to the operator.
 
 ---
 
 ## 3. Secondary Journeys Supporting Elements
 
-| Secondary Journey | Core API Tool Hooks | Action Profile |
-| :--- | :--- | :--- |
-| **Dictate Specifications** | `add_project_note` & `add_pane_note` | Speech-to-text notes are written directly to ledger. |
-| **Narrate Terminal Walk-through** | `get_pane_summary` | Recent terminal output (ANSI-stripped, secret-redacted via WS-B's `redactSecrets`) is read back; the operator dictates notes for needed changes. *(No semantic analysis yet — see `docs/review/IMPLEMENTATION_PLAN.md` WS-J.)* |
+The two secondary journeys are numbered **J7** and **J8** — the same identifiers used by
+`tests/test_journeys.ts` and `docs/README.md`. Counting both tiers, the product has **eight**
+journeys total (J1–J6 primary, J7–J8 secondary).
+
+| # | Secondary Journey | Core API Tool Hooks | Action Profile |
+| :--- | :--- | :--- | :--- |
+| **J7** | **Dictate Specifications** | `add_project_note` & `add_pane_note` | Speech-to-text notes are written directly to ledger. |
+| **J8** | **Narrate Terminal Walk-through** | `get_pane_summary` | Recent terminal output (ANSI-stripped, secret-redacted via WS-B's `redactSecrets`) is read back; the operator dictates notes for needed changes. *(No semantic analysis yet — see `docs/review/IMPLEMENTATION_PLAN.md` WS-J.)* |
 
 ---
 
-## 4. Maintenance and Validation Strategy
+## 4. Cross-Cutting Layer: Conversational Coherence (J0)
+
+Journeys 1–8 describe *what the operator is trying to do*. All of them ride on one shared
+substrate: **the assistant's turn-taking and its truthfulness about state.** This layer is not a
+journey — it is the floor every journey stands on, and it owns a defect class none of J1–J8 can
+express.
+
+**The defect class: utterance ⇄ state divergence.** A spoken line is composed and queued when a
+staged item is in one state; the state then changes before the line is delivered. The ledger is
+correct, the speech is not. Mental model: the arbiter is an **outbox of pre-written letters** — when
+the situation changes you must reach into the outbox and pull the letter, not merely update your own
+records.
+
+**Components:**
+
+*   **Turn Arbiter (`/src/voice/turnArbiter.ts`):** the single conversation scheduler owning *all*
+    model-bound sends — priority classes plus one coalesced drain — so two subsystems cannot talk
+    over each other. `factsForDrain` re-derives an item's facts at drain time rather than trusting
+    the text composed at queue time.
+*   **Staged-item clock (`/src/gating/index.ts`):** TTL → last-call → grace → expire, plus the
+    defer re-arm — `applyDeferral` here for approvals, `handleDefer` in
+    `/src/voiceApprovalRouting.ts` for staged actions, both capped by `MAX_DEFERRALS` — and the
+    stop-all brake.
+*   **Speech admission (`/src/voice/speakGate.ts`, `correctionLedger.ts`, `recentTurns.ts`):** the
+    silence gate, bounded live-claim set, and correction/retraction bookkeeping.
+
+**The invariant (learned the hard way — `p19o`, `okes`):**
+
+> Any code path that **re-arms, cancels, or resolves** a staged item MUST also **retract or re-word
+> the already-queued arbiter utterance** for it — e.g. `turnArbiter.remove('last-call:<id>')`, as the
+> gating module's stale-last-call retraction helper does (`removeStaleReattachedLastCall`; renamed
+> `removeStaleLastCallOnTtlReset` and extended to the TTL-reset path when PR #155 /
+> `feat/last-call-retraction-p19o-okes` lands). Updating the record alone leaves a letter in the
+> outbox describing a world that no longer exists.
+
+**Live debt in this layer** (beads, not a register — `bd show <id>`): `3tx3` (the staged-**action**
+defer leg misses the arbiter retraction), `y9tj` (brake-cancelled approvals claim a 5-minute
+timeout), `7qb1`, `rz7k`, `vwld`, `r59t`. The approval-leg counterpart of `3tx3` is fixed by PR #155,
+pending merge. Program stability for the layer is gated on the `v02l` telemetry watch —
+`npm run telemetry:arbiter` must show `jump_over` at structurally ~zero.
+
+---
+
+## 5. Maintenance and Validation Strategy
 
 Journey coverage lives in several layers (not just the journey suite):
 
 *   **Journey suite (`/tests/test_journeys.ts`):** Journeys 1–8 at the noun level (real PTY panes, real ledger). Its J2/J3/J6 verb logic is locally mocked — the real verbs are covered by the purpose-built suites below.
 *   **Purpose-built unit/integration suites:** the real approval parser/routing/durability (`test_approvals_wse`, `test_voice_approval_routing`, `test_pendingApprovals_durable`), the real status machine (`test_status_machine`), notes + recall with redaction (`test_notes_recall`, `test_c55_12_notes`), capability gates (`test_capability_gate`, `test_c55_16_set_pane_gates`), and `get_pane_summary` redaction at the real method (`test_redaction`) — covering the J7/J8 components.
 *   **Live e2e lane (`e2e/live_*.spec.ts`, `npm run test:e2e:live`):** real server + real PTYs, no mock harness — pane lifecycle through the capability gate, archive/restore, per-pane gate behavior, keyboard-only operation, draft durability, stop-all.
+*   **Coherence layer (J0, §4):** the turn arbiter and speech-admission substrate have their own suites — `test_turn_arbiter_core`, `_journeys`, `_deadlines`, `_corrections`, `_briefs`, `_completions`, `_matrix`, plus `test_speak_gate`, `test_correction_ledger_eviction` / `_query`, `test_vcd_journeys`, and `test_arbiter_telemetry`.
 *   **Drift guards:** every registry action must be referenced by at least one test (`tests/test_action_test_presence.ts`); voice/REST surface asymmetries are allowlist-gated (`tests/test_action_coverage.ts`).
 
 CI runs the lint + unit suite plus both Playwright lanes (mock and live) — see `.github/workflows/ci.yml`.

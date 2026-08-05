@@ -1,5 +1,14 @@
 # Journey 4: Knowledge Capture & Continuity — Deep Dive
 
+> ⚠️ **HISTORICAL — audited 2026-05-30, NOT maintained.** This deep-dive describes the code as it
+> stood in May 2026. The voice/approval stack has since been rewritten: approval routing now lives
+> in `src/voiceApprovalRouting.ts` + `src/gating/index.ts` (TTL → last-call → grace → expire,
+> defer/hold, stop-all brake) behind the turn arbiter, and persistence is the SQLite `JanusStore`
+> — **not** the `.janus_ledger.json` `Ledger`. **Verify every `file:line` citation against current
+> code before acting on it.** The companion per-journey gap register (`gaps.md`) was retired on
+> 2026-08-05; live defects are tracked in beads (`bd ready`). Context and retrieval instructions:
+> [`docs/journeys/README.md`](../README.md).
+
 > "Log decisions, rationale, and TODOs as notes while you work; on return, have Janus
 > re-brief you from the project summary, notes, and recent history; and generate a
 > hand-off for the next person (or your future self)."
