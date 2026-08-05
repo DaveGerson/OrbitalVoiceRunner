@@ -61,7 +61,12 @@ import { createLiveTraceWriter, wrapOnMessageWithCapture } from "./liveTraceCapt
 import { extractGrounding, hasGrounding } from "../liveGrounding";
 import { buildSystemInstruction } from "./systemPrompt";
 import { applyPaneInputFrame } from "./paneInputFrame";
-import { shouldSpeakOpeningAck, shouldSpeakReadyAck, OPERATOR_HOLD_MS } from "../voiceAckGate";
+import { shouldSpeakOpeningAck, shouldSpeakReadyAck, briefTurnComplete, OPERATOR_HOLD_MS, type AckTurnState } from "../voiceAckGate";
+import {
+  createTurnArbiter, DEFAULT_DELIVERY_MATRIX,
+  type DeliveryMode, type Digest, type DrainDecision, type TurnArbiter,
+} from "./turnArbiter";
+import { completionNarration, DEFAULT_COMPLETION_ANNOUNCE } from "./completionPolicy";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
@@ -463,9 +468,10 @@ export function sweepHeartbeats(clients: Iterable<HeartbeatClient>): HeartbeatCl
   return terminated;
 }
 
-/** A PaneSignal queued on the phase-2 "ready" defer path, tagged with the wall-clock time it was
- *  deferred so the drain can age it out (READY_DEFER_MAX_MS). The tag lives on a CLONE, never the
- *  shared bus payload — see stampDeferred. */
+/** A PaneSignal tagged with the wall-clock time it was deferred. The tag lives on a CLONE, never
+ *  the shared bus payload — see stampDeferred. Pure standalone helper (tests/test_pane_signal_bus.ts
+ *  exercises it directly); production deferral itself now rides the W3 pane-ack arbiter fold below,
+ *  which never ages an item out (told-more floor). */
 export type DeferredPaneSignal = PaneSignal & { __deferredAt: number };
 
 /**
@@ -503,6 +509,134 @@ export function applyBackgroundFraming(text: string, turnComplete: boolean): str
   if (turnComplete) return text;
   if (text.startsWith(BACKGROUND_PREAMBLE)) return text;
   return `${BACKGROUND_PREAMBLE}\n${text}`;
+}
+
+/**
+ * W3 fold (turn-arbiter program, spec §3.3 row 6; audit §2.5 "producer proliferation"): the ONE
+ * classifier deciding which arbiter class a pane signal submits as. "created"/"closed" are the
+ * operator-facing spawn/archive acks the old ready-defer trichotomy gated -- class 4. Every other
+ * kind (idle/error/prompt/exited/running/quiescing) is passive context -- class 5. Pure + exported
+ * for unit coverage (no live session needed).
+ */
+export function paneSignalClass(kind: string): 4 | 5 {
+  return kind === "created" || kind === "closed" ? 4 : 5;
+}
+
+/**
+ * co-design spec A (turn-arbiter program, Wave 3): the send-site rendering decision for a memory
+ * brief (arbiter class 5). `briefTurnComplete(ack)` decides whether the turn state ever PERMITS a
+ * brief to complete a turn; `mode` (the class-5 delivery-matrix dial, D4) then decides whether it
+ * ACTUALLY does. A brief is never dropped either way (told-more floor) -- the non-completing arm
+ * still lands, framed as passive BACKGROUND context (fikj.8 Leg B, reused verbatim). Pure + exported
+ * for unit coverage, same home as applyBackgroundFraming.
+ */
+export function composeBriefEnvelope(input: {
+  briefText: string;
+  ack: AckTurnState;
+  mode: DeliveryMode;
+}): { text: string; turnComplete: boolean } {
+  const turnComplete = briefTurnComplete(input.ack) && input.mode !== "passive-context";
+  if (!turnComplete) return { text: applyBackgroundFraming(input.briefText, false), turnComplete: false };
+  return { text: input.briefText, turnComplete: true };
+}
+
+/**
+ * renderArbiterDigest -- Wave 4 (D3 rendering, spec §3.1): the pure "DrainDecision -> spoken text"
+ * composer, same pure-exported home as composeBriefEnvelope. Structured facts only (D3: the model
+ * does its own phrasing per [7. VOICE OUTPUT RULES]) -- the headline's facts ride VERBATIM and
+ * FIRST; a non-empty tail is counted and offered as a rundown so a "give me the rundown" ask can
+ * actually be answered from the SAME injection (D2 told-more floor). passive-context never
+ * completes a turn and reuses applyBackgroundFraming VERBATIM (fikj.8 Leg B machinery).
+ */
+export function renderArbiterDigest(digest: Digest, mode: DeliveryMode): { text: string; turnComplete: boolean } {
+  const parts = [digest.headline.facts];
+  if (digest.tailCount > 0) {
+    const tailFacts = digest.tail.map((it) => it.facts).join("; ");
+    parts.push(`Also, ${digest.tailCount} more: ${tailFacts} — ask for the rundown if you want it.`);
+  }
+  const text = parts.join("\n");
+  if (mode === "passive-context") return { text: applyBackgroundFraming(text, false), turnComplete: false };
+  return { text, turnComplete: true };
+}
+
+/**
+ * digestSendPlan -- the pure "DrainDecision -> what the drain tick actually sends" mapper (same
+ * pure-exported home as renderArbiterDigest). Load-bearing for the D1 cap (spec §3.1): an
+ * `interrupt-at-phrase-boundary` decision has ALREADY dequeued its item from the arbiter
+ * (exactly-once delivery) -- a caller that only handles the "drain" arm would vanish it, the exact
+ * silent-drop the standing invariant forbids. The interrupt digest is delivered as a FORCED turn:
+ * the arbiter timed it (cap consumed, extended deadline reached), so the send completes the turn at
+ * the tick's own settle-cadence phrase boundary.
+ */
+export function digestSendPlan(
+  decision: DrainDecision,
+): { send: false } | { send: true; digest: Digest; mode: DeliveryMode } {
+  if (decision.action === "hold") return { send: false };
+  if (decision.action === "drain") return { send: true, digest: decision.digest, mode: decision.mode };
+  return { send: true, digest: decision.digest, mode: "forced-turn" };
+}
+
+/**
+ * isJumpOverSend -- Wave 4 (T4 telemetry, spec §5-T4): the pure classifier the jump_over counter
+ * records against. A jump-over is a FORCED turn (turnComplete:true) landing over a floor that is
+ * NOT clear -- mid-utterance (the operator is still talking) or a live barge-in. Derived from the
+ * SAME turn-aware gate every ack decision already reads (shouldSpeakReadyAck) -- never a parallel
+ * clock (the LOCKED seam rule: turn-timing decisions stay in-process TS). Passive context can never
+ * jump anything; class 1 (operator-response) is exempt -- the operator just spoke, so the turn is
+ * theirs to fill (the same reason family D tool responses never count).
+ */
+export function isJumpOverSend(opts: { turnComplete: boolean; cls?: 0 | 1 | 2 | 3 | 4 | 5; ack: AckTurnState }): boolean {
+  if (!opts.turnComplete || opts.cls === 1) return false;
+  return shouldSpeakReadyAck(opts.ack) !== "speak";
+}
+
+/**
+ * sendArbiterDigest -- the ONE choke point (spec §3.3: "one module owns every model-bound send")
+ * where a drained Digest becomes an actual injection: render (renderArbiterDigest), send, and
+ * record the T4 telemetry rows (spec §5-T4) -- recordArbiterDrain always, recordJumpOver only when
+ * the classifier trips (post-arbiter this should be structurally zero; the row exists to prove it).
+ * Fail-soft: a send fault is swallowed + logged, matching pushApprovalNarration/pushAck's own
+ * never-throw contract; telemetry is skipped (not thrown) when no store is wired.
+ */
+function sendArbiterDigest(
+  session: any,
+  store: JanusStore | null,
+  sessionId: string | null,
+  ack: AckTurnState,
+  digest: Digest,
+  mode: DeliveryMode,
+): void {
+  const rendered = renderArbiterDigest(digest, mode);
+  try {
+    session.sendClientContent({ turns: [{ role: "user", parts: [{ text: rendered.text }] }], turnComplete: rendered.turnComplete });
+  } catch (e) {
+    console.error("[turn-arbiter] drain send failed:", e);
+  }
+  if (!store) return;
+  const headlineCls = digest.headline.cls as 0 | 1 | 2 | 3 | 4 | 5;
+  if (isJumpOverSend({ turnComplete: rendered.turnComplete, cls: headlineCls, ack })) {
+    store.recordJumpOver({
+      ts: Date.now(), sessionId, producer: "turn-arbiter-drain",
+      cls: digest.headline.cls, detail: digest.headline.coalesceKey ?? null,
+    });
+  }
+  store.recordArbiterDrain({
+    ts: Date.now(), sessionId, mode, headlineCls: digest.headline.cls,
+    drainSize: 1 + digest.tailCount, tailCount: digest.tailCount,
+  });
+}
+
+/** vc-C's dispatch-intent input (spec §3.3 row 4): was a live exchange bound to this pane at the
+ *  idle edge? Best-effort/never-throw, mirroring every other exchange-spine read in this file --
+ *  spine off or a lookup fault both fail toward "no exchange" (the false-done guard's safe default). */
+function hasActiveExchange(paneId: string): boolean {
+  if (!exchangeSpineActive()) return false;
+  try {
+    return !!getExchangeService().activeExchangeForPane(paneId);
+  } catch (e) {
+    console.error(`[turn-arbiter] hasActiveExchange lookup failed for ${paneId}:`, e);
+    return false;
+  }
 }
 
 /**
@@ -612,6 +746,19 @@ export interface VoiceDeps {
    *  ranking). Wired onto ActionContext.policies for the voice lane ONLY — undefined when the
    *  master switch (advanced.memoryPythonEnabled) is off or the daemon init failed (permanent fallback). */
   policies?: PythonPolicyClient;
+  /** Turn-arbiter program, Wave 3 (spec §3.3 row 4): the SAME settled-outcome resolver
+   *  src/observe/index.ts's ObserveHandlers exposes (the fikj.7 earcon's own seam) — keys vc-C's
+   *  class-3 completion facts so the spoken outcome can never disagree with the failure earcon.
+   *  Optional so existing test harnesses that build deps inline need not supply it (fail-open
+   *  "completion" default, matching the seam's own contract for an unknown pane). */
+  completionKindFor?: (terminalId: string) => "completion" | "completion_failed";
+  /** Turn-arbiter program, Wave 4 (spec §3.3 rows 4/6/7; §4-W4): the SAME shared instance
+   *  server.ts injects into createGating's deps too — one queue, one drain, one rendered
+   *  injection (renderArbiterDigest) instead of the private per-connection arbiter this used to
+   *  be. Optional so a hand-built test harness that injects none falls back to a fresh local
+   *  instance (see the connection-scoped `sharedArbiter` below) — never a throw, never a second
+   *  implementation of the decision core. */
+  turnArbiter?: TurnArbiter;
 }
 
 /**
@@ -652,11 +799,11 @@ interface VoiceSessionState {
   // (onOperatorSpeech) and on turnComplete/generationComplete so it can NEVER bleed past one turn.
   // Default false (off => never set true). The on-screen transcript_text stays unconditional.
   muteCurrentModelTurn: boolean;
-  // B1 (phase-2 defer): a "ready" pane signal arriving mid-utterance is QUEUED here and re-tried at
-  // the next safe gap (armReadyDrain) instead of speaking over the operator. The drain timer is
-  // unref'd (force-exit hygiene) and cleared on socket close.
-  deferredReady: DeferredPaneSignal[];
-  readyDrainTimer: ReturnType<typeof setTimeout> | null;
+  // W3 fold (turn-arbiter program, yg1w / audit §2.5): class-4 pane acks (created/closed) now defer
+  // through a per-connection TurnArbiter instance instead of a private array — this is just the
+  // outstanding drain timer handle so it can be cleared on reconnect/socket-close (force-exit
+  // hygiene).
+  paneAckDrainTimer: ReturnType<typeof setTimeout> | null;
   reconnectAttempts: number;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   stableResetTimer: ReturnType<typeof setTimeout> | null;
@@ -713,6 +860,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     getCookie,
     registerReconnectNudge,
     policies,
+    completionKindFor,
+    turnArbiter,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -945,9 +1094,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       lastInterrupted: false,
       // BEAD tkd: no turn muted yet. Set per-turn from shouldSpeak when the operator transcript lands.
       muteCurrentModelTurn: false,
-      // B1 (phase-2 defer): empty queue, no drain timer in flight.
-      deferredReady: [],
-      readyDrainTimer: null,
+      // W3 fold: no pane-ack drain timer in flight yet.
+      paneAckDrainTimer: null,
       reconnectAttempts: 0,
       reconnectTimer: null,
       // PLM4 (Finding: flap): one-shot timer armed on each successful hoist; it resets the retry budget
@@ -1243,20 +1391,19 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // Redaction invariant: every string injected toward Gemini goes through the redaction pass
         // regardless of who composed it — identity on already-clean tier text, load-bearing when the
         // cortex-curated path renders text this choke point did not itself sanitize upstream.
+        // co-design spec A (turn-arbiter program, Wave 3): the hardcoded turnComplete:true literal
+        // dies here — composeBriefEnvelope decides turn-completion off the LIVE ack state + the
+        // class-5 delivery-matrix mode (no settings dial wired yet, so the DEFAULT mode applies).
+        // Under that default (passive-context) a brief NEVER manufactures a proactive spoken turn by
+        // itself (co-design invariant 5) — it reuses applyBackgroundFraming (fikj.8 Leg B) verbatim.
+        const briefEnvelope = composeBriefEnvelope({
+          briefText: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}`,
+          ack: ackState(),
+          mode: DEFAULT_DELIVERY_MATRIX[5],
+        });
         sess.sendClientContent({
-          turns: [{
-            role: "user",
-            parts: [{
-              // WS2 (fikj.8): the brief is conceptually passive background context — classify it
-              // passive to applyBackgroundFraming (false) regardless of the turnComplete:true this
-              // send still hands Gemini; see the helper's doc comment for why those are decoupled.
-              text: applyBackgroundFraming(
-                `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}`,
-                false,
-              ),
-            }],
-          }],
-          turnComplete: true,
+          turns: [{ role: "user", parts: [{ text: briefEnvelope.text }] }],
+          turnComplete: briefEnvelope.turnComplete,
         });
         // Phase 2 Step 2.2: acknowledge ONLY now that the send returned without throwing — this is
         // the ack-on-success seam. A reconnect race (an older delivery's ack landing after a newer
@@ -2370,17 +2517,13 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // debounce; we forward each signal as a user-role nudge (same convention as approval
         // narration the model already speaks). Unsubscribed on socket close.
         if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
-        // B1 (phase-2 defer): reset the queue for this fresh session — its `sig` payloads + timer belong
-        // to the prior session's closure; a survivor "ready" is re-published by the bus, not replayed.
-        state.deferredReady = [];
-        if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
+        // W3 fold: cancel any in-flight pane-ack drain timer from the PRIOR session's closure — its
+        // arbiter instance + pending map belong to that closure; a survivor "ready" is re-published
+        // by the bus, not replayed.
+        if (state.paneAckDrainTimer) { clearTimeout(state.paneAckDrainTimer); state.paneAckDrainTimer = null; }
         // wsm-e2e-pinned-zmu5: same reset rationale — a fresh/resumed session must not inherit a stale
         // partial-thought buffer left over from a torn-down connection.
         state.pendingModelThinking = "";
-
-        // B1 (phase-2 defer): stale ceiling — a "ready" older than this is dropped on drain (the UI
-        // already shows the pane, so a 10s-late "it's up" is pure noise).
-        const READY_DEFER_MAX_MS = 10_000;
 
         // Phase 4, Step 4.2 — exchange-aware enrichment of a pane signal's spoken/context text.
         // Three-way decision (Phase 5.5 fix — see ExchangeSignalNarration's doc): `narrate` sends
@@ -2433,44 +2576,97 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           }
         };
 
-        // B1 (phase-2 defer): re-evaluate the queued "ready" signals at the next safe gap. Single unref'd
-        // timer (re-armed if still mid-utterance); each queued sig is dropped once stale or suppressed on
-        // a barge-in, spoken when the turn is clear.
-        const armReadyDrain = () => {
-          if (state.readyDrainTimer) return; // one timer in flight; it re-arms itself if needed.
-          state.readyDrainTimer = setTimeout(() => {
-            state.readyDrainTimer = null;
-            const now = Date.now();
-            const still: DeferredPaneSignal[] = [];
-            for (const sig of state.deferredReady) {
-              const age = now - (sig.__deferredAt ?? now);
-              if (age > READY_DEFER_MAX_MS) continue; // stale -> drop (UI already reflects the pane).
-              const d = shouldSpeakReadyAck(ackState());
-              if (d === "speak") { pushSignal(sig); }
-              else if (d === "suppress") { /* barge-in -> drop */ }
-              else { still.push(sig); } // defer again
-            }
-            state.deferredReady = still;
-            if (state.deferredReady.length > 0) armReadyDrain();
-          }, OPERATOR_HOLD_MS);
-          if (state.readyDrainTimer.unref) state.readyDrainTimer.unref();
+        // W4 fold (turn-arbiter program, spec §3.3/§4-W4; audit §2.5 "producer proliferation"): the
+        // private per-connection arbiter is GONE — class-4 pane acks now defer through the SHARED
+        // arbiter server.ts constructs ONCE and injects into BOTH createGating and
+        // attachVoiceSession (falls back to a fresh local instance for a legacy harness that injects
+        // none), the SAME queue vc-C completions below submit into and the gating sweep's five timer
+        // call-sites submit into. The drain loop below is CONTINUOUS (started once, re-arms itself
+        // every tick for the life of the connection, cleared alongside the heartbeat/reconnect
+        // timers on disconnect via the SAME state.paneAckDrainTimer field) rather than "armed only
+        // when THIS connection queued something" — a class-2 item the gating sweep submitted must
+        // still drain even when no pane ack/completion ever fires here. Each tick renders AT MOST
+        // one digest (renderArbiterDigest) through the ONE choke point (sendArbiterDigest) instead
+        // of replaying N raw signals.
+        const sharedArbiter: TurnArbiter = turnArbiter ?? createTurnArbiter();
+
+        // One tick of the continuous drain loop. Extracted so the timer callback can wrap it in a
+        // try/catch (spec §3.4 failure semantics: an arbiter/render/store fault must degrade, never
+        // kill the loop — a dead loop is permanent silence for every queued item, the exact
+        // silent-drop the program forbids).
+        const drainArbiterTick = () => {
+          // Dead/superseded-session guard: once this closure's session is no longer the live one
+          // (socket died, reconnect hoisted a newer closure), draining here would clear the shared
+          // queue into a dead sendClientContent — items lost with nobody hearing them. Hold them:
+          // the next established session's own loop drains the SAME shared arbiter (never-drop).
+          if (coreState.activeLiveSession !== justConnected) return;
+          const turnClear = shouldSpeakReadyAck(ackState()) === "speak";
+          const decision = sharedArbiter.evaluate({ now: Date.now(), floorHeld: !turnClear, turnClear });
+          // digestSendPlan (pure, unit-pinned) maps BOTH deliverable arms — "drain" AND the D1 cap's
+          // "interrupt-at-phrase-boundary" (which the arbiter has already dequeued exactly-once; a
+          // drain-only caller would silently vanish it). This tick fires on the OPERATOR_HOLD_MS
+          // settle cadence, so the forced-turn interrupt send IS the phrase-boundary delivery.
+          const plan = digestSendPlan(decision);
+          if (!plan.send) return;
+          sendArbiterDigest(justConnected, store, state.voiceSessionId, ackState(), plan.digest, plan.mode);
         };
 
-        const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
-          // B1 (phase-2 gate): the async-spawn "ready" ("created") AND the operator-initiated exit+
-          // archive completion ("closed", wsm-e2e-pinned-5h0) are turn-gated — both are follow-ups that
-          // must never talk over the operator. All other kinds (idle/error/prompt/exited) keep today's
-          // immediate-push behavior verbatim.
-          if (sig.kind === "created" || sig.kind === "closed") {
-            const d = shouldSpeakReadyAck(ackState());
-            if (d === "suppress") return;                       // barge-in -> drop the "ready".
-            if (d === "defer") {                                // mid-utterance -> queue + re-arm.
-              // bead ykr: clone before stamping — the bus shares ONE signal object across all observers,
-              // so we must NOT mutate the shared payload. The queue owns its tagged copy.
-              state.deferredReady.push(stampDeferred(sig, Date.now()));
-              armReadyDrain();
-              return;
+        const armArbiterDrain = () => {
+          if (state.paneAckDrainTimer) return; // one timer in flight; it re-arms itself below.
+          state.paneAckDrainTimer = setTimeout(() => {
+            state.paneAckDrainTimer = null;
+            try {
+              drainArbiterTick();
+            } catch (e) {
+              // §3.4: a broken scheduler degrades to pre-arbiter behavior, never to silence — the
+              // loop re-arms below regardless, so one bad tick can never end all future drains.
+              console.error("[turn-arbiter] drain tick failed:", e);
             }
+            armArbiterDrain(); // keep polling for the life of the connection.
+          }, OPERATOR_HOLD_MS);
+          if (state.paneAckDrainTimer.unref) state.paneAckDrainTimer.unref();
+        };
+        armArbiterDrain();
+
+        const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
+          // W3 fold: paneSignalClass is the ONE classifier deciding which arbiter class a pane
+          // signal submits as — class 4 (created/closed, the operator-facing acks the old ready-defer
+          // trichotomy gated) defers through the shared arbiter above; class 5 (idle/error/prompt/
+          // exited/running/quiescing) keeps today's immediate passive-context push verbatim.
+          if (paneSignalClass(sig.kind) === 4) {
+            if (shouldSpeakReadyAck(ackState()) === "speak") { pushSignal(sig); return; }
+            // mid-utterance OR barge-in: BOTH now defer — never a silent drop (told-more floor).
+            const coalesceKey = `ready-ack:${sig.paneId}:${sig.kind}`;
+            try {
+              sharedArbiter.submit({ facts: formatPaneSignal(sig), cls: 4, paneId: sig.paneId, coalesceKey });
+            } catch (e) {
+              // Spec §3.4: an arbiter throw degrades the producer to the passive framed injection
+              // (pushSignal applies applyBackgroundFraming) — never to silence, never a lost ack.
+              console.error("[turn-arbiter] pane-ack submit failed:", e);
+              pushSignal(sig);
+            }
+            return;
+          }
+          // vc-C (spec §3.3 row 4): the genuine idle completion edge ALSO elects a class-3 completion
+          // narration, keyed off the SAME settled-outcome seam (completionKindFor) PR #152's earcon
+          // uses — reused, never re-derived. Joins the SAME shared arbiter queue class-4 acks defer
+          // through above (W4 fold — one queue, no more submit-with-nowhere-to-drain).
+          if (sig.kind === "idle") {
+            const outcomeKind = completionKindFor ? completionKindFor(sig.paneId) : "completion";
+            const decision = completionNarration({
+              sig, outcomeKind, hasExchange: hasActiveExchange(sig.paneId), policy: DEFAULT_COMPLETION_ANNOUNCE,
+            });
+            if (decision.speak) {
+              try { sharedArbiter.submit(decision.item); }
+              catch (e) { console.error("[turn-arbiter] completion narration submit failed:", e); }
+            }
+            // DELIBERATE divergence from co-design §C acceptance 7 ("suppress the duplicate passive
+            // idle signal when the deterministic line is elected"): the passive push below still
+            // runs, because it is the exchange-aware ENRICHED narration seam PR #152's return-
+            // channel journeys pin ("Pane 'X' finished: <summary>", exactly-once, settle-before-
+            // publish) — suppressing it would break that pinned, richer behavior. Double delivery
+            // is safe by construction: the passive line is BACKGROUND-framed and can never complete
+            // a turn; the class-3 digest is the single SPOKEN guarantee (told-more, never a drop).
           }
           pushSignal(sig);
         });
@@ -2715,9 +2911,8 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
       clearReconnectTimer();
       clearStableResetTimer(); // PLM4 (Finding: flap): no budget-refresh timer should outlive the WS.
       if (state.unsubscribePaneSignals) { state.unsubscribePaneSignals(); state.unsubscribePaneSignals = null; }
-      // B1 (phase-2 defer): no queued-ack drain timer should outlive the operator's WS.
-      if (state.readyDrainTimer) { clearTimeout(state.readyDrainTimer); state.readyDrainTimer = null; }
-      state.deferredReady = [];
+      // W3 fold: no pane-ack drain timer should outlive the operator's WS.
+      if (state.paneAckDrainTimer) { clearTimeout(state.paneAckDrainTimer); state.paneAckDrainTimer = null; }
       coreState.clients.delete(clientWs);
       if (coreState.activeFrontendWs === clientWs) {
         coreState.activeFrontendWs = null;

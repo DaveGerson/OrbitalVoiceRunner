@@ -18,8 +18,11 @@
 //       report; here we pin the durable RECALL primitive that backs it.)
 //   US-4.3 (voice drop & reconnect) — the REAL headless server: stage a HITL approval bound to the
 //       live session, drop the socket, reconnect, and assert (a) GET /api/commands/pending still
-//       lists it, (b) the survivor re-attaches + is re-announced into the NEW session
-//       (session.clientContents), (c) a non-empty Gemini key via PUT /api/settings nudges the
+//       lists it, (b) the survivor re-attaches to the NEW session (session.sessionFor) — SILENTLY,
+//       never re-announced, because the bounded PLM4 auto-reconnect here re-establishes well under
+//       RECONNECT_QUIET_MS after the drop (turn-arbiter program, Wave 3, yg1w; audit §2.4 names this
+//       EXACT transient-blip scenario as the bug the quiet threshold fixes — the operator's browser
+//       WS never even noticed), (c) a non-empty Gemini key via PUT /api/settings nudges the
 //       CURRENT connection exactly once (stale-owner clear is a no-op), (d) approving via REST after
 //       reconnect dispatches the command to the correct pane, and (e) the SERVER retained
 //       drafts/attention/pane-state across the drop (server source of truth).
@@ -395,7 +398,7 @@ describe("US-4.3 voice drop & reconnect: server retains state, reconnect re-cont
     assert.ok((running.manager.terminals as any)["e04-pane"], "the pane object survived the drop server-side");
   });
 
-  it("US-4.3 reconnect re-announces the survivor into the NEW session + injects the working brief", async () => {
+  it("US-4.3 a quiet reconnect blip re-attaches the survivor SILENTLY — no 'welcome back' replay", async () => {
     const approvals = running._testPendingApprovals!();
     const messageId = "e04-survivor-1"; // staged in the prior test; the suite shares one server.
 
@@ -405,16 +408,24 @@ describe("US-4.3 voice drop & reconnect: server retains state, reconnect re-cont
       return s && s.clientContents ? s : undefined;
     });
 
-    // The survivor re-attached to the reconnected session (reattachSession on the reconnect hoist)...
+    // The survivor re-attached to the reconnected session (reattachSession on the reconnect hoist) —
+    // the MECHANICS run regardless of the quiet threshold below.
     await waitFor(() => approvals.sessionFor(messageId) === session1);
     assert.strictEqual(approvals.sessionFor(messageId), session1, "survivor re-attached to the reconnected session");
 
-    // ...and the survivors digest was SPOKEN into the new session (reannounceSurvivors -> sendClientContent).
-    await waitFor(() => session1.clientContents.some((c: any) => JSON.stringify(c).includes("run the full test suite")));
+    // turn-arbiter program, Wave 3 (yg1w, spec §3.3 row 7): this bounded PLM4 auto-reconnect (base/
+    // max delay 20/60ms here) re-establishes the Gemini session well under RECONNECT_QUIET_MS after
+    // the drop — EXACTLY the transient-blip scenario audit §2.4 names ("the operator hears 'Welcome
+    // back' plus a re-read of approvals they were just discussing" — a bug, not a feature). The fix
+    // is that a quiet re-attach must NEVER replay that ceremony; a short settle window (not a slow
+    // 4000ms waitFor-timeout) confirms it never arrives.
+    await new Promise((resolve) => setTimeout(resolve, 250));
     const spokeDigest = session1.clientContents.some((c: any) => JSON.stringify(c).includes("run the full test suite"));
-    assert.ok(spokeDigest, "the reconnect re-contextualized the new session with the survivors digest");
+    assert.strictEqual(spokeDigest, false,
+      "yg1w: a sub-threshold reconnect blip must NOT replay the survivors digest into the new session");
     const spokeWelcome = session1.clientContents.some((c: any) => /welcome back/i.test(JSON.stringify(c)));
-    assert.ok(spokeWelcome, "the survivors digest opens with a 'welcome back' re-orientation");
+    assert.strictEqual(spokeWelcome, false,
+      "yg1w: a quiet re-attach never says 'Welcome back' mid-flow — the ceremony defers to a genuine absence");
   });
 
   it("US-4.3 a non-empty Gemini key via PUT /api/settings nudges the CURRENT connection exactly once", async () => {

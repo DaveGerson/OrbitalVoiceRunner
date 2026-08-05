@@ -445,6 +445,12 @@ export function resolveDecision(
  *   - "none"     : leave the record staged (not yet due, or clock paused, or already claimed).
  *   - "lastcall" : connected + past TTL + no prior last-call → speak the last-call, set lastCallAt, DON'T reject.
  *   - "reject"   : connected + last-call already spoken + grace elapsed → route to applyResolution(id,"expire").
+ *
+ * Wave-2 (turn-arbiter D1, spec section 3.3 row 1): `extraGraceMs` widens the grace check ONLY --
+ * "while the operator holds the floor, a class-2 deadline pauses" -- the gating sweep passes in
+ * `turnArbiter.floorPausedMs(coalesceKey)` so a floor-held last-call cannot be rejected out from
+ * under the operator. Defaults to 0 (byte-identical to the pre-Wave-2 signature) when the caller
+ * has no arbiter injected.
  */
 export type SweepAction = { action: "none" } | { action: "lastcall" } | { action: "reject" };
 
@@ -474,16 +480,19 @@ export function decideSweepAction(
   ttlMs: number,
   graceMs: number,
   isConnected: boolean,
+  extraGraceMs: number = 0,
 ): SweepAction {
   // (1) Clock paused while disconnected — never reject without a session to hear the last-call.
   if (!isConnected) return { action: "none" };
   // (2) A claimed record is mid-resolve / already won; the sweep must not touch it.
   if (record.claimed) return { action: "none" };
   // (4) Last-call already spoken and the grace window has elapsed → reject. (Checked before the
-  // first-crossing gate so a record with lastCallAt set isn't re-issued a last-call.)
+  // first-crossing gate so a record with lastCallAt set isn't re-issued a last-call.) Wave-2 D1:
+  // `extraGraceMs` (the arbiter's floor-held pause on this same deadline) widens the window so a
+  // last-call the operator was mid-floor for cannot expire out from under them.
   if (record.lastCallAt !== undefined) {
-    if (now - record.lastCallAt > graceMs) return { action: "reject" };
-    return { action: "none" }; // still inside the grace window.
+    if (now - record.lastCallAt > graceMs + extraGraceMs) return { action: "reject" };
+    return { action: "none" }; // still inside the (possibly floor-extended) grace window.
   }
   // (3) First crossing of the TTL while connected and idle → speak the last-call.
   if (now - record.timestamp > ttlMs) return { action: "lastcall" };

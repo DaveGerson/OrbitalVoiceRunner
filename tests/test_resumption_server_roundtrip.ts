@@ -10,9 +10,11 @@
 //      purge it), verified over the REAL `GET /api/commands/pending` HTTP endpoint (a genuine
 //      server round-trip), not just an in-process store-object assertion.
 //   2. `reannounceSurvivors` — the reconnect that follows must (a) re-attach the orphan to the
-//      fresh session, (b) speak the batched digest into it, AND (c) broadcast `terminals_updated`
-//      to the OPERATOR's real WebSocket client so the UI's chips repopulate. (b) is already pinned
-//      by test_session_reconnect.ts suite (b); (a) via REST and (c) are the NEW pins here.
+//      fresh session, (b) stay QUIET — no spoken digest — because this scripted reconnect succeeds
+//      well under RECONNECT_QUIET_MS after the drop (turn-arbiter program, Wave 3, yg1w; audit §2.4
+//      names this exact transient-blip scenario), AND (c) still broadcast `terminals_updated` to the
+//      OPERATOR's real WebSocket client so the UI's chips repopulate (the quiet path is silent, not
+//      inert). (a) via REST and (c) are the NEW pins here.
 //
 // Deterministic: every wait is a `waitFor` poll on real (non-mocked) timers/state, no fixed sleeps
 // for the pass path.
@@ -206,10 +208,16 @@ describe("wsm-e2e-pinned-yfa: detachSession -> reannounceSurvivors over a REAL s
     await waitFor(() => approvals.sessionFor(messageId) === session1);
     assert.strictEqual(approvals.sessionFor(messageId), session1, "the survivor re-attached to the reconnected session");
 
-    // (b) The batched digest was spoken into the new session, naming the survivor.
-    const spokeDigest = await waitFor(() =>
-      session1.clientContents.some((c) => JSON.stringify(c).includes("npm run deploy")));
-    assert.ok(spokeDigest, "the reconnect spoke the resumption digest naming the survivor");
+    // (b) turn-arbiter program, Wave 3 (yg1w, spec §3.3 row 7): this scripted reconnect succeeds
+    // immediately (failuresRemaining=0) — well under RECONNECT_QUIET_MS after the drop. That is
+    // EXACTLY the transient-blip scenario audit §2.4 names as the bug the quiet threshold fixes (a
+    // network hiccup the operator never perceived must not replay "Welcome back" mid-conversation).
+    // A short settle window (not a slow waitFor-timeout) confirms the digest never arrives — the
+    // approval stays actionable via REST regardless (asserted below).
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const spokeDigest = session1.clientContents.some((c) => JSON.stringify(c).includes("npm run deploy"));
+    assert.strictEqual(spokeDigest, false,
+      "yg1w: a sub-threshold reconnect blip must NOT replay the resumption digest into the new session");
 
     // (c) The OPERATOR's real WebSocket client received the `terminals_updated` broadcast that
     // repopulates its chips — the outward half of the round-trip resumption.spec.ts's mock harness

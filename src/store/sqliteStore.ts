@@ -7,6 +7,7 @@ import type {
   PaneRow, ArchivedPaneRow, ProjectRow, NoteRow, PendingApprovalRow, PendingActionRow,
   AttentionRow, HandoffRow, ValueRow, CountRow, IdRow, SearchHitRow,
   AgentExchangeRow, ExchangeEventRow, ContextDeliveryRow, TranscriptRow,
+  JumpOverRow, ArbiterDrainRow,
 } from "./types";
 import { pruneOnBoot, pruneIncremental, type PruneOpts, type SweepOpts, type SweepResult } from "./retention";
 import type { AgentExchange, ExchangeEvent, ContextDelivery, ExchangeState, ExchangeEventType } from "../exchanges/types";
@@ -1898,6 +1899,67 @@ export class JanusStore {
       ).all(sinceMs, limit) as TranscriptRow[]).map(r => ({ ...r }));
     } catch (e) {
       console.error("[store] listTranscriptsSince failed:", e);
+      return [];
+    }
+  }
+
+  // ── turn-arbiter program T4 telemetry (schema v14) ──────────────────────────────────────────────
+  // jump_over proves the arbiter's own steady-state invariant (post-arbiter: structurally zero
+  // forced turns landing mid-answer/mid-utterance); arbiter_drain gives the drain-size distribution
+  // the D2 headline+counted-tail policy is judged by. Both fail-soft BOTH ways (recordGeminiTurnUsage's
+  // try/catch writer shape; getContextInjections' hardened-reader shape) — telemetry must never
+  // throw into the live voice loop, and a closed handle must read as [].
+
+  /** Append one jump-over row. Fail-soft: swallows + console.error on any DB error. */
+  recordJumpOver(row: { ts: number; sessionId: string | null; producer: string | null; cls: number | null; detail: string | null }): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO jump_over(ts,session_id,producer,cls,detail) VALUES(@ts,@session_id,@producer,@cls,@detail)`
+      ).run({ ts: row.ts, session_id: row.sessionId, producer: row.producer, cls: row.cls, detail: row.detail });
+    } catch (e) {
+      console.error("[store] recordJumpOver failed:", e);
+    }
+  }
+
+  /** Read jump-over rows (most-recent-first) at or after `sinceTs`. Default limit 100. Fail-soft:
+   *  an unexpected DB error (including a closed handle) degrades to []. */
+  getJumpOvers(sinceTs: number, limit = 100): JumpOverRow[] {
+    try {
+      return this.db.prepare(
+        `SELECT * FROM jump_over WHERE ts >= ? ORDER BY id DESC LIMIT ?`
+      ).all(sinceTs, limit) as JumpOverRow[];
+    } catch (e) {
+      console.error("[store] getJumpOvers failed:", e);
+      return [];
+    }
+  }
+
+  /** Append one arbiter-drain row. `drainSize` === `1 + tailCount` is the CALLER's own invariant —
+   *  this writer persists whatever it is handed. Fail-soft: swallows + console.error on any DB error. */
+  recordArbiterDrain(row: { ts: number; sessionId: string | null; mode: string; headlineCls: number; drainSize: number; tailCount: number }): void {
+    try {
+      this.db.prepare(
+        `INSERT INTO arbiter_drain(ts,session_id,mode,headline_cls,drain_size,tail_count)
+         VALUES(@ts,@session_id,@mode,@headline_cls,@drain_size,@tail_count)`
+      ).run({
+        ts: row.ts, session_id: row.sessionId, mode: row.mode,
+        headline_cls: row.headlineCls, drain_size: row.drainSize, tail_count: row.tailCount,
+      });
+    } catch (e) {
+      console.error("[store] recordArbiterDrain failed:", e);
+    }
+  }
+
+  /** Read arbiter-drain rows (most-recent-first) at or after `sinceTs`. Default limit 100 — the
+   *  drain-size distribution over these rows is the T4 analysis unit. Fail-soft: an unexpected DB
+   *  error (including a closed handle) degrades to []. */
+  getArbiterDrains(sinceTs: number, limit = 100): ArbiterDrainRow[] {
+    try {
+      return this.db.prepare(
+        `SELECT * FROM arbiter_drain WHERE ts >= ? ORDER BY id DESC LIMIT ?`
+      ).all(sinceTs, limit) as ArbiterDrainRow[];
+    } catch (e) {
+      console.error("[store] getArbiterDrains failed:", e);
       return [];
     }
   }

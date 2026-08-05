@@ -162,6 +162,21 @@ export interface GeminiTurnUsageRow {
  *  with `ContextInjectionEvent` (src/memory/contextTelemetry.ts) — this IS that shape as stored. */
 export type ContextInjectionRow = import("../memory/contextTelemetry").ContextInjectionEvent;
 
+/** Raw `jump_over` row (schema v14, turn-arbiter program T4 telemetry). A forced turn
+ *  (turnComplete:true) landing mid-answer/mid-utterance — post-arbiter this should be
+ *  STRUCTURALLY ZERO; the row exists to prove it (the +14d watch bead reads this). */
+export interface JumpOverRow {
+  id: number; ts: number; session_id: string | null; producer: string | null;
+  cls: number | null; detail: string | null;
+}
+/** Raw `arbiter_drain` row (schema v14, turn-arbiter program T4 telemetry). `drain_size` ===
+ *  `1 + tail_count` (headline + tail) is the caller's own invariant — the distribution over these
+ *  rows is the T4 analysis unit (D2 headline + counted-tail policy). */
+export interface ArbiterDrainRow {
+  id: number; ts: number; session_id: string | null; mode: string | null;
+  headline_cls: number | null; drain_size: number; tail_count: number;
+}
+
 /** Raw `agent_exchanges` row (schema v12, AgentExchange spine). Column-for-column with
  *  `AgentExchange` (src/exchanges/types.ts) — this IS that shape as stored; no boolean columns to
  *  coerce, so the row IS the stored shape (mirrors the ContextInjectionRow precedent above). */
