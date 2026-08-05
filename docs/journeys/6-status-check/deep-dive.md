@@ -1,5 +1,14 @@
 # Journey 6: On-Demand Status Check — Deep Dive
 
+> ⚠️ **HISTORICAL — audited 2026-05-30, NOT maintained.** This deep-dive describes the code as it
+> stood in May 2026. The voice/approval stack has since been rewritten: approval routing now lives
+> in `src/voiceApprovalRouting.ts` + `src/gating/index.ts` (TTL → last-call → grace → expire,
+> defer/hold, stop-all brake) behind the turn arbiter, and persistence is the SQLite `JanusStore`
+> — **not** the `.janus_ledger.json` `Ledger`. **Verify every `file:line` citation against current
+> code before acting on it.** The companion per-journey gap register (`gaps.md`) was retired on
+> 2026-08-05; live defects are tracked in beads (`bd ready`). Context and retrieval instructions:
+> [`docs/journeys/README.md`](../README.md).
+
 **Scope:** "Ask 'what's busy or done?' across all panes whenever you want a spoken status of in-flight work."
 **Modality constraint:** Janus input is audio-only (16 kHz PCM in; audio + tool calls out). No vision. All "content" is terminal output accessed via `get_pane_summary`. Fully hands-free, eyes-off.
 

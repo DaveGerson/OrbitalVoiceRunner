@@ -11,6 +11,12 @@ independent final audit.
 > fails at the exact seam an eyes-off operator cannot recover from.
 > **Not hands-free-safe today.** 39 distinct defects, 8 P0.
 
+> ⚠️ **This audit is a May–June 2026 snapshot, preserved as written.** Many of the defects below —
+> including P0s such as oldest-FIFO voice approval (BUG-007) and `isApprove` winning collisions
+> (BUG-008) — have since shipped fixes. For **current** defects use beads (`bd ready`); for the
+> **current** architecture use [`JOURNEYS_DESIGN.md`](../JOURNEYS_DESIGN.md). Do not read the
+> present-tense claims here as today's state.
+
 ## Start here
 - **[review/IMPLEMENTATION_PLAN.md](review/IMPLEMENTATION_PLAN.md)** — build-ready remediation plan: 12 workstreams across 4 milestones, dependency-aware sequencing, per-item file/function targets, data-model & tool-schema changes, tests, and the "hands-free-safe" definition of done.
 - **[review/final-review.md](review/final-review.md)** — independent audit, re-verification (8/8 confirmed), priority challenges, new findings, remediation roadmap, readiness sign-off.
@@ -22,17 +28,25 @@ independent final audit.
 - **[synthesis/future-technical-architecture.md](synthesis/future-technical-architecture.md)** — best-in-class target architecture, subsystem-by-subsystem "Today → Target" contrasts, target tool surface, and a gap→target migration map.
 - **[synthesis/_operator-narrative.md](synthesis/_operator-narrative.md)** — first-person "day in the car" eyes-off narrative chaining the journeys, friction tied to gap IDs (input to the holistic synthesis).
 
-## Per-journey (deep-dive + gaps)
-| # | Journey | Deep-dive | Gaps |
-|---|---------|-----------|------|
-| 1 | Fan-out / delegate in parallel | [deep-dive](journeys/1-fan-out/deep-dive.md) | [gaps](journeys/1-fan-out/gaps.md) |
-| 2 | Supervisor / air-traffic control | [deep-dive](journeys/2-supervisor/deep-dive.md) | [gaps](journeys/2-supervisor/gaps.md) |
-| 3 | Review & approve across panes | [deep-dive](journeys/3-review-approve/deep-dive.md) | [gaps](journeys/3-review-approve/gaps.md) |
-| 4 | Knowledge capture & continuity | [deep-dive](journeys/4-knowledge-capture/deep-dive.md) | [gaps](journeys/4-knowledge-capture/gaps.md) |
-| 5 | Adjust autonomy mid-session | [deep-dive](journeys/5-adjust-autonomy/deep-dive.md) | [gaps](journeys/5-adjust-autonomy/gaps.md) |
-| 6 | On-demand status check | [deep-dive](journeys/6-status-check/deep-dive.md) | [gaps](journeys/6-status-check/gaps.md) |
-| 7 | Dictate a specification *(secondary)* | [deep-dive](journeys/7-dictate-spec/deep-dive.md) | [gaps](journeys/7-dictate-spec/gaps.md) |
-| 8 | Narrate a terminal walk-through *(secondary)* | [deep-dive](journeys/8-narrate-walkthrough/deep-dive.md) | [gaps](journeys/8-narrate-walkthrough/gaps.md) |
+## Per-journey (deep-dive)
+> **The per-journey gap registers (`gaps.md`) were retired on 2026-08-05.** They were a frozen
+> parallel tracker whose `file:line` citations had rotted against the rewritten voice/approval
+> stack. Live defects are tracked in beads (`bd ready`); rationale, the six gap IDs that were ever
+> promoted, and git recovery instructions are in **[journeys/README.md](journeys/README.md)**.
+> The deep-dives below are banner-stamped **historical** (audited 2026-05-30) — verify any citation
+> against current code before acting on it. The live journey artifacts are
+> [`JOURNEYS_DESIGN.md`](../JOURNEYS_DESIGN.md) and `tests/test_journeys.ts`.
+
+| # | Journey | Deep-dive |
+|---|---------|-----------|
+| 1 | Fan-out / delegate in parallel | [deep-dive](journeys/1-fan-out/deep-dive.md) |
+| 2 | Supervisor / air-traffic control | [deep-dive](journeys/2-supervisor/deep-dive.md) |
+| 3 | Review & approve across panes | [deep-dive](journeys/3-review-approve/deep-dive.md) |
+| 4 | Knowledge capture & continuity | [deep-dive](journeys/4-knowledge-capture/deep-dive.md) |
+| 5 | Adjust autonomy mid-session | [deep-dive](journeys/5-adjust-autonomy/deep-dive.md) |
+| 6 | On-demand status check | [deep-dive](journeys/6-status-check/deep-dive.md) |
+| 7 | Dictate a specification *(secondary)* | [deep-dive](journeys/7-dictate-spec/deep-dive.md) |
+| 8 | Narrate a terminal walk-through *(secondary)* | [deep-dive](journeys/8-narrate-walkthrough/deep-dive.md) |
 
 ## The P0 set (eyes-off severity)
 1. **BUG-001** — Janus is mute while an approval is pending and never speaks the command → blind voice approval.
