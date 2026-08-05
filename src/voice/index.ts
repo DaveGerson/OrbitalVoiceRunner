@@ -478,6 +478,33 @@ export function stampDeferred(sig: PaneSignal, now: number): DeferredPaneSignal 
   return { ...sig, __deferredAt: now };
 }
 
+// WS2 (fikj.8): the one-line BACKGROUND preamble applyBackgroundFraming prefixes onto passive
+// injections. Kept well under 120 chars — it counts against the memory brief's 4.8k-char budget.
+const BACKGROUND_PREAMBLE =
+  "BACKGROUND — do not change subject to this unless asked or it supersedes the current task.";
+
+/**
+ * WS2 (fikj.8) "answer-first ordering" fix, mechanical Leg B (Leg A is the prompt rule added to
+ * [7. VOICE OUTPUT RULES] in systemPrompt.ts). Once deferred background briefs pile in, nothing
+ * stops the model opening a spoken turn with that news instead of answering what the director just
+ * asked — this prefixes passively-injected context text with a BACKGROUND preamble so the model can
+ * tell, at the text itself, that it must not lead with it.
+ *
+ * `turnComplete` is the CALLER's own passive/forced classification, not necessarily the literal
+ * value the site ultimately hands to Gemini's sendClientContent — the memory-brief send is
+ * conceptually passive background context even though its protocol-level turnComplete is still
+ * `true` (flipping that literal is a deeper fix out of this bead's scope); that site classifies
+ * itself passive here regardless. `turnComplete: true` (operator turns, forced acks/narrations) is a
+ * strict no-op — those must never carry the preamble. Idempotent: text that already starts with the
+ * preamble is returned unchanged, so re-narrated/re-injected text never accumulates a second copy.
+ * Pure (exported for unit coverage) — no live session required.
+ */
+export function applyBackgroundFraming(text: string, turnComplete: boolean): string {
+  if (turnComplete) return text;
+  if (text.startsWith(BACKGROUND_PREAMBLE)) return text;
+  return `${BACKGROUND_PREAMBLE}\n${text}`;
+}
+
 /**
  * B1 (async spawn): a lighter sibling of pushApprovalNarration for the two-phase spawn acks. No
  * "SYSTEM EVENT" framing — these are natural-cadence confirmations ("Opening the pane now.") the
@@ -1217,7 +1244,18 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         // regardless of who composed it — identity on already-clean tier text, load-bearing when the
         // cortex-curated path renders text this choke point did not itself sanitize upstream.
         sess.sendClientContent({
-          turns: [{ role: "user", parts: [{ text: `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}` }] }],
+          turns: [{
+            role: "user",
+            parts: [{
+              // WS2 (fikj.8): the brief is conceptually passive background context — classify it
+              // passive to applyBackgroundFraming (false) regardless of the turnComplete:true this
+              // send still hands Gemini; see the helper's doc comment for why those are decoupled.
+              text: applyBackgroundFraming(
+                `CONTEXT (situational, do not read aloud):\n${redactSecrets(brief.text)}`,
+                false,
+              ),
+            }],
+          }],
           turnComplete: true,
         });
         // Phase 2 Step 2.2: acknowledge ONLY now that the send returned without throwing — this is
@@ -2387,7 +2425,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             if (decision.kind === "suppress") return; // deliberately silent — never a plain-text leak
             const text = decision.kind === "narrate" ? decision.text : formatPaneSignal(sig);
             justConnected.sendClientContent({
-              turns: [{ role: "user", parts: [{ text }] }],
+              turns: [{ role: "user", parts: [{ text: applyBackgroundFraming(text, false) }] }],
               turnComplete: false, // L1 fix: inject as passive context, not a forced spoken turn
             });
           } catch (e) {

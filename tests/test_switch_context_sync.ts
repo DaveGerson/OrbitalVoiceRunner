@@ -49,6 +49,9 @@ describe("switch_context catch-up briefing is non-stale (fact [E])", () => {
       broadcastLedgerUpdate: () => {},
       // PHASE 2: switch_context now Off-vetoes on its veto-class capability; default Auto = no change.
       effectiveCapabilityGateFor: () => "Auto",
+      // WS3 (voice-followups-tdd): switch_context now consults the focused-pane seam
+      // (resolveSwitchContextHonesty); no focused pane here, so the honesty branch never engages.
+      getActivePaneId: () => null,
     } as unknown as ActionContext;
 
     const res = switchContext.handler({ project_id: "proj_x" }, ctx);
@@ -84,6 +87,8 @@ describe("switch_context catch-up briefing is non-stale (fact [E])", () => {
       broadcastLedgerUpdate: () => { events.push("broadcastLedgerUpdate"); },
       // PHASE 2: switch_context now Off-vetoes on its veto-class capability; default Auto = no change.
       effectiveCapabilityGateFor: () => "Auto",
+      // WS3 (voice-followups-tdd): see the sibling test above.
+      getActivePaneId: () => null,
     } as unknown as ActionContext;
 
     const res = switchContext.handler({ project_id: "proj_y" }, ctx);

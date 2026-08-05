@@ -7,12 +7,16 @@ export type EarconType =
   | "completion" | "alert" | "success" | "execute" | "chime" | "reconnect"
   // BUG-018 differentiation tokens: an eyes-off operator must hear a DISTINCT tone for a held-back
   // command ("blocked") vs. a pane needing your OK ("alert") vs. an autonomy change ("permission").
-  | "blocked" | "permission" | "note";
+  | "blocked" | "permission" | "note"
+  // WS1 (completion_failed): a run that FAILED must never ring the same tone as a clean pass —
+  // "failure" is a genuinely new earcon (the sanctioned BUG-018 path: server kind + client tone
+  // vocabulary updated together in one slice, not the "reuse alert" carve-out card 1C.1 used).
+  | "failure";
 
 /** Runtime guard for untyped WS frames (proactive_earcon carries a free-form string). */
 export function isEarconType(v: unknown): v is EarconType {
   return v === "completion" || v === "alert" || v === "success" || v === "execute" || v === "chime" || v === "reconnect"
-    || v === "blocked" || v === "permission" || v === "note";
+    || v === "blocked" || v === "permission" || v === "note" || v === "failure";
 }
 
 // [freq, startOffset, duration] triples per earcon — distinct enough to tell apart eyes-off. A
@@ -34,6 +38,10 @@ const TONE_TABLE: Record<EarconType, [number, number, number][]> = {
   // passes "note" to playEarcon. Kept in the table (and isEarconType) so a future note-save broadcast
   // can ring it without re-plumbing the vocabulary; delete this entry if that path never materializes.
   note: [[659.25, 0, 0.12]],                                    // single E5 blip — note saved
+  // WS1: a harsh, LOW two-note falling buzz — deliberately lower/darker than both alert's A4->E4
+  // and blocked's E4->A3 falling tones so a failed run is never mistaken for "needs you" or "held
+  // back"; distinct from every existing tuple in the table.
+  failure: [[293.66, 0, 0.14], [196.00, 0.12, 0.30]],           // D4->G3 falling — run failed
 };
 
 export function playEarcon(type: EarconType): void {

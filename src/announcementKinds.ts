@@ -12,14 +12,17 @@
 
 /** Status-keyed earcon vocabulary (App.tsx oscillator tones). BUG-018: "blocked" (command_blocked)
  *  and "permission" (permission_changed) are DISTINCT hands-free tones so an eyes-off operator can
- *  tell a held-back command / an autonomy change apart from a plain "alert" (an approval pending). */
-export type EarconType = "completion" | "alert" | "success" | "execute" | "chime" | "blocked" | "permission";
+ *  tell a held-back command / an autonomy change apart from a plain "alert" (an approval pending).
+ *  "failure" (completion_failed, WS1) is likewise its own tone: a run that FAILED must never ring
+ *  the same chime as a clean pass. */
+export type EarconType = "completion" | "alert" | "success" | "execute" | "chime" | "blocked" | "permission" | "failure";
 
 /** The earcon vocabulary as used by the client event bus, which may also yield "no earcon". */
 export type EarconTypeOrNull = EarconType | null;
 
 export type AnnouncementKind =
   | "completion"   // genuine WS-C Running->Idle edge (real work finished)
+  | "completion_failed" // genuine Running->Idle edge whose settled outcome FAILED (WS1)
   | "error"        // error text detected
   | "build-failed" // build failure
   | "exited"       // process exited
@@ -31,6 +34,7 @@ export type AnnouncementKind =
 /** The operator-editable template keys (Settings surface). */
 export type TemplateKey =
   | "completion"
+  | "completionFailed"
   | "error"
   | "buildFailed"
   | "exited"
@@ -61,18 +65,25 @@ export interface KindMeta {
  * `approval_pending` / `approval_expired` (Phase 1 Track C, card 1C.1): the approval paths used
  * to BORROW kind:"exited" for its high severity, which rendered the exited template — the
  * notification literally claimed a healthy pane died. These are the REAL kinds: same high
- * severity + the EXISTING client-known "alert" earcon (the kitchen client's playEarcon union is
- * updated by a later track — never invent a new earcon type here).
+ * severity + the EXISTING client-known "alert" earcon.
+ *
+ * `completion_failed` (WS1): a run that FAILED must not share the plain "completion" kind's
+ * "ta-da" earcon or its normal-severity bucket — it gets the NEW "failure" earcon (added to the
+ * client's playEarcon union in this same slice, the sanctioned BUG-018 path: server + client
+ * unions updated together) and HIGH severity, ranked above the approval kinds (a failed run is a
+ * more urgent signal than a pending approval) but below error/build-failed/exited (a process-level
+ * failure still outranks an outcome-level one).
  */
 export const KIND_META: Record<AnnouncementKind, KindMeta> = {
-  "build-failed":   { earcon: "alert", severity: "high", priority: 7, templateKey: "buildFailed" },
-  error:            { earcon: "alert", severity: "high", priority: 6, templateKey: "error" },
-  exited:           { earcon: "alert", severity: "high", priority: 5, templateKey: "exited" },
-  approval_pending: { earcon: "alert", severity: "high", priority: 4, templateKey: "approvalPending" },
-  approval_expired: { earcon: "alert", severity: "high", priority: 3, templateKey: "approvalExpired" },
-  plan_paused:      { earcon: "alert", severity: "high", priority: 2, templateKey: "planPaused" },
-  completion:       { earcon: "completion", severity: "normal", priority: 1, templateKey: "completion" },
-  plan_completed:   { earcon: "success", severity: "normal", priority: 0, templateKey: "planCompleted" },
+  "build-failed":     { earcon: "alert", severity: "high", priority: 8, templateKey: "buildFailed" },
+  error:              { earcon: "alert", severity: "high", priority: 7, templateKey: "error" },
+  exited:             { earcon: "alert", severity: "high", priority: 6, templateKey: "exited" },
+  completion_failed:  { earcon: "failure", severity: "high", priority: 5, templateKey: "completionFailed" },
+  approval_pending:   { earcon: "alert", severity: "high", priority: 4, templateKey: "approvalPending" },
+  approval_expired:   { earcon: "alert", severity: "high", priority: 3, templateKey: "approvalExpired" },
+  plan_paused:        { earcon: "alert", severity: "high", priority: 2, templateKey: "planPaused" },
+  completion:         { earcon: "completion", severity: "normal", priority: 1, templateKey: "completion" },
+  plan_completed:     { earcon: "success", severity: "normal", priority: 0, templateKey: "planCompleted" },
 };
 
 /** Derived projections — never hand-maintained; always read from KIND_META. */
@@ -100,6 +111,7 @@ export type AnnouncementTemplates = Record<TemplateKey, string>;
 
 export const DEFAULT_ANNOUNCEMENT_TEMPLATES: AnnouncementTemplates = {
   completion: "Pane '{pane}' finished. {summary}",
+  completionFailed: "Pane '{pane}' finished WITH FAILURES. {summary}",
   error: "Pane '{pane}' reported an error. {summary}",
   buildFailed: "Build failed on pane '{pane}'.",
   exited: "Pane '{pane}' exited.",
@@ -113,6 +125,7 @@ export const DEFAULT_ANNOUNCEMENT_TEMPLATES: AnnouncementTemplates = {
  *  this single array so the default strings are never re-typed by hand. */
 export const ANNOUNCEMENT_TEMPLATE_FIELDS: ReadonlyArray<readonly [TemplateKey, string]> = [
   ["completion", "Completion"],
+  ["completionFailed", "Completion (failed)"],
   ["error", "Error"],
   ["buildFailed", "Build failed"],
   ["exited", "Exited"],

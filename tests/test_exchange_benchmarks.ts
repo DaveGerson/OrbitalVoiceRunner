@@ -347,11 +347,19 @@ describe("exchange release benchmark (real server, real voice verbs, real observ
     ]);
   }
 
+  /** WS2 (wsm-e2e-pinned-fikj.8): passive injections carry a ONE-LINE "BACKGROUND — ..." preamble
+   *  (src/voice/index.ts applyBackgroundFraming; shape pinned by tests/test_answer_first_ordering.ts).
+   *  It is transport framing, not narration content — unwrap it so the narration-shape filters below
+   *  keep reading the same body text they always did. */
+  function unwrapBackgroundFraming(text: string): string {
+    return text.replace(/^BACKGROUND\b[^\n]*\n/, "");
+  }
   function clientTextsSince(sess: MockLiveSession, fromIdx: number): string[] {
     return sess.clientContents
       .slice(fromIdx)
       .map((c: any) => c?.turns?.[0]?.parts?.[0]?.text)
-      .filter((t: unknown): t is string => typeof t === "string");
+      .filter((t: unknown): t is string => typeof t === "string")
+      .map(unwrapBackgroundFraming);
   }
   function isExchangeNarration(text: string): boolean {
     return text.startsWith("Pane '") || text.startsWith("In project '");

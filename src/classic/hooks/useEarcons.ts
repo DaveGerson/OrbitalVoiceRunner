@@ -26,6 +26,14 @@ export interface Earcons {
   setBrowserNotificationsEnabled: (v: boolean) => void;
 }
 
+/** The classic player's AudioContext constructor (webkit fallback), hoisted out of playEarcon so
+ *  its `||` no longer counts against that function's McCabe budget (the WS1 "failure" branch took
+ *  the chain to the CC<=10 ceiling). Returning undefined is fine: `new undefined()` throws and
+ *  playEarcon's existing try/catch swallows it — the identical degrade-silently path as before. */
+function resolveAudioContextCtor(): typeof AudioContext {
+  return window.AudioContext || (window as any).webkitAudioContext;
+}
+
 export function useEarcons(): Earcons {
   // browserNotificationsEnabled gates triggerDesktopNotification(), which still fires for the
   // surviving approval / action-pending / auto-approve / blocked notifications. Auto-enabled at
@@ -36,7 +44,7 @@ export function useEarcons(): Earcons {
   // Web Audio Synth Chimes for Hands-Free Feedback
   const playEarcon = (type: EarconType) => {
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const ctx = new (resolveAudioContextCtor())();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
@@ -153,6 +161,30 @@ export function useEarcons(): Earcons {
         gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.22);
         osc2.start(now + 0.12);
         osc2.stop(now + 0.12 + 0.24);
+      } else if (type === "failure") {
+        // WS1 (completion_failed): a run that FAILED must never ring the completion "ta-da" — and
+        // in this if/else-if player an unknown token plays NOTHING, which is the forbidden silent
+        // drop (UX_BRIEF §4). Mirrors the kitchen tuple (src/utils/earcon.ts TONE_TABLE.failure,
+        // D4→G3 falling) so the two UIs sound the same — lower/darker than both alert (440/554)
+        // and blocked (330→220).
+        const now = ctx.currentTime;
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(293.66, now); // D4
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+        osc.start(now);
+        osc.stop(now + 0.16);
+
+        const osc2 = ctx.createOscillator();
+        const gain2 = ctx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(ctx.destination);
+        osc2.type = "triangle";
+        osc2.frequency.setValueAtTime(196, now + 0.12); // G3
+        gain2.gain.setValueAtTime(0.05, now + 0.12);
+        gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + 0.3);
+        osc2.start(now + 0.12);
+        osc2.stop(now + 0.12 + 0.32);
       } else if (type === "permission") {
         // BUG-018: a crisp two-note RISE (B4→D#5) — the operator learns it as "autonomy changed",
         // audibly distinct from alert (falling) and blocked (low falling). Mirrors the kitchen tone
