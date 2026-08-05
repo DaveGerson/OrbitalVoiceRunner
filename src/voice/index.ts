@@ -716,9 +716,10 @@ function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedger
  * Final-review fix 3: returns whether the send genuinely landed (`sent`) so the drain-tick call
  * site can resubmit an undelivered digest (resubmitUndeliveredDigest) instead of silently dropping
  * it — the queue was already cleared pre-send, so a swallowed throw used to be an unrecoverable
- * loss (class-0 corrections included: the ledger had marked the claim corrected, so re-invalidate
- * refused). Exported (alongside the pure digestSendPlan/renderArbiterDigest family) so the
- * never-drop loop is unit-testable end to end.
+ * loss (class-0 corrections included: the ledger EVICTS a claim at invalidate time — r25i; before
+ * that it flagged it corrected — so re-invalidate refuses either way and only digest resubmission
+ * can recover the retraction). Exported (alongside the pure digestSendPlan/renderArbiterDigest
+ * family) so the never-drop loop is unit-testable end to end.
  */
 export function sendArbiterDigest(
   session: any,

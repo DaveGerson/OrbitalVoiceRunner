@@ -88,12 +88,13 @@ test("end to end: spoken completion -> error signal -> ONE class-0 retraction th
   assert.strictEqual(d.action, "drain");
   assert.strictEqual(d.digest.headline.cls, 0, "the retraction is a class-0 arbiter item (AC2)");
   assert.match(d.digest.headline.facts, /correct|retract/i);
-  // storm control (rider: DETERMINISTIC): the spoken index still points at the corrected claim —
-  // that IS the designed storm-control path: the guard re-elects, the ledger's already-corrected
-  // rule refuses the second retraction. The same contradiction can never fire twice.
+  // storm control (rider: DETERMINISTIC — pin updated for r25i eviction): the corrected claim is
+  // now EVICTED from the ledger (claims map + spoken index), so the guard elects NOTHING — storm
+  // control moved from flag-check (re-elect, then the already-corrected rule refuses) to absence
+  // (evicted claims cannot be re-elected at all). The OUTCOME is identical: the same
+  // contradiction can never fire twice, and this path does strictly less wasted work.
   const again = voiceIndex.completionContradiction({ paneId: "p1", kind: "exited" }, led, T0 + 4_000);
-  assert.ok(again, "the index still points at the corrected claim — storm control lives in the ledger, not the guard");
-  assert.strictEqual(led.invalidate(again.claimId, again.groundTruth).corrected, false, "already corrected -> skip");
+  assert.strictEqual(again, null, "the corrected claim was evicted — nothing left to re-elect");
 });
 
 test("an UNSPOKEN (passive-drained) completion claim never yields a correction (AC3 negative fixture)", () => {
@@ -107,14 +108,16 @@ test("an UNSPOKEN (passive-drained) completion claim never yields a correction (
   assert.strictEqual(arb.evaluate({ now: T0 + 2_000, floorHeld: false, turnClear: true }).action, "hold");
 });
 
-// Rider (review pin): the superseded/unspoken interaction. An UNSPOKEN completion recorded after a
-// SPOKEN one on the same (pane, kind) marks the spoken claim superseded WITHOUT touching the
-// spoken index — so the contradiction guard still elects it, but invalidate refuses with
-// "superseded". Net behavior: a silent no-op, never a spoken correction. This means a genuine
-// error inside that window goes UNRETRACTED by design — the fail-safe hierarchy (co-design §D):
-// a false/confusing correction is worse than a gap, and the operator's operative belief is the
-// newer claim anyway. This test documents that trade so a future change can't drift it silently.
-test("superseded-unspoken semantics: a later unspoken completion supersedes the spoken one -> silent no-op", () => {
+// Rider (review pin, UPDATED for r25i eviction): the superseded/unspoken interaction. An UNSPOKEN
+// completion recorded after a SPOKEN one on the same (pane, kind) now EVICTS the spoken claim —
+// from the claims map AND from the spoken index (which tracks spoken-only, so it must not dangle
+// at the evicted id). latestSpokenClaim returns undefined and invalidate(c1) returns the
+// unknown-ref result (pre-r25i: a stale index hit refused with "superseded"). Net behavior is
+// UNCHANGED: a silent no-op, never a spoken correction. A genuine error inside that window still
+// goes UNRETRACTED by design — the fail-safe hierarchy (co-design §D): a false/confusing
+// correction is worse than a gap, and the operator's operative belief is the newer claim anyway.
+// This test documents that trade so a future change can't drift it silently.
+test("superseded-unspoken semantics: a later unspoken completion evicts the spoken one -> silent no-op", () => {
   const arb = createTurnArbiter();
   const led: AnyRec = createCorrectionLedger({ arbiter: arb });
   // c1: spoken completion on p1. The claimId is time+monotonic-seq minted (same-ms collision
@@ -130,13 +133,14 @@ test("superseded-unspoken semantics: a later unspoken completion supersedes the 
   voiceIndex.recordSpokenCompletionClaims(
     digestWith([{ facts: "pane p1 finished again", cls: 3, paneId: "p1", forVisualStack: false }]), false, led, T0 + 500,
   );
-  const spoken = led.latestSpokenClaim("p1");
-  assert.ok(spoken, "the spoken index still resolves");
-  assert.strictEqual(spoken.claimId, c1.claimId,
-    "the unspoken record never touches the spoken index — c1 is still the latest SPOKEN claim");
-  const res = led.invalidate(spoken.claimId, "pane p1 errored right after", { severity: "exception" });
+  // r25i: c1 was evicted on supersession; c2 is unspoken, so the pane has NO spoken claim left —
+  // the completion guard elects nothing (a gap, never a stale projection, never a throw).
+  assert.strictEqual(led.latestSpokenClaim("p1"), undefined,
+    "the spoken index is cleaned on eviction — it must not dangle at the evicted claim");
+  const res = led.invalidate(c1.claimId, "pane p1 errored right after", { severity: "exception" });
   assert.strictEqual(res.corrected, false, "the superseded spoken claim is never retracted aloud");
-  assert.strictEqual(res.reason, "superseded", "the newer same-(pane,kind) claim superseded it");
+  assert.strictEqual(res.reason, "unknown ref",
+    "r25i: eviction replaced the 'superseded' flag — the old ref resolves to nothing");
   assert.strictEqual(arb.evaluate({ now: T0 + 2_000, floorHeld: false, turnClear: true }).action, "hold",
     "nothing was submitted to the arbiter — the whole scenario is a silent no-op");
 });

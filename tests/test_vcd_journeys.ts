@@ -119,10 +119,13 @@ test("journey: dispatch + completion + failed restart against ONE ledger -> exac
   assert.ok(hit, "the completion contradiction elects");
   led.invalidate(hit.claimId, hit.groundTruth, { severity: "exception" });
 
-  // The SAME signal shape against t1 must NOT elect (its latest spoken claim is the RESTART claim,
-  // already corrected — and before that a dispatch claim; neither is a completion): no false correction.
+  // The SAME signal shape against t1 must NOT elect: no false correction. (r25i eviction note:
+  // t1's corrected RESTART claim was EVICTED at invalidate time, clearing the spoken index — so
+  // latestSpokenClaim(t1) is undefined and the guard elects nothing. Pre-r25i the index still
+  // held the corrected restart claim and kind-scoping did the shielding; either way the pinned
+  // OUTCOME — null, no false correction — is identical.)
   assert.strictEqual(voiceIndex.completionContradiction({ paneId: "t1", kind: "error" }, led, T0 + 2_000), null,
-    "kind-scoping shields dispatch/restart claims from the completion guard");
+    "the evicted restart claim (r25i) and kind-scoping both shield t1 from the completion guard");
 
   // Drain: BOTH pending corrections (restart failure + false-done) ride ONE class-0 digest.
   const d: AnyRec = arb.evaluate({ now: T0 + 5_000, floorHeld: false, turnClear: true });
