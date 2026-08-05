@@ -26,6 +26,7 @@
     "smoke:handoff": "tsx scripts/smoke-handoff.ts",
     "smoke:kitchen": "node scripts/live-smoke-kitchen.mjs",
     "smoke:voice-synth": "tsx scripts/smoke-voice-synth.ts",
+    "telemetry:arbiter": "tsx scripts/arbiter-telemetry.ts",
     "verify:modeswitch": "tsx scripts/verify-live-modeswitch.ts",
     "verify:modeswitch:agy": "tsx scripts/verify-live-modeswitch-agy.ts",
     "verify:agy-resume": "tsx scripts/verify-agy-resume.ts",

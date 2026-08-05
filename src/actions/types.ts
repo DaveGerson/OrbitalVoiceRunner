@@ -269,6 +269,20 @@ export interface ActionContext {
    *  called. Absent on the test/REST/WS paths that do not opt in. */
   audit?: (row: ActionAuditRow) => void;
 
+  /** fikj.11 (vc-D): correction-ledger seam for the restart-ack producer. `record` logs the
+   *  "Terminal X restarted." ACK-before-readiness claim (spoken:true — the confirm string always
+   *  reaches the invoking surface); `invalidate` retracts it when the ordered async stop()->start()
+   *  later fails or is cancelled by an interleaved archive (the arms that today only console.error).
+   *  OPTIONAL + structural (no src/voice value import); absent on test/legacy paths. */
+  correctionLedger?: {
+    record(claim: {
+      claimId: string; paneId: string;
+      kind: "dispatch" | "restart" | "completion" | "readiness";
+      assertedText: string; assertedAt: number; spoken: boolean;
+    }): void;
+    invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): { corrected: boolean; reason?: string };
+  };
+
   /** PLM3 version stamp for THIS dispatch: { actionName, schemaHash } the deferring handlers spread
    *  into the params they hand to ctx.gateOrDefer, so a boot can quarantine a drifted intent. Set by
    *  the server's context builder (it knows the dispatched action name); undefined off that path. */

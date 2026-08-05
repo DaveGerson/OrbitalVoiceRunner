@@ -68,7 +68,8 @@ import { createApprovalShadowRecorder, getApprovalShadow, installApprovalShadow,
 import { setCortexPrimary, getCortexFallbackStats } from "./src/memory/cortexShadow";
 import { createGating, findPaneOwningProject } from "./src/gating";
 import { attachVoiceSession, pushApprovalNarration } from "./src/voice";
-import { createTurnArbiter } from "./src/voice/turnArbiter";
+import { createTurnArbiter, normalizeDeliveryMatrix } from "./src/voice/turnArbiter";
+import { createCorrectionLedger } from "./src/voice/correctionLedger";
 // BEAD wsm-e2e-pinned-s1ap: the scripted Gemini Live connector + its control-channel business logic.
 // Gated at every layer on isScriptedLiveModeEnabled() — see the boot call site inside startServer()
 // and registerScriptedLiveControlRoutes below.
@@ -282,7 +283,55 @@ function validateVoiceUxField(body: Record<string, unknown>): string | null {
     ?? validateVoiceUxHotSlots(voiceUx);
 }
 
-export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string } {
+// fikj.12 (turn-arbiter D4): boundary handling for voiceAi's dial fields. The deliveryMatrix is
+// NEVER a 400 — normalizeDeliveryMatrix (the SAME validator the arbiter re-runs internally) clamps
+// under-floor/invalid values IN PLACE so the persisted value is the clamped truth, and the
+// violations surface through the PUT response (`dialViolations`). completionAnnounce is a plain
+// enum knob — strict-when-present, mirroring voiceUx.sitrepShape.
+const SettingsCompletionAnnounceSchema = z.enum(["off", "exceptions", "dispatched", "all"]);
+
+function clampVoiceAiDialFields(body: Record<string, unknown>): { error: string | null; violations: string[] } {
+  const voiceAi = body.voiceAi;
+  if (voiceAi === undefined) return { error: null, violations: [] };
+  if (!isPlainObject(voiceAi)) {
+    return { error: "Invalid settings field 'voiceAi': expected an object.", violations: [] };
+  }
+  if (voiceAi.completionAnnounce !== undefined &&
+      !SettingsCompletionAnnounceSchema.safeParse(voiceAi.completionAnnounce).success) {
+    return {
+      error: `Invalid settings field 'voiceAi.completionAnnounce': must be one of ${SettingsCompletionAnnounceSchema.options.join(", ")}.`,
+      violations: [],
+    };
+  }
+  if (voiceAi.deliveryMatrix === undefined) return { error: null, violations: [] };
+  if (!isPlainObject(voiceAi.deliveryMatrix)) {
+    return { error: "Invalid settings field 'voiceAi.deliveryMatrix': expected an object map of class -> delivery mode.", violations: [] };
+  }
+  const { matrix, violations } = normalizeDeliveryMatrix(voiceAi.deliveryMatrix);
+  voiceAi.deliveryMatrix = matrix; // clamp IN PLACE (the strip idiom): persist the clamped truth.
+  return { error: null, violations };
+}
+
+/** fikj.12: the settings PUT response's dial-violations fragment — `{}` when clean, so a dial-free
+ *  PUT's success shape stays byte-identical. Merges the boundary clamp's violations with the live
+ *  re-dial's (normally [] — the boundary already clamped the body in place). Extracted so the PUT
+ *  handler stays under the CC gate. */
+function applyDialAndCollectFragment(boundary: string[] | undefined, applyDeliveryDial?: () => string[]): { dialViolations?: string[] } {
+  const dialViolations = [...(boundary ?? []), ...(applyDeliveryDial?.() ?? [])];
+  return dialViolations.length ? { dialViolations } : {};
+}
+
+/** fikj.12 (D4): boot-time surfacing of persisted delivery-dial violations. A hand-edited
+ *  under-floor settings file is clamped by the arbiter's own internal re-normalize (defense in
+ *  depth); this warn loop makes that clamp visible instead of silent. Extracted from startServer
+ *  for the CC gate. */
+function warnBootDialViolations(): void {
+  for (const v of normalizeDeliveryMatrix(manager.settings.voiceAi?.deliveryMatrix).violations) {
+    console.warn(`[turn-arbiter] delivery-dial settings violation (clamped at boot): ${v}`);
+  }
+}
+
+export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: string; dialViolations?: string[] } {
   if (!isPlainObject(body)) {
     return { ok: false, error: "Settings body must be a JSON object." };
   }
@@ -298,7 +347,12 @@ export function validateSettingsPutBody(body: unknown): { ok: boolean; error?: s
   }
   const voiceUxError = validateVoiceUxField(body);
   if (voiceUxError) return { ok: false, error: voiceUxError };
-  return { ok: true };
+  // fikj.12: dial fields — completionAnnounce may 400; the deliveryMatrix only ever clamps+reports.
+  // `dialViolations` is included only when non-empty: existing callers/tests deep-equal the clean
+  // return against exactly { ok: true }.
+  const dial = clampVoiceAiDialFields(body);
+  if (dial.error) return { ok: false, error: dial.error };
+  return { ok: true, ...(dial.violations.length ? { dialViolations: dial.violations } : {}) };
 }
 
 // The Gemini Live session is created through this seam so tests and the offline
@@ -1287,9 +1341,12 @@ function registerDraftAndSettingsRoutes(
     /** Step 3.5: the gating resolve choke-point — the typed-edit convergence + operator-direct
      *  send use it to invalidate a pending approval staged from a now-stale draft version. */
     applyResolution: (messageId: string, mode: "reject", opts?: { vocal?: boolean }) => unknown;
+    /** fikj.12 (D4): re-dial the LIVE shared arbiter from the just-persisted settings. Returns any
+     *  clamp violations (normally [] — the PUT boundary already clamped the body in place). */
+    applyDeliveryDial?: () => string[];
   }
 ): void {
-  const { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution } = deps;
+  const { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution, applyDeliveryDial } = deps;
 
   // Step 6 (the Workbench): per-pane WIP draft REST. Composing/editing a draft is not a CLI write.
   app.get("/api/panes/:projectId/:paneId/draft", (req, res) => {
@@ -1396,6 +1453,11 @@ function registerDraftAndSettingsRoutes(
       newSettings.secrets.geminiApiKey = manager.settings.secrets.geminiApiKey;
     }
     manager.updateSettings(newSettings);
+    // fikj.12: apply the (already-clamped) delivery dial to the LIVE arbiter — queued items drain
+    // under the new modes immediately; no reconnect, no reconstruction. Violations from the live
+    // apply are normally [] (the boundary clamped the body in place above). MUST run after
+    // updateSettings — the re-dial reads persisted state.
+    const dialFragment = applyDialAndCollectFragment(validated.dialViolations, applyDeliveryDial);
     broadcast({
       type: "settings_updated",
       globalPermissionsMode: manager.globalPermissionsMode,
@@ -1407,7 +1469,13 @@ function registerDraftAndSettingsRoutes(
     if (shouldNudgeReconnectOnSettingsKey(incomingGeminiKey)) {
       requestVoiceReconnect();
     }
-    res.json({ success: true, settings: sanitizeSettingsForClient(manager.settings), globalPermissionsMode: manager.globalPermissionsMode, keyKeptUnchanged: !!keyKeptUnchanged });
+    res.json({
+      success: true,
+      settings: sanitizeSettingsForClient(manager.settings),
+      globalPermissionsMode: manager.globalPermissionsMode,
+      keyKeptUnchanged: !!keyKeptUnchanged,
+      ...dialFragment,
+    });
   });
 }
 
@@ -1835,7 +1903,18 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // voice layer's completions/acks/passive-context join the SAME queue, so a single turn-clear
   // drains ONE severity-ordered digest instead of a wall-clock accident across private queues.
   // Constructed HERE (before either deps bag) so both surfaces inject the SAME instance.
-  const turnArbiter = createTurnArbiter();
+  // fikj.12 (D4): the boot arbiter is dialed from persisted settings. A hand-edited under-floor
+  // file is clamped by the arbiter's own internal re-normalize (defense in depth); the violations
+  // are surfaced (warnBootDialViolations) so the clamp is never silent.
+  warnBootDialViolations();
+  const turnArbiter = createTurnArbiter({ matrix: manager.settings.voiceAi?.deliveryMatrix });
+  // fikj.11 (vc-D wiring): the ONE correction ledger, bound to the ONE shared arbiter. Every
+  // producer records into the SAME bookkeeping — renderApproved dispatch claims (gating), restart
+  // acks (REST ActionContext + the gating replay builders), vc-C completion claims (the voice
+  // drain sink) — so pane-ref resolution and (pane, kind) supersession see the whole truth plane.
+  // Corrections leave this object ONLY as class-0 submissions into `turnArbiter`: no new
+  // model-bound send site exists (the T1 send-site ratchet is untouched by design).
+  const correctionLedger = createCorrectionLedger({ arbiter: turnArbiter });
   const gating = createGating({
     manager,
     store,
@@ -1848,6 +1927,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     sanitizeSettingsForClient,
     addCommand: (terminalId, command, exchangeId) => HistoryManager.getInstance().addCommand(terminalId, command, exchangeId),
     turnArbiter,
+    correctionLedger,
   });
   // Destructure the gating seam so the existing inline call sites across the REST + WS surfaces keep
   // referencing these by name. ONE shared object by reference — the pending stores + the posture
@@ -2151,7 +2231,12 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
   // VERBATIM extraction (CC paydown): the four per-pane WIP draft routes (GET/PUT pane draft, GET
   // project drafts, POST draft/send) then the two settings routes (GET/PUT) — registered together,
   // IN THE SAME ORDER, by this helper at the SAME point in the boot sequence.
-  registerDraftAndSettingsRoutes(app, { broadcast, broadcastDraft, requestVoiceReconnect, applyResolution });
+  registerDraftAndSettingsRoutes(app, {
+    broadcast, broadcastDraft, requestVoiceReconnect, applyResolution,
+    // fikj.12 (D4): the PUT re-dial reads the FULL persisted (post-clamp) matrix — updateMatrix is
+    // a full replace, so the request delta must never be passed here.
+    applyDeliveryDial: () => turnArbiter.updateMatrix(manager.settings.voiceAi?.deliveryMatrix).violations,
+  });
 
   // dec-4 (DBT5): the WS-E pending-approval store + the deferred-action store + their durable boot
   // hydration, effectiveModeFor / effectiveCapabilityGateFor / gateCapability / gateOrDefer, the
@@ -2225,6 +2310,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
     // Turn-arbiter program, Wave 4 (spec §3.3/§4-W4): the SAME shared instance injected into
     // createGating above — one queue, one drain, across both surfaces.
     turnArbiter,
+    correctionLedger,
     REGISTRY,
     runAction,
     resultToToolResponse,
@@ -2348,6 +2434,7 @@ async function startServer(options: StartServerOptions = {}): Promise<RunningSer
       pendingActions,                           // c55.15: the converged approvals/pending REST defs read it
       applyResolution,
       applyPaneMode,
+      correctionLedger,
       store,
       sanitizeSettingsForClient,
       recipes: recipes as ActionContext["recipes"],

@@ -101,6 +101,12 @@ export interface SubmitItem {
    *  item in the class ties, so insertion order (FIFO) stays the sole tiebreaker -- an additive
    *  refinement that never changes behavior for a producer that doesn't set it. */
   severityRank?: number;
+  /** Class-3 only (vc-D final-review fix 2): did this completion item assert a CLEAN success
+   *  ("pane X finished") -- as opposed to a failure/error/prompt exception? Carried through to the
+   *  DigestItem so the drain sink can record an asserted-outcome-aware completion claim (a spoken
+   *  FAILED claim must never be "retracted" by the very error signal that confirms it). Optional +
+   *  additive: absent on every other producer's items. */
+  completionSuccess?: boolean;
 }
 
 export interface DigestItem {
@@ -110,6 +116,9 @@ export interface DigestItem {
   coalesceKey?: string;
   /** D2 told-more floor: every TAIL item is flagged so the visual stack/catch-up never misses it. */
   forVisualStack: boolean;
+  /** Class-3 only (see SubmitItem.completionSuccess). Present ONLY when the submitted item carried
+   *  it -- conditional so digests of other producers keep their exact pre-fix shape. */
+  completionSuccess?: boolean;
 }
 
 export interface TailGroup {
@@ -143,6 +152,20 @@ export interface TurnArbiter {
   evaluate(ctx: EvaluateCtx): DrainDecision;
   /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
   floorPausedMs(coalesceKey: string): number;
+  /** I-1 (chain review): remove every QUEUED item under `coalesceKey` (any pane). For INVALIDATED
+   *  facts ONLY — the fact the item asserted is no longer true (its approval/action RESOLVED, or
+   *  its TTL was RESET on re-attach). This does NOT violate the never-drop invariant: never-drop
+   *  protects TRUE facts, and a resolved approval's "approve now or I'll drop it" last-call is no
+   *  longer a true fact — SPEAKING it is the falsehood. Key-scoped: class-1 immediates and items
+   *  under other keys are never touched; a non-matching key is a strict no-op. The key's
+   *  floor-pause clock resets with it (a reset TTL owes no stale extension to a fresh last-call). */
+  remove(coalesceKey: string): void;
+  /** D4 (fikj.12): live re-dial. Re-normalizes `raw` (the SAME floor clamp + fallback as
+   *  construction -- defense in depth) and swaps the ACTIVE matrix in place: already-queued items
+   *  drain under the new modes, nothing is dropped or reconstructed. Violations are returned for
+   *  the settings boundary to surface. FULL REPLACE -- classes absent from `raw` revert to their
+   *  defaults; always pass the complete persisted matrix, never a delta. */
+  updateMatrix(raw: unknown): NormalizeMatrixResult;
 }
 
 /** Internal queued representation. Class-1 items never reach here (see submit()). */
@@ -154,6 +177,7 @@ interface QueuedItem {
   coalesceKey?: string;
   deadline?: { expiresAt: number; onExpirySwap: string };
   severityRank?: number;
+  completionSuccess?: boolean;
   insertionOrder: number;
   /** Accumulated floor-held pause for this item's deadline, capped at TTL_FLOOR_EXTENSION_CAP_MS. */
   pausedMs: number;
@@ -162,7 +186,11 @@ interface QueuedItem {
 }
 
 function toDigestItem(it: QueuedItem, forVisualStack: boolean): DigestItem {
-  return { facts: it.facts, cls: it.cls, paneId: it.paneId, coalesceKey: it.coalesceKey, forVisualStack };
+  return {
+    facts: it.facts, cls: it.cls, paneId: it.paneId, coalesceKey: it.coalesceKey, forVisualStack,
+    // Conditional so items without the class-3 marker keep their exact pre-fix digest shape.
+    ...(it.completionSuccess !== undefined ? { completionSuccess: it.completionSuccess } : {}),
+  };
 }
 
 /** Groups the tail by coalesceKey; an item without one is its own solo group. Always partitions tail. */
@@ -240,6 +268,7 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
       coalesceKey: item.coalesceKey,
       deadline: item.deadline,
       severityRank: item.severityRank,
+      completionSuccess: item.completionSuccess,
       insertionOrder,
       pausedMs,
       lastTick,
@@ -329,5 +358,21 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return lastKnownPausedMs.get(coalesceKey) ?? 0;
   }
 
-  return { submit, evaluate, floorPausedMs };
+  /** See TurnArbiter.remove — invalidated-fact removal, QUEUED items only (immediates untouched). */
+  function remove(coalesceKey: string): void {
+    for (const [key, it] of queue) {
+      if (it.coalesceKey === coalesceKey) queue.delete(key);
+    }
+    lastKnownPausedMs.delete(coalesceKey);
+  }
+
+  function updateMatrix(raw: unknown): NormalizeMatrixResult {
+    const result = normalizeDeliveryMatrix(raw);
+    // Swap IN PLACE: buildQueueDrain closed over `matrix` by reference, so mutating the same
+    // object re-dials every future drain without touching the queue (never-drop invariant).
+    Object.assign(matrix, result.matrix);
+    return result;
+  }
+
+  return { submit, evaluate, floorPausedMs, remove, updateMatrix };
 }

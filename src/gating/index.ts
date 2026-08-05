@@ -129,6 +129,24 @@ export interface GatingDeps {
     }): void;
     /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
     floorPausedMs(coalesceKey: string): number;
+    /** I-1 (chain review): remove a QUEUED, now-INVALIDATED item by its coalesceKey — called when
+     *  a resolution definitively settles the approval/action a last-call was about, and when
+     *  re-attach resets a survivor's TTL window. OPTIONAL (and optional-chained at every call
+     *  site) so legacy harness fakes exposing only submit+floorPausedMs keep working unchanged. */
+    remove?(coalesceKey: string): void;
+  };
+  /** fikj.11 (vc-D wiring): the correction-ledger seam. renderApproved records the spoken
+   *  "Dispatching now" DISPATCH claim so ground-truth flips (a2tp commit-time revalidation, qj6s
+   *  launch plans — the named future consumers) can retract it via invalidate; the boot-hydration
+   *  effect builders thread it through to the restart replay (Task 7). OPTIONAL: absent (legacy
+   *  harnesses) => byte-identical behavior. Structural — gating never imports src/voice. */
+  correctionLedger?: {
+    record(claim: {
+      claimId: string; paneId: string;
+      kind: "dispatch" | "restart" | "completion" | "readiness";
+      assertedText: string; assertedAt: number; spoken: boolean;
+    }): void;
+    invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): { corrected: boolean; reason?: string };
   };
 }
 
@@ -226,6 +244,7 @@ export function createGating(deps: GatingDeps): Gating {
     sanitizeSettingsForClient,
     addCommand,
     turnArbiter,
+    correctionLedger,
   } = deps;
 
   // WS-E: the spoken/targeted/safe pending-approval store. The serializable record +
@@ -245,7 +264,16 @@ export function createGating(deps: GatingDeps): Gating {
   // (capability + params); the boot loop below rebuilds run() via buildActionRun. store===null
   // (a hand-built test harness — dbt3 removed the only production cause) => pure in-memory,
   // byte-for-byte as before.
-  const pendingActions = new PendingActionStore(store);
+  const pendingActions = new PendingActionStore(store, {
+    // I-1 (chain review): confirm()/cancel() are the single settle points every action-resolution
+    // caller (REST confirm/cancel, voice routing, spoken confirm, per-pane drain) funnels through
+    // — the action mirror of applyResolution's removeQueuedLastCall below. A queued class-2
+    // last-call about a just-resolved action is no longer a true fact and must never drain.
+    // expire() is deliberately NOT hooked: the sweep's TTL drop keeps the queued item so its
+    // deadline self-swaps to the honest "expired; I cancelled it" facts at drain (told-more —
+    // removing it there would silently eat a TRUE fact).
+    onResolved: (id) => turnArbiter?.remove?.(`last-call:${id}`),
+  });
   let pendingActionSeq = 0;
 
   // f09.2 (timed autonomy windows): the in-memory window state. It ALWAYS starts EMPTY — a window
@@ -334,6 +362,7 @@ export function createGating(deps: GatingDeps): Gating {
           broadcast,
           broadcastLedgerUpdate,
           sanitizeSettingsForClient,
+          correctionLedger: deps.correctionLedger,
           setActivePane: (id) => { coreState.activePaneId = id; },
         },
       );
@@ -983,7 +1012,12 @@ export function createGating(deps: GatingDeps): Gating {
   // arbiter when present (a class `cls` submit, never a forced turn); legacy (no arbiter) speaks it
   // immediately through the injected pushApprovalNarration slot instead — byte-identical to
   // pre-Wave-3 behavior. Extracted so reannounceSurvivors' own branch count stays flat.
-  function narrateReconnect(facts: string, cls: 2 | 5, coalesceKey: string, session: any): void {
+  // M-3 (chain review): `coalesceKey` is OPTIONAL. The survivors digest keeps its fixed key
+  // ("reconnect-survivors" — recomputed-whole each ceremony, so latest-wins is honest); the away
+  // digest passes undefined so EACH ceremony's digest queues independently — it is delta/windowed
+  // truth, and a fixed key let a double-flap's second ceremony latest-wins-overwrite the first
+  // absence's undrained events out of the spoken channel.
+  function narrateReconnect(facts: string, cls: 2 | 5, coalesceKey: string | undefined, session: any): void {
     if (turnArbiter) {
       turnArbiter.submit({ facts, cls, coalesceKey });
     } else {
@@ -997,6 +1031,16 @@ export function createGating(deps: GatingDeps): Gating {
     if (total === 1) return `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
     if (total <= 3) return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
     return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+  }
+
+  // I-1(b) (chain review): the re-attach just RESET a survivor's TTL/last-call window (lastCallAt
+  // cleared), so a still-queued class-2 last-call carries a deadline that is no longer true —
+  // after a >grace disconnect its expiry-swap would speak "expired; I cancelled it" in the SAME
+  // drain as a survivors digest saying the command is still waiting (a spoken contradiction).
+  // Remove the stale item; the sweep re-submits a fresh last-call on the new window. Extracted so
+  // reannounceSurvivors stays under the complexity gate.
+  function removeStaleReattachedLastCall(messageId: string): void {
+    turnArbiter?.remove?.(`last-call:${messageId}`);
   }
 
   // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
@@ -1013,6 +1057,7 @@ export function createGating(deps: GatingDeps): Gating {
     // Mechanics ALWAYS run, quiet blip or genuine absence — the UI chips must never lag.
     for (const orphan of pendingApprovals.orphans()) {
       pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
+      removeStaleReattachedLastCall(orphan.messageId);
     }
 
     // yg1w: lastDetachAt === null means a FIRST connect (never quiet — the operator has never left
@@ -1059,7 +1104,8 @@ export function createGating(deps: GatingDeps): Gating {
     if (since !== null) {
       const away = composeAwayDigest(since, now);
       // Wave-3 site: the away digest is passive context (class 5) — it never forces a turn.
-      if (away) narrateReconnect(away, 5, "reconnect-away-digest", session);
+      // M-3: NO coalesceKey — each ceremony's away digest queues independently (see narrateReconnect).
+      if (away) narrateReconnect(away, 5, undefined, session);
     }
   }
 
@@ -1182,14 +1228,53 @@ export function createGating(deps: GatingDeps): Gating {
 
   function renderApproved(record: ResolvedRecord, safeInstr: string, verb: string, session: any, opts?: { vocal?: boolean }): void {
     // Claim already won inside resolveDecision — this is the single write path.
+    // fikj.11 / co-design §D (a2tp ships-now ordering): an Exited-but-present pane CANNOT receive a
+    // dispatch — writeInput never runs it (applyStatusEvent early-returns on Exited, so the status
+    // does not even flip). Two real failure modes, both making "Dispatching now" a FALSE claim:
+    //   (a) a crash-in-place Exited pane keeps its DEAD transport (self-exit does not null it), so
+    //       the write is silently DISCARDED into the corpse;
+    //   (b) a STOPPED pane (transport nulled) buffers the write into pendingInput
+    //       (src/terminal.ts:1216) — which start() preserves across a stop→start gap
+    //       (src/terminal.ts:1123-1124), so it would REPLAY on a later restart: a
+    //       surprise-later-execution hazard, not a dispatch.
+    // Same check the Full-Auto arm already applies (src/dispatch/paneWrite.ts). Narrate the honest
+    // failure as the FIRST claim (renderDeadPane) instead of an optimistic claim that needs retracting.
+    const term = manager.terminals[record.terminalId];
+    if (!term || term.status === "Exited") {
+      renderDeadPane(record, safeInstr, session);
+      return;
+    }
     beginExchangeDeliveryOnApprove(record);
     addCommand(record.terminalId, record.instruction, record.exchangeId);
-    manager.terminals[record.terminalId]!.writeInput(record.instruction);
+    term.writeInput(record.instruction);
     completeExchangeDeliveryOnApprove(record);
     clearMatchingDraftOnApprove(record);
-    if (session) pushApprovalNarration(session, `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`);
+    // Narration stays POST-dispatch (it already was — the write above precedes it). The push result
+    // is the claim's `spoken` flag: 3V.3 semantics — only a strict `false` (or no session) is unheard.
+    const narration = `Approving: ${verb} ${record.terminalId} — "${safeInstr}". Dispatching now.`;
+    const spoken = session ? pushApprovalNarration(session, narration) !== false : false;
+    recordDispatchClaim(record, narration, spoken);
     // P1-2: operator-APPROVED, not an auto-execution — flag it so the UI does not mislabel.
     broadcast({ type: WS_EVT.AUTO_EXECUTED, terminalId: record.terminalId, cmd: safeInstr, approved: true, ...(opts?.vocal ? { vocal: true } : {}) });
+  }
+
+  /** fikj.11: best-effort dispatch-claim record — a ledger fault must never break the resolution.
+   *  claimId == `dispatch:<messageId>` so a2tp/qj6s can invalidate by approval identity; the
+   *  ledger's (pane, kind) supersession handles repeat dispatches on one pane. */
+  function recordDispatchClaim(record: ResolvedRecord, assertedText: string, spoken: boolean): void {
+    if (!correctionLedger) return;
+    try {
+      correctionLedger.record({
+        claimId: `dispatch:${record.messageId}`,
+        paneId: record.terminalId,
+        kind: "dispatch",
+        assertedText,
+        assertedAt: Date.now(),
+        spoken,
+      });
+    } catch (e) {
+      console.error("[vc-d] dispatch claim record failed:", e);
+    }
   }
 
   function renderDeadPane(record: ResolvedRecord, safeInstr: string, session: any): void {
@@ -1273,6 +1358,20 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  // I-1 (chain review): a resolution that definitively SETTLES the approval (approve / reject /
+  // dead-pane — the claim won and the record is gone) INVALIDATES any still-queued class-2
+  // last-call about it. Without this, the arbiter's next drain speaks "approve now or I'll drop
+  // it" for an approval that no longer exists, right after the resolve narration — the exact
+  // stale-claim falsehood the never-drop invariant does NOT protect (never-drop protects TRUE
+  // facts). The key mirrors the sweep's submit identity exactly (`last-call:<messageId>`, the
+  // same scheme sweepApprovalItem uses). `expired` is deliberately EXCLUDED: renderExpired
+  // re-submits the honest expiry notice under the SAME coalesceKey so the stale last-call
+  // COLLAPSES into truth (Wave-2 site 5) instead of vanishing unspoken.
+  function removeQueuedLastCall(messageId: string, reason: ResolveReason): void {
+    if (reason !== "approved" && reason !== "rejected" && reason !== "dead_pane") return;
+    turnArbiter?.remove?.(`last-call:${messageId}`);
+  }
+
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
     // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
@@ -1282,10 +1381,22 @@ export function createGating(deps: GatingDeps): Gating {
       pendingApprovals,
       messageId,
       envelopeCasMode(messageId, mode),
-      (terminalId) => !!manager.terminals[terminalId]
+      // izvq (final-review blocker): LIVENESS, not mere presence. An Exited-but-present pane can
+      // never receive a dispatch (renderApproved's ships-now guard, kept below as defense in
+      // depth), so the whole choke point must resolve `dead_pane` coherently: the envelope draft
+      // stays open + revisable (settleEnvelopeBindingOnResolve's own dead-pane contract), a linked
+      // handoff flips to its dead-pane outcome (expired), and the UI hears ONE honest
+      // APPROVAL_RESOLVED outcome instead of "approved" alongside a contradictory command_blocked.
+      // Trips ONLY on the literal "Exited" status — a status-less test fake stays alive.
+      (terminalId) => {
+        const t = manager.terminals[terminalId];
+        return !!t && t.status !== "Exited";
+      }
     );
     const { reason, record } = action;
     if (!record) return action; // not_found: idempotent no-op
+    // I-1: invalidate the settled approval's queued last-call BEFORE rendering the new truth.
+    removeQueuedLastCall(messageId, reason);
     const safeInstr = redactSecrets(record.instruction);
     const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
 

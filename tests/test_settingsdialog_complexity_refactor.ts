@@ -158,6 +158,10 @@ describe("deriveVoiceFields", () => {
       systemPrompt: "",
       groundingEnabled: false,
       silenceGate: false,
+      // fikj.12: the D4 dial fields ride the voice group; absent settings resolve to the spec
+      // defaults (tests/test_delivery_dial_settings.ts pins the derivation itself).
+      deliveryMatrix: { "0": "forced-turn", "2": "forced-turn", "3": "steered-digest", "4": "steered-digest", "5": "passive-context" },
+      completionAnnounce: "dispatched",
     });
   });
   it("preserves provided values incl. volume 0 and explicit false toggles", () => {

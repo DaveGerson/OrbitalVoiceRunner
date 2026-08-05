@@ -51,7 +51,7 @@ import { z } from "zod";
 import type { ActionContext, ActionDef, ActionResult } from "../types";
 import { getHistoryBridge } from "../../historyBridge";
 import { findPaneOwningProject } from "../../paneOwnership";
-import { respawnFromLedger } from "../respawnFromLedger";
+import { respawnFromLedger, recordRestartClaim, invalidateRestartClaim } from "../respawnFromLedger";
 import { withPaneLifecycleLock } from "../../lifecycleLock";
 import { exchangeSpineActive, getExchangeService } from "../../exchanges/spine";
 
@@ -183,6 +183,10 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
     // ONE synchronous gated effect closure (serves Auto-run-now AND the in-process Ask->confirm replay).
     const restartEffect = (): string => {
       if (term) {
+        // fikj.11 (vc-D): "Terminal X restarted." is an ACK-BEFORE-READINESS claim — the ordered
+        // stop()->start() below runs AFTER this string returns. Record the claim now; the failure/
+        // cancel arms retract it (a class-0 correction via the ledger's injected arbiter).
+        const claimId = recordRestartClaim(ctx.correctionLedger, id, `Terminal ${id} restarted.`);
         // Ordered async restart, fire-and-return: stop() (SIGTERM->SIGKILL) MUST resolve before start()
         // spawns the replacement. The ordering is preserved inside this IIFE; the gate's sync `run`
         // contract only needs the confirm string back, which the inline route returned eagerly too.
@@ -207,16 +211,25 @@ export const respawnPane: ActionDef<typeof RespawnPaneParams> = {
           //      The archive marks manager.archivingPanes SYNCHRONOUSLY at entry, so that intent is
           //      visible here regardless of reaction order. (`?.` tolerates slim test fakes.)
           // The checks and term.start() share one synchronous tick — no await re-opens the window.
-          if (ctx.manager.terminals[id] !== term || ctx.manager.archivingPanes?.has(id)) return;
+          if (ctx.manager.terminals[id] !== term || ctx.manager.archivingPanes?.has(id)) {
+            // fikj.11: the restart was CANCELLED — the already-delivered "restarted" ack is false.
+            invalidateRestartClaim(ctx.correctionLedger, claimId, id, "the restart was cancelled — the pane was archived or removed first");
+            return;
+          }
           term.start();
           ctx.broadcastLedgerUpdate();
           ctx.broadcastTerminalsUpdated();
-        }).catch((e) => console.error(`[restart_pane] deferred restart failed for ${id}:`, e));
+        }).catch((e) => {
+          console.error(`[restart_pane] deferred restart failed for ${id}:`, e);
+          // fikj.11: the ack was already delivered — retract it (today this arm is operator-silent).
+          invalidateRestartClaim(ctx.correctionLedger, claimId, id, "the restart actually failed — the pane is not up");
+        });
         return `Terminal ${id} restarted.`;
       }
       // Spawn into the pane's OWNING project (its directory + project id as the 7th arg), NOT the active
       // project — mirrors archive.ts Restore so a non-active-project pane lands back where it belongs.
       // Shared spawn closure: presetCommand(normalizePreset(pane.tool_preset), …) — one launch home.
+      // (Synchronous — a throw here surfaces to the caller BEFORE any ack exists, so no claim to record.)
       return respawnFromLedger(ctx, id, pane!, owner!.projectId, `Terminal ${id} restored and started.`);
     };
 

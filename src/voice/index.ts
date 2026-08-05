@@ -43,7 +43,7 @@ import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { mintExchangeForSend } from "../exchanges/deliveryHooks";
 import { withExchangeCorrelationHint } from "../exchanges/resultEnvelope";
-import type { ExchangeSnapshot } from "../exchanges/lifecycle";
+import { TERMINAL_STATES, type ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
 import { convergeTypedDraftEdit } from "../exchanges/draftRegistry";
@@ -64,9 +64,9 @@ import { applyPaneInputFrame } from "./paneInputFrame";
 import { shouldSpeakOpeningAck, shouldSpeakReadyAck, briefTurnComplete, OPERATOR_HOLD_MS, type AckTurnState } from "../voiceAckGate";
 import {
   createTurnArbiter, DEFAULT_DELIVERY_MATRIX,
-  type DeliveryMode, type Digest, type DrainDecision, type TurnArbiter,
+  type DeliveryMode, type Digest, type DrainDecision, type SubmitItem, type TurnArbiter,
 } from "./turnArbiter";
-import { completionNarration, DEFAULT_COMPLETION_ANNOUNCE } from "./completionPolicy";
+import { completionNarration, normalizeCompletionAnnounce } from "./completionPolicy";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
@@ -590,6 +590,121 @@ export function isJumpOverSend(opts: { turnComplete: boolean; cls?: 0 | 1 | 2 | 
   return shouldSpeakReadyAck(opts.ack) !== "speak";
 }
 
+/** fikj.11 (vc-D producer 3): the voice layer's structural view of src/voice/correctionLedger.ts.
+ *  Kept structural (not the factory's inferred type) so test fakes stay trivially satisfiable. */
+export interface CorrectionLedgerSeam {
+  record(claim: {
+    claimId: string; paneId: string;
+    kind: "dispatch" | "restart" | "completion" | "readiness";
+    assertedText: string; assertedAt: number; spoken: boolean;
+    /** Optional + additive (final-review fix 2): whether the claim asserted a CLEAN success. */
+    assertedSuccess?: boolean;
+  }): void;
+  invalidate(ref: string, groundTruth: string, opts?: { severity?: "exception" | "info" }): { corrected: boolean; reason?: string };
+  latestSpokenClaim(paneId: string): {
+    claimId: string;
+    kind: "dispatch" | "restart" | "completion" | "readiness";
+    assertedAt: number;
+    assertedSuccess?: boolean;
+  } | undefined;
+}
+
+/**
+ * recordSpokenCompletionClaims -- fikj.11: vc-C completion claims are recorded AT THE DRAIN SINK,
+ * the only place spokenness is ground truth: a class-3 item drained under a passive-context dial
+ * (D4) never completes a turn, so it records spoken:false and a later invalidate correctly skips
+ * it (never-spoken rule) instead of retracting words nobody heard. Tail items ARE audible — the
+ * rendered digest carries their facts verbatim (renderArbiterDigest) — so they record too. Pure
+ * over its inputs except the monotonic claimId seq below; the caller supplies `now` and whether
+ * the send genuinely landed as a turn.
+ */
+
+/** Monotonic per-process claimId suffix, mirroring the restart producer (src/actions/
+ *  respawnFromLedger.ts `restartClaimSeq`): two completion claims minted in the SAME millisecond
+ *  (same-tick digests, or a pane completing twice within one ms) would otherwise collide on
+ *  `completion:<pane>:<now>:<i>` and merge claim identities. The seq subsumes the old per-digest
+ *  index; time keeps the ids humanly orderable. */
+let completionClaimSeq = 0;
+
+export function recordSpokenCompletionClaims(
+  digest: Digest,
+  spokenTurn: boolean,
+  ledger: Pick<CorrectionLedgerSeam, "record"> | undefined,
+  now: number,
+): void {
+  if (!ledger) return;
+  for (const it of [digest.headline, ...digest.tail]) {
+    if (it.cls !== 3 || !it.paneId) continue;
+    ledger.record({
+      claimId: `completion:${it.paneId}:${now}:${++completionClaimSeq}`,
+      paneId: it.paneId,
+      kind: "completion",
+      assertedText: it.facts,
+      assertedAt: now,
+      spoken: spokenTurn,
+      // Final-review fix 2 — asserted outcome, EXPLICIT on every completion claim, STRICT
+      // derivation: only an item the producer marked `completionSuccess: true` records an
+      // asserted-success claim. An unmarked item fails toward NON-success — per the fail-safe
+      // hierarchy (co-design §D) a false retraction is worse than a missed one, so an unknown
+      // shape must lose electability, never gain it. Failed claims still record (they usefully
+      // shadow older success claims in latestSpokenByPane).
+      assertedSuccess: it.completionSuccess === true,
+    });
+  }
+}
+
+/** fikj.11: the false-done residue guard's recency bound (co-design §D: "idle/error/exited signals
+ *  contradicting a RECENT Change-C completion claim"). PRODUCER-side — this is NOT a ledger
+ *  staleness clock: a pending correction still never decays anywhere. It only decides whether a
+ *  fresh bus signal genuinely contradicts the last spoken claim. */
+export const COMPLETION_CONTRADICTION_WINDOW_MS = 15_000;
+
+/**
+ * completionContradiction -- elects a retraction plan (claimId + ground truth) when an error/exited
+ * pane signal contradicts a JUST-SPOKEN completion claim on the same pane. Every other case is
+ * null: wrong signal kind, no ledger, no spoken claim, claim of a DIFFERENT kind (a pane exiting
+ * after a dispatch claim is NOT evidence the dispatch never happened — that would be a FALSE
+ * correction, the one thing worse than a missing one), or outside the recency window. Consumes the
+ * EXISTING pane-signal bus — no new liveness check is implemented here.
+ */
+export function completionContradiction(
+  sig: { paneId: string; kind: string },
+  ledger: Pick<CorrectionLedgerSeam, "latestSpokenClaim"> | undefined,
+  now: number,
+): { claimId: string; groundTruth: string } | null {
+  if (!ledger || (sig.kind !== "error" && sig.kind !== "exited")) return null;
+  const claim = ledger.latestSpokenClaim(sig.paneId);
+  if (!claim || claim.kind !== "completion") return null;
+  // Final-review fix 2 — ELECTION RULE (deliberate, documented decision): require
+  // `assertedSuccess === true`, not merely `!== false`. The sink and this guard ship together and
+  // the sink stamps the flag EXPLICITLY on every completion claim, so a strict check costs no
+  // real elections — while a claim of unknown/older shape (flag absent) fails CLOSED: a spoken
+  // "completion FAILED" must never be "retracted" by the error/exited signal that confirms it
+  // (a false correction is worse than a gap — the fail-safe hierarchy, co-design §D).
+  if (claim.assertedSuccess !== true) return null;
+  if (now - claim.assertedAt > COMPLETION_CONTRADICTION_WINDOW_MS) return null;
+  const what = sig.kind === "error" ? "reported an error" : "exited";
+  return {
+    claimId: claim.claimId,
+    groundTruth: `pane ${sig.paneId} ${what} right after the completion was announced — it did not finish cleanly`,
+  };
+}
+
+/** fikj.11: the pane-signal subscriber's contradiction arm, extracted whole (election + invalidate
+ *  + the fail-soft catch) so the subscriber callback stays under the complexity gates. A ledger
+ *  fault never blocks the signal path; the ledger itself submits the class-0 retraction (there is
+ *  NO new model-bound send here). */
+function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): void {
+  try {
+    const contradiction = completionContradiction(sig, ledger, Date.now());
+    if (contradiction && ledger) {
+      ledger.invalidate(contradiction.claimId, contradiction.groundTruth, { severity: "exception" });
+    }
+  } catch (e) {
+    console.error("[vc-d] completion contradiction check failed:", e);
+  }
+}
+
 /**
  * sendArbiterDigest -- the ONE choke point (spec §3.3: "one module owns every model-bound send")
  * where a drained Digest becomes an actual injection: render (renderArbiterDigest), send, and
@@ -597,22 +712,40 @@ export function isJumpOverSend(opts: { turnComplete: boolean; cls?: 0 | 1 | 2 | 
  * the classifier trips (post-arbiter this should be structurally zero; the row exists to prove it).
  * Fail-soft: a send fault is swallowed + logged, matching pushApprovalNarration/pushAck's own
  * never-throw contract; telemetry is skipped (not thrown) when no store is wired.
+ *
+ * Final-review fix 3: returns whether the send genuinely landed (`sent`) so the drain-tick call
+ * site can resubmit an undelivered digest (resubmitUndeliveredDigest) instead of silently dropping
+ * it — the queue was already cleared pre-send, so a swallowed throw used to be an unrecoverable
+ * loss (class-0 corrections included: the ledger EVICTS a claim at invalidate time — r25i; before
+ * that it flagged it corrected — so re-invalidate refuses either way and only digest resubmission
+ * can recover the retraction). Exported (alongside the pure digestSendPlan/renderArbiterDigest
+ * family) so the never-drop loop is unit-testable end to end.
  */
-function sendArbiterDigest(
+export function sendArbiterDigest(
   session: any,
-  store: JanusStore | null,
+  store: Pick<JanusStore, "recordJumpOver" | "recordArbiterDrain"> | null,
   sessionId: string | null,
   ack: AckTurnState,
   digest: Digest,
   mode: DeliveryMode,
-): void {
+  ledger?: CorrectionLedgerSeam,
+): boolean {
   const rendered = renderArbiterDigest(digest, mode);
+  let sent = true;
   try {
     session.sendClientContent({ turns: [{ role: "user", parts: [{ text: rendered.text }] }], turnComplete: rendered.turnComplete });
   } catch (e) {
+    sent = false;
     console.error("[turn-arbiter] drain send failed:", e);
   }
-  if (!store) return;
+  // fikj.11: record vc-C completion claims HERE, where spokenness is ground truth (a failed send
+  // or a passive-context turn is NOT a spoken claim). Best-effort — never breaks the drain.
+  try {
+    recordSpokenCompletionClaims(digest, sent && rendered.turnComplete, ledger, Date.now());
+  } catch (e) {
+    console.error("[vc-d] completion claim record failed:", e);
+  }
+  if (!store) return sent;
   const headlineCls = digest.headline.cls as 0 | 1 | 2 | 3 | 4 | 5;
   if (isJumpOverSend({ turnComplete: rendered.turnComplete, cls: headlineCls, ack })) {
     store.recordJumpOver({
@@ -624,15 +757,66 @@ function sendArbiterDigest(
     ts: Date.now(), sessionId, mode, headlineCls: digest.headline.cls,
     drainSize: 1 + digest.tailCount, tailCount: digest.tailCount,
   });
+  return sent;
 }
 
-/** vc-C's dispatch-intent input (spec §3.3 row 4): was a live exchange bound to this pane at the
+/**
+ * resubmitUndeliveredDigest -- never-drop at the send boundary (final-review fix 3). The arbiter's
+ * buildQueueDrain clears the queue BEFORE the send, so a sendClientContent throw in
+ * sendArbiterDigest would otherwise lose the whole digest. The drain tick calls this when the send
+ * reports failure: every drained item goes back into the arbiter to drain on a later tick.
+ *
+ * Semantics (deliberate, reviewed):
+ *  - Items WITH a coalesceKey re-coalesce with anything queued since (fine — never-drop is about
+ *    the FACTS, and coalescing is the desk's own designed dedup). Class-0 corrections carry no
+ *    coalesceKey, so they resubmit identity-safe.
+ *  - DigestItem does not carry severityRank/deadline, so a resubmitted item re-queues at FIFO rank
+ *    with its drain-time facts (a class-2 item's expiry swap already resolved at drain — honest).
+ *  - No spin: the tick sends at most once per OPERATOR_HOLD_MS and only while its closure's
+ *    session is still coreState.activeLiveSession; a superseded/dead session's tick early-returns
+ *    and the next established session's loop drains the SAME shared arbiter. Resubmission is 1:1
+ *    with the drain, so the queue never grows from retries.
+ *  - Completion claims were already recorded spoken:false for the failed send (correct — kept);
+ *    the successful re-drain records them AGAIN under a fresh seq'd claimId, superseding the
+ *    spoken:false claim via the ledger's own (pane, kind) supersession — acceptable by design.
+ */
+export function resubmitUndeliveredDigest(arbiter: Pick<TurnArbiter, "submit">, digest: Digest): void {
+  for (const it of [digest.headline, ...digest.tail]) {
+    try {
+      arbiter.submit({
+        facts: it.facts,
+        cls: it.cls as SubmitItem["cls"],
+        paneId: it.paneId,
+        coalesceKey: it.coalesceKey,
+        completionSuccess: it.completionSuccess,
+      });
+    } catch (e) {
+      // Fail-soft per §3.4 — one bad item must not block the rest of the digest's resubmission.
+      console.error("[turn-arbiter] resubmit of undelivered digest item failed:", e);
+    }
+  }
+}
+
+/** vc-C's dispatch-intent input (spec §3.3 row 4): was a LIVE exchange bound to this pane at the
  *  idle edge? Best-effort/never-throw, mirroring every other exchange-spine read in this file --
- *  spine off or a lookup fault both fail toward "no exchange" (the false-done guard's safe default). */
-function hasActiveExchange(paneId: string): boolean {
+ *  spine off or a lookup fault both fail toward "no exchange" (the false-done guard's safe default).
+ *  I-2 (chain review): `paneActive` is a sticky DELIVERY marker — the service sets it on
+ *  completeDelivery and clears it only in recoverOnBoot, never on settle — so the marker alone
+ *  reports hasExchange:true for every later ambient Running→Idle edge on a pane that EVER carried
+ *  a dispatch, and the default `dispatched` tier would speak "pane X finished" for uncorroborated
+ *  idles (the exact false-done amplification the tier guard exists to block). Mirror
+ *  completionKindFor's staleness-guard idiom (src/observe/index.ts, lastCommandBelongsToActiveExchange):
+ *  the resolved exchange must ALSO be in a non-terminal state (TERMINAL_STATES:
+ *  agent_complete/agent_failed/cancelled, src/exchanges/lifecycle.ts) to count as live.
+ *  Exported for the focused staleness suite (tests/test_completion_staleness_guard.ts). */
+export function hasActiveExchange(paneId: string): boolean {
   if (!exchangeSpineActive()) return false;
   try {
-    return !!getExchangeService().activeExchangeForPane(paneId);
+    const svc = getExchangeService();
+    const exchangeId = svc.activeExchangeForPane(paneId);
+    if (!exchangeId) return false;
+    const snap = svc.get(exchangeId);
+    return !!snap && !TERMINAL_STATES.has(snap.state);
   } catch (e) {
     console.error(`[turn-arbiter] hasActiveExchange lookup failed for ${paneId}:`, e);
     return false;
@@ -759,6 +943,11 @@ export interface VoiceDeps {
    *  instance (see the connection-scoped `sharedArbiter` below) — never a throw, never a second
    *  implementation of the decision core. */
   turnArbiter?: TurnArbiter;
+  /** fikj.11 (vc-D): the ONE server-constructed correction ledger (same instance gating + the REST
+   *  ActionContext receive). The drain sink records spoken class-3 completion claims into it; the
+   *  pane-signal subscriber retracts them on a contradicting error/exited signal. Optional — a
+   *  hand-built harness that injects none simply produces no completion claims. */
+  correctionLedger?: CorrectionLedgerSeam;
 }
 
 /**
@@ -862,6 +1051,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
     policies,
     completionKindFor,
     turnArbiter,
+    correctionLedger,
   } = deps;
 
   // Destructure the gating seam so the moved inline call sites keep referencing these by name. ONE
@@ -2608,7 +2798,14 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // settle cadence, so the forced-turn interrupt send IS the phrase-boundary delivery.
           const plan = digestSendPlan(decision);
           if (!plan.send) return;
-          sendArbiterDigest(justConnected, store, state.voiceSessionId, ackState(), plan.digest, plan.mode);
+          const sent = sendArbiterDigest(justConnected, store, state.voiceSessionId, ackState(), plan.digest, plan.mode, correctionLedger);
+          // Final-review fix 3 (never-drop): the queue was cleared pre-send, so a failed send must
+          // put the digest BACK — it drains again on a later tick. Bounded by construction: this
+          // tick only runs while `justConnected` is still the live session (guard above), fires at
+          // most once per OPERATOR_HOLD_MS, and resubmission is 1:1 with the drain — a dead-but-
+          // still-active session retries without spinning or growing the queue, and a superseded
+          // one parks the items for the next session's loop.
+          if (!sent) resubmitUndeliveredDigest(sharedArbiter, plan.digest);
         };
 
         const armArbiterDrain = () => {
@@ -2629,6 +2826,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         armArbiterDrain();
 
         const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
+          // fikj.11 (vc-D): a fresh error/exited signal contradicting a JUST-SPOKEN completion
+          // claim retracts it (closes vc-C's false-done residue — co-design §D). Kind- and
+          // recency-scoped inside completionContradiction so a dispatch/restart claim, an old
+          // completion, or an unspoken one can NEVER yield a false correction.
+          retractContradictedCompletion(sig, correctionLedger);
           // W3 fold: paneSignalClass is the ONE classifier deciding which arbiter class a pane
           // signal submits as — class 4 (created/closed, the operator-facing acks the old ready-defer
           // trichotomy gated) defers through the shared arbiter above; class 5 (idle/error/prompt/
@@ -2654,7 +2856,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           if (sig.kind === "idle") {
             const outcomeKind = completionKindFor ? completionKindFor(sig.paneId) : "completion";
             const decision = completionNarration({
-              sig, outcomeKind, hasExchange: hasActiveExchange(sig.paneId), policy: DEFAULT_COMPLETION_ANNOUNCE,
+              sig, outcomeKind, hasExchange: hasActiveExchange(sig.paneId),
+              // fikj.12: the operator's LIVE completionAnnounce tier. normalize guards retired
+              // ("focused") / garbage persisted values; absent -> the LOCKED `dispatched` default.
+              // Read per idle edge (pure, cheap) so a settings PUT applies immediately.
+              policy: normalizeCompletionAnnounce(manager.settings.voiceAi?.completionAnnounce),
             });
             if (decision.speak) {
               try { sharedArbiter.submit(decision.item); }

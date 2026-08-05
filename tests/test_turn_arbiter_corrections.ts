@@ -32,6 +32,9 @@
 //   • Skip rules (return { corrected: false }, submit NOTHING): claim never spoken; claim already
 //     corrected (at most ONE correction per claimId — a correction is never re-corrected); claim
 //     superseded by a NEWER spoken claim on the same (paneId, kind); unknown ref.
+//     (r25i update: corrected/superseded are terminal, so the ledger now EVICTS those claims —
+//     both refusals surface as the unknown-ref result. Every OUTCOME pinned below is unchanged;
+//     this suite deliberately asserts `.corrected` only, never those two reason strings.)
 //   • invalidate by paneId resolves the latest spoken claim on that pane.
 //   • NO time-based downgrade path exists: a pending correction drains spoken however long the
 //     turn stays busy (the staleness clock was removed — supersession is the ONLY skip).
@@ -182,6 +185,9 @@ test("dedup: a claim corrects at most once, and a delivered correction is never 
   led.record({ claimId: "c1", paneId: "p2", kind: "restart", assertedText: "Restarted pane p2.", assertedAt: T0, spoken: true });
 
   assert.strictEqual(led.invalidate("c1", "restart failed").corrected, true, "first invalidation corrects");
+  // r25i: the refusal mechanism is now ABSENCE (the corrected claim was evicted -> unknown ref),
+  // not an already-corrected flag — the pinned INTENT (at most one correction per claim, nothing
+  // resubmitted) is mechanism-independent and asserted below unchanged.
   assert.strictEqual(led.invalidate("c1", "restart failed harder").corrected, false, "second invalidation is a no-op");
 
   const d: AnyRec = arb.evaluate({ now: T0 + 1_000, floorHeld: false, turnClear: true });
@@ -214,6 +220,7 @@ test("supersession is the ONLY skip: a claim replaced by a newer spoken claim on
   led.record({ claimId: "c1", paneId: "p2", kind: "restart", assertedText: "Restarted pane p2.", assertedAt: T0, spoken: true });
   led.record({ claimId: "c2", paneId: "p2", kind: "restart", assertedText: "Restarted pane p2 again.", assertedAt: T0 + 5_000, spoken: true });
 
+  // r25i: supersession now EVICTS c1 (unknown ref) instead of flagging it — same refusal outcome.
   assert.strictEqual(led.invalidate("c1", "the first restart failed").corrected, false,
     "the operator's operative belief is the NEWER claim — correcting the superseded one would confuse, not inform");
   assert.strictEqual(arb.evaluate({ now: T0 + 6_000, floorHeld: false, turnClear: true }).action, "hold");
