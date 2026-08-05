@@ -917,14 +917,42 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  // okes: the brake's ACTION-leg mirror of renderExpired's site-5 collapse (line ~1298-1309) — a
+  // brake-expired action may have a queued class-2 last-call (sweepActionItem's "approve now or
+  // I'll drop it", coalesceKey `last-call:<id>`) that would otherwise keep sounding actionable
+  // until its OWN stale deadline swaps, up to APPROVAL_GRACE_MS after "Stop-all engaged.". Submit
+  // the honest cancellation under the SAME coalesceKey so any queued item COLLAPSES (latest-wins)
+  // instead of surviving stale — and fires even with nothing queued (told-more parity with the
+  // approvals loop's applyResolution('expire') -> renderExpired, which always re-submits).
+  // Deliberately NOT routed through PendingActionStore.expire()'s hook (pendingActions.ts:99-101 /
+  // this file's own exclusion above at "expire() is deliberately NOT hooked") — that exclusion is
+  // what lets the SWEEP's own TTL-drop leg self-swap via the deadline's onExpirySwap; hooking
+  // expire() globally would double-collapse that path. NO paneId (sweepActionItem's submit above
+  // carries none — identityKey is `key-<coalesceKey>--pane-<paneId??''>`; adding one here would
+  // mint a DIFFERENT identity and leave the stale item alive) and NO deadline (the overwrite must
+  // discard the stale expiresAt, never schedule a new interrupt candidate). Gated on the claim
+  // winner (`reason === "expired"`) — a lost-race expire is not a truth and must not be voiced.
+  function collapseBrakedActionLastCall(a: ReturnType<PendingActionStore["all"]>[number]): void {
+    if (!turnArbiter) return;
+    turnArbiter.submit({
+      facts: `${a.capability}: ${redactSecrets(a.summary)} — cancelled by stop-all.`,
+      cls: 2,
+      coalesceKey: `last-call:${a.id}`,
+    });
+  }
+
   // STOP-ALL Stage 1 (kill=false): freeze + cancel everything in-flight. PANES KEEP RUNNING. Extracted
   // verbatim from stopAll's `!kill` branch (behavior-preserving) so stopAll stays a thin dispatcher.
   function stopAllStage1Freeze(): string[] {
     coreState.setFrozen(true);
     // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
     for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
-    // Expire every deferred non-PTY action (no side effect runs).
-    for (const a of [...pendingActions.all()]) pendingActions.expire(a.id);
+    // Expire every deferred non-PTY action (no side effect runs). okes: mirror the approvals loop's
+    // honest collapse on the action leg — see collapseBrakedActionLastCall.
+    for (const a of [...pendingActions.all()]) {
+      const result = pendingActions.expire(a.id);
+      if (result.reason === "expired") collapseBrakedActionLastCall(a);
+    }
     haltPlansAndWatchRules();
     const stillRunning = runningPaneIds();
     recordActivitySafe({
@@ -1033,13 +1061,19 @@ export function createGating(deps: GatingDeps): Gating {
     return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
   }
 
-  // I-1(b) (chain review): the re-attach just RESET a survivor's TTL/last-call window (lastCallAt
-  // cleared), so a still-queued class-2 last-call carries a deadline that is no longer true —
-  // after a >grace disconnect its expiry-swap would speak "expired; I cancelled it" in the SAME
-  // drain as a survivors digest saying the command is still waiting (a spoken contradiction).
-  // Remove the stale item; the sweep re-submits a fresh last-call on the new window. Extracted so
-  // reannounceSurvivors stays under the complexity gate.
-  function removeStaleReattachedLastCall(messageId: string): void {
+  // I-1(b) (chain review) / p19o (its sibling): a TTL RESET invalidates any still-queued class-2
+  // last-call's deadline — two call sites reset a survivor's TTL/last-call window this way:
+  //   (b) RECONNECT: reattachSession clears lastCallAt and re-opens a fresh TTL window.
+  //   p19o: DEFER: applyDeferral re-arms the window (timestamp/lastCallAt/lastCallFailures reset)
+  //     but grants NO new class-2 truth to queue — the operator already heard the instant defer
+  //     echo ("Holding it — I'll ask again in N minutes") via pushApprovalNarration.
+  // Either way the queued item's deadline.expiresAt is stale: before turn-clear it would drain as
+  // "approve now or I'll drop it" contradicting the hold/reconnect truth, and past the stale
+  // deadline the factsForDrain swap (turnArbiter.ts) would speak "expired; I cancelled it" for a
+  // command that is HELD, not cancelled. Remove the stale item; the sweep re-submits a fresh
+  // last-call under the SAME key once the re-armed window crosses TTL (never-drop resubmission).
+  // Extracted so each caller (reannounceSurvivors, applyDeferral) stays under the complexity gate.
+  function removeStaleLastCallOnTtlReset(messageId: string): void {
     turnArbiter?.remove?.(`last-call:${messageId}`);
   }
 
@@ -1057,7 +1091,7 @@ export function createGating(deps: GatingDeps): Gating {
     // Mechanics ALWAYS run, quiet blip or genuine absence — the UI chips must never lag.
     for (const orphan of pendingApprovals.orphans()) {
       pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
-      removeStaleReattachedLastCall(orphan.messageId);
+      removeStaleLastCallOnTtlReset(orphan.messageId);
     }
 
     // yg1w: lastDetachAt === null means a FIRST connect (never quiet — the operator has never left
@@ -1463,6 +1497,9 @@ export function createGating(deps: GatingDeps): Gating {
     rec.timestamp = now;
     rec.lastCallAt = undefined;
     rec.lastCallFailures = undefined;
+    // p19o: the re-armed TTL invalidates any queued last-call's deadline — same shape as I-1(b)
+    // reattach. The sweep re-submits a fresh last-call once the new window crosses TTL.
+    removeStaleLastCallOnTtlReset(messageId);
     recordActivitySafe({
       type: "approval_decided",
       pane_id: rec.terminalId,

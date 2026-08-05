@@ -110,9 +110,12 @@ function addApproval(gating: AnyRec, session: AnyRec, id = "d1", ts = T0): void 
 /** Seam probe: records every submitted item; floor pause is scripted per coalesceKey. */
 function captureArbiter(pausedByKey: Record<string, number> = {}) {
   const submitted: AnyRec[] = [];
+  const removed: string[] = [];
   return {
     submitted,
+    removed,
     submit: (item: AnyRec) => { submitted.push(item); },
+    remove: (k: string) => { removed.push(k); },
     floorPausedMs: (k: string) => pausedByKey[k] ?? 0,
   };
 }
@@ -547,6 +550,92 @@ test("I-1 remove — reattach resets the last-call: no stale expiry-swap after a
     "the fresh last-call drains as a live actionable ask — remove() only killed the stale item");
 });
 
+// ── p19o (I-1(b) sibling): defer re-arms the TTL — the queued last-call's deadline is stale ──
+//
+// applyDeferral re-arms the approval's TTL (timestamp = now, lastCallAt/lastCallFailures cleared)
+// exactly like reattachSession does, but — unlike reattach — it never touched the arbiter queue.
+// A last-call already queued from BEFORE the defer keeps its OLD deadline.expiresAt, so past that
+// stale instant the honest-sounding factsForDrain expiry-swap ("expired; I cancelled it") would
+// speak for a command that is HELD, not cancelled — the same TTL-reset falsehood as I-1(b).
+
+test("p19o defer — a DEFERRED approval's stale queued last-call never drains its expiry-swap lie; the re-armed window re-earns a fresh last-call under the same key", () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  addApproval(h.gating, h.session);
+
+  h.gating.sweepExpiredApprovals(S1); // last-call queued, deadline.expiresAt = S1 + GRACE
+  assert.strictEqual(h.gating.pendingApprovals.get("d1")!.lastCallAt, S1, "precondition: last-call stamped");
+  assert.strictEqual(h.narrations.length, 0, "precondition: timer lane diverted to the arbiter");
+
+  const out = h.gating.applyDeferral("d1", S1 + 1_000);
+  assert.strictEqual(out.reason, "deferred", "precondition: the defer re-armed the window");
+  assert.ok(h.narrations.some((n) => /Holding it/i.test(n)),
+    "the defer echo lands on the SLOT (pushApprovalNarration), never the arbiter — untouched");
+
+  // Past the STALE deadline (S1+GRACE) but well inside the re-armed window (S1+1_000+TTL).
+  const d: AnyRec = arb.evaluate({ now: S1 + GRACE + 2_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "hold",
+    "p19o feature absent: the defer re-armed the TTL but the queued last-call kept its stale " +
+      "deadline — pre-fix this drains the factsForDrain expiry-swap 'expired; I cancelled it' for " +
+      "a command that is HELD, not cancelled");
+
+  // Never-drop resubmission: the re-armed window still earns a fresh last-call under the same key.
+  const S2 = S1 + 1_000 + TTL + 1;
+  h.gating.sweepExpiredApprovals(S2);
+  assert.strictEqual(h.gating.pendingApprovals.get("d1")!.lastCallAt, S2, "fresh last-call stamped on the new window");
+  const d2: AnyRec = arb.evaluate({ now: S2 + 1, floorHeld: false, turnClear: true });
+  assert.strictEqual(d2.action, "drain");
+  assert.strictEqual(d2.digest.headline.coalesceKey, "last-call:d1");
+  assert.match(d2.digest.headline.facts, /approve now/i,
+    "the fresh last-call drains as a live actionable ask — remove() only killed the stale item; never-drop holds");
+});
+
+test("p19o defer seam — the deferred branch removes 'last-call:<id>' exactly; defer_limit and not_found never remove; the fresh resubmit carries the new deadline", () => {
+  const cap = captureArbiter();
+  const h = makeHarness({ arbiter: cap });
+  addApproval(h.gating, h.session);
+
+  h.gating.sweepExpiredApprovals(S1);
+  assert.strictEqual(cap.submitted.length, 1, "precondition: last-call submitted");
+  assert.strictEqual(cap.removed.length, 0, "precondition: nothing removed yet");
+
+  const out1 = h.gating.applyDeferral("d1", S1 + 1_000);
+  assert.strictEqual(out1.reason, "deferred");
+  assert.deepStrictEqual(cap.removed, ["last-call:d1"],
+    "p19o feature absent: the deferred branch must remove the queued arbiter last-call — the " +
+      "re-armed TTL invalidated its deadline, the same TTL-reset shape as I-1(b) reattach");
+
+  const S2 = S1 + 1_000 + TTL + 1;
+  h.gating.sweepExpiredApprovals(S2);
+  assert.strictEqual(cap.submitted.length, 2, "the re-armed window re-earns a fresh submission");
+  const fresh = cap.submitted[1];
+  assert.strictEqual(fresh.cls, 2);
+  assert.strictEqual(fresh.coalesceKey, "last-call:d1", "the sweep re-earns the SAME key");
+  assert.strictEqual(fresh.deadline?.expiresAt, S2 + GRACE,
+    "the fresh last-call carries the honest deadline measured from the new stamp");
+  assert.strictEqual(h.gating.pendingApprovals.get("d1")!.lastCallAt, S2);
+
+  // Drive to the cap (MAX_DEFERRALS = 3, src/approvalIntent.ts:23).
+  const out2 = h.gating.applyDeferral("d1", S2 + 1_000);
+  assert.strictEqual(out2.reason, "deferred");
+  const out3 = h.gating.applyDeferral("d1", S2 + 2_000);
+  assert.strictEqual(out3.reason, "deferred");
+  assert.strictEqual(cap.removed.length, 3, "each successful defer fires the remove");
+  assert.ok(cap.removed.every((k) => k === "last-call:d1"));
+
+  // defer_limit: the window is UNTOUCHED — the queued last-call and its honest expiry-swap remain
+  // TRUE facts and must keep their honest collapse; removing here would violate never-drop.
+  const lenAtCap = cap.removed.length;
+  const out4 = h.gating.applyDeferral("d1", S2 + 3_000);
+  assert.strictEqual(out4.reason, "defer_limit");
+  assert.strictEqual(cap.removed.length, lenAtCap, "defer_limit must never remove");
+
+  // not_found: never removes.
+  const out5 = h.gating.applyDeferral("nope", S2 + 4_000);
+  assert.strictEqual(out5.reason, "not_found");
+  assert.strictEqual(cap.removed.length, lenAtCap, "not_found must never remove");
+});
+
 test("I-1 remove — negatives: a non-matching key is a no-op; class-1 immediates and unrelated class-3 items on the same pane survive", () => {
   const arb: AnyRec = createTurnArbiter();
   assert.strictEqual(typeof arb.remove, "function",
@@ -582,4 +671,102 @@ test("I-1 remove — negatives: a non-matching key is a no-op; class-1 immediate
   assert.deepStrictEqual([d.digest.headline, ...d.digest.tail].map((i: AnyRec) => [i.cls, i.coalesceKey]),
     [[3, "pane-completion"]],
     "remove() is key-scoped: only the invalidated last-call goes; the unrelated class-3 on the same pane survives");
+});
+
+// ── okes: the brake's ACTION leg — same-key honest collapse, mirroring renderExpired's site-5 ──
+//
+// stopAllStage1Freeze's action loop (src/gating/index.ts:927) calls pendingActions.expire(a.id) for
+// every staged action but — unlike the approvals loop's applyResolution(id,"expire") ->
+// renderExpired, which re-submits under the SAME coalesceKey (line ~1298-1309) — never touches the
+// arbiter. A queued action last-call ("approve now or I'll drop it") therefore keeps sounding
+// actionable until its OWN stale deadline swaps, up to APPROVAL_GRACE_MS after "Stop-all engaged."
+
+test("okes brake ACTION leg — a brake-expired action's queued last-call drains as 'cancelled by stop-all' BEFORE its stale deadline, exactly once", async () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  h.gating.pendingActions.add({ id: "act_1", capability: "create_pane", summary: "Create pane x", timestamp: T0, run: () => "ok" });
+
+  // Queue the last-call under last-call:act_1 (deadline S1+GRACE).
+  h.gating.sweepExpiredApprovals(S1);
+  assert.strictEqual(h.gating.pendingActions.get("act_1")!.lastCallAt, S1, "precondition: last-call stamped");
+  assert.strictEqual(arb.evaluate({ now: S1 + 100, floorHeld: true, turnClear: false }).action, "hold",
+    "precondition: mid-floor, nothing drained yet — the stale deadline is exactly S1+GRACE");
+
+  // EMERGENCY BRAKE.
+  await h.gating.stopAll(false);
+  assert.strictEqual(h.gating.pendingActions.has("act_1"), false, "the brake expired the staged action");
+  assert.ok(h.narrations.some((n) => /stop-all engaged/i.test(n)), "the instant slot echo is untouched (invariant 3)");
+
+  // Observation BEFORE the stale deadline (S1+GRACE): pre-fix the queued item still sounds actionable.
+  const d: AnyRec = arb.evaluate({ now: S1 + 1_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain", "holds pre- and post-fix — the failure must be the FACTS, not the drain");
+  const items = [d.digest.headline, ...d.digest.tail].filter((i: AnyRec) => (i.coalesceKey ?? "").includes("act_1"));
+  assert.strictEqual(items.length, 1,
+    "exactly one act_1 item — a duplicate means the collapse submit minted a DIFFERENT identity " +
+      "(the paneId trap: identityKey is key-<coalesceKey>--pane-<paneId??''>; sweepActionItem " +
+      "submitted with NO paneId, the collapse must too)");
+  assert.match(items[0].facts, /cancelled by stop-all/i,
+    "okes feature absent: after the brake the queued action last-call must collapse to the " +
+      "stop-all cancellation truth — today it drains as the stale still-actionable ask");
+  assert.doesNotMatch(items[0].facts, /approve now/i, "a brake-killed action must never sound actionable");
+  assert.match(items[0].facts, /create_pane|Create pane x/, "the honest item still names the action (told-more, not a generic line)");
+});
+
+test("okes shape — the brake's action collapse submits cls-2 under the SAME identity: coalesceKey last-call:<id>, paneId strictly undefined, deadline strictly undefined", async () => {
+  const cap = captureArbiter();
+  const h = makeHarness({ arbiter: cap });
+  h.gating.pendingActions.add({ id: "act_1", capability: "create_pane", summary: "Create pane x", timestamp: T0, run: () => "ok" });
+  h.gating.sweepExpiredApprovals(S1);
+  assert.strictEqual(cap.submitted.length, 1, "precondition: the sweep last-call submitted");
+
+  await h.gating.stopAll(false);
+
+  assert.strictEqual(cap.submitted.length, 2,
+    "okes feature absent: the brake's action leg must submit the honest collapse for the " +
+      "brake-expired action (mirror of renderExpired's site-5 collapse on the approvals leg)");
+  const it = cap.submitted[1];
+  assert.strictEqual(it.cls, 2);
+  assert.strictEqual(it.coalesceKey, "last-call:act_1", "SAME identity as sweepActionItem's last-call — latest-wins overwrite wipes the stale deadline");
+  assert.match(it.facts, /create_pane/);
+  assert.match(it.facts, /cancelled by stop-all/i);
+  assert.strictEqual(it.paneId, undefined,
+    "MUST omit paneId — sweepActionItem's submit carries none; passing one mints " +
+      "key-...--pane-<id> instead of key-...--pane- and leaves the stale item alive");
+  assert.strictEqual(it.deadline, undefined,
+    "NO deadline — the collapse must never become a tickDeadlines interrupt candidate; the overwrite discards the stale expiresAt");
+});
+
+test("okes delta — a brake with NO queued last-call still voices one honest per-action cancellation (told-more parity with the approval leg)", async () => {
+  const cap = captureArbiter();
+  const h = makeHarness({ arbiter: cap });
+  h.gating.pendingActions.add({ id: "act_1", capability: "create_pane", summary: "Create pane x", timestamp: T0, run: () => "ok" });
+  // No sweep — no last-call was ever queued.
+
+  await h.gating.stopAll(false);
+
+  assert.strictEqual(cap.submitted.length, 1,
+    "okes delta: the brake voices the cancellation of EVERY staged action at next turn-clear even " +
+      "when no last-call was queued — exact parity with the approvals loop, whose " +
+      "applyResolution('expire') -> renderExpired always submits; tailGroups digest-bounds the chattiness");
+  assert.strictEqual(cap.submitted[0].coalesceKey, "last-call:act_1");
+  assert.match(cap.submitted[0].facts, /cancelled by stop-all/i);
+  assert.strictEqual(cap.submitted[0].cls, 2);
+});
+
+test("okes negative — a lost-race expire never fabricates a spoken cancel (claim-winner gate)", async () => {
+  const cap = captureArbiter();
+  const h = makeHarness({ arbiter: cap });
+  h.gating.pendingActions.add({ id: "act_1", capability: "create_pane", summary: "Create pane x", timestamp: T0, run: () => "ok" });
+  h.gating.sweepExpiredApprovals(S1);
+  assert.strictEqual(cap.submitted.length, 1);
+
+  // Simulate a concurrently-won claim — the only way to force expire() -> 'lost_race' through the
+  // public surface, since confirm/cancel REMOVE the record before the brake could see it.
+  h.gating.pendingActions.get("act_1")!.claimed = true;
+
+  await h.gating.stopAll(false);
+
+  assert.strictEqual(cap.submitted.length, 1,
+    "a lost-race expire must NOT submit a cancellation — never-drop protects TRUE facts only, and " +
+      "only the claim winner's expire is a truth (invariant 2); the collapse must gate on expire(...).reason === 'expired'");
 });
