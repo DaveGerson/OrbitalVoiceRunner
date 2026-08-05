@@ -1935,15 +1935,19 @@ export class JanusStore {
   }
 
   /** Append one arbiter-drain row. `drainSize` === `1 + tailCount` is the CALLER's own invariant —
-   *  this writer persists whatever it is handed. Fail-soft: swallows + console.error on any DB error. */
-  recordArbiterDrain(row: { ts: number; sessionId: string | null; mode: string; headlineCls: number; drainSize: number; tailCount: number }): void {
+   *  this writer persists whatever it is handed. `delivered` is REQUIRED (schema v15, bead r59t) so
+   *  no call site can silently omit the send verdict and re-create the over-count it fixes — the
+   *  caller (sendArbiterDigest) writes its own `sent` local here. Fail-soft: swallows + console.error
+   *  on any DB error. */
+  recordArbiterDrain(row: { ts: number; sessionId: string | null; mode: string; headlineCls: number; drainSize: number; tailCount: number; delivered: boolean }): void {
     try {
       this.db.prepare(
-        `INSERT INTO arbiter_drain(ts,session_id,mode,headline_cls,drain_size,tail_count)
-         VALUES(@ts,@session_id,@mode,@headline_cls,@drain_size,@tail_count)`
+        `INSERT INTO arbiter_drain(ts,session_id,mode,headline_cls,drain_size,tail_count,delivered)
+         VALUES(@ts,@session_id,@mode,@headline_cls,@drain_size,@tail_count,@delivered)`
       ).run({
         ts: row.ts, session_id: row.sessionId, mode: row.mode,
         headline_cls: row.headlineCls, drain_size: row.drainSize, tail_count: row.tailCount,
+        delivered: row.delivered ? 1 : 0,
       });
     } catch (e) {
       console.error("[store] recordArbiterDrain failed:", e);

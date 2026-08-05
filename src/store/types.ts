@@ -169,12 +169,20 @@ export interface JumpOverRow {
   id: number; ts: number; session_id: string | null; producer: string | null;
   cls: number | null; detail: string | null;
 }
-/** Raw `arbiter_drain` row (schema v14, turn-arbiter program T4 telemetry). `drain_size` ===
- *  `1 + tail_count` (headline + tail) is the caller's own invariant — the distribution over these
- *  rows is the T4 analysis unit (D2 headline + counted-tail policy). */
+/** Raw `arbiter_drain` row (schema v14, turn-arbiter program T4 telemetry; `delivered` added in
+ *  schema v15, bead r59t). `drain_size` === `1 + tail_count` (headline + tail) is the caller's own
+ *  invariant — the distribution over DELIVERED rows is the T4 analysis unit (D2 headline + counted-
+ *  tail policy). `delivered` is the send verdict sendArbiterDigest recorded for THIS attempt; NULL
+ *  means the row predates the v15 column (a historical drain, not a failure — never backfilled). */
 export interface ArbiterDrainRow {
   id: number; ts: number; session_id: string | null; mode: string | null;
   headline_cls: number | null; drain_size: number; tail_count: number;
+  // Optional, not merely nullable: rows are read via `SELECT *`, and scripts/arbiter-telemetry.ts
+  // deliberately never migrates, so a pre-v15 .janus.db yields rows with NO `delivered` property at
+  // all (`undefined`). Both `undefined` and `null` mean "historical drain". A `delivered === null`
+  // legacy check, or any `?? `-style narrowing that trusts non-optionality, would silently
+  // reclassify every legacy row as undelivered.
+  delivered?: SqlBool | null;
 }
 
 /** Raw `agent_exchanges` row (schema v12, AgentExchange spine). Column-for-column with

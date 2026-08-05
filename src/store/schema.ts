@@ -1,7 +1,7 @@
 // src/store/schema.ts
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /** Ordered migrations. Index+1 == target user_version. Each runs once, in a txn.
  *  Exported (not just `applyMigrations`) so tests can build a pre-migration fixture DB by
@@ -511,6 +511,21 @@ export const MIGRATIONS: ((db: Database.Database) => void)[] = [
       );
       CREATE INDEX idx_arbiter_drain_ts ON arbiter_drain(ts);
     `);
+  },
+  // v15 (bead r59t — arbiter_drain delivery flag): sendArbiterDigest (src/voice/index.ts) recorded
+  // every drain attempt UNCONDITIONALLY, so a swallowed sendClientContent throw — and each never-
+  // drop retry of it (f30c914) — read back indistinguishably from a real delivery, skewing the
+  // drain_size distribution the v02l watch gate is judged on. This adds a nullable `delivered`
+  // column so sendArbiterDigest can write its own send verdict per row. NULL means "written before
+  // this column existed" — pre-existing rows are historical drains, not failures, and are NEVER
+  // backfilled (the v12 exchange_id precedent). Guarded on the table's existence (the v11 `hasNotes`
+  // idiom) for isolation robustness against fixtures that fast-forward user_version past a subset of
+  // earlier migrations; on any real DB arbiter_drain was created in v14, so the column always lands.
+  (db) => {
+    const hasArbiterDrain = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='arbiter_drain'"
+    ).get();
+    if (hasArbiterDrain) db.exec(`ALTER TABLE arbiter_drain ADD COLUMN delivered INTEGER;`);
   },
 ];
 

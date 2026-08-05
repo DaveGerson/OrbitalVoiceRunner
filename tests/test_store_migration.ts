@@ -77,11 +77,12 @@ describe("v11 -> v12 migration: fixture sanity (pre-migration)", () => {
 });
 
 describe("v11 -> v12 migration: applyMigrations upgrades cleanly", () => {
-  // NOTE: applyMigrations always runs to the CURRENT SCHEMA_VERSION (14, since bead 98f2's v13
-  // transcripts migration and the turn-arbiter program's v14 telemetry migration), not just to
-  // v12 — so from an v11 fixture it now advances THREE steps in one call. The literal "12" pin
-  // this test used to assert was stale post-v13 (and stays stale post-v14); verified below via
-  // MIGRATIONS[11] run in isolation, which is exactly the v12 step this describe block is about.
+  // NOTE: applyMigrations always runs to the CURRENT SCHEMA_VERSION (15, since bead 98f2's v13
+  // transcripts migration, the turn-arbiter program's v14 telemetry migration, and bead r59t's v15
+  // arbiter_drain.delivered migration), not just to v12 — so from an v11 fixture it now advances
+  // FOUR steps in one call. The literal "12" pin this test used to assert was stale post-v13 (and
+  // stays stale post-v14/v15); verified below via MIGRATIONS[11] run in isolation, which is exactly
+  // the v12 step this describe block is about.
   it("MIGRATIONS[11] (the v12 step) taken alone lands on user_version 12", () => {
     const db = buildV11Fixture();
     MIGRATIONS[11](db);
@@ -90,11 +91,11 @@ describe("v11 -> v12 migration: applyMigrations upgrades cleanly", () => {
     db.close();
   });
 
-  it("applyMigrations from v11 lands on the CURRENT SCHEMA_VERSION (now 14, past v12)", () => {
+  it("applyMigrations from v11 lands on the CURRENT SCHEMA_VERSION (now 15, past v12)", () => {
     const db = buildV11Fixture();
     applyMigrations(db);
     assert.equal(db.pragma("user_version", { simple: true }), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 14);
+    assert.equal(SCHEMA_VERSION, 15);
     db.close();
   });
 
@@ -209,10 +210,11 @@ describe("v11 -> v12 migration: fresh boot (no prior data) also lands on v12's t
 const V12 = 12;
 
 describe("v12 -> v13 migration: opt-in transcripts table", () => {
-  // SCHEMA_VERSION is the CURRENT terminal version (14, past the turn-arbiter program's own v14
-  // telemetry migration) — this test only pins that v13's transcripts step landed SOMEWHERE at or
-  // before it, not that it is the last migration (see the v11->v12 describe block's own note above
-  // for why a literal "the newest migration's index" pin goes stale on every subsequent addition).
+  // SCHEMA_VERSION is the CURRENT terminal version (15, past the turn-arbiter program's own v14
+  // telemetry migration and bead r59t's v15 arbiter_drain.delivered migration) — this test only
+  // pins that v13's transcripts step landed SOMEWHERE at or before it, not that it is the last
+  // migration (see the v11->v12 describe block's own note above for why a literal "the newest
+  // migration's index" pin goes stale on every subsequent addition).
   it("bumps SCHEMA_VERSION to at least 13 (v13's transcripts step is present)", () => {
     assert.ok(SCHEMA_VERSION >= 13);
   });
@@ -232,7 +234,7 @@ describe("v12 -> v13 migration: opt-in transcripts table", () => {
     db.pragma(`user_version = ${V12}`);
 
     applyMigrations(db);
-    // applyMigrations always lands on the CURRENT SCHEMA_VERSION (14, past v13's own transcripts
+    // applyMigrations always lands on the CURRENT SCHEMA_VERSION (15, past v13's own transcripts
     // step) — see the v11->v12 describe block's note for why a literal "13" pin here goes stale.
     assert.equal(db.pragma("user_version", { simple: true }), SCHEMA_VERSION);
 

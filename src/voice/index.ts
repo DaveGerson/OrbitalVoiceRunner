@@ -755,7 +755,7 @@ export function sendArbiterDigest(
   }
   store.recordArbiterDrain({
     ts: Date.now(), sessionId, mode, headlineCls: digest.headline.cls,
-    drainSize: 1 + digest.tailCount, tailCount: digest.tailCount,
+    drainSize: 1 + digest.tailCount, tailCount: digest.tailCount, delivered: sent,
   });
   return sent;
 }
@@ -2172,6 +2172,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 broadcast,
                 narrate: (t) => pushApprovalNarrationDep(session, t),
                 redact: redactSecrets,
+                // 3tx3: a successful hold re-arms the record's TTL window in place, invalidating the
+                // deadline of any already-queued class-2 last-call for it (ACTION-leg mirror of
+                // removeStaleLastCallOnTtlReset / p19o). Retract the stale letter under the SAME
+                // identity the sweep submitted it under (no paneId).
+                onDeferred: (actionId) => turnArbiter?.remove?.(`last-call:${actionId}`),
               });
               return;
             }

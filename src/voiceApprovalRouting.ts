@@ -33,6 +33,10 @@ export interface VoiceApprovalDeps {
   narrate: (text: string) => void;
   /** Redact secrets from any text before it leaves the process (server.ts `redactSecrets`). */
   redact: (s: string) => string;
+  /** 3tx3: fired when a hold RE-ARMS a staged action's TTL window. The re-arm invalidates any
+   *  queued class-2 last-call's deadline, so the caller retracts it (voice/index.ts wires this to
+   *  turnArbiter.remove(`last-call:<actionId>`)). Optional: omit it and behavior is unchanged. */
+  onDeferred?: (actionId: string) => void;
 }
 
 /**
@@ -88,6 +92,7 @@ function handleDefer(deps: VoiceApprovalDeps, actions: PendingActionResolverStor
   r.deferCount = count + 1;
   rec.timestamp = Date.now();
   rec.lastCallAt = undefined;
+  deps.onDeferred?.(targetId);
   narrate(`Holding it — I'll ask again in ${Math.round(ACTION_DEFAULT_TTL_MS / 60000)} minutes.`);
 }
 

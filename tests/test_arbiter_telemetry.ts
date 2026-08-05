@@ -18,8 +18,8 @@ test("the report reflects real rows: 1 jump-over (flagged as a bug) + 2 drains w
   store.init();
   try {
     store.recordJumpOver({ ts: T0, sessionId: "s1", producer: "completion", cls: 3, detail: "landed mid-utterance" });
-    store.recordArbiterDrain({ ts: T0 + 1_000, sessionId: "s1", mode: "forced-turn", headlineCls: 0, drainSize: 3, tailCount: 2 });
-    store.recordArbiterDrain({ ts: T0 + 2_000, sessionId: "s1", mode: "next-turn", headlineCls: 3, drainSize: 1, tailCount: 0 });
+    store.recordArbiterDrain({ ts: T0 + 1_000, sessionId: "s1", mode: "forced-turn", headlineCls: 0, drainSize: 3, tailCount: 2, delivered: true });
+    store.recordArbiterDrain({ ts: T0 + 2_000, sessionId: "s1", mode: "next-turn", headlineCls: 3, drainSize: 1, tailCount: 0, delivered: true });
 
     const out = buildArbiterTelemetryReport(store, { sinceTs: 0 });
 

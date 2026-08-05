@@ -197,7 +197,7 @@ test("recordArbiterDrain stores and getArbiterDrains retrieves the row column-fo
   const s: AnyRec = seed();
   assertStoreSeam(s, "recordArbiterDrain");
   assertStoreSeam(s, "getArbiterDrains");
-  s.recordArbiterDrain({ ts: T, sessionId: "sess-a", mode: "forced-turn", headlineCls: 2, drainSize: 5, tailCount: 4 });
+  s.recordArbiterDrain({ delivered: true, ts: T, sessionId: "sess-a", mode: "forced-turn", headlineCls: 2, drainSize: 5, tailCount: 4 });
 
   const rows = s.getArbiterDrains(0);
   assert.strictEqual(rows.length, 1);
@@ -214,9 +214,9 @@ test("drain-size distribution: rows aggregate by drain_size (the T4 analysis uni
   const s: AnyRec = seed();
   assertStoreSeam(s, "recordArbiterDrain");
   // Three drains: two singletons and one 3-item digest — the shape the watch bead trends.
-  s.recordArbiterDrain({ ts: T + 1, sessionId: "sess-a", mode: "steered-digest", headlineCls: 4, drainSize: 1, tailCount: 0 });
-  s.recordArbiterDrain({ ts: T + 2, sessionId: "sess-a", mode: "passive-context", headlineCls: 5, drainSize: 1, tailCount: 0 });
-  s.recordArbiterDrain({ ts: T + 3, sessionId: "sess-a", mode: "forced-turn", headlineCls: 2, drainSize: 3, tailCount: 2 });
+  s.recordArbiterDrain({ delivered: true, ts: T + 1, sessionId: "sess-a", mode: "steered-digest", headlineCls: 4, drainSize: 1, tailCount: 0 });
+  s.recordArbiterDrain({ delivered: true, ts: T + 2, sessionId: "sess-a", mode: "passive-context", headlineCls: 5, drainSize: 1, tailCount: 0 });
+  s.recordArbiterDrain({ delivered: true, ts: T + 3, sessionId: "sess-a", mode: "forced-turn", headlineCls: 2, drainSize: 3, tailCount: 2 });
 
   const rows = s.getArbiterDrains(0);
   assert.strictEqual(rows.length, 3);
@@ -234,7 +234,7 @@ test("recordArbiterDrain/getArbiterDrains are fail-soft on a closed handle", () 
   const s: AnyRec = seed();
   assertStoreSeam(s, "recordArbiterDrain");
   s.close();
-  assert.doesNotThrow(() => s.recordArbiterDrain({ ts: T, sessionId: null, mode: "forced-turn", headlineCls: 2, drainSize: 1, tailCount: 0 }));
+  assert.doesNotThrow(() => s.recordArbiterDrain({ delivered: true, ts: T, sessionId: null, mode: "forced-turn", headlineCls: 2, drainSize: 1, tailCount: 0 }));
   let rows: unknown;
   assert.doesNotThrow(() => { rows = s.getArbiterDrains(0); });
   assert.deepStrictEqual(rows, []);
@@ -249,8 +249,8 @@ test("pruneIncremental sweeps jump_over + arbiter_drain at the 30d default, keep
   const NOW = T + 365 * DAY;
   s.recordJumpOver({ ts: NOW - 31 * DAY, sessionId: "sess-old", producer: "ack", cls: 4, detail: "stale" });
   s.recordJumpOver({ ts: NOW - 1 * DAY, sessionId: "sess-new", producer: "ack", cls: 4, detail: "fresh" });
-  s.recordArbiterDrain({ ts: NOW - 31 * DAY, sessionId: "sess-old", mode: "forced-turn", headlineCls: 2, drainSize: 2, tailCount: 1 });
-  s.recordArbiterDrain({ ts: NOW - 1 * DAY, sessionId: "sess-new", mode: "forced-turn", headlineCls: 2, drainSize: 1, tailCount: 0 });
+  s.recordArbiterDrain({ delivered: true, ts: NOW - 31 * DAY, sessionId: "sess-old", mode: "forced-turn", headlineCls: 2, drainSize: 2, tailCount: 1 });
+  s.recordArbiterDrain({ delivered: true, ts: NOW - 1 * DAY, sessionId: "sess-new", mode: "forced-turn", headlineCls: 2, drainSize: 1, tailCount: 0 });
 
   pruneIncremental((s as AnyRec).db, { now: NOW, eventsTtlDays: 30, archiveTtlDays: 14 });
 
