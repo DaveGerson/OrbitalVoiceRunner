@@ -152,6 +152,14 @@ export interface TurnArbiter {
   evaluate(ctx: EvaluateCtx): DrainDecision;
   /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
   floorPausedMs(coalesceKey: string): number;
+  /** I-1 (chain review): remove every QUEUED item under `coalesceKey` (any pane). For INVALIDATED
+   *  facts ONLY — the fact the item asserted is no longer true (its approval/action RESOLVED, or
+   *  its TTL was RESET on re-attach). This does NOT violate the never-drop invariant: never-drop
+   *  protects TRUE facts, and a resolved approval's "approve now or I'll drop it" last-call is no
+   *  longer a true fact — SPEAKING it is the falsehood. Key-scoped: class-1 immediates and items
+   *  under other keys are never touched; a non-matching key is a strict no-op. The key's
+   *  floor-pause clock resets with it (a reset TTL owes no stale extension to a fresh last-call). */
+  remove(coalesceKey: string): void;
   /** D4 (fikj.12): live re-dial. Re-normalizes `raw` (the SAME floor clamp + fallback as
    *  construction -- defense in depth) and swaps the ACTIVE matrix in place: already-queued items
    *  drain under the new modes, nothing is dropped or reconstructed. Violations are returned for
@@ -350,6 +358,14 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return lastKnownPausedMs.get(coalesceKey) ?? 0;
   }
 
+  /** See TurnArbiter.remove — invalidated-fact removal, QUEUED items only (immediates untouched). */
+  function remove(coalesceKey: string): void {
+    for (const [key, it] of queue) {
+      if (it.coalesceKey === coalesceKey) queue.delete(key);
+    }
+    lastKnownPausedMs.delete(coalesceKey);
+  }
+
   function updateMatrix(raw: unknown): NormalizeMatrixResult {
     const result = normalizeDeliveryMatrix(raw);
     // Swap IN PLACE: buildQueueDrain closed over `matrix` by reference, so mutating the same
@@ -358,5 +374,5 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return result;
   }
 
-  return { submit, evaluate, floorPausedMs, updateMatrix };
+  return { submit, evaluate, floorPausedMs, remove, updateMatrix };
 }

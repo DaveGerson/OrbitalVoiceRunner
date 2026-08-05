@@ -90,6 +90,21 @@ export interface PendingAction {
 
 export type ActionResolveReason = "not_found" | "lost_race" | "confirmed" | "cancelled" | "expired";
 
+/**
+ * I-1 (chain review): optional observer hooks. `onResolved` fires exactly once when confirm() or
+ * cancel() wins its claim — the SINGLE settle points every operator resolution funnels through
+ * (REST confirm/cancel, voice routing, spoken confirm, per-pane drain). It is the invalidation
+ * seam for spoken last-calls: createGating wires it to `turnArbiter.remove("last-call:<id>")` so a
+ * queued class-2 last-call about a just-resolved action can never drain later as a false
+ * still-actionable claim. Deliberately NOT fired on expire(): the sweep's TTL drop keeps the
+ * queued arbiter item so its deadline self-swaps to the honest "expired; I cancelled it" facts at
+ * drain time — removing it there would silently eat a TRUE fact (told-more beats silently-missed).
+ * Best-effort: a throwing hook is swallowed (logged) and never breaks the claim/remove contract.
+ */
+export interface PendingActionStoreHooks {
+  onResolved?: (id: string, reason: "confirmed" | "cancelled") => void;
+}
+
 export interface ActionResolveResult {
   reason: ActionResolveReason;
   /** The record (for narration/audit). Absent only for "not_found". */
@@ -113,8 +128,10 @@ export class PendingActionStore {
   // construct — it cannot rebuild the non-serializable `run`. Instead `hydrateIntents()` exposes the
   // persisted intents for the SERVER to rebuild (via actionEffects) and re-stage through add().
   private readonly store: ActionDurableStore | null;
-  constructor(store: ActionDurableStore | null = null) {
+  private readonly hooks: PendingActionStoreHooks;
+  constructor(store: ActionDurableStore | null = null, hooks: PendingActionStoreHooks = {}) {
     this.store = store ?? null;
+    this.hooks = hooks;
   }
 
   /** Stage a deferred action. `run` executes the side effect when confirmed. */
@@ -174,6 +191,13 @@ export class PendingActionStore {
     try { record.onDiscard(); } catch (e) { console.error(`[pendingActions] onDiscard hook failed for ${record.id}:`, e); }
   }
 
+  /** Fire the I-1 onResolved hook exactly once for the claim winner, swallowing any throw so the
+   *  invalidation seam can never break the claim/remove/run contract. */
+  private fireResolved(id: string, reason: "confirmed" | "cancelled"): void {
+    if (!this.hooks.onResolved) return;
+    try { this.hooks.onResolved(id, reason); } catch (e) { console.error(`[pendingActions] onResolved hook failed for ${id}:`, e); }
+  }
+
   /**
    * Atomic claim: returns true only for the first caller (exactly-once seam). With a durable store
    * the winner is selected by the atomic SQL `claimAction` (UPDATE ... WHERE claimed=0 => exactly one
@@ -204,6 +228,8 @@ export class PendingActionStore {
     if (!record) return { reason: "not_found" };
     if (!this.claim(id)) return { reason: "lost_race", record };
     this.remove(id);
+    // I-1: invalidate BEFORE run() — a throwing effect must not leave a stale spoken last-call.
+    this.fireResolved(id, "confirmed");
     const output = record.run();
     return { reason: "confirmed", record, output };
   }
@@ -218,6 +244,7 @@ export class PendingActionStore {
     if (!record) return { reason: "not_found" };
     if (!this.claim(id)) return { reason: "lost_race", record };
     this.remove(id);
+    this.fireResolved(id, "cancelled");
     // Discard side effect (hwu.4): fire AFTER claim+remove so it runs exactly once, only for the caller
     // that won the claim (a concurrent confirm that lost the race returned above, never double-firing).
     this.fireDiscard(record);

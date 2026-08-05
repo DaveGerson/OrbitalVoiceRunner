@@ -438,3 +438,148 @@ test("W2 brake — stop-all echoes are instant (never queued); a brake-cancelled
   assert.ok(h.narrations.slice(beforeKill).some((n) => /stage two|killed|being killed/i.test(n)),
     "the kill-stage echo is instant through the slot (use case c)");
 });
+
+// ── I-1 (chain review): TurnArbiter.remove() — invalidated last-calls never drain as falsehoods ─
+//
+// The arbiter had no removal API, so two paths spoke falsehoods:
+//   (a) RESOLUTION: the sweep queues a class-2 last-call while the operator holds the floor; the
+//       operator approves BEFORE a turn-clear; resolveDecision never touches the arbiter queue →
+//       the next drain speaks "approve now or I'll drop it" for an approval that no longer
+//       exists, right after the "approving" narration.
+//   (b) RECONNECT: reattachSession clears lastCallAt and re-opens a fresh TTL, but a stale queued
+//       item keeps its old deadline.expiresAt → after a >grace disconnect the first drain speaks
+//       the onExpirySwap "expired; I cancelled it" while the survivors digest says the SAME
+//       command is still waiting — a direct spoken contradiction.
+// remove(coalesceKey) is for INVALIDATED facts only (the fact is no longer true) — never-drop
+// protects TRUE facts, and speaking a resolved approval's last-call IS the falsehood. It removes
+// matching QUEUED items only: immediates and unrelated keys are never touched.
+
+test("I-1 remove — an APPROVED approval's queued last-call never drains; the rest of the queue still speaks", () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  addApproval(h.gating, h.session);
+
+  h.gating.sweepExpiredApprovals(S1); // class-2 last-call queued under "last-call:d1"
+  // The operator approves BEFORE any turn-clear drained the last-call.
+  const res = h.gating.applyResolution("d1", "approve");
+  assert.strictEqual(res.reason, "approved", "precondition: the resolution settled the approval");
+  assert.ok(h.narrations.some((n) => /Approving/i.test(n)), "precondition: the approve echo spoke");
+
+  // Something unrelated is also queued — remove() must be key-scoped, never a queue wipe.
+  arb.submit({ facts: "context: pane p9 went idle", cls: 5, paneId: "p9" });
+
+  const d: AnyRec = arb.evaluate({ now: S1 + 5_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain", "the unrelated context still drains at turn-clear");
+  const all = [d.digest.headline, ...d.digest.tail];
+  assert.deepStrictEqual(all.filter((i: AnyRec) => (i.coalesceKey ?? "").includes("d1")).map((i: AnyRec) => i.facts), [],
+    "I-1 feature absent: a RESOLVED approval's last-call is no longer a true fact — it must never " +
+      "drain as 'approve now or I'll drop it' right after the approve narration");
+  assert.deepStrictEqual(all.map((i: AnyRec) => i.facts), ["context: pane p9 went idle"],
+    "only the still-true fact drains");
+});
+
+test("I-1 remove — a REJECTED approval's queued last-call leaves the queue empty: next turn-clear HOLDS", () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  addApproval(h.gating, h.session);
+
+  h.gating.sweepExpiredApprovals(S1);
+  const res = h.gating.applyResolution("d1", "reject");
+  assert.strictEqual(res.reason, "rejected", "precondition: the resolution settled the approval");
+
+  assert.strictEqual(arb.evaluate({ now: S1 + 5_000, floorHeld: false, turnClear: true }).action, "hold",
+    "I-1 feature absent: with the invalidated last-call removed and nothing else queued, the " +
+      "arbiter holds — it must not speak a last-call for a rejected approval");
+});
+
+test("I-1 remove — an operator-resolved pending ACTION's queued last-call never drains (confirm and cancel)", () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  h.gating.pendingActions.add({ id: "act_1", capability: "create_pane", summary: "Create pane x", timestamp: T0, run: () => "ok" });
+  h.gating.pendingActions.add({ id: "act_2", capability: "create_pane", summary: "Create pane y", timestamp: T0, run: () => "ok" });
+
+  h.gating.sweepExpiredApprovals(S1); // both class-2 last-calls queued ("last-call:act_1"/"last-call:act_2")
+
+  assert.strictEqual(h.gating.pendingActions.confirm("act_1").reason, "confirmed", "precondition: act_1 confirmed");
+  assert.strictEqual(h.gating.pendingActions.cancel("act_2").reason, "cancelled", "precondition: act_2 cancelled");
+
+  assert.strictEqual(arb.evaluate({ now: S1 + 5_000, floorHeld: false, turnClear: true }).action, "hold",
+    "I-1 feature absent: confirm()/cancel() are the single settle points for pending actions — " +
+      "both invalidated last-calls must be removed, so the arbiter holds instead of speaking " +
+      "'approve now or I'll drop it' for actions that no longer exist");
+});
+
+test("I-1 remove — reattach resets the last-call: no stale expiry-swap after a long disconnect; a fresh sweep last-call still drains", () => {
+  const arb = createTurnArbiter();
+  const h = makeHarness({ arbiter: arb as any });
+  addApproval(h.gating, h.session);
+
+  h.gating.sweepExpiredApprovals(S1); // last-call queued with deadline S1+GRACE
+
+  // Disconnect right after; the operator stays away past the queued item's ENTIRE grace deadline.
+  h.gating.pendingApprovals.detachSession(h.session);
+  h.gating.noteSessionDetached(S1 + 1_000);
+  const sB = { sendClientContent: () => {} };
+  const R = S1 + GRACE + 40_000; // ~99s absence: a genuine ceremony; the stale deadline is long past
+  h.gating.reannounceSurvivors(sB, R);
+  assert.notStrictEqual(h.gating.pendingApprovals.sessionFor("d1"), undefined, "precondition: re-attached");
+  assert.strictEqual(h.gating.pendingApprovals.get("d1")!.lastCallAt, undefined,
+    "precondition: re-attach opened a fresh window (lastCallAt cleared)");
+
+  const d: AnyRec = arb.evaluate({ now: R + 1, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain", "the survivors digest drains at the first turn-clear");
+  const all = [d.digest.headline, ...d.digest.tail];
+  assert.deepStrictEqual(all.filter((i: AnyRec) => /expired; I cancelled/i.test(i.facts)).map((i: AnyRec) => i.facts), [],
+    "I-1(b) feature absent: the STALE queued last-call (old deadline) must not fire its expiry-swap " +
+      "— the survivors digest in the SAME drain says the command is still waiting (spoken contradiction)");
+  assert.ok(all.some((i: AnyRec) => /welcome|waiting|still/i.test(i.facts)),
+    "the survivors digest itself still speaks");
+
+  // remove() must not poison resubmission: the next sweep re-opens a FRESH last-call that drains
+  // normally on its new TTL (lastCallAt was cleared by the re-attach, so the sweep re-fires).
+  const R2 = R + 30_000;
+  h.gating.sweepExpiredApprovals(R2);
+  assert.strictEqual(h.gating.pendingApprovals.get("d1")!.lastCallAt, R2, "fresh last-call stamped on the new window");
+  const d2: AnyRec = arb.evaluate({ now: R2 + 1, floorHeld: false, turnClear: true });
+  assert.strictEqual(d2.action, "drain");
+  assert.strictEqual(d2.digest.headline.coalesceKey, "last-call:d1");
+  assert.match(d2.digest.headline.facts, /approve now/i,
+    "the fresh last-call drains as a live actionable ask — remove() only killed the stale item");
+});
+
+test("I-1 remove — negatives: a non-matching key is a no-op; class-1 immediates and unrelated class-3 items on the same pane survive", () => {
+  const arb: AnyRec = createTurnArbiter();
+  assert.strictEqual(typeof arb.remove, "function",
+    "I-1 feature absent: the TurnArbiter must expose remove(coalesceKey) for INVALIDATED facts");
+
+  const lastCall = () => arb.submit({
+    facts: "cmd on t1 — approve now or I'll drop it.", cls: 2, paneId: "t1", coalesceKey: "last-call:a1",
+    deadline: { expiresAt: T0 + GRACE, onExpirySwap: "The command on pane t1 expired; I cancelled it." },
+  });
+  const completion = () => arb.submit({ facts: "pane t1 finished", cls: 3, paneId: "t1", coalesceKey: "pane-completion" });
+
+  // Round 1: a NON-matching remove touches nothing.
+  lastCall();
+  completion();
+  arb.remove("last-call:zzz");
+  let d: AnyRec = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  assert.deepStrictEqual([d.digest.headline, ...d.digest.tail].map((i: AnyRec) => i.coalesceKey).sort(),
+    ["last-call:a1", "pane-completion"], "a non-matching remove() must be a strict no-op");
+
+  // Round 2: a matching remove is KEY-scoped — the class-3 item on the SAME pane and a class-1
+  // immediate both survive; only the invalidated last-call goes.
+  lastCall();
+  completion();
+  arb.submit({ facts: "Holding it.", cls: 1 });
+  arb.remove("last-call:a1");
+  d = arb.evaluate({ now: T0 + 1, floorHeld: true, turnClear: false });
+  assert.strictEqual(d.action, "drain", "the class-1 immediate is untouched by remove()");
+  assert.strictEqual(d.digest.headline.cls, 1);
+  assert.strictEqual(d.digest.headline.facts, "Holding it.");
+  d = arb.evaluate({ now: T0 + 2, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  assert.deepStrictEqual([d.digest.headline, ...d.digest.tail].map((i: AnyRec) => [i.cls, i.coalesceKey]),
+    [[3, "pane-completion"]],
+    "remove() is key-scoped: only the invalidated last-call goes; the unrelated class-3 on the same pane survives");
+});

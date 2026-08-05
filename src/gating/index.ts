@@ -129,6 +129,11 @@ export interface GatingDeps {
     }): void;
     /** The gating sweep consults this per last-call coalesceKey before expiring it (D1). */
     floorPausedMs(coalesceKey: string): number;
+    /** I-1 (chain review): remove a QUEUED, now-INVALIDATED item by its coalesceKey — called when
+     *  a resolution definitively settles the approval/action a last-call was about, and when
+     *  re-attach resets a survivor's TTL window. OPTIONAL (and optional-chained at every call
+     *  site) so legacy harness fakes exposing only submit+floorPausedMs keep working unchanged. */
+    remove?(coalesceKey: string): void;
   };
   /** fikj.11 (vc-D wiring): the correction-ledger seam. renderApproved records the spoken
    *  "Dispatching now" DISPATCH claim so ground-truth flips (a2tp commit-time revalidation, qj6s
@@ -259,7 +264,16 @@ export function createGating(deps: GatingDeps): Gating {
   // (capability + params); the boot loop below rebuilds run() via buildActionRun. store===null
   // (a hand-built test harness — dbt3 removed the only production cause) => pure in-memory,
   // byte-for-byte as before.
-  const pendingActions = new PendingActionStore(store);
+  const pendingActions = new PendingActionStore(store, {
+    // I-1 (chain review): confirm()/cancel() are the single settle points every action-resolution
+    // caller (REST confirm/cancel, voice routing, spoken confirm, per-pane drain) funnels through
+    // — the action mirror of applyResolution's removeQueuedLastCall below. A queued class-2
+    // last-call about a just-resolved action is no longer a true fact and must never drain.
+    // expire() is deliberately NOT hooked: the sweep's TTL drop keeps the queued item so its
+    // deadline self-swaps to the honest "expired; I cancelled it" facts at drain (told-more —
+    // removing it there would silently eat a TRUE fact).
+    onResolved: (id) => turnArbiter?.remove?.(`last-call:${id}`),
+  });
   let pendingActionSeq = 0;
 
   // f09.2 (timed autonomy windows): the in-memory window state. It ALWAYS starts EMPTY — a window
@@ -998,7 +1012,12 @@ export function createGating(deps: GatingDeps): Gating {
   // arbiter when present (a class `cls` submit, never a forced turn); legacy (no arbiter) speaks it
   // immediately through the injected pushApprovalNarration slot instead — byte-identical to
   // pre-Wave-3 behavior. Extracted so reannounceSurvivors' own branch count stays flat.
-  function narrateReconnect(facts: string, cls: 2 | 5, coalesceKey: string, session: any): void {
+  // M-3 (chain review): `coalesceKey` is OPTIONAL. The survivors digest keeps its fixed key
+  // ("reconnect-survivors" — recomputed-whole each ceremony, so latest-wins is honest); the away
+  // digest passes undefined so EACH ceremony's digest queues independently — it is delta/windowed
+  // truth, and a fixed key let a double-flap's second ceremony latest-wins-overwrite the first
+  // absence's undrained events out of the spoken channel.
+  function narrateReconnect(facts: string, cls: 2 | 5, coalesceKey: string | undefined, session: any): void {
     if (turnArbiter) {
       turnArbiter.submit({ facts, cls, coalesceKey });
     } else {
@@ -1012,6 +1031,16 @@ export function createGating(deps: GatingDeps): Gating {
     if (total === 1) return `Welcome back — one action still waiting: ${shown[0]}. Approve, or has this moved on?`;
     if (total <= 3) return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}. Which first?`;
     return `Welcome back — ${total} actions waiting from before: ${shown.join("; ")}; …and ${total - 3} more, all in your queue.`;
+  }
+
+  // I-1(b) (chain review): the re-attach just RESET a survivor's TTL/last-call window (lastCallAt
+  // cleared), so a still-queued class-2 last-call carries a deadline that is no longer true —
+  // after a >grace disconnect its expiry-swap would speak "expired; I cancelled it" in the SAME
+  // drain as a survivors digest saying the command is still waiting (a spoken contradiction).
+  // Remove the stale item; the sweep re-submits a fresh last-call on the new window. Extracted so
+  // reannounceSurvivors stays under the complexity gate.
+  function removeStaleReattachedLastCall(messageId: string): void {
+    turnArbiter?.remove?.(`last-call:${messageId}`);
   }
 
   // WS-F reconnect digest (spec §6.2/§7): "welcome back — here's what you left in progress."
@@ -1028,6 +1057,7 @@ export function createGating(deps: GatingDeps): Gating {
     // Mechanics ALWAYS run, quiet blip or genuine absence — the UI chips must never lag.
     for (const orphan of pendingApprovals.orphans()) {
       pendingApprovals.reattachSession(orphan, session, now + APPROVAL_TTL_MS);
+      removeStaleReattachedLastCall(orphan.messageId);
     }
 
     // yg1w: lastDetachAt === null means a FIRST connect (never quiet — the operator has never left
@@ -1074,7 +1104,8 @@ export function createGating(deps: GatingDeps): Gating {
     if (since !== null) {
       const away = composeAwayDigest(since, now);
       // Wave-3 site: the away digest is passive context (class 5) — it never forces a turn.
-      if (away) narrateReconnect(away, 5, "reconnect-away-digest", session);
+      // M-3: NO coalesceKey — each ceremony's away digest queues independently (see narrateReconnect).
+      if (away) narrateReconnect(away, 5, undefined, session);
     }
   }
 
@@ -1327,6 +1358,20 @@ export function createGating(deps: GatingDeps): Gating {
     }
   }
 
+  // I-1 (chain review): a resolution that definitively SETTLES the approval (approve / reject /
+  // dead-pane — the claim won and the record is gone) INVALIDATES any still-queued class-2
+  // last-call about it. Without this, the arbiter's next drain speaks "approve now or I'll drop
+  // it" for an approval that no longer exists, right after the resolve narration — the exact
+  // stale-claim falsehood the never-drop invariant does NOT protect (never-drop protects TRUE
+  // facts). The key mirrors the sweep's submit identity exactly (`last-call:<messageId>`, the
+  // same scheme sweepApprovalItem uses). `expired` is deliberately EXCLUDED: renderExpired
+  // re-submits the honest expiry notice under the SAME coalesceKey so the stale last-call
+  // COLLAPSES into truth (Wave-2 site 5) instead of vanishing unspoken.
+  function removeQueuedLastCall(messageId: string, reason: ResolveReason): void {
+    if (reason !== "approved" && reason !== "rejected" && reason !== "dead_pane") return;
+    turnArbiter?.remove?.(`last-call:${messageId}`);
+  }
+
   function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
     // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
@@ -1350,6 +1395,8 @@ export function createGating(deps: GatingDeps): Gating {
     );
     const { reason, record } = action;
     if (!record) return action; // not_found: idempotent no-op
+    // I-1: invalidate the settled approval's queued last-call BEFORE rendering the new truth.
+    removeQueuedLastCall(messageId, reason);
     const safeInstr = redactSecrets(record.instruction);
     const verb = record.kind === "agent_instruction" ? "direct pane" : "run on pane";
 

@@ -341,6 +341,44 @@ test("W3 yg1w — a pane failure during the absence reaches the operator exactly
     `the consumed window must never replay pane p7's failure, got: ${JSON.stringify(replayed)}`);
 });
 
+// ── M-3 (chain review): per-ceremony away digests — a double-flap must not eat the first one ───
+//
+// The away digest used to submit under the FIXED coalesceKey "reconnect-away-digest": absence →
+// reconnect (digest queued, undrained, window consumed) → second absence → reconnect: ceremony 2's
+// digest latest-wins-OVERWROTE ceremony 1's undrained digest, so the first absence's events
+// silently vanished from the spoken channel. Each ceremony's away digest is delta/windowed truth —
+// it must queue independently (no coalesceKey), unlike the survivors digest (recomputed-whole each
+// ceremony, where latest-wins is honest).
+
+test("M-3 — a double away-flap keeps BOTH away digests: ceremony 2 must not overwrite ceremony 1's undrained digest", () => {
+  const arb: AnyRec = createTurnArbiter();
+  const store = fakeStore();
+  const rows = [
+    { ts: T0 + 1_000, type: "status_transition", project_id: "default_project", pane_id: "p7", summary: "completion_failed", payload: { transition: "completion_failed" } },
+    { ts: T0 + 45_000, type: "status_transition", project_id: "default_project", pane_id: "p8", summary: "exited", payload: { transition: "exited" } },
+  ];
+  (store as AnyRec).getEvents = (f: AnyRec) => rows.filter((r) => r.type === f?.type);
+  const h = makeHarness({ arbiter: arb, store });
+  const sA = { sendClientContent: () => {} };
+
+  // Absence 1 (T0 → +31s): the genuine ceremony queues away digest #1 (covers p7's failure).
+  // NOTHING drains — the operator flaps again before any turn-clear.
+  h.gating.noteSessionDetached(T0);
+  h.gating.reannounceSurvivors(sA, T0 + 31_000);
+  // Absence 2 (+40s → +80s): ceremony #2 queues away digest #2 (covers p8's exit).
+  h.gating.noteSessionDetached(T0 + 40_000);
+  h.gating.reannounceSurvivors(sA, T0 + 80_000);
+
+  const d: AnyRec = arb.evaluate({ now: T0 + 81_000, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain", "the deferred ceremonies drain at the first turn-clear");
+  const facts = [d.digest.headline, ...d.digest.tail].map((i: AnyRec) => i.facts);
+  assert.ok(facts.some((f: string) => /p7/.test(f)),
+    "M-3 feature absent: the FIRST absence's events (pane p7 failed) must survive a double-flap — " +
+      `a fixed away-digest coalesceKey lets ceremony 2 latest-wins-overwrite them, got: ${JSON.stringify(facts)}`);
+  assert.ok(facts.some((f: string) => /p8/.test(f)),
+    `the second absence's events still speak too, got: ${JSON.stringify(facts)}`);
+});
+
 // ── the private-queue fold: deferredReady/armReadyDrain die; the arbiter owns deferral ─────────
 
 test("W3 fold — the pushSignal private queue is deleted from src/voice/index.ts", () => {

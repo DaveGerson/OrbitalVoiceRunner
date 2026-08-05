@@ -43,7 +43,7 @@ import { applyDispatchDecision } from "../dispatch/paneWrite";
 import { getExchangeService, exchangeSpineActive } from "../exchanges/spine";
 import { mintExchangeForSend } from "../exchanges/deliveryHooks";
 import { withExchangeCorrelationHint } from "../exchanges/resultEnvelope";
-import type { ExchangeSnapshot } from "../exchanges/lifecycle";
+import { TERMINAL_STATES, type ExchangeSnapshot } from "../exchanges/lifecycle";
 import { getExchangeNarrationGate } from "../announcementBus";
 import { terseExchangeOutcomeLine, paneDisplayLabel } from "./sitrep";
 import { convergeTypedDraftEdit } from "../exchanges/draftRegistry";
@@ -797,13 +797,26 @@ export function resubmitUndeliveredDigest(arbiter: Pick<TurnArbiter, "submit">, 
   }
 }
 
-/** vc-C's dispatch-intent input (spec §3.3 row 4): was a live exchange bound to this pane at the
+/** vc-C's dispatch-intent input (spec §3.3 row 4): was a LIVE exchange bound to this pane at the
  *  idle edge? Best-effort/never-throw, mirroring every other exchange-spine read in this file --
- *  spine off or a lookup fault both fail toward "no exchange" (the false-done guard's safe default). */
-function hasActiveExchange(paneId: string): boolean {
+ *  spine off or a lookup fault both fail toward "no exchange" (the false-done guard's safe default).
+ *  I-2 (chain review): `paneActive` is a sticky DELIVERY marker — the service sets it on
+ *  completeDelivery and clears it only in recoverOnBoot, never on settle — so the marker alone
+ *  reports hasExchange:true for every later ambient Running→Idle edge on a pane that EVER carried
+ *  a dispatch, and the default `dispatched` tier would speak "pane X finished" for uncorroborated
+ *  idles (the exact false-done amplification the tier guard exists to block). Mirror
+ *  completionKindFor's staleness-guard idiom (src/observe/index.ts, lastCommandBelongsToActiveExchange):
+ *  the resolved exchange must ALSO be in a non-terminal state (TERMINAL_STATES:
+ *  agent_complete/agent_failed/cancelled, src/exchanges/lifecycle.ts) to count as live.
+ *  Exported for the focused staleness suite (tests/test_completion_staleness_guard.ts). */
+export function hasActiveExchange(paneId: string): boolean {
   if (!exchangeSpineActive()) return false;
   try {
-    return !!getExchangeService().activeExchangeForPane(paneId);
+    const svc = getExchangeService();
+    const exchangeId = svc.activeExchangeForPane(paneId);
+    if (!exchangeId) return false;
+    const snap = svc.get(exchangeId);
+    return !!snap && !TERMINAL_STATES.has(snap.state);
   } catch (e) {
     console.error(`[turn-arbiter] hasActiveExchange lookup failed for ${paneId}:`, e);
     return false;
