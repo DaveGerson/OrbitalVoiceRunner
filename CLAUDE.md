@@ -110,11 +110,28 @@ The default profile for agents on this repo is **team-maintainer-scoped** (not C
 - **In an isolated worktree**, once the full quality gate passes (adversarial review → e2e →
   loop-until-clean → lint → unit tests → build → smoke where applicable), agents **commit and push
   to a feature branch** without waiting for explicit approval.
-- **Open a PR** from that branch — the PR is the human review gate.
-- **Direct push to `main` is always prohibited.** Main is reached only via PR merge.
+- **Open a PR** from that branch — it is the audit trail and the CI trigger, **not** a wait-for-human
+  gate.
+- **Agents MERGE their own PR into `main`** once, and only once, all three hold (operator, 2026-08-06
+  — this has always been the intended workflow; earlier wording here wrongly implied a human had to
+  click merge):
+  1. **CI/CD is green and clean** — every required check SUCCESS on the PR's *current* head SHA (not a
+     stale run: re-verify after any sync/rebase push), and `mergeStateStatus` is `CLEAN`.
+  2. **The local quality gate passed** — lint/`tsc`, `npm run complexity` (zero suppressions), unit
+     suite, e2e where applicable.
+  3. **An adversarial review passed** — a *fresh* reviewer (a different agent/model, ideally a
+     different family) that is instructed to REFUTE the work, whose findings were then applied or
+     explicitly, honestly dispositioned (e.g. filed as beads with the reason they were out of scope).
+     Self-review does not satisfy this.
+- **If any of the three fails, do not merge** — report the exact failing check/finding and stop.
+  Merging is the one action where "probably fine" is not good enough.
+- **Direct push to `main` (bypassing a PR) stays prohibited.** Main is reached by *merging* a PR, so
+  the branch, its checks, and the review remain on the record.
+- **Close the beads after the merge lands**, not on a green branch — the tracker describes `main`.
 - **Outside an isolated worktree** (the shared main checkout), fall back to Conservative: report
   changed files + proposed commands, and wait for approval.
-- An explicit "do not commit / do not push" instruction in the current session still wins.
+- An explicit "do not commit / do not push / do not merge" instruction in the current session still
+  wins.
 
 ## Worktree Isolation (REQUIRED for commit-authorized agents)
 
