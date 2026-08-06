@@ -102,19 +102,57 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Repository Default: Agent Commit + Push Policy
 
-> This section overrides the Conservative default inside the Beads block. The Beads block is
-> issue-tracker scaffolding; git authority is set here.
+> This section sets git authority for this repo and **overrides the Beads block wherever the two
+> touch git** — the Conservative default, the Team-maintainer "close beads / run quality gates /
+> commit and push" enumeration, and the Session Completion git snippet. Those enumerations predate
+> agent merge authority and omitting `merge` from them grants nothing and forbids nothing. The Beads
+> block is issue-tracker scaffolding; git authority — **including MERGE authority** — is defined here
+> and only here.
 
 The default profile for agents on this repo is **team-maintainer-scoped** (not Conservative):
 
 - **In an isolated worktree**, once the full quality gate passes (adversarial review → e2e →
   loop-until-clean → lint → unit tests → build → smoke where applicable), agents **commit and push
   to a feature branch** without waiting for explicit approval.
-- **Open a PR** from that branch — the PR is the human review gate.
-- **Direct push to `main` is always prohibited.** Main is reached only via PR merge.
+- **Open a PR** from that branch — it is the audit trail and the CI trigger, **not** a wait-for-human
+  gate.
+- **Agents MERGE their own PR into `main`** when, and only when, all three hold (operator,
+  2026-08-06 — this has always been the intended workflow; earlier wording here wrongly implied a
+  human had to click merge). Merge **server-side only**, via `gh pr merge <n>` — never by building
+  the merge commit locally in any checkout, which would be an autonomous commit on `main` and is
+  prohibited under Worktree Isolation below.
+  1. **CI/CD is green and clean** — **every** check that ran on the PR's *current* head SHA is
+     SUCCESS. This repo has **no branch protection** (verified 2026-08-06: `branches/main/protection`
+     → 404, rulesets → `[]`), so there is no such thing as a "required" check here — "required" means
+     **all of them**, and a red board must never be waved through on the grounds that nothing was
+     formally required. A stale run proves nothing: re-verify against the current head SHA after any
+     sync/rebase push. Then confirm `gh pr view <n> --json mergeStateStatus` reports `CLEAN` — with no
+     protection, that field is the load-bearing check.
+  2. **The local quality gate passed** — the full gate from the first bullet above (adversarial review
+     → e2e → loop-until-clean → lint/`tsc` → unit suite → build → smoke where applicable), plus
+     `npm run complexity` with zero suppressions. "Where applicable" qualifies **smoke only**; e2e is
+     skippable only for a docs-only diff (`*.md` exclusively), and CI's e2e lanes must be green
+     regardless.
+  3. **An adversarial review passed** — a *fresh* reviewer (a different agent/model, ideally a
+     different family) that is instructed to REFUTE the work, whose findings were then applied or
+     explicitly, honestly dispositioned (e.g. filed as beads with the reason they were out of scope).
+     Self-review does not satisfy this.
+- **If any of the three fails, do not merge** — report the exact failing check/finding and stop.
+  Merging is the one action where "probably fine" is not good enough.
+- **Re-check `mergeStateStatus` immediately before merging.** Nothing forces a PR up to date here, so
+  a sibling merge does not flip a `CLEAN` PR to `BEHIND`: two green PRs can land back-to-back with CI
+  never having run on the combination. If another PR landed on `main` since your last CI run, wait for
+  `main`'s post-merge CI before merging on top.
+- **Direct push to `main` stays prohibited** — including a locally-constructed merge commit, even when
+  a PR exists. Main is reached by *merging the PR* so the branch, its checks, and the review remain on
+  the record.
+- **Close the beads after the merge lands**, not on a green branch — the tracker describes `main`.
+  This supersedes the step-3-before-step-4 ordering in the managed Session Completion block above: for
+  merged work, step 3's "close finished work" happens only after step 4's merge has landed.
 - **Outside an isolated worktree** (the shared main checkout), fall back to Conservative: report
   changed files + proposed commands, and wait for approval.
-- An explicit "do not commit / do not push" instruction in the current session still wins.
+- An explicit "do not commit / do not push / do not merge" instruction in the current session still
+  wins.
 
 ## Worktree Isolation (REQUIRED for commit-authorized agents)
 
