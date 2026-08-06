@@ -20,6 +20,11 @@ export type DeliveryMode = "forced-turn" | "steered-digest" | "passive-context";
 /** D1 -- while the operator holds the floor, a class-2 deadline pauses, up to this extension. */
 export const TTL_FLOOR_EXTENSION_CAP_MS = 60_000;
 
+/** 7qb1 -- tick-granularity allowance for a genuinely-earned interrupt landing a fraction of a tick
+ *  past its floor-extended boundary (not a policy dial). Overshoot past this means the interrupt was
+ *  never ticked across the real expiry (a drain-tick blackout) and its facts are stale. */
+const INTERRUPT_STALENESS_TOLERANCE_MS = 5_000;
+
 /** Classes that carry a settings dial. Class 1 (operator-response) is always immediate -- undialed. */
 const DIALABLE_CLASSES = [0, 2, 3, 4, 5] as const;
 type DialableClass = (typeof DIALABLE_CLASSES)[number];
@@ -97,9 +102,13 @@ export interface SubmitItem {
   /** Class-2 only: the TTL this item is honest about (D1). */
   deadline?: { expiresAt: number; onExpirySwap: string };
   /** Wave-2: optional within-class severity rank (lower = more severe -- e.g. vc-D ranks an
-   *  `exception` correction ahead of an `info` one even when it arrives later). Absent -> every
-   *  item in the class ties, so insertion order (FIFO) stays the sole tiebreaker -- an additive
-   *  refinement that never changes behavior for a producer that doesn't set it. */
+   *  `exception` correction ahead of an `info` one even when it arrives later). Two clauses:
+   *  (1) an item that DECLARES a rank sorts among other rank-declaring items in the same class by
+   *  that rank, regardless of arrival order; (2) an item that declares NO rank is a FIFO TIE -- it
+   *  keeps its insertion-order slot within the class, never promoted to the most-severe rank and
+   *  never demoted past the least-severe one. Absent is an additive refinement that never changes
+   *  behavior for a producer that doesn't set it (bead vwld: `?? 0` used to violate clause 2 by
+   *  treating "no rank declared" as rank 0, i.e. 'exception'). */
   severityRank?: number;
   /** Class-3 only (vc-D final-review fix 2): did this completion item assert a CLEAN success
    *  ("pane X finished") -- as opposed to a failure/error/prompt exception? Carried through to the
@@ -160,6 +169,13 @@ export interface TurnArbiter {
    *  under other keys are never touched; a non-matching key is a strict no-op. The key's
    *  floor-pause clock resets with it (a reset TTL owes no stale extension to a fresh last-call). */
   remove(coalesceKey: string): void;
+  /** rz7k: drop `coalesceKey`'s floor-pause ledger entry WITHOUT touching the queue. Call it from
+   *  the terminal sites (expiry collapse, brake collapse) where the record is finished but its
+   *  replacement utterance must still be spoken — `remove()` would eat that TRUE fact, and the
+   *  deadline-less collapse item cannot be recognised as terminal by shape alone (a resubmitted
+   *  undelivered digest is also deadline-less but still LIVE and still owed its credit). Optional so
+   *  pre-rz7k TurnArbiter doubles keep typechecking; a key with no entry is a strict no-op. */
+  releaseFloorPause?(coalesceKey: string): void;
   /** D4 (fikj.12): live re-dial. Re-normalizes `raw` (the SAME floor clamp + fallback as
    *  construction -- defense in depth) and swaps the ACTIVE matrix in place: already-queued items
    *  drain under the new modes, nothing is dropped or reconstructed. Violations are returned for
@@ -183,6 +199,10 @@ interface QueuedItem {
   pausedMs: number;
   /** The `now` this item was last ticked at; null until its first evaluate() observation. */
   lastTick: number | null;
+  /** Floor state observed at `lastTick`; null until the first observation. A span is only credited
+   *  when the floor was held at BOTH of its endpoint observations (rz7k) -- the resume tick's flag
+   *  alone is not enough, or a drain-tick blackout would bank the whole unobserved gap as pause. */
+  lastFloorHeld: boolean | null;
 }
 
 function toDigestItem(it: QueuedItem, forVisualStack: boolean): DigestItem {
@@ -249,6 +269,7 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
         insertionOrder: 0,
         pausedMs: 0,
         lastTick: null,
+        lastFloorHeld: null,
       });
       return;
     }
@@ -259,6 +280,7 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     // resubmitted last-call is a re-fired display of one deadline, not a fresh one.
     const pausedMs = existing ? existing.pausedMs : 0;
     const lastTick = existing ? existing.lastTick : null;
+    const lastFloorHeld = existing ? existing.lastFloorHeld : null;
     seq += 1;
     queue.set(key, {
       key,
@@ -272,21 +294,26 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
       insertionOrder,
       pausedMs,
       lastTick,
+      lastFloorHeld,
     });
   }
 
   /** Advances one item's pause clock by the elapsed span since its last observation, crediting the
-   *  span only while floorHeld (D1). First observation just sets the baseline (no pause change). */
+   *  span only when the floor was held at BOTH endpoint observations (D1, rz7k) -- the current
+   *  tick's floorHeld alone never proves the floor was held across a gap the loop didn't watch.
+   *  First observation just sets the baseline (no pause change). */
   function advancePause(it: QueuedItem, now: number, floorHeld: boolean): void {
     if (it.lastTick === null) {
       it.lastTick = now;
+      it.lastFloorHeld = floorHeld;
       return;
     }
     const dt = now - it.lastTick;
-    if (floorHeld && dt > 0) {
+    if (floorHeld && it.lastFloorHeld === true && dt > 0) {
       it.pausedMs = Math.min(TTL_FLOOR_EXTENSION_CAP_MS, it.pausedMs + dt);
     }
     it.lastTick = now;
+    it.lastFloorHeld = floorHeld;
   }
 
   /** Ticks one class-2 deadline item and reports whether it has become an interrupt candidate:
@@ -313,6 +340,17 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return interruptCandidate;
   }
 
+  /** Releases a class-2 item's floor-pause ledger entry when it leaves the queue with its
+   *  (extended) deadline ALREADY REACHED -- the expiry-swap drain or the D1 cap interrupt (rz7k).
+   *  A still-LIVE extension keeps its credit: the gating sweep is still widening that approval's
+   *  grace by it. Same terminal-exit predicate as factsForDrain / tickOne's interrupt check. */
+  function releaseDeadDeadline(it: QueuedItem, now: number): void {
+    if (it.coalesceKey === undefined || it.cls !== 2 || !it.deadline) return;
+    if (now >= it.deadline.expiresAt + it.pausedMs) {
+      lastKnownPausedMs.delete(it.coalesceKey);
+    }
+  }
+
   function buildImmediateDrain(): DrainDecision {
     const items = immediate.splice(0, immediate.length);
     const [headlineItem, ...tailItems] = items;
@@ -325,10 +363,38 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     };
   }
 
+  /**
+   * Wave-2 (bead vwld): given an array already sorted FIFO (class, then insertion order), reorders
+   * ONLY the rank-DECLARING items within each contiguous class block, by severityRank ascending
+   * (stable sort -> FIFO within equal rank). Items that never declared a rank keep the exact slot
+   * they already occupy -- an absent severityRank is a FIFO TIE, never rank 0 ('exception'). Scoped
+   * per class block so severity never crosses a class boundary.
+   */
+  function applySeverityOrder<T extends { cls: number; severityRank?: number }>(fifoSorted: T[]): T[] {
+    const resolved = fifoSorted.slice();
+    let start = 0;
+    while (start < resolved.length) {
+      let end = start + 1;
+      while (end < resolved.length && resolved[end].cls === resolved[start].cls) end += 1;
+      const rankedSlots: number[] = [];
+      for (let i = start; i < end; i += 1) {
+        if (resolved[i].severityRank !== undefined) rankedSlots.push(i);
+      }
+      const ranked = rankedSlots
+        .map((i) => resolved[i])
+        .sort((a, b) => (a.severityRank as number) - (b.severityRank as number));
+      rankedSlots.forEach((slot, k) => { resolved[slot] = ranked[k]; });
+      start = end;
+    }
+    return resolved;
+  }
+
   function buildQueueDrain(now: number): DrainDecision {
-    const resolved = [...queue.values()]
+    const fifoSorted = [...queue.values()]
       .map((it) => ({ ...it, facts: factsForDrain(it, now) }))
-      .sort((a, b) => a.cls - b.cls || (a.severityRank ?? 0) - (b.severityRank ?? 0) || a.insertionOrder - b.insertionOrder);
+      .sort((a, b) => a.cls - b.cls || a.insertionOrder - b.insertionOrder);
+    const resolved = applySeverityOrder(fifoSorted);
+    for (const it of queue.values()) releaseDeadDeadline(it, now);
     queue.clear();
     const [headlineItem, ...tailItems] = resolved;
     const headline = toDigestItem(headlineItem, false);
@@ -346,12 +412,31 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     const interruptCandidate = tickDeadlines(now, floorHeld);
     if (interruptCandidate) {
       queue.delete(interruptCandidate.key);
-      const headline = toDigestItem(interruptCandidate, false);
+      // ORDERING (rz7k x 7qb1): the release runs BEFORE the overshoot/factsForDrain computation
+      // below, which is safe ONLY because both read the per-item `pausedMs` field, never the
+      // lastKnownPausedMs ledger this deletes from. If either is ever changed to consult
+      // floorPausedMs()/the ledger, move this release AFTER the digest is built — otherwise the
+      // utterance is derived from a credit that was just dropped.
+      releaseDeadDeadline(interruptCandidate, now);
+      // 7qb1: a blanket factsForDrain swap here would trip on every honestly-earned interrupt too
+      // (tickOne's predicate is the same inequality as factsForDrain's swap predicate) -- discriminate
+      // by OVERSHOOT past the floor-extended boundary, not by the boundary test itself.
+      const overshoot = now - (interruptCandidate.deadline!.expiresAt + interruptCandidate.pausedMs);
+      const spokenItem = overshoot > INTERRUPT_STALENESS_TOLERANCE_MS
+        ? { ...interruptCandidate, facts: factsForDrain(interruptCandidate, now) }
+        : interruptCandidate;
+      const headline = toDigestItem(spokenItem, false);
       return { action: "interrupt-at-phrase-boundary", digest: { headline, tail: [], tailCount: 0, tailGroups: [] } };
     }
     if (immediate.length > 0) return buildImmediateDrain();
     if (!turnClear || queue.size === 0) return { action: "hold" };
     return buildQueueDrain(now);
+  }
+
+  /** rz7k: explicit terminal-site release (see the interface note). Unlike releaseDeadDeadline this
+   *  needs no deadline/shape inference — the caller knows the record is finished. */
+  function releaseFloorPause(coalesceKey: string): void {
+    lastKnownPausedMs.delete(coalesceKey);
   }
 
   function floorPausedMs(coalesceKey: string): number {
@@ -374,5 +459,5 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
     return result;
   }
 
-  return { submit, evaluate, floorPausedMs, remove, updateMatrix };
+  return { submit, evaluate, floorPausedMs, remove, releaseFloorPause, updateMatrix };
 }

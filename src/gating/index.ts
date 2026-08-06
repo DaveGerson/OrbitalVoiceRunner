@@ -134,6 +134,11 @@ export interface GatingDeps {
      *  re-attach resets a survivor's TTL window. OPTIONAL (and optional-chained at every call
      *  site) so legacy harness fakes exposing only submit+floorPausedMs keep working unchanged. */
     remove?(coalesceKey: string): void;
+    /** rz7k: drop a key's floor-pause credit WITHOUT dequeuing anything — for terminal sites that
+     *  must still speak a truthful replacement (the expiry/brake collapse). `remove?()` would eat
+     *  that replacement; leaving it alone leaks one ledger entry per staged item for the life of the
+     *  process. OPTIONAL and optional-chained for the same harness-fake reason as `remove?()`. */
+    releaseFloorPause?(coalesceKey: string): void;
   };
   /** fikj.11 (vc-D wiring): the correction-ledger seam. renderApproved records the spoken
    *  "Dispatching now" DISPATCH claim so ground-truth flips (a2tp commit-time revalidation, qj6s
@@ -927,7 +932,10 @@ export function createGating(deps: GatingDeps): Gating {
   // Deliberately NOT routed through PendingActionStore.expire()'s hook (pendingActions.ts:99-101 /
   // this file's own exclusion above at "expire() is deliberately NOT hooked") — that exclusion is
   // what lets the SWEEP's own TTL-drop leg self-swap via the deadline's onExpirySwap; hooking
-  // expire() globally would double-collapse that path. NO paneId (sweepActionItem's submit above
+  // expire() globally would double-collapse that path. CAVEAT (adversarial review, bead hyly): the
+  // self-swap only fires while the letter is STILL QUEUED. If the action's last-call already drained
+  // LIVE during grace, the sweep's TTL-drop speaks nothing at all — told-LESS, not stale. The
+  // approvals leg has no such hole (renderExpired always re-submits). NO paneId (sweepActionItem's submit above
   // carries none — identityKey is `key-<coalesceKey>--pane-<paneId??''>`; adding one here would
   // mint a DIFFERENT identity and leave the stale item alive) and NO deadline (the overwrite must
   // discard the stale expiresAt, never schedule a new interrupt candidate). Gated on the claim
@@ -939,6 +947,9 @@ export function createGating(deps: GatingDeps): Gating {
       cls: 2,
       coalesceKey: `last-call:${a.id}`,
     });
+    // rz7k: same terminal-but-deadline-less shape as renderExpired's collapse — release the
+    // floor-pause credit explicitly rather than leaking it.
+    turnArbiter.releaseFloorPause?.(`last-call:${a.id}`);
   }
 
   // STOP-ALL Stage 1 (kill=false): freeze + cancel everything in-flight. PANES KEEP RUNNING. Extracted
@@ -946,7 +957,7 @@ export function createGating(deps: GatingDeps): Gating {
   function stopAllStage1Freeze(): string[] {
     coreState.setFrozen(true);
     // Cancel in-flight: reject every pending approval (expire path = no write, claim+delete).
-    for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire");
+    for (const p of [...pendingApprovals.all()]) applyResolution(p.messageId, "expire", { cause: "stop_all" });
     // Expire every deferred non-PTY action (no side effect runs). okes: mirror the approvals loop's
     // honest collapse on the action leg — see collapseBrakedActionLastCall.
     for (const a of [...pendingActions.all()]) {
@@ -1323,15 +1334,28 @@ export function createGating(deps: GatingDeps): Gating {
     cancelExchangeOnResolve(record, "rejected");
   }
 
-  function renderExpired(record: ResolvedRecord, safeInstr: string, session: any): void {
+  function renderExpired(record: ResolvedRecord, safeInstr: string, session: any, opts?: { cause?: "stop_all" }): void {
     // Wave-2 site 5: the honest expiry notice submits under the SAME coalesceKey the last-call used
     // (spec section 3.3 row 1) so a stale queued last-call COLLAPSES into this truth rather than
     // draining later as a still-actionable "approve now". This fires regardless of the CALLER
     // (the sweep's reject leg OR the emergency brake's cancel-everything loop) — either way the
     // operator must never hear a dropped/cancelled approval described as still live.
-    const expiryFacts = `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`;
+    // y9tj: the CAUSE must be threaded, not inferred (coreState.frozen can already be true from an
+    // earlier brake while THIS tick is a genuine TTL sweep) — mirrors collapseBrakedActionLastCall's
+    // "— cancelled by stop-all." wording so one stop-all narrates one cause for every staged kind.
+    // Told-more parity with the action leg: okes names the item (`create_pane: Create pane x —
+    // cancelled by stop-all.`), so the approval leg must too — two brake-cancelled approvals on one
+    // pane would otherwise read out as two byte-identical lines. `safeInstr` is already redacted and
+    // already spoken verbatim by renderRejected, so this adds no new disclosure.
+    const expiryFacts = opts?.cause === "stop_all"
+      ? `The command on pane ${record.terminalId} ("${safeInstr}") — cancelled by stop-all.`
+      : `The command on pane ${record.terminalId} expired after ${Math.round(APPROVAL_TTL_MS / 60000)} minutes; I cancelled it.`;
     if (turnArbiter) {
       turnArbiter.submit({ facts: expiryFacts, cls: 2, paneId: record.terminalId, coalesceKey: `last-call:${record.messageId}` });
+      // rz7k: the record is terminal here, but this collapse item carries NO deadline, so the
+      // arbiter cannot recognise it as dead by shape and would leak the ledger entry for the life of
+      // the process. Release explicitly — remove() would eat the TRUE collapse fact just submitted.
+      turnArbiter.releaseFloorPause?.(`last-call:${record.messageId}`);
     } else if (session) {
       pushApprovalNarration(session, expiryFacts);
     }
@@ -1406,7 +1430,7 @@ export function createGating(deps: GatingDeps): Gating {
     turnArbiter?.remove?.(`last-call:${messageId}`);
   }
 
-  function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean }) {
+  function applyResolution(messageId: string, mode: ResolveMode, opts?: { vocal?: boolean; cause?: "stop_all" }) {
     // BUG-041: read the session BEFORE resolveDecision — terminal outcomes claim+delete the record
     // and the store's delete() drops the session side-map entry with it, so a lookup after the
     // resolve always misses and every spoken read-back below would be silently skipped.
@@ -1440,7 +1464,7 @@ export function createGating(deps: GatingDeps): Gating {
       case "approved":  renderApproved(record, safeInstr, verb, session, opts); break;
       case "dead_pane": renderDeadPane(record, safeInstr, session); break;
       case "rejected":  renderRejected(record, safeInstr, session, opts); break;
-      case "expired":   renderExpired(record, safeInstr, session); break;
+      case "expired":   renderExpired(record, safeInstr, session, opts); break;
       case "lost_race": break;
     }
     // Phase 3 step 3.5: consume the instruction-envelope draft binding in the SAME choke-point
@@ -1610,6 +1634,22 @@ export function createGating(deps: GatingDeps): Gating {
   // One PENDING-ACTIONS-leg item: same last-call->grace shape as the approvals leg. Extracted VERBATIM.
   // Connectivity is the SAME ref used to narrate (`coreState.activeLiveSession`), resolved ONCE by the
   // caller and passed in (see the long-form rationale at the call site).
+  /** The action leg's TERMINAL drop (grace elapsed): claim + remove, release the arbiter's
+   *  floor-pause credit, announce. Extracted from sweepActionItem to keep it under the CC<=10 gate.
+   *
+   *  rz7k: this is a terminal site and it MUST release. The approvals leg releases inside
+   *  renderExpired and the brake leg inside collapseBrakedActionLastCall, but this drop had no
+   *  arbiter interaction at all — and in the dominant lifecycle the last-call already drained LIVE
+   *  (turn-clear during grace), so the item is gone from the queue and `releaseDeadDeadline` can
+   *  never see it: the credit leaked for the life of the process. Harmless if the item IS still
+   *  queued — tickOne re-banks and the eventual swap-drain releases again. See bead hyly for the
+   *  separate told-LESS gap (this leg speaks nothing when the letter already drained). */
+  function dropExpiredAction(actionId: string, coalesceKey: string): void {
+    pendingActions.expire(actionId);
+    turnArbiter?.releaseFloorPause?.(coalesceKey);
+    broadcast({ type: "action_resolved", actionId, outcome: "expired" });
+  }
+
   function sweepActionItem(act: ReturnType<PendingActionStore["expired"]>[number], now: number, actionsConnected: boolean): void {
     const coalesceKey = `last-call:${act.id}`;
     const extraGraceMs = turnArbiter ? turnArbiter.floorPausedMs(coalesceKey) : 0;
@@ -1653,8 +1693,7 @@ export function createGating(deps: GatingDeps): Gating {
       return;
     }
     // decision.action === "reject": grace elapsed -> expire (claim + drop, no side effect).
-    pendingActions.expire(act.id);
-    broadcast({ type: "action_resolved", actionId: act.id, outcome: "expired" });
+    dropExpiredAction(act.id, coalesceKey);
   }
 
   function sweepExpiredApprovalsUnsafe(now: number) {

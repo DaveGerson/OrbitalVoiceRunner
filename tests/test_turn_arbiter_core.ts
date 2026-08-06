@@ -287,7 +287,10 @@ test("floorPausedMs is capped at TTL_FLOOR_EXTENSION_CAP_MS and never accrues wi
   const held = freshArbiter(mod);
   held.submit({
     facts: "last call", cls: 2, coalesceKey: "last-call:appr-cap",
-    deadline: { expiresAt: t0 + 5_000, onExpirySwap: "expired" },
+    // expiresAt kept far past t0+120_000+cap (rz7k): the item must still be QUEUED (not yet
+    // D1-cap-interrupted) when floorPausedMs is read below, or rz7k(a)'s interrupt-exit prune
+    // (a dead deadline's credit is released) would zero this read for an unrelated reason.
+    deadline: { expiresAt: t0 + 500_000, onExpirySwap: "expired" },
   });
   held.evaluate({ now: t0, floorHeld: true, turnClear: false });
   held.evaluate({ now: t0 + 120_000, floorHeld: true, turnClear: false });

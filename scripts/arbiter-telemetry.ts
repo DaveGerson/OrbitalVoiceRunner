@@ -7,7 +7,12 @@
 //      row prints in full;
 //   2. the arbiter_drain shape — count, drain_size distribution (min/p50/p90/max + count by
 //      size), delivery-mode distribution, and headline-cls distribution (the D2 headline +
-//      counted-tail policy's analysis unit).
+//      counted-tail policy's analysis unit). Schema v15 (bead r59t) added a `delivered` flag: the
+//      distribution above covers DELIVERED rows only (a swallowed sendClientContent throw — and
+//      each never-drop retry of it — never reached the model and would otherwise skew the D2
+//      analysis); undelivered attempts are reported separately (count + sizes). Legacy pre-v15
+//      rows (`delivered` NULL) predate the flag and count as delivered — they are historical
+//      drains, not failures.
 //
 // Usage: npm run telemetry:arbiter [-- --days N | --all]      (default window: 14 days)
 //        JANUS_DB=path/to/.janus.db npm run telemetry:arbiter
@@ -74,15 +79,44 @@ function jumpOverSection(rows: JumpOverRow[]): string[] {
   return lines;
 }
 
+/** r59t: `delivered !== 0` counts as delivered. BOTH absent shapes mean "historical drain, not a
+ *  failure": `null` (a legacy row in a migrated v15+ DB) and `undefined` (this script never calls
+ *  init(), so a pre-v15 DB's `SELECT *` returns rows with no such property at all). Only an explicit
+ *  0 — a sendClientContent throw that sendArbiterDigest recorded — is undelivered. Do NOT rewrite
+ *  this as `=== null` or `?? 1`: either would reclassify every pre-v15 row as a failed send. */
+function wasDelivered(r: ArbiterDrainRow): boolean {
+  return r.delivered !== 0;
+}
+
+/** The drain_size distribution + mode/cls breakdowns over DELIVERED rows only (the v02l gate's
+ *  analysis unit — an undelivered attempt never reached the model and must not skew it). */
+function deliveredDistLines(rows: ArbiterDrainRow[]): string[] {
+  if (rows.length === 0) return ["delivered drain_size: (none)"];
+  const sizes = rows.map((r) => r.drain_size).sort((a, b) => a - b);
+  return [
+    `delivered drain_size: min=${sizes[0]} p50=${percentile(sizes, 0.5)} p90=${percentile(sizes, 0.9)} max=${sizes[sizes.length - 1]}`,
+    distLine("by size", countBy(rows, (r) => `size ${r.drain_size}`)),
+    distLine("by mode", countBy(rows, (r) => r.mode ?? "(null)")),
+    distLine("by headline_cls", countBy(rows, (r) => `cls ${r.headline_cls ?? "(null)"}`)),
+  ];
+}
+
+/** The undelivered attempts — surfaced, not hidden: their count AND sizes so a v02l reviewer can
+ *  see WHAT failed to land (a swallowed sendClientContent throw, or one of its never-drop retries). */
+function undeliveredLine(rows: ArbiterDrainRow[]): string {
+  if (rows.length === 0) return "undelivered: 0";
+  const sizes = rows.map((r) => r.drain_size).sort((a, b) => a - b);
+  return `undelivered: ${rows.length} (sizes: ${sizes.join(", ")})`;
+}
+
 function drainSection(rows: ArbiterDrainRow[]): string[] {
   const lines = ["== arbiter_drain (D2 headline + counted-tail shape) =="];
   lines.push(`drains total: ${rows.length}`);
   if (rows.length === 0) return lines;
-  const sizes = rows.map((r) => r.drain_size).sort((a, b) => a - b);
-  lines.push(`drain_size: min=${sizes[0]} p50=${percentile(sizes, 0.5)} p90=${percentile(sizes, 0.9)} max=${sizes[sizes.length - 1]}`);
-  lines.push(distLine("by size", countBy(rows, (r) => `size ${r.drain_size}`)));
-  lines.push(distLine("by mode", countBy(rows, (r) => r.mode ?? "(null)")));
-  lines.push(distLine("by headline_cls", countBy(rows, (r) => `cls ${r.headline_cls ?? "(null)"}`)));
+  const delivered = rows.filter(wasDelivered);
+  const undelivered = rows.filter((r) => !wasDelivered(r));
+  lines.push(...deliveredDistLines(delivered));
+  lines.push(undeliveredLine(undelivered));
   return lines;
 }
 
