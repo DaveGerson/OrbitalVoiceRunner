@@ -108,4 +108,59 @@ test("rendered DEFAULT holds the load-bearing identity + tool-surface invariants
 test("DEFAULT_SYSTEM_PROMPT carries the {{placeholder}} tokens (it is a template, not pre-rendered)", () => {
   assert.ok(DEFAULT_SYSTEM_PROMPT.includes("{{activeProjectId}}"), "{{activeProjectId}} placeholder present");
   assert.ok(DEFAULT_SYSTEM_PROMPT.includes("{{workspaces}}"), "{{workspaces}} placeholder present");
+  assert.ok(DEFAULT_SYSTEM_PROMPT.includes("{{silenceGateClause}}"), "{{silenceGateClause}} placeholder present");
+});
+
+// --- vc-B1: honest silence-gate clause (bead wsm-e2e-pinned-fikj.1) --------------------------------
+// The runtime silence gate (src/voice/speakGate.ts, gated by voiceAi.silenceGate) is a REAL but
+// OPTIONAL mechanism. The rendered prompt must never assert its existence when it is not actually
+// wired on for the session — that was the bug: the old prompt claimed "A runtime gate also enforces
+// this silence" UNCONDITIONALLY, regardless of the live setting (which defaults to false).
+
+test("buildSystemInstruction with silenceGate:true injects the runtime-gate enforcement clause", () => {
+  const out = buildSystemInstruction({
+    activeProjectId: SAMPLE_ACTIVE_PROJECT_ID,
+    workspaces: SAMPLE_WORKSPACES,
+    silenceGate: true,
+  });
+  assert.ok(
+    out.includes("A runtime gate also enforces this silence"),
+    "gate ON must state that a runtime gate enforces silence",
+  );
+  assert.ok(!out.includes("{{silenceGateClause}}"), "no unsubstituted silenceGateClause token may remain");
+  // The behavioral ask (silence is the default; speak only when it earns its place) must survive
+  // regardless of which clause is substituted.
+  assert.ok(out.includes("silence is your default"), "the behavioral ask must survive with the gate ON");
+});
+
+test("buildSystemInstruction with silenceGate:false (or omitted) must NOT claim a runtime gate enforces silence", () => {
+  const outFalse = buildSystemInstruction({
+    activeProjectId: SAMPLE_ACTIVE_PROJECT_ID,
+    workspaces: SAMPLE_WORKSPACES,
+    silenceGate: false,
+  });
+  const outOmitted = buildSystemInstruction({
+    activeProjectId: SAMPLE_ACTIVE_PROJECT_ID,
+    workspaces: SAMPLE_WORKSPACES,
+  });
+  for (const out of [outFalse, outOmitted]) {
+    // The exact false claim the bug shipped must be gone...
+    assert.ok(
+      !out.includes("A runtime gate also enforces this silence"),
+      "gate OFF must not carry the false 'a runtime gate enforces this silence' claim",
+    );
+    // ...and no rephrasing of the same false claim may sneak back in.
+    assert.ok(
+      !/runtime gate[^.]*enforces/i.test(out),
+      "gate OFF must not contain ANY phrasing asserting a runtime gate enforces silence",
+    );
+    // The honest replacement clause must be present instead.
+    assert.ok(
+      out.includes("Your own judgment is the only gate here"),
+      "gate OFF must honestly state the model's own judgment is the only gate",
+    );
+    assert.ok(!out.includes("{{silenceGateClause}}"), "no unsubstituted silenceGateClause token may remain");
+    // The behavioral ask survives even though the (false) enforcement claim is removed.
+    assert.ok(out.includes("silence is your default"), "the behavioral ask must survive with the gate OFF");
+  }
 });
