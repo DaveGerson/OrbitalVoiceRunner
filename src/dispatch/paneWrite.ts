@@ -128,6 +128,31 @@ function failExchangeDeliveryOnAutoExecute(deps: DispatchDeps, reason: string): 
   failExchangeDelivery(deps.exchangeId, reason, "failExchangeDeliveryOnAutoExecute");
 }
 
+// ── res2/wsm-e2e-pinned-486w: the shared "dead-in-place pane" guard ────────────────────────────
+// A pane whose process exited unexpectedly keeps its manager.terminals registration (src/terminal.ts
+// deliberately retains the transport/entry across an unexpected exit) — only `.status` flips to
+// "Exited". Registration presence (`!term`) alone is therefore NEVER a liveness proof, but
+// `term.writeInput` has no guard of its own and the node-pty transport SILENTLY SWALLOWS a write
+// against a dead process (src/ptyTransport.ts's `write()` — `catch { /* process gone */ }`), so a
+// caller that skips this check gets a false-positive success. `applyAutoExecute` below is the
+// ORIGINAL guard (res2); it is exported here so every OTHER direct-write call site (the Workbench
+// REST draft/send route, server.ts) can check the exact same predicate with the exact same
+// narration instead of re-deriving its own copy — which is precisely how wsm-e2e-pinned-486w
+// happened (this file had the guard, server.ts's route never got it). Intentionally NOT a larger
+// `deliverToLivePane` primitive (transport-generation checks, staged pre-write intent, etc.) — that
+// consolidation is tracked separately; this is only the minimal predicate + narration two surfaces
+// already needed.
+export function isPaneDeadInPlace(term: { status?: string } | undefined): boolean {
+  return term !== undefined && term.status === "Exited";
+}
+
+/** The shared human-readable refusal for a registered-but-not-running pane — used for BOTH the
+ *  never-live/archived case (`!term`) and the dead-in-place case (`isPaneDeadInPlace`), so every
+ *  surface narrates the exact same reason for "this pane cannot receive a write right now". */
+export function deadPaneRefusal(paneId: string): string {
+  return `Pane ${paneId} is not running. Start it first (restart the pane), then try again.`;
+}
+
 /**
  * The THREE connection-bound bindings (design §5). Voice binds the originating socket + live session +
  * the guard ON; REST binds broadcast + a null session + the guard OFF.
@@ -237,7 +262,7 @@ function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcom
   // pending-approval path re-checks liveness at resolve time.)
   if (!term) {
     failExchangeDeliveryOnAutoExecute(deps, "no_live_pane");
-    return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+    return { kind: "error", text: deadPaneRefusal(targetId) };
   }
   // res2: a REGISTERED-but-dead pane (the process crashed/exited in place, term still present in
   // manager.terminals) previously fell through to `term.writeInput` — a swallowed no-op against a
@@ -245,9 +270,9 @@ function applyAutoExecute(deps: DispatchDeps, safeInstr: string): DispatchOutcom
   // `{kind:'executed', ...}`: a false-positive success narrated to the operator/model. Fail the
   // same way the never-spawned/archived case above does (kind:'error', same message shape) instead
   // of a silent no-op success.
-  if (term.status === "Exited") {
+  if (isPaneDeadInPlace(term)) {
     failExchangeDeliveryOnAutoExecute(deps, "pane_exited");
-    return { kind: "error", text: `Pane ${targetId} is not running. Start it first (restart the pane), then try again.` };
+    return { kind: "error", text: deadPaneRefusal(targetId) };
   }
   // AgentExchange spine (step 1.4): the durable pre-write intent genuinely precedes the write —
   // a crash between this call and `term.writeInput` leaves exactly the "uncertain delivery"
