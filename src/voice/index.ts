@@ -2187,6 +2187,9 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             template: manager.settings.voiceAi?.systemPrompt,
             activeProjectId: manager.ledger.activeProjectId || "None",
             workspaces: Object.keys(manager.ledger.workspaces).map((pId: string) => pId + " (" + manager.ledger.workspaces[pId].name + ")").join(", "),
+            // vc-B1: pass the LIVE silenceGate setting so the prompt's honesty clause matches whether
+            // src/voice/speakGate.ts's runtime gate is actually enabled for this session (default off).
+            silenceGate: manager.settings.voiceAi?.silenceGate === true,
           }),
           ...({
             // PLM4 (Finding B1): feed the REAL resume handle under the SDK's actual config key. The

@@ -24,7 +24,7 @@ The director (the operator) sets the destination; you own how the work gets shap
 - Available Workspaces: {{workspaces}}
 
 [3. WHEN YOU SPEAK]
-Speak when the director addresses you, asks you something, or hands you work. Stay silent while the director is thinking aloud, discussing options, or talking to someone else — silence is your default, and speaking earns its place by clearing a real value bar. When a transcript is garbled or low-confidence, treat it as ambiguous and hold, rather than act on a possible mis-hear. A runtime gate also enforces this silence, so contribute when you have something net-new and useful.
+Speak when the director addresses you, asks you something, or hands you work. Stay silent while the director is thinking aloud, discussing options, or talking to someone else — silence is your default, and speaking earns its place by clearing a real value bar. When a transcript is garbled or low-confidence, treat it as ambiguous and hold, rather than act on a possible mis-hear. {{silenceGateClause}}
 
 [4. HOW YOU WORK THE REQUEST]
 Once engaged, run the work through four moves:
@@ -73,6 +73,17 @@ Janus: (stays silent; the director is reasoning, not addressing you)
 Director: "Drop the users table on prod." -> Janus: "That's irreversible on prod — confirm you want pane 1 to drop the users table?"
 Director: "Stop everything." -> Janus: (calls stop_all) "Frozen, and in-flight work cancelled; three panes are still running. Want me to kill them too?"`;
 
+// vc-B1 (bead wsm-e2e-pinned-fikj.1): the two honest clauses substituted for {{silenceGateClause}}.
+// The OLD prompt asserted the runtime-gate clause UNCONDITIONALLY, regardless of the live
+// voiceAi.silenceGate setting (which src/voice/speakGate.ts defaults to false — i.e. today the
+// model was told a mechanism exists that, by default, is not wired on). These two clauses make the
+// claim match the live setting: ON only when the gate is actually enabled; OFF is never allowed to
+// claim mechanical enforcement that isn't there.
+const SILENCE_GATE_CLAUSE_ON =
+  "A runtime gate also enforces this silence, so contribute when you have something net-new and useful.";
+const SILENCE_GATE_CLAUSE_OFF =
+  "Your own judgment is the only gate here - when in doubt, stay silent.";
+
 export interface BuildSystemInstructionOpts {
   /**
    * Operator-supplied template (voiceAi.systemPrompt). When non-empty (after trim) it overrides
@@ -85,6 +96,14 @@ export interface BuildSystemInstructionOpts {
   activeProjectId: string;
   /** Live joined workspace list (`pId (name)`, comma-separated). */
   workspaces: string;
+  /**
+   * Live `voiceAi.silenceGate` setting (src/voice/speakGate.ts's `SpeakGateOpts.enabled`). Governs
+   * which honest clause is substituted for {{silenceGateClause}} in [3. WHEN YOU SPEAK]: `true`
+   * injects the runtime-gate clause (accurate only because the gate is actually enabled for this
+   * session); `false` or omitted injects the judgment-only clause, since with the gate off nothing
+   * runtime-side enforces silence. Defaults to OFF (honest-by-default) when not supplied.
+   */
+  silenceGate?: boolean;
 }
 
 /**
@@ -95,7 +114,9 @@ export interface BuildSystemInstructionOpts {
  */
 export function buildSystemInstruction(opts: BuildSystemInstructionOpts): string {
   const base = (opts.template && opts.template.trim()) ? opts.template : DEFAULT_SYSTEM_PROMPT;
+  const silenceGateClause = opts.silenceGate ? SILENCE_GATE_CLAUSE_ON : SILENCE_GATE_CLAUSE_OFF;
   return base
     .split("{{activeProjectId}}").join(opts.activeProjectId)
-    .split("{{workspaces}}").join(opts.workspaces);
+    .split("{{workspaces}}").join(opts.workspaces)
+    .split("{{silenceGateClause}}").join(silenceGateClause);
 }
