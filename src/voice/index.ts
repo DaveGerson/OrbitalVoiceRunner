@@ -347,9 +347,10 @@ function projectActionResult(result: ActionResult): ActionActivityPayload {
 
 /**
  * Size-cap the (already redacted) payload. If the serialized form exceeds `cap`, the large `output`
- * field is replaced with a marker and `truncated` is set; a still-oversized payload (a pathological
- * huge scalar field) hard-minimizes to just its kind. Never throws — an unserializable payload
- * (e.g. a cycle) collapses to a truncated stub.
+ * field is replaced with a prefix of the real content (see truncateOutputToFit) and `truncated` is
+ * set; a still-oversized payload (a pathological huge scalar field on a non-`output` key) hard-
+ * minimizes to just its kind. Never throws — an unserializable payload (e.g. a cycle) collapses to
+ * a truncated stub.
  */
 function capActionPayload(payload: ActionActivityPayload, cap: number): ActionActivityPayload {
   let size: number;
@@ -360,9 +361,29 @@ function capActionPayload(payload: ActionActivityPayload, cap: number): ActionAc
   }
   if (size <= cap) return payload;
   const capped: ActionActivityPayload = { ...payload, truncated: true };
-  if ("output" in capped) capped.output = `[truncated: ${size} bytes exceeded ${cap}]`;
+  if ("output" in capped) capped.output = truncateOutputToFit(capped, cap);
   if (JSON.stringify(capped).length > cap) return { kind: payload.kind, truncated: true };
   return capped;
+}
+
+/**
+ * Keep the START of `payload.output` (a postmortem needs SOME of the record, not an all-or-nothing
+ * "[truncated]" stub) and append "…(+K bytes omitted)" so the reader also knows how much was cut.
+ * Re-measures the WHOLE candidate payload each shrink step — rather than trusting one size estimate
+ * — because JSON-escaping the kept text (quotes/backslashes, common when `output` was an object)
+ * can inflate the wire size past a naive character-count budget. Only runs on the rare oversized
+ * path, so a handful of shrink/re-stringify iterations is cheap relative to correctness.
+ */
+function truncateOutputToFit(payload: ActionActivityPayload, cap: number): string {
+  const full = typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output);
+  let keep = full.length;
+  while (keep > 0) {
+    const omitted = full.length - keep;
+    const candidate = `${full.slice(0, keep)}…(+${omitted} bytes omitted)`;
+    if (JSON.stringify({ ...payload, output: candidate }).length <= cap) return candidate;
+    keep = Math.floor(keep * 0.9);
+  }
+  return `…(+${full.length} bytes omitted)`;
 }
 
 /**
@@ -520,6 +541,55 @@ export function applyBackgroundFraming(text: string, turnComplete: boolean): str
  */
 export function paneSignalClass(kind: string): 4 | 5 {
   return kind === "created" || kind === "closed" ? 4 : 5;
+}
+
+/**
+ * wsm-e2e-pinned-mvjf: the spoken class-3 failure narration for a dead/failed pane — today ONLY
+ * sig.kind==='idle' elects a spoken completion (the vc-C branch below); 'exited'/'error' fall all
+ * the way through to pushSignal's BACKGROUND-framed passive injection and are NEVER spoken, even
+ * though docs/roadmap/EXECUTION-PLAN-V2.md:258 expects a spoken 'exited'. This mirrors the idle
+ * branch's structure/priority-class discipline (same class 3, same shared arbiter queue) but
+ * deliberately does NOT reuse completionNarration's factsFor — a pane that died must never read as
+ * "finished". Scoped to the two FAILURE_TRANSITIONS kinds (src/observe/index.ts FAILURE_TRANSITIONS)
+ * that actually reach the voice bus: 'exited' (the state-machine edge, itself already deduped
+ * upstream by observe/index.ts's lastStates) and 'error' (the per-chunk classifier, which has no
+ * such upstream dedup). `seen` is the caller's own once-per-transition guard — the SAME lastStates
+ * idiom, kept locally: a fresh non-failure kind for the pane clears its entry, so a genuinely NEW
+ * failure after a recovery narrates again, but a flapping/repeated signal for the SAME unresolved
+ * transition narrates only once (no spam). `severityRank: 0` mirrors completionNarration's own
+ * "exceptions headline over clean successes within class 3" (D2) — a dead pane must never be buried
+ * in the tail. Pure (exported for unit coverage) — no live session required.
+ */
+export function failureNarrationItem(
+  sig: PaneSignal,
+  seen: Map<string, string>,
+): (SubmitItem & { cls: 3 }) | null {
+  if (sig.kind !== "exited" && sig.kind !== "error") {
+    seen.delete(sig.paneId); // any other kind is a recovery edge — re-arm the guard for next time.
+    return null;
+  }
+  if (seen.get(sig.paneId) === sig.kind) return null; // already narrated this transition
+  seen.set(sig.paneId, sig.kind);
+  const facts = sig.kind === "error" ? `pane ${sig.paneId} reported an error` : `pane ${sig.paneId} exited`;
+  return { facts, cls: 3, paneId: sig.paneId, coalesceKey: `pane-failure:${sig.paneId}`, severityRank: 0 };
+}
+
+/**
+ * wsm-e2e-pinned-mvjf: submit-if-elected wrapper for failureNarrationItem, extracted so the
+ * paneSignalBus.subscribe callback in connectLiveSession stays under the complexity gates (McCabe
+ * <=10, cognitive <=15). Same fail-soft discipline as every other arbiter submit site in that
+ * callback: a throw degrades to a logged no-op — pushSignal's passive framed injection still runs
+ * regardless (never silence, never a lost failure narration).
+ */
+function narrateFailureIfElected(
+  sig: PaneSignal,
+  seen: Map<string, string>,
+  arbiter: Pick<TurnArbiter, "submit">,
+): void {
+  const item = failureNarrationItem(sig, seen);
+  if (!item) return;
+  try { arbiter.submit(item); }
+  catch (e) { console.error("[turn-arbiter] failure narration submit failed:", e); }
 }
 
 /**
@@ -2514,7 +2584,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 try {
                   outputProjection = capActionPayload(
                     redactDeep(projectActionResult(result as ActionResult), redactSecrets) as ActionActivityPayload,
-                    512
+                    ACTION_ACTIVITY_CAP_BYTES
                   );
                 } catch { /* fail-soft: projection must never break dispatch */ }
                 interactionLog.log({
@@ -2830,6 +2900,10 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         };
         armArbiterDrain();
 
+        // wsm-e2e-pinned-mvjf: this connection's own once-per-transition guard for
+        // failureNarrationItem below — see its doc comment for the dedupe contract.
+        const narratedFailureKinds = new Map<string, string>();
+
         const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
           // fikj.11 (vc-D): a fresh error/exited signal contradicting a JUST-SPOKEN completion
           // claim retracts it (closes vc-C's false-done residue — co-design §D). Kind- and
@@ -2879,6 +2953,11 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // is safe by construction: the passive line is BACKGROUND-framed and can never complete
             // a turn; the class-3 digest is the single SPOKEN guarantee (told-more, never a drop).
           }
+          // wsm-e2e-pinned-mvjf: the idle branch's dead twin — 'exited'/'error' are a FAILURE
+          // completion, not a clean one, so they get their own class-3 narration text instead of
+          // riding completionNarration's "finished" phrasing. Same shared-arbiter queue, same
+          // fail-soft catch (a throw degrades to the passive framed injection below, never silence).
+          narrateFailureIfElected(sig, narratedFailureKinds, sharedArbiter);
           pushSignal(sig);
         });
         // Wave 4 (D1, cortex cutover design) + z5c slice 1 (spec 2026-07-07 D1, closes bead

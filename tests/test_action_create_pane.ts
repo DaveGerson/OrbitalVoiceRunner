@@ -55,6 +55,14 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
   let tmpDir: string;
   let projDir: string;
   let prevCwd: string;
+  // PATH fixture (bead wsm-e2e-pinned-0bof): the create_pane preflight resolves the DERIVED
+  // command's first token against the REAL process.env.PATH before spawning. This suite fakes
+  // addTerminal (installSpy) so it never cared whether claude/codex/agy were actually installed —
+  // the preflight now does. Seed a throwaway dir with bare-named stand-ins (never executed;
+  // addTerminal stays faked) and prepend it to PATH so the suite stays host/CI-independent,
+  // exactly as it was before the preflight existed.
+  let binDir: string;
+  let prevPath: string | undefined;
 
   // The addTerminal spy: captures every call and returns a fake id WITHOUT spawning.
   let realAddTerminal: typeof running.manager.addTerminal;
@@ -143,6 +151,16 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
 
     installSpy();
     setCreatePaneAuto();
+
+    // See the binDir/prevPath comment above: guarantee claude/codex/agy resolve on PATH
+    // regardless of host/CI, so the new preflight (wsm-e2e-pinned-0bof) never breaks the
+    // pre-existing derivation pins above (17a-17f, 8/8b/8c, deferred, post-restart, origin).
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), "janus-cp-bin-"));
+    for (const bin of ["claude", "codex", "agy"]) {
+      fs.writeFileSync(path.join(binDir, bin), "");
+    }
+    prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${prevPath ?? ""}`;
   });
 
   after(async () => {
@@ -151,6 +169,8 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     if (running.manager.settings.advanced.capabilityGates) {
       delete (running.manager.settings.advanced.capabilityGates as any).create_pane;
     }
+    if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
+    if (binDir) { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch {} }
     if (client && client.readyState !== WebSocket.CLOSED) {
       await new Promise<void>((resolve) => {
         client.once("close", () => resolve());
@@ -174,6 +194,14 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     await waitFor(() => mock.responseFor(call));
     await waitFor(() => captured.length > before);
     return lastCapture();
+  }
+
+  // Drive voice create_pane and return only the spoken tool-response string, WITHOUT waiting for
+  // an addTerminal capture — for the PATH-preflight refusal case (wsm-e2e-pinned-0bof) addTerminal
+  // is never called, so voiceCreatePane's `captured.length > before` waitFor would hang forever.
+  async function voiceCreatePaneRaw(args: Record<string, any>): Promise<string> {
+    const call = session.emitToolCall("create_pane", args);
+    return String(await waitFor(() => mock.responseFor(call)));
   }
 
   // Drive REST POST /api/terminals (Auto -> spawnEffect runs inline) and return the capture.
@@ -647,5 +675,70 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     assert.strictEqual(activeSet, null, "rest origin create_pane must NOT call setActivePane");
     const restSwitch = broadcasts.find((m) => m.type === "switch_active_pane");
     assert.strictEqual(restSwitch, undefined, "rest origin create_pane must NOT broadcast switch_active_pane");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // PATH preflight (bead wsm-e2e-pinned-0bof) — NON-Custom presets ONLY. A bad launch binary was
+  // previously only discoverable by spawning it. src/binaryOnPath.ts's own unit suite
+  // (tests/test_binary_on_path.ts) pins the pure resolver; these three cases pin its WIRING into
+  // the create_pane handler.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe("PATH preflight (wsm-e2e-pinned-0bof)", () => {
+    // Temporarily override one preset's configured command, restoring it in `finally` so later
+    // tests in this suite keep seeing the real "claude"/"codex"/"agy" derivation.
+    function withPresetCommand<T>(id: string, command: string, fn: () => T): T {
+      const preset = (running.manager.settings.presets as any[]).find((p) => p.id === id);
+      const prev = preset.command;
+      preset.command = command;
+      try {
+        return fn();
+      } finally {
+        preset.command = prev;
+      }
+    }
+
+    it("non-Custom preset whose derived binary is NOT on PATH is refused before spawn — no addTerminal call", async () => {
+      await withPresetCommand("claudeCode", "definitely-not-a-real-cli-0bof", async () => {
+        const before = captured.length;
+        const out = await voiceCreatePaneRaw({
+          project_id: "cp_proj",
+          pane_id: "cp-voice-preflight-missing",
+          tool_preset: "Claude Code",
+          permissions_mode: "Human-in-the-Loop",
+        });
+        assert.match(
+          out,
+          /Claude Code CLI 'definitely-not-a-real-cli-0bof' is not installed or not on PATH/,
+          `spoken-friendly refusal, not a spawn attempt: ${out}`
+        );
+        assert.strictEqual(captured.length, before, "missing-binary refusal never reached addTerminal");
+      });
+    });
+
+    it("non-Custom preset whose derived binary IS on PATH spawns as today ('node' — guaranteed on PATH in CI)", async () => {
+      await withPresetCommand("claudeCode", "node", async () => {
+        const call = await voiceCreatePane({
+          project_id: "cp_proj",
+          pane_id: "cp-voice-preflight-ok",
+          tool_preset: "Claude Code",
+          permissions_mode: "Human-in-the-Loop",
+        });
+        assert.strictEqual(call.command, "node", "an on-PATH binary spawns unchanged, exactly as before this preflight existed");
+      });
+    });
+
+    it("Custom preset is NEVER preflighted — a garbage command still spawns", async () => {
+      const call = await voiceCreatePane({
+        project_id: "cp_proj",
+        pane_id: "cp-voice-preflight-custom",
+        tool_preset: "Custom",
+        command: "totally-garbage-nonexistent-cmd-0bof",
+      });
+      assert.strictEqual(
+        call.command,
+        "totally-garbage-nonexistent-cmd-0bof",
+        "Custom honors the free-form command verbatim — no preflight (shell builtins/paths are false-positive-prone)"
+      );
+    });
   });
 });

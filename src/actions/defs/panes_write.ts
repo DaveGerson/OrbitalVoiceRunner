@@ -26,6 +26,7 @@ import type { ActionDef, ActionResult } from "../types";
 import { normalizePreset, presetCommand } from "../../terminal";
 import { findPaneOwningProject } from "../../paneOwnership";
 import { activateCreatedPane } from "../../paneActivation";
+import { unresolvedPresetBinary } from "../../binaryOnPath";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // switch_active_pane — UNGATED focus move (server.ts:2613-2632).
@@ -230,6 +231,46 @@ function shouldDropRestCommand(out: Record<string, unknown>, isRestShape: boolea
 }
 
 /**
+ * Derive the launch command from the normalized preset (single home: ../terminal's presetCommand).
+ * For the Custom preset honor a non-empty client command (REG1 §5.4 / REST escape hatch);
+ * otherwise derive. Extracted (CC burndown — behavior-preserving) so the handler's own branching
+ * stays flat; the `&&`/ternary this replaces is byte-identical logic, just named.
+ */
+function deriveCreatePaneCommand(
+  preset: ReturnType<typeof normalizePreset>,
+  clientCommand: string,
+  rawCommand: string | undefined,
+  presets: Parameters<typeof presetCommand>[1],
+  defaultShellCommand: Parameters<typeof presetCommand>[2]
+): string {
+  if (preset === "Custom" && clientCommand !== "") return rawCommand!;
+  return presetCommand(preset, presets, defaultShellCommand);
+}
+
+/**
+ * bead wsm-e2e-pinned-0bof: pre-spawn PATH preflight, NON-Custom presets ONLY. Custom is NEVER
+ * preflighted — shell builtins/relative paths make it false-positive-prone, and it is the
+ * operator/model's own free-form command, not a derived agent binary. Without this, a
+ * misconfigured/uninstalled agent CLI was only discoverable by spawning it (the pane dies
+ * silently, or the operator watches a dead pane in a demo). unresolvedPresetBinary fails OPEN on
+ * an unparseable command (returns null) — this is a courtesy, not a security gate, so ambiguity
+ * always resolves to "spawn anyway", never to a false refusal. Returns null (proceed) or the
+ * kind:"blocked" refusal to return verbatim — extracted so the handler's own branching stays flat.
+ */
+function presetBinaryPreflightRefusal(
+  preset: ReturnType<typeof normalizePreset>,
+  command: string
+): ActionResult | null {
+  if (preset === "Custom") return null;
+  const missingBin = unresolvedPresetBinary(command);
+  if (!missingBin) return null;
+  return {
+    kind: "blocked",
+    reason: `the ${preset} CLI '${missingBin}' is not installed or not on PATH — install it or fix the preset command in Settings.`,
+  };
+}
+
+/**
  * create_pane — FAITHFUL PORT of the voice branch (server.ts:2849-2886). DETERMINISTIC launch:
  * tool_preset is the single source of truth. normalizePreset() collapses id/name/union onto the
  * addTerminal union; presetCommand() derives the launch command from the (normalized) preset using
@@ -237,6 +278,12 @@ function shouldDropRestCommand(out: Record<string, unknown>, isRestShape: boolea
  * (NOT inlined). For the Custom preset a non-empty client `command` is honored (the REST Custom escape
  * hatch at server.ts:884, now mirrored on voice per REG1 §5.4); every non-Custom preset derives and
  * IGNORES any client-supplied command.
+ *
+ * PATH PREFLIGHT (bead wsm-e2e-pinned-0bof): for a NON-Custom preset only, the derived command's
+ * first token is resolved against PATH (src/binaryOnPath.ts) BEFORE gateOrDefer even runs — a
+ * missing agent CLI returns kind:"blocked" immediately (no addTerminal call, no gate consulted).
+ * Custom is NEVER preflighted (shell builtins/relative paths are false-positive-prone) and an
+ * unparseable command fails OPEN (spawns anyway) — this is a courtesy, not a security gate.
  *
  * GATED via ctx.gateOrDefer("create_pane", pane_id, summary, createPaneEffect, intentParams):
  *   - forbidden -> { output: "Error: the 'create_pane' capability is gated Off; pane creation is
@@ -294,13 +341,17 @@ export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   handler: (args, ctx): ActionResult => {
     const { project_id, pane_id, tool_preset, permissions_mode } = args;
     const preset = normalizePreset(tool_preset);
-    // Derive the launch command from the normalized preset (single home: ../terminal). For the Custom
-    // preset honor a non-empty client command (REG1 §5.4 / REST escape hatch); otherwise derive.
     const clientCommand = (args.command ?? "").trim();
-    const command =
-      preset === "Custom" && clientCommand !== ""
-        ? args.command!
-        : presetCommand(preset, ctx.manager.settings.presets, ctx.manager.settings.advanced?.defaultShellCommand);
+    const command = deriveCreatePaneCommand(
+      preset,
+      clientCommand,
+      args.command,
+      ctx.manager.settings.presets,
+      ctx.manager.settings.advanced?.defaultShellCommand
+    );
+
+    const preflightRefusal = presetBinaryPreflightRefusal(preset, command);
+    if (preflightRefusal) return preflightRefusal;
 
     const createPaneEffect = (): string => {
       if (!ctx.manager.ledger.getProject(project_id)) {

@@ -454,6 +454,22 @@ const DEFAULT_PTY_SUBMIT_DELAY_MS = resolveSubmitDelayMs(process.env.JANUS_PTY_S
 // need the deliverSubmit body/CR split, 'raw' bytes must flush verbatim (no CR appended).
 type PendingInputEntry = { kind: "submit"; command: string } | { kind: "raw"; bytes: string };
 
+// wsm-e2e-pinned-94fb: patterns proving the wrapping shell itself failed to launch the target
+// binary (bad tool-preset command, typo'd PATH entry, etc.) — cmd.exe / POSIX shells all emit one
+// of these as their FIRST (and often only) line before exiting. A first PTY chunk matching one of
+// these is proof the shell is dying, not proof the child attached its PTY — see the onData
+// content-gate below, which keeps such a chunk from satisfying spawn-readiness.
+const LAUNCH_FAILURE_PATTERNS: RegExp[] = [
+  /is not recognized as an internal or external command/i,
+  /command not found/i,
+  /no such file or directory/i,
+  /cannot find the path/i,
+];
+
+function isLaunchFailureChunk(text: string): boolean {
+  return LAUNCH_FAILURE_PATTERNS.some((re) => re.test(text));
+}
+
 export class UniversalTerminal {
   public terminalId: string;
   public cwd: string;
@@ -1097,7 +1113,15 @@ export class UniversalTerminal {
       // G3: first data out == the child is alive and has attached its PTY. Flush
       // any queued input BEFORE this chunk advances the status machine, so our
       // queued command causally precedes the child's response to it.
-      if (!this.spawnReady) this.markSpawnReady();
+      //
+      // wsm-e2e-pinned-94fb content-gate: a first chunk is NOT proof-of-life when it IS the
+      // wrapping shell's own launch-failure text (e.g. Windows "'antigravity' is not recognized
+      // as an internal or external command" for a bad tool-preset binary) — that shell is about
+      // to exit, not stay up. Skip markSpawnReady for that chunk so no false ready/"created"
+      // signal fires. The near-certain onExit a moment later cancels readyFallbackTimer (existing
+      // mechanism, untouched), so a launch failure never gets a false ready from either path; a
+      // slow-dying process that DOES stay up still gets exactly one ready via the fallback timer.
+      if (!this.spawnReady && !isLaunchFailureChunk(decoded)) this.markSpawnReady();
       this.appendScrollback(decoded);
       // Display lane: keep raw bytes (escape sequences intact) for xterm backfill.
       this.rawBackfill = appendRawCapped(this.rawBackfill, decoded, this.maxRawBackfillChars);

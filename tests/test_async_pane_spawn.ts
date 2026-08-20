@@ -46,8 +46,9 @@ class DeferredReadyTransport implements PtyTransport {
   write(d: string) { this.writes.push(d); }
   resize() {}
   kill() {}
-  /** Drive the readiness edge: the child produced its first output. */
-  becomeReady() { this.dataCb?.("welcome\n"); }
+  /** Drive the readiness edge: the child produced its first output. Defaults to benign output;
+   *  pass launch-failure text to model a shell that died on its very first chunk (wsm-e2e-pinned-94fb). */
+  becomeReady(text: string = "welcome\n") { this.dataCb?.(text); }
   emitExit() { this.exitCb?.({ exitCode: 0 }); }
 }
 
@@ -181,5 +182,55 @@ test("phase-2 'ready' ack fires once, after spawn-ready, through the onReady hoo
   } finally {
     await term.stop();
     deleteScrollback("b1-7");
+  }
+});
+
+// wsm-e2e-pinned-94fb: the FIRST PTY chunk must not be treated as ready-proof when it IS the
+// wrapping shell's own launch-failure text (demo repro: a bad tool-preset binary made Windows
+// cmd.exe emit "'antigravity' is not recognized as an internal or external command..." as its
+// only line before exiting — the old code marked the pane ready/"created" off that chunk, a beat
+// before the pane died). Content-gate: spawnReady must stay false and onReady must never fire.
+test("a launch-failure first chunk does not mark spawn-ready or fire onReady", async () => {
+  const stub = new DeferredReadyTransport();
+  const term = makeTerm("b1-8", stub);
+  let readyAcks: string[] = [];
+  (term as any).onReady = (id: string) => { readyAcks.push(id); };
+  try {
+    term.start();
+    stub.becomeReady(
+      "'antigravity' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n"
+    );
+    await tick();
+    assert.strictEqual((term as any).spawnReady, false, "launch-failure text must not satisfy spawn-readiness");
+    assert.deepStrictEqual(readyAcks, [], "onReady must not fire for a launch-failure first chunk");
+    // The shell dies moments later — the pane must still reach "Exited" normally, and the
+    // pre-existing readyFallbackTimer cancellation on exit must mean no LATE ready ever fires.
+    stub.emitExit();
+    await tick();
+    assert.strictEqual((term as any).status, "Exited", "the dying shell still reaches Exited normally");
+    assert.deepStrictEqual(readyAcks, [], "no ready ack fires even after the shell's own exit");
+  } finally {
+    await term.stop();
+    deleteScrollback("b1-8");
+  }
+});
+
+// Companion (paired with the launch-failure test above, and with test #7): normal first-chunk
+// output for a DIFFERENT pane must still mark spawn-ready and fire onReady exactly once — the
+// content-gate must not degrade the common case.
+test("a normal (non-failure) first chunk still marks spawn-ready and fires onReady exactly once", async () => {
+  const stub = new DeferredReadyTransport();
+  const term = makeTerm("b1-9", stub);
+  let readyAcks: string[] = [];
+  (term as any).onReady = (id: string) => { readyAcks.push(id); };
+  try {
+    term.start();
+    stub.becomeReady("Welcome to Claude Code\r\n");
+    await tick();
+    assert.strictEqual((term as any).spawnReady, true, "normal output still satisfies spawn-readiness");
+    assert.deepStrictEqual(readyAcks, ["b1-9"], "onReady fires exactly once for normal first output");
+  } finally {
+    await term.stop();
+    deleteScrollback("b1-9");
   }
 });

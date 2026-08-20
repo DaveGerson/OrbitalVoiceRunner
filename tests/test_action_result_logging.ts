@@ -82,7 +82,7 @@ describe("FIX 3 — log the tool result output (bead wsm-e2e-pinned-vprp)", () =
     const startOffset = logSize();
 
     const secretKey = "sk-abc123456789012345678901234567890";
-    const hugeProjectName = "x".repeat(1000);
+    const hugeProjectName = "x".repeat(9000);
 
     // (a) dispatch tool returning kind:ok with secret
     session.emit({
@@ -102,7 +102,7 @@ describe("FIX 3 — log the tool result output (bead wsm-e2e-pinned-vprp)", () =
       },
     });
 
-    // (c) dispatch tool returning oversized output (>512 bytes)
+    // (c) dispatch tool returning oversized output (>8192 bytes — the shared ACTION_ACTIVITY_CAP_BYTES)
     session.emit({
       toolCall: {
         functionCalls: [
@@ -136,9 +136,20 @@ describe("FIX 3 — log the tool result output (bead wsm-e2e-pinned-vprp)", () =
     assert.strictEqual(resB.data.output.kind, "error");
     assert.ok(resB.data.output.message?.includes("nonexistent_action_boom"), "error message must be present");
 
-    // Check (c): oversized output is capped (truncated)
+    // Check (c): oversized output is capped at the shared ACTION_ACTIVITY_CAP_BYTES (not the old
+    // 512-byte log-only cap) and the marker is informative — it keeps the START of the real
+    // payload (an audit trail needs SOME of the record) instead of an all-or-nothing stub, and
+    // says how many bytes were dropped.
     assert.ok(resC.data.output, "resC data must carry output object");
     assert.strictEqual(resC.data.output.truncated, true, "oversized payload must be marked truncated");
-    assert.ok(resC.data.output.output?.includes("truncated"), "oversized output text must mention truncated");
+    assert.ok(
+      resC.data.output.output?.startsWith("Project "),
+      "truncated output must retain the start of the real payload, not drop it entirely",
+    );
+    assert.match(
+      resC.data.output.output,
+      /…\(\+\d+ bytes omitted\)$/,
+      "truncated output must end with an informative omitted-byte-count marker",
+    );
   });
 });
