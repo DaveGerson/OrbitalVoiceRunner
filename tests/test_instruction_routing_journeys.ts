@@ -246,6 +246,9 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
   let base: string;
   let tmpDir: string;
   let prevCwd: string;
+  // wsm-e2e-pinned-486w (journey 13) observers — bound in before(), see the note there.
+  let loadPaneHistory: (paneId: string) => Array<{ command: string }>;
+  let deadPaneRefusal: (paneId: string) => string;
 
   const live = (): MockLiveSession => mock.latest()!;
 
@@ -327,6 +330,13 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
     const serverMod = await import("../server");
     startServer = serverMod.startServer;
     apiToken = serverMod.API_AUTH_TOKEN;
+    // wsm-e2e-pinned-486w (journey 13): observe the SAME singletons the draft/send route mutates.
+    // Both modules are already loaded (transitively, by the ../server import above) so these only
+    // fetch the cached instances — and this runs AFTER the chdir above, so HistoryManager's
+    // cwd-keyed file path points at THIS suite's tmpDir. loadHistory is dirty-first (an unflushed
+    // addCommand is visible immediately), so history assertions never race the debounced flush.
+    loadPaneHistory = (paneId) => serverMod.HistoryManager.getInstance().loadHistory(paneId);
+    ({ deadPaneRefusal } = await import("../src/dispatch/paneWrite"));
 
     mock = installMockLive();
     running = await startServer({ port: 0, enableVite: false });
@@ -1006,6 +1016,126 @@ describe("instruction-routing journeys (real server, mock-live voice dispatch, s
       const term = running.manager.terminals["long-rest-pane"] as unknown as StubTerminal;
       assert.strictEqual(term.writeInputCount, 0, "nothing was written");
       assert.strictEqual(ledgerDraftText(PJ, "long-rest-pane"), bigText, "the draft text survives byte-exact — no truncation");
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════════════════════════════════
+  // wsm-e2e-pinned-486w: Workbench send to a REGISTERED-but-dead-in-place pane used to 200, clear
+  // the draft, and mark the exchange delivered — a silent no-op (src/ptyTransport.ts swallows a
+  // write() against a gone process) narrated to the operator as success. The `!term` check at the
+  // top of this route only proves REGISTRATION; an unexpectedly exited pane keeps its
+  // manager.terminals entry (src/terminal.ts intentionally retains it) with only `.status` flipped
+  // to "Exited" — exactly the StubTerminal mutation below.
+  // ═════════════════════════════════════════════════════════════════════════════════════════════
+  describe("journey 13: Workbench send to an Exited-but-registered pane is refused — no silent data loss", () => {
+    it("POST draft/send against a dead-in-place pane returns a non-2xx refusal, never writes, leaves the draft byte-exact, and does not mark the exchange delivered", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j13";
+      const paneId = "exited-pane";
+      const term = registerPane(PJ, paneId, paneId, "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane(paneId);
+
+      const instruction = "rm -rf /tmp/stale-cache";
+      const putRes = await api(`/api/panes/${PJ}/${paneId}/draft`, { method: "PUT", body: JSON.stringify({ text: instruction }) });
+      assert.strictEqual(putRes.status, 200);
+
+      // The pane died in place AFTER the operator composed the draft — the exact bug scenario.
+      // Registration survives (still in running.manager.terminals); only status flips.
+      term.status = "Exited";
+
+      const sendRes = await api(`/api/panes/${PJ}/${paneId}/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(sendRes.status, 409, "a dead-in-place pane must never 200 on send");
+      const body = await sendRes.json();
+      assert.match(String(body.error), new RegExp(paneId), "the refusal names the dead pane");
+      assert.match(String(body.error), /not running/i);
+      // The DRIFT-HEAL clause of the bead: the Workbench surface must narrate this refusal with the
+      // EXACT shared prose the voice auto_execute path uses (src/dispatch/paneWrite.ts's res2 guard)
+      // — strict equality, not just a resemblance, so the two surfaces cannot silently re-diverge.
+      assert.strictEqual(String(body.error), deadPaneRefusal(paneId), "the 409 body is the SAME shared narration the voice path emits for a dead-in-place pane");
+
+      assert.strictEqual(term.writeInputCount, 0, "the dead pane's writeInput was never called — no swallowed no-op");
+      assert.strictEqual(loadPaneHistory(paneId).length, 0, "a refused send records NO phantom history entry — the recall buffer must never show a command that never ran (and the echo-veto must never match against it)");
+      assert.strictEqual(
+        ledgerDraftText(PJ, paneId),
+        instruction,
+        "the draft survives byte-exact — the operator's instruction is not silently discarded",
+      );
+
+      // The exchange the route mints (spine=authoritative in this suite) must be recorded as
+      // FAILED (re-armed to 'draft'), never left/marked 'delivered' for a write that never landed.
+      const summaryRes = await api("/api/fleet/exchange-summary");
+      assert.strictEqual(summaryRes.status, 200);
+      const { summaries } = await summaryRes.json();
+      assert.ok(summaries[paneId], "the attempted send minted an exchange for this pane");
+      assert.notStrictEqual(summaries[paneId].state, "delivered", "must not be marked delivered");
+      assert.strictEqual(summaries[paneId].state, "draft", "failDelivery re-arms to 'draft', not a quarantine state");
+    });
+
+    it("(no regression) sending to a LIVE pane still 200s, delivers exactly once, clears the draft, and marks the exchange delivered", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j13b";
+      const paneId = "live-pane";
+      const term = registerPane(PJ, paneId, paneId, "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane(paneId);
+
+      const instruction = "echo still-alive";
+      const putRes = await api(`/api/panes/${PJ}/${paneId}/draft`, { method: "PUT", body: JSON.stringify({ text: instruction }) });
+      assert.strictEqual(putRes.status, 200);
+      assert.strictEqual(term.status, "Running", "precondition: the pane is live");
+
+      const sendRes = await api(`/api/panes/${PJ}/${paneId}/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(sendRes.status, 200);
+      assert.strictEqual(term.writeInputCount, 1, "the live pane delivered exactly once");
+      assert.strictEqual(ledgerDraftText(PJ, paneId), "", "the draft is cleared on a real delivery");
+
+      const summaryRes = await api("/api/fleet/exchange-summary");
+      const { summaries } = await summaryRes.json();
+      assert.strictEqual(summaries[paneId]?.state, "delivered", "a live-pane send genuinely marks the exchange delivered");
+    });
+
+    it("(recovery loop) after the refusal, restarting the pane lets the SAME surviving draft deliver — the refusal re-arms, it never quarantines", async () => {
+      resetDraftRegistryForTests();
+      clearPanes();
+      const PJ = "ir_proj_j13c";
+      const paneId = "revive-pane";
+      const term = registerPane(PJ, paneId, paneId, "Custom", "Full Auto");
+      running.manager.ledger.activeProjectId = PJ;
+      await setActivePane(paneId);
+
+      const instruction = "npm run build -- --profile";
+      const putRes = await api(`/api/panes/${PJ}/${paneId}/draft`, { method: "PUT", body: JSON.stringify({ text: instruction }) });
+      assert.strictEqual(putRes.status, 200);
+
+      // Die in place, get refused — the scenario test A pins in detail.
+      term.status = "Exited";
+      const refused = await api(`/api/panes/${PJ}/${paneId}/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(refused.status, 409, "precondition: the dead-in-place refusal fired");
+      assert.strictEqual(term.writeInputCount, 0, "precondition: nothing was written while dead");
+
+      // The operator restarts the pane. (In-place for the stub: the guard's contract is
+      // status-based — a real restart also swaps the transport, which is bead 30mg's
+      // transport-generation concern, deliberately out of scope here.)
+      term.status = "Running";
+
+      // The WHOLE POINT of preserving the draft is this retry: the refusal must have re-armed the
+      // exchange to 'draft' (never a quarantine/locked state), so the identical send now delivers.
+      const retry = await api(`/api/panes/${PJ}/${paneId}/draft/send`, { method: "POST", body: "{}" });
+      assert.strictEqual(retry.status, 200, "the surviving draft is genuinely re-sendable after a restart — the refusal re-armed it");
+      assert.strictEqual(term.writeInputCount, 1, "the retry delivered exactly once");
+      assert.ok(term.lastCommand.startsWith(instruction), "the ORIGINAL preserved instruction reached the pane byte-exact (plus only the documented correlation hint)");
+      assert.strictEqual(ledgerDraftText(PJ, paneId), "", "the draft clears ONLY on the acknowledged delivery — exactly the bead's 'clear after acknowledged write' clause");
+
+      const history = loadPaneHistory(paneId);
+      assert.strictEqual(history.length, 1, "exactly ONE history entry across refusal+retry — the refused attempt left no phantom");
+      assert.strictEqual(history[0].command, instruction, "the history entry records the operator's original text (no correlation-hint pollution)");
+
+      const summaryRes = await api("/api/fleet/exchange-summary");
+      const { summaries } = await summaryRes.json();
+      assert.strictEqual(summaries[paneId]?.state, "delivered", "the exchange settles 'delivered' after the successful retry");
     });
   });
 });

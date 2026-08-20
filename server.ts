@@ -29,7 +29,7 @@ import {
 // c55.9: the SHARED [apply effect] dispatch core (extracted in step 1). The REST dispatchProposal
 // wrapper below binds the three connection-bound values (sess:null, notify=broadcast, guard:false,
 // origin:"rest") — byte-identical engine to the voice wrapper, two bindings.
-import { applyDispatchDecision } from "./src/dispatch/paneWrite";
+import { applyDispatchDecision, isPaneDeadInPlace, deadPaneRefusal } from "./src/dispatch/paneWrite";
 import { JanusStore } from "./src/store/sqliteStore";
 import { deliverOutcomeToHandoff } from "./src/handoffFlow";
 // c55 + concurrent multi-cli merge: c55 dropped restGateOutcome from create_pane/recipes (now registry-
@@ -1394,7 +1394,10 @@ function registerDraftAndSettingsRoutes(
     const text = (manager.ledger.getDraft(projectId, paneId)?.text ?? "").trim();
     if (!text) { res.status(400).json({ error: "Draft is empty." }); return; }
     const term = manager.terminals[paneId];
-    if (!term) { res.status(400).json({ error: `Pane '${paneId}' is not live.` }); return; }
+    // wsm-e2e-pinned-486w: never-spawned/archived case shares the exact same operator-facing
+    // narration as the dead-in-place case below (paneWrite.ts's deadPaneRefusal doc comment) —
+    // only the status code differs (400: never live at all, vs 409: was live, died in place).
+    if (!term) { res.status(400).json({ error: deadPaneRefusal(paneId) }); return; }
     // Step 3.5 (BUG-D, spec §6.2): refuse an over-limit send — never silent truncation. Primary only.
     const overflow = operatorSendOverflow(paneId, text);
     if (overflow > 0) {
@@ -1407,6 +1410,20 @@ function registerDraftAndSettingsRoutes(
     // flags are active.
     const exchangeId = stampExchangeForWorkbenchSend(projectId, paneId, text);
     beginExchangeDeliveryForWorkbenchSend(exchangeId);
+    // wsm-e2e-pinned-486w: `!term` above only proves REGISTRATION, not liveness — a pane that
+    // exited unexpectedly keeps its manager.terminals entry (src/terminal.ts intentionally retains
+    // it) with only `.status` flipped to "Exited". `term.writeInput` has no guard of its own and
+    // the node-pty transport SILENTLY SWALLOWS a write against a dead process
+    // (src/ptyTransport.ts), so without this check the write below would no-op while this route
+    // still returned success, clearing the draft and marking the exchange delivered — the exact
+    // silent-data-loss bug this bead fixes. Same shared guard + narration as the voice auto_execute
+    // path (src/dispatch/paneWrite.ts's res2 fix) — refuse BEFORE the write, fail the exchange
+    // (re-arms to `draft`, never left `delivered`), and leave the draft/history untouched.
+    if (isPaneDeadInPlace(term)) {
+      failExchangeDeliveryForWorkbenchSend(exchangeId, "pane_exited");
+      res.status(409).json({ error: deadPaneRefusal(paneId) });
+      return;
+    }
     // neg1: live correlation — append this exchange's own id (prose, only when
     // JANUS_AGENT_COMPLETION_PROMPT=on — post-collapse name for the old "request" rung) to the
     // completion-request line so a live agent can echo it back. HistoryManager.addCommand stays on

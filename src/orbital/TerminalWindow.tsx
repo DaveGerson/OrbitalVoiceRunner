@@ -143,15 +143,20 @@ function useDraft(projectId: string, paneId: string, isMockRef: MutableRefObject
       }).catch(() => { /* best-effort */ });
     }
   };
-  const send = async (): Promise<boolean> => {
-    if (!text.trim() || !paneId) return false;
+  const send = async (): Promise<{ ok: boolean; refusal?: string }> => {
+    if (!text.trim() || !paneId) return { ok: false };
     // 3C.3b: same gate — a manual ?mock=1 "send" clears the pad client-side, no real POST.
-    if (isMockRef.current && !isE2EWireArmed()) { setText(""); return true; }
+    if (isMockRef.current && !isE2EWireArmed()) { setText(""); return { ok: true }; }
     try {
       const r = await apiFetch(`/api/panes/${projectId}/${paneId}/draft/send`, { method: "POST" });
-      if (r.ok) { setText(""); return true; }
+      if (r.ok) { setText(""); return { ok: true }; }
+      // wsm-e2e-pinned-486w: a refused send (e.g. the 409 dead-in-place guard) keeps the draft
+      // server-side AND client-side — surface the server's own refusal so the operator is never
+      // told "Nothing to send" while their preserved draft needs a pane restart.
+      const body = await r.json().catch(() => null) as { error?: unknown } | null;
+      if (body?.error) return { ok: false, refusal: String(body.error) };
     } catch { /* pane may have exited */ }
-    return false;
+    return { ok: false };
   };
   // The Workbench "Send" button calls the SAME `send()` above (no parallel effect path); this just
   // records the client-local delivered-version marker afterward — see the exchange state doc comment.
@@ -300,9 +305,11 @@ export function TerminalWindow({ st, backfill, accentHex, dark, isMockRef, wsRef
   const draftTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const onSend = async () => {
-    const ok = await draft.send();
-    if (ok) draft.ackSend();
-    showToast(ok ? "Sent to the line 🔥" : "Nothing to send", ok ? "fire" : "warn");
+    const r = await draft.send();
+    if (r.ok) draft.ackSend();
+    // wsm-e2e-pinned-486w: narrate a server refusal (dead pane, over-limit, …) with the server's
+    // own reason — "Nothing to send" is ONLY the empty-draft case.
+    showToast(r.ok ? "Sent to the line 🔥" : (r.refusal ?? "Nothing to send"), r.ok ? "fire" : "warn");
   };
   const onRevise = () => { setTab("pad"); draftTextareaRef.current?.focus(); };
 
