@@ -86,6 +86,35 @@ function makeTerm(id: string, over: Partial<Record<string, unknown>> = {}): Reco
   };
 }
 
+// Realistic PaneMeta-shaped row for the VOICE-projection tests below (wsm-e2e-pinned-2icl) — the
+// actual manager.listPanes() tree carries full PaneMeta objects per pane (ledger records), not the
+// REST-only makeTerm() shape above (a stand-in UniversalTerminal).
+function makePaneMetaRow(id: string, over: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    pane_id: id,
+    name: id,
+    runtime_type: "interactive_cli",
+    last_known_state: "Running active command",
+    is_busy: true,
+    alive: true,
+    notes: [],
+    permissions_mode: "Human-in-the-Loop",
+    tool_preset: "Claude Code",
+    session_id: `sess-${id}`,
+    context_size: 123,
+    last_status_change_at: "2026-01-01T00:00:00.000Z",
+    last_command: "",
+    elapsed_ms: 4242,
+    ...over,
+  };
+}
+function makePaneGroup(
+  projectId: string,
+  panes: Array<Record<string, unknown>>,
+): { project_id: string; panes: Array<Record<string, unknown>> } {
+  return { project_id: projectId, panes };
+}
+
 interface CtxOpts {
   terminals?: Record<string, Record<string, unknown>>;
   surface?: "voice" | "rest";
@@ -205,23 +234,122 @@ describe("c55 Batch F — list_panes flat REST array", () => {
     assert.strictEqual(row.output, "stripped-output-only-last20", "output is the ANSI-stripped tail (getRecentOutput(20))");
   });
 
-  it("VOICE surface narrates the project/pane TREE (NOT the flat array) — surface-aware handler", async () => {
-    const treeSentinel = { tree: "VOICE-TREE", projects: ["a"] };
+  // wsm-e2e-pinned-2icl: the 2026-08-18 demo showed the model GUESSING ('it's busy') at the raw
+  // multi-KB manager.listPanes() ledger tree instead of reading it. The voice branch now projects
+  // that tree through a compact, deterministic VOICE-ONLY shape (below) rather than returning it
+  // untouched — this supersedes the old "untouched tree" pin.
+  it("VOICE surface narrates a COMPACT per-project/per-pane projection (NOT the raw tree, NOT the flat array)", async () => {
+    const treeSentinel = [makePaneGroup("a", [makePaneMetaRow("p1")])];
     const ctx = makeCtx({ terminals: { p1: makeTerm("p1") }, surface: "voice", treeSentinel });
     const result = await runAction(REGISTRY, "list_panes", {}, ctx);
     assert.strictEqual(result.kind, "ok");
-    assert.deepStrictEqual((result as { output: unknown }).output, treeSentinel,
-      "voice list_panes must return the manager.listPanes() tree, untouched");
+    const out = (result as { output: unknown }).output as any[];
+    assert.notDeepStrictEqual(out, treeSentinel, "voice output must NOT be the raw manager.listPanes() tree, untouched");
+    assert.deepStrictEqual(out, [
+      {
+        project_id: "a",
+        counts: { alive: 1, busy: 1, idle: 0 },
+        panes: [
+          {
+            pane_id: "p1",
+            tool_preset: "Claude Code",
+            last_known_state: "Running active command",
+            is_busy: true,
+            alive: true,
+            permissions_mode: "Human-in-the-Loop",
+            elapsed_ms: 4242,
+          },
+        ],
+      },
+    ]);
   });
 
-  it("voice projection narrates the tree output (resultToToolResponse reads result.output, never toHttp)", async () => {
-    const treeSentinel = { tree: "VOICE-TREE-2" };
+  it("voice projection is what actually reaches the model (resultToToolResponse reads result.output, never toHttp)", async () => {
+    const treeSentinel = [makePaneGroup("b", [makePaneMetaRow("p2", { is_busy: false, last_known_state: "Idle" })])];
     const ctx = makeCtx({ terminals: { p1: makeTerm("p1") }, surface: "voice", treeSentinel });
     const result = await runAction(REGISTRY, "list_panes", {}, ctx);
     let spoken: any;
     const session = { sendToolResponse: (p: any) => { spoken = p.functionResponses[0].response; } };
     resultToToolResponse(result, session as any, "list_panes", "cid-tree");
-    assert.deepStrictEqual(spoken.output, treeSentinel, "voice speaks the tree (result.output), bypassing toHttp");
+    assert.deepStrictEqual(
+      spoken.output,
+      [{ project_id: "b", counts: { alive: 1, busy: 0, idle: 1 }, panes: [{
+        pane_id: "p2", tool_preset: "Claude Code", last_known_state: "Idle",
+        is_busy: false, alive: true, permissions_mode: "Human-in-the-Loop", elapsed_ms: 4242,
+      }] }],
+      "voice speaks the compact projection (result.output), bypassing toHttp",
+    );
+  });
+
+  it("compact projection: drops notes/capabilityGates/session_id/context_size/model_context/runtime_type/last_command", async () => {
+    const rich = makePaneMetaRow("p3", {
+      notes: ["a note"],
+      capabilityGates: { read_pane: "Off" },
+      session_id: "sess-1",
+      context_size: 99999,
+      modelContext: [{ text: "orientation" } as any],
+      runtime_type: "interactive_cli",
+      last_command: "npm test",
+    });
+    const treeSentinel = [makePaneGroup("c", [rich])];
+    const ctx = makeCtx({ terminals: {}, surface: "voice", treeSentinel });
+    const result = await runAction(REGISTRY, "list_panes", {}, ctx);
+    const row = ((result as { output: any[] }).output[0]).panes[0];
+    for (const droppedKey of [
+      "notes", "capabilityGates", "session_id", "context_size",
+      "modelContext", "runtime_type", "last_command",
+    ]) {
+      assert.ok(!(droppedKey in row), `compact pane row must NOT carry '${droppedKey}'`);
+    }
+  });
+
+  it("compact projection: pane 'name' is present only when it differs from pane_id", async () => {
+    const same = makePaneMetaRow("p4"); // name defaults to pane_id in the helper
+    const renamed = makePaneMetaRow("p5", { name: "API" });
+    const treeSentinel = [makePaneGroup("d", [same, renamed])];
+    const ctx = makeCtx({ terminals: {}, surface: "voice", treeSentinel });
+    const result = await runAction(REGISTRY, "list_panes", {}, ctx);
+    const panes = ((result as { output: any[] }).output[0]).panes;
+    assert.ok(!("name" in panes.find((p: any) => p.pane_id === "p4")), "same-as-id name is omitted");
+    assert.strictEqual(panes.find((p: any) => p.pane_id === "p5").name, "API", "differing name is carried");
+  });
+
+  it("compact projection: header counts alive/busy/idle per project", async () => {
+    const treeSentinel = [makePaneGroup("e", [
+      makePaneMetaRow("busy-1", { is_busy: true, last_known_state: "Running active command" }),
+      makePaneMetaRow("idle-1", { is_busy: false, last_known_state: "Idle" }),
+      makePaneMetaRow("dead-1", { is_busy: false, alive: false, last_known_state: "Exited" }),
+    ])];
+    const ctx = makeCtx({ terminals: {}, surface: "voice", treeSentinel });
+    const result = await runAction(REGISTRY, "list_panes", {}, ctx);
+    const grp = (result as { output: any[] }).output[0];
+    assert.deepStrictEqual(grp.counts, { alive: 2, busy: 1, idle: 1 });
+  });
+
+  it("compact projection: deterministic ordering — sorted by project_id then pane_id regardless of input order", async () => {
+    const treeSentinel = [
+      makePaneGroup("zeta", [makePaneMetaRow("z2"), makePaneMetaRow("z1")]),
+      makePaneGroup("alpha", [makePaneMetaRow("a2"), makePaneMetaRow("a1")]),
+    ];
+    const ctx = makeCtx({ terminals: {}, surface: "voice", treeSentinel });
+    const result = await runAction(REGISTRY, "list_panes", {}, ctx);
+    const out = (result as { output: any[] }).output;
+    assert.deepStrictEqual(out.map((g: any) => g.project_id), ["alpha", "zeta"], "projects sorted by id");
+    assert.deepStrictEqual(out[0].panes.map((p: any) => p.pane_id), ["a1", "a2"], "panes sorted by id within a project");
+    assert.deepStrictEqual(out[1].panes.map((p: any) => p.pane_id), ["z1", "z2"], "panes sorted by id within a project");
+  });
+
+  it("REST surface stays byte-identical — the compact voice projection never leaks in (no 'counts' field, still the flat array)", async () => {
+    const terminals = { only: makeTerm("only") };
+    const ctx = makeCtx({ terminals, surface: "rest" });
+    const { json } = await runToHttp("list_panes", {}, ctx);
+    assert.ok(Array.isArray(json), "REST body is still the flat array");
+    const row = (json as Array<Record<string, unknown>>)[0];
+    assert.ok(!("counts" in row), "REST row must not carry the voice-only 'counts' header");
+    assert.ok(!("project_id" in row), "REST body is the flat per-pane array, not the project-grouped voice shape");
+    for (const restField of ["backfill", "output", "context_size", "session_id"]) {
+      assert.ok(restField in row, `REST must keep '${restField}' even though voice dropped it`);
+    }
   });
 });
 

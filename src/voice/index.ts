@@ -66,7 +66,7 @@ import {
   createTurnArbiter, DEFAULT_DELIVERY_MATRIX,
   type DeliveryMode, type Digest, type DrainDecision, type SubmitItem, type TurnArbiter,
 } from "./turnArbiter";
-import { completionNarration, normalizeCompletionAnnounce } from "./completionPolicy";
+import { completionNarration, normalizeCompletionAnnounce, PANE_COMPLETION_COALESCE_KEY } from "./completionPolicy";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
@@ -347,9 +347,10 @@ function projectActionResult(result: ActionResult): ActionActivityPayload {
 
 /**
  * Size-cap the (already redacted) payload. If the serialized form exceeds `cap`, the large `output`
- * field is replaced with a marker and `truncated` is set; a still-oversized payload (a pathological
- * huge scalar field) hard-minimizes to just its kind. Never throws — an unserializable payload
- * (e.g. a cycle) collapses to a truncated stub.
+ * field is replaced with a prefix of the real content (see truncateOutputToFit) and `truncated` is
+ * set; a still-oversized payload (a pathological huge scalar field on a non-`output` key) hard-
+ * minimizes to just its kind. Never throws — an unserializable payload (e.g. a cycle) collapses to
+ * a truncated stub.
  */
 function capActionPayload(payload: ActionActivityPayload, cap: number): ActionActivityPayload {
   let size: number;
@@ -360,9 +361,36 @@ function capActionPayload(payload: ActionActivityPayload, cap: number): ActionAc
   }
   if (size <= cap) return payload;
   const capped: ActionActivityPayload = { ...payload, truncated: true };
-  if ("output" in capped) capped.output = `[truncated: ${size} bytes exceeded ${cap}]`;
+  if ("output" in capped) capped.output = truncateOutputToFit(capped, cap);
   if (JSON.stringify(capped).length > cap) return { kind: payload.kind, truncated: true };
   return capped;
+}
+
+/**
+ * Keep the START of `payload.output` (a postmortem needs SOME of the record, not an all-or-nothing
+ * "[truncated]" stub) and append "…(+K bytes omitted)" so the reader also knows how much was cut.
+ * Re-measures the WHOLE candidate payload each shrink step — rather than trusting one size estimate
+ * — because JSON-escaping the kept text (quotes/backslashes, common when `output` was an object)
+ * can inflate the wire size past a naive character-count budget. Only runs on the rare oversized
+ * path, so a handful of shrink/re-stringify iterations is cheap relative to correctness.
+ * Sizes here are UTF-16 code units of the serialized frame (the same `.length` semantics every
+ * other ACTION_ACTIVITY_CAP_BYTES consumer uses), not UTF-8 bytes — consistency over precision.
+ * Exported for unit coverage (multibyte cut-point safety, tests/test_action_result_logging.ts).
+ */
+export function truncateOutputToFit(payload: ActionActivityPayload, cap: number): string {
+  const full = typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output);
+  let keep = full.length;
+  while (keep > 0) {
+    // Codex review (ed768a6): never cut mid-surrogate-pair — a kept prefix ending in a lone high
+    // surrogate is corrupt text (and JSON-escapes fatter). Backing off one unit keeps the
+    // shrink-loop bound intact (kept.length <= keep, keep still strictly decreases).
+    let kept = full.slice(0, keep);
+    if (/[\uD800-\uDBFF]$/.test(kept)) kept = kept.slice(0, -1);
+    const candidate = `${kept}…(+${full.length - kept.length} bytes omitted)`;
+    if (JSON.stringify({ ...payload, output: candidate }).length <= cap) return candidate;
+    keep = Math.floor(keep * 0.9);
+  }
+  return `…(+${full.length} bytes omitted)`;
 }
 
 /**
@@ -520,6 +548,71 @@ export function applyBackgroundFraming(text: string, turnComplete: boolean): str
  */
 export function paneSignalClass(kind: string): 4 | 5 {
   return kind === "created" || kind === "closed" ? 4 : 5;
+}
+
+/**
+ * wsm-e2e-pinned-mvjf: the spoken class-3 failure narration for a dead/failed pane — today ONLY
+ * sig.kind==='idle' elects a spoken completion (the vc-C branch below); 'exited'/'error' fall all
+ * the way through to pushSignal's BACKGROUND-framed passive injection and are NEVER spoken, even
+ * though docs/roadmap/EXECUTION-PLAN-V2.md:258 expects a spoken 'exited'. This mirrors the idle
+ * branch's structure/priority-class discipline (same class 3, same shared arbiter queue) but
+ * deliberately does NOT reuse completionNarration's factsFor — a pane that died must never read as
+ * "finished". Scoped to the two FAILURE_TRANSITIONS kinds (src/observe/index.ts FAILURE_TRANSITIONS)
+ * that actually reach the voice bus: 'exited' (the state-machine edge, itself already deduped
+ * upstream by observe/index.ts's lastStates) and 'error' (the per-chunk classifier, which has no
+ * such upstream dedup). `seen` is the caller's own once-per-transition guard — the SAME lastStates
+ * idiom, kept locally: a fresh non-failure kind for the pane clears its entry, so a genuinely NEW
+ * failure after a recovery narrates again, but a flapping/repeated signal for the SAME unresolved
+ * transition narrates only once (no spam). `severityRank: 0` mirrors completionNarration's own
+ * "exceptions headline over clean successes within class 3" (D2) — a dead pane must never be buried
+ * in the tail. Pure (exported for unit coverage) — no live session required.
+ */
+export function failureNarrationItem(
+  sig: PaneSignal,
+  seen: Map<string, string>,
+): (SubmitItem & { cls: 3 }) | null {
+  if (sig.kind !== "exited" && sig.kind !== "error") {
+    seen.delete(sig.paneId); // any other kind is a recovery edge — re-arm the guard for next time.
+    return null;
+  }
+  if (seen.get(sig.paneId) === sig.kind) return null; // already narrated this transition
+  seen.set(sig.paneId, sig.kind);
+  const facts = sig.kind === "error" ? `pane ${sig.paneId} reported an error` : `pane ${sig.paneId} exited`;
+  return { facts, cls: 3, paneId: sig.paneId, coalesceKey: `pane-failure:${sig.paneId}`, severityRank: 0 };
+}
+
+/**
+ * wsm-e2e-pinned-mvjf: submit-if-elected wrapper for failureNarrationItem, extracted so the
+ * paneSignalBus.subscribe callback in connectLiveSession stays under the complexity gates (McCabe
+ * <=10, cognitive <=15). Same fail-soft discipline as every other arbiter submit site in that
+ * callback: a throw degrades to a logged no-op — pushSignal's passive framed injection still runs
+ * regardless (never silence, never a lost failure narration).
+ *
+ * Codex review (ed768a6), two reconciliation duties on election:
+ *  1. PURGE the pane's queued-but-unspoken SUCCESS completion claim (remove under the shared
+ *     "pane-completion" key, this pane only, completionSuccess items only) BEFORE submitting —
+ *     otherwise one drain could speak "pane X exited. Also… pane X finished". A queued failure
+ *     completion asserts the same direction and is left alone. The claim being purged is FALSE
+ *     (the pane died), so this is exactly remove()'s invalidated-fact carve-out.
+ *  2. When the vc-D retraction arm ALREADY elected a class-0 correction for this same signal
+ *     (`retractionElected`), skip the class-3 twin — the spoken correction carries the failure
+ *     fact; a second item would narrate the death twice in one drain. The transition still counts
+ *     as narrated (failureNarrationItem marked `seen`), so a repeat signal stays deduped.
+ * Exported for unit coverage (tests/test_pane_failure_narration.ts).
+ */
+export function narrateFailureIfElected(
+  sig: PaneSignal,
+  seen: Map<string, string>,
+  arbiter: Pick<TurnArbiter, "submit" | "remove">,
+  retractionElected = false,
+): void {
+  const item = failureNarrationItem(sig, seen);
+  if (!item) return;
+  try { arbiter.remove(PANE_COMPLETION_COALESCE_KEY, { paneId: sig.paneId, completionSuccessOnly: true }); }
+  catch (e) { console.error("[turn-arbiter] queued-claim purge failed:", e); }
+  if (retractionElected) return;
+  try { arbiter.submit(item); }
+  catch (e) { console.error("[turn-arbiter] failure narration submit failed:", e); }
 }
 
 /**
@@ -693,16 +786,20 @@ export function completionContradiction(
 /** fikj.11: the pane-signal subscriber's contradiction arm, extracted whole (election + invalidate
  *  + the fail-soft catch) so the subscriber callback stays under the complexity gates. A ledger
  *  fault never blocks the signal path; the ledger itself submits the class-0 retraction (there is
- *  NO new model-bound send here). */
-function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): void {
+ *  NO new model-bound send here). Returns whether a retraction was ELECTED — the failure-narration
+ *  twin (narrateFailureIfElected) suppresses its own class-3 item then, or the same drain would
+ *  speak the failure twice (the class-0 correction already carries it — Codex review ed768a6). */
+function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): boolean {
   try {
     const contradiction = completionContradiction(sig, ledger, Date.now());
     if (contradiction && ledger) {
       ledger.invalidate(contradiction.claimId, contradiction.groundTruth, { severity: "exception" });
+      return true;
     }
   } catch (e) {
     console.error("[vc-d] completion contradiction check failed:", e);
   }
+  return false;
 }
 
 /**
@@ -2514,7 +2611,7 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
                 try {
                   outputProjection = capActionPayload(
                     redactDeep(projectActionResult(result as ActionResult), redactSecrets) as ActionActivityPayload,
-                    512
+                    ACTION_ACTIVITY_CAP_BYTES
                   );
                 } catch { /* fail-soft: projection must never break dispatch */ }
                 interactionLog.log({
@@ -2830,12 +2927,25 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
         };
         armArbiterDrain();
 
+        // wsm-e2e-pinned-mvjf: this connection's own once-per-transition guard for
+        // failureNarrationItem below — see its doc comment for the dedupe contract.
+        const narratedFailureKinds = new Map<string, string>();
+
         const unsubscribeSpoken = paneSignalBus.subscribe((sig: PaneSignal) => {
           // fikj.11 (vc-D): a fresh error/exited signal contradicting a JUST-SPOKEN completion
           // claim retracts it (closes vc-C's false-done residue — co-design §D). Kind- and
           // recency-scoped inside completionContradiction so a dispatch/restart claim, an old
           // completion, or an unspoken one can NEVER yield a false correction.
-          retractContradictedCompletion(sig, correctionLedger);
+          const retracted = retractContradictedCompletion(sig, correctionLedger);
+          // wsm-e2e-pinned-mvjf: the idle branch's dead twin — 'exited'/'error' are a FAILURE
+          // completion, not a clean one, so they get their own class-3 narration text instead of
+          // riding completionNarration's "finished" phrasing. Same shared-arbiter queue, same
+          // fail-soft catch. MUST run BEFORE the class-4 early return below (Codex review
+          // ed768a6): 'created'/'closed' re-arm the once-per-transition guard inside
+          // failureNarrationItem, so a reused pane id's next death still narrates. For class-4
+          // kinds this call is a pure re-arm (no submit); `retracted` suppresses the class-3
+          // twin when the vc-D correction above already carries this failure.
+          narrateFailureIfElected(sig, narratedFailureKinds, sharedArbiter, retracted);
           // W3 fold: paneSignalClass is the ONE classifier deciding which arbiter class a pane
           // signal submits as — class 4 (created/closed, the operator-facing acks the old ready-defer
           // trichotomy gated) defers through the shared arbiter above; class 5 (idle/error/prompt/

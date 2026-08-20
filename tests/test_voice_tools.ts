@@ -35,7 +35,10 @@ import path from "path";
 import { WebSocket } from "ws";
 import type { MockLiveHandle, MockLiveSession } from "./helpers/mockLive";
 import { teardownServerSuite } from "./helpers/teardown";
+import { seedAgentBinsOnPath } from "./helpers/agentBins";
 import type { RunningServer } from "../server";
+
+let restoreAgentBins: (() => void) | undefined;
 
 // Minimal stand-in for a UniversalTerminal, covering the surface stopAllPanes uses.
 class StubTerminal {
@@ -96,6 +99,9 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
   before(async () => {
     process.env.NODE_ENV = "test";
     process.env.JANUS_NO_AUTOSTART = "1";
+    // wsm-e2e-pinned-0bof: create_pane now preflights the derived agent binary against the REAL
+    // PATH; this suite spies addTerminal (never spawns), so seed stand-ins to stay CI-independent.
+    restoreAgentBins = seedAgentBinsOnPath();
 
     // Isolate the .janus_* ledger/scrollback files into a temp cwd BEFORE importing
     // ../server (its boot-time store restore reads the cwd).
@@ -128,6 +134,7 @@ describe("8sq voice-tools backend (headless, no API key, no mic)", () => {
   });
 
   after(async () => {
+    restoreAgentBins?.();
     // Clear any leftover Stage-1 freeze so the persisted `frozen` kv flag never leaks across suites.
     try { await api("/api/stop-all/release", { method: "POST" }); } catch {}
     clearPanes();

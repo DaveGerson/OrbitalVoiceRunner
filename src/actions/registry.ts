@@ -20,6 +20,7 @@
 import { z } from "zod";
 import type { ActionDef, ActionResult } from "./types";
 import type { ApprovalKind } from "../pendingApprovals";
+import type { PaneMeta } from "../types";
 import { ALWAYS_ALLOWED } from "./types";
 // Phase-B grouped ActionDefs (one file per capability domain, src/actions/defs/*).
 import { READS_ACTIONS } from "./defs/reads";
@@ -108,10 +109,70 @@ export const releaseStopAll: ActionDef<typeof NoParams> = {
   },
 };
 
+/** wsm-e2e-pinned-2icl: compact VOICE-ONLY per-pane row. Only the cheap orientation fields the
+ *  system prompt promises (id, name-if-different, preset, state, busy flag, permissions mode,
+ *  elapsed-since-last-status) — NOT content recall (notes/capabilityGates/session_id/context_size/
+ *  modelContext/runtime_type/last_command), which stays behind get_pane_summary et al. */
+interface CompactPaneRow {
+  pane_id: string;
+  name?: string;
+  tool_preset: PaneMeta["tool_preset"];
+  last_known_state: string;
+  is_busy: boolean;
+  alive: boolean;
+  permissions_mode: PaneMeta["permissions_mode"];
+  elapsed_ms?: number;
+}
+
+interface CompactProjectGroup {
+  project_id: string;
+  counts: { alive: number; busy: number; idle: number };
+  panes: CompactPaneRow[];
+}
+
+function compactPaneRow(p: PaneMeta): CompactPaneRow {
+  const row: CompactPaneRow = {
+    pane_id: p.pane_id,
+    tool_preset: p.tool_preset,
+    last_known_state: p.last_known_state,
+    is_busy: p.is_busy,
+    alive: p.alive,
+    permissions_mode: p.permissions_mode,
+  };
+  if (p.name && p.name !== p.pane_id) row.name = p.name; // "id (name if different)"
+  if (typeof p.elapsed_ms === "number") row.elapsed_ms = p.elapsed_ms; // cheaply available; omit if not
+  return row;
+}
+
+/** wsm-e2e-pinned-2icl: the 2026-08-18 demo showed the model GUESSING ('it's busy') at the raw
+ *  multi-KB manager.listPanes() ledger tree instead of reading it. This projects that SAME tree
+ *  (still the one source of truth — REST above reads the raw terminals map directly, this reads the
+ *  synced ledger listPanes() already computes) into a small, stable shape: a per-project counts
+ *  header plus one compact line per pane. Sorted by project_id then pane_id so repeat calls narrate
+ *  identically regardless of Map/object iteration order. */
+function buildCompactVoiceProjection(
+  tree: Array<{ project_id: string; panes: PaneMeta[] }>,
+): CompactProjectGroup[] {
+  return tree
+    .slice()
+    .sort((a, b) => a.project_id.localeCompare(b.project_id))
+    .map((grp) => {
+      const panes = [...grp.panes].sort((a, b) => a.pane_id.localeCompare(b.pane_id));
+      const counts = { alive: 0, busy: 0, idle: 0 };
+      for (const p of panes) {
+        if (!p.alive) continue;
+        counts.alive++;
+        if (p.is_busy) counts.busy++;
+        else counts.idle++;
+      }
+      return { project_id: grp.project_id, counts, panes: panes.map(compactPaneRow) };
+    });
+}
+
 export const listPanes: ActionDef<typeof NoParams> = {
   name: "list_panes",
   description:
-    "List all projects and their panes with runtime_type, is_busy, alive, a one-line state, and live timing. The authoritative source of current pane status — always call it before reporting whether something is busy or done. Cheap orientation call.",
+    "List all projects and their panes with preset, is_busy, alive, a one-line state, permissions mode, and live timing. The authoritative source of current pane status — always call it before reporting whether something is busy or done. Cheap orientation call.",
   params: NoParams,
   // rm4: `capability: "read_pane"` here is DISCOVERABILITY METADATA ONLY — this handler
   // deliberately does NOT check effectiveCapabilityGateFor. read_pane Off gates pane CONTENT
@@ -134,12 +195,14 @@ export const listPanes: ActionDef<typeof NoParams> = {
     }),
   },
   handler: (_args, ctx): ActionResult => {
-    // SURFACE-AWARE (c55 Batch F): voice narrates the project/pane TREE (manager.listPanes(), which
-    // syncs the ledger); REST returns the FLAT per-pane array the UI's setTerminals() needs — a rich
-    // fact-sheet the tree narration cannot carry (raw ANSI backfill, the ANSI-stripped tail, the 16
-    // effective gate values, the posture word, context_size). toHttp emits the flat array top-level;
-    // the voice path keeps reading result.output via resultToToolResponse, so the tree must stay the
-    // VOICE output. Field-for-field parity with the legacy inline GET /api/terminals body (server.ts).
+    // SURFACE-AWARE (c55 Batch F, narrowed by wsm-e2e-pinned-2icl): voice narrates a COMPACT
+    // projection of the project/pane tree (manager.listPanes(), which syncs the ledger, run through
+    // buildCompactVoiceProjection below); REST returns the FLAT per-pane array the UI's setTerminals()
+    // needs — a rich fact-sheet the compact voice narration cannot carry (raw ANSI backfill, the
+    // ANSI-stripped tail, the 16 effective gate values, the posture word, context_size). toHttp emits
+    // the flat array top-level; the voice path keeps reading result.output via resultToToolResponse,
+    // so the projection must stay the VOICE output. Field-for-field parity with the legacy inline
+    // GET /api/terminals body (server.ts).
     if (ctx.surface === "rest") {
       const flat = Object.keys(ctx.manager.terminals).map((id) => {
         const term = ctx.manager.terminals[id];
@@ -174,9 +237,10 @@ export const listPanes: ActionDef<typeof NoParams> = {
       });
       return { kind: "ok", output: flat };
     }
-    // Voice (and any non-rest surface): the genuine domain call. listPanes() syncs the ledger and
-    // returns the project/pane tree the model narrates.
-    return { kind: "ok", output: ctx.manager.listPanes() };
+    // Voice (and any non-rest surface) — wsm-e2e-pinned-2icl: a COMPACT projection, not the raw
+    // ledger tree. listPanes() still syncs the ledger (the one source of truth); this only narrows
+    // what gets narrated to the cheap orientation fields (see buildCompactVoiceProjection above).
+    return { kind: "ok", output: buildCompactVoiceProjection(ctx.manager.listPanes()) };
   },
 };
 

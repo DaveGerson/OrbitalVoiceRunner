@@ -144,23 +144,27 @@
   "list_panes": {
     "output": [
       {
+        "counts": {
+          "alive": 0,
+          "busy": 0,
+          "idle": 0
+        },
         "panes": [],
         "project_id": "default_project"
       },
       {
+        "counts": {
+          "alive": 1,
+          "busy": 1,
+          "idle": 0
+        },
         "panes": [
           {
             "alive": true,
-            "context_size": 0,
             "is_busy": true,
-            "last_command": "stub-last-command",
             "last_known_state": "Running active command",
-            "name": "gold-list",
-            "notes": [],
             "pane_id": "gold-list",
             "permissions_mode": "Human-in-the-Loop",
-            "runtime_type": "interactive_cli",
-            "session_id": "<ID>",
             "tool_preset": "Claude Code"
           }
         ],

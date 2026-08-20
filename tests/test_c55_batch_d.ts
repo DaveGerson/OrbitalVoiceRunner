@@ -26,7 +26,7 @@
 // DOCTRINE (def-level deterministic): call runAction with a fake ctx, assert the ActionResult
 // kind/output, then assert resultToHttp maps it to {status,body}. No server boot, no PTY.
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,12 @@ import {
   type RestResponse,
 } from "../src/actions/rest";
 import type { ActionContext, ActionDef, ActionResult, GateDisposition } from "../src/actions/types";
+import { seedAgentBinsOnPath } from "./helpers/agentBins";
+
+// wsm-e2e-pinned-0bof: create_pane now preflights the derived agent binary against the REAL PATH;
+// this suite fabricates its ctx and never spawns, so seed stand-ins to stay CI-independent.
+const restoreAgentBins = seedAgentBinsOnPath();
+after(() => restoreAgentBins());
 
 // ── fake response (records status + json) ───────────────────────────────────────────────────────
 function makeFakeRes(): { res: RestResponse; sent: { status?: number; json?: unknown } } {

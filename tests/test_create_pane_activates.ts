@@ -1,7 +1,13 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert";
 import type { ActionContext } from "../src/actions/types";
 import { createPane } from "../src/actions/defs/panes_write";
+import { seedAgentBinsOnPath } from "./helpers/agentBins";
+
+// wsm-e2e-pinned-0bof: create_pane now preflights the derived agent binary against the REAL PATH;
+// this suite fabricates its ctx and never spawns, so seed stand-ins to stay CI-independent.
+const restoreAgentBins = seedAgentBinsOnPath();
+after(() => restoreAgentBins());
 
 // ── Issue #2 (RCA: voice command never reaches a freshly-created pane) ──────────────────────────
 // The single-active-pane WRITE gate (src/activePane.ts: isPaneActiveForWrite) refuses propose_command
