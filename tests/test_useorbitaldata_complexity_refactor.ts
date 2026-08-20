@@ -173,7 +173,7 @@ describe("resolvePaneCommand", () => {
   it("falls back to the built-in default per preset name", () => {
     assert.strictEqual(resolvePaneCommand("Claude Code", []), "claude");
     assert.strictEqual(resolvePaneCommand("Codex", undefined), "codex");
-    assert.strictEqual(resolvePaneCommand("Antigravity", []), "antigravity");
+    assert.strictEqual(resolvePaneCommand("Antigravity", []), "agy");
   });
   it("returns undefined for Custom so the client omits command and the server derives the platform shell", () => {
     // wsm-e2e-pinned-q2mb: hardcoding 'bash' here exited live Windows panes ('bash' not recognized).

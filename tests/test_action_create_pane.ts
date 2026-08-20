@@ -193,7 +193,7 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
 
     assert.strictEqual(presetCommand(normalizePreset("Claude Code"), presets, def), "claude", "Claude Code -> claude");
     assert.strictEqual(presetCommand(normalizePreset("Codex"), presets, def), "codex", "Codex -> codex");
-    assert.strictEqual(presetCommand(normalizePreset("Antigravity"), presets, def), "antigravity", "Antigravity -> antigravity");
+    assert.strictEqual(presetCommand(normalizePreset("Antigravity"), presets, def), "agy", "Antigravity -> agy (the installed Gemini CLI binary)");
 
     // Preset .ids collapse onto the same union -> same command (the misclassification surface).
     assert.strictEqual(presetCommand(normalizePreset("claudeCode"), presets, def), "claude", ".id 'claudeCode' -> claude");
@@ -216,6 +216,22 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     });
     assert.ok(call.command.startsWith("claude"), `voice derived the claude command: ${call.command}`);
     assert.strictEqual(call.toolPreset, "Claude Code", "voice normalized to the union");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 17b2 — Gemini spelling. Demo 2026-08-18: "make it a Gemini pane" had no path to the
+  // Antigravity preset (the model guessed Codex). "gemini" must normalize to Antigravity
+  // and derive the agy launch.
+  // ──────────────────────────────────────────────────────────────────────────
+  it("17b2 voice create_pane accepts 'gemini' and derives the agy launch (Antigravity)", async () => {
+    const call = await voiceCreatePane({
+      project_id: "cp_proj",
+      pane_id: "cp-voice-gemini",
+      tool_preset: "gemini",
+      permissions_mode: "Human-in-the-Loop",
+    });
+    assert.strictEqual(call.toolPreset, "Antigravity", "gemini normalizes to the Antigravity union");
+    assert.ok(call.command.startsWith("agy"), `gemini derives the agy command: ${call.command}`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -390,7 +406,7 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
     assert.strictEqual(shellCall.toolPreset, "Custom", "Custom-without-command stays Custom");
     assert.ok(shellCall.command && shellCall.command.length, "Custom-without-command derives a (shell) command, not rejected");
     assert.ok(
-      !/^(claude|codex|antigravity)\b/.test(shellCall.command),
+      !/^(claude|codex|antigravity|agy)\b/.test(shellCall.command),
       `Custom-without-command derives a shell, not an agent launch: ${shellCall.command}`,
     );
 

@@ -118,6 +118,20 @@ describe("targetResolver: exact references bind silently (spec §3.2)", () => {
     assert.strictEqual(d.kind, "bind", "one pane runs Codex, so the role reference is exact-unique");
     if (d.kind === "bind") assert.strictEqual(d.paneId, "codex-1");
   });
+
+  it("Gemini/agy role spellings ('gemini' / 'agy' / 'anti-gravity') -> bind the Antigravity pane", async () => {
+    // Demo 2026-08-18: the operator said "make it a Gemini pane" and no spelling reached the
+    // Antigravity preset. Gemini IS the agy CLI — all three spoken forms are exact role tokens.
+    const withAgy = [
+      cand({ paneId: "build-runner", ordinal: 1, presetLabel: "Claude Code" }),
+      cand({ paneId: "agy-1", ordinal: 2, presetLabel: "Antigravity" }),
+    ];
+    for (const reference of ["the gemini pane", "the agy pane", "the anti-gravity pane"]) {
+      const d = await resolveTarget(input({ reference, candidates: withAgy, rank: deadRank }));
+      assert.strictEqual(d.kind, "bind", `${reference} resolves via the exact-token floor`);
+      if (d.kind === "bind") assert.strictEqual(d.paneId, "agy-1", reference);
+    }
+  });
 });
 
 // ── ambiguity -> confirm with candidates ────────────────────────────────────────────────────────

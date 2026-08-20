@@ -48,6 +48,13 @@ test("buildSystemInstruction with NO template returns DEFAULT with the live valu
   assert.ok(!out.includes("}}"), "no '}}' placeholder may remain in the rendered instruction");
 });
 
+test("DEFAULT teaches the Gemini/agy = Antigravity equivalence (demo 2026-08-18: 'a Gemini pane' guessed Codex)", () => {
+  // Load-bearing content invariant, not prose: the operator says "Gemini" or "agy" for the
+  // Antigravity preset. Without this the model has no mapping and substitutes another agent.
+  assert.match(DEFAULT_SYSTEM_PROMPT, /Antigravity[^.\n]*(Gemini|agy)/i,
+    "the prompt must state that Antigravity is the Gemini/agy CLI");
+});
+
 test("buildSystemInstruction uses a CUSTOM template when one is provided (with substitution)", () => {
   const out = buildSystemInstruction({
     template: "custom {{activeProjectId}}",

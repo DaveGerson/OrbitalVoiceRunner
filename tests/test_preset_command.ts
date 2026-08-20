@@ -19,7 +19,8 @@ import {
 import type { CliPreset } from "../src/types";
 
 // The seeded default presets (parsePresetsSafe(undefined) returns the canonical trio:
-// {claudeCode->claude}, {codex->codex}, {antigravity->antigravity}).
+// {claudeCode->claude}, {codex->codex}, {antigravity->agy} — the Antigravity/Gemini CLI
+// installs as `agy`; there is no `antigravity` binary (demo regression 2026-08-18).
 const seeded: CliPreset[] = parsePresetsSafe(undefined);
 
 describe("U4 normalizePreset — id|name|union -> addTerminal union", () => {
@@ -33,6 +34,12 @@ describe("U4 normalizePreset — id|name|union -> addTerminal union", () => {
     assert.strictEqual(normalizePreset("Claude Code"), "Claude Code");
     assert.strictEqual(normalizePreset("Codex CLI"), "Codex");
     assert.strictEqual(normalizePreset("Antigravity Agent"), "Antigravity");
+  });
+
+  it("maps the Gemini/agy spellings onto Antigravity (demo 2026-08-18: 'a Gemini pane' guessed Codex)", () => {
+    assert.strictEqual(normalizePreset("gemini"), "Antigravity");
+    assert.strictEqual(normalizePreset("Gemini"), "Antigravity");
+    assert.strictEqual(normalizePreset("agy"), "Antigravity");
   });
 
   it("passes an already-union value through unchanged", () => {
@@ -54,7 +61,7 @@ describe("U4 presetCommand — union -> launch command", () => {
   it("derives the seeded agent binaries from settings.presets", () => {
     assert.strictEqual(presetCommand("Claude Code", seeded, undefined), "claude");
     assert.strictEqual(presetCommand("Codex", seeded, undefined), "codex");
-    assert.strictEqual(presetCommand("Antigravity", seeded, undefined), "antigravity");
+    assert.strictEqual(presetCommand("Antigravity", seeded, undefined), "agy");
   });
 
   it("Custom -> defaultShellCommand when provided", () => {
@@ -78,7 +85,7 @@ describe("U4 presetCommand — union -> launch command", () => {
     // empty presets list -> no .command override -> canonical fallback name.
     assert.strictEqual(presetCommand("Claude Code", [], undefined), "claude");
     assert.strictEqual(presetCommand("Codex", undefined, undefined), "codex");
-    assert.strictEqual(presetCommand("Antigravity", [], undefined), "antigravity");
+    assert.strictEqual(presetCommand("Antigravity", [], undefined), "agy");
   });
 });
 

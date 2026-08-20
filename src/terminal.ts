@@ -87,7 +87,7 @@ export function parsePresetsSafe(input: any): CliPreset[] {
   return [
     { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
     { id: "codex", name: "Codex CLI", command: "codex", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Amber Slop-Shield", persistentRestore: false, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },
-    { id: "antigravity", name: "Antigravity Agent", command: "antigravity", enabled: true, permissionsMode: "Full Auto", windowMode: "Standard Split-Pane", visualTheme: "Cosmic Slate", persistentRestore: true, dangerouslySkipPermissions: true, sessionResume: true, portOffset: "", customEnvVars: "" }
+    { id: "antigravity", name: "Antigravity Agent", command: "agy", enabled: true, permissionsMode: "Full Auto", windowMode: "Standard Split-Pane", visualTheme: "Cosmic Slate", persistentRestore: true, dangerouslySkipPermissions: true, sessionResume: true, portOffset: "", customEnvVars: "" }
   ];
 }
 
@@ -110,11 +110,14 @@ const PRESET_ID_BY_UNION: Record<Exclude<ToolPresetUnion, "Custom">, string> = {
   Antigravity: "antigravity",
 };
 
-// Fallback binary when settings.presets carries no override for the id.
+// Fallback binary when settings.presets carries no override for the id. NOTE: the
+// Antigravity/Gemini CLI installs as `agy` — there is no `antigravity` binary; spawning
+// one exits the pane with "'antigravity' is not recognized" (demo regression 2026-08-18,
+// bead wsm-e2e-pinned-zs64). Must stay aligned with AntigravityAdapter's default bin.
 const PRESET_FALLBACK_CMD: Record<Exclude<ToolPresetUnion, "Custom">, string> = {
   "Claude Code": "claude",
   Codex: "codex",
-  Antigravity: "antigravity",
+  Antigravity: "agy",
 };
 
 /**
@@ -134,6 +137,12 @@ const PRESET_UNION_BY_ALIAS: Record<string, ToolPresetUnion> = {
   antigravity: "Antigravity",
   "Antigravity Agent": "Antigravity",
   Antigravity: "Antigravity",
+  // Gemini/agy spellings: Antigravity IS Google's Gemini CLI and installs as `agy`. Without
+  // these aliases a spoken "Gemini pane" has no reachable preset and the model guesses
+  // (demo 2026-08-18: it guessed Codex; bead wsm-e2e-pinned-wp4r).
+  gemini: "Antigravity",
+  Gemini: "Antigravity",
+  agy: "Antigravity",
   Custom: "Custom",
 };
 
@@ -1560,7 +1569,7 @@ export class OrchestratorManager {
       presets: [
         { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true },
         { id: "codex", name: "Codex CLI", command: "codex", enabled: true },
-        { id: "antigravity", name: "Antigravity Agent", command: "antigravity", enabled: true }
+        { id: "antigravity", name: "Antigravity Agent", command: "agy", enabled: true }
       ],
       announcements: { ...DEFAULT_ANNOUNCEMENT_TEMPLATES },
       advanced: {

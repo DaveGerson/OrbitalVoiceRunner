@@ -59,7 +59,11 @@ const ROLE_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bclaude\s*code\b/i, "Claude Code"],
   [/\bclaude\b/i, "Claude Code"],
   [/\bcodex\b/i, "Codex"],
-  [/\bantigravity\b/i, "Antigravity"],
+  // Antigravity IS the Gemini CLI (`agy`): the operator says "gemini pane", "agy pane", or
+  // "anti-gravity" (ASR hyphenates) as often as "antigravity" (demo 2026-08-18).
+  [/\banti-?gravity\b/i, "Antigravity"],
+  [/\bgemini\b/i, "Antigravity"],
+  [/\bagy\b/i, "Antigravity"],
   [/\bcustom\b/i, "Custom"],
 ];
 
