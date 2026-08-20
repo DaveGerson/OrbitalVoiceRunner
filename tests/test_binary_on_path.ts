@@ -6,6 +6,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { firstCommandToken, isOnPath, unresolvedPresetBinary } from "../src/binaryOnPath";
 
 describe("firstCommandToken", () => {
@@ -144,5 +147,36 @@ describe("unresolvedPresetBinary", () => {
       existsSync: () => false,
     });
     assert.strictEqual(result, null);
+  });
+});
+
+// ── Codex-review reconciliation (ed768a6) ───────────────────────────────────────────────────────
+
+describe("relative-path fail-open (Codex finding: server cwd is not the pane cwd)", () => {
+  it("a RELATIVE path token is never refused — it can only be judged from the pane's own cwd", () => {
+    // The PTY launches under the PROJECT directory (panes_write spawn closure), but this preflight
+    // runs in the SERVER process cwd — a relative preset command like .\tools\agy.exe would be
+    // checked against the wrong root and falsely blocked. Relative == unjudgeable here == fail open.
+    assert.strictEqual(unresolvedPresetBinary("./tools/agy.exe --flag"), null);
+    assert.strictEqual(unresolvedPresetBinary(".\\tools\\agy.exe"), null);
+    assert.strictEqual(unresolvedPresetBinary("tools/agy.exe"), null);
+  });
+
+  it("an ABSOLUTE missing path still refuses (fully judgeable regardless of cwd)", () => {
+    const abs = process.platform === "win32" ? "C:\\definitely\\missing\\agy.exe" : "/definitely/missing/agy";
+    assert.strictEqual(unresolvedPresetBinary(abs, { existsSync: () => false }), abs);
+  });
+});
+
+describe("executability floor (Codex finding: existsSync mistakes a directory for a binary)", () => {
+  it("a DIRECTORY on PATH is not a hit under real-fs semantics; a file is", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "binpath-isfile-"));
+    fs.mkdirSync(path.join(tmp, "fakebin"));
+    fs.writeFileSync(path.join(tmp, "realbin"), "");
+    // No existsSync injection -> production semantics: a hit must be a FILE, not just exist.
+    assert.strictEqual(isOnPath("fakebin", { pathEnv: tmp }), false,
+      "a directory named like the binary must not satisfy the preflight");
+    assert.strictEqual(isOnPath("realbin", { pathEnv: tmp }), true,
+      "a real file still resolves");
   });
 });

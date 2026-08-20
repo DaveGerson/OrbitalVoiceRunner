@@ -167,8 +167,14 @@ export interface TurnArbiter {
    *  protects TRUE facts, and a resolved approval's "approve now or I'll drop it" last-call is no
    *  longer a true fact — SPEAKING it is the falsehood. Key-scoped: class-1 immediates and items
    *  under other keys are never touched; a non-matching key is a strict no-op. The key's
-   *  floor-pause clock resets with it (a reset TTL owes no stale extension to a fresh last-call). */
-  remove(coalesceKey: string): void;
+   *  floor-pause clock resets with it (a reset TTL owes no stale extension to a fresh last-call).
+   *  FILTERED form (Codex review ed768a6): `remove(key, { paneId, completionSuccessOnly })`
+   *  narrows the purge to one pane's items (and, with completionSuccessOnly, to items that
+   *  ASSERT a clean finish) — the failure-narration path uses it to kill a queued-but-unspoken
+   *  "pane X finished" claim the pane's death just falsified, without touching other panes'
+   *  claims under the shared "pane-completion" key. A filtered removal leaves the key's
+   *  floor-pause clock alone (other items under the key may still be live). */
+  remove(coalesceKey: string, filter?: { paneId?: string; completionSuccessOnly?: boolean }): void;
   /** rz7k: drop `coalesceKey`'s floor-pause ledger entry WITHOUT touching the queue. Call it from
    *  the terminal sites (expiry collapse, brake collapse) where the record is finished but its
    *  replacement utterance must still be spoken — `remove()` would eat that TRUE fact, and the
@@ -444,11 +450,16 @@ export function createTurnArbiter(opts?: { matrix?: unknown }): TurnArbiter {
   }
 
   /** See TurnArbiter.remove — invalidated-fact removal, QUEUED items only (immediates untouched). */
-  function remove(coalesceKey: string): void {
+  function remove(coalesceKey: string, filter?: { paneId?: string; completionSuccessOnly?: boolean }): void {
     for (const [key, it] of queue) {
-      if (it.coalesceKey === coalesceKey) queue.delete(key);
+      if (it.coalesceKey !== coalesceKey) continue;
+      if (filter?.paneId !== undefined && it.paneId !== filter.paneId) continue;
+      if (filter?.completionSuccessOnly && it.completionSuccess !== true) continue;
+      queue.delete(key);
     }
-    lastKnownPausedMs.delete(coalesceKey);
+    // Only the unfiltered form resets the key's floor-pause clock — a filtered purge leaves other
+    // items under the key live, and they are still owed any accrued pause credit.
+    if (!filter) lastKnownPausedMs.delete(coalesceKey);
   }
 
   function updateMatrix(raw: unknown): NormalizeMatrixResult {

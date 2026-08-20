@@ -66,7 +66,7 @@ import {
   createTurnArbiter, DEFAULT_DELIVERY_MATRIX,
   type DeliveryMode, type Digest, type DrainDecision, type SubmitItem, type TurnArbiter,
 } from "./turnArbiter";
-import { completionNarration, normalizeCompletionAnnounce } from "./completionPolicy";
+import { completionNarration, normalizeCompletionAnnounce, PANE_COMPLETION_COALESCE_KEY } from "./completionPolicy";
 import { actionSchemaHash } from "../actions/registry";
 import type { ActionContext, DispatchOutcome, ActionResult } from "../actions/types";
 import type { CapabilityGate, ActionActivityFrame, ActionActivityPayload } from "../types";
@@ -373,13 +373,20 @@ function capActionPayload(payload: ActionActivityPayload, cap: number): ActionAc
  * — because JSON-escaping the kept text (quotes/backslashes, common when `output` was an object)
  * can inflate the wire size past a naive character-count budget. Only runs on the rare oversized
  * path, so a handful of shrink/re-stringify iterations is cheap relative to correctness.
+ * Sizes here are UTF-16 code units of the serialized frame (the same `.length` semantics every
+ * other ACTION_ACTIVITY_CAP_BYTES consumer uses), not UTF-8 bytes — consistency over precision.
+ * Exported for unit coverage (multibyte cut-point safety, tests/test_action_result_logging.ts).
  */
-function truncateOutputToFit(payload: ActionActivityPayload, cap: number): string {
+export function truncateOutputToFit(payload: ActionActivityPayload, cap: number): string {
   const full = typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output);
   let keep = full.length;
   while (keep > 0) {
-    const omitted = full.length - keep;
-    const candidate = `${full.slice(0, keep)}…(+${omitted} bytes omitted)`;
+    // Codex review (ed768a6): never cut mid-surrogate-pair — a kept prefix ending in a lone high
+    // surrogate is corrupt text (and JSON-escapes fatter). Backing off one unit keeps the
+    // shrink-loop bound intact (kept.length <= keep, keep still strictly decreases).
+    let kept = full.slice(0, keep);
+    if (/[\uD800-\uDBFF]$/.test(kept)) kept = kept.slice(0, -1);
+    const candidate = `${kept}…(+${full.length - kept.length} bytes omitted)`;
     if (JSON.stringify({ ...payload, output: candidate }).length <= cap) return candidate;
     keep = Math.floor(keep * 0.9);
   }
@@ -580,14 +587,30 @@ export function failureNarrationItem(
  * <=10, cognitive <=15). Same fail-soft discipline as every other arbiter submit site in that
  * callback: a throw degrades to a logged no-op — pushSignal's passive framed injection still runs
  * regardless (never silence, never a lost failure narration).
+ *
+ * Codex review (ed768a6), two reconciliation duties on election:
+ *  1. PURGE the pane's queued-but-unspoken SUCCESS completion claim (remove under the shared
+ *     "pane-completion" key, this pane only, completionSuccess items only) BEFORE submitting —
+ *     otherwise one drain could speak "pane X exited. Also… pane X finished". A queued failure
+ *     completion asserts the same direction and is left alone. The claim being purged is FALSE
+ *     (the pane died), so this is exactly remove()'s invalidated-fact carve-out.
+ *  2. When the vc-D retraction arm ALREADY elected a class-0 correction for this same signal
+ *     (`retractionElected`), skip the class-3 twin — the spoken correction carries the failure
+ *     fact; a second item would narrate the death twice in one drain. The transition still counts
+ *     as narrated (failureNarrationItem marked `seen`), so a repeat signal stays deduped.
+ * Exported for unit coverage (tests/test_pane_failure_narration.ts).
  */
-function narrateFailureIfElected(
+export function narrateFailureIfElected(
   sig: PaneSignal,
   seen: Map<string, string>,
-  arbiter: Pick<TurnArbiter, "submit">,
+  arbiter: Pick<TurnArbiter, "submit" | "remove">,
+  retractionElected = false,
 ): void {
   const item = failureNarrationItem(sig, seen);
   if (!item) return;
+  try { arbiter.remove(PANE_COMPLETION_COALESCE_KEY, { paneId: sig.paneId, completionSuccessOnly: true }); }
+  catch (e) { console.error("[turn-arbiter] queued-claim purge failed:", e); }
+  if (retractionElected) return;
   try { arbiter.submit(item); }
   catch (e) { console.error("[turn-arbiter] failure narration submit failed:", e); }
 }
@@ -763,16 +786,20 @@ export function completionContradiction(
 /** fikj.11: the pane-signal subscriber's contradiction arm, extracted whole (election + invalidate
  *  + the fail-soft catch) so the subscriber callback stays under the complexity gates. A ledger
  *  fault never blocks the signal path; the ledger itself submits the class-0 retraction (there is
- *  NO new model-bound send here). */
-function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): void {
+ *  NO new model-bound send here). Returns whether a retraction was ELECTED — the failure-narration
+ *  twin (narrateFailureIfElected) suppresses its own class-3 item then, or the same drain would
+ *  speak the failure twice (the class-0 correction already carries it — Codex review ed768a6). */
+function retractContradictedCompletion(sig: PaneSignal, ledger: CorrectionLedgerSeam | undefined): boolean {
   try {
     const contradiction = completionContradiction(sig, ledger, Date.now());
     if (contradiction && ledger) {
       ledger.invalidate(contradiction.claimId, contradiction.groundTruth, { severity: "exception" });
+      return true;
     }
   } catch (e) {
     console.error("[vc-d] completion contradiction check failed:", e);
   }
+  return false;
 }
 
 /**
@@ -2909,7 +2936,16 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
           // claim retracts it (closes vc-C's false-done residue — co-design §D). Kind- and
           // recency-scoped inside completionContradiction so a dispatch/restart claim, an old
           // completion, or an unspoken one can NEVER yield a false correction.
-          retractContradictedCompletion(sig, correctionLedger);
+          const retracted = retractContradictedCompletion(sig, correctionLedger);
+          // wsm-e2e-pinned-mvjf: the idle branch's dead twin — 'exited'/'error' are a FAILURE
+          // completion, not a clean one, so they get their own class-3 narration text instead of
+          // riding completionNarration's "finished" phrasing. Same shared-arbiter queue, same
+          // fail-soft catch. MUST run BEFORE the class-4 early return below (Codex review
+          // ed768a6): 'created'/'closed' re-arm the once-per-transition guard inside
+          // failureNarrationItem, so a reused pane id's next death still narrates. For class-4
+          // kinds this call is a pure re-arm (no submit); `retracted` suppresses the class-3
+          // twin when the vc-D correction above already carries this failure.
+          narrateFailureIfElected(sig, narratedFailureKinds, sharedArbiter, retracted);
           // W3 fold: paneSignalClass is the ONE classifier deciding which arbiter class a pane
           // signal submits as — class 4 (created/closed, the operator-facing acks the old ready-defer
           // trichotomy gated) defers through the shared arbiter above; class 5 (idle/error/prompt/
@@ -2953,11 +2989,6 @@ export function attachVoiceSession(wss: WebSocketServer, deps: VoiceDeps): void 
             // is safe by construction: the passive line is BACKGROUND-framed and can never complete
             // a turn; the class-3 digest is the single SPOKEN guarantee (told-more, never a drop).
           }
-          // wsm-e2e-pinned-mvjf: the idle branch's dead twin — 'exited'/'error' are a FAILURE
-          // completion, not a clean one, so they get their own class-3 narration text instead of
-          // riding completionNarration's "finished" phrasing. Same shared-arbiter queue, same
-          // fail-soft catch (a throw degrades to the passive framed injection below, never silence).
-          narrateFailureIfElected(sig, narratedFailureKinds, sharedArbiter);
           pushSignal(sig);
         });
         // Wave 4 (D1, cortex cutover design) + z5c slice 1 (spec 2026-07-07 D1, closes bead

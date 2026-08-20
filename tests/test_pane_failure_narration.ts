@@ -172,7 +172,7 @@ test("production wiring conformance: the failure narration is wired into the SAM
   const end = src.indexOf("state.unsubscribePaneSignals = ()", start);
   assert.ok(end > start, "could not bound the subscriber callback body for inspection");
   const body = src.slice(start, end);
-  assert.match(body, /narrateFailureIfElected\(sig, narratedFailureKinds, sharedArbiter\)/,
+  assert.match(body, /narrateFailureIfElected\(sig, narratedFailureKinds, sharedArbiter(, \w+)?\)/,
     "the failure branch must live inside the spoken subscriber and be handed THIS connection's " +
       "own dedupe guard plus the SAME shared arbiter the idle completion above submits through");
   assert.match(body, /sig\.kind === "idle"/, "sanity: this is indeed the idle branch's home");
@@ -185,4 +185,81 @@ test("production wiring conformance: the failure narration is wired into the SAM
   const helperBody = src.slice(helperStart, helperEnd);
   assert.match(helperBody, /failureNarrationItem\(sig, seen\)/, "the helper must consult failureNarrationItem");
   assert.match(helperBody, /arbiter\.submit\(/, "the helper must submit the elected item through its injected arbiter");
+});
+
+// ── Codex-review reconciliation (ed768a6) ───────────────────────────────────────────────────────
+// Finding 1 (HIGH): a queued-but-unspoken "pane X finished" claim survived a subsequent failure —
+// the vc-D retraction only covers ALREADY-SPOKEN claims, so one drain could speak "pane X exited.
+// Also… pane X finished". Findings 2/3: double narration after a spoken-claim retraction; the
+// class-4 early return kept 'created'/'closed' from ever re-arming the dedupe guard.
+
+test("arbiter.remove with a pane filter kills ONLY that pane's queued SUCCESS completion", () => {
+  const arb: AnyRec = createTurnArbiter();
+  arb.submit({ facts: "pane A finished", cls: 3, paneId: "A", coalesceKey: "pane-completion", severityRank: 1, completionSuccess: true });
+  arb.submit({ facts: "pane B finished", cls: 3, paneId: "B", coalesceKey: "pane-completion", severityRank: 1, completionSuccess: true });
+  arb.submit({ facts: "pane A completion FAILED: tests red", cls: 3, paneId: "A", coalesceKey: "pane-completion", severityRank: 0, completionSuccess: false });
+  arb.remove("pane-completion", { paneId: "A", completionSuccessOnly: true });
+  const d: AnyRec = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  const all = [d.digest.headline, ...d.digest.tail].map((i: AnyRec) => i.facts).join(" | ");
+  assert.doesNotMatch(all, /pane A finished/, "pane A's queued SUCCESS claim must be purged");
+  assert.match(all, /pane B finished/, "pane B's claim must be untouched");
+  assert.match(all, /pane A completion FAILED/, "pane A's FAILURE completion asserts the same direction — untouched");
+});
+
+test("narrateFailureIfElected purges the pane's queued success claim BEFORE submitting", () => {
+  const calls: string[] = [];
+  const stub = {
+    submit: (it: AnyRec) => calls.push(`submit:${it.facts}`),
+    remove: (key: string, filter?: AnyRec) => calls.push(`remove:${key}:${filter?.paneId}:${filter?.completionSuccessOnly === true}`),
+  };
+  const seen = new Map<string, string>();
+  voiceIndex.narrateFailureIfElected({ paneId: "px", kind: "exited" }, seen, stub);
+  assert.deepStrictEqual(calls, [
+    "remove:pane-completion:px:true",
+    "submit:pane px exited",
+  ], "purge first (a false claim must never co-drain), then the failure narration");
+});
+
+test("narrateFailureIfElected: an elected vc-D retraction suppresses the class-3 twin but still purges + arms the guard", () => {
+  const calls: string[] = [];
+  const stub = {
+    submit: () => calls.push("submit"),
+    remove: () => calls.push("remove"),
+  };
+  const seen = new Map<string, string>();
+  voiceIndex.narrateFailureIfElected({ paneId: "py", kind: "exited" }, seen, stub, true);
+  assert.deepStrictEqual(calls, ["remove"],
+    "the spoken class-0 retraction already carries the failure fact — no duplicate class-3 submit");
+  voiceIndex.narrateFailureIfElected({ paneId: "py", kind: "exited" }, seen, stub, false);
+  assert.deepStrictEqual(calls, ["remove"],
+    "the transition counts as narrated: a repeat of the same signal stays silent");
+});
+
+test("END TO END (Codex finding 1): a queued 'finished' claim is purged when the pane dies before the drain", () => {
+  const arb = createTurnArbiter();
+  const seen = new Map<string, string>();
+  arb.submit({ facts: "pane pz finished", cls: 3, paneId: "pz", coalesceKey: "pane-completion", severityRank: 1, completionSuccess: true });
+  voiceIndex.narrateFailureIfElected({ paneId: "pz", kind: "exited" }, seen, arb, false);
+  const d: AnyRec = arb.evaluate({ now: T0, floorHeld: false, turnClear: true });
+  assert.strictEqual(d.action, "drain");
+  const all = [d.digest.headline, ...d.digest.tail].map((i: AnyRec) => i.facts).join(" | ");
+  assert.match(all, /pane pz exited/);
+  assert.doesNotMatch(all, /pane pz finished/,
+    "one digest must never assert 'exited' AND 'finished' for the same pane");
+});
+
+test("subscriber ordering (Codex finding 3): the re-arm/narrate call runs BEFORE the class-4 early return", () => {
+  const src = readFileSync(path.resolve(repoRoot, "src/voice/index.ts"), "utf-8");
+  const start = src.indexOf("const unsubscribeSpoken = paneSignalBus.subscribe(");
+  const end = src.indexOf("state.unsubscribePaneSignals = ()", start);
+  assert.ok(start >= 0 && end > start, "could not bound the subscriber callback body");
+  const body = src.slice(start, end);
+  const narrateIdx = body.indexOf("narrateFailureIfElected(sig, narratedFailureKinds, sharedArbiter");
+  const class4Idx = body.indexOf('paneSignalClass(sig.kind) === 4');
+  assert.ok(narrateIdx >= 0, "narrateFailureIfElected call site missing from the subscriber");
+  assert.ok(class4Idx >= 0, "class-4 branch missing from the subscriber");
+  assert.ok(narrateIdx < class4Idx,
+    "narrateFailureIfElected must run before the class-4 early return, or 'created'/'closed' " +
+      "never re-arm the dedupe guard (a reused pane id's next death would be swallowed)");
 });

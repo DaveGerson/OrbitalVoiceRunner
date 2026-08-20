@@ -14,6 +14,7 @@
  */
 
 import fs from "fs";
+import path from "path";
 
 /** Injectable knobs so every case here is deterministic on any host/CI — no real fs/env reads
  *  unless the caller omits them (the production call site lets these default to the real thing). */
@@ -22,6 +23,11 @@ export interface BinaryLookupEnv {
   pathEnv?: string;
   pathExtEnv?: string;
   existsSync?: (p: string) => boolean;
+  /** Executability floor (Codex review ed768a6): under the REAL fs a hit must be a FILE — a
+   *  directory named `claude` on PATH is not a binary. Injectable for tests; when a test injects
+   *  existsSync WITHOUT isFile, the floor is skipped (the fake paths have no real stat to consult
+   *  and the injected existsSync fully owns hit semantics). */
+  isFile?: (p: string) => boolean;
 }
 
 // win32's own default when the process has no PATHEXT set at all (rare, but defensive).
@@ -68,13 +74,22 @@ function pathExtCandidates(bin: string, platform: NodeJS.Platform, pathExtEnv: s
 interface ResolvedLookupEnv {
   platform: NodeJS.Platform;
   existsSync: (p: string) => boolean;
+  isFile: (p: string) => boolean;
   pathExtEnv: string;
+}
+
+/** Real-fs executability floor: a hit must be a FILE (statSync), not merely exist. */
+function isRealFile(p: string): boolean {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
 }
 
 function resolveLookupEnv(env: BinaryLookupEnv): ResolvedLookupEnv {
   return {
     platform: env.platform ?? process.platform,
     existsSync: env.existsSync ?? fs.existsSync,
+    // See BinaryLookupEnv.isFile: injected existsSync (tests) owns hit semantics unless the test
+    // also injects isFile; the real fs pairs existsSync with the statSync file floor.
+    isFile: env.isFile ?? (env.existsSync ? () => true : isRealFile),
     pathExtEnv: env.pathExtEnv ?? process.env.PATHEXT ?? DEFAULT_WIN32_PATHEXT,
   };
 }
@@ -85,9 +100,9 @@ function looksLikePath(bin: string): boolean {
   return bin.includes("/") || bin.includes("\\");
 }
 
-/** existsSync check for a single already-joined path, expanded through PATHEXT candidates. */
+/** existsSync+isFile check for a single already-joined path, expanded through PATHEXT candidates. */
 function pathHit(fullPath: string, r: ResolvedLookupEnv): boolean {
-  return pathExtCandidates(fullPath, r.platform, r.pathExtEnv).some(r.existsSync);
+  return pathExtCandidates(fullPath, r.platform, r.pathExtEnv).some((c) => r.existsSync(c) && r.isFile(c));
 }
 
 /** Scan every `pathEnv` directory for `bin`, joined with the platform's own path separator. */
@@ -124,5 +139,12 @@ export function isOnPath(bin: string, env: BinaryLookupEnv = {}): boolean {
 export function unresolvedPresetBinary(command: string, env: BinaryLookupEnv = {}): string | null {
   const bin = firstCommandToken(command);
   if (bin === null) return null;
+  // Codex review (ed768a6): a RELATIVE path is only judgeable from the pane's own cwd (the PTY
+  // launches under the PROJECT directory), and this preflight runs in the SERVER process cwd —
+  // checking it here would false-block a valid preset like `.\tools\agy.exe`. Relative ⇒
+  // unjudgeable ⇒ fail open, exactly like an unparseable command. Absolute paths and bare names
+  // are cwd-independent and still checked.
+  const isAbs = ((env.platform ?? process.platform) === "win32" ? path.win32 : path.posix).isAbsolute;
+  if (looksLikePath(bin) && !isAbs(bin)) return null;
   return isOnPath(bin, env) ? null : bin;
 }

@@ -71,8 +71,11 @@ function factsFor(input: CompletionNarrationInput): string {
 }
 
 /** W1's canonical shared coalesce key -- every completion item (success or failure) carries it, so
- *  the D2 tail-group phrasing hook ("three panes finished") sees the successes share ONE group. */
-const COALESCE_KEY = "pane-completion";
+ *  the D2 tail-group phrasing hook ("three panes finished") sees the successes share ONE group.
+ *  Exported (Codex review ed768a6): the failure-narration purge targets queued success claims
+ *  under exactly this key -- a string duplicate would silently drift. */
+export const PANE_COMPLETION_COALESCE_KEY = "pane-completion";
+const COALESCE_KEY = PANE_COMPLETION_COALESCE_KEY;
 
 function buildItem(input: CompletionNarrationInput, exception: boolean): CompletionNarrationResult {
   return {
