@@ -81,6 +81,25 @@ describe("U4 presetCommand — union -> launch command", () => {
     assert.strictEqual(presetCommand("Claude Code", renamed, undefined), "claude-next");
   });
 
+  it("migrates the broken legacy 'antigravity' persisted command to 'agy' (array + object forms)", () => {
+    // Every install seeded before the 2026-08-18 demo fix persisted command:"antigravity" — a
+    // binary that never existed under that name (the CLI installs as `agy`). That value is a
+    // bad shipped default, not a director rename, so parsePresetsSafe rewrites EXACTLY that
+    // value; any other explicit rename is still honored verbatim.
+    const arr = parsePresetsSafe([{ id: "antigravity", name: "Antigravity Agent", command: "antigravity" }]);
+    assert.strictEqual(arr[0].command, "agy", "array form: stale seeded default migrates");
+    const obj = parsePresetsSafe({ antigravity: { command: "antigravity" } });
+    assert.strictEqual(obj[0].command, "agy", "object form: stale seeded default migrates");
+    assert.strictEqual(presetCommand("Antigravity", arr, undefined), "agy", "spawn derives agy post-migration");
+  });
+
+  it("preserves a deliberate Antigravity rename (only the exact broken default migrates)", () => {
+    const custom = parsePresetsSafe([{ id: "antigravity", name: "Antigravity Agent", command: "C:/tools/agy-pinned.exe" }]);
+    assert.strictEqual(custom[0].command, "C:/tools/agy-pinned.exe");
+    const otherId = parsePresetsSafe([{ id: "myTool", name: "MyTool", command: "antigravity" }]);
+    assert.strictEqual(otherId[0].command, "antigravity", "a NON-antigravity preset keeps its command even if it happens to be the string 'antigravity'");
+  });
+
   it("falls back to the canonical binary when no preset matches the id", () => {
     // empty presets list -> no .command override -> canonical fallback name.
     assert.strictEqual(presetCommand("Claude Code", [], undefined), "claude");

@@ -74,15 +74,28 @@ function presetDisplayName(key: string): string {
   }
 }
 
+// Every install seeded before the 2026-08-18 demo fix persisted command:"antigravity" — a
+// binary that never existed under that name (the Antigravity/Gemini CLI installs as `agy`).
+// That value is a broken shipped default, not a director rename, so heal EXACTLY that value
+// here (loadSettings AND updateSettings both flow through parsePresetsSafe — the one
+// persistence choke-point). Any other command on the preset is honored verbatim per the
+// presetCommand override contract.
+function migrateStaleAntigravityCommand(p: CliPreset): CliPreset {
+  return p.id === "antigravity" && (p.command ?? "").trim() === "antigravity" ? { ...p, command: "agy" } : p;
+}
+
 export function parsePresetsSafe(input: any): CliPreset[] {
   if (Array.isArray(input)) {
     // bead 8sq: the field-by-field rebuild is the SERVER-SIDE persistence choke-point
     // (updateSettings -> here); buildPreset carries per-preset capabilityGates through it.
-    return input.map((item: any) => buildPreset(item, String(item?.id || ""), String(item?.name || "")));
+    return input
+      .map((item: any) => buildPreset(item, String(item?.id || ""), String(item?.name || "")))
+      .map(migrateStaleAntigravityCommand);
   }
   if (input && typeof input === "object") {
-    return Object.entries(input).map(([key, val]: [string, any]) =>
-      buildPreset(val, key, val?.name || presetDisplayName(key)));
+    return Object.entries(input)
+      .map(([key, val]: [string, any]) => buildPreset(val, key, val?.name || presetDisplayName(key)))
+      .map(migrateStaleAntigravityCommand);
   }
   return [
     { id: "claudeCode", name: "Claude Code", command: "claude", enabled: true, permissionsMode: "Human-in-the-Loop", windowMode: "Standard Split-Pane", visualTheme: "Royal Purple", persistentRestore: true, dangerouslySkipPermissions: false, sessionResume: true, portOffset: "", customEnvVars: "" },

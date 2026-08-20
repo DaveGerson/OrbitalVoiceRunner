@@ -160,6 +160,7 @@ const CreatePaneParamsSchema = z
       "codex",
       "antigravity",
       "gemini",
+      "Gemini",
       "agy",
       "Claude Code",
       "Codex",

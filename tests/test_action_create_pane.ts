@@ -223,15 +223,20 @@ describe("KS create_pane launch-derivation (headless, no API key, no mic)", () =
   // Antigravity preset (the model guessed Codex). "gemini" must normalize to Antigravity
   // and derive the agy launch.
   // ──────────────────────────────────────────────────────────────────────────
-  it("17b2 voice create_pane accepts 'gemini' and derives the agy launch (Antigravity)", async () => {
-    const call = await voiceCreatePane({
-      project_id: "cp_proj",
-      pane_id: "cp-voice-gemini",
-      tool_preset: "gemini",
-      permissions_mode: "Human-in-the-Loop",
-    });
-    assert.strictEqual(call.toolPreset, "Antigravity", "gemini normalizes to the Antigravity union");
-    assert.ok(call.command.startsWith("agy"), `gemini derives the agy command: ${call.command}`);
+  it("17b2 voice create_pane accepts 'gemini'/'Gemini' and derives the agy launch (Antigravity)", async () => {
+    // Both casings: the zod enum is the model-facing contract and must admit every spelling
+    // normalizePreset supports (Codex review of 874d084: 'Gemini' was normalizable but rejected
+    // by the enum, a schema/normalizer mismatch).
+    for (const spelling of ["gemini", "Gemini"]) {
+      const call = await voiceCreatePane({
+        project_id: "cp_proj",
+        pane_id: `cp-voice-${spelling.toLowerCase()}-${spelling === "Gemini" ? "cap" : "lc"}`,
+        tool_preset: spelling,
+        permissions_mode: "Human-in-the-Loop",
+      });
+      assert.strictEqual(call.toolPreset, "Antigravity", `${spelling} normalizes to the Antigravity union`);
+      assert.ok(call.command.startsWith("agy"), `${spelling} derives the agy command: ${call.command}`);
+    }
   });
 
   // ──────────────────────────────────────────────────────────────────────────
