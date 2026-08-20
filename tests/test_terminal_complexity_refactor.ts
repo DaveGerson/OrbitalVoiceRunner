@@ -171,7 +171,7 @@ describe("Phase 7b — parsePresetsSafe characterization (pure)", () => {
     assert.deepStrictEqual(out.map((p) => p.id), ["claudeCode", "codex", "antigravity"]);
     assert.strictEqual(out[0].command, "claude");
     assert.strictEqual(out[1].command, "codex");
-    assert.strictEqual(out[2].command, "antigravity");
+    assert.strictEqual(out[2].command, "agy"); // the Antigravity/Gemini CLI binary (demo fix 2026-08-18)
     assert.strictEqual(out[0].visualTheme, "Royal Purple");
     assert.strictEqual(out[2].permissionsMode, "Full Auto");
     assert.strictEqual(out[2].dangerouslySkipPermissions, true);

@@ -36,7 +36,7 @@ export function CreateTerminalDialog({
     } else if (toolPreset === "Codex") {
       baseCmd = "codex";
     } else if (toolPreset === "Antigravity") {
-      baseCmd = "antigravity";
+      baseCmd = "agy";
     } else {
       baseCmd = process.platform === "win32" ? "cmd.exe" : "bash";
     }

@@ -147,7 +147,8 @@ export const updateDraftPrompt: ActionDef<typeof UpdateDraftPromptParams> = {
  * launch command for an agent preset.
  *
  * tool_preset accepts both preset .ids (claudeCode/codex/antigravity), union display names
- * (Claude Code/Codex/Antigravity), and Custom; normalizePreset() collapses any of them onto the
+ * (Claude Code/Codex/Antigravity), the Gemini spellings (gemini/agy — Antigravity IS the Gemini
+ * CLI, installed as `agy`), and Custom; normalizePreset() collapses any of them onto the
  * addTerminal union server-side.
  */
 const CreatePaneParamsSchema = z
@@ -158,6 +159,9 @@ const CreatePaneParamsSchema = z
       "claudeCode",
       "codex",
       "antigravity",
+      "gemini",
+      "Gemini",
+      "agy",
       "Claude Code",
       "Codex",
       "Antigravity",
@@ -254,7 +258,7 @@ function shouldDropRestCommand(out: Record<string, unknown>, isRestShape: boolea
 export const createPane: ActionDef<typeof CreatePaneParamsSchema> = {
   name: "create_pane",
   description:
-    "Create a new terminal pane inside a project and start its agent. For an agent preset (Claude Code / Codex / Antigravity) the command line is DERIVED on the server from tool_preset — do NOT pass command. ONLY for the Custom preset may you pass a free-form `command` (e.g. 'htop'); omit it to open a bare shell.",
+    "Create a new terminal pane inside a project and start its agent. For an agent preset (Claude Code / Codex / Antigravity) the command line is DERIVED on the server from tool_preset — do NOT pass command. Antigravity is Google's Gemini CLI (the `agy` binary): when the operator asks for a Gemini, agy, or anti-gravity pane, use tool_preset 'gemini'/'agy'/'antigravity' — NEVER substitute another agent preset. ONLY for the Custom preset may you pass a free-form `command` (e.g. 'htop'); omit it to open a bare shell.",
   params: CreatePaneParamsSchema,
   capability: "create_pane",
   readOnly: false,

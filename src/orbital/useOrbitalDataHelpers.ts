@@ -323,7 +323,7 @@ export function resolvePaneCommand(
 ): string | undefined {
   const configured = presets?.find((p) => p.name === toolPreset)?.command;
   if (configured?.trim()) return configured;
-  return ({ "Claude Code": "claude", Codex: "codex", Antigravity: "antigravity" } as Record<string, string>)[toolPreset];
+  return ({ "Claude Code": "claude", Codex: "codex", Antigravity: "agy" } as Record<string, string>)[toolPreset];
 }
 
 /** createPane: the pane id slug (lowercased, non-alnum→dash, trimmed, capped 24) + a 4-char suffix
